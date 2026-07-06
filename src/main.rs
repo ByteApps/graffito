@@ -475,8 +475,14 @@ fn suggested_coins(
     spk_len: Option<usize>,
     sent: u64,
 ) -> Vec<(String, u32)> {
-    let mut coins: Vec<&app_core::store::LedgerUtxo> =
-        store.utxos.iter().filter(|u| !u.pending_spend).collect();
+    // Auto-suggestion uses CONFIRMED coins only (largest-first).
+    // Unconfirmed coins are never auto-selected — the user can add them
+    // manually in the coin-control list.
+    let mut coins: Vec<&app_core::store::LedgerUtxo> = store
+        .utxos
+        .iter()
+        .filter(|u| !u.pending_spend && u.height.is_some())
+        .collect();
     coins.sort_by(|a, b| b.value.cmp(&a.value));
     let mut chosen = Vec::new();
     let mut total = 0u64;
@@ -1379,6 +1385,13 @@ fn main() {
                 refresh_compose(&w, &mut s);
             }
         }
+    });
+
+    cb!(on_refresh_coins, |w, s| {
+        println!("cb: refresh-coins");
+        refresh(&w, &mut s);
+        w.set_status("".into());
+        refresh_compose(&w, &mut s);
     });
 
     cb!(on_compose_send, |w, s| {

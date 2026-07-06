@@ -441,6 +441,7 @@ export component AppWindow inherits Window {
     callback compose-send();
     callback change-scan();
     callback toggle-coin(string);
+    callback refresh-coins();
     callback settings-open();
     callback set-network(string);
     callback hide-backup();
@@ -825,6 +826,13 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                         Rectangle { }
+                        IconButton {
+                            glyph: "↻";
+                            glyph-size: 15px;
+                            width: 28px;
+                            height: 22px;
+                            clicked => { root.refresh-coins(); }
+                        }
                         Image {
                             source: root.spend-expanded
                                 ? @image-url("icons/caret-up.svg")
