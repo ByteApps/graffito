@@ -44,8 +44,8 @@ Screens (`screen` property): 0 onboarding (3 doors) · 1 import (typed/
 QR/file, live format feedback + word autocomplete) · 2 backup words ·
 3 quiz · 4 home (balance card, QR, notes list w/ badge pills) · 5 note
 view (+ web-viewer permalink link, hidden on regtest) · 6 compose
-(picker-first, Private default, live cost line, collapsible custom
-change-address section) · 7 send-to (Self card,
+(picker-first, Private default, live cost line, collapsible coin-
+control + custom-change sections) · 7 send-to (Self card,
 address input + QR-icon scan [scan-to-pick] + Use, recents w/ pencil-
 rename dialog + confirmed remove) · 8 settings (Identity card w/
 account switch + reset, network/chunk pills, esplora, Coins card,

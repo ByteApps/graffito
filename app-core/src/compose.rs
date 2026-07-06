@@ -4,8 +4,11 @@
 //! Pending note with the tx hex still in hand.
 
 use notes_core::address::Recipient;
-use notes_core::bundle::{compose_directed_note_with_change, compose_note_with_change, Identity};
 use notes_core::address::address_to_script_pubkey;
+use notes_core::bundle::{
+    compose_directed_note_exact, compose_directed_note_with_change, compose_note_exact,
+    compose_note_with_change, Identity,
+};
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::tx::NoteTx;
 use notes_core::Network;
@@ -22,6 +25,9 @@ pub struct ComposeRequest<'a> {
     /// Some = a custom address; that change is NOT tracked as a spendable
     /// coin (it leaves this wallet).
     pub change_to: Option<&'a str>,
+    /// Coin control: exact inputs to spend as (display-txid, vout).
+    /// None = auto-select (largest-first).
+    pub coins: Option<&'a [(String, u32)]>,
     pub fee_rate: f64,
     /// Local wall-clock seconds for created_at (display only).
     pub now: u64,
@@ -55,29 +61,43 @@ pub fn compose_and_record(
     };
     let change_spk = change.as_ref().map(|c| c.spk.as_slice());
 
-    let tx = match &recipient {
-        Some(r) => compose_directed_note_with_change(
-            identity,
-            &utxos,
-            req.text,
-            req.private,
-            note_id,
-            r,
-            change_spk,
-            store.chunk_size,
-            req.fee_rate,
-            generate_aux_rand,
+    // Coin control: resolve the selected outpoints to spendable inputs.
+    let selected: Option<Vec<notes_core::tx::Utxo>> = match req.coins {
+        Some(sel) => {
+            let mut v = Vec::with_capacity(sel.len());
+            for (txid_disp, vout) in sel {
+                let l = store
+                    .utxos
+                    .iter()
+                    .find(|u| &u.txid == txid_disp && u.vout == *vout && !u.pending_spend)
+                    .ok_or(Error::Store("selected coin is not spendable".into()))?;
+                let mut t = [0u8; 32];
+                hex::decode_to_slice(&l.txid, &mut t)
+                    .map_err(|_| Error::Store("bad coin txid".into()))?;
+                t.reverse();
+                v.push(notes_core::tx::Utxo { txid: t, vout: l.vout, value: l.value });
+            }
+            Some(v)
+        }
+        None => None,
+    };
+
+    let tx = match (&recipient, &selected) {
+        (Some(r), Some(ins)) => compose_directed_note_exact(
+            identity, ins, req.text, req.private, note_id, r, change_spk,
+            store.chunk_size, req.fee_rate, generate_aux_rand,
         ),
-        None => compose_note_with_change(
-            identity,
-            &utxos,
-            req.text,
-            req.private,
-            note_id,
-            change_spk,
-            store.chunk_size,
-            req.fee_rate,
-            generate_aux_rand,
+        (Some(r), None) => compose_directed_note_with_change(
+            identity, &utxos, req.text, req.private, note_id, r, change_spk,
+            store.chunk_size, req.fee_rate, generate_aux_rand,
+        ),
+        (None, Some(ins)) => compose_note_exact(
+            identity, ins, req.text, req.private, note_id, change_spk,
+            store.chunk_size, req.fee_rate, generate_aux_rand,
+        ),
+        (None, None) => compose_note_with_change(
+            identity, &utxos, req.text, req.private, note_id, change_spk,
+            store.chunk_size, req.fee_rate, generate_aux_rand,
         ),
     }?;
 
