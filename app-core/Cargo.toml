@@ -1,0 +1,16 @@
+# UI-free application core: identity import/create, derivation, chain
+# client, store, compose orchestration. Host-testable: cargo test -p app-core.
+#
+# notes-core (pinned rev) provides the FROZEN protocol pieces — PNTE
+# envelope, XChaCha20 sealing, dm ECDH, taproot tx build/sign, extract —
+# so note txs are byte-identical to the Prime app's by construction.
+# Its workspace [patch] getrandom/TRNG override deliberately does NOT
+# propagate here: on the host we want OS randomness.
+[package]
+name = "app-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+notes-core = { git = "ssh://git@github.com/ObjSal/prime-chain-notes.git", rev = "6530edcb8daacab98fbe72754fa67c8f3d7253af" }

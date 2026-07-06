@@ -1,0 +1,13 @@
+[package]
+name = "chain-notes-app"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Native Mac/iOS/Android peer for chain notes (PNTE protocol)"
+
+[workspace]
+members = ["app-core"]
+
+[dependencies]
+app-core = { path = "app-core" }
+# slint lands at M5 (Mac shell milestone) — the bin is a stub until then.
