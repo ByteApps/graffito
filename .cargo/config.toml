@@ -1,0 +1,4 @@
+# notes-core is an ssh:// git dependency on a private repo — fetch with
+# the real git CLI so the user's ssh agent/keys are used.
+[net]
+git-fetch-with-cli = true
