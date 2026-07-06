@@ -47,10 +47,12 @@ view (+ web-viewer permalink link, hidden on regtest) · 6 compose
 (picker-first, Private default, live cost line) · 7 send-to (Self card,
 address input + QR-icon scan [scan-to-pick] + Use, recents w/ pencil-
 rename dialog + confirmed remove) · 8 settings (Identity card w/
-account switch + reset, network pills, chunk pills, esplora, Touch ID
-reveal) · 9 account picker (paginated, 5/page, current badge). Modals
+account switch + reset, network/chunk pills, esplora, Coins card,
+Funds/sweep, Touch ID reveal — Flickable-scrollable) · 9 account
+picker (paginated, 5/page, current badge) · 10 coins (spendable UTXO
+list + consolidate-to-self). Modals
 (overlays as LAST children of the window root): rename, remove-confirm,
-reset-confirm.
+reset-confirm, sweep-confirm, consolidate-confirm.
 
 **Identity lifecycle:** key material verbatim in the keychain; BIP-86
 account chosen on a paginated picker after hierarchical imports and
