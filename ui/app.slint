@@ -6,6 +6,7 @@ import { LineEdit, TextEdit, ListView, Switch } from "std-widgets.slint";
 
 export struct NoteItem { id: string, title: string, meta: string, badge: string }
 export struct ContactItem { address: string, name: string }
+export struct AccountItem { index: int, address: string, active: bool }
 
 // ---- palette ----
 global Pal {
@@ -277,7 +278,6 @@ export component AppWindow inherits Window {
     in property <string> status;
 
     in-out property <string> import-text;
-    in-out property <string> import-account: "0";
     in property <string> import-feedback;
     in property <string> import-suggestions;
 
@@ -306,6 +306,9 @@ export component AppWindow inherits Window {
 
     in property <string> settings-network;
     in property <string> settings-identity;
+    in property <bool> settings-hierarchical;
+    in property <[AccountItem]> accounts;
+    in-out property <int> account-page;
     in-out property <bool> show-reset-confirm;
     in-out property <string> chunk-text;
     in-out property <bool> chunk-custom;
@@ -338,6 +341,10 @@ export component AppWindow inherits Window {
     callback set-network(string);
     callback hide-backup();
     callback reset-identity();
+    callback open-account-picker();
+    callback accounts-page(int);
+    callback pick-account(int);
+    callback account-cancel();
     callback set-chunk(string);
     callback set-esplora(string);
     callback reveal-backup();
@@ -364,7 +371,7 @@ export component AppWindow inherits Window {
         DoorCard {
             highlight: true;
             title: "Import a key";
-            subtitle: "BIP-85 child from your Passport Prime (recommended) — or any mnemonic, xprv, WIF, or hex key. Type, scan, or open a file.";
+            subtitle: "Any mnemonic, xprv, WIF, or 32-byte hex key — e.g. a BIP-85 child from your hardware wallet. Type, scan, or open a file.";
             clicked => { root.door-import(); }
         }
         DoorCard {
@@ -398,20 +405,6 @@ export component AppWindow inherits Window {
             height: 110px;
             text <=> root.import-text;
             edited => { root.import-changed(self.text); }
-        }
-        HorizontalLayout {
-            spacing: 8px;
-            alignment: start;
-            Caption { text: "Account #"; vertical-alignment: center; }
-            LineEdit {
-                width: 64px;
-                text <=> root.import-account;
-                edited => { root.import-changed(root.import-text); }
-            }
-            Caption {
-                text: "BIP-86 account — for mnemonic / master xprv (0 is standard)";
-                vertical-alignment: center;
-            }
         }
         if root.import-suggestions != "": Caption {
             text: root.import-suggestions;
@@ -761,6 +754,10 @@ export component AppWindow inherits Window {
                 wrap: no-wrap;
                 overflow: elide;
             }
+            if root.settings-hierarchical: GhostButton {
+                text: "Change account…";
+                clicked => { root.open-account-picker(); }
+            }
             GhostButton {
                 text: "Switch identity — new seed or different key…";
                 clicked => { root.show-reset-confirm = true; }
@@ -843,6 +840,68 @@ export component AppWindow inherits Window {
             }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
+    }
+
+    // ---------- 9 · account picker ----------
+    if screen == 9: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Choose account";
+            back => { root.account-cancel(); }
+        }
+        Caption {
+            text: "One seed holds many BIP-86 accounts. Each is a completely separate notebook: its own address, its own encryption key, its own notes.";
+        }
+        for a in root.accounts: Rectangle {
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: a.active ? Pal.accent : Pal.line;
+            background: at.has-hover ? Pal.card-hover : Pal.card;
+            height: al.preferred-height;
+            at := TouchArea { clicked => { root.pick-account(a.index); } }
+            al := VerticalLayout {
+                padding: 14px;
+                spacing: 4px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Account " + a.index;
+                        font-size: 14px;
+                        font-weight: 700;
+                        color: a.active ? Pal.accent : Pal.text;
+                    }
+                    Rectangle { }
+                    if a.active: Badge { label: "current"; tint: Pal.accent; }
+                }
+                Mono {
+                    text: a.address;
+                    font-size: 10px;
+                    color: Pal.muted;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            GhostButton {
+                width: 90px;
+                text: "‹ Prev";
+                clicked => { root.accounts-page(-1); }
+            }
+            Caption {
+                text: "accounts " + (root.account-page * 5) + " – " + (root.account-page * 5 + 4);
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            GhostButton {
+                width: 90px;
+                text: "Next ›";
+                clicked => { root.accounts-page(1); }
+            }
+        }
     }
 
     // ---------- rename dialog (modal overlay) ----------
