@@ -15,8 +15,9 @@ use app_core::store::{NoteStatus, Store};
 
 fn identity(network: Network) -> AppIdentity {
     let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | xprv | WIF | hex32");
+    let account = std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
     let material = parse_key_material(&key, network).expect("APP_KEY parse");
-    realize(&material, network).expect("APP_KEY realize")
+    realize(&material, network, account).expect("APP_KEY realize")
 }
 
 fn network(s: &str) -> Network {

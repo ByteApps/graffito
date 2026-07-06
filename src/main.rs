@@ -29,6 +29,7 @@ const KEYCHAIN_ACCOUNT: &str = "identity-key";
 struct State {
     data_dir: PathBuf,
     network: Network,
+    account: u32,
     ident: Option<AppIdentity>,
     store: Option<Store>,
     fees: Option<FeeRates>,
@@ -40,8 +41,14 @@ struct State {
 }
 
 impl State {
-    fn store_path(&self) -> PathBuf {
-        self.data_dir.join(format!("store-{}.json", self.network.as_str()))
+    /// Per-identity, per-network store file — switching keys or accounts
+    /// can never collide notebooks.
+    fn store_path(&self) -> Option<PathBuf> {
+        let fp = hex::encode(self.ident.as_ref()?.identity.output_x);
+        Some(
+            self.data_dir
+                .join(format!("store-{}-{}.json", self.network.as_str(), &fp[..8])),
+        )
     }
 
     fn base_url(&self) -> Option<String> {
@@ -52,15 +59,19 @@ impl State {
     }
 
     fn save_store(&self) {
-        if let Some(s) = &self.store {
-            let _ = s.save(&self.store_path());
+        if let (Some(s), Some(p)) = (&self.store, self.store_path()) {
+            let _ = s.save(&p);
         }
     }
 
     fn save_config(&self) {
         let _ = std::fs::write(
             self.data_dir.join("config.json"),
-            format!("{{\"network\":\"{}\"}}", self.network.as_str()),
+            serde_json::json!({
+                "network": self.network.as_str(),
+                "account": self.account,
+            })
+            .to_string(),
         );
     }
 }
@@ -86,22 +97,27 @@ fn normalize_addr(raw: &str) -> String {
 fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), String> {
     let material =
         parse_key_material(material_str, st.network).map_err(|e| e.to_string())?;
-    let ident = realize(&material, st.network).map_err(|e| e.to_string())?;
+    let ident = realize(&material, st.network, st.account).map_err(|e| e.to_string())?;
     if persist {
         keychain::store_secret_protected(KEYCHAIN_ACCOUNT, material_str.trim())?;
     }
     st.material = Some(material_str.trim().to_string());
-    let path = st.data_dir.join(format!("store-{}.json", st.network.as_str()));
+    let fp = hex::encode(ident.identity.output_x);
+    let path = st
+        .data_dir
+        .join(format!("store-{}-{}.json", st.network.as_str(), &fp[..8]));
     let store = Store::load(&path).unwrap_or_else(|_| Store::new(&ident.identity, st.network));
     println!(
-        "cb: identity kind={} network={} address={}",
+        "cb: identity kind={} account={} network={} address={}",
         ident.kind,
+        ident.account,
         st.network.as_str(),
         ident.address
     );
     st.ident = Some(ident);
     st.store = Some(store);
     st.save_store();
+    st.save_config();
     Ok(())
 }
 
@@ -160,6 +176,21 @@ fn update_home(w: &AppWindow, st: &State) {
         .collect();
     w.set_contacts(VecModel::from_slice(&contacts));
     w.set_settings_network(st.network.as_str().into());
+    if let Some(i) = &st.ident {
+        w.set_settings_identity(
+            format!(
+                "{}{} · {}",
+                i.kind,
+                if matches!(i.kind, "mnemonic" | "xprv") {
+                    format!(" · account {}", i.account)
+                } else {
+                    String::new()
+                },
+                st.network.as_str()
+            )
+            .into(),
+        );
+    }
     w.set_chunk_text(store.chunk_size.to_string().into());
     w.set_esplora_text(store.esplora.clone().unwrap_or_default().into());
 }
@@ -272,19 +303,25 @@ fn main() {
             .join("Library/Application Support/ChainNotes")
     });
     let _ = std::fs::create_dir_all(&data_dir);
+    let config: serde_json::Value = std::fs::read_to_string(data_dir.join("config.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or(serde_json::Value::Null);
     let network = std::env::var("APP_NETWORK")
         .ok()
-        .or_else(|| {
-            std::fs::read_to_string(data_dir.join("config.json"))
-                .ok()
-                .and_then(|c| serde_json_network(&c))
-        })
+        .or_else(|| config.get("network").and_then(|v| v.as_str()).map(String::from))
         .and_then(|s| Network::from_str_opt(&s))
         .unwrap_or(Network::Testnet4);
+    let account: u32 = std::env::var("APP_ACCOUNT")
+        .ok()
+        .and_then(|a| a.parse().ok())
+        .or_else(|| config.get("account").and_then(|v| v.as_u64()).map(|v| v as u32))
+        .unwrap_or(0);
 
     let st = Rc::new(RefCell::new(State {
         data_dir,
         network,
+        account,
         ident: None,
         store: None,
         fees: None,
@@ -440,14 +477,34 @@ fn main() {
             String::new()
         };
         w.set_import_suggestions(sugg.into());
+        let account: u32 = w.get_import_account().trim().parse().unwrap_or(0);
         let fb = match parse_key_material(&t, s.network) {
-            Ok(m) => format!("✓ recognized: {}", m.kind()),
+            Ok(m) => match realize(&m, s.network, account) {
+                Ok(preview) => {
+                    let a = &preview.address;
+                    let short = format!("{}…{}", &a[..12.min(a.len())], &a[a.len().saturating_sub(6)..]);
+                    match m.kind() {
+                        "mnemonic" | "xprv" => {
+                            format!("✓ {} · account {account} → {short}", m.kind())
+                        }
+                        k => format!("✓ {k} → {short}"),
+                    }
+                }
+                Err(e) => format!("{e}"),
+            },
             Err(e) => format!("{e}"),
         };
         w.set_import_feedback(fb.into());
     });
 
     cb!(on_import_confirm, |w, s, text: SharedString| {
+        match w.get_import_account().trim().parse::<u32>() {
+            Ok(a) if a < 0x8000_0000 => s.account = a,
+            _ => {
+                w.set_import_feedback("account must be a number (0, 1, 2, …)".into());
+                return;
+            }
+        }
         match activate(&mut s, text.trim(), true) {
             Ok(()) => {
                 println!("cb: import ok");
@@ -748,6 +805,22 @@ fn main() {
         w.set_screen(8);
     });
 
+    cb!(on_reset_identity, |w, s| {
+        println!("cb: reset-identity");
+        let _ = keychain::delete_secret(KEYCHAIN_ACCOUNT);
+        s.ident = None;
+        s.store = None;
+        s.material = None;
+        s.account = 0;
+        s.to_address = None;
+        w.set_show_reset_confirm(false);
+        w.set_reveal_text("".into());
+        w.set_status("".into());
+        w.set_import_text("".into());
+        w.set_import_account("0".into());
+        w.set_screen(0);
+    });
+
     cb!(on_hide_backup, |w, s| {
         let _ = &mut s;
         w.set_reveal_text("".into());
@@ -829,14 +902,6 @@ fn main() {
     });
 
     window.run().expect("event loop");
-}
-
-fn serde_json_network(config: &str) -> Option<String> {
-    config
-        .split('"')
-        .skip_while(|s| *s != "network")
-        .nth(2)
-        .map(String::from)
 }
 
 fn getrandom_fill(buf: &mut [u8]) -> Result<(), ()> {

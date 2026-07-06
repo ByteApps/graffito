@@ -40,6 +40,9 @@ impl KeyMaterial {
 /// A realized identity: leaf secret + notes-core Identity + address.
 pub struct AppIdentity {
     pub kind: &'static str,
+    /// BIP-86 account index (meaningful for mnemonic / master-xprv;
+    /// 0 and ignored for account-xprv / WIF / hex).
+    pub account: u32,
     pub leaf_secret: Zeroizing<[u8; 32]>,
     pub identity: Identity,
     pub address: String,
@@ -118,11 +121,19 @@ pub fn generate_mnemonic(word_count: usize) -> Result<bip39::Mnemonic, Error> {
 }
 
 /// Material → leaf secret → Identity + address on `network`.
-pub fn realize(material: &KeyMaterial, network: Network) -> Result<AppIdentity, Error> {
+/// `account` = BIP-86 account index for mnemonic / master-xprv imports
+/// (each account is a fully separate identity: its own address AND its
+/// own note-encryption key, since the frozen rule derives from the
+/// leaf). Ignored for account-xprv / WIF / hex.
+pub fn realize(
+    material: &KeyMaterial,
+    network: Network,
+    account: u32,
+) -> Result<AppIdentity, Error> {
     let leaf: Zeroizing<[u8; 32]> = Zeroizing::new(match material {
-        KeyMaterial::Mnemonic(m) => leaf_from_mnemonic(m, network)?,
+        KeyMaterial::Mnemonic(m) => leaf_from_mnemonic(m, network, account)?,
         KeyMaterial::Xprv(x) => match x.depth {
-            0 => leaf_from_master(x, network)?,
+            0 => leaf_from_master(x, network, account)?,
             3 => leaf_from_account(x)?,
             d => return Err(Error::XprvDepth(d)),
         },
@@ -131,5 +142,5 @@ pub fn realize(material: &KeyMaterial, network: Network) -> Result<AppIdentity, 
     });
     let identity = identity_from_leaf(&leaf)?;
     let address = identity.address(network);
-    Ok(AppIdentity { kind: material.kind(), leaf_secret: leaf, identity, address })
+    Ok(AppIdentity { kind: material.kind(), account, leaf_secret: leaf, identity, address })
 }

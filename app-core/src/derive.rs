@@ -51,13 +51,13 @@ fn normal(i: u32) -> ChildNumber {
     ChildNumber::from_normal_idx(i).expect("index < 2^31")
 }
 
-/// m/86'/{coin}'/0'/0/0 from a master (depth-0) xprv.
-pub fn leaf_from_master(master: &Xpriv, network: Network) -> Result<[u8; 32], Error> {
+/// m/86'/{coin}'/{account}'/0/0 from a master (depth-0) xprv.
+pub fn leaf_from_master(master: &Xpriv, network: Network, account: u32) -> Result<[u8; 32], Error> {
     let secp = Secp256k1::new();
     let path = [
         hardened(86),
         hardened(coin_type(network)),
-        hardened(0),
+        hardened(account),
         normal(0),
         normal(0),
     ];
@@ -102,9 +102,10 @@ pub fn identity_from_leaf(leaf_secret: &[u8; 32]) -> Result<Identity, Error> {
 pub fn leaf_from_mnemonic(
     mnemonic: &bip39::Mnemonic,
     network: Network,
+    account: u32,
 ) -> Result<[u8; 32], Error> {
     let seed = Zeroizing::new(mnemonic.to_seed(""));
     let master = Xpriv::new_master(btc_network(network), seed.as_ref())
         .map_err(|e| Error::Xprv(e.to_string()))?;
-    leaf_from_master(&master, network)
+    leaf_from_master(&master, network, account)
 }
