@@ -10,4 +10,14 @@ members = ["app-core"]
 
 [dependencies]
 app-core = { path = "app-core" }
-# slint lands at M5 (Mac shell milestone) — the bin is a stub until then.
+slint = "=1.16.1"
+# QR out: rendered into a slint Image.
+qrcode = "0.14"
+# QR in: camera frames (AVFoundation on Mac) → rqrr decode.
+nokhwa = { version = "0.10", features = ["input-avfoundation"] }
+rqrr = "0.7"
+# Key material at rest: macOS Keychain (SecretStore spec in the PLAN).
+security-framework = "3"
+
+[build-dependencies]
+slint-build = "=1.16.1"
