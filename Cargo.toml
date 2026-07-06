@@ -18,6 +18,17 @@ nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 rqrr = "0.7"
 # Key material at rest: macOS Keychain (SecretStore spec in the PLAN).
 security-framework = "3"
+# Raw SecItemAdd/CopyMatching for the UserPresence ACL item (the high-
+# level item API has no access-control setter).
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+# Dev-build fallback: LAContext user-presence gate (unsigned binaries
+# cannot use SecAccessControl items — errSecMissingEntitlement).
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-local-authentication = "0.3"
+block2 = "0.6"
 # Native file-open dialog (import-from-file door).
 rfd = "0.14"
 # Quiz word picks + misc entropy.

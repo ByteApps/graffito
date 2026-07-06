@@ -34,6 +34,7 @@ struct State {
     fees: Option<FeeRates>,
     usd: Option<f64>,
     to_address: Option<String>, // None = self-note
+    material: Option<String>,   // session cache: avoids re-prompting Touch ID
     pending_mnemonic: Option<String>,
     quiz_indices: Vec<usize>,
 }
@@ -87,8 +88,9 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
         parse_key_material(material_str, st.network).map_err(|e| e.to_string())?;
     let ident = realize(&material, st.network).map_err(|e| e.to_string())?;
     if persist {
-        keychain::store_secret(KEYCHAIN_ACCOUNT, material_str.trim())?;
+        keychain::store_secret_protected(KEYCHAIN_ACCOUNT, material_str.trim())?;
     }
+    st.material = Some(material_str.trim().to_string());
     let path = st.data_dir.join(format!("store-{}.json", st.network.as_str()));
     let store = Store::load(&path).unwrap_or_else(|_| Store::new(&ident.identity, st.network));
     println!(
@@ -245,6 +247,7 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("--spike") {
         let result = match args.get(2).map(String::as_str) {
             Some("keychain") => keychain::spike(),
+            Some("keychain-auth") => keychain::spike_auth(),
             Some("camera") => {
                 camera::spike(args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15))
             }
@@ -280,6 +283,7 @@ fn main() {
         fees: None,
         usd: None,
         to_address: None,
+        material: None,
         pending_mnemonic: None,
         quiz_indices: Vec::new(),
     }));
@@ -288,9 +292,26 @@ fn main() {
     // Boot identity: APP_KEY env (dev/tests) or the keychain.
     {
         let mut s = st.borrow_mut();
-        let material = std::env::var("APP_KEY")
-            .ok()
-            .or_else(|| keychain::load_secret(KEYCHAIN_ACCOUNT).ok().flatten());
+        let material = match std::env::var("APP_KEY") {
+            Ok(k) => Some(k),
+            Err(_) => match keychain::load_secret_protected(
+                KEYCHAIN_ACCOUNT,
+                "unlock your Chain Notes identity",
+            ) {
+                Ok(m) => m,
+                Err(e) if e == "cancelled" => {
+                    println!("cb: unlock cancelled");
+                    window.set_status(
+                        "unlock cancelled — restart the app to try again, or import a key".into(),
+                    );
+                    None
+                }
+                Err(e) => {
+                    window.set_status(format!("keychain: {e}").into());
+                    None
+                }
+            },
+        };
         if let Some(m) = material {
             match activate(&mut s, &m, false) {
                 Ok(()) => {
@@ -647,9 +668,7 @@ fn main() {
         println!("cb: set-network {}", s.network.as_str());
         s.save_config();
         // Same key material, new network: re-derive + reload store.
-        let material = std::env::var("APP_KEY")
-            .ok()
-            .or_else(|| keychain::load_secret(KEYCHAIN_ACCOUNT).ok().flatten());
+        let material = std::env::var("APP_KEY").ok().or_else(|| s.material.clone());
         if let Some(m) = material {
             match activate(&mut s, &m, false) {
                 Ok(()) => {
@@ -691,12 +710,16 @@ fn main() {
 
     cb!(on_reveal_backup, |w, s| {
         let _ = &mut s;
-        match keychain::load_secret(KEYCHAIN_ACCOUNT) {
+        match keychain::load_secret_protected(KEYCHAIN_ACCOUNT, "reveal your backup words") {
             Ok(Some(secret)) => {
                 println!("cb: reveal-backup ok len={}", secret.len());
                 w.set_reveal_text(secret.into());
             }
             Ok(None) => w.set_reveal_text("(no key in keychain — APP_KEY env session?)".into()),
+            Err(e) if e == "cancelled" => {
+                println!("cb: reveal-backup cancelled");
+                w.set_reveal_text("authentication cancelled".into());
+            }
             Err(e) => w.set_reveal_text(format!("keychain: {e}").into()),
         }
     });
