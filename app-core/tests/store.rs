@@ -264,7 +264,7 @@ fn sweep_tx_record_bump_and_confirm() {
     ).unwrap();
     for u in &mut store.utxos { u.pending_spend = true; }
     store.record_tx("consolidate", tx.txid_hex.clone(), tx.tx.outputs[0].value, tx.fee,
-        tx.raw_hex.clone(), "self".into(), inputs, hex::encode(&me.spk), 1000);
+        tx.vsize as u64, tx.raw_hex.clone(), "self".into(), inputs, hex::encode(&me.spk), 1000);
     assert_eq!(store.txs.len(), 1);
     assert_eq!(store.txs[0].status, NoteStatus::Pending);
 

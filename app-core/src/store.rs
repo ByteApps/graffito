@@ -66,6 +66,9 @@ pub struct NoteRecord {
     /// Fee (sats) of the current tx — for the activity view.
     #[serde(default)]
     pub fee: Option<u64>,
+    /// vsize of the current tx — with fee gives the sat/vB rate.
+    #[serde(default)]
+    pub vsize: Option<u64>,
 }
 
 /// One input spent by a sweep/consolidate tx — kept for RBF re-signing.
@@ -87,6 +90,8 @@ pub struct TxRecord {
     pub status: NoteStatus,
     pub value: u64, // output value (sats delivered)
     pub fee: u64,
+    #[serde(default)]
+    pub vsize: u64,
     #[serde(default)]
     pub created_at: Option<u64>,
     #[serde(default)]
@@ -301,6 +306,7 @@ impl Store {
         txid: String,
         value: u64,
         fee: u64,
+        vsize: u64,
         raw_hex: String,
         dest: String,
         inputs: Vec<TxInput>,
@@ -313,6 +319,7 @@ impl Store {
             status: NoteStatus::Pending,
             value,
             fee,
+            vsize,
             created_at: Some(now),
             raw_hex: Some(raw_hex),
             dest,
@@ -370,6 +377,7 @@ impl Store {
                     spent: Vec::new(),
                     raw_hex: None,
                     fee: None,
+                    vsize: None,
                 });
                 true
             }
