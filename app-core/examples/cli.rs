@@ -137,6 +137,29 @@ fn main() {
                 private,
             );
         }
+        Some("sweep") => {
+            // sweep <store.json> <base-url> <dest-address> <fee_rate>
+            let mut store = load(&args[2]);
+            let net = network(&store.network.clone());
+            let ident = identity(net);
+            let dest = app_core::notes_core::address::Recipient::parse(net, &args[4])
+                .expect("dest address");
+            let rate: f64 = args[5].parse().expect("fee rate");
+            let sweep = app_core::notes_core::tx::build_sweep_tx(
+                &store.available_utxos(),
+                &ident.identity.output_x,
+                dest.spk,
+                rate,
+                &ident.identity.tweaked_seckey,
+                app_core::notes_core::keys::generate_aux_rand,
+            )
+            .expect("sweep build");
+            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let txid = client.broadcast(&sweep.raw_hex).expect("broadcast");
+            for u in &mut store.utxos { u.pending_spend = true; }
+            save(&store, &args[2]);
+            println!("cli: sweep txid={} value={} fee={}", txid.trim(), sweep.tx.outputs[0].value, sweep.fee);
+        }
         Some("bundle") => {
             // bundle <address> <network> <base-url> <out.json|->
             let net = network(&args[3]);
