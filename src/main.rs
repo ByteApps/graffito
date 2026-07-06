@@ -626,6 +626,18 @@ fn main() {
         w.set_rename_input("".into());
     });
 
+    cb!(on_confirm_remove, |w, s, addr: SharedString, name: SharedString| {
+        let _ = &mut s;
+        println!("cb: confirm-remove addr={addr}");
+        w.set_confirm_remove_name(name);
+        w.set_confirm_remove_address(addr);
+    });
+
+    cb!(on_cancel_remove, |w, s| {
+        let _ = &mut s;
+        w.set_confirm_remove_address("".into());
+    });
+
     cb!(on_remove_contact, |w, s, addr: SharedString| {
         if let Some(store) = &mut s.store {
             store.remove_contact(addr.as_str());
@@ -633,6 +645,7 @@ fn main() {
         s.save_store();
         println!("cb: remove-contact addr={addr}");
         w.set_status("".into());
+        w.set_confirm_remove_address("".into());
         if w.get_rename_address() == addr {
             w.set_rename_address("".into());
         }
