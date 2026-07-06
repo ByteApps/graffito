@@ -28,8 +28,20 @@ app-core/               # UI-free core: cargo test -p app-core
   src/chain.rs          # esplora → in-memory SyncBundle (M2)
   src/store.rs          # notes + UTXO ledger + contacts (M3)
   src/compose.rs        # orchestration over notes-core compose (M3)
-src/main.rs             # Slint shell (stub until M5)
+src/main.rs             # Slint shell + --spike modes (M5); screens at M6
+src/{camera,keychain,qr}.rs  # Mac glue: nokhwa→rqrr, Keychain, QR-out
+ui/app.slint            # window (M5 skeleton)
+scripts/bundle-mac.sh   # minimal .app (TCC camera permission needs a bundle)
+scripts/regtest-e2e.sh  # M4 interop matrix
 ```
+
+M5 platform facts: **slint is pinned `=1.16.1`** — 1.17 needs rustc
+1.92 and the SDK nix shell ships 1.91-nightly; bump the pin only with a
+newer toolchain. Camera spike: `cargo run -- --spike camera [secs]`
+(first run pops the TCC prompt; 1080p Luma frames → rqrr). Keychain
+spike: `--spike keychain` (generic-password round-trip; the
+userPresence ACL upgrade is an M6 TODO with the reveal screen).
+`tests/qr_roundtrip.rs` proves render→decode without optics.
 
 ## Invariants
 

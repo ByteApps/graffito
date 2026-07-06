@@ -1,0 +1,91 @@
+// M5 shell: window + placeholder home. Real screens land in M6 — this
+// exists to wire app-core, the QR-out path, and the two spike buttons.
+
+export component AppWindow inherits Window {
+    width: 440px;
+    min-height: 640px;
+    title: "Chain Notes";
+    background: #101418;
+
+    in property <string> status: "no identity (set APP_KEY / onboarding lands in M6)";
+    in property <string> address: "";
+    in property <string> balance: "";
+    in property <image> address-qr;
+    in property <string> spike-log: "";
+
+    callback spike-camera();
+    callback spike-keychain();
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        Text {
+            text: "Chain Notes";
+            font-size: 22px;
+            color: #e8eef4;
+        }
+        Text {
+            text: root.status;
+            font-size: 12px;
+            color: #9ab0c4;
+            wrap: word-wrap;
+        }
+        if root.address != "": Rectangle {
+            background: white;
+            height: 220px;
+            border-radius: 8px;
+            Image {
+                source: root.address-qr;
+                width: 200px;
+                height: 200px;
+                image-rendering: pixelated;
+            }
+        }
+        if root.address != "": Text {
+            text: root.address;
+            font-size: 11px;
+            color: #cfe0ee;
+            wrap: char-wrap;
+        }
+        if root.balance != "": Text {
+            text: root.balance;
+            font-size: 14px;
+            color: #e8eef4;
+        }
+
+        Rectangle { height: 8px; }
+
+        HorizontalLayout {
+            spacing: 12px;
+            Rectangle {
+                background: #1d2c3a;
+                border-radius: 6px;
+                height: 40px;
+                TouchArea { clicked => { root.spike-camera(); } }
+                Text {
+                    text: "Spike: camera QR";
+                    color: #cfe0ee;
+                }
+            }
+            Rectangle {
+                background: #1d2c3a;
+                border-radius: 6px;
+                height: 40px;
+                TouchArea { clicked => { root.spike-keychain(); } }
+                Text {
+                    text: "Spike: keychain";
+                    color: #cfe0ee;
+                }
+            }
+        }
+
+        Text {
+            text: root.spike-log;
+            font-size: 11px;
+            color: #8fdc9a;
+            wrap: word-wrap;
+            vertical-alignment: top;
+        }
+    }
+}
