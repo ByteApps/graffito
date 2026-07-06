@@ -15,11 +15,13 @@ fn wif_and_hex_same_key_same_address() {
     let via_wif = realize(
         &parse_key_material(&wif.to_wif(), Network::Testnet4).unwrap(),
         Network::Testnet4,
+            0,
     )
     .unwrap();
     let via_hex = realize(
         &parse_key_material(&hex::encode(key), Network::Testnet4).unwrap(),
         Network::Testnet4,
+            0,
     )
     .unwrap();
 
@@ -32,6 +34,7 @@ fn wif_and_hex_same_key_same_address() {
     let via_hex_rt = realize(
         &parse_key_material(&hex::encode(key), Network::Regtest).unwrap(),
         Network::Regtest,
+            0,
     )
     .unwrap();
     assert!(via_hex_rt.address.starts_with("bcrt1p"));
@@ -104,7 +107,7 @@ fn generated_mnemonics_are_valid_and_distinct() {
         assert_eq!(m.word_count(), words);
         // Round-trips through the importer.
         let parsed = parse_key_material(&m.to_string(), Network::Mainnet).unwrap();
-        realize(&parsed, Network::Mainnet).unwrap();
+        realize(&parsed, Network::Mainnet, 0).unwrap();
     }
     let a = generate_mnemonic(12).unwrap();
     let b = generate_mnemonic(12).unwrap();

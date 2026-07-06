@@ -1003,6 +1003,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys 0.8.7",
  "getrandom 0.2.17",
+ "hex",
  "nokhwa",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
@@ -1012,6 +1013,7 @@ dependencies = [
  "rqrr",
  "security-framework",
  "security-framework-sys",
+ "serde_json",
  "slint",
  "slint-build",
 ]
