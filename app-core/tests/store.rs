@@ -219,6 +219,11 @@ fn identity_mismatch_rejected_and_persistence_roundtrip() {
 
     store.touch_contact("bcrt1qsomeone");
     store.name_contact("bcrt1qsomeone", "someone");
+    store.touch_contact("bcrt1qother");
+    assert_eq!(store.contacts[0].address, "bcrt1qother", "touch puts newest first");
+    store.remove_contact("bcrt1qother");
+    assert_eq!(store.contacts.len(), 1);
+    assert_eq!(store.contacts[0].name, "someone", "remove leaves others intact");
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let path = dir.join("store-roundtrip.json");
     store.save(&path).unwrap();
