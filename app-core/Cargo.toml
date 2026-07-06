@@ -6,6 +6,9 @@
 # so note txs are byte-identical to the Prime app's by construction.
 # Its workspace [patch] getrandom/TRNG override deliberately does NOT
 # propagate here: on the host we want OS randomness.
+#
+# rust-bitcoin is a first-class dependency here (unlike on KeyOS, where
+# pure-Rust-only rules it out): BIP-32/86 derivation, WIF/xprv parsing.
 [package]
 name = "app-core"
 version = "0.1.0"
@@ -14,3 +17,16 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 notes-core = { git = "ssh://git@github.com/ObjSal/prime-chain-notes.git", rev = "6530edcb8daacab98fbe72754fa67c8f3d7253af" }
+bitcoin = "0.32"
+bip39 = "2"
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+hex = "0.4"
+getrandom = "0.2"
+
+[dev-dependencies]
+# Fixture generator for the flagship import path: the parity tests feed
+# REAL prime-bip85 outputs (mnemonic/WIF/XPRV/hex + SeedQR digits)
+# through our importer — no hand-copied vectors.
+bip85-core = { git = "ssh://git@github.com/ObjSal/prime-bip85.git", rev = "0bf5b25206c05733997af66998ccd4c3e6f4eceb" }
