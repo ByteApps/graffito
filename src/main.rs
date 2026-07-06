@@ -41,6 +41,9 @@ struct State {
     /// stop auto-suggesting).
     selected_coins: Vec<(String, u32)>,
     coins_overridden: bool,
+    /// Coin-suggestion strategy: false = fewest coins (largest-first),
+    /// true = consolidate (smallest-first).
+    consolidate_coins: bool,
     material: Option<Zeroizing<String>>, // session cache: avoids re-prompting Touch ID
     pending_import: Option<Zeroizing<String>>, // hierarchical import awaiting account pick
     pending_mnemonic: Option<String>,
@@ -465,32 +468,56 @@ fn refresh(w: &AppWindow, st: &mut State) {
     update_home(w, st);
 }
 
-/// Suggested coin selection: the minimal largest-first set that covers
-/// fee + dust for the current note.
+/// Estimated (chunks, vsize) for a note. `estimate_note_cost` assumes a
+/// 34-byte taproot change output; when the change goes to a custom script
+/// of `l` bytes, correct the vsize by `l - 34` (outputs aren't
+/// witness-discounted, so 1 byte = 1 vB). None → self/taproot change.
+fn note_est(
+    store: &Store,
+    text_len: usize,
+    private: bool,
+    n_inputs: usize,
+    recipient_spk_len: Option<usize>,
+    change_spk_len: Option<usize>,
+) -> Result<(usize, usize), app_core::notes_core::Error> {
+    let (chunks, vsize) =
+        estimate_note_cost(text_len, private, store.chunk_size, n_inputs, recipient_spk_len)?;
+    let vsize = change_spk_len.map_or(vsize, |l| (vsize as i64 + l as i64 - 34).max(0) as usize);
+    Ok((chunks, vsize))
+}
+
+/// Suggested coin selection over CONFIRMED coins only (unconfirmed are
+/// never auto-selected — the user adds them manually). `consolidate` = pick
+/// SMALLEST coins first (sweeps dust up into the change); otherwise LARGEST
+/// first (fewest inputs, lowest fee). Stops once the note + fee is covered.
+#[allow(clippy::too_many_arguments)]
 fn suggested_coins(
     store: &Store,
     text_len: usize,
     private: bool,
     rate: f64,
     spk_len: Option<usize>,
+    change_spk_len: Option<usize>,
     sent: u64,
+    consolidate: bool,
 ) -> Vec<(String, u32)> {
-    // Auto-suggestion uses CONFIRMED coins only (largest-first).
-    // Unconfirmed coins are never auto-selected — the user can add them
-    // manually in the coin-control list.
     let mut coins: Vec<&app_core::store::LedgerUtxo> = store
         .utxos
         .iter()
         .filter(|u| !u.pending_spend && u.height.is_some())
         .collect();
-    coins.sort_by(|a, b| b.value.cmp(&a.value));
+    if consolidate {
+        coins.sort_by(|a, b| a.value.cmp(&b.value)); // smallest first
+    } else {
+        coins.sort_by(|a, b| b.value.cmp(&a.value)); // largest first
+    }
     let mut chosen = Vec::new();
     let mut total = 0u64;
     for u in coins {
         chosen.push((u.txid.clone(), u.vout));
         total += u.value;
         if let Ok((_, vsize)) =
-            estimate_note_cost(text_len.max(1), private, store.chunk_size, chosen.len(), spk_len)
+            note_est(store, text_len.max(1), private, chosen.len(), spk_len, change_spk_len)
         {
             let fee = (vsize as f64 * rate).ceil() as u64;
             if total >= fee + sent {
@@ -516,22 +543,35 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         .map(|r| r.spk.len());
     let sent = if spk_len.is_some() { 330u64 } else { 0 };
 
-    // Change-address destination label + validation.
+    // Change-address destination label + validation. A valid custom change
+    // address also yields its scriptPubKey length so the fee/change preview
+    // sizes the real change output (not the assumed taproot one).
     let change_raw = w.get_change_address().to_string();
     let change_trim = change_raw.trim();
-    let (change_dest, change_err) = if change_trim.is_empty() {
-        ("your address".to_string(), String::new())
-    } else if Recipient::parse(net, change_trim).is_ok() {
-        (format!("{}…", &change_trim[..14.min(change_trim.len())]), String::new())
+    let (change_dest, change_err, change_spk_len) = if change_trim.is_empty() {
+        ("your address".to_string(), String::new(), None)
     } else {
-        ("⚠ invalid".to_string(), format!("Not a valid {} address.", net.as_str()))
+        match Recipient::parse(net, change_trim) {
+            Ok(r) => (
+                format!("{}…", &change_trim[..14.min(change_trim.len())]),
+                String::new(),
+                Some(r.spk.len()),
+            ),
+            Err(_) => (
+                "⚠ invalid".to_string(),
+                format!("Not a valid {} address.", net.as_str()),
+                None,
+            ),
+        }
     };
     w.set_change_error(change_err.clone().into());
 
+    let consolidate = st.consolidate_coins;
     let Some(store) = &st.store else { return };
     // Auto-suggest a selection until the user overrides it.
     if !st.coins_overridden {
-        st.selected_coins = suggested_coins(store, text.len(), private, rate, spk_len, sent);
+        st.selected_coins =
+            suggested_coins(store, text.len(), private, rate, spk_len, change_spk_len, sent, consolidate);
     }
     let store = st.store.as_ref().unwrap();
     let sel: std::collections::HashSet<(String, u32)> = st.selected_coins.iter().cloned().collect();
@@ -568,7 +608,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         return;
     }
     let n = sel_count.max(1);
-    match estimate_note_cost(text.len(), private, store.chunk_size, n, spk_len) {
+    match note_est(store, text.len(), private, n, spk_len, change_spk_len) {
         Ok((chunks, vsize)) => {
             let fee = (vsize as f64 * rate).ceil() as u64;
             let enough = sel_count > 0 && sel_total >= fee + sent;
@@ -654,6 +694,7 @@ fn main() {
         to_address: None,
         selected_coins: Vec::new(),
         coins_overridden: false,
+        consolidate_coins: false,
         material: None,
         pending_import: None,
         pending_mnemonic: None,
@@ -1261,6 +1302,8 @@ fn main() {
         w.set_change_expanded(false);
         w.set_spend_expanded(false);
         s.coins_overridden = false;
+        s.consolidate_coins = false;
+        w.set_coin_strategy(0);
         s.selected_coins.clear();
         w.set_status("".into());
         w.set_screen(6);
@@ -1391,6 +1434,16 @@ fn main() {
                 refresh_compose(&w, &mut s);
             }
         }
+    });
+
+    cb!(on_set_coin_strategy, |w, s, strategy: i32| {
+        // 0 = fewest coins (largest-first), 1 = consolidate (smallest-first).
+        // Re-applies the suggestion (clears any manual override).
+        s.consolidate_coins = strategy == 1;
+        s.coins_overridden = false;
+        w.set_coin_strategy(strategy);
+        println!("cb: coin-strategy {}", if strategy == 1 { "consolidate" } else { "fewest" });
+        refresh_compose(&w, &mut s);
     });
 
     cb!(on_refresh_coins, |w, s| {

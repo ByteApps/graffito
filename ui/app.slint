@@ -368,6 +368,7 @@ export component AppWindow inherits Window {
     in property <[SpendCoin]> spend-coins;
     in property <string> spend-title;
     in-out property <bool> spend-expanded;
+    in-out property <int> coin-strategy;
     in property <bool> spend-enough: true;
     in property <[ContactItem]> contacts;
     in-out property <string> contact-input;
@@ -442,6 +443,7 @@ export component AppWindow inherits Window {
     callback change-scan();
     callback toggle-coin(string);
     callback refresh-coins();
+    callback set-coin-strategy(int);
     callback settings-open();
     callback set-network(string);
     callback hide-backup();
@@ -846,6 +848,20 @@ export component AppWindow inherits Window {
                 }
                 if root.spend-expanded: Caption {
                     text: "Tap coins to include or exclude. The note spends exactly what's selected.";
+                }
+                if root.spend-expanded: HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    SelectPill {
+                        text: "fewest coins";
+                        active: root.coin-strategy == 0;
+                        clicked => { root.set-coin-strategy(0); }
+                    }
+                    SelectPill {
+                        text: "consolidate";
+                        active: root.coin-strategy == 1;
+                        clicked => { root.set-coin-strategy(1); }
+                    }
                 }
                 if root.spend-expanded && !root.spend-enough: Caption {
                     text: "Selected coins don't cover the note + fee — select more.";

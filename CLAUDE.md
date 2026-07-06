@@ -55,9 +55,10 @@ QR/file, live format feedback + word autocomplete) · 2 backup words ·
 view (+ web-viewer permalink link, hidden on regtest) · 6 compose
 (picker-first, Private default, live cost line; collapsible **coin
 control** — spendable UTXOs sorted low→high, auto-suggests CONFIRMED
-coins only [unconfirmed spendable but manual], tap-to-toggle, live
-total, ↻ refresh, per-coin mempool txid pill, Sign gated on
-sufficiency; and a collapsible **custom change address** with live
+coins only [unconfirmed spendable but manual] via a **fewest-coins vs
+consolidate** strategy toggle [largest- vs smallest-first],
+tap-to-toggle, live total, ↻ refresh, per-coin mempool txid pill, Sign
+gated on sufficiency; and a collapsible **custom change address** with live
 validation) · 7 send-to (Self card,
 address input + QR-icon scan [scan-to-pick] + Use, recents w/ pencil-
 rename dialog + confirmed remove) · 8 settings (Identity card w/
@@ -112,7 +113,10 @@ typed as text.
   (change = leftover). Custom change goes to any spk and is NOT tracked
   as an own coin; the destination is stored on the note so RBF preserves
   it. Unconfirmed coins are spendable (scan keeps height=None, only
-  pending-locked are excluded) — never auto-suggested.
+  pending-locked are excluded) — never auto-suggested. The live
+  cost/change preview (`note_est`) sizes the REAL change output — a
+  custom non-taproot change spk corrects the estimate by `spk_len - 34`
+  vB (estimate_note_cost assumes a 34-byte taproot change).
 - Sweep/consolidate txs are tracked in `store.txs` (`TxRecord`) so they
   get the same pending→confirmed lifecycle, rebroadcast, and RBF
   (`bump_raw_tx`) as notes; confirmed when their inputs vanish on a full
