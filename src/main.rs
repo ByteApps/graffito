@@ -743,16 +743,22 @@ fn main() {
         println!("cb: settings-open");
         let _ = &mut s;
         w.set_reveal_text("".into());
+        w.set_status("".into());
+        w.set_chunk_custom(false);
         w.set_screen(8);
     });
 
-    cb!(on_cycle_network, |w, s| {
-        s.network = match s.network {
-            Network::Mainnet => Network::Testnet4,
-            Network::Testnet4 => Network::Signet,
-            Network::Signet => Network::Regtest,
-            Network::Regtest => Network::Mainnet,
-        };
+    cb!(on_hide_backup, |w, s| {
+        let _ = &mut s;
+        w.set_reveal_text("".into());
+    });
+
+    cb!(on_set_network, |w, s, net: SharedString| {
+        let Some(n) = Network::from_str_opt(net.as_str()) else { return };
+        if n == s.network {
+            return;
+        }
+        s.network = n;
         println!("cb: set-network {}", s.network.as_str());
         s.save_config();
         // Same key material, new network: re-derive + reload store.
@@ -777,6 +783,10 @@ fn main() {
                 }
                 s.save_store();
                 println!("cb: set-chunk-size {n} ok");
+                w.set_chunk_text(n.to_string().into());
+                if n == 100_000 || n == 80 {
+                    w.set_chunk_custom(false);
+                }
                 w.set_status("".into());
             }
             _ => {
