@@ -594,20 +594,6 @@ export component AppWindow inherits Window {
             ScanButton { clicked => { root.contact-scan(); } }
             GhostButton { width: 64px; text: "Use"; clicked => { root.pick-contact(root.contact-input); } }
         }
-        if root.rename-address != "": VerticalLayout {
-            spacing: 6px;
-            Caption { text: "Name for " + root.rename-address; overflow: elide; wrap: no-wrap; }
-            HorizontalLayout {
-                spacing: 10px;
-                LineEdit {
-                    text <=> root.rename-input;
-                    placeholder-text: "contact name (empty clears it)";
-                    accepted(t) => { root.save-rename(t); }
-                }
-                GhostButton { width: 70px; text: "Save"; clicked => { root.save-rename(root.rename-input); } }
-                GhostButton { width: 44px; text: "×"; clicked => { root.cancel-rename(); } }
-            }
-        }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
         Caption { text: root.contacts.length == 0 ? "" : "Recent"; }
         ListView {
@@ -721,5 +707,55 @@ export component AppWindow inherits Window {
             }
         }
         Caption { text: root.status; }
+    }
+
+    // ---------- rename dialog (modal overlay) ----------
+    if root.rename-address != "": Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.cancel-rename(); } }
+        Rectangle {
+            width: 400px;
+            height: dl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { } // swallow clicks on the card body
+            dl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Name this contact";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Mono {
+                    text: root.rename-address;
+                    font-size: 10px;
+                    color: Pal.muted;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+                rename-edit := LineEdit {
+                    text <=> root.rename-input;
+                    placeholder-text: "name (empty clears it)";
+                    accepted(t) => { root.save-rename(t); }
+                    init => {
+                        self.focus();
+                        self.select-all();
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.cancel-rename(); } }
+                    PrimaryButton { text: "Save"; clicked => { root.save-rename(root.rename-input); } }
+                }
+            }
+        }
     }
 }
