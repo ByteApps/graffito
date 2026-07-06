@@ -192,6 +192,32 @@ fn directed_private_note_both_sides() {
 }
 
 #[test]
+fn unconfirmed_scanned_utxo_is_spendable() {
+    let a = alice();
+    let mut store = Store::new(&a, NET);
+    // A scan that returns one UNCONFIRMED utxo (height None) paying us.
+    let b = bundle(
+        vec![],
+        vec![BundleUtxo { txid: "ab".repeat(32), vout: 0, value: 50_000, height: None }],
+        100,
+    );
+    store.apply_bundle(&b, &a, NET).unwrap();
+    // Counts toward balance and is spendable (0-conf), not filtered out.
+    assert_eq!(store.balance(), 50_000);
+    assert_eq!(store.available_utxos().len(), 1);
+    // A note composes against it.
+    let n = compose_and_record(
+        &mut store, &a, NET,
+        &ComposeRequest {
+            text: "spend unconfirmed", private: false, recipient: None,
+            change_to: None, coins: None, fee_rate: 1.0, now: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(n.tx.spent_outpoints.len(), 1);
+}
+
+#[test]
 fn coin_control_spends_exactly_selected() {
     let a = alice();
     let mut store = Store::new(&a, NET);
