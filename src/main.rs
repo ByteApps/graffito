@@ -538,7 +538,11 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
 
     let mut coins: Vec<SpendCoin> = Vec::new();
     let (mut sel_total, mut sel_count) = (0u64, 0usize);
-    for u in store.utxos.iter().filter(|u| !u.pending_spend) {
+    // Spendable coins, sorted by amount low → high.
+    let mut spendable: Vec<&app_core::store::LedgerUtxo> =
+        store.utxos.iter().filter(|u| !u.pending_spend).collect();
+    spendable.sort_by(|a, b| a.value.cmp(&b.value));
+    for u in spendable {
         let selected = sel.contains(&(u.txid.clone(), u.vout));
         if selected {
             sel_total += u.value;
@@ -549,6 +553,8 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             value: u.value.to_string().into(),
             confirmed: u.height.is_some(),
             selected,
+            txid_short: u.txid[..8.min(u.txid.len())].to_string().into(),
+            explorer: explorer_tx_url(net, &u.txid).into(),
         });
     }
     w.set_spend_coins(VecModel::from_slice(&coins));
