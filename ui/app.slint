@@ -1,19 +1,187 @@
-// M6 screens. Router: screen property. Every user action fires a
-// callback whose Rust side emits a `cb:` log-contract line.
-import { Button, LineEdit, TextEdit, CheckBox, ListView } from "std-widgets.slint";
+// M6 screens, designed. Dark theme, bitcoin-orange accent, card-based
+// layout. Property/callback names are the contract with main.rs — do
+// not rename. Router: `screen` property; every action emits a cb: line
+// on the Rust side.
+import { LineEdit, TextEdit, ListView, Switch } from "std-widgets.slint";
 
-export struct NoteItem { id: string, title: string, meta: string }
+export struct NoteItem { id: string, title: string, meta: string, badge: string }
 export struct ContactItem { address: string, name: string }
 
-component Title inherits Text { font-size: 20px; color: #e8eef4; }
-component Label inherits Text { font-size: 12px; color: #9ab0c4; wrap: word-wrap; }
-component Body inherits Text { font-size: 13px; color: #cfe0ee; wrap: word-wrap; }
+// ---- palette ----
+global Pal {
+    out property <color> bg: #0B0F14;
+    out property <color> card: #151B23;
+    out property <color> card-hover: #1B232E;
+    out property <color> line: #26303C;
+    out property <color> text: #E6EDF3;
+    out property <color> muted: #8B98A5;
+    out property <color> faint: #5A6572;
+    out property <color> accent: #F7931A;
+    out property <color> accent-hover: #FFA53C;
+    out property <color> on-accent: #1A1005;
+    out property <color> good: #3FB950;
+    out property <color> warn: #D29922;
+    out property <color> bad: #F85149;
+}
+
+component H1 inherits Text {
+    font-size: 21px;
+    font-weight: 700;
+    color: Pal.text;
+}
+component Body inherits Text {
+    font-size: 13px;
+    color: Pal.text;
+    wrap: word-wrap;
+}
+component Caption inherits Text {
+    font-size: 11px;
+    color: Pal.muted;
+    wrap: word-wrap;
+}
+component Mono inherits Text {
+    font-family: "Menlo";
+    font-size: 12px;
+    color: Pal.text;
+    wrap: char-wrap;
+}
+
+component Card inherits Rectangle {
+    background: Pal.card;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Pal.line;
+}
+
+component PrimaryButton inherits Rectangle {
+    in property <string> text;
+    callback clicked;
+    height: 46px;
+    border-radius: 10px;
+    background: ta.has-hover ? Pal.accent-hover : Pal.accent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        color: Pal.on-accent;
+        font-size: 14px;
+        font-weight: 700;
+    }
+}
+
+component GhostButton inherits Rectangle {
+    in property <string> text;
+    callback clicked;
+    height: 40px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Pal.line;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        color: Pal.text;
+        font-size: 13px;
+    }
+}
+
+component IconButton inherits Rectangle {
+    in property <string> glyph;
+    callback clicked;
+    width: 36px;
+    height: 36px;
+    border-radius: 18px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.glyph;
+        color: Pal.muted;
+        font-size: 17px;
+    }
+}
+
+component Header inherits HorizontalLayout {
+    in property <string> title;
+    in property <bool> show-back: true;
+    callback back;
+    spacing: 8px;
+    height: 40px;
+    if root.show-back: IconButton {
+        glyph: "‹";
+        clicked => { root.back(); }
+    }
+    Text {
+        text: root.title;
+        font-size: 19px;
+        font-weight: 700;
+        color: Pal.text;
+        vertical-alignment: center;
+    }
+    Rectangle { }
+    @children
+}
+
+component Badge inherits Rectangle {
+    in property <string> label;
+    in property <color> tint: Pal.muted;
+    height: 20px;
+    width: t.preferred-width + 16px;
+    border-radius: 10px;
+    background: root.tint.with-alpha(0.16);
+    t := Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.label;
+        color: root.tint;
+        font-size: 10px;
+        font-weight: 600;
+    }
+}
+
+component DoorCard inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <bool> highlight: false;
+    callback clicked;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: root.highlight ? Pal.accent.with-alpha(0.55) : Pal.line;
+    background: ta.has-hover ? Pal.card-hover : Pal.card;
+    height: l.preferred-height + 32px;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    l := VerticalLayout {
+        x: 16px;
+        y: 14px;
+        width: parent.width - 32px;
+        spacing: 4px;
+        Text {
+            text: root.title;
+            font-size: 14px;
+            font-weight: 700;
+            color: root.highlight ? Pal.accent : Pal.text;
+        }
+        Caption { text: root.subtitle; }
+    }
+}
 
 export component AppWindow inherits Window {
     width: 480px;
-    height: 760px;
+    height: 780px;
     title: "Chain Notes";
-    background: #101418;
+    background: Pal.bg;
 
     // 0 onboard · 1 import · 2 backup · 3 quiz · 4 home · 5 note ·
     // 6 compose · 7 contacts · 8 settings
@@ -69,183 +237,413 @@ export component AppWindow inherits Window {
     callback reveal-backup();
     callback go-home();
 
-    VerticalLayout {
-        padding: 16px;
-        spacing: 10px;
-
-        if screen == 0: VerticalLayout {
-            spacing: 12px;
-            Title { text: "Chain Notes"; }
-            Label { text: "Personal notes on the bitcoin blockchain. Pick a door:"; }
-            Button { text: "Import from Prime / BIP-85 or other key (recommended)"; clicked => { root.door-import(); } }
-            Button { text: "Create new 12-word seed"; clicked => { root.door-create(12); } }
-            Button { text: "Create new 24-word seed"; clicked => { root.door-create(24); } }
-            Label { text: "This app holds a HOT key on an online computer — fund it with note-fee money only. A BIP-85 child from your Prime is the recommended identity."; }
-            Label { text: root.status; }
+    // ---------- 0 · onboarding ----------
+    if screen == 0: VerticalLayout {
+        padding: 24px;
+        spacing: 14px;
+        alignment: start;
+        Rectangle { height: 26px; }
+        Text {
+            text: "₿";
+            font-size: 34px;
+            color: Pal.accent;
+            horizontal-alignment: center;
         }
+        H1 { text: "Chain Notes"; horizontal-alignment: center; }
+        Caption {
+            text: "Personal notes on the bitcoin blockchain — encrypted, permanent, yours.";
+            horizontal-alignment: center;
+        }
+        Rectangle { height: 12px; }
+        DoorCard {
+            highlight: true;
+            title: "Import a key";
+            subtitle: "BIP-85 child from your Passport Prime (recommended) — or any mnemonic, xprv, WIF, or hex key. Type, scan, or open a file.";
+            clicked => { root.door-import(); }
+        }
+        DoorCard {
+            title: "Create a new 12-word seed";
+            subtitle: "Fresh identity, backed up on paper. For everyone without a hardware wallet.";
+            clicked => { root.door-create(12); }
+        }
+        DoorCard {
+            title: "Create a new 24-word seed";
+            subtitle: "Same, with a longer phrase.";
+            clicked => { root.door-create(24); }
+        }
+        Rectangle { height: 6px; }
+        Caption {
+            text: "⚠  This app holds a hot key on an online computer. Fund it with note-fee money only.";
+        }
+        Caption { text: root.status; color: Pal.bad; }
+    }
 
-        if screen == 1: VerticalLayout {
-            spacing: 8px;
-            Title { text: "Import key"; }
-            Label { text: "Mnemonic (12/24 words) · xprv · WIF · 32-byte hex. Typed, scanned, or from a file."; }
-            TextEdit {
-                height: 110px;
-                text <=> root.import-text;
-                edited => { root.import-changed(self.text); }
+    // ---------- 1 · import ----------
+    if screen == 1: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Import key";
+            back => { root.screen = 0; }
+        }
+        Caption { text: "Mnemonic (12/24 words), xprv, WIF, or 32-byte hex."; }
+        TextEdit {
+            height: 110px;
+            text <=> root.import-text;
+            edited => { root.import-changed(self.text); }
+        }
+        if root.import-suggestions != "": Caption {
+            text: root.import-suggestions;
+            color: Pal.accent;
+        }
+        if root.import-feedback != "": Body {
+            text: root.import-feedback;
+            font-size: 12px;
+            color: root.import-feedback == "" ? Pal.muted
+                : (root.import-feedback == "✓ recognized: mnemonic"
+                   || root.import-feedback == "✓ recognized: xprv"
+                   || root.import-feedback == "✓ recognized: wif"
+                   || root.import-feedback == "✓ recognized: hex" ? Pal.good : Pal.warn);
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            GhostButton { text: "Scan QR"; clicked => { root.import-scan(); } }
+            GhostButton { text: "From file…"; clicked => { root.import-file(); } }
+        }
+        PrimaryButton { text: "Import"; clicked => { root.import-confirm(root.import-text); } }
+    }
+
+    // ---------- 2 · backup ----------
+    if screen == 2: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header { title: "Write these words down"; show-back: false; }
+        Rectangle {
+            border-radius: 10px;
+            background: Pal.warn.with-alpha(0.12);
+            height: warn-t.preferred-height + 20px;
+            warn-t := Caption {
+                x: 12px;
+                y: 10px;
+                width: parent.width - 24px;
+                color: Pal.warn;
+                text: "This is the ONLY backup. Anyone with these words can spend the funds and read every private note. No screenshots — paper.";
             }
-            Label { text: root.import-suggestions; }
-            Body { text: root.import-feedback; }
-            HorizontalLayout {
-                spacing: 8px;
-                Button { text: "Scan QR"; clicked => { root.import-scan(); } }
-                Button { text: "From file…"; clicked => { root.import-file(); } }
+        }
+        Card {
+            height: words-t.preferred-height + 32px;
+            words-t := Mono {
+                x: 16px;
+                y: 16px;
+                width: parent.width - 32px;
+                text: root.backup-words;
+                font-size: 13px;
             }
-            Button { text: "Import"; primary: true; clicked => { root.import-confirm(root.import-text); } }
-            Button { text: "Back"; clicked => { root.screen = 0; } }
         }
+        PrimaryButton { text: "I wrote them down"; clicked => { root.backup-continue(); } }
+    }
 
-        if screen == 2: VerticalLayout {
+    // ---------- 3 · quiz ----------
+    if screen == 3: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header { title: "Spot check"; show-back: false; }
+        Body { text: root.quiz-prompt; }
+        LineEdit { text <=> root.quiz-answer; placeholder-text: "word  word  word"; }
+        PrimaryButton { text: "Verify"; clicked => { root.quiz-submit(root.quiz-answer); } }
+        Caption { text: root.status; color: Pal.bad; }
+    }
+
+    // ---------- 4 · home ----------
+    if screen == 4: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        HorizontalLayout {
             spacing: 8px;
-            Title { text: "Write these words down"; }
-            Label { text: "This is the ONLY backup. Anyone with these words can spend the funds and read every private note. No screenshots."; }
-            Body { text: root.backup-words; }
-            Button { text: "I wrote them down"; primary: true; clicked => { root.backup-continue(); } }
+            height: 40px;
+            Text {
+                text: "Chain Notes";
+                font-size: 19px;
+                font-weight: 700;
+                color: Pal.text;
+                vertical-alignment: center;
+            }
+            Rectangle { }
+            IconButton { glyph: "↻"; clicked => { root.refresh(); } }
+            IconButton { glyph: "⚙"; clicked => { root.settings-open(); } }
         }
-
-        if screen == 3: VerticalLayout {
-            spacing: 8px;
-            Title { text: "Spot check"; }
-            Body { text: root.quiz-prompt; }
-            LineEdit { text <=> root.quiz-answer; placeholder-text: "word1 word2 word3"; }
-            Button { text: "Verify"; primary: true; clicked => { root.quiz-submit(root.quiz-answer); } }
-            Label { text: root.status; }
-        }
-
-        if screen == 4: VerticalLayout {
-            spacing: 8px;
-            Title { text: "Chain Notes"; }
+        Card {
+            height: 124px;
             HorizontalLayout {
-                spacing: 8px;
+                padding: 12px;
+                spacing: 14px;
                 Rectangle {
+                    width: 100px;
+                    height: 100px;
                     background: white;
-                    width: 150px;
-                    height: 150px;
-                    border-radius: 6px;
-                    Image { source: root.address-qr; width: 140px; height: 140px; image-rendering: pixelated; }
+                    border-radius: 8px;
+                    Image {
+                        source: root.address-qr;
+                        width: 92px;
+                        height: 92px;
+                        x: 4px;
+                        y: 4px;
+                        image-rendering: pixelated;
+                    }
                 }
                 VerticalLayout {
-                    spacing: 6px;
-                    Body { text: root.address; }
-                    Body { text: root.balance-line; }
-                    Button { text: "Refresh"; clicked => { root.refresh(); } }
+                    alignment: center;
+                    spacing: 4px;
+                    Text {
+                        text: root.balance-line;
+                        font-size: 17px;
+                        font-weight: 700;
+                        color: Pal.text;
+                    }
+                    Mono {
+                        text: root.address;
+                        font-size: 10px;
+                        color: Pal.muted;
+                    }
+                    Caption { text: root.status; }
                 }
             }
-            HorizontalLayout {
-                spacing: 8px;
-                Button { text: "Compose note"; primary: true; clicked => { root.compose-open(); } }
-                Button { text: "Settings"; clicked => { root.settings-open(); } }
-            }
-            Label { text: root.status; }
-            ListView {
-                for note in root.notes: Rectangle {
-                    height: 52px;
-                    background: #16202a;
-                    border-radius: 6px;
-                    TouchArea { clicked => { root.open-note(note.id); } }
+        }
+        PrimaryButton { text: "+  Compose note"; clicked => { root.compose-open(); } }
+        Caption { text: root.notes.length == 0 ? "No notes yet — fund the address above, then compose." : "Notebook"; }
+        ListView {
+            for note in root.notes: Rectangle {
+                height: 62px;
+                nt := TouchArea { clicked => { root.open-note(note.id); } }
+                Rectangle {
+                    y: 2px;
+                    height: parent.height - 6px;
+                    border-radius: 10px;
+                    background: nt.has-hover ? Pal.card-hover : Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
                     VerticalLayout {
-                        padding: 6px;
-                        Body { text: note.title; }
-                        Label { text: note.meta; }
+                        x: 14px;
+                        y: 9px;
+                        width: parent.width - 28px;
+                        spacing: 6px;
+                        alignment: start;
+                        Text {
+                            text: note.title;
+                            font-size: 13px;
+                            color: Pal.text;
+                            overflow: elide;
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            Badge {
+                                label: note.badge;
+                                tint: note.badge == "confirmed" ? Pal.good
+                                    : (note.badge == "pending" ? Pal.warn : Pal.bad);
+                            }
+                            Caption { text: note.meta; }
+                        }
                     }
                 }
             }
         }
+    }
 
-        if screen == 5: VerticalLayout {
-            spacing: 8px;
-            Title { text: "Note"; }
-            Body { text: root.note-detail; }
-            Button { text: "Back"; clicked => { root.go-home(); } }
+    // ---------- 5 · note view ----------
+    if screen == 5: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Note";
+            back => { root.go-home(); }
         }
+        Card {
+            height: nd.preferred-height + 32px;
+            nd := Mono {
+                x: 16px;
+                y: 16px;
+                width: parent.width - 32px;
+                text: root.note-detail;
+                font-size: 12px;
+            }
+        }
+    }
 
-        if screen == 6: VerticalLayout {
-            spacing: 8px;
-            Title { text: "Compose"; }
-            Label { text: root.to-label; }
-            TextEdit {
-                height: 140px;
-                text <=> root.compose-text;
+    // ---------- 6 · compose ----------
+    if screen == 6: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Compose";
+            back => { root.screen = 7; }
+        }
+        Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: 34px;
+            Text {
+                x: 12px;
+                width: parent.width - 24px;
+                height: parent.height;
+                vertical-alignment: center;
+                text: root.to-label;
+                font-size: 12px;
+                color: Pal.muted;
+                overflow: elide;
+            }
+        }
+        TextEdit {
+            height: 150px;
+            text <=> root.compose-text;
+            edited => { root.compose-changed(); }
+        }
+        HorizontalLayout {
+            spacing: 12px;
+            Switch {
+                text: "Private";
+                checked <=> root.compose-private;
+                toggled => { root.compose-changed(); }
+            }
+            Rectangle { }
+            LineEdit {
+                width: 84px;
+                text <=> root.rate-text;
                 edited => { root.compose-changed(); }
             }
-            HorizontalLayout {
-                spacing: 8px;
-                CheckBox {
-                    text: "Private (encrypted)";
-                    checked <=> root.compose-private;
-                    toggled => { root.compose-changed(); }
-                }
-                LineEdit {
-                    width: 90px;
-                    text <=> root.rate-text;
-                    edited => { root.compose-changed(); }
-                }
-                Label { text: "sat/vB"; vertical-alignment: center; }
-            }
-            Body { text: root.cost-line; }
-            Label { text: "Public notes are world-readable forever; private notes are permanent ciphertext. Either costs a real fee."; }
-            Button { text: "Sign + broadcast"; primary: true; clicked => { root.compose-send(); } }
-            Button { text: "Back"; clicked => { root.screen = 7; } }
+            Caption { text: "sat/vB"; vertical-alignment: center; }
         }
+        if root.cost-line != "": Text {
+            text: root.cost-line;
+            font-size: 13px;
+            font-weight: 600;
+            color: Pal.accent;
+        }
+        Caption {
+            text: root.compose-private
+                ? "Encrypted forever on-chain; only your key (and a directed recipient) can read it."
+                : "⚠  Public notes are world-readable, forever.";
+        }
+        PrimaryButton { text: "Sign + broadcast"; clicked => { root.compose-send(); } }
+        Caption { text: root.status; color: Pal.bad; }
+    }
 
-        if screen == 7: VerticalLayout {
-            spacing: 8px;
-            Title { text: "Send to"; }
-            Button { text: "To: Self (my notebook)"; primary: true; clicked => { root.pick-contact("self"); } }
-            HorizontalLayout {
-                spacing: 8px;
-                LineEdit { text <=> root.contact-input; placeholder-text: "taproot or segwit address"; }
-                Button { text: "Use"; clicked => { root.pick-contact(root.contact-input); } }
-            }
-            Button { text: "Scan address QR"; clicked => { root.contact-scan(); } }
-            Label { text: root.status; }
-            ListView {
-                for c in root.contacts: Rectangle {
-                    height: 44px;
-                    background: #16202a;
-                    border-radius: 6px;
-                    TouchArea { clicked => { root.pick-contact(c.address); } }
+    // ---------- 7 · contacts ----------
+    if screen == 7: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: "Send to";
+            back => { root.go-home(); }
+        }
+        DoorCard {
+            highlight: true;
+            title: "Self — my notebook";
+            subtitle: "A private note only you can read back.";
+            clicked => { root.pick-contact("self"); }
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            LineEdit { text <=> root.contact-input; placeholder-text: "taproot / segwit address"; }
+            GhostButton { width: 64px; text: "Use"; clicked => { root.pick-contact(root.contact-input); } }
+        }
+        GhostButton { text: "Scan address QR"; clicked => { root.contact-scan(); } }
+        if root.status != "": Caption { text: root.status; color: Pal.bad; }
+        Caption { text: root.contacts.length == 0 ? "" : "Recent"; }
+        ListView {
+            for c in root.contacts: Rectangle {
+                height: 52px;
+                ct := TouchArea { clicked => { root.pick-contact(c.address); } }
+                Rectangle {
+                    y: 2px;
+                    height: parent.height - 6px;
+                    border-radius: 10px;
+                    background: ct.has-hover ? Pal.card-hover : Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
                     VerticalLayout {
-                        padding: 6px;
-                        Body { text: c.name == "" ? c.address : c.name; }
-                        Label { text: c.name == "" ? "" : c.address; }
+                        x: 14px;
+                        y: 7px;
+                        width: parent.width - 28px;
+                        spacing: 3px;
+                        alignment: start;
+                        Text {
+                            text: c.name == "" ? c.address : c.name;
+                            font-size: 12px;
+                            color: Pal.text;
+                            overflow: elide;
+                        }
+                        if c.name != "": Caption { text: c.address; overflow: elide; }
                     }
                 }
             }
-            Button { text: "Back"; clicked => { root.go-home(); } }
         }
+    }
 
-        if screen == 8: VerticalLayout {
-            spacing: 8px;
-            Title { text: "Settings"; }
-            HorizontalLayout {
-                spacing: 8px;
-                Body { text: "Network: " + root.settings-network; vertical-alignment: center; }
-                Button { text: "Cycle"; clicked => { root.cycle-network(); } }
-            }
-            HorizontalLayout {
-                spacing: 8px;
-                Label { text: "Chunk bytes"; vertical-alignment: center; }
-                LineEdit { text <=> root.chunk-text; accepted(t) => { root.set-chunk(t); } }
-            }
-            HorizontalLayout {
-                spacing: 8px;
-                Label { text: "Esplora URL"; vertical-alignment: center; }
-                LineEdit { text <=> root.esplora-text; accepted(t) => { root.set-esplora(t); } }
-            }
-            Button { text: "Reveal backup"; clicked => { root.reveal-backup(); } }
-            Body { text: root.reveal-text; }
-            Label { text: root.status; }
-            Button { text: "Back"; clicked => { root.go-home(); } }
+    // ---------- 8 · settings ----------
+    if screen == 8: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Settings";
+            back => { root.go-home(); }
         }
+        Card {
+            height: 56px;
+            HorizontalLayout {
+                padding: 14px;
+                spacing: 10px;
+                Body { text: "Network"; vertical-alignment: center; }
+                Rectangle { }
+                Badge { label: root.settings-network; tint: Pal.accent; }
+                GhostButton { width: 72px; height: 28px; text: "cycle"; clicked => { root.cycle-network(); } }
+            }
+        }
+        Card {
+            height: 56px;
+            HorizontalLayout {
+                padding: 14px;
+                spacing: 10px;
+                Body { text: "Chunk bytes"; vertical-alignment: center; }
+                Rectangle { }
+                LineEdit {
+                    width: 110px;
+                    text <=> root.chunk-text;
+                    accepted(t) => { root.set-chunk(t); }
+                }
+            }
+        }
+        Card {
+            height: 56px;
+            HorizontalLayout {
+                padding: 14px;
+                spacing: 10px;
+                Body { text: "Esplora URL"; vertical-alignment: center; }
+                LineEdit {
+                    text <=> root.esplora-text;
+                    placeholder-text: "network default";
+                    accepted(t) => { root.set-esplora(t); }
+                }
+            }
+        }
+        GhostButton { text: "Reveal backup  ·  asks for Touch ID"; clicked => { root.reveal-backup(); } }
+        if root.reveal-text != "": Card {
+            height: rv.preferred-height + 28px;
+            rv := Mono {
+                x: 14px;
+                y: 14px;
+                width: parent.width - 28px;
+                text: root.reveal-text;
+            }
+        }
+        Caption { text: root.status; }
     }
 }

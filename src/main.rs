@@ -123,7 +123,7 @@ fn update_home(w: &AppWindow, st: &State) {
             let badge = match n.status {
                 NoteStatus::Pending => "pending",
                 NoteStatus::Confirmed => "confirmed",
-                NoteStatus::Orphaned => "ORPHANED — recompose",
+                NoteStatus::Orphaned => "orphaned",
             };
             let kind = match (n.received, n.directed, n.private) {
                 (true, _, true) => "received private",
@@ -136,15 +136,16 @@ fn update_home(w: &AppWindow, st: &State) {
             NoteItem {
                 id: n.note_id.clone().into(),
                 title: n.text.clone().unwrap_or_else(|| "(not decryptable)".into()).into(),
+                badge: badge.into(),
                 meta: format!(
-                    "{kind} · {badge}{}",
-                    n.height.map(|h| format!(" · h{h}")).unwrap_or_default()
+                    "{kind}{}",
+                    n.height.map(|h| format!(" · block {h}")).unwrap_or_default()
                 )
                 .into(),
             }
         })
         .collect();
-    items.sort_by_key(|i| i.meta.contains("confirmed"));
+    items.sort_by_key(|i| i.badge == "confirmed");
     w.set_notes(VecModel::from_slice(&items));
     let contacts: Vec<ContactItem> = store
         .contacts
@@ -529,6 +530,7 @@ fn main() {
         println!("cb: compose-open");
         let _ = &mut s;
         w.set_contact_input("".into());
+        w.set_status("".into());
         w.set_screen(7);
     });
 
