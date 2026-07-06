@@ -36,6 +36,7 @@ struct State {
     usd: Option<f64>,
     to_address: Option<String>, // None = self-note
     material: Option<String>,   // session cache: avoids re-prompting Touch ID
+    pending_import: Option<String>, // hierarchical import awaiting account pick
     pending_mnemonic: Option<String>,
     quiz_indices: Vec<usize>,
 }
@@ -121,6 +122,42 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     Ok(())
 }
 
+fn is_hierarchical(material_str: &str, network: Network) -> bool {
+    matches!(
+        parse_key_material(material_str, network),
+        Ok(app_core::identity::KeyMaterial::Mnemonic(_))
+    ) || matches!(
+        parse_key_material(material_str, network),
+        Ok(app_core::identity::KeyMaterial::Xprv(x)) if x.depth == 0
+    )
+}
+
+/// One picker page: 5 accounts with their derived addresses.
+fn account_rows(
+    material_str: &str,
+    network: Network,
+    page: u32,
+    active: Option<u32>,
+) -> Vec<AccountItem> {
+    let Ok(material) = parse_key_material(material_str, network) else { return vec![] };
+    (page * 5..page * 5 + 5)
+        .filter_map(|i| {
+            let ident = realize(&material, network, i).ok()?;
+            Some(AccountItem {
+                index: i as i32,
+                address: ident.address.into(),
+                active: active == Some(i),
+            })
+        })
+        .collect()
+}
+
+fn show_account_picker(w: &AppWindow, material: &str, network: Network, page: u32, active: Option<u32>) {
+    w.set_account_page(page as i32);
+    w.set_accounts(VecModel::from_slice(&account_rows(material, network, page, active)));
+    w.set_screen(9);
+}
+
 fn update_home(w: &AppWindow, st: &State) {
     let Some(ident) = &st.ident else { return };
     let Some(store) = &st.store else { return };
@@ -176,6 +213,12 @@ fn update_home(w: &AppWindow, st: &State) {
         .collect();
     w.set_contacts(VecModel::from_slice(&contacts));
     w.set_settings_network(st.network.as_str().into());
+    w.set_settings_hierarchical(
+        st.material
+            .as_deref()
+            .map(|m| is_hierarchical(m, st.network))
+            .unwrap_or(false),
+    );
     if let Some(i) = &st.ident {
         w.set_settings_identity(
             format!(
@@ -328,6 +371,7 @@ fn main() {
         usd: None,
         to_address: None,
         material: None,
+        pending_import: None,
         pending_mnemonic: None,
         quiz_indices: Vec::new(),
     }));
@@ -477,18 +521,14 @@ fn main() {
             String::new()
         };
         w.set_import_suggestions(sugg.into());
-        let account: u32 = w.get_import_account().trim().parse().unwrap_or(0);
         let fb = match parse_key_material(&t, s.network) {
-            Ok(m) => match realize(&m, s.network, account) {
-                Ok(preview) => {
-                    let a = &preview.address;
-                    let short = format!("{}…{}", &a[..12.min(a.len())], &a[a.len().saturating_sub(6)..]);
-                    match m.kind() {
-                        "mnemonic" | "xprv" => {
-                            format!("✓ {} · account {account} → {short}", m.kind())
-                        }
-                        k => format!("✓ {k} → {short}"),
-                    }
+            Ok(m) if is_hierarchical(&t, s.network) => {
+                format!("✓ {} — you'll choose an account next", m.kind())
+            }
+            Ok(m) => match realize(&m, s.network, 0) {
+                Ok(p) => {
+                    let a = &p.address;
+                    format!("✓ {} → {}…{}", m.kind(), &a[..12.min(a.len())], &a[a.len().saturating_sub(6)..])
                 }
                 Err(e) => format!("{e}"),
             },
@@ -498,13 +538,14 @@ fn main() {
     });
 
     cb!(on_import_confirm, |w, s, text: SharedString| {
-        match w.get_import_account().trim().parse::<u32>() {
-            Ok(a) if a < 0x8000_0000 => s.account = a,
-            _ => {
-                w.set_import_feedback("account must be a number (0, 1, 2, …)".into());
-                return;
-            }
+        let t = text.trim().to_string();
+        if parse_key_material(&t, s.network).is_ok() && is_hierarchical(&t, s.network) {
+            println!("cb: import hierarchical → account picker");
+            s.pending_import = Some(t.clone());
+            show_account_picker(&w, &t, s.network, 0, None);
+            return;
         }
+        s.account = 0;
         match activate(&mut s, text.trim(), true) {
             Ok(()) => {
                 println!("cb: import ok");
@@ -805,6 +846,49 @@ fn main() {
         w.set_screen(8);
     });
 
+    cb!(on_open_account_picker, |w, s| {
+        let Some(material) = s.material.clone() else { return };
+        println!("cb: account-picker open");
+        let page = s.account / 5;
+        show_account_picker(&w, &material, s.network, page, Some(s.account));
+    });
+
+    cb!(on_accounts_page, |w, s, delta: i32| {
+        let page = (w.get_account_page() + delta).max(0) as u32;
+        let material = s.pending_import.clone().or_else(|| s.material.clone());
+        let Some(material) = material else { return };
+        let active = if s.pending_import.is_some() { None } else { Some(s.account) };
+        show_account_picker(&w, &material, s.network, page, active);
+    });
+
+    cb!(on_pick_account, |w, s, idx: i32| {
+        let first_import = s.pending_import.is_some();
+        let Some(material) = s.pending_import.take().or_else(|| s.material.clone()) else {
+            return;
+        };
+        s.account = idx.max(0) as u32;
+        println!("cb: pick-account {}", s.account);
+        match activate(&mut s, &material, first_import) {
+            Ok(()) => {
+                w.set_import_text("".into());
+                w.set_status("".into());
+                w.set_screen(4);
+                update_home(&w, &s);
+                refresh(&w, &mut s);
+            }
+            Err(e) => w.set_status(format!("{e}").into()),
+        }
+    });
+
+    cb!(on_account_cancel, |w, s| {
+        if s.pending_import.take().is_some() {
+            w.set_screen(1); // abandon import → back to the import form
+        } else {
+            update_home(&w, &s);
+            w.set_screen(8); // came from settings
+        }
+    });
+
     cb!(on_reset_identity, |w, s| {
         println!("cb: reset-identity");
         let _ = keychain::delete_secret(KEYCHAIN_ACCOUNT);
@@ -817,7 +901,6 @@ fn main() {
         w.set_reveal_text("".into());
         w.set_status("".into());
         w.set_import_text("".into());
-        w.set_import_account("0".into());
         w.set_screen(0);
     });
 
