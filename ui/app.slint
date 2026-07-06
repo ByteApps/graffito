@@ -244,6 +244,7 @@ export component AppWindow inherits Window {
     in property <string> balance-line;
     in property <[NoteItem]> notes;
     in property <string> note-detail;
+    in property <string> note-web-url;
 
     in property <string> to-label;
     in-out property <string> compose-text;
@@ -272,6 +273,7 @@ export component AppWindow inherits Window {
     callback backup-continue();
     callback refresh();
     callback open-note(string);
+    callback open-note-web();
     callback compose-open();
     callback pick-contact(string);
     callback contact-scan();
@@ -529,6 +531,13 @@ export component AppWindow inherits Window {
                 text: root.note-detail;
                 font-size: 12px;
             }
+        }
+        if root.note-web-url != "": GhostButton {
+            text: "Open in web viewer";
+            clicked => { root.open-note-web(); }
+        }
+        if root.note-web-url == "": Caption {
+            text: "Web viewer link unavailable on regtest.";
         }
     }
 
