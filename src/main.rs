@@ -237,6 +237,28 @@ fn update_home(w: &AppWindow, st: &State) {
     }
     w.set_chunk_text(store.chunk_size.to_string().into());
     w.set_esplora_text(store.esplora.clone().unwrap_or_default().into());
+    // Coins (spendable UTXOs) list + summary.
+    let coins: Vec<CoinItem> = store
+        .utxos
+        .iter()
+        .filter(|u| !u.pending_spend)
+        .map(|u| CoinItem {
+            outpoint: format!("{}:{}", u.txid, u.vout).into(),
+            value: u.value.to_string().into(),
+            status: if u.height.is_some() { "confirmed" } else { "unconfirmed" }.into(),
+        })
+        .collect();
+    let spendable: u64 = store.utxos.iter().filter(|u| !u.pending_spend).map(|u| u.value).sum();
+    let n = coins.len();
+    w.set_coins(VecModel::from_slice(&coins));
+    w.set_coins_summary(
+        if n == 0 {
+            "No coins yet — fund your address to add some.".to_string()
+        } else {
+            format!("{n} coin{} · {spendable} sats total", if n == 1 { "" } else { "s" })
+        }
+        .into(),
+    );
 }
 
 fn refresh(w: &AppWindow, st: &mut State) {
@@ -440,7 +462,9 @@ fn main() {
                 let grid: String = phrase
                     .split(' ')
                     .enumerate()
-                    .map(|(i, wd)| format!("{:2}. {wd}{}", i + 1, if i % 3 == 2 { "\n" } else { "   " }))
+                    .map(|(i, wd)| {
+                        format!("{:>2}. {:<9}{}", i + 1, wd, if i % 3 == 2 { "\n" } else { " " })
+                    })
                     .collect();
                 if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
                     // TEST ONLY (env-gated): lets the UI e2e complete the
@@ -756,6 +780,56 @@ fn main() {
         w.set_rate_text(format!("{rate}").into());
         println!("cb: fee-tier {tier} rate={rate}");
         update_cost(&w, &s);
+    });
+
+    cb!(on_open_coins, |w, s| {
+        println!("cb: open-coins");
+        update_home(&w, &s);
+        w.set_status("".into());
+        w.set_screen(10);
+    });
+
+    cb!(on_consolidate, |w, s| {
+        w.set_show_consolidate_confirm(false);
+        let rate: f64 = w.get_consolidate_rate().trim().parse().unwrap_or(1.0);
+        let net = s.network;
+        let Some(base) = s.base_url() else { return };
+        let ident = s.ident.as_ref().unwrap();
+        // Self-send: consolidate all spendable coins into one output at
+        // our own address.
+        let Ok(me) = Recipient::parse(net, &ident.address) else { return };
+        let identity = ident.identity.clone_fields();
+        let store = s.store.as_mut().unwrap();
+        if store.available_utxos().len() < 2 {
+            w.set_status("nothing to consolidate (need 2+ coins)".into());
+            return;
+        }
+        let tx = app_core::notes_core::tx::build_sweep_tx(
+            &store.available_utxos(),
+            &identity.output_x,
+            me.spk,
+            rate,
+            &identity.tweaked_seckey,
+            app_core::notes_core::keys::generate_aux_rand,
+        );
+        match tx {
+            Ok(tx) => {
+                let client = ChainClient::new(HttpTransport::new(base), net);
+                match client.broadcast(&tx.raw_hex) {
+                    Ok(txid) => {
+                        for u in &mut store.utxos {
+                            u.pending_spend = true;
+                        }
+                        s.save_store();
+                        println!("cb: consolidate txid={txid} value={} fee={}", tx.tx.outputs[0].value, tx.fee);
+                        w.set_status(format!("consolidating → {}…", &txid[..12.min(txid.len())]).into());
+                        update_home(&w, &s);
+                    }
+                    Err(e) => w.set_status(format!("consolidate broadcast failed: {e}").into()),
+                }
+            }
+            Err(e) => w.set_status(format!("consolidate: {e}").into()),
+        }
     });
 
     cb!(on_sweep, |w, s| {
