@@ -10,7 +10,8 @@ export struct AccountItem { index: int, address: string, active: bool }
 export struct CoinItem { outpoint: string, value: string, status: string }
 export struct ActivityItem {
     ref-id: string, is-note: bool, kind: string, title: string,
-    txid: string, fee: string, status: string, explorer: string, pending: bool }
+    txid: string, fee-line: string, status: string, explorer: string,
+    pending: bool, replaced: string }
 
 // ---- palette ----
 global Pal {
@@ -335,7 +336,6 @@ export component AppWindow inherits Window {
     in-out property <string> note-view-id;
     in property <bool> note-pending;
     in property <string> note-txid;
-    in-out property <string> bump-rate;
 
     in property <string> to-label;
     in-out property <string> compose-text;
@@ -364,7 +364,15 @@ export component AppWindow inherits Window {
     in property <string> coins-summary;
     in property <[ActivityItem]> activity;
     in property <string> activity-summary;
-    in-out property <string> activity-rate: "2";
+    in-out property <bool> show-bump-dialog;
+    in-out property <string> bump-ref;
+    in-out property <bool> bump-is-note;
+    in property <string> bump-kind;
+    in property <string> bump-current;
+    in property <string> bump-min;
+    in property <string> bump-error;
+    in property <string> bump-new-fee;
+    in-out property <string> bump-rate;
     in-out property <string> consolidate-rate: "1";
     in-out property <bool> show-consolidate-confirm;
     in-out property <string> sweep-dest;
@@ -383,15 +391,15 @@ export component AppWindow inherits Window {
     callback open-note(string);
     callback open-note-web();
     callback copy-text(string, string);
-    callback rebroadcast-note();
-    callback bump-note(string);
     callback set-fee-tier(int);
     callback sweep();
     callback open-coins();
     callback consolidate();
     callback open-activity();
     callback act-retry(string, bool);
-    callback act-bump(string, bool, string);
+    callback act-bump-open(string, bool);
+    callback act-bump-rate-changed(string);
+    callback act-bump-confirm();
     callback act-explorer(string);
     callback compose-open();
     callback pick-contact(string);
@@ -671,16 +679,8 @@ export component AppWindow inherits Window {
             GhostButton { text: "Copy text"; clicked => { root.copy-text("note-text", root.note-detail); } }
             GhostButton { text: "Copy txid"; clicked => { root.copy-text("txid", root.note-txid); } }
         }
-        if root.note-pending: VerticalLayout {
-            spacing: 8px;
-            Caption { text: "Still unconfirmed. Bump replaces it with a higher-fee version (same note), or rebroadcast the existing transaction."; }
-            HorizontalLayout {
-                spacing: 10px;
-                LineEdit { width: 84px; text <=> root.bump-rate; }
-                Caption { text: "sat/vB"; vertical-alignment: center; }
-                GhostButton { text: "Bump fee"; clicked => { root.bump-note(root.bump-rate); } }
-                GhostButton { text: "Rebroadcast"; clicked => { root.rebroadcast-note(); } }
-            }
+        if root.note-pending: Caption {
+            text: "Still unconfirmed — speed it up or rebroadcast from Activity (⟳ icon on the home screen).";
         }
         if root.note-web-url != "": GhostButton {
             text: "Open in web viewer";
@@ -1107,12 +1107,6 @@ export component AppWindow inherits Window {
             title: "Activity";
             back => { root.go-home(); }
         }
-        HorizontalLayout {
-            spacing: 8px;
-            Caption { text: "Bump rate"; vertical-alignment: center; }
-            LineEdit { width: 74px; text <=> root.activity-rate; }
-            Caption { text: "sat/vB — used when you Bump a stuck tx"; vertical-alignment: center; }
-        }
         Caption { text: root.activity-summary; }
         Flickable {
             viewport-height: act-col.preferred-height;
@@ -1137,6 +1131,7 @@ export component AppWindow inherits Window {
                                 color: Pal.text;
                             }
                             Rectangle { }
+                            if a.replaced != "": Badge { label: a.replaced; tint: Pal.faint; }
                             Badge {
                                 label: a.status;
                                 tint: a.status == "confirmed" ? Pal.good
@@ -1144,8 +1139,9 @@ export component AppWindow inherits Window {
                             }
                         }
                         Body { text: a.title; font-size: 12px; overflow: elide; }
+                        Caption { text: a.fee-line; }
                         Mono {
-                            text: a.txid + "  ·  fee " + a.fee;
+                            text: a.txid;
                             font-size: 10px;
                             color: Pal.muted;
                             wrap: no-wrap;
@@ -1157,8 +1153,8 @@ export component AppWindow inherits Window {
                             if a.pending: GhostButton {
                                 width: 96px;
                                 height: 30px;
-                                text: "Bump fee";
-                                clicked => { root.act-bump(a.ref-id, a.is-note, root.activity-rate); }
+                                text: "Speed up";
+                                clicked => { root.act-bump-open(a.ref-id, a.is-note); }
                             }
                             if a.pending: GhostButton {
                                 width: 108px;
@@ -1407,6 +1403,54 @@ export component AppWindow inherits Window {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.show-consolidate-confirm = false; } }
                     PrimaryButton { text: "Consolidate"; clicked => { root.consolidate(); } }
+                }
+            }
+        }
+    }
+
+    // ---------- speed-up (RBF bump) dialog ----------
+    if root.show-bump-dialog: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.show-bump-dialog = false; } }
+        Rectangle {
+            width: 400px;
+            height: bl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 200px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { }
+            bl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Speed up transaction";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Body { text: root.bump-kind; font-size: 12px; }
+                Caption { text: root.bump-current; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        width: 96px;
+                        text <=> root.bump-rate;
+                        edited => { root.act-bump-rate-changed(self.text); }
+                    }
+                    Caption { text: "sat/vB"; vertical-alignment: center; }
+                }
+                Body { text: root.bump-new-fee; font-size: 13px; font-weight: 600; color: Pal.accent; }
+                Caption { text: root.bump-min; color: Pal.warn; }
+                if root.bump-error != "": Caption { text: root.bump-error; color: Pal.bad; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.show-bump-dialog = false; } }
+                    PrimaryButton { text: "Replace & broadcast"; clicked => { root.act-bump-confirm(); } }
                 }
             }
         }

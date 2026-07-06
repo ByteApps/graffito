@@ -102,6 +102,7 @@ pub fn compose_and_record(
         spent,
         raw_hex: Some(tx.raw_hex.clone()),
         fee: Some(tx.fee),
+        vsize: Some(tx.vsize as u64),
     };
     store.record_signed(record, change);
 
@@ -188,6 +189,7 @@ pub fn bump_fee(
     rec.txids.push(tx.txid_hex.clone());
     rec.raw_hex = Some(tx.raw_hex.clone());
     rec.fee = Some(tx.fee);
+    rec.vsize = Some(tx.vsize as u64);
 
     Ok(ComposedNote { note_id: note_id_hex.to_string(), tx })
 }
@@ -236,6 +238,7 @@ pub fn bump_raw_tx(
     rec.txids.push(tx.txid_hex.clone());
     rec.raw_hex = Some(tx.raw_hex.clone());
     rec.fee = tx.fee;
+    rec.vsize = tx.vsize as u64;
     rec.value = tx.tx.outputs[0].value;
     Ok(tx)
 }
