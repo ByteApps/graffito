@@ -8,6 +8,7 @@
 //!
 //! Milestones and design: ../../PLAN-chain-notes-app.md (prime workspace).
 
+pub mod chain;
 pub mod derive;
 pub mod identity;
 pub mod seedqr;
@@ -40,6 +41,10 @@ pub enum Error {
     UnrecognizedFormat,
     SeedQr(&'static str),
     Entropy,
+    /// HTTP transport failure (network, status, body).
+    Http(String),
+    /// Response body did not parse as expected.
+    Json(String),
 }
 
 impl core::fmt::Display for Error {
@@ -65,6 +70,8 @@ impl core::fmt::Display for Error {
             }
             Error::SeedQr(m) => write!(f, "SeedQR: {m}"),
             Error::Entropy => write!(f, "entropy source failure"),
+            Error::Http(m) => write!(f, "http: {m}"),
+            Error::Json(m) => write!(f, "response: {m}"),
         }
     }
 }
