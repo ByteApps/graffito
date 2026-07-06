@@ -360,6 +360,7 @@ fn update_home(w: &AppWindow, st: &State) {
                 )
                 .into(),
                 web_url: note_web_url(net, &address, &n.note_id).into(),
+                private: n.private,
             }
         })
         .collect();
