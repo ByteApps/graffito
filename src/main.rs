@@ -94,6 +94,44 @@ fn spendable_inputs(store: &Store) -> Vec<app_core::store::TxInput> {
         .collect()
 }
 
+/// "R.R sat/vB · F sats" (or just "F sats" without a known vsize).
+fn fee_line_str(fee: Option<u64>, vsize: Option<u64>) -> String {
+    match (fee, vsize) {
+        (Some(f), Some(v)) if v > 0 => format!("{:.1} sat/vB · {f} sats", f as f64 / v as f64),
+        (Some(f), _) => format!("{f} sats"),
+        _ => "—".into(),
+    }
+}
+
+/// "replaced N×" when a tx was RBF-bumped (>1 txids), else empty.
+fn replaced_label(txid_count: usize) -> String {
+    if txid_count > 1 {
+        format!("replaced {}×", txid_count - 1)
+    } else {
+        String::new()
+    }
+}
+
+/// "New fee ~N sats (+D)" for a proposed rate over a tx of `vsize`.
+fn new_fee_line(rate: f64, vsize: u64, old_fee: u64) -> String {
+    let new_fee = (rate * vsize as f64).ceil() as u64;
+    let delta = new_fee.saturating_sub(old_fee);
+    format!("New fee ~{new_fee} sats  (+{delta} over current)")
+}
+
+/// Current rate (sat/vB), fee, vsize for a pending tx referenced by the
+/// activity list (note_id if is_note, else txid).
+fn tx_rate(store: &Store, ref_id: &str, is_note: bool) -> Option<(f64, u64, u64)> {
+    if is_note {
+        let n = store.notes.iter().find(|n| n.note_id == ref_id)?;
+        let (f, v) = (n.fee?, n.vsize?);
+        (v > 0).then(|| (f as f64 / v as f64, f, v))
+    } else {
+        let t = store.txs.iter().find(|t| t.txids.iter().any(|x| x == ref_id))?;
+        (t.vsize > 0).then(|| (t.fee as f64 / t.vsize as f64, t.fee, t.vsize))
+    }
+}
+
 /// mempool.space tx permalink, or empty on regtest (no public explorer).
 fn explorer_tx_url(network: Network, txid: &str) -> String {
     match network {
@@ -137,10 +175,11 @@ fn update_activity(w: &AppWindow, st: &State) {
                 kind: kind.into(),
                 title: n.text.clone().unwrap_or_else(|| "(encrypted)".into()).into(),
                 txid: txid.clone().into(),
-                fee: n.fee.map(|f| f.to_string()).unwrap_or_else(|| "—".into()).into(),
+                fee_line: fee_line_str(n.fee, n.vsize).into(),
                 status: status.into(),
                 explorer: explorer_tx_url(net, txid).into(),
                 pending: n.status == NoteStatus::Pending && n.raw_hex.is_some(),
+                replaced: replaced_label(n.txids.len()).into(),
             },
         ));
     }
@@ -166,10 +205,11 @@ fn update_activity(w: &AppWindow, st: &State) {
                 kind: if t.kind == "consolidate" { "Consolidate" } else { "Sweep" }.into(),
                 title: title.into(),
                 txid: txid.clone().into(),
-                fee: t.fee.to_string().into(),
+                fee_line: fee_line_str(Some(t.fee), Some(t.vsize)).into(),
                 status: status.into(),
                 explorer: explorer_tx_url(net, txid).into(),
                 pending: t.status == NoteStatus::Pending && t.raw_hex.is_some(),
+                replaced: replaced_label(t.txids.len()).into(),
             },
         ));
     }
@@ -766,8 +806,6 @@ fn main() {
             w.set_note_view_id(n.note_id.clone().into());
             w.set_note_pending(n.status == NoteStatus::Pending && n.raw_hex.is_some());
             w.set_note_txid(n.txids.last().cloned().unwrap_or_default().into());
-            let bump = s.fees.as_ref().map(|f| f.fastest.max(2.0)).unwrap_or(2.0);
-            w.set_bump_rate(format!("{bump}").into());
             let web = match s.network {
                 Network::Regtest => String::new(),
                 net => {
@@ -809,69 +847,6 @@ fn main() {
         println!("cb: copy kind={kind} len={} ok={ok}", text.len());
     });
 
-    cb!(on_rebroadcast_note, |w, s| {
-        let id = w.get_note_view_id().to_string();
-        let raw = s
-            .store
-            .as_ref()
-            .and_then(|st| st.notes.iter().find(|n| n.note_id == id))
-            .and_then(|n| n.raw_hex.clone());
-        let (Some(raw), Some(base)) = (raw, s.base_url()) else {
-            w.set_status("nothing to rebroadcast".into());
-            return;
-        };
-        let client = ChainClient::new(HttpTransport::new(base), s.network);
-        match client.broadcast(&raw) {
-            Ok(txid) => {
-                println!("cb: rebroadcast id={id} txid={txid} ok");
-                w.set_status(format!("rebroadcast {}…", &txid[..12.min(txid.len())]).into());
-            }
-            Err(e) => {
-                println!("cb: rebroadcast id={id} err={e}");
-                w.set_status(format!("rebroadcast failed: {e}").into());
-            }
-        }
-    });
-
-    cb!(on_bump_note, |w, s, rate: SharedString| {
-        let id = w.get_note_view_id().to_string();
-        let Ok(rate) = rate.trim().parse::<f64>() else {
-            w.set_status("bad fee rate".into());
-            return;
-        };
-        let net = s.network;
-        let Some(base) = s.base_url() else { return };
-        let identity = s.ident.as_ref().unwrap().identity.clone_fields();
-        let result = app_core::compose::bump_fee(
-            s.store.as_mut().unwrap(),
-            &identity,
-            net,
-            &id,
-            rate,
-        );
-        match result {
-            Ok(c) => {
-                s.save_store();
-                let client = ChainClient::new(HttpTransport::new(base), net);
-                match client.broadcast(&c.tx.raw_hex) {
-                    Ok(txid) => {
-                        println!("cb: bump id={id} txid={txid} fee={} ok", c.tx.fee);
-                        w.set_status(format!("bumped → {}…", &txid[..12.min(txid.len())]).into());
-                        w.set_note_txid(txid.into());
-                    }
-                    Err(e) => {
-                        println!("cb: bump id={id} broadcast err={e}");
-                        w.set_status(format!("bump signed but broadcast failed: {e}").into());
-                    }
-                }
-            }
-            Err(e) => {
-                println!("cb: bump id={id} err={e}");
-                w.set_status(format!("{e}").into());
-            }
-        }
-    });
-
     cb!(on_set_fee_tier, |w, s, tier: i32| {
         let f = s.fees.clone().unwrap_or_default();
         let rate = match tier {
@@ -895,8 +870,6 @@ fn main() {
 
     cb!(on_open_activity, |w, s| {
         println!("cb: open-activity");
-        let rate = s.fees.as_ref().map(|f| f.fastest.max(2.0)).unwrap_or(2.0);
-        w.set_activity_rate(format!("{rate}").into());
         update_activity(&w, &s);
         w.set_status("".into());
         w.set_screen(11);
@@ -932,41 +905,91 @@ fn main() {
         }
     });
 
-    cb!(on_act_bump, |w, s, ref_id: SharedString, is_note: bool, rate_s: SharedString| {
-        let Ok(rate) = rate_s.trim().parse::<f64>() else {
-            w.set_status("bad fee rate".into());
+    cb!(on_act_bump_open, |w, s, ref_id: SharedString, is_note: bool| {
+        let Some(store) = &s.store else { return };
+        let Some((old_rate, fee, vsize)) = tx_rate(store, ref_id.as_str(), is_note) else {
+            w.set_status("can't determine current fee rate".into());
+            return;
+        };
+        // BIP-125: the replacement must add at least 1 sat/vB (incremental
+        // relay) over the original, and pay a strictly higher total fee.
+        let min_rate = old_rate + 1.0;
+        let fast = s.fees.as_ref().map(|f| f.fastest).unwrap_or(min_rate);
+        let recommended = fast.max(min_rate);
+        println!("cb: bump-open ref={ref_id} old={old_rate:.1} min={min_rate:.1}");
+        w.set_bump_ref(ref_id.clone());
+        w.set_bump_is_note(is_note);
+        w.set_bump_kind(if is_note { "Note transaction" } else { "Sweep / consolidate" }.into());
+        w.set_bump_current(format!("Currently {old_rate:.1} sat/vB · {fee} sats fee").into());
+        w.set_bump_min(format!("Minimum {min_rate:.1} sat/vB — RBF must add ≥1 sat/vB.").into());
+        w.set_bump_error("".into());
+        w.set_bump_rate(format!("{recommended:.1}").into());
+        w.set_bump_new_fee(new_fee_line(recommended, vsize, fee).into());
+        w.set_show_bump_dialog(true);
+    });
+
+    cb!(on_act_bump_rate_changed, |w, s, rate_s: SharedString| {
+        let ref_id = w.get_bump_ref().to_string();
+        let is_note = w.get_bump_is_note();
+        let Some((_, old_fee, vsize)) = s.store.as_ref().and_then(|st| tx_rate(st, &ref_id, is_note))
+        else {
+            return;
+        };
+        match rate_s.trim().parse::<f64>() {
+            Ok(r) if r > 0.0 => w.set_bump_new_fee(new_fee_line(r, vsize, old_fee).into()),
+            _ => w.set_bump_new_fee("".into()),
+        }
+    });
+
+    cb!(on_act_bump_confirm, |w, s| {
+        let ref_id = w.get_bump_ref().to_string();
+        let is_note = w.get_bump_is_note();
+        let Ok(new_rate) = w.get_bump_rate().trim().parse::<f64>() else {
+            w.set_bump_error("enter a number".into());
             return;
         };
         let net = s.network;
         let Some(base) = s.base_url() else { return };
+        let min_rate = match s.store.as_ref().and_then(|st| tx_rate(st, &ref_id, is_note)) {
+            Some((old_rate, _, _)) => old_rate + 1.0,
+            None => {
+                w.set_bump_error("transaction no longer pending".into());
+                return;
+            }
+        };
+        if new_rate + 1e-9 < min_rate {
+            w.set_bump_error(format!("below the {min_rate:.1} sat/vB minimum").into());
+            return;
+        }
         let identity = s.ident.as_ref().unwrap().identity.clone_fields();
         let result: Result<(String, String, u64), app_core::Error> = if is_note {
-            app_core::compose::bump_fee(s.store.as_mut().unwrap(), &identity, net, ref_id.as_str(), rate)
+            app_core::compose::bump_fee(s.store.as_mut().unwrap(), &identity, net, &ref_id, new_rate)
                 .map(|c| (c.tx.raw_hex.clone(), c.tx.txid_hex.clone(), c.tx.fee))
         } else {
-            app_core::compose::bump_raw_tx(s.store.as_mut().unwrap(), &identity, ref_id.as_str(), rate)
+            app_core::compose::bump_raw_tx(s.store.as_mut().unwrap(), &identity, &ref_id, new_rate)
                 .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee))
         };
         match result {
             Ok((raw, txid, fee)) => {
                 s.save_store();
+                w.set_show_bump_dialog(false);
                 let client = ChainClient::new(HttpTransport::new(base), net);
                 match client.broadcast(&raw) {
                     Ok(bt) => {
-                        println!("cb: act-bump ref={ref_id} txid={txid} fee={fee} ok");
-                        w.set_status(format!("bumped → {}…", &bt[..12.min(bt.len())]).into());
-                        update_activity(&w, &s);
+                        println!("cb: act-bump ref={ref_id} txid={txid} fee={fee} rate={new_rate:.1} ok");
+                        w.set_status(format!("sped up → {}…", &bt[..12.min(bt.len())]).into());
                     }
                     Err(e) => {
                         println!("cb: act-bump ref={ref_id} broadcast err={e}");
-                        w.set_status(format!("bump signed but broadcast failed: {e}").into());
-                        update_activity(&w, &s);
+                        w.set_status(format!("signed but broadcast failed: {e}").into());
                     }
                 }
+                update_activity(&w, &s);
+                update_home(&w, &s);
             }
             Err(e) => {
                 println!("cb: act-bump ref={ref_id} err={e}");
-                w.set_status(format!("{e}").into());
+                w.set_bump_error(format!("{e}").into());
             }
         }
     });
@@ -1013,7 +1036,7 @@ fn main() {
                         for u in &mut store.utxos {
                             u.pending_spend = true;
                         }
-                        store.record_tx("consolidate", txid.clone(), tx.tx.outputs[0].value, tx.fee, tx.raw_hex.clone(), "self".into(), inputs, dest_spk_hex, now());
+                        store.record_tx("consolidate", txid.clone(), tx.tx.outputs[0].value, tx.fee, tx.vsize as u64, tx.raw_hex.clone(), "self".into(), inputs, dest_spk_hex, now());
                         s.save_store();
                         println!("cb: consolidate txid={txid} value={} fee={}", tx.tx.outputs[0].value, tx.fee);
                         w.set_status(format!("consolidating → {}…", &txid[..12.min(txid.len())]).into());
@@ -1056,7 +1079,7 @@ fn main() {
                         for u in &mut store.utxos {
                             u.pending_spend = true;
                         }
-                        store.record_tx("sweep", txid.clone(), tx.tx.outputs[0].value, tx.fee, tx.raw_hex.clone(), dest.clone(), inputs, dest_spk_hex, now());
+                        store.record_tx("sweep", txid.clone(), tx.tx.outputs[0].value, tx.fee, tx.vsize as u64, tx.raw_hex.clone(), dest.clone(), inputs, dest_spk_hex, now());
                         s.save_store();
                         println!(
                             "cb: sweep txid={txid} value={} fee={}",
