@@ -21,6 +21,7 @@ use app_core::notes_core::bundle::{estimate_note_cost, FeeRates};
 use app_core::notes_core::Network;
 use app_core::store::{NoteStatus, Store};
 use slint::{ComponentHandle, SharedString, VecModel};
+use zeroize::Zeroizing;
 
 slint::include_modules!();
 
@@ -35,8 +36,8 @@ struct State {
     fees: Option<FeeRates>,
     usd: Option<f64>,
     to_address: Option<String>, // None = self-note
-    material: Option<String>,   // session cache: avoids re-prompting Touch ID
-    pending_import: Option<String>, // hierarchical import awaiting account pick
+    material: Option<Zeroizing<String>>, // session cache: avoids re-prompting Touch ID
+    pending_import: Option<Zeroizing<String>>, // hierarchical import awaiting account pick
     pending_mnemonic: Option<String>,
     quiz_indices: Vec<usize>,
 }
@@ -102,7 +103,7 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     if persist {
         keychain::store_secret_protected(KEYCHAIN_ACCOUNT, material_str.trim())?;
     }
-    st.material = Some(material_str.trim().to_string());
+    st.material = Some(Zeroizing::new(material_str.trim().to_string()));
     let fp = hex::encode(ident.identity.output_x);
     let path = st
         .data_dir
@@ -441,6 +442,11 @@ fn main() {
                     .enumerate()
                     .map(|(i, wd)| format!("{:2}. {wd}{}", i + 1, if i % 3 == 2 { "\n" } else { "   " }))
                     .collect();
+                if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
+                    // TEST ONLY (env-gated): lets the UI e2e complete the
+                    // backup quiz. Never set outside automation.
+                    println!("cb-test: words={phrase}");
+                }
                 w.set_backup_words(grid.into());
                 s.pending_mnemonic = Some(phrase);
                 w.set_screen(2);
@@ -461,6 +467,9 @@ fn main() {
             picks.push((picks.last().copied().unwrap_or(0) + 3) % count);
             picks.sort();
             picks.dedup();
+        }
+        if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
+            println!("cb-test: quiz={} {} {}", picks[0] + 1, picks[1] + 1, picks[2] + 1);
         }
         w.set_quiz_prompt(
             format!(
@@ -541,7 +550,7 @@ fn main() {
         let t = text.trim().to_string();
         if parse_key_material(&t, s.network).is_ok() && is_hierarchical(&t, s.network) {
             println!("cb: import hierarchical → account picker");
-            s.pending_import = Some(t.clone());
+            s.pending_import = Some(Zeroizing::new(t.clone()));
             show_account_picker(&w, &t, s.network, 0, None);
             return;
         }
@@ -626,6 +635,11 @@ fn main() {
                 n.recipient.as_deref().map(|a| format!("to: {a}\n")).unwrap_or_default(),
             );
             w.set_note_detail(detail.into());
+            w.set_note_view_id(n.note_id.clone().into());
+            w.set_note_pending(n.status == NoteStatus::Pending && n.raw_hex.is_some());
+            w.set_note_txid(n.txids.last().cloned().unwrap_or_default().into());
+            let bump = s.fees.as_ref().map(|f| f.fastest.max(2.0)).unwrap_or(2.0);
+            w.set_bump_rate(format!("{bump}").into());
             let web = match s.network {
                 Network::Regtest => String::new(),
                 net => {
@@ -650,6 +664,141 @@ fn main() {
         }
         println!("cb: open-note-web url={url}");
         let _ = std::process::Command::new("open").arg(&url).spawn();
+    });
+
+    cb!(on_copy_text, |w, s, kind: SharedString, text: SharedString| {
+        let _ = &mut s;
+        let _ = &w;
+        use std::io::Write;
+        let ok = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                c.stdin.as_mut().expect("piped").write_all(text.as_bytes())?;
+                c.wait()
+            })
+            .is_ok();
+        println!("cb: copy kind={kind} len={} ok={ok}", text.len());
+    });
+
+    cb!(on_rebroadcast_note, |w, s| {
+        let id = w.get_note_view_id().to_string();
+        let raw = s
+            .store
+            .as_ref()
+            .and_then(|st| st.notes.iter().find(|n| n.note_id == id))
+            .and_then(|n| n.raw_hex.clone());
+        let (Some(raw), Some(base)) = (raw, s.base_url()) else {
+            w.set_status("nothing to rebroadcast".into());
+            return;
+        };
+        let client = ChainClient::new(HttpTransport::new(base), s.network);
+        match client.broadcast(&raw) {
+            Ok(txid) => {
+                println!("cb: rebroadcast id={id} txid={txid} ok");
+                w.set_status(format!("rebroadcast {}…", &txid[..12.min(txid.len())]).into());
+            }
+            Err(e) => {
+                println!("cb: rebroadcast id={id} err={e}");
+                w.set_status(format!("rebroadcast failed: {e}").into());
+            }
+        }
+    });
+
+    cb!(on_bump_note, |w, s, rate: SharedString| {
+        let id = w.get_note_view_id().to_string();
+        let Ok(rate) = rate.trim().parse::<f64>() else {
+            w.set_status("bad fee rate".into());
+            return;
+        };
+        let net = s.network;
+        let Some(base) = s.base_url() else { return };
+        let identity = s.ident.as_ref().unwrap().identity.clone_fields();
+        let result = app_core::compose::bump_fee(
+            s.store.as_mut().unwrap(),
+            &identity,
+            net,
+            &id,
+            rate,
+        );
+        match result {
+            Ok(c) => {
+                s.save_store();
+                let client = ChainClient::new(HttpTransport::new(base), net);
+                match client.broadcast(&c.tx.raw_hex) {
+                    Ok(txid) => {
+                        println!("cb: bump id={id} txid={txid} fee={} ok", c.tx.fee);
+                        w.set_status(format!("bumped → {}…", &txid[..12.min(txid.len())]).into());
+                        w.set_note_txid(txid.into());
+                    }
+                    Err(e) => {
+                        println!("cb: bump id={id} broadcast err={e}");
+                        w.set_status(format!("bump signed but broadcast failed: {e}").into());
+                    }
+                }
+            }
+            Err(e) => {
+                println!("cb: bump id={id} err={e}");
+                w.set_status(format!("{e}").into());
+            }
+        }
+    });
+
+    cb!(on_set_fee_tier, |w, s, tier: i32| {
+        let f = s.fees.clone().unwrap_or_default();
+        let rate = match tier {
+            0 => f.economy,
+            2 => f.fastest,
+            _ => f.hour,
+        }
+        .max(1.0);
+        w.set_fee_tier(tier);
+        w.set_rate_text(format!("{rate}").into());
+        println!("cb: fee-tier {tier} rate={rate}");
+        update_cost(&w, &s);
+    });
+
+    cb!(on_sweep, |w, s| {
+        w.set_show_sweep_confirm(false);
+        let dest = w.get_sweep_dest().to_string();
+        let rate: f64 = w.get_sweep_rate().trim().parse().unwrap_or(1.0);
+        let net = s.network;
+        let Some(base) = s.base_url() else { return };
+        let Ok(recipient) = Recipient::parse(net, &dest) else {
+            w.set_status(format!("not a valid {} address", net.as_str()).into());
+            return;
+        };
+        let identity = s.ident.as_ref().unwrap().identity.clone_fields();
+        let store = s.store.as_mut().unwrap();
+        let sweep = app_core::notes_core::tx::build_sweep_tx(
+            &store.available_utxos(),
+            &identity.output_x,
+            recipient.spk,
+            rate,
+            &identity.tweaked_seckey,
+            app_core::notes_core::keys::generate_aux_rand,
+        );
+        match sweep {
+            Ok(tx) => {
+                let client = ChainClient::new(HttpTransport::new(base), net);
+                match client.broadcast(&tx.raw_hex) {
+                    Ok(txid) => {
+                        for u in &mut store.utxos {
+                            u.pending_spend = true;
+                        }
+                        s.save_store();
+                        println!(
+                            "cb: sweep txid={txid} value={} fee={}",
+                            tx.tx.outputs[0].value, tx.fee
+                        );
+                        w.set_status(format!("swept {} sats → {}…", tx.tx.outputs[0].value, &dest[..14.min(dest.len())]).into());
+                        update_home(&w, &s);
+                    }
+                    Err(e) => w.set_status(format!("sweep broadcast failed: {e}").into()),
+                }
+            }
+            Err(e) => w.set_status(format!("sweep: {e}").into()),
+        }
     });
 
     cb!(on_compose_open, |w, s| {
@@ -685,7 +834,8 @@ fn main() {
             w.set_to_label(format!("To: {a} (+330 sat dust delivery)").into());
             s.to_address = Some(a);
         }
-        let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0);
+        let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+        w.set_fee_tier(1);
         w.set_rate_text(format!("{rate}").into());
         w.set_status("".into());
         w.set_screen(6);
@@ -847,7 +997,7 @@ fn main() {
     });
 
     cb!(on_open_account_picker, |w, s| {
-        let Some(material) = s.material.clone() else { return };
+        let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else { return };
         println!("cb: account-picker open");
         let page = s.account / 5;
         show_account_picker(&w, &material, s.network, page, Some(s.account));
@@ -855,7 +1005,11 @@ fn main() {
 
     cb!(on_accounts_page, |w, s, delta: i32| {
         let page = (w.get_account_page() + delta).max(0) as u32;
-        let material = s.pending_import.clone().or_else(|| s.material.clone());
+        let material = s
+            .pending_import
+            .as_ref()
+            .or(s.material.as_ref())
+            .map(|z| String::from(z.as_str()));
         let Some(material) = material else { return };
         let active = if s.pending_import.is_some() { None } else { Some(s.account) };
         show_account_picker(&w, &material, s.network, page, active);
@@ -863,7 +1017,12 @@ fn main() {
 
     cb!(on_pick_account, |w, s, idx: i32| {
         let first_import = s.pending_import.is_some();
-        let Some(material) = s.pending_import.take().or_else(|| s.material.clone()) else {
+        let Some(material) = s
+            .pending_import
+            .take()
+            .map(|z| String::from(z.as_str()))
+            .or_else(|| s.material.as_ref().map(|z| String::from(z.as_str())))
+        else {
             return;
         };
         s.account = idx.max(0) as u32;
@@ -892,6 +1051,15 @@ fn main() {
     cb!(on_reset_identity, |w, s| {
         println!("cb: reset-identity");
         let _ = keychain::delete_secret(KEYCHAIN_ACCOUNT);
+        // Privacy: local stores cache decrypted note text — delete them.
+        if let Ok(entries) = std::fs::read_dir(&s.data_dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("store-") && name.ends_with(".json") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
         s.ident = None;
         s.store = None;
         s.material = None;
@@ -918,7 +1086,9 @@ fn main() {
         println!("cb: set-network {}", s.network.as_str());
         s.save_config();
         // Same key material, new network: re-derive + reload store.
-        let material = std::env::var("APP_KEY").ok().or_else(|| s.material.clone());
+        let material = std::env::var("APP_KEY")
+            .ok()
+            .or_else(|| s.material.as_ref().map(|z| String::from(z.as_str())));
         if let Some(m) = material {
             match activate(&mut s, &m, false) {
                 Ok(()) => {
@@ -983,6 +1153,26 @@ fn main() {
         update_home(&w, &s);
         w.set_screen(4);
     });
+
+    let auto_refresh = slint::Timer::default();
+    {
+        let st = st.clone();
+        let weak = window.as_weak();
+        auto_refresh.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(60),
+            move || {
+                if let Some(w) = weak.upgrade() {
+                    if w.get_screen() == 4 {
+                        let mut s = st.borrow_mut();
+                        if s.ident.is_some() {
+                            refresh(&w, &mut s);
+                        }
+                    }
+                }
+            },
+        );
+    }
 
     window.run().expect("event loop");
 }

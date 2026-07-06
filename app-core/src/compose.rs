@@ -100,6 +100,7 @@ pub fn compose_and_record(
         blocktime: None,
         created_at: Some(req.now),
         spent,
+        raw_hex: Some(tx.raw_hex.clone()),
     };
     store.record_signed(record, change);
 
@@ -108,4 +109,83 @@ pub fn compose_and_record(
     }
 
     Ok(ComposedNote { note_id: hex::encode(note_id), tx })
+}
+
+/// RBF fee-bump a Pending note: re-sign the SAME note_id spending the
+/// SAME inputs at a higher rate. The envelope's note_id is unchanged, so
+/// the next scan re-matches whichever tx confirms; the store keeps both
+/// txids and swaps the change UTXO.
+pub fn bump_fee(
+    store: &mut Store,
+    identity: &Identity,
+    network: Network,
+    note_id_hex: &str,
+    new_rate: f64,
+) -> Result<ComposedNote, Error> {
+    let rec = store
+        .notes
+        .iter()
+        .find(|n| n.note_id == note_id_hex && n.status == crate::store::NoteStatus::Pending)
+        .ok_or(Error::Store("only pending notes can be fee-bumped".into()))?;
+    let text = rec.text.clone().ok_or(Error::Store("no cached text".into()))?;
+    let private = rec.private;
+    let recipient_addr = rec.recipient.clone();
+    let old_txids = rec.txids.clone();
+    let spent = rec.spent.clone();
+
+    let mut note_id = [0u8; 4];
+    hex::decode_to_slice(note_id_hex, &mut note_id).map_err(|_| Error::Store("bad id".into()))?;
+
+    // Rebuild the exact input set (values from the ledger, which retains
+    // pending-locked entries).
+    let utxos: Vec<notes_core::tx::Utxo> = spent
+        .iter()
+        .map(|op| {
+            let l = store
+                .utxos
+                .iter()
+                .find(|u| u.txid == op.txid && u.vout == op.vout)
+                .ok_or(Error::Store("bumped input missing from ledger".into()))?;
+            let mut txid = [0u8; 32];
+            hex::decode_to_slice(&l.txid, &mut txid).map_err(|_| Error::Store("bad txid".into()))?;
+            txid.reverse();
+            Ok(notes_core::tx::Utxo { txid, vout: l.vout, value: l.value })
+        })
+        .collect::<Result<_, Error>>()?;
+
+    let recipient = match &recipient_addr {
+        Some(a) => Some(Recipient::parse(network, a)?),
+        None => None,
+    };
+    let tx = match &recipient {
+        Some(r) => compose_directed_note(
+            identity, &utxos, &text, private, note_id, r,
+            store.chunk_size, new_rate, generate_aux_rand,
+        ),
+        None => compose_note(
+            identity, &utxos, &text, private, note_id,
+            store.chunk_size, new_rate, generate_aux_rand,
+        ),
+    }?;
+
+    // Swap ledger change: drop the replaced tx's outputs, add the new one.
+    store.utxos.retain(|u| !old_txids.contains(&u.txid));
+    if tx.change > 0 {
+        store.utxos.push(crate::store::LedgerUtxo {
+            txid: tx.txid_hex.clone(),
+            vout: (tx.tx.outputs.len() - 1) as u32,
+            value: tx.change,
+            height: None,
+            pending_spend: false,
+        });
+    }
+    let rec = store
+        .notes
+        .iter_mut()
+        .find(|n| n.note_id == note_id_hex)
+        .expect("checked above");
+    rec.txids.push(tx.txid_hex.clone());
+    rec.raw_hex = Some(tx.raw_hex.clone());
+
+    Ok(ComposedNote { note_id: note_id_hex.to_string(), tx })
 }
