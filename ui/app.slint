@@ -196,6 +196,51 @@ component ScanButton inherits Rectangle {
     }
 }
 
+component SelectPill inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+    height: 32px;
+    border-radius: 16px;
+    border-width: 1px;
+    border-color: root.active ? Pal.accent : Pal.line;
+    background: root.active ? Pal.accent : (ta.has-hover ? Pal.card-hover : transparent);
+    width: t.preferred-width + 24px;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    t := Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        font-size: 12px;
+        font-weight: 600;
+        color: root.active ? Pal.on-accent : Pal.text;
+    }
+}
+
+component SettingsCard inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Pal.line;
+    background: Pal.card;
+    height: l.preferred-height;
+    l := VerticalLayout {
+        padding: 16px;
+        spacing: 8px;
+        Text {
+            text: root.title;
+            font-size: 14px;
+            font-weight: 700;
+            color: Pal.text;
+        }
+        Caption { text: root.subtitle; }
+        @children
+    }
+}
+
 component DoorCard inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
@@ -260,6 +305,7 @@ export component AppWindow inherits Window {
 
     in property <string> settings-network;
     in-out property <string> chunk-text;
+    in-out property <bool> chunk-custom;
     in-out property <string> esplora-text;
     in property <string> reveal-text;
 
@@ -286,7 +332,8 @@ export component AppWindow inherits Window {
     callback compose-changed();
     callback compose-send();
     callback settings-open();
-    callback cycle-network();
+    callback set-network(string);
+    callback hide-backup();
     callback set-chunk(string);
     callback set-esplora(string);
     callback reveal-backup();
@@ -686,55 +733,83 @@ export component AppWindow inherits Window {
             title: "Settings";
             back => { root.go-home(); }
         }
-        Card {
-            height: 56px;
+        SettingsCard {
+            title: "Network";
+            subtitle: "Which chain this notebook lives on. Every network keeps its own separate notebook for the same key.";
             HorizontalLayout {
-                padding: 14px;
-                spacing: 10px;
-                Body { text: "Network"; vertical-alignment: center; }
-                Rectangle { }
-                Badge { label: root.settings-network; tint: Pal.accent; }
-                GhostButton { width: 72px; height: 28px; text: "cycle"; clicked => { root.cycle-network(); } }
+                spacing: 8px;
+                alignment: start;
+                SelectPill { text: "mainnet"; active: root.settings-network == "mainnet"; clicked => { root.set-network("mainnet"); } }
+                SelectPill { text: "testnet4"; active: root.settings-network == "testnet4"; clicked => { root.set-network("testnet4"); } }
+                SelectPill { text: "signet"; active: root.settings-network == "signet"; clicked => { root.set-network("signet"); } }
+                SelectPill { text: "regtest"; active: root.settings-network == "regtest"; clicked => { root.set-network("regtest"); } }
             }
         }
-        Card {
-            height: 56px;
+        SettingsCard {
+            title: "Note size limit";
+            subtitle: "Largest OP_RETURN chunk per output. Standard suits modern relays (Core v30+). If a broadcast is rejected, switch to 80 compat and recompose.";
             HorizontalLayout {
-                padding: 14px;
-                spacing: 10px;
-                Body { text: "Chunk bytes"; vertical-alignment: center; }
-                Rectangle { }
+                spacing: 8px;
+                alignment: start;
+                SelectPill {
+                    text: "Standard";
+                    active: root.chunk-text == "100000";
+                    clicked => { root.set-chunk("100000"); }
+                }
+                SelectPill {
+                    text: "80 compat";
+                    active: root.chunk-text == "80";
+                    clicked => { root.set-chunk("80"); }
+                }
+                SelectPill {
+                    text: "Custom";
+                    active: root.chunk-text != "100000" && root.chunk-text != "80";
+                    clicked => { root.chunk-custom = true; }
+                }
+            }
+            if root.chunk-custom || (root.chunk-text != "100000" && root.chunk-text != "80"): HorizontalLayout {
+                spacing: 8px;
                 LineEdit {
-                    width: 110px;
+                    width: 130px;
                     text <=> root.chunk-text;
+                    placeholder-text: "20 – 100000";
                     accepted(t) => { root.set-chunk(t); }
                 }
+                Caption { text: "bytes · press Return to apply"; vertical-alignment: center; }
             }
         }
-        Card {
-            height: 56px;
-            HorizontalLayout {
-                padding: 14px;
-                spacing: 10px;
-                Body { text: "Esplora URL"; vertical-alignment: center; }
-                LineEdit {
-                    text <=> root.esplora-text;
-                    placeholder-text: "network default";
-                    accepted(t) => { root.set-esplora(t); }
+        SettingsCard {
+            title: "Esplora endpoint";
+            subtitle: "Scans and broadcasts go through this server — it learns your address and IP. Leave empty for the network default (mempool.space). Press Return to apply.";
+            LineEdit {
+                text <=> root.esplora-text;
+                placeholder-text: "https://mempool.space/… (network default)";
+                accepted(t) => { root.set-esplora(t); }
+            }
+        }
+        SettingsCard {
+            title: "Backup";
+            subtitle: "Shows the exact key material you imported or created. Anyone who sees it controls the funds and every private note.";
+            GhostButton { text: "Reveal backup  ·  asks for Touch ID"; clicked => { root.reveal-backup(); } }
+            if root.reveal-text != "": VerticalLayout {
+                spacing: 8px;
+                Rectangle {
+                    border-radius: 10px;
+                    background: Pal.warn.with-alpha(0.10);
+                    border-width: 1px;
+                    border-color: Pal.warn.with-alpha(0.4);
+                    height: rv.preferred-height + 28px;
+                    rv := Mono {
+                        x: 14px;
+                        y: 14px;
+                        width: parent.width - 28px;
+                        text: root.reveal-text;
+                    }
                 }
+                GhostButton { text: "Hide"; clicked => { root.hide-backup(); } }
             }
         }
-        GhostButton { text: "Reveal backup  ·  asks for Touch ID"; clicked => { root.reveal-backup(); } }
-        if root.reveal-text != "": Card {
-            height: rv.preferred-height + 28px;
-            rv := Mono {
-                x: 14px;
-                y: 14px;
-                width: parent.width - 28px;
-                text: root.reveal-text;
-            }
-        }
-        Caption { text: root.status; }
+        if root.status != "": Caption { text: root.status; color: Pal.bad; }
     }
 
     // ---------- rename dialog (modal overlay) ----------
