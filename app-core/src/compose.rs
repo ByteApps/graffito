@@ -4,7 +4,8 @@
 //! Pending note with the tx hex still in hand.
 
 use notes_core::address::Recipient;
-use notes_core::bundle::{compose_directed_note, compose_note, Identity};
+use notes_core::bundle::{compose_directed_note_with_change, compose_note_with_change, Identity};
+use notes_core::address::address_to_script_pubkey;
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::tx::NoteTx;
 use notes_core::Network;
@@ -17,6 +18,10 @@ pub struct ComposeRequest<'a> {
     pub private: bool,
     /// None = self-note; Some = directed note (dust output).
     pub recipient: Option<&'a str>,
+    /// Where the change goes. None = back to the notes address (default).
+    /// Some = a custom address; that change is NOT tracked as a spendable
+    /// coin (it leaves this wallet).
+    pub change_to: Option<&'a str>,
     pub fee_rate: f64,
     /// Local wall-clock seconds for created_at (display only).
     pub now: u64,
@@ -43,25 +48,33 @@ pub fn compose_and_record(
         Some(addr) => Some(Recipient::parse(network, addr)?),
         None => None,
     };
+    // Custom change destination (leaves this wallet, so not ledger-tracked).
+    let change = match req.change_to {
+        Some(addr) => Some(Recipient::parse(network, addr)?),
+        None => None,
+    };
+    let change_spk = change.as_ref().map(|c| c.spk.as_slice());
 
     let tx = match &recipient {
-        Some(r) => compose_directed_note(
+        Some(r) => compose_directed_note_with_change(
             identity,
             &utxos,
             req.text,
             req.private,
             note_id,
             r,
+            change_spk,
             store.chunk_size,
             req.fee_rate,
             generate_aux_rand,
         ),
-        None => compose_note(
+        None => compose_note_with_change(
             identity,
             &utxos,
             req.text,
             req.private,
             note_id,
+            change_spk,
             store.chunk_size,
             req.fee_rate,
             generate_aux_rand,
@@ -78,7 +91,10 @@ pub fn compose_and_record(
         })
         .collect();
 
-    let change = (tx.change > 0).then(|| LedgerUtxo {
+    // Only track change as our own coin when it returns to the notes
+    // address. Custom change leaves the wallet (re-discovered by a scan
+    // only if it happens to pay us).
+    let change_utxo = (tx.change > 0 && change_spk.is_none()).then(|| LedgerUtxo {
         txid: tx.txid_hex.clone(),
         vout: (tx.tx.outputs.len() - 1) as u32,
         value: tx.change,
@@ -103,8 +119,9 @@ pub fn compose_and_record(
         raw_hex: Some(tx.raw_hex.clone()),
         fee: Some(tx.fee),
         vsize: Some(tx.vsize as u64),
+        change_to: req.change_to.map(str::to_string),
     };
-    store.record_signed(record, change);
+    store.record_signed(record, change_utxo);
 
     if let Some(r) = &recipient {
         store.touch_contact(&r.address);
@@ -132,6 +149,7 @@ pub fn bump_fee(
     let text = rec.text.clone().ok_or(Error::Store("no cached text".into()))?;
     let private = rec.private;
     let recipient_addr = rec.recipient.clone();
+    let change_to = rec.change_to.clone();
     let old_txids = rec.txids.clone();
     let spent = rec.spent.clone();
 
@@ -159,20 +177,26 @@ pub fn bump_fee(
         Some(a) => Some(Recipient::parse(network, a)?),
         None => None,
     };
+    let change_spk_vec = match &change_to {
+        Some(a) => Some(address_to_script_pubkey(network, a)?),
+        None => None,
+    };
+    let change_spk = change_spk_vec.as_deref();
     let tx = match &recipient {
-        Some(r) => compose_directed_note(
-            identity, &utxos, &text, private, note_id, r,
+        Some(r) => compose_directed_note_with_change(
+            identity, &utxos, &text, private, note_id, r, change_spk,
             store.chunk_size, new_rate, generate_aux_rand,
         ),
-        None => compose_note(
-            identity, &utxos, &text, private, note_id,
+        None => compose_note_with_change(
+            identity, &utxos, &text, private, note_id, change_spk,
             store.chunk_size, new_rate, generate_aux_rand,
         ),
     }?;
 
-    // Swap ledger change: drop the replaced tx's outputs, add the new one.
+    // Swap ledger change: drop the replaced tx's outputs; re-add only if
+    // change returns to self.
     store.utxos.retain(|u| !old_txids.contains(&u.txid));
-    if tx.change > 0 {
+    if tx.change > 0 && change_spk.is_none() {
         store.utxos.push(crate::store::LedgerUtxo {
             txid: tx.txid_hex.clone(),
             vout: (tx.tx.outputs.len() - 1) as u32,
