@@ -16,7 +16,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-notes-core = { git = "ssh://git@github.com/ObjSal/prime-chain-notes.git", rev = "6530edcb8daacab98fbe72754fa67c8f3d7253af" }
+notes-core = { git = "ssh://git@github.com/ObjSal/prime-chain-notes.git", rev = "066477ed5ebf11d496a8ab6a956b744fa8c6be07" }
 bitcoin = "0.32"
 bip39 = "2"
 hkdf = "0.12"

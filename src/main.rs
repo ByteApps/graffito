@@ -94,6 +94,34 @@ fn spendable_inputs(store: &Store) -> Vec<app_core::store::TxInput> {
         .collect()
 }
 
+/// Expected change (sats) a note tx would return, simulating notes-core's
+/// largest-first coin selection. None = no change output (all to fees).
+fn preview_change(
+    store: &Store,
+    text_len: usize,
+    private: bool,
+    rate: f64,
+    spk_len: Option<usize>,
+    sent: u64,
+) -> Option<u64> {
+    use app_core::notes_core::bundle::estimate_note_cost;
+    use app_core::notes_core::DUST_LIMIT;
+    let mut vals: Vec<u64> =
+        store.utxos.iter().filter(|u| !u.pending_spend).map(|u| u.value).collect();
+    vals.sort_unstable_by(|a, b| b.cmp(a));
+    let mut in_value = 0u64;
+    for k in 1..=vals.len() {
+        in_value += vals[k - 1];
+        if let Ok((_, vsize)) = estimate_note_cost(text_len, private, store.chunk_size, k, spk_len) {
+            let fee = (vsize as f64 * rate).ceil() as u64;
+            if in_value >= fee + sent + DUST_LIMIT {
+                return Some(in_value - fee - sent);
+            }
+        }
+    }
+    None
+}
+
 /// "R.R sat/vB · F sats" (or just "F sats" without a known vsize).
 fn fee_line_str(fee: Option<u64>, vsize: Option<u64>) -> String {
     match (fee, vsize) {
@@ -465,15 +493,31 @@ fn update_cost(w: &AppWindow, st: &State) {
     let text = w.get_compose_text();
     let private = w.get_compose_private();
     let rate: f64 = w.get_rate_text().parse().unwrap_or(1.0);
-    if text.is_empty() {
-        w.set_cost_line("".into());
-        return;
-    }
     let spk_len = st
         .to_address
         .as_deref()
         .and_then(|a| Recipient::parse(st.network, a).ok())
         .map(|r| r.spk.len());
+    // Collapsed change header: destination + expected amount.
+    let change_dest = {
+        let a = w.get_change_address();
+        let a = a.trim();
+        if a.is_empty() {
+            "your address".to_string()
+        } else {
+            format!("{}…", &a[..14.min(a.len())])
+        }
+    };
+    if text.is_empty() {
+        w.set_cost_line("".into());
+        w.set_change_amount(format!("Change → {change_dest}").into());
+        return;
+    }
+    let sent = if spk_len.is_some() { 330 } else { 0 };
+    let change_amt = preview_change(store, text.len(), private, rate, spk_len, sent)
+        .map(|c| format!("~{c} sats"))
+        .unwrap_or_else(|| "none".into());
+    w.set_change_amount(format!("Change → {change_dest} · {change_amt}").into());
     let n_inputs = store.available_utxos().len().max(1);
     match estimate_note_cost(text.len(), private, store.chunk_size, n_inputs, spk_len) {
         Ok((chunks, vsize)) => {
@@ -1155,6 +1199,8 @@ fn main() {
         let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
         w.set_fee_tier(1);
         w.set_rate_text(format!("{rate}").into());
+        w.set_change_address("".into());
+        w.set_change_expanded(false);
         w.set_status("".into());
         w.set_screen(6);
         update_cost(&w, &s);
@@ -1181,6 +1227,30 @@ fn main() {
                         // to Compose (the Prime picker behavior).
                         w.set_contact_input(a.clone().into());
                         w.invoke_pick_contact(a.into());
+                    }
+                });
+            });
+        });
+    }
+
+    {
+        let weak = window.as_weak();
+        window.on_change_scan(move || {
+            println!("cb: change-scan start");
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let text = match camera::capture_and_decode(20, |_, _, _| {}) {
+                    Ok(Some(p)) => String::from_utf8_lossy(&p).to_string(),
+                    _ => String::new(),
+                };
+                let _ = weak.upgrade_in_event_loop(move |w| {
+                    if text.is_empty() {
+                        w.set_status("scan: no QR seen".into());
+                    } else {
+                        println!("cb: change-scan ok");
+                        w.set_change_address(normalize_addr(&text).into());
+                        w.set_change_expanded(true);
+                        w.invoke_compose_changed();
                     }
                 });
             });
@@ -1253,6 +1323,12 @@ fn main() {
             w.set_status("empty note or bad fee rate".into());
             return;
         }
+        // Optional custom change address (empty = back to self).
+        let change_addr = normalize_addr(w.get_change_address().as_str());
+        if !change_addr.is_empty() && Recipient::parse(s.network, &change_addr).is_err() {
+            w.set_status(format!("change address isn't a valid {} address", s.network.as_str()).into());
+            return;
+        }
         let net = s.network;
         let to = s.to_address.clone();
         let Some(base) = s.base_url() else {
@@ -1270,6 +1346,7 @@ fn main() {
                 text: &text,
                 private,
                 recipient: to.as_deref(),
+                change_to: (!change_addr.is_empty()).then_some(change_addr.as_str()),
                 fee_rate: rate,
                 now: now(),
             },
@@ -1287,6 +1364,8 @@ fn main() {
                         );
                         w.set_status(format!("broadcast {}…", &txid[..12]).into());
                         w.set_compose_text("".into());
+                        w.set_change_address("".into());
+                        w.set_change_expanded(false);
                         w.set_screen(4);
                         refresh(&w, &mut s);
                     }
