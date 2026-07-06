@@ -31,6 +31,8 @@ objc2-local-authentication = "0.3"
 block2 = "0.6"
 # Native file-open dialog (import-from-file door).
 rfd = "0.14"
+serde_json = "1"
+hex = "0.4"
 # Quiz word picks + misc entropy.
 getrandom = "0.2"
 bip39 = "2"

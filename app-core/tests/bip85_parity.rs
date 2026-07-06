@@ -18,7 +18,7 @@ fn bip39_child_and_its_seedqr() {
         .unwrap();
 
     let material = parse_key_material(&child.display, Network::Mainnet).unwrap();
-    let ident = realize(&material, Network::Mainnet).unwrap();
+    let ident = realize(&material, Network::Mainnet, 0).unwrap();
     assert!(ident.address.starts_with("bc1p"));
 
     // prime-bip85's SeedQR digit stream decodes to the same mnemonic.
@@ -29,6 +29,7 @@ fn bip39_child_and_its_seedqr() {
     let ident_qr = realize(
         &parse_key_material(&from_qr.to_string(), Network::Mainnet).unwrap(),
         Network::Mainnet,
+            0,
     )
     .unwrap();
     assert_eq!(ident_qr.address, ident.address);
@@ -41,6 +42,7 @@ fn wif_child_matches_hex_of_same_entropy() {
     let via_wif = realize(
         &parse_key_material(&child.display, Network::Mainnet).unwrap(),
         Network::Mainnet,
+            0,
     )
     .unwrap();
     assert_eq!(via_wif.kind, "wif");
@@ -48,6 +50,7 @@ fn wif_child_matches_hex_of_same_entropy() {
     let via_hex = realize(
         &parse_key_material(&hex::encode(&child.entropy), Network::Mainnet).unwrap(),
         Network::Mainnet,
+            0,
     )
     .unwrap();
     assert_eq!(via_wif.address, via_hex.address);
@@ -58,7 +61,7 @@ fn xprv_child_imports_as_master() {
     let child = derive(&root(), Application::Xprv, 0, bip85_core::Network::Mainnet).unwrap();
     let material = parse_key_material(&child.display, Network::Mainnet).unwrap();
     assert!(matches!(&material, KeyMaterial::Xprv(x) if x.depth == 0));
-    let ident = realize(&material, Network::Mainnet).unwrap();
+    let ident = realize(&material, Network::Mainnet, 0).unwrap();
     assert!(ident.address.starts_with("bc1p"));
 }
 
@@ -69,6 +72,6 @@ fn hex_child_imports_raw() {
             .unwrap();
     let material = parse_key_material(&child.display, Network::Mainnet).unwrap();
     assert!(matches!(material, KeyMaterial::Hex(_)));
-    let ident = realize(&material, Network::Mainnet).unwrap();
+    let ident = realize(&material, Network::Mainnet, 0).unwrap();
     assert!(ident.address.starts_with("bc1p"));
 }
