@@ -61,5 +61,31 @@ forces git-CLI fetch for the ssh:// dep):
 
 ```bash
 nix develop ~/.foundation/sdk/current --command cargo test -p app-core
+nix develop ~/.foundation/sdk/current --command bash scripts/regtest-e2e.sh  # app↔Prime interop matrix vs real bitcoind
 nix develop ~/.foundation/sdk/current --command cargo run
 ```
+
+The e2e script reuses ../prime-chain-notes' `companion/server.py
+--regtest` (manages its own throwaway bitcoind; auto-mines on POST /tx
+and /faucet) and drives BOTH cores: `examples/cli.rs` as the app
+(identity via `APP_KEY` env — any accepted format) and prime's
+`notes_cli` (via `NOTES_APP_SEED`). The `cli bundle` command emits
+SyncBundle JSON for any address — the two cores share the serde, so it
+feeds notes_cli's scan directly.
+
+## CLI log contract (grep targets)
+
+`cli: init kind=<k> network=<n> address=<a>` ·
+`cli: scan notes=<n> new=<k> orphaned=<o> balance=<b> tip=<h>` ·
+`cli: compose id=<hex8> txid=<t> fee=<f> vsize=<v> to=<addr|self>
+private=<b> broadcast=ok` ·
+`note id=<hex8> status=<pending|confirmed|orphaned> private=<b>
+directed=<b> received=<b> from=<a|-> to=<a|-> text=<t|->` ·
+`cli: bundle address=<a> txs=<n> utxos=<n> -> <path>`
+
+Esplora-shape gotcha (baked into chain.rs, don't regress): server.py
+prevouts carry ONLY `scriptpubkey_address` (no script hex, no type) and
+its vout types are Core-style (`witness_v1_taproot`), while real esplora
+uses `v1_p2tr` — so taproot detection goes by address prefix
+(bc1p/tb1p/bcrt1p, the chain-scan.js P2TR_RE rule), never type strings,
+and every EsploraOut field is serde-default.
