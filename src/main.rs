@@ -132,6 +132,17 @@ fn tx_rate(store: &Store, ref_id: &str, is_note: bool) -> Option<(f64, u64, u64)
     }
 }
 
+/// chain-notes companion note.html permalink, or empty on regtest.
+fn note_web_url(network: Network, address: &str, note_id: &str) -> String {
+    match network {
+        Network::Regtest => String::new(),
+        net => format!(
+            "https://objsal.github.io/chain-notes-companion/note.html?address={address}&network={}&note={note_id}",
+            net.as_str()
+        ),
+    }
+}
+
 /// mempool.space tx permalink, or empty on regtest (no public explorer).
 fn explorer_tx_url(network: Network, txid: &str) -> String {
     match network {
@@ -313,6 +324,8 @@ fn update_home(w: &AppWindow, st: &State) {
     w.set_balance_line(
         format!("{} sats · height {}", store.balance(), store.tip_height).into(),
     );
+    let address = ident.address.clone();
+    let net = st.network;
     let mut items: Vec<NoteItem> = store
         .notes
         .iter()
@@ -346,6 +359,7 @@ fn update_home(w: &AppWindow, st: &State) {
                     n.height.map(|h| format!(" · block {h}")).unwrap_or_default()
                 )
                 .into(),
+                web_url: note_web_url(net, &address, &n.note_id).into(),
             }
         })
         .collect();
@@ -439,7 +453,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
         }
         Err(e) => {
             println!("cb: refresh err={e}");
-            w.set_status(format!("scan failed: {e}").into());
+            w.set_status("couldn't reach the network — tap ↻ to retry".into());
         }
     }
     update_home(w, st);
@@ -1093,6 +1107,15 @@ fn main() {
             }
             Err(e) => w.set_status(format!("sweep: {e}").into()),
         }
+    });
+
+    cb!(on_open_note_web_url, |w, s, url: SharedString| {
+        let _ = &mut s;
+        if url.is_empty() {
+            return;
+        }
+        println!("cb: open-note-web-url");
+        let _ = std::process::Command::new("open").arg(url.as_str()).spawn();
     });
 
     cb!(on_compose_open, |w, s| {

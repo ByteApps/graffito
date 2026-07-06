@@ -4,7 +4,7 @@
 // on the Rust side.
 import { LineEdit, TextEdit, ListView, Switch } from "std-widgets.slint";
 
-export struct NoteItem { id: string, title: string, meta: string, badge: string }
+export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string }
 export struct ContactItem { address: string, name: string }
 export struct AccountItem { index: int, address: string, active: bool }
 export struct CoinItem { outpoint: string, value: string, status: string }
@@ -216,6 +216,23 @@ component PencilButton inherits Rectangle {
     }
 }
 
+component WebViewButton inherits Rectangle {
+    callback clicked;
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Image {
+        source: @image-url("icons/external.svg");
+        colorize: Pal.muted;
+        width: 15px;
+        height: 15px;
+        x: (parent.width - 15px) / 2;
+        y: (parent.height - 15px) / 2;
+    }
+}
+
 component ScanButton inherits Rectangle {
     callback clicked;
     width: 44px;
@@ -389,6 +406,7 @@ export component AppWindow inherits Window {
     callback backup-continue();
     callback refresh();
     callback open-note(string);
+    callback open-note-web-url(string);
     callback open-note-web();
     callback copy-text(string, string);
     callback set-fee-tier(int);
@@ -624,12 +642,13 @@ export component AppWindow inherits Window {
                     border-color: Pal.line;
                     VerticalLayout {
                         x: 14px;
-                        y: 9px;
-                        width: parent.width - 28px;
+                        width: note.web-url != "" ? parent.width - 62px : parent.width - 28px;
+                        height: parent.height;
+                        alignment: center;
                         spacing: 6px;
-                        alignment: start;
                         Text {
                             text: note.title;
+                            horizontal-alignment: left;
                             font-size: 13px;
                             color: Pal.text;
                             overflow: elide;
@@ -649,6 +668,11 @@ export component AppWindow inherits Window {
                                 height: 20px;
                             }
                         }
+                    }
+                    if note.web-url != "": WebViewButton {
+                        x: parent.width - 44px;
+                        y: (parent.height - self.height) / 2;
+                        clicked => { root.open-note-web-url(note.web-url); }
                     }
                 }
             }
