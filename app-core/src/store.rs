@@ -101,6 +101,9 @@ pub struct Store {
     pub last_scan_time: u64,
     #[serde(default = "default_chunk")]
     pub chunk_size: usize,
+    /// Custom esplora base URL (Settings); None = network default.
+    #[serde(default)]
+    pub esplora: Option<String>,
 }
 
 fn default_chunk() -> usize {
@@ -120,6 +123,7 @@ impl Store {
             tip_height: 0,
             last_scan_time: 0,
             chunk_size: DEFAULT_CHUNK,
+            esplora: None,
         }
     }
 

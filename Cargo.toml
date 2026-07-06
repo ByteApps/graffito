@@ -18,6 +18,11 @@ nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 rqrr = "0.7"
 # Key material at rest: macOS Keychain (SecretStore spec in the PLAN).
 security-framework = "3"
+# Native file-open dialog (import-from-file door).
+rfd = "0.14"
+# Quiz word picks + misc entropy.
+getrandom = "0.2"
+bip39 = "2"
 
 [build-dependencies]
 slint-build = "=1.16.1"
