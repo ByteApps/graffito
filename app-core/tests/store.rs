@@ -246,6 +246,43 @@ fn orphaned_when_inputs_spent_elsewhere() {
 }
 
 #[test]
+fn sweep_tx_record_bump_and_confirm() {
+    use app_core::compose::bump_raw_tx;
+    use app_core::store::TxInput;
+    let a = alice();
+    let mut store = funded_store(&a);
+    // Two coins so a self-send has inputs.
+    store.utxos.push(LedgerUtxo {
+        txid: "bb".repeat(32), vout: 1, value: 40_000, height: Some(100), pending_spend: false,
+    });
+    let me = app_core::notes_core::address::Recipient::parse(NET, &a.address(NET)).unwrap();
+    let inputs: Vec<TxInput> = store.utxos.iter()
+        .map(|u| TxInput { txid: u.txid.clone(), vout: u.vout, value: u.value }).collect();
+    let tx = app_core::notes_core::tx::build_sweep_tx(
+        &store.available_utxos(), &a.output_x, me.spk.clone(), 1.0, &a.tweaked_seckey,
+        app_core::notes_core::keys::generate_aux_rand,
+    ).unwrap();
+    for u in &mut store.utxos { u.pending_spend = true; }
+    store.record_tx("consolidate", tx.txid_hex.clone(), tx.tx.outputs[0].value, tx.fee,
+        tx.raw_hex.clone(), "self".into(), inputs, hex::encode(&me.spk), 1000);
+    assert_eq!(store.txs.len(), 1);
+    assert_eq!(store.txs[0].status, NoteStatus::Pending);
+
+    // RBF bump: same inputs, higher fee, new txid appended.
+    let bumped = bump_raw_tx(&mut store, &a, &tx.txid_hex, 8.0).unwrap();
+    assert_ne!(bumped.txid_hex, tx.txid_hex);
+    assert!(bumped.fee > tx.fee);
+    assert_eq!(store.txs[0].txids, vec![tx.txid_hex.clone(), bumped.txid_hex.clone()]);
+    assert_eq!(store.txs[0].raw_hex.as_deref(), Some(bumped.raw_hex.as_str()));
+
+    // Confirm on full scan: the inputs are gone from the UTXO set.
+    let b = bundle(vec![], vec![change_utxo(&bumped, Some(120))], 120);
+    store.apply_bundle(&b, &a, NET).unwrap();
+    assert_eq!(store.txs[0].status, NoteStatus::Confirmed);
+    assert!(store.txs[0].raw_hex.is_none());
+}
+
+#[test]
 fn identity_mismatch_rejected_and_persistence_roundtrip() {
     let a = alice();
     let mut store = funded_store(&a);
