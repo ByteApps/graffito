@@ -753,17 +753,17 @@ export component AppWindow inherits Window {
                 alignment: start;
                 SelectPill {
                     text: "Standard";
-                    active: root.chunk-text == "100000";
+                    active: !root.chunk-custom && root.chunk-text == "100000";
                     clicked => { root.set-chunk("100000"); }
                 }
                 SelectPill {
                     text: "80 compat";
-                    active: root.chunk-text == "80";
+                    active: !root.chunk-custom && root.chunk-text == "80";
                     clicked => { root.set-chunk("80"); }
                 }
                 SelectPill {
                     text: "Custom";
-                    active: root.chunk-text != "100000" && root.chunk-text != "80";
+                    active: root.chunk-custom || (root.chunk-text != "100000" && root.chunk-text != "80");
                     clicked => { root.chunk-custom = true; }
                 }
             }
