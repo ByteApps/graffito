@@ -93,15 +93,24 @@ pub struct EsploraStatus {
     pub block_time: Option<u64>,
 }
 
+/// Field-tolerant: real esplora sends script hex + `v1_p2tr` types, the
+/// regtest server.py sends only addresses on prevouts and Core-style
+/// type names — taproot detection therefore goes by address prefix
+/// (chain-scan.js's P2TR_RE rule), never by type string.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EsploraOut {
-    pub scriptpubkey: String,
     #[serde(default)]
-    pub scriptpubkey_type: String,
+    pub scriptpubkey: Option<String>,
+    #[serde(default)]
+    pub scriptpubkey_type: Option<String>,
     #[serde(default)]
     pub scriptpubkey_address: Option<String>,
     #[serde(default)]
     pub value: u64,
+}
+
+fn is_taproot_addr(addr: &str) -> bool {
+    addr.starts_with("bc1p") || addr.starts_with("tb1p") || addr.starts_with("bcrt1p")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -247,9 +256,9 @@ pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
     let payloads: Vec<String> = tx
         .vout
         .iter()
-        .filter(|o| o.scriptpubkey_type == "op_return")
+        .filter(|o| o.scriptpubkey_type.as_deref() == Some("op_return"))
         .filter_map(|o| {
-            let script = hex::decode(&o.scriptpubkey).ok()?;
+            let script = hex::decode(o.scriptpubkey.as_deref()?).ok()?;
             op_return_payload(&script).map(hex::encode)
         })
         .collect();
@@ -267,23 +276,22 @@ pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
         .vin
         .iter()
         .filter_map(|i| i.prevout.as_ref())
-        .find(|p| p.scriptpubkey_type == "v1_p2tr")
-        .and_then(|p| p.scriptpubkey_address.clone());
+        .filter_map(|p| p.scriptpubkey_address.as_deref())
+        .find(|a| is_taproot_addr(a))
+        .map(String::from);
 
-    let externals: Vec<&EsploraOut> = tx
+    let externals: Vec<&str> = tx
         .vout
         .iter()
-        .filter(|o| {
-            o.scriptpubkey_type != "op_return"
-                && o.scriptpubkey_address.is_some()
-                && o.scriptpubkey_address.as_deref() != Some(address)
-        })
+        .filter(|o| o.scriptpubkey_type.as_deref() != Some("op_return"))
+        .filter_map(|o| o.scriptpubkey_address.as_deref())
+        .filter(|a| *a != address)
         .collect();
     let recipient = externals
         .iter()
-        .find(|o| o.scriptpubkey_type == "v1_p2tr")
+        .find(|a| is_taproot_addr(a))
         .or(externals.first())
-        .and_then(|o| o.scriptpubkey_address.clone());
+        .map(|a| a.to_string());
 
     Some(OnchainTx {
         txid: tx.txid.clone(),
