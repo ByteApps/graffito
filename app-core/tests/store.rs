@@ -86,7 +86,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "first, public", private: false, recipient: None, change_to: None, fee_rate: 1.0, now: 1000 },
+        &ComposeRequest { text: "first, public", private: false, recipient: None, change_to: None, coins: None, fee_rate: 1.0, now: 1000 },
     )
     .unwrap();
     assert_eq!(store.notes.len(), 1);
@@ -97,7 +97,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "second, private", private: true, recipient: None, change_to: None, fee_rate: 1.0, now: 2000 },
+        &ComposeRequest { text: "second, private", private: true, recipient: None, change_to: None, coins: None, fee_rate: 1.0, now: 2000 },
     )
     .unwrap();
     assert_eq!(
@@ -153,6 +153,7 @@ fn directed_private_note_both_sides() {
             private: true,
             recipient: Some(&bob_addr),
             change_to: None,
+            coins: None,
             fee_rate: 1.0,
             now: 3000,
         },
@@ -191,6 +192,42 @@ fn directed_private_note_both_sides() {
 }
 
 #[test]
+fn coin_control_spends_exactly_selected() {
+    let a = alice();
+    let mut store = Store::new(&a, NET);
+    // Three coins.
+    for (i, v) in [(0u32, 60_000u64), (1, 40_000), (2, 20_000)] {
+        store.utxos.push(LedgerUtxo {
+            txid: format!("{i:02x}").repeat(32), vout: i, value: v,
+            height: Some(100), pending_spend: false,
+        });
+    }
+    // Select only coins #0 (60k) and #2 (20k) — skip the 40k.
+    let picks = vec![
+        (store.utxos[0].txid.clone(), 0u32),
+        (store.utxos[2].txid.clone(), 2u32),
+    ];
+    let n = compose_and_record(
+        &mut store, &a, NET,
+        &ComposeRequest {
+            text: "coin control", private: false, recipient: None,
+            change_to: None, coins: Some(&picks), fee_rate: 1.0, now: 1,
+        },
+    )
+    .unwrap();
+    // Spent exactly the two selected coins (not the 40k).
+    assert_eq!(n.tx.spent_outpoints.len(), 2);
+    let spent_vouts: std::collections::HashSet<u32> =
+        n.tx.spent_outpoints.iter().map(|(_, v)| *v).collect();
+    assert!(spent_vouts.contains(&0) && spent_vouts.contains(&2));
+    assert!(!spent_vouts.contains(&1), "unselected coin not spent");
+    // The 40k coin stays spendable; the selected two are pending-locked.
+    let spendable: Vec<_> = store.utxos.iter().filter(|u| !u.pending_spend).collect();
+    // change (to self) added + the untouched 40k.
+    assert!(spendable.iter().any(|u| u.value == 40_000));
+}
+
+#[test]
 fn custom_change_address_not_tracked_as_own_coin() {
     let a = alice();
     let b = bob();
@@ -200,7 +237,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "change goes to bob", private: false, recipient: None,
-            change_to: Some(&bob_addr), fee_rate: 1.0, now: 1,
+            change_to: Some(&bob_addr), coins: None, fee_rate: 1.0, now: 1,
         },
     )
     .unwrap();
@@ -217,7 +254,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
         &mut store2, &a, NET,
         &ComposeRequest {
             text: "change to self", private: false, recipient: None,
-            change_to: None, fee_rate: 1.0, now: 1,
+            change_to: None, coins: None, fee_rate: 1.0, now: 1,
         },
     )
     .unwrap();
@@ -231,7 +268,7 @@ fn bump_fee_same_note_id_same_inputs_higher_fee() {
     let mut store = funded_store(&a);
     let n1 = compose_and_record(
         &mut store, &a, NET,
-        &ComposeRequest { text: "bump me", private: true, recipient: None, change_to: None, fee_rate: 1.0, now: 1 },
+        &ComposeRequest { text: "bump me", private: true, recipient: None, change_to: None, coins: None, fee_rate: 1.0, now: 1 },
     )
     .unwrap();
     assert!(store.notes[0].raw_hex.is_some(), "raw kept for rebroadcast");
@@ -267,7 +304,7 @@ fn orphaned_when_inputs_spent_elsewhere() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "never broadcast", private: false, recipient: None, change_to: None, fee_rate: 1.0, now: 1 },
+        &ComposeRequest { text: "never broadcast", private: false, recipient: None, change_to: None, coins: None, fee_rate: 1.0, now: 1 },
     )
     .unwrap();
 

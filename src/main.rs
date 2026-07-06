@@ -36,6 +36,11 @@ struct State {
     fees: Option<FeeRates>,
     usd: Option<f64>,
     to_address: Option<String>, // None = self-note
+    /// Coin control: selected inputs (display-txid, vout) for the compose
+    /// in progress; `coins_overridden` = the user has touched the set (so
+    /// stop auto-suggesting).
+    selected_coins: Vec<(String, u32)>,
+    coins_overridden: bool,
     material: Option<Zeroizing<String>>, // session cache: avoids re-prompting Touch ID
     pending_import: Option<Zeroizing<String>>, // hierarchical import awaiting account pick
     pending_mnemonic: Option<String>,
@@ -92,34 +97,6 @@ fn spendable_inputs(store: &Store) -> Vec<app_core::store::TxInput> {
         .filter(|u| !u.pending_spend)
         .map(|u| app_core::store::TxInput { txid: u.txid.clone(), vout: u.vout, value: u.value })
         .collect()
-}
-
-/// Expected change (sats) a note tx would return, simulating notes-core's
-/// largest-first coin selection. None = no change output (all to fees).
-fn preview_change(
-    store: &Store,
-    text_len: usize,
-    private: bool,
-    rate: f64,
-    spk_len: Option<usize>,
-    sent: u64,
-) -> Option<u64> {
-    use app_core::notes_core::bundle::estimate_note_cost;
-    use app_core::notes_core::DUST_LIMIT;
-    let mut vals: Vec<u64> =
-        store.utxos.iter().filter(|u| !u.pending_spend).map(|u| u.value).collect();
-    vals.sort_unstable_by(|a, b| b.cmp(a));
-    let mut in_value = 0u64;
-    for k in 1..=vals.len() {
-        in_value += vals[k - 1];
-        if let Ok((_, vsize)) = estimate_note_cost(text_len, private, store.chunk_size, k, spk_len) {
-            let fee = (vsize as f64 * rate).ceil() as u64;
-            if in_value >= fee + sent + DUST_LIMIT {
-                return Some(in_value - fee - sent);
-            }
-        }
-    }
-    None
 }
 
 /// "R.R sat/vB · F sats" (or just "F sats" without a known vsize).
@@ -488,40 +465,102 @@ fn refresh(w: &AppWindow, st: &mut State) {
     update_home(w, st);
 }
 
-fn update_cost(w: &AppWindow, st: &State) {
-    let Some(store) = &st.store else { return };
-    let text = w.get_compose_text();
+/// Suggested coin selection: the minimal largest-first set that covers
+/// fee + dust for the current note.
+fn suggested_coins(
+    store: &Store,
+    text_len: usize,
+    private: bool,
+    rate: f64,
+    spk_len: Option<usize>,
+    sent: u64,
+) -> Vec<(String, u32)> {
+    let mut coins: Vec<&app_core::store::LedgerUtxo> =
+        store.utxos.iter().filter(|u| !u.pending_spend).collect();
+    coins.sort_by(|a, b| b.value.cmp(&a.value));
+    let mut chosen = Vec::new();
+    let mut total = 0u64;
+    for u in coins {
+        chosen.push((u.txid.clone(), u.vout));
+        total += u.value;
+        if let Ok((_, vsize)) =
+            estimate_note_cost(text_len.max(1), private, store.chunk_size, chosen.len(), spk_len)
+        {
+            let fee = (vsize as f64 * rate).ceil() as u64;
+            if total >= fee + sent {
+                break;
+            }
+        }
+    }
+    chosen
+}
+
+/// Recompute the whole compose screen from state: coin list + selection,
+/// spend total, live cost, change preview, change-address validation, and
+/// the feasibility gate on the Sign button.
+fn refresh_compose(w: &AppWindow, st: &mut State) {
+    let net = st.network;
+    let text = w.get_compose_text().to_string();
     let private = w.get_compose_private();
-    let rate: f64 = w.get_rate_text().parse().unwrap_or(1.0);
+    let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
     let spk_len = st
         .to_address
         .as_deref()
-        .and_then(|a| Recipient::parse(st.network, a).ok())
+        .and_then(|a| Recipient::parse(net, a).ok())
         .map(|r| r.spk.len());
-    // Collapsed change header: destination + expected amount.
-    let change_dest = {
-        let a = w.get_change_address();
-        let a = a.trim();
-        if a.is_empty() {
-            "your address".to_string()
-        } else {
-            format!("{}…", &a[..14.min(a.len())])
-        }
+    let sent = if spk_len.is_some() { 330u64 } else { 0 };
+
+    // Change-address destination label + validation.
+    let change_raw = w.get_change_address().to_string();
+    let change_trim = change_raw.trim();
+    let (change_dest, change_err) = if change_trim.is_empty() {
+        ("your address".to_string(), String::new())
+    } else if Recipient::parse(net, change_trim).is_ok() {
+        (format!("{}…", &change_trim[..14.min(change_trim.len())]), String::new())
+    } else {
+        ("⚠ invalid".to_string(), format!("Not a valid {} address.", net.as_str()))
     };
+    w.set_change_error(change_err.clone().into());
+
+    let Some(store) = &st.store else { return };
+    // Auto-suggest a selection until the user overrides it.
+    if !st.coins_overridden {
+        st.selected_coins = suggested_coins(store, text.len(), private, rate, spk_len, sent);
+    }
+    let store = st.store.as_ref().unwrap();
+    let sel: std::collections::HashSet<(String, u32)> = st.selected_coins.iter().cloned().collect();
+
+    let mut coins: Vec<SpendCoin> = Vec::new();
+    let (mut sel_total, mut sel_count) = (0u64, 0usize);
+    for u in store.utxos.iter().filter(|u| !u.pending_spend) {
+        let selected = sel.contains(&(u.txid.clone(), u.vout));
+        if selected {
+            sel_total += u.value;
+            sel_count += 1;
+        }
+        coins.push(SpendCoin {
+            outpoint: format!("{}:{}", u.txid, u.vout).into(),
+            value: u.value.to_string().into(),
+            confirmed: u.height.is_some(),
+            selected,
+        });
+    }
+    w.set_spend_coins(VecModel::from_slice(&coins));
+    let plural = if sel_count == 1 { "" } else { "s" };
+    w.set_spend_title(format!("Spending {sel_count} coin{plural} · {sel_total} sats").into());
+
     if text.is_empty() {
         w.set_cost_line("".into());
         w.set_change_amount(format!("Change → {change_dest}").into());
+        w.set_spend_enough(true);
         return;
     }
-    let sent = if spk_len.is_some() { 330 } else { 0 };
-    let change_amt = preview_change(store, text.len(), private, rate, spk_len, sent)
-        .map(|c| format!("~{c} sats"))
-        .unwrap_or_else(|| "none".into());
-    w.set_change_amount(format!("Change → {change_dest} · {change_amt}").into());
-    let n_inputs = store.available_utxos().len().max(1);
-    match estimate_note_cost(text.len(), private, store.chunk_size, n_inputs, spk_len) {
+    let n = sel_count.max(1);
+    match estimate_note_cost(text.len(), private, store.chunk_size, n, spk_len) {
         Ok((chunks, vsize)) => {
             let fee = (vsize as f64 * rate).ceil() as u64;
+            let enough = sel_count > 0 && sel_total >= fee + sent;
+            let change = sel_total.saturating_sub(fee + sent);
             let usd = st
                 .usd
                 .map(|p| format!(" (~${:.2})", fee as f64 * p / 1e8))
@@ -530,8 +569,13 @@ fn update_cost(w: &AppWindow, st: &State) {
             w.set_cost_line(
                 format!("{chunks} chunk(s) · ~{vsize} vB · ~{fee} sats{usd}{dust}").into(),
             );
+            w.set_change_amount(format!("Change → {change_dest} · ~{change} sats").into());
+            w.set_spend_enough(enough);
         }
-        Err(e) => w.set_cost_line(format!("{e}").into()),
+        Err(e) => {
+            w.set_cost_line(format!("{e}").into());
+            w.set_spend_enough(false);
+        }
     }
 }
 
@@ -596,6 +640,8 @@ fn main() {
         fees: None,
         usd: None,
         to_address: None,
+        selected_coins: Vec::new(),
+        coins_overridden: false,
         material: None,
         pending_import: None,
         pending_mnemonic: None,
@@ -917,7 +963,7 @@ fn main() {
         w.set_fee_tier(tier);
         w.set_rate_text(format!("{rate}").into());
         println!("cb: fee-tier {tier} rate={rate}");
-        update_cost(&w, &s);
+        refresh_compose(&w, &mut s);
     });
 
     cb!(on_open_coins, |w, s| {
@@ -1201,9 +1247,12 @@ fn main() {
         w.set_rate_text(format!("{rate}").into());
         w.set_change_address("".into());
         w.set_change_expanded(false);
+        w.set_spend_expanded(false);
+        s.coins_overridden = false;
+        s.selected_coins.clear();
         w.set_status("".into());
         w.set_screen(6);
-        update_cost(&w, &s);
+        refresh_compose(&w, &mut s);
     });
 
     {
@@ -1311,8 +1360,25 @@ fn main() {
     });
 
     cb!(on_compose_changed, |w, s| {
-        let _ = &mut s;
-        update_cost(&w, &s);
+        refresh_compose(&w, &mut s);
+    });
+
+    cb!(on_toggle_coin, |w, s, outpoint: SharedString| {
+        // "txid:vout" → (txid, vout)
+        let op = outpoint.as_str();
+        if let Some((txid, vout)) = op.rsplit_once(':') {
+            if let Ok(vout) = vout.parse::<u32>() {
+                let key = (txid.to_string(), vout);
+                if let Some(i) = s.selected_coins.iter().position(|c| c == &key) {
+                    s.selected_coins.remove(i);
+                } else {
+                    s.selected_coins.push(key);
+                }
+                s.coins_overridden = true;
+                println!("cb: toggle-coin selected={}", s.selected_coins.len());
+                refresh_compose(&w, &mut s);
+            }
+        }
     });
 
     cb!(on_compose_send, |w, s| {
@@ -1335,9 +1401,14 @@ fn main() {
             w.set_status("no esplora endpoint — set one in Settings".into());
             return;
         };
+        if !w.get_spend_enough() {
+            w.set_status("selected coins don't cover the note + fee".into());
+            return;
+        }
         let ident_ptr = s.ident.as_ref().map(|i| i.identity.output_x);
         let Some(_) = ident_ptr else { return };
         let identity = s.ident.as_ref().unwrap().identity.clone_fields();
+        let coins_vec = s.selected_coins.clone();
         let result = compose_and_record(
             s.store.as_mut().unwrap(),
             &identity,
@@ -1347,6 +1418,7 @@ fn main() {
                 private,
                 recipient: to.as_deref(),
                 change_to: (!change_addr.is_empty()).then_some(change_addr.as_str()),
+                coins: (!coins_vec.is_empty()).then_some(coins_vec.as_slice()),
                 fee_rate: rate,
                 now: now(),
             },
@@ -1366,6 +1438,9 @@ fn main() {
                         w.set_compose_text("".into());
                         w.set_change_address("".into());
                         w.set_change_expanded(false);
+                        w.set_spend_expanded(false);
+                        s.coins_overridden = false;
+                        s.selected_coins.clear();
                         w.set_screen(4);
                         refresh(&w, &mut s);
                     }

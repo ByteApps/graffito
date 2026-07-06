@@ -8,6 +8,7 @@ export struct NoteItem { id: string, title: string, meta: string, badge: string,
 export struct ContactItem { address: string, name: string }
 export struct AccountItem { index: int, address: string, active: bool }
 export struct CoinItem { outpoint: string, value: string, status: string }
+export struct SpendCoin { outpoint: string, value: string, confirmed: bool, selected: bool }
 export struct ActivityItem {
     ref-id: string, is-note: bool, kind: string, title: string,
     txid: string, fee-line: string, status: string, explorer: string,
@@ -363,6 +364,11 @@ export component AppWindow inherits Window {
     in-out property <string> change-address;
     in-out property <bool> change-expanded;
     in property <string> change-amount;
+    in property <string> change-error;
+    in property <[SpendCoin]> spend-coins;
+    in property <string> spend-title;
+    in-out property <bool> spend-expanded;
+    in property <bool> spend-enough: true;
     in property <[ContactItem]> contacts;
     in-out property <string> contact-input;
     in-out property <string> rename-address;
@@ -434,6 +440,7 @@ export component AppWindow inherits Window {
     callback compose-changed();
     callback compose-send();
     callback change-scan();
+    callback toggle-coin(string);
     callback settings-open();
     callback set-network(string);
     callback hide-backup();
@@ -797,11 +804,101 @@ export component AppWindow inherits Window {
             font-weight: 600;
             color: Pal.accent;
         }
+        // ---- coin control (collapsible) ----
         Rectangle {
             border-radius: 10px;
             background: Pal.card;
             border-width: 1px;
-            border-color: Pal.line;
+            border-color: root.spend-enough ? Pal.line : Pal.bad;
+            height: spend-col.preferred-height;
+            spend-col := VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                Rectangle {
+                    height: 22px;
+                    TouchArea { clicked => { root.spend-expanded = !root.spend-expanded; } }
+                    HorizontalLayout {
+                        Text {
+                            text: root.spend-title;
+                            font-size: 12px;
+                            color: root.spend-enough ? Pal.muted : Pal.bad;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { }
+                        Image {
+                            source: root.spend-expanded
+                                ? @image-url("icons/caret-up.svg")
+                                : @image-url("icons/caret-down.svg");
+                            colorize: Pal.muted;
+                            width: 16px;
+                            height: 16px;
+                            y: (parent.height - 16px) / 2;
+                        }
+                    }
+                }
+                if root.spend-expanded: Caption {
+                    text: "Tap coins to include or exclude. The note spends exactly what's selected.";
+                }
+                if root.spend-expanded && !root.spend-enough: Caption {
+                    text: "Selected coins don't cover the note + fee — select more.";
+                    color: Pal.bad;
+                }
+                if root.spend-expanded: VerticalLayout {
+                    spacing: 6px;
+                    for c in root.spend-coins: Rectangle {
+                        height: 42px;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: c.selected ? Pal.accent : Pal.line;
+                        background: c.selected ? Pal.accent.with-alpha(0.10) : transparent;
+                        cta := TouchArea { clicked => { root.toggle-coin(c.outpoint); } }
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 10px;
+                            Rectangle {
+                                width: 18px;
+                                height: 18px;
+                                y: (parent.height - 18px) / 2;
+                                border-radius: 4px;
+                                border-width: 2px;
+                                border-color: c.selected ? Pal.accent : Pal.muted;
+                                background: c.selected ? Pal.accent : transparent;
+                                if c.selected: Rectangle {
+                                    width: 8px; height: 8px;
+                                    x: (parent.width - 8px) / 2;
+                                    y: (parent.height - 8px) / 2;
+                                    background: Pal.on-accent;
+                                    border-radius: 2px;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: c.value + " sats";
+                                    font-size: 12px;
+                                    color: Pal.text;
+                                }
+                            }
+                            Rectangle { }
+                            VerticalLayout {
+                                alignment: center;
+                                Badge {
+                                    label: c.confirmed ? "confirmed" : "unconfirmed";
+                                    tint: c.confirmed ? Pal.good : Pal.warn;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // ---- change output (collapsible) ----
+        Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: root.change-error != "" ? Pal.bad : Pal.line;
             height: change-col.preferred-height;
             change-col := VerticalLayout {
                 padding: 10px;
@@ -840,6 +937,7 @@ export component AppWindow inherits Window {
                     }
                     ScanButton { clicked => { root.change-scan(); } }
                 }
+                if root.change-error != "": Caption { text: root.change-error; color: Pal.bad; }
             }
         }
         Caption {
@@ -847,7 +945,12 @@ export component AppWindow inherits Window {
                 ? "Encrypted forever on-chain; only your key (and a directed recipient) can read it."
                 : "⚠  Public notes are world-readable, forever.";
         }
-        PrimaryButton { text: "Sign + broadcast"; clicked => { root.compose-send(); } }
+PrimaryButton {
+            text: "Sign + broadcast";
+            tint: root.spend-enough ? Pal.accent : Pal.faint;
+            tint-hover: root.spend-enough ? Pal.accent-hover : Pal.faint;
+            clicked => { if (root.spend-enough) { root.compose-send(); } }
+        }
         Caption { text: root.status; color: Pal.bad; }
     }
 
