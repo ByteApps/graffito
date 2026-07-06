@@ -59,6 +59,10 @@ pub struct NoteRecord {
     /// Inputs this note's signed tx spends — pending bookkeeping only.
     #[serde(default)]
     pub spent: Vec<OutPointRef>,
+    /// Raw signed tx hex while Pending — enables rebroadcast (and fee
+    /// bumps) across app restarts. Cleared on confirmation.
+    #[serde(default)]
+    pub raw_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +223,7 @@ impl Store {
                     n.status = NoteStatus::Confirmed;
                     n.height = *h;
                     n.blocktime = *bt;
+                    n.raw_hex = None; // on-chain now — no rebroadcast needed
                 }
             }
         }
@@ -252,6 +257,7 @@ impl Store {
                     n.status = NoteStatus::Confirmed;
                     n.height = note.height;
                     n.blocktime = note.blocktime;
+                    n.raw_hex = None;
                 }
                 if n.text.is_none() {
                     n.text = note.text.clone();
@@ -280,6 +286,7 @@ impl Store {
                     blocktime: note.blocktime,
                     created_at: None,
                     spent: Vec::new(),
+                    raw_hex: None,
                 });
                 true
             }

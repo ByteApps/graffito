@@ -190,6 +190,41 @@ fn directed_private_note_both_sides() {
 }
 
 #[test]
+fn bump_fee_same_note_id_same_inputs_higher_fee() {
+    use app_core::compose::bump_fee;
+    let a = alice();
+    let mut store = funded_store(&a);
+    let n1 = compose_and_record(
+        &mut store, &a, NET,
+        &ComposeRequest { text: "bump me", private: true, recipient: None, fee_rate: 1.0, now: 1 },
+    )
+    .unwrap();
+    assert!(store.notes[0].raw_hex.is_some(), "raw kept for rebroadcast");
+
+    let bumped = bump_fee(&mut store, &a, NET, &n1.note_id, 5.0).unwrap();
+    assert_eq!(bumped.note_id, n1.note_id, "note identity survives RBF");
+    assert_ne!(bumped.tx.txid_hex, n1.tx.txid_hex, "txid changes");
+    assert!(bumped.tx.fee > n1.tx.fee, "fee actually higher");
+    assert_eq!(bumped.tx.spent_outpoints, n1.tx.spent_outpoints, "same inputs");
+    let rec = &store.notes[0];
+    assert_eq!(rec.txids, vec![n1.tx.txid_hex.clone(), bumped.tx.txid_hex.clone()]);
+    assert_eq!(rec.raw_hex.as_deref(), Some(bumped.tx.raw_hex.as_str()));
+    // Old change gone from the ledger, new change present.
+    assert!(!store.utxos.iter().any(|u| u.txid == n1.tx.txid_hex));
+    assert!(store.utxos.iter().any(|u| u.txid == bumped.tx.txid_hex));
+
+    // Confirmation of the bumped tx clears raw_hex and confirms the note.
+    let b = bundle(
+        vec![onchain(&bumped.tx, 120, true, None, None)],
+        vec![change_utxo(&bumped.tx, Some(120))],
+        120,
+    );
+    store.apply_bundle(&b, &a, NET).unwrap();
+    assert_eq!(store.notes[0].status, NoteStatus::Confirmed);
+    assert!(store.notes[0].raw_hex.is_none());
+}
+
+#[test]
 fn orphaned_when_inputs_spent_elsewhere() {
     let a = alice();
     let mut store = funded_store(&a);

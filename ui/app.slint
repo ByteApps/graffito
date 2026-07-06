@@ -267,8 +267,10 @@ component DoorCard inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
-    width: 480px;
-    height: 780px;
+    preferred-width: 480px;
+    preferred-height: 780px;
+    min-width: 440px;
+    min-height: 620px;
     title: "Chain Notes";
     background: Pal.bg;
 
@@ -291,11 +293,16 @@ export component AppWindow inherits Window {
     in property <[NoteItem]> notes;
     in property <string> note-detail;
     in property <string> note-web-url;
+    in-out property <string> note-view-id;
+    in property <bool> note-pending;
+    in property <string> note-txid;
+    in-out property <string> bump-rate;
 
     in property <string> to-label;
     in-out property <string> compose-text;
     in-out property <bool> compose-private: true;
     in-out property <string> rate-text;
+    in-out property <int> fee-tier: 1;
     in property <string> cost-line;
     in property <[ContactItem]> contacts;
     in-out property <string> contact-input;
@@ -314,6 +321,9 @@ export component AppWindow inherits Window {
     in-out property <bool> chunk-custom;
     in-out property <string> esplora-text;
     in property <string> reveal-text;
+    in-out property <string> sweep-dest;
+    in-out property <string> sweep-rate: "1";
+    in-out property <bool> show-sweep-confirm;
 
     callback door-import();
     callback door-create(int);
@@ -326,6 +336,11 @@ export component AppWindow inherits Window {
     callback refresh();
     callback open-note(string);
     callback open-note-web();
+    callback copy-text(string, string);
+    callback rebroadcast-note();
+    callback bump-note(string);
+    callback set-fee-tier(int);
+    callback sweep();
     callback compose-open();
     callback pick-contact(string);
     callback contact-scan();
@@ -489,7 +504,7 @@ export component AppWindow inherits Window {
             IconButton { glyph: "⚙"; clicked => { root.settings-open(); } }
         }
         Card {
-            height: 124px;
+            height: 148px;
             HorizontalLayout {
                 padding: 12px;
                 spacing: 14px;
@@ -520,6 +535,16 @@ export component AppWindow inherits Window {
                         text: root.address;
                         font-size: 10px;
                         color: Pal.muted;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        GhostButton {
+                            width: 110px;
+                            height: 26px;
+                            text: "Copy address";
+                            clicked => { root.copy-text("address", root.address); }
+                        }
                     }
                     Caption { text: root.status; }
                 }
@@ -590,10 +615,27 @@ export component AppWindow inherits Window {
                 font-size: 12px;
             }
         }
+        HorizontalLayout {
+            spacing: 10px;
+            GhostButton { text: "Copy text"; clicked => { root.copy-text("note-text", root.note-detail); } }
+            GhostButton { text: "Copy txid"; clicked => { root.copy-text("txid", root.note-txid); } }
+        }
+        if root.note-pending: VerticalLayout {
+            spacing: 8px;
+            Caption { text: "Still unconfirmed. Bump replaces it with a higher-fee version (same note), or rebroadcast the existing transaction."; }
+            HorizontalLayout {
+                spacing: 10px;
+                LineEdit { width: 84px; text <=> root.bump-rate; }
+                Caption { text: "sat/vB"; vertical-alignment: center; }
+                GhostButton { text: "Bump fee"; clicked => { root.bump-note(root.bump-rate); } }
+                GhostButton { text: "Rebroadcast"; clicked => { root.rebroadcast-note(); } }
+            }
+        }
         if root.note-web-url != "": GhostButton {
             text: "Open in web viewer";
             clicked => { root.open-note-web(); }
         }
+        Caption { text: root.status; }
         if root.note-web-url == "": Caption {
             text: "Web viewer link unavailable on regtest.";
         }
@@ -641,9 +683,20 @@ export component AppWindow inherits Window {
             LineEdit {
                 width: 84px;
                 text <=> root.rate-text;
-                edited => { root.compose-changed(); }
+                edited => {
+                    root.fee-tier = 3;
+                    root.compose-changed();
+                }
             }
             Caption { text: "sat/vB"; vertical-alignment: center; }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            SelectPill { text: "economy"; active: root.fee-tier == 0; clicked => { root.set-fee-tier(0); } }
+            SelectPill { text: "normal"; active: root.fee-tier == 1; clicked => { root.set-fee-tier(1); } }
+            SelectPill { text: "fast"; active: root.fee-tier == 2; clicked => { root.set-fee-tier(2); } }
+            SelectPill { text: "custom"; active: root.fee-tier == 3; clicked => { root.fee-tier = 3; } }
         }
         if root.cost-line != "": Text {
             text: root.cost-line;
@@ -739,11 +792,15 @@ export component AppWindow inherits Window {
     if screen == 8: VerticalLayout {
         padding: 20px;
         spacing: 12px;
-        alignment: start;
         Header {
             title: "Settings";
             back => { root.go-home(); }
         }
+        Flickable {
+            viewport-height: settings-col.preferred-height;
+            settings-col := VerticalLayout {
+                spacing: 12px;
+                alignment: start;
         SettingsCard {
             title: "Identity";
             subtitle: root.settings-identity;
@@ -818,6 +875,20 @@ export component AppWindow inherits Window {
             }
         }
         SettingsCard {
+            title: "Funds";
+            subtitle: "Move everything off the notes address (minus the fee) — e.g. returning testnet coins.";
+            HorizontalLayout {
+                spacing: 8px;
+                LineEdit { text <=> root.sweep-dest; placeholder-text: "destination address"; }
+                LineEdit { width: 64px; text <=> root.sweep-rate; }
+                Caption { text: "sat/vB"; vertical-alignment: center; }
+            }
+            GhostButton {
+                text: "Sweep all funds…";
+                clicked => { root.show-sweep-confirm = true; }
+            }
+        }
+        SettingsCard {
             title: "Backup";
             subtitle: "Shows the exact key material you imported or created. Anyone who sees it controls the funds and every private note.";
             GhostButton { text: "Reveal backup  ·  asks for Touch ID"; clicked => { root.reveal-backup(); } }
@@ -840,6 +911,8 @@ export component AppWindow inherits Window {
             }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
+            }
+        }
     }
 
     // ---------- 9 · account picker ----------
@@ -1043,6 +1116,54 @@ export component AppWindow inherits Window {
                         tint: Pal.bad;
                         tint-hover: #ff6b62;
                         clicked => { root.reset-identity(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- sweep confirmation (modal overlay) ----------
+    if root.show-sweep-confirm: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.show-sweep-confirm = false; } }
+        Rectangle {
+            width: 400px;
+            height: sl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { }
+            sl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Sweep all funds?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Body { text: root.balance-line; font-size: 12px; }
+                Mono {
+                    text: "→ " + root.sweep-dest;
+                    font-size: 10px;
+                    color: Pal.muted;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+                Caption { text: "Sends the entire balance (minus the fee). Pending notes' locked inputs are not touched."; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.show-sweep-confirm = false; } }
+                    PrimaryButton {
+                        text: "Sweep";
+                        tint: Pal.bad;
+                        tint-hover: #ff6b62;
+                        clicked => { root.sweep(); }
                     }
                 }
             }
