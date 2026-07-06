@@ -101,6 +101,7 @@ pub fn compose_and_record(
         created_at: Some(req.now),
         spent,
         raw_hex: Some(tx.raw_hex.clone()),
+        fee: Some(tx.fee),
     };
     store.record_signed(record, change);
 
@@ -186,6 +187,55 @@ pub fn bump_fee(
         .expect("checked above");
     rec.txids.push(tx.txid_hex.clone());
     rec.raw_hex = Some(tx.raw_hex.clone());
+    rec.fee = Some(tx.fee);
 
     Ok(ComposedNote { note_id: note_id_hex.to_string(), tx })
+}
+
+/// RBF-bump a pending sweep/consolidate: re-sign the SAME inputs to the
+/// SAME destination at a higher rate. Returns the new signed tx; the
+/// caller broadcasts it and the store swaps txids/raw_hex/fee.
+pub fn bump_raw_tx(
+    store: &mut Store,
+    identity: &Identity,
+    txid: &str,
+    new_rate: f64,
+) -> Result<notes_core::tx::NoteTx, Error> {
+    let rec = store
+        .txs
+        .iter()
+        .find(|t| {
+            t.txids.iter().any(|x| x == txid) && t.status == crate::store::NoteStatus::Pending
+        })
+        .ok_or(Error::Store("only pending sweeps/consolidations can be bumped".into()))?;
+    let inputs: Vec<notes_core::tx::Utxo> = rec
+        .inputs
+        .iter()
+        .map(|i| {
+            let mut t = [0u8; 32];
+            hex::decode_to_slice(&i.txid, &mut t).map_err(|_| Error::Store("bad txid".into()))?;
+            t.reverse();
+            Ok(notes_core::tx::Utxo { txid: t, vout: i.vout, value: i.value })
+        })
+        .collect::<Result<_, Error>>()?;
+    let dest_spk =
+        hex::decode(&rec.dest_spk_hex).map_err(|_| Error::Store("bad dest spk".into()))?;
+    let tx = notes_core::tx::build_sweep_tx(
+        &inputs,
+        &identity.output_x,
+        dest_spk,
+        new_rate,
+        &identity.tweaked_seckey,
+        generate_aux_rand,
+    )?;
+    let rec = store
+        .txs
+        .iter_mut()
+        .find(|t| t.txids.iter().any(|x| x == txid))
+        .expect("checked above");
+    rec.txids.push(tx.txid_hex.clone());
+    rec.raw_hex = Some(tx.raw_hex.clone());
+    rec.fee = tx.fee;
+    rec.value = tx.tx.outputs[0].value;
+    Ok(tx)
 }
