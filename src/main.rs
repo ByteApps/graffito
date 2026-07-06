@@ -135,7 +135,13 @@ fn update_home(w: &AppWindow, st: &State) {
             };
             NoteItem {
                 id: n.note_id.clone().into(),
-                title: n.text.clone().unwrap_or_else(|| "(not decryptable)".into()).into(),
+                title: n
+                    .text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("(not decryptable)")
+                    .into(),
                 badge: badge.into(),
                 meta: format!(
                     "{kind}{}",

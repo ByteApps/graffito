@@ -94,10 +94,12 @@ component GhostButton inherits Rectangle {
 
 component IconButton inherits Rectangle {
     in property <string> glyph;
+    in property <length> glyph-size: 17px;
+    in property <color> glyph-color: Pal.muted;
     callback clicked;
-    width: 36px;
-    height: 36px;
-    border-radius: 18px;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
     background: ta.has-hover ? Pal.card-hover : transparent;
     ta := TouchArea { clicked => { root.clicked(); } }
     Text {
@@ -106,8 +108,8 @@ component IconButton inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         text: root.glyph;
-        color: Pal.muted;
-        font-size: 17px;
+        color: root.glyph-color;
+        font-size: root.glyph-size;
     }
 }
 
@@ -119,6 +121,9 @@ component Header inherits HorizontalLayout {
     height: 40px;
     if root.show-back: IconButton {
         glyph: "‹";
+        glyph-size: 30px;
+        glyph-color: Pal.text;
+        width: 44px;
         clicked => { root.back(); }
     }
     Text {
@@ -160,13 +165,11 @@ component DoorCard inherits Rectangle {
     border-width: 1px;
     border-color: root.highlight ? Pal.accent.with-alpha(0.55) : Pal.line;
     background: ta.has-hover ? Pal.card-hover : Pal.card;
-    height: l.preferred-height + 32px;
+    height: l.preferred-height;
     ta := TouchArea { clicked => { root.clicked(); } }
     l := VerticalLayout {
-        x: 16px;
-        y: 14px;
-        width: parent.width - 32px;
-        spacing: 4px;
+        padding: 16px;
+        spacing: 5px;
         Text {
             text: root.title;
             font-size: 14px;
@@ -438,14 +441,19 @@ export component AppWindow inherits Window {
                             overflow: elide;
                         }
                         HorizontalLayout {
-                            spacing: 6px;
+                            spacing: 8px;
                             alignment: start;
+                            height: 20px;
                             Badge {
                                 label: note.badge;
                                 tint: note.badge == "confirmed" ? Pal.good
                                     : (note.badge == "pending" ? Pal.warn : Pal.bad);
                             }
-                            Caption { text: note.meta; }
+                            Caption {
+                                text: note.meta;
+                                vertical-alignment: center;
+                                height: 20px;
+                            }
                         }
                     }
                 }
