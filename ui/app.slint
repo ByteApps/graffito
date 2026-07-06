@@ -8,6 +8,9 @@ export struct NoteItem { id: string, title: string, meta: string, badge: string 
 export struct ContactItem { address: string, name: string }
 export struct AccountItem { index: int, address: string, active: bool }
 export struct CoinItem { outpoint: string, value: string, status: string }
+export struct ActivityItem {
+    ref-id: string, is-note: bool, kind: string, title: string,
+    txid: string, fee: string, status: string, explorer: string, pending: bool }
 
 // ---- palette ----
 global Pal {
@@ -157,6 +160,24 @@ component Badge inherits Rectangle {
         color: root.tint;
         font-size: 10px;
         font-weight: 600;
+    }
+}
+
+component SvgIconButton inherits Rectangle {
+    in property <string> icon;
+    callback clicked;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Image {
+        source: root.icon == "activity" ? @image-url("icons/activity.svg") : @image-url("icons/copy.svg");
+        colorize: Pal.muted;
+        width: 19px;
+        height: 19px;
+        x: (parent.width - 19px) / 2;
+        y: (parent.height - 19px) / 2;
     }
 }
 
@@ -341,6 +362,9 @@ export component AppWindow inherits Window {
     in property <string> reveal-text;
     in property <[CoinItem]> coins;
     in property <string> coins-summary;
+    in property <[ActivityItem]> activity;
+    in property <string> activity-summary;
+    in-out property <string> activity-rate: "2";
     in-out property <string> consolidate-rate: "1";
     in-out property <bool> show-consolidate-confirm;
     in-out property <string> sweep-dest;
@@ -365,6 +389,10 @@ export component AppWindow inherits Window {
     callback sweep();
     callback open-coins();
     callback consolidate();
+    callback open-activity();
+    callback act-retry(string, bool);
+    callback act-bump(string, bool, string);
+    callback act-explorer(string);
     callback compose-open();
     callback pick-contact(string);
     callback contact-scan();
@@ -525,6 +553,7 @@ export component AppWindow inherits Window {
             }
             Rectangle { }
             IconButton { glyph: "↻"; clicked => { root.refresh(); } }
+            SvgIconButton { icon: "activity"; clicked => { root.open-activity(); } }
             IconButton { glyph: "⚙"; clicked => { root.settings-open(); } }
         }
         Card {
@@ -1068,6 +1097,87 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // ---------- 11 · activity (transactions) ----------
+    if screen == 11: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: "Activity";
+            back => { root.go-home(); }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Caption { text: "Bump rate"; vertical-alignment: center; }
+            LineEdit { width: 74px; text <=> root.activity-rate; }
+            Caption { text: "sat/vB — used when you Bump a stuck tx"; vertical-alignment: center; }
+        }
+        Caption { text: root.activity-summary; }
+        Flickable {
+            viewport-height: act-col.preferred-height;
+            act-col := VerticalLayout {
+                spacing: 8px;
+                alignment: start;
+                for a in root.activity: Rectangle {
+                    height: ail.preferred-height;
+                    border-radius: 10px;
+                    background: Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    ail := VerticalLayout {
+                        padding: 12px;
+                        spacing: 5px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: a.kind;
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: Pal.text;
+                            }
+                            Rectangle { }
+                            Badge {
+                                label: a.status;
+                                tint: a.status == "confirmed" ? Pal.good
+                                    : (a.status == "pending" ? Pal.warn : Pal.bad);
+                            }
+                        }
+                        Body { text: a.title; font-size: 12px; overflow: elide; }
+                        Mono {
+                            text: a.txid + "  ·  fee " + a.fee;
+                            font-size: 10px;
+                            color: Pal.muted;
+                            wrap: no-wrap;
+                            overflow: elide;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            if a.pending: GhostButton {
+                                width: 96px;
+                                height: 30px;
+                                text: "Bump fee";
+                                clicked => { root.act-bump(a.ref-id, a.is-note, root.activity-rate); }
+                            }
+                            if a.pending: GhostButton {
+                                width: 108px;
+                                height: 30px;
+                                text: "Rebroadcast";
+                                clicked => { root.act-retry(a.ref-id, a.is-note); }
+                            }
+                            if a.explorer != "": GhostButton {
+                                width: 92px;
+                                height: 30px;
+                                text: "Explorer";
+                                clicked => { root.act-explorer(a.explorer); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if root.status != "": Caption { text: root.status; color: Pal.bad; }
     }
 
     // ---------- rename dialog (modal overlay) ----------

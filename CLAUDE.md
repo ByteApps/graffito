@@ -50,7 +50,8 @@ rename dialog + confirmed remove) · 8 settings (Identity card w/
 account switch + reset, network/chunk pills, esplora, Coins card,
 Funds/sweep, Touch ID reveal — Flickable-scrollable) · 9 account
 picker (paginated, 5/page, current badge) · 10 coins (spendable UTXO
-list + consolidate-to-self). Modals
+list + consolidate-to-self) · 11 activity (all note + sweep/consolidate
+txs; pending get Bump-fee/Rebroadcast/Explorer). Modals
 (overlays as LAST children of the window root): rename, remove-confirm,
 reset-confirm, sweep-confirm, consolidate-confirm.
 
@@ -87,6 +88,10 @@ typed as text.
 
 ## Invariants
 
+- Sweep/consolidate txs are tracked in `store.txs` (`TxRecord`) so they
+  get the same pending→confirmed lifecycle, rebroadcast, and RBF
+  (`bump_raw_tx`) as notes; confirmed when their inputs vanish on a full
+  scan. Notes' own RBF is `bump_fee` (same note_id, same inputs).
 - **notes-core is a pinned git dependency** (`ObjSal/prime-chain-notes`)
   and the ONLY producer of on-chain bytes: envelope, sealing, dm ECDH,
   tx build/sign all go through it — never reimplement, so app txs stay

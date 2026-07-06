@@ -63,6 +63,41 @@ pub struct NoteRecord {
     /// bumps) across app restarts. Cleared on confirmation.
     #[serde(default)]
     pub raw_hex: Option<String>,
+    /// Fee (sats) of the current tx — for the activity view.
+    #[serde(default)]
+    pub fee: Option<u64>,
+}
+
+/// One input spent by a sweep/consolidate tx — kept for RBF re-signing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxInput {
+    pub txid: String, // display hex
+    pub vout: u32,
+    pub value: u64,
+}
+
+/// A non-note transaction the app broadcast (sweep or consolidate).
+/// Notes track their own lifecycle in `NoteRecord`; this ledger gives
+/// sweeps/consolidations the same pending → confirmed tracking plus
+/// rebroadcast and RBF, so a stuck admin tx isn't lost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxRecord {
+    pub kind: String, // "sweep" | "consolidate"
+    pub txids: Vec<String>,
+    pub status: NoteStatus,
+    pub value: u64, // output value (sats delivered)
+    pub fee: u64,
+    #[serde(default)]
+    pub created_at: Option<u64>,
+    #[serde(default)]
+    pub raw_hex: Option<String>,
+    /// Destination label for display (address or "self").
+    #[serde(default)]
+    pub dest: String,
+    /// Exact inputs + destination script, so an RBF bump re-signs the
+    /// same spend at a higher rate.
+    pub inputs: Vec<TxInput>,
+    pub dest_spk_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +134,9 @@ pub struct Store {
     /// Recents-ordered, front = latest use (the Prime contacts rule).
     #[serde(default)]
     pub contacts: Vec<Contact>,
+    /// Sweep/consolidate transactions (newest last).
+    #[serde(default)]
+    pub txs: Vec<TxRecord>,
     #[serde(default)]
     pub tip_height: u64,
     #[serde(default)]
@@ -124,6 +162,7 @@ impl Store {
             notes: Vec::new(),
             utxos: Vec::new(),
             contacts: Vec::new(),
+            txs: Vec::new(),
             tip_height: 0,
             last_scan_time: 0,
             chunk_size: DEFAULT_CHUNK,
@@ -230,6 +269,21 @@ impl Store {
 
         if bundle.full {
             self.reconcile_utxos_full(bundle, &mut stats);
+            // Sweep/consolidate txs: confirmed once every input they spent
+            // is gone from the authoritative UTXO set (server auto-mines;
+            // the funds left, so the tx landed). RBF replacements share
+            // the same inputs, so this resolves either way.
+            let present: std::collections::HashSet<(&str, u32)> =
+                bundle.utxos.iter().map(|u| (u.txid.as_str(), u.vout)).collect();
+            for t in &mut self.txs {
+                if t.status == NoteStatus::Pending
+                    && !t.inputs.is_empty()
+                    && t.inputs.iter().all(|i| !present.contains(&(i.txid.as_str(), i.vout)))
+                {
+                    t.status = NoteStatus::Confirmed;
+                    t.raw_hex = None;
+                }
+            }
         } else {
             self.merge_utxos_incremental(bundle);
         }
@@ -237,6 +291,34 @@ impl Store {
         self.tip_height = self.tip_height.max(bundle.tip_height);
         self.last_scan_time = bundle.bundle_time;
         Ok(stats)
+    }
+
+    /// Record a broadcast sweep/consolidate for the activity view + RBF.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_tx(
+        &mut self,
+        kind: &str,
+        txid: String,
+        value: u64,
+        fee: u64,
+        raw_hex: String,
+        dest: String,
+        inputs: Vec<TxInput>,
+        dest_spk_hex: String,
+        now: u64,
+    ) {
+        self.txs.push(TxRecord {
+            kind: kind.to_string(),
+            txids: vec![txid],
+            status: NoteStatus::Pending,
+            value,
+            fee,
+            created_at: Some(now),
+            raw_hex: Some(raw_hex),
+            dest,
+            inputs,
+            dest_spk_hex,
+        });
     }
 
     /// Returns true if the note was new.
@@ -287,6 +369,7 @@ impl Store {
                     created_at: None,
                     spent: Vec::new(),
                     raw_hex: None,
+                    fee: None,
                 });
                 true
             }

@@ -85,6 +85,110 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+fn spendable_inputs(store: &Store) -> Vec<app_core::store::TxInput> {
+    store
+        .utxos
+        .iter()
+        .filter(|u| !u.pending_spend)
+        .map(|u| app_core::store::TxInput { txid: u.txid.clone(), vout: u.vout, value: u.value })
+        .collect()
+}
+
+/// mempool.space tx permalink, or empty on regtest (no public explorer).
+fn explorer_tx_url(network: Network, txid: &str) -> String {
+    match network {
+        Network::Regtest => String::new(),
+        Network::Mainnet => format!("https://mempool.space/tx/{txid}"),
+        net => format!("https://mempool.space/{}/tx/{txid}", net.as_str()),
+    }
+}
+
+/// Build the unified activity list (note txs + sweep/consolidate),
+/// actionable (pending) first, then newest.
+fn update_activity(w: &AppWindow, st: &State) {
+    let Some(store) = &st.store else { return };
+    let net = st.network;
+    let mut items: Vec<(u64, bool, ActivityItem)> = Vec::new(); // (created, confirmed, item)
+
+    for n in &store.notes {
+        let Some(txid) = n.txids.last() else { continue };
+        let kind = format!(
+            "Note · {}{}",
+            if n.private { "private" } else { "public" },
+            if n.received {
+                " · received"
+            } else if n.directed {
+                " · sent"
+            } else {
+                ""
+            }
+        );
+        let status = match n.status {
+            NoteStatus::Pending => "pending",
+            NoteStatus::Confirmed => "confirmed",
+            NoteStatus::Orphaned => "orphaned",
+        };
+        items.push((
+            n.created_at.or(n.blocktime).unwrap_or(0),
+            n.status == NoteStatus::Confirmed,
+            ActivityItem {
+                ref_id: n.note_id.clone().into(),
+                is_note: true,
+                kind: kind.into(),
+                title: n.text.clone().unwrap_or_else(|| "(encrypted)".into()).into(),
+                txid: txid.clone().into(),
+                fee: n.fee.map(|f| f.to_string()).unwrap_or_else(|| "—".into()).into(),
+                status: status.into(),
+                explorer: explorer_tx_url(net, txid).into(),
+                pending: n.status == NoteStatus::Pending && n.raw_hex.is_some(),
+            },
+        ));
+    }
+
+    for t in &store.txs {
+        let Some(txid) = t.txids.last() else { continue };
+        let status = match t.status {
+            NoteStatus::Pending => "pending",
+            NoteStatus::Confirmed => "confirmed",
+            NoteStatus::Orphaned => "orphaned",
+        };
+        let title = if t.dest == "self" {
+            format!("Consolidate → your address · {} sats", t.value)
+        } else {
+            format!("→ {} · {} sats", t.dest, t.value)
+        };
+        items.push((
+            t.created_at.unwrap_or(0),
+            t.status == NoteStatus::Confirmed,
+            ActivityItem {
+                ref_id: txid.clone().into(),
+                is_note: false,
+                kind: if t.kind == "consolidate" { "Consolidate" } else { "Sweep" }.into(),
+                title: title.into(),
+                txid: txid.clone().into(),
+                fee: t.fee.to_string().into(),
+                status: status.into(),
+                explorer: explorer_tx_url(net, txid).into(),
+                pending: t.status == NoteStatus::Pending && t.raw_hex.is_some(),
+            },
+        ));
+    }
+
+    // Actionable (unconfirmed) first, then newest created.
+    items.sort_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+    let list: Vec<ActivityItem> = items.into_iter().map(|(_, _, it)| it).collect();
+    let pending = list.iter().filter(|i| i.pending).count();
+    w.set_activity_summary(
+        if list.is_empty() {
+            "No transactions yet.".to_string()
+        } else {
+            format!("{} transaction{} · {pending} pending", list.len(), if list.len() == 1 { "" } else { "s" })
+        }
+        .into(),
+    );
+    w.set_activity(VecModel::from_slice(&list));
+}
+
 fn normalize_addr(raw: &str) -> String {
     let mut s = raw.trim().to_string();
     if let Some(rest) = s.strip_prefix("bitcoin:").or_else(|| s.strip_prefix("BITCOIN:")) {
@@ -789,6 +893,93 @@ fn main() {
         w.set_screen(10);
     });
 
+    cb!(on_open_activity, |w, s| {
+        println!("cb: open-activity");
+        let rate = s.fees.as_ref().map(|f| f.fastest.max(2.0)).unwrap_or(2.0);
+        w.set_activity_rate(format!("{rate}").into());
+        update_activity(&w, &s);
+        w.set_status("".into());
+        w.set_screen(11);
+    });
+
+    cb!(on_act_retry, |w, s, ref_id: SharedString, is_note: bool| {
+        let Some(base) = s.base_url() else { return };
+        let raw = if is_note {
+            s.store
+                .as_ref()
+                .and_then(|st| st.notes.iter().find(|n| n.note_id.as_str() == ref_id.as_str()))
+                .and_then(|n| n.raw_hex.clone())
+        } else {
+            s.store
+                .as_ref()
+                .and_then(|st| st.txs.iter().find(|t| t.txids.iter().any(|x| x == ref_id.as_str())))
+                .and_then(|t| t.raw_hex.clone())
+        };
+        let Some(raw) = raw else {
+            w.set_status("nothing to rebroadcast".into());
+            return;
+        };
+        let client = ChainClient::new(HttpTransport::new(base), s.network);
+        match client.broadcast(&raw) {
+            Ok(txid) => {
+                println!("cb: act-retry ref={ref_id} txid={txid} ok");
+                w.set_status(format!("rebroadcast {}…", &txid[..12.min(txid.len())]).into());
+            }
+            Err(e) => {
+                println!("cb: act-retry ref={ref_id} err={e}");
+                w.set_status(format!("rebroadcast failed: {e}").into());
+            }
+        }
+    });
+
+    cb!(on_act_bump, |w, s, ref_id: SharedString, is_note: bool, rate_s: SharedString| {
+        let Ok(rate) = rate_s.trim().parse::<f64>() else {
+            w.set_status("bad fee rate".into());
+            return;
+        };
+        let net = s.network;
+        let Some(base) = s.base_url() else { return };
+        let identity = s.ident.as_ref().unwrap().identity.clone_fields();
+        let result: Result<(String, String, u64), app_core::Error> = if is_note {
+            app_core::compose::bump_fee(s.store.as_mut().unwrap(), &identity, net, ref_id.as_str(), rate)
+                .map(|c| (c.tx.raw_hex.clone(), c.tx.txid_hex.clone(), c.tx.fee))
+        } else {
+            app_core::compose::bump_raw_tx(s.store.as_mut().unwrap(), &identity, ref_id.as_str(), rate)
+                .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee))
+        };
+        match result {
+            Ok((raw, txid, fee)) => {
+                s.save_store();
+                let client = ChainClient::new(HttpTransport::new(base), net);
+                match client.broadcast(&raw) {
+                    Ok(bt) => {
+                        println!("cb: act-bump ref={ref_id} txid={txid} fee={fee} ok");
+                        w.set_status(format!("bumped → {}…", &bt[..12.min(bt.len())]).into());
+                        update_activity(&w, &s);
+                    }
+                    Err(e) => {
+                        println!("cb: act-bump ref={ref_id} broadcast err={e}");
+                        w.set_status(format!("bump signed but broadcast failed: {e}").into());
+                        update_activity(&w, &s);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("cb: act-bump ref={ref_id} err={e}");
+                w.set_status(format!("{e}").into());
+            }
+        }
+    });
+
+    cb!(on_act_explorer, |w, s, url: SharedString| {
+        let _ = &mut s;
+        if url.is_empty() {
+            return;
+        }
+        println!("cb: act-explorer");
+        let _ = std::process::Command::new("open").arg(url.as_str()).spawn();
+    });
+
     cb!(on_consolidate, |w, s| {
         w.set_show_consolidate_confirm(false);
         let rate: f64 = w.get_consolidate_rate().trim().parse().unwrap_or(1.0);
@@ -804,6 +995,8 @@ fn main() {
             w.set_status("nothing to consolidate (need 2+ coins)".into());
             return;
         }
+        let inputs = spendable_inputs(store);
+        let dest_spk_hex = hex::encode(&me.spk);
         let tx = app_core::notes_core::tx::build_sweep_tx(
             &store.available_utxos(),
             &identity.output_x,
@@ -820,6 +1013,7 @@ fn main() {
                         for u in &mut store.utxos {
                             u.pending_spend = true;
                         }
+                        store.record_tx("consolidate", txid.clone(), tx.tx.outputs[0].value, tx.fee, tx.raw_hex.clone(), "self".into(), inputs, dest_spk_hex, now());
                         s.save_store();
                         println!("cb: consolidate txid={txid} value={} fee={}", tx.tx.outputs[0].value, tx.fee);
                         w.set_status(format!("consolidating → {}…", &txid[..12.min(txid.len())]).into());
@@ -844,6 +1038,8 @@ fn main() {
         };
         let identity = s.ident.as_ref().unwrap().identity.clone_fields();
         let store = s.store.as_mut().unwrap();
+        let inputs = spendable_inputs(store);
+        let dest_spk_hex = hex::encode(&recipient.spk);
         let sweep = app_core::notes_core::tx::build_sweep_tx(
             &store.available_utxos(),
             &identity.output_x,
@@ -860,6 +1056,7 @@ fn main() {
                         for u in &mut store.utxos {
                             u.pending_spend = true;
                         }
+                        store.record_tx("sweep", txid.clone(), tx.tx.outputs[0].value, tx.fee, tx.raw_hex.clone(), dest.clone(), inputs, dest_spk_hex, now());
                         s.save_store();
                         println!(
                             "cb: sweep txid={txid} value={} fee={}",
