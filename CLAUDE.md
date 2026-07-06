@@ -51,6 +51,12 @@ prompts once (material cached in-session; APP_KEY env bypasses for
 automation); Reveal prompts fresh every time.
 `tests/qr_roundtrip.rs` proves render→decode without optics.
 
+**Icon rule:** femtovg (the default renderer) has no font fallback —
+non-Latin glyphs (✎ ✕ ▦ ＋ emoji) render as tofu. Icons are SVG assets
+in `ui/icons/` via `@image-url` + `colorize` (resvg ships in slint's
+default features); only universally-safe chars ("×", "‹", "Aa") may be
+typed as text.
+
 ## Invariants
 
 - **notes-core is a pinned git dependency** (`ObjSal/prime-chain-notes`)
