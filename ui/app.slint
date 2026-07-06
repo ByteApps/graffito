@@ -156,6 +156,27 @@ component Badge inherits Rectangle {
     }
 }
 
+component ScanButton inherits Rectangle {
+    callback clicked;
+    width: 44px;
+    height: 40px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Pal.line;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Rectangle {
+        width: 20px;
+        height: 20px;
+        x: (parent.width - 20px) / 2;
+        y: (parent.height - 20px) / 2;
+        Rectangle { x: 0; y: 0; width: 8px; height: 8px; border-width: 2px; border-color: Pal.accent; }
+        Rectangle { x: 12px; y: 0; width: 8px; height: 8px; border-width: 2px; border-color: Pal.accent; }
+        Rectangle { x: 0; y: 12px; width: 8px; height: 8px; border-width: 2px; border-color: Pal.accent; }
+        Rectangle { x: 12px; y: 12px; width: 8px; height: 8px; background: Pal.accent; }
+    }
+}
+
 component DoorCard inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
@@ -559,10 +580,14 @@ export component AppWindow inherits Window {
         }
         HorizontalLayout {
             spacing: 10px;
-            LineEdit { text <=> root.contact-input; placeholder-text: "taproot / segwit address"; }
+            LineEdit {
+                text <=> root.contact-input;
+                placeholder-text: "taproot / segwit address";
+                accepted(t) => { root.pick-contact(t); }
+            }
+            ScanButton { clicked => { root.contact-scan(); } }
             GhostButton { width: 64px; text: "Use"; clicked => { root.pick-contact(root.contact-input); } }
         }
-        GhostButton { text: "Scan address QR"; clicked => { root.contact-scan(); } }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
         Caption { text: root.contacts.length == 0 ? "" : "Recent"; }
         ListView {
@@ -578,10 +603,10 @@ export component AppWindow inherits Window {
                     border-color: Pal.line;
                     VerticalLayout {
                         x: 14px;
-                        y: 7px;
+                        height: parent.height;
                         width: parent.width - 28px;
                         spacing: 3px;
-                        alignment: start;
+                        alignment: center;
                         Text {
                             text: c.name == "" ? c.address : c.name;
                             font-size: 12px;
