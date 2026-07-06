@@ -587,7 +587,12 @@ fn main() {
                         w.set_status("scan: no QR seen".into());
                     } else {
                         println!("cb: contact-scan ok");
-                        w.set_contact_input(normalize_addr(&text).into());
+                        let a = normalize_addr(&text);
+                        // Prefill so a failed validation leaves it editable,
+                        // then pick directly — a valid scan goes straight
+                        // to Compose (the Prime picker behavior).
+                        w.set_contact_input(a.clone().into());
+                        w.invoke_pick_contact(a.into());
                     }
                 });
             });
