@@ -233,6 +233,8 @@ export component AppWindow inherits Window {
     in property <string> cost-line;
     in property <[ContactItem]> contacts;
     in-out property <string> contact-input;
+    in-out property <string> rename-address;
+    in-out property <string> rename-input;
 
     in property <string> settings-network;
     in-out property <string> chunk-text;
@@ -252,6 +254,10 @@ export component AppWindow inherits Window {
     callback compose-open();
     callback pick-contact(string);
     callback contact-scan();
+    callback start-rename(string, string);
+    callback save-rename(string);
+    callback cancel-rename();
+    callback remove-contact(string);
     callback compose-changed();
     callback compose-send();
     callback settings-open();
@@ -588,6 +594,20 @@ export component AppWindow inherits Window {
             ScanButton { clicked => { root.contact-scan(); } }
             GhostButton { width: 64px; text: "Use"; clicked => { root.pick-contact(root.contact-input); } }
         }
+        if root.rename-address != "": VerticalLayout {
+            spacing: 6px;
+            Caption { text: "Name for " + root.rename-address; overflow: elide; wrap: no-wrap; }
+            HorizontalLayout {
+                spacing: 10px;
+                LineEdit {
+                    text <=> root.rename-input;
+                    placeholder-text: "contact name (empty clears it)";
+                    accepted(t) => { root.save-rename(t); }
+                }
+                GhostButton { width: 70px; text: "Save"; clicked => { root.save-rename(root.rename-input); } }
+                GhostButton { width: 44px; text: "×"; clicked => { root.cancel-rename(); } }
+            }
+        }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
         Caption { text: root.contacts.length == 0 ? "" : "Recent"; }
         ListView {
@@ -601,19 +621,42 @@ export component AppWindow inherits Window {
                     background: ct.has-hover ? Pal.card-hover : Pal.card;
                     border-width: 1px;
                     border-color: Pal.line;
-                    VerticalLayout {
-                        x: 14px;
-                        height: parent.height;
-                        width: parent.width - 28px;
-                        spacing: 3px;
-                        alignment: center;
-                        Text {
-                            text: c.name == "" ? c.address : c.name;
-                            font-size: 12px;
-                            color: Pal.text;
-                            overflow: elide;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 6px;
+                        spacing: 2px;
+                        VerticalLayout {
+                            spacing: 3px;
+                            alignment: center;
+                            Text {
+                                text: c.name == "" ? c.address : c.name;
+                                font-size: 12px;
+                                color: Pal.text;
+                                overflow: elide;
+                            }
+                            if c.name != "": Caption { text: c.address; overflow: elide; }
                         }
-                        if c.name != "": Caption { text: c.address; overflow: elide; }
+                        VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                glyph: "Aa";
+                                glyph-size: 13px;
+                                width: 32px;
+                                height: 32px;
+                                clicked => { root.start-rename(c.address, c.name); }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                glyph: "×";
+                                glyph-size: 20px;
+                                width: 32px;
+                                height: 32px;
+                                glyph-color: Pal.bad;
+                                clicked => { root.remove-contact(c.address); }
+                            }
+                        }
                     }
                 }
             }

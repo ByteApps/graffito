@@ -599,6 +599,46 @@ fn main() {
         });
     }
 
+    cb!(on_start_rename, |w, s, addr: SharedString, name: SharedString| {
+        let _ = &mut s;
+        println!("cb: rename-start addr={addr}");
+        w.set_status("".into());
+        w.set_rename_address(addr);
+        w.set_rename_input(name);
+    });
+
+    cb!(on_save_rename, |w, s, name: SharedString| {
+        let addr = w.get_rename_address().to_string();
+        if let Some(store) = &mut s.store {
+            store.name_contact(&addr, name.trim());
+        }
+        s.save_store();
+        println!("cb: save-contact addr={addr} name-len={}", name.trim().len());
+        w.set_status("".into());
+        w.set_rename_address("".into());
+        w.set_rename_input("".into());
+        update_home(&w, &s);
+    });
+
+    cb!(on_cancel_rename, |w, s| {
+        let _ = &mut s;
+        w.set_rename_address("".into());
+        w.set_rename_input("".into());
+    });
+
+    cb!(on_remove_contact, |w, s, addr: SharedString| {
+        if let Some(store) = &mut s.store {
+            store.remove_contact(addr.as_str());
+        }
+        s.save_store();
+        println!("cb: remove-contact addr={addr}");
+        w.set_status("".into());
+        if w.get_rename_address() == addr {
+            w.set_rename_address("".into());
+        }
+        update_home(&w, &s);
+    });
+
     cb!(on_compose_changed, |w, s| {
         let _ = &mut s;
         update_cost(&w, &s);

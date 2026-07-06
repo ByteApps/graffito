@@ -420,6 +420,10 @@ impl Store {
             c.name = name.to_string();
         }
     }
+
+    pub fn remove_contact(&mut self, address: &str) {
+        self.contacts.retain(|c| c.address != address);
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
