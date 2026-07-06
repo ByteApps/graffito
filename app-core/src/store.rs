@@ -69,6 +69,9 @@ pub struct NoteRecord {
     /// vsize of the current tx — with fee gives the sat/vB rate.
     #[serde(default)]
     pub vsize: Option<u64>,
+    /// Custom change destination (None = change returned to self).
+    #[serde(default)]
+    pub change_to: Option<String>,
 }
 
 /// One input spent by a sweep/consolidate tx — kept for RBF re-signing.
@@ -378,6 +381,7 @@ impl Store {
                     raw_hex: None,
                     fee: None,
                     vsize: None,
+                    change_to: None,
                 });
                 true
             }

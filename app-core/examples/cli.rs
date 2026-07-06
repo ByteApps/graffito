@@ -116,6 +116,7 @@ fn main() {
                     text: &args[6],
                     private,
                     recipient: to,
+                    change_to: None,
                     fee_rate,
                     now: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

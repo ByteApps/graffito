@@ -86,7 +86,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "first, public", private: false, recipient: None, fee_rate: 1.0, now: 1000 },
+        &ComposeRequest { text: "first, public", private: false, recipient: None, change_to: None, fee_rate: 1.0, now: 1000 },
     )
     .unwrap();
     assert_eq!(store.notes.len(), 1);
@@ -97,7 +97,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "second, private", private: true, recipient: None, fee_rate: 1.0, now: 2000 },
+        &ComposeRequest { text: "second, private", private: true, recipient: None, change_to: None, fee_rate: 1.0, now: 2000 },
     )
     .unwrap();
     assert_eq!(
@@ -152,6 +152,7 @@ fn directed_private_note_both_sides() {
             text: "for bob only",
             private: true,
             recipient: Some(&bob_addr),
+            change_to: None,
             fee_rate: 1.0,
             now: 3000,
         },
@@ -190,13 +191,47 @@ fn directed_private_note_both_sides() {
 }
 
 #[test]
+fn custom_change_address_not_tracked_as_own_coin() {
+    let a = alice();
+    let b = bob();
+    let bob_addr = b.address(NET);
+    let mut store = funded_store(&a);
+    let n = compose_and_record(
+        &mut store, &a, NET,
+        &ComposeRequest {
+            text: "change goes to bob", private: false, recipient: None,
+            change_to: Some(&bob_addr), fee_rate: 1.0, now: 1,
+        },
+    )
+    .unwrap();
+    // The note records the custom change destination...
+    assert_eq!(store.notes[0].change_to.as_deref(), Some(bob_addr.as_str()));
+    // ...and the change is NOT a spendable coin (it left the wallet):
+    // only the funding input remains, now pending-locked.
+    assert!(n.tx.change > 0, "there was change");
+    let spendable: Vec<_> = store.utxos.iter().filter(|u| !u.pending_spend).collect();
+    assert!(spendable.is_empty(), "custom change must not be tracked");
+    // Sanity: the same note with default change WOULD track the change.
+    let mut store2 = funded_store(&a);
+    compose_and_record(
+        &mut store2, &a, NET,
+        &ComposeRequest {
+            text: "change to self", private: false, recipient: None,
+            change_to: None, fee_rate: 1.0, now: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(store2.utxos.iter().filter(|u| !u.pending_spend).count(), 1);
+}
+
+#[test]
 fn bump_fee_same_note_id_same_inputs_higher_fee() {
     use app_core::compose::bump_fee;
     let a = alice();
     let mut store = funded_store(&a);
     let n1 = compose_and_record(
         &mut store, &a, NET,
-        &ComposeRequest { text: "bump me", private: true, recipient: None, fee_rate: 1.0, now: 1 },
+        &ComposeRequest { text: "bump me", private: true, recipient: None, change_to: None, fee_rate: 1.0, now: 1 },
     )
     .unwrap();
     assert!(store.notes[0].raw_hex.is_some(), "raw kept for rebroadcast");
@@ -232,7 +267,7 @@ fn orphaned_when_inputs_spent_elsewhere() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "never broadcast", private: false, recipient: None, fee_rate: 1.0, now: 1 },
+        &ComposeRequest { text: "never broadcast", private: false, recipient: None, change_to: None, fee_rate: 1.0, now: 1 },
     )
     .unwrap();
 
