@@ -4,7 +4,7 @@
 // on the Rust side.
 import { LineEdit, TextEdit, ListView, Switch } from "std-widgets.slint";
 
-export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string }
+export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string, private: bool }
 export struct ContactItem { address: string, name: string }
 export struct AccountItem { index: int, address: string, active: bool }
 export struct CoinItem { outpoint: string, value: string, status: string }
@@ -640,32 +640,46 @@ export component AppWindow inherits Window {
                     background: nt.has-hover ? Pal.card-hover : Pal.card;
                     border-width: 1px;
                     border-color: Pal.line;
-                    VerticalLayout {
+                    HorizontalLayout {
                         x: 14px;
-                        width: note.web-url != "" ? parent.width - 62px : parent.width - 28px;
+                        width: note.web-url != "" ? parent.width - 60px : parent.width - 26px;
                         height: parent.height;
-                        alignment: center;
-                        spacing: 6px;
-                        Text {
-                            text: note.title;
-                            horizontal-alignment: left;
-                            font-size: 13px;
-                            color: Pal.text;
-                            overflow: elide;
-                        }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            alignment: start;
-                            height: 20px;
-                            Badge {
-                                label: note.badge;
-                                tint: note.badge == "confirmed" ? Pal.good
-                                    : (note.badge == "pending" ? Pal.warn : Pal.bad);
+                        spacing: 8px;
+                        Rectangle {
+                            width: 16px;
+                            if note.private: Image {
+                                source: @image-url("icons/lock.svg");
+                                colorize: Pal.muted;
+                                width: 13px;
+                                height: 13px;
+                                x: 0;
+                                y: (parent.height - 13px) / 2;
                             }
-                            Caption {
-                                text: note.meta;
-                                vertical-alignment: center;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 6px;
+                            Text {
+                                text: note.title;
+                                horizontal-alignment: left;
+                                font-size: 13px;
+                                color: Pal.text;
+                                overflow: elide;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
                                 height: 20px;
+                                Badge {
+                                    label: note.badge;
+                                    tint: note.badge == "confirmed" ? Pal.good
+                                        : (note.badge == "pending" ? Pal.warn : Pal.bad);
+                                }
+                                Caption {
+                                    text: note.meta;
+                                    vertical-alignment: center;
+                                    height: 20px;
+                                }
                             }
                         }
                     }
