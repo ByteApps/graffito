@@ -13,6 +13,14 @@ from the chain plus your key alone.
   a paginated BIP-86 account picker; accounts are switchable later in
   Settings. Key material lives in the macOS Keychain; reveal and unlock
   ask for Touch ID.
+- **Compose**: public or private notes, directed notes to other taproot
+  addresses, live cost/change preview, fee-tier picker, coin control
+  (pick exactly which UTXOs to spend, incl. unconfirmed), and an
+  optional custom change address.
+- **Manage**: an Activity screen listing every transaction with retry
+  (rebroadcast) and RBF fee-bump for stuck ones; a Coins screen to view
+  and consolidate UTXOs; sweep-all; per-coin/-note links to the tx on
+  mempool.space and to notes in the web viewer.
 - **Networks**: mainnet · testnet4 · signet · regtest (custom esplora
   endpoint supported). Verified live on testnet4 — including a directed
   private note decrypted by the Passport Prime app's own core — and

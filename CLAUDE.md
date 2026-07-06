@@ -21,7 +21,7 @@ Prime apps). Protocol invariants live in
 ## Layout
 
 ```
-app-core/               # UI-free core: cargo test -p app-core (28 tests)
+app-core/               # UI-free core: cargo test -p app-core
   src/identity.rs       # create/import: bip39 | xprv | wif | hex; realize(material, network, account)
   src/derive.rs         # BIP-32/86 (account-aware) + FROZEN enc-key rule
   src/seedqr.rs         # SeedQR standard+compact, both directions
@@ -37,15 +37,28 @@ ui/app.slint            # design system (Pal palette, Card/PrimaryButton/
                         #   fluent-dark std widgets) + 10 screens + modals
 ui/icons/*.svg          # icon assets (@image-url + colorize — see icon rule)
 scripts/bundle-mac.sh   # minimal .app (TCC camera permission needs a bundle)
-scripts/regtest-e2e.sh  # app↔Prime interop matrix
+scripts/regtest-e2e.sh  # app↔Prime interop matrix (host CLIs vs bitcoind)
 ```
+
+Two UI e2e suites in `../ui-automation/tests/` (simtap on the real Mac
+window): `chain-notes-app.sh` (compose→sign→broadcast smoke) and
+`chain-notes-app-matrix.sh` (full journey: hex/WIF/mnemonic import +
+account picker + settings account-switch + reset; create-seed →
+backup/quiz → fund → fee-tier directed private note decrypted by a CLI
+identity → contact rename/remove → chunk/network pills → coins list +
+consolidate → activity). Point offsets are calibrated to the current
+layout — recalibrate from screenshots when app.slint moves controls.
 
 Screens (`screen` property): 0 onboarding (3 doors) · 1 import (typed/
 QR/file, live format feedback + word autocomplete) · 2 backup words ·
 3 quiz · 4 home (balance card, QR, notes list w/ badge pills) · 5 note
 view (+ web-viewer permalink link, hidden on regtest) · 6 compose
-(picker-first, Private default, live cost line, collapsible coin-
-control + custom-change sections) · 7 send-to (Self card,
+(picker-first, Private default, live cost line; collapsible **coin
+control** — spendable UTXOs sorted low→high, auto-suggests CONFIRMED
+coins only [unconfirmed spendable but manual], tap-to-toggle, live
+total, ↻ refresh, per-coin mempool txid pill, Sign gated on
+sufficiency; and a collapsible **custom change address** with live
+validation) · 7 send-to (Self card,
 address input + QR-icon scan [scan-to-pick] + Use, recents w/ pencil-
 rename dialog + confirmed remove) · 8 settings (Identity card w/
 account switch + reset, network/chunk pills, esplora, Coins card,
@@ -89,10 +102,24 @@ typed as text.
 
 ## Invariants
 
+- **Extending notes-core is ADDITIVE**: coin control + custom change
+  needed new tx builders — added `build_note_tx_with_change` /
+  `_exact` and `compose_*_with_change` / `_exact`; the original
+  no-arg functions delegate (change=self, auto-select) so every
+  existing caller stays byte-identical. Bump the pin, re-run all tests.
+- Compose input paths: default = notes-core auto-select (largest-first);
+  coin control = `compose_*_exact` spending EXACTLY the selected coins
+  (change = leftover). Custom change goes to any spk and is NOT tracked
+  as an own coin; the destination is stored on the note so RBF preserves
+  it. Unconfirmed coins are spendable (scan keeps height=None, only
+  pending-locked are excluded) — never auto-suggested.
 - Sweep/consolidate txs are tracked in `store.txs` (`TxRecord`) so they
   get the same pending→confirmed lifecycle, rebroadcast, and RBF
   (`bump_raw_tx`) as notes; confirmed when their inputs vanish on a full
-  scan. Notes' own RBF is `bump_fee` (same note_id, same inputs).
+  scan. Notes' own RBF is `bump_fee` (same note_id, same inputs). The
+  Activity screen (11) shows per-tx sat/vB + fee, a "replaced N×" badge
+  after a bump, and a Speed-up dialog enforcing the BIP-125 +1 sat/vB
+  minimum with a live new-fee preview.
 - **notes-core is a pinned git dependency** (`ObjSal/prime-chain-notes`)
   and the ONLY producer of on-chain bytes: envelope, sealing, dm ECDH,
   tx build/sign all go through it — never reimplement, so app txs stay
@@ -142,7 +169,9 @@ confirm-remove/remove-contact` · `cb: import hierarchical → account
 picker` · `cb: pick-account <n>` · `cb: account-picker open` ·
 `cb: set-network <net>` · `cb: set-chunk-size <n> ok` ·
 `cb: reveal-backup ok|cancelled` · `cb: reset-identity` ·
-`cb: open-note-web url=…`. UI e2e:
+`cb: open-note-web url=…` · `cb: toggle-coin selected=<n>` ·
+`cb: refresh-coins` · `cb: act-explorer` · `cb: bump-open`/`act-bump`.
+UI e2e:
 `../ui-automation/tests/chain-notes-app.sh` (simtap point offsets from
 the window origin — recalibrate from screenshots when app.slint moves
 controls; simtap also has `scroll <x> <y> <dy>`).
