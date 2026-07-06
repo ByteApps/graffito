@@ -528,8 +528,30 @@ fn main() {
                 n.recipient.as_deref().map(|a| format!("to: {a}\n")).unwrap_or_default(),
             );
             w.set_note_detail(detail.into());
+            let web = match s.network {
+                Network::Regtest => String::new(),
+                net => {
+                    let addr = s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
+                    format!(
+                        "https://objsal.github.io/chain-notes-companion/note.html?address={addr}&network={}&note={}",
+                        net.as_str(),
+                        n.note_id
+                    )
+                }
+            };
+            w.set_note_web_url(web.into());
             w.set_screen(5);
         }
+    });
+
+    cb!(on_open_note_web, |w, s| {
+        let _ = &mut s;
+        let url = w.get_note_web_url().to_string();
+        if url.is_empty() {
+            return;
+        }
+        println!("cb: open-note-web url={url}");
+        let _ = std::process::Command::new("open").arg(&url).spawn();
     });
 
     cb!(on_compose_open, |w, s| {
