@@ -39,8 +39,16 @@ M5 platform facts: **slint is pinned `=1.16.1`** — 1.17 needs rustc
 1.92 and the SDK nix shell ships 1.91-nightly; bump the pin only with a
 newer toolchain. Camera spike: `cargo run -- --spike camera [secs]`
 (first run pops the TCC prompt; 1080p Luma frames → rqrr). Keychain
-spike: `--spike keychain` (generic-password round-trip; the
-userPresence ACL upgrade is an M6 TODO with the reveal screen).
+spike: `--spike keychain` (plain round-trip, automation-safe) and
+`--spike keychain-auth` (interactive user-presence round-trip).
+Layered protection is DONE: SecAccessControl/UserPresence item when the
+build is entitled (properly signed → OS-enforced), else automatic
+fallback to a plain item whose reads are gated by an LAContext
+DeviceOwnerAuthentication prompt (unsigned dev builds hit
+errSecMissingEntitlement -34018 — both SecItemAdd paths force the
+data-protection keychain once kSecAttrAccessControl is present). Boot
+prompts once (material cached in-session; APP_KEY env bypasses for
+automation); Reveal prompts fresh every time.
 `tests/qr_roundtrip.rs` proves render→decode without optics.
 
 ## Invariants
