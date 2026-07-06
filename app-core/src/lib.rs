@@ -8,4 +8,71 @@
 //!
 //! Milestones and design: ../../PLAN-chain-notes-app.md (prime workspace).
 
+pub mod derive;
+pub mod identity;
+pub mod seedqr;
+
 pub use notes_core;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    /// Frozen-protocol layer error (notes-core).
+    Notes(notes_core::Error),
+    /// Mnemonic had a word count we don't accept (only 12 and 24).
+    MnemonicWordCount(usize),
+    /// Mnemonic failed BIP-39 parsing (unknown word, bad checksum, ...).
+    Mnemonic(String),
+    /// xprv/tprv prefix does not match the active network.
+    XprvNetwork,
+    /// xprv at a depth we don't interpret (only 0 = master, 3 = account).
+    XprvDepth(u8),
+    Xprv(String),
+    /// WIF network byte does not match the active network.
+    WifNetwork,
+    /// Uncompressed WIF — taproot identities require compressed keys.
+    WifUncompressed,
+    Wif(String),
+    /// Hex key material must be exactly 32 bytes (64 hex chars).
+    HexLength(usize),
+    /// Key bytes are not a valid secp256k1 secret.
+    InvalidKey,
+    /// Input matched none of: mnemonic, xprv, WIF, 32-byte hex.
+    UnrecognizedFormat,
+    SeedQr(&'static str),
+    Entropy,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::Notes(e) => write!(f, "{e}"),
+            Error::MnemonicWordCount(n) => {
+                write!(f, "mnemonic must be 12 or 24 words (got {n})")
+            }
+            Error::Mnemonic(m) => write!(f, "mnemonic: {m}"),
+            Error::XprvNetwork => write!(f, "xprv is for a different network"),
+            Error::XprvDepth(d) => {
+                write!(f, "xprv depth {d} unsupported (need master or 86' account)")
+            }
+            Error::Xprv(m) => write!(f, "xprv: {m}"),
+            Error::WifNetwork => write!(f, "WIF is for a different network"),
+            Error::WifUncompressed => write!(f, "uncompressed WIF unsupported"),
+            Error::Wif(m) => write!(f, "WIF: {m}"),
+            Error::HexLength(n) => write!(f, "hex key must be 32 bytes (got {n})"),
+            Error::InvalidKey => write!(f, "not a valid secp256k1 secret key"),
+            Error::UnrecognizedFormat => {
+                write!(f, "not a mnemonic, xprv, WIF, or 32-byte hex key")
+            }
+            Error::SeedQr(m) => write!(f, "SeedQR: {m}"),
+            Error::Entropy => write!(f, "entropy source failure"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<notes_core::Error> for Error {
+    fn from(e: notes_core::Error) -> Self {
+        Error::Notes(e)
+    }
+}
