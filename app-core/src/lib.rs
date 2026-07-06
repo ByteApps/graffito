@@ -9,9 +9,11 @@
 //! Milestones and design: ../../PLAN-chain-notes-app.md (prime workspace).
 
 pub mod chain;
+pub mod compose;
 pub mod derive;
 pub mod identity;
 pub mod seedqr;
+pub mod store;
 
 pub use notes_core;
 
@@ -45,6 +47,8 @@ pub enum Error {
     Http(String),
     /// Response body did not parse as expected.
     Json(String),
+    /// Store I/O, (de)serialization, or identity-mismatch failure.
+    Store(String),
 }
 
 impl core::fmt::Display for Error {
@@ -72,6 +76,7 @@ impl core::fmt::Display for Error {
             Error::Entropy => write!(f, "entropy source failure"),
             Error::Http(m) => write!(f, "http: {m}"),
             Error::Json(m) => write!(f, "response: {m}"),
+            Error::Store(m) => write!(f, "store: {m}"),
         }
     }
 }
