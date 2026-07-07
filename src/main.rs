@@ -19,7 +19,7 @@ use app_core::identity::{generate_mnemonic, parse_key_material, realize, AppIden
 use app_core::notes_core::address::Recipient;
 use app_core::notes_core::bundle::{estimate_note_cost, FeeRates};
 use app_core::notes_core::Network;
-use app_core::store::{NoteStatus, Store};
+use app_core::store::{NoteStatus, Store, DEFAULT_CHUNK};
 use slint::{ComponentHandle, SharedString, VecModel};
 use zeroize::Zeroizing;
 
@@ -48,6 +48,10 @@ struct State {
     pending_import: Option<Zeroizing<String>>, // hierarchical import awaiting account pick
     pending_mnemonic: Option<String>,
     quiz_indices: Vec<usize>,
+    /// Edge-tracks whether the current compose draft is over the broadcast
+    /// ceiling, so the "too large" dialog pops once on crossing — not on
+    /// every keystroke while the draft stays too big.
+    compose_oversize: bool,
 }
 
 impl State {
@@ -472,6 +476,14 @@ fn refresh(w: &AppWindow, st: &mut State) {
 /// 34-byte taproot change output; when the change goes to a custom script
 /// of `l` bytes, correct the vsize by `l - 34` (outputs aren't
 /// witness-discounted, so 1 byte = 1 vB). None → self/taproot change.
+/// Bitcoin standardness ceiling on a single transaction: `MAX_STANDARD_TX_WEIGHT`
+/// (400_000 WU) / 4 = 100_000 vB. Nodes won't relay a bigger tx, so this — NOT
+/// the per-output chunk-size setting — is the hard wall on how much one note can
+/// carry. (A note is one tx of ≤255 OP_RETURN chunks.) The chunk setting only
+/// decides how the body is sliced across outputs; at a small chunk size the
+/// 255-chunk cap binds first, so raising it to Standard can rescue a note.
+const MAX_STANDARD_TX_VSIZE: usize = 100_000;
+
 fn note_est(
     store: &Store,
     text_len: usize,
@@ -480,10 +492,57 @@ fn note_est(
     recipient_spk_len: Option<usize>,
     change_spk_len: Option<usize>,
 ) -> Result<(usize, usize), app_core::notes_core::Error> {
+    note_est_at(store.chunk_size, text_len, private, n_inputs, recipient_spk_len, change_spk_len)
+}
+
+/// `note_est` at an arbitrary chunk size — used to test whether a note that
+/// doesn't fit at the current setting would fit at Standard.
+fn note_est_at(
+    chunk_size: usize,
+    text_len: usize,
+    private: bool,
+    n_inputs: usize,
+    recipient_spk_len: Option<usize>,
+    change_spk_len: Option<usize>,
+) -> Result<(usize, usize), app_core::notes_core::Error> {
     let (chunks, vsize) =
-        estimate_note_cost(text_len, private, store.chunk_size, n_inputs, recipient_spk_len)?;
+        estimate_note_cost(text_len, private, chunk_size, n_inputs, recipient_spk_len)?;
     let vsize = change_spk_len.map_or(vsize, |l| (vsize as i64 + l as i64 - 34).max(0) as usize);
     Ok((chunks, vsize))
+}
+
+/// Whether the composed note can go out as one standard tx, and if not, whether
+/// bumping the chunk size to Standard would rescue it.
+enum FitCheck {
+    /// Broadcastable at the current chunk-size setting.
+    Ok,
+    /// Over the limit now, but would fit at Standard (the user is on a smaller
+    /// setting whose 255-chunk cap binds first) — offer to switch.
+    FitsAtStandard,
+    /// Over even at Standard: the ~100 kB per-tx network wall. No setting helps.
+    HardWall,
+}
+
+fn fit_check(
+    store: &Store,
+    text_len: usize,
+    private: bool,
+    n_inputs: usize,
+    recipient_spk_len: Option<usize>,
+    change_spk_len: Option<usize>,
+) -> FitCheck {
+    let fits = |chunk: usize| {
+        note_est_at(chunk, text_len, private, n_inputs, recipient_spk_len, change_spk_len)
+            .map(|(_, vsize)| vsize <= MAX_STANDARD_TX_VSIZE)
+            .unwrap_or(false) // Err = >255 chunks → treat as over-limit
+    };
+    if fits(store.chunk_size) {
+        FitCheck::Ok
+    } else if store.chunk_size < DEFAULT_CHUNK && fits(DEFAULT_CHUNK) {
+        FitCheck::FitsAtStandard
+    } else {
+        FitCheck::HardWall
+    }
 }
 
 /// Suggested coin selection over CONFIRMED coins only (unconfirmed are
@@ -605,11 +664,15 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         w.set_cost_line("".into());
         w.set_change_amount(format!("Change → {change_dest}").into());
         w.set_spend_enough(true);
+        st.compose_oversize = false;
         return;
     }
     let n = sel_count.max(1);
-    match note_est(store, text.len(), private, n, spk_len, change_spk_len) {
-        Ok((chunks, vsize)) => {
+    let est = note_est(store, text.len(), private, n, spk_len, change_spk_len);
+    let fit = fit_check(store, text.len(), private, n, spk_len, change_spk_len);
+    let over = !matches!(fit, FitCheck::Ok);
+    match est {
+        Ok((chunks, vsize)) if !over => {
             let fee = (vsize as f64 * rate).ceil() as u64;
             let enough = sel_count > 0 && sel_total >= fee + sent;
             let change = sel_total.saturating_sub(fee + sent);
@@ -624,11 +687,49 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             w.set_change_amount(format!("Change → {change_dest} · ~{change} sats").into());
             w.set_spend_enough(enough);
         }
-        Err(e) => {
-            w.set_cost_line(format!("{e}").into());
+        // Over the per-tx broadcast ceiling: vsize > 100 kB (Ok arm) or the
+        // body needs > 255 chunks (Err arm). Sign is gated off; the dialog
+        // below offers the fix.
+        Ok((chunks, vsize)) => {
+            w.set_cost_line(
+                format!("{chunks} chunk(s) · ~{vsize} vB — too large to broadcast").into(),
+            );
+            w.set_spend_enough(false);
+        }
+        Err(_) => {
+            w.set_cost_line("Too large to broadcast (> 255 chunks)".into());
             w.set_spend_enough(false);
         }
     }
+
+    // Edge-trigger the "too large" dialog: pop once when the draft first
+    // crosses the ceiling, not on every keystroke while it stays over.
+    if over && !st.compose_oversize {
+        match fit {
+            FitCheck::FitsAtStandard => {
+                w.set_oversize_offer_bump(true);
+                w.set_oversize_message(
+                    "This note doesn't fit at your current chunk size. \
+                     Switch to Standard (a single large chunk) to fit it in one transaction?"
+                        .into(),
+                );
+                w.set_show_oversize_modal(true);
+            }
+            FitCheck::HardWall => {
+                w.set_oversize_offer_bump(false);
+                w.set_oversize_message(
+                    "This note is too large to broadcast. A single Bitcoin transaction \
+                     can't exceed ~100 kB (the network relay limit), whatever the chunk \
+                     size. Shorten the note, or split it across several notes. \
+                     Multi-transaction notes are planned for a future release."
+                        .into(),
+                );
+                w.set_show_oversize_modal(true);
+            }
+            FitCheck::Ok => {}
+        }
+    }
+    st.compose_oversize = over;
 }
 
 trait CloneFields {
@@ -699,6 +800,7 @@ fn main() {
         pending_import: None,
         pending_mnemonic: None,
         quiz_indices: Vec::new(),
+        compose_oversize: false,
     }));
     let window = AppWindow::new().expect("window");
 
@@ -1664,6 +1766,20 @@ fn main() {
                 w.set_status("chunk bytes must be 20..=100000".into());
             }
         }
+    });
+
+    // Compose "too large" dialog: raise the chunk size to Standard and reprice
+    // the draft in place. Only offered when the note actually fits at Standard.
+    cb!(on_oversize_bump, |w, s| {
+        if let Some(store) = &mut s.store {
+            store.chunk_size = DEFAULT_CHUNK;
+        }
+        s.save_store();
+        println!("cb: set-chunk-size {DEFAULT_CHUNK} ok (oversize-bump)");
+        w.set_chunk_text(DEFAULT_CHUNK.to_string().into());
+        w.set_chunk_custom(false);
+        w.set_show_oversize_modal(false);
+        refresh_compose(&w, &mut s);
     });
 
     cb!(on_set_esplora, |w, s, t: SharedString| {
