@@ -1101,9 +1101,8 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        // ---- change output (collapsible) — self-funded only; external funding
-        //      returns change to the funding wallet's own change address ----
-        if !root.fund-external: Rectangle {
+        // ---- change output (collapsible) ----
+        Rectangle {
             border-radius: 10px;
             background: Pal.card;
             border-width: 1px;
@@ -1135,7 +1134,9 @@ export component AppWindow inherits Window {
                     }
                 }
                 if root.change-expanded: Caption {
-                    text: "Change returns to your address by default. Send it somewhere else:";
+                    text: root.fund-external
+                        ? "Change returns to the funding wallet by default. Send it elsewhere:"
+                        : "Change returns to your address by default. Send it somewhere else:";
                 }
                 if root.change-expanded: HorizontalLayout {
                     spacing: 8px;

@@ -36,6 +36,9 @@ pub struct FundingPlan<'a> {
     pub coins: &'a [FundingUtxo],
     pub change_index: u32,
     pub fee_rate: f64,
+    /// Custom change scriptPubKey. `None` = the funding wallet's own next
+    /// change address (`source`'s change chain at `change_index`).
+    pub change_override: Option<Vec<u8>>,
 }
 
 /// The note side of a build request.
@@ -129,7 +132,10 @@ pub fn build_funding_psbt(plan: &FundingPlan, note: &NoteParams) -> Result<Built
     // --- fee / change selection (prefer a change output; else fold < dust into fee) ---
     let in_value: u64 = plan.coins.iter().map(|c| c.value).sum();
     let fixed_out: u64 = sent_to_recipient + dust_to_self; // OP_RETURNs are 0-value
-    let change_spk = ScriptBuf::from_bytes(plan.source.derive(1, plan.change_index)?.spk);
+    let change_spk = match &plan.change_override {
+        Some(spk) => ScriptBuf::from_bytes(spk.clone()),
+        None => ScriptBuf::from_bytes(plan.source.derive(1, plan.change_index)?.spk),
+    };
 
     let base_lens: Vec<usize> = outputs.iter().map(|o| o.script_pubkey.len()).collect();
     let mut selected: Option<(u64, u64, bool)> = None; // (fee, change, with_change)
@@ -211,7 +217,7 @@ mod tests {
         let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
         let to_bob = Recipient::parse(NET, &bob.address(NET)).unwrap();
 
-        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 2.0 };
+        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 2.0, change_override: None };
         let np = NoteParams {
             identity: &alice,
             text: "hi bob, paid from cold storage",
@@ -270,7 +276,7 @@ mod tests {
         let src = source();
         let coins = one_coin(&src);
         let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
-        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 1.0 };
+        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 1.0, change_override: None };
         let np = NoteParams {
             identity: &alice,
             text: "note to self",
@@ -300,7 +306,7 @@ mod tests {
             confirmed: true,
         }];
         let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
-        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 5.0 };
+        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 5.0, change_override: None };
         let np = NoteParams {
             identity: &alice,
             text: "too poor",
