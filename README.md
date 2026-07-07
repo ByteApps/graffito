@@ -25,7 +25,9 @@ from the chain plus your key alone.
   / your own Esplora-compatible node) selects the API used for scans and
   broadcasts; a separate **Block explorer** dropdown (mempool.space /
   Blockstream / a self-hosted mempool) selects where "Explorer" links
-  open. Both offer a Custom URL and are set entirely through the UI.
+  open. Both offer a Custom URL, are set entirely through the UI, and are
+  remembered per network at the device level — so switching identity (or
+  account) keeps them.
 - **Networks**: mainnet · testnet4 · signet · regtest (point the Bitcoin
   node at any Esplora/mempool-compatible endpoint). Verified live on
   testnet4 — including a directed private note decrypted by the Passport

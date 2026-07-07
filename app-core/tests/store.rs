@@ -402,10 +402,10 @@ fn identity_mismatch_rejected_and_persistence_roundtrip() {
     assert_eq!(loaded.contacts[0].name, "someone");
 }
 
-/// Back-compat: stores written before the Settings rename used a bare
-/// `"esplora"` key for the custom Bitcoin-node URL. The serde `alias` must
-/// keep those loading into `node_url` so upgrading never silently drops a
-/// user's custom node.
+/// Back-compat: stores written before the node choice moved to device-level
+/// config used a bare `"esplora"` key. The serde `alias` must keep those
+/// loading into `node_url` — the field the app reads once, on load, to migrate
+/// the value into config.json — so upgrading never silently drops a custom node.
 #[test]
 fn legacy_esplora_key_loads_into_node_url() {
     let json = r#"{
