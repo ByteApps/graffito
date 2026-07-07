@@ -233,6 +233,7 @@ fn main() {
                 coins: &scan.utxos,
                 change_index: scan.next_change_index,
                 fee_rate,
+                change_override: None,
             };
             let np = NoteParams {
                 identity: &ident.identity,

@@ -830,17 +830,24 @@ impl CloneFields for app_core::notes_core::bundle::Identity {
 /// wallet's scanned coins (all spent) and a source summary, instead of the
 /// self-funded store coins. Keeps the intricate self-funded path untouched.
 fn funding_compose_ui(w: &AppWindow, st: &State, text: &str) {
+    let net = st.network;
     let total: u64 = st.funding_coins.iter().map(|c| c.value).sum();
     let n = st.funding_coins.len();
     let ready = st.funding.is_some() && n > 0;
     w.set_funding_ready(ready);
+
+    // Summary card = which wallet + how much (its first receive address is a
+    // recognisable handle for a multi-address wallet).
     match &st.funding {
-        Some(src) => w.set_funding_summary(
-            format!("{} · {n} coin{} · {total} sats", src.kind.label(), if n == 1 { "" } else { "s" }).into(),
-        ),
+        Some(src) => {
+            let addr0 = src.derive(0, 0).map(|d| d.address).unwrap_or_default();
+            w.set_funding_summary(
+                format!("{} · {} · {n} coin{} · {total} sats", src.kind.label(), short_addr(&addr0), if n == 1 { "" } else { "s" }).into(),
+            );
+        }
         None => w.set_funding_summary("Set a funding wallet".into()),
     }
-    let net = st.network;
+
     let exb = st.explorer_base();
     let coins: Vec<SpendCoin> = st
         .funding_coins
@@ -858,7 +865,46 @@ fn funding_compose_ui(w: &AppWindow, st: &State, text: &str) {
     w.set_spend_title(format!("Funding {n} coin{} · {total} sats", if n == 1 { "" } else { "s" }).into());
     w.set_cost_line(if text.is_empty() { String::new() } else { "funded from the external wallet".into() }.into());
     w.set_spend_enough(ready && !text.is_empty());
-    w.set_change_error("".into());
+
+    // Change: blank = the funding wallet's own change; a valid custom address
+    // overrides it. Same validation/label pattern as the self-funded path.
+    let change_trim = w.get_change_address().trim().to_string();
+    if change_trim.is_empty() {
+        w.set_change_amount("Change → funding wallet".into());
+        w.set_change_error("".into());
+    } else if Recipient::parse(net, &normalize_addr(&change_trim)).is_ok() {
+        w.set_change_amount(format!("Change → {}…", &change_trim[..14.min(change_trim.len())]).into());
+        w.set_change_error("".into());
+    } else {
+        w.set_change_amount("Change → ⚠ invalid".into());
+        w.set_change_error(format!("Not a valid {} address.", net.as_str()).into());
+    }
+}
+
+/// Shorten a bech32 address for display: `bcrt1p2caqg…6hrewe`.
+fn short_addr(a: &str) -> String {
+    if a.len() > 20 {
+        format!("{}…{}", &a[..10], &a[a.len() - 6..])
+    } else {
+        a.to_string()
+    }
+}
+
+/// Pull an output descriptor out of pasted text or a wallet-export file:
+/// a bare descriptor/xpub passes through; otherwise find an embedded
+/// `tr(...)`/`wpkh(...)` token (handles Sparrow-style JSON + text exports).
+fn extract_descriptor(text: &str) -> String {
+    let t = text.trim();
+    for pat in ["tr(", "wpkh("] {
+        if let Some(i) = t.find(pat) {
+            let rest = &t[i..];
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == '}')
+                .unwrap_or(rest.len());
+            return rest[..end].to_string();
+        }
+    }
+    t.to_string()
 }
 
 /// Import a signed PSBT (from file bytes, a base64/hex string, or a UR string),
@@ -1738,7 +1784,7 @@ fn main() {
                         w.set_status("scan: no QR seen".into());
                     } else {
                         println!("cb: funding-scan ok");
-                        let t: SharedString = text.trim().into();
+                        let t: SharedString = extract_descriptor(&text).into();
                         w.set_funding_descriptor(t.clone());
                         w.invoke_funding_changed(t);
                     }
@@ -1872,6 +1918,10 @@ fn main() {
         }
         w.set_status("".into());
         refresh_compose(&w, &mut s);
+        // Turning it on with no wallet yet → go straight to the funding screen.
+        if on && s.funding.is_none() {
+            w.set_screen(12);
+        }
     });
 
     cb!(on_open_funding, |w, s| {
@@ -1890,7 +1940,7 @@ fn main() {
             w.set_funding_valid(false);
             return;
         }
-        match FundingSource::parse(t, net) {
+        match FundingSource::parse(&extract_descriptor(t), net) {
             Ok(src) => {
                 let a0 = src.derive(0, 0).map(|d| d.address).unwrap_or_default();
                 w.set_funding_feedback(format!("{} wallet · first address\n{a0}", src.kind.label()).into());
@@ -1904,9 +1954,9 @@ fn main() {
     });
 
     cb!(on_funding_use, |w, s| {
-        let desc = w.get_funding_descriptor().to_string();
+        let desc = extract_descriptor(&w.get_funding_descriptor());
         let net = s.network;
-        let src = match FundingSource::parse(desc.trim(), net) {
+        let src = match FundingSource::parse(&desc, net) {
             Ok(src) => src,
             Err(e) => {
                 w.set_status(format!("{e}").into());
@@ -1935,6 +1985,23 @@ fn main() {
                 refresh_compose(&w, &mut s);
             }
             Err(e) => w.set_status(format!("scan failed: {e}").into()),
+        }
+    });
+
+    cb!(on_funding_file, |w, s| {
+        let _ = &mut s;
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Descriptor / wallet export", &["txt", "json", "desc"])
+            .pick_file()
+        {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    let d = extract_descriptor(&content);
+                    w.set_funding_descriptor(d.clone().into());
+                    w.invoke_funding_changed(d.into());
+                }
+                Err(e) => w.set_status(format!("read failed: {e}").into()),
+            }
         }
     });
 
@@ -1973,6 +2040,20 @@ fn main() {
             },
             None => None,
         };
+        // Change destination: blank field = the funding wallet's own change
+        // address; a valid custom address overrides it.
+        let change_raw = normalize_addr(w.get_change_address().as_str());
+        let change_override = if change_raw.is_empty() {
+            None
+        } else {
+            match Recipient::parse(net, &change_raw) {
+                Ok(r) => Some(r.spk),
+                Err(_) => {
+                    w.set_status(format!("change address isn't a valid {} address", net.as_str()).into());
+                    return;
+                }
+            }
+        };
         let src = s.funding.clone().unwrap();
         let coins = s.funding_coins.clone();
         let change_index = s.funding_change_index;
@@ -1980,7 +2061,8 @@ fn main() {
         let r = app_core::notes_core::keys::generate_aux_rand()
             .map(|x| [x[0], x[1], x[2], x[3]])
             .unwrap_or([1, 2, 3, 4]);
-        let plan = FundingPlan { source: &src, coins: &coins, change_index, fee_rate: rate };
+        let plan =
+            FundingPlan { source: &src, coins: &coins, change_index, fee_rate: rate, change_override };
         let np = NoteParams {
             identity: &identity,
             text: &text,
@@ -2448,7 +2530,8 @@ fn main() {
 fn preview_mock(w: &AppWindow) {
     w.set_fund_external(true);
     w.set_funding_ready(true);
-    w.set_funding_summary("taproot · 2 coins · 220,000 sats".into());
+    w.set_funding_summary("taproot · bcrt1p2caq…6hrewe · 2 coins · 220,000 sats".into());
+    w.set_change_amount("Change → funding wallet".into());
     w.set_funding_descriptor("tr([a1b2c3d4/86h/1h/0h]tpub…/<0;1>/*)".into());
     w.set_funding_feedback(
         "Taproot wallet · fingerprint a1b2c3d4 · first address\nbcrt1p2caqg0ht8m7dykfrx2lnrcc85kxs09m3vgur9fl6emljxktnu7es6hrewe"
