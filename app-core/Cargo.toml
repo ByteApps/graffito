@@ -16,8 +16,15 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-notes-core = { git = "ssh://git@github.com/ObjSal/prime-chain-notes.git", rev = "33b563a402a6e7340652c12a4929abe4045c7488" }
-bitcoin = "0.32"
+notes-core = { git = "ssh://git@github.com/ObjSal/prime-chain-notes.git", rev = "18babc0c207e692d9a4a3a29f73cffe1dfe542f2" }
+# base64 feature = PSBT <-> base64 string (`.psbt` file / clipboard export).
+bitcoin = { version = "0.32", features = ["base64"] }
+# Output-descriptor parsing + address derivation for external funding wallets
+# (watch-only). Pairs with bitcoin 0.32.
+miniscript = "12"
+# Animated crypto-psbt UR (BCR-2020-006) framing for QR export/import — the
+# EXACT codec the KeyOS scanner runs, so the Prime app reassembles our frames.
+foundation-ur = "0.4"
 bip39 = "2"
 hkdf = "0.12"
 sha2 = "0.10"

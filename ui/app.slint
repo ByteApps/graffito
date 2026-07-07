@@ -9,6 +9,9 @@ export struct ContactItem { address: string, name: string }
 export struct AccountItem { index: int, address: string, active: bool }
 export struct CoinItem { outpoint: string, value: string, status: string }
 export struct SpendCoin { outpoint: string, value: string, confirmed: bool, selected: bool, txid-short: string, explorer: string }
+// One input/output row in the Sparrow-style PSBT confirmation. `kind` drives
+// the accent: note · self · recipient · change · input · other.
+export struct PsbtRow { title: string, subtitle: string, amount: string, kind: string }
 export struct ActivityItem {
     ref-id: string, is-note: bool, kind: string, title: string,
     txid: string, fee-line: string, status: string, explorer: string,
@@ -444,6 +447,21 @@ export component AppWindow inherits Window {
     in-out property <bool> spend-expanded;
     in-out property <int> coin-strategy;
     in property <bool> spend-enough: true;
+    // ---- external funding (pay a note from another wallet via PSBT) ----
+    in-out property <bool> fund-external;      // compose toggle
+    in property <bool> funding-ready;          // a valid source with coins is loaded
+    in property <string> funding-summary;      // one-line source summary (or a call to action)
+    in-out property <string> funding-descriptor;
+    in property <string> funding-feedback;     // parse feedback on the entry screen
+    in property <bool> funding-valid;
+    in property <image> psbt-qr;               // current animated-UR frame
+    in property <string> psbt-frame-label;     // "frame 2 / 5" or "" for a single frame
+    in property <string> psbt-cost-line;       // "fee 240 sats · 1 input · 187 vB"
+    in property <bool> psbt-signed;            // an imported signed PSBT validated
+    in property <[PsbtRow]> confirm-inputs;
+    in property <[PsbtRow]> confirm-outputs;
+    in property <string> confirm-note;         // decoded note text (public) or placeholder
+    in property <string> confirm-fee-line;
     in property <[ContactItem]> contacts;
     in-out property <string> contact-input;
     in-out property <string> rename-address;
@@ -526,6 +544,22 @@ export component AppWindow inherits Window {
     callback toggle-coin(string);
     callback refresh-coins();
     callback set-coin-strategy(int);
+    // external funding (PSBT)
+    callback toggle-fund-external(bool);
+    callback open-funding();       // compose → funding-wallet screen
+    callback funding-changed(string);
+    callback funding-scan();       // scan a descriptor/xpub QR
+    callback funding-file();       // load a descriptor from file
+    callback funding-use();        // accept the source, scan its coins, back to compose
+    callback funding-clear();      // forget the funding wallet
+    callback fund-build();         // build the unsigned PSBT → export screen
+    callback psbt-save();          // export the .psbt file
+    callback psbt-copy();          // copy PSBT base64
+    callback psbt-goto-import();   // export → import screen
+    callback psbt-import-file();
+    callback psbt-import-scan();
+    callback psbt-loaded(string);  // internal: a scanned PSBT string → validate + confirm
+    callback psbt-broadcast();     // finalize + broadcast the signed PSBT
     callback settings-open();
     callback set-network(string);
     callback hide-backup();
@@ -893,6 +927,37 @@ export component AppWindow inherits Window {
             font-weight: 600;
             color: Pal.accent;
         }
+        // ---- pay from another wallet (external PSBT) ----
+        HorizontalLayout {
+            Switch {
+                text: "Pay from another wallet";
+                checked <=> root.fund-external;
+                toggled => { root.toggle-fund-external(self.checked); }
+            }
+            Rectangle { }
+        }
+        if root.fund-external: Rectangle {
+            border-radius: 10px;
+            background: ftap.has-hover ? Pal.card-hover : Pal.card;
+            border-width: 1px;
+            border-color: root.funding-ready ? Pal.line : Pal.accent.with-alpha(0.5);
+            height: 44px;
+            ftap := TouchArea { clicked => { root.open-funding(); } }
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+                Text {
+                    text: root.funding-summary;
+                    font-size: 12px;
+                    color: root.funding-ready ? Pal.text : Pal.accent;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                Text { text: "›"; font-size: 22px; color: Pal.muted; vertical-alignment: center; }
+            }
+        }
         // ---- coin control (collapsible) ----
         Rectangle {
             border-radius: 10px;
@@ -1036,8 +1101,9 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        // ---- change output (collapsible) ----
-        Rectangle {
+        // ---- change output (collapsible) — self-funded only; external funding
+        //      returns change to the funding wallet's own change address ----
+        if !root.fund-external: Rectangle {
             border-radius: 10px;
             background: Pal.card;
             border-width: 1px;
@@ -1088,11 +1154,23 @@ export component AppWindow inherits Window {
                 ? "Encrypted forever on-chain; only your key (and a directed recipient) can read it."
                 : "⚠  Public notes are world-readable, forever.";
         }
-PrimaryButton {
+        if !root.fund-external: PrimaryButton {
             text: "Sign + broadcast";
             tint: root.spend-enough ? Pal.accent : Pal.faint;
             tint-hover: root.spend-enough ? Pal.accent-hover : Pal.faint;
             clicked => { if (root.spend-enough) { root.compose-send(); } }
+        }
+        if root.fund-external: PrimaryButton {
+            text: root.funding-ready ? "Build transaction to sign" : "Set a funding wallet first";
+            tint: (root.funding-ready && root.spend-enough) ? Pal.accent : Pal.faint;
+            tint-hover: (root.funding-ready && root.spend-enough) ? Pal.accent-hover : Pal.faint;
+            clicked => {
+                if (!root.funding-ready) {
+                    root.open-funding();
+                } else if (root.spend-enough) {
+                    root.fund-build();
+                }
+            }
         }
         Caption { text: root.status; color: Pal.bad; }
     }
@@ -1524,6 +1602,230 @@ PrimaryButton {
                     }
                 }
             }
+        }
+        if root.status != "": Caption { text: root.status; color: Pal.bad; }
+    }
+
+    // ---------- 12 · funding wallet (external PSBT source) ----------
+    if screen == 12: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Funding wallet";
+            back => { root.screen = 6; }
+        }
+        Caption {
+            text: "Paste or scan an output descriptor (or xpub) for the wallet that pays. Its key never leaves that wallet — you'll sign the transaction there.";
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            LineEdit {
+                text <=> root.funding-descriptor;
+                placeholder-text: "tr([…]xpub…/<0;1>/*)  or  xpub…";
+                edited => { root.funding-changed(self.text); }
+            }
+            ScanButton { clicked => { root.funding-scan(); } }
+        }
+        HorizontalLayout {
+            alignment: start;
+            GhostButton {
+                width: 140px;
+                text: "Load from file…";
+                clicked => { root.funding-file(); }
+            }
+        }
+        if root.funding-feedback != "": Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: root.funding-valid ? Pal.good.with-alpha(0.5) : Pal.bad.with-alpha(0.5);
+            height: fbl.preferred-height;
+            fbl := VerticalLayout {
+                padding: 14px;
+                Body {
+                    text: root.funding-feedback;
+                    color: root.funding-valid ? Pal.good : Pal.bad;
+                }
+            }
+        }
+        PrimaryButton {
+            text: "Use this wallet";
+            tint: root.funding-valid ? Pal.accent : Pal.faint;
+            tint-hover: root.funding-valid ? Pal.accent-hover : Pal.faint;
+            clicked => { if (root.funding-valid) { root.funding-use(); } }
+        }
+        if root.status != "": Caption { text: root.status; color: Pal.bad; }
+    }
+
+    // ---------- 13 · export PSBT (sign externally) ----------
+    if screen == 13: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Sign externally";
+            back => { root.screen = 6; }
+        }
+        Caption {
+            text: "Scan this with your wallet (or save the file), sign it there, then bring the signed PSBT back.";
+        }
+        if root.psbt-cost-line != "": Text {
+            text: root.psbt-cost-line;
+            font-size: 13px;
+            font-weight: 600;
+            color: Pal.accent;
+            horizontal-alignment: center;
+        }
+        Rectangle {
+            height: 296px;
+            border-radius: 14px;
+            background: #FFFFFF;
+            Image {
+                source: root.psbt-qr;
+                width: 256px;
+                height: 256px;
+                x: (parent.width - 256px) / 2;
+                y: (parent.height - 256px) / 2;
+                image-rendering: pixelated;
+            }
+        }
+        if root.psbt-frame-label != "": Caption {
+            text: root.psbt-frame-label;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            GhostButton { text: "Save .psbt"; clicked => { root.psbt-save(); } }
+            GhostButton { text: "Copy"; clicked => { root.psbt-copy(); } }
+        }
+        PrimaryButton {
+            text: "I've signed it  →  Review";
+            clicked => { root.psbt-goto-import(); }
+        }
+        if root.status != "": Caption { text: root.status; color: Pal.bad; }
+    }
+
+    // ---------- 14 · import signed PSBT + confirmation ----------
+    if screen == 14: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Review + broadcast";
+            back => { root.screen = 13; }
+        }
+        if !root.psbt-signed: Caption {
+            text: "Load the signed PSBT from your wallet — file or QR.";
+        }
+        if !root.psbt-signed: HorizontalLayout {
+            spacing: 10px;
+            GhostButton { text: "Load .psbt file"; clicked => { root.psbt-import-file(); } }
+            GhostButton { text: "Scan QR"; clicked => { root.psbt-import-scan(); } }
+        }
+        if root.psbt-signed: Flickable {
+            viewport-height: conf-col.preferred-height;
+            conf-col := VerticalLayout {
+                spacing: 10px;
+                alignment: start;
+                Rectangle {
+                    border-radius: 10px;
+                    background: Pal.accent.with-alpha(0.08);
+                    border-width: 1px;
+                    border-color: Pal.accent.with-alpha(0.35);
+                    height: ncard.preferred-height;
+                    ncard := VerticalLayout {
+                        padding: 14px;
+                        spacing: 6px;
+                        Caption { text: "NOTE"; color: Pal.accent; }
+                        Body { text: root.confirm-note; }
+                    }
+                }
+                Caption { text: "INPUTS"; }
+                for i in root.confirm-inputs: Rectangle {
+                    border-radius: 10px;
+                    background: Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    height: irow.preferred-height;
+                    irow := HorizontalLayout {
+                        padding: 12px;
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            horizontal-stretch: 1;
+                            Mono { text: i.title; font-size: 11px; overflow: elide; wrap: no-wrap; }
+                            Caption { text: i.subtitle; font-size: 10px; overflow: elide; }
+                        }
+                        Mono {
+                            text: i.amount + " sats";
+                            color: Pal.text;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Caption { text: "OUTPUTS"; }
+                for o in root.confirm-outputs: Rectangle {
+                    border-radius: 10px;
+                    background: Pal.card;
+                    border-width: 1px;
+                    border-color: o.kind == "self" ? Pal.good.with-alpha(0.4)
+                        : (o.kind == "recipient" ? Pal.accent.with-alpha(0.4) : Pal.line);
+                    height: orow.preferred-height;
+                    orow := HorizontalLayout {
+                        padding: 12px;
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            horizontal-stretch: 1;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                Badge {
+                                    label: o.kind;
+                                    tint: o.kind == "self" ? Pal.good
+                                        : (o.kind == "recipient" ? Pal.accent
+                                        : (o.kind == "change" ? Pal.faint
+                                        : (o.kind == "note" ? Pal.accent : Pal.muted)));
+                                }
+                            }
+                            if o.title != "": Mono { text: o.title; font-size: 11px; overflow: elide; wrap: no-wrap; }
+                            if o.subtitle != "": Caption { text: o.subtitle; font-size: 10px; overflow: elide; }
+                        }
+                        Mono {
+                            text: o.amount + " sats";
+                            color: o.kind == "self" ? Pal.good : Pal.text;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Rectangle {
+                    border-radius: 10px;
+                    background: Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    height: frow.preferred-height;
+                    frow := HorizontalLayout {
+                        padding: 14px;
+                        Text {
+                            text: "Network fee";
+                            font-size: 13px;
+                            color: Pal.muted;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Mono { text: root.confirm-fee-line; color: Pal.text; }
+                    }
+                }
+            }
+        }
+        if root.psbt-signed: PrimaryButton {
+            text: "Broadcast";
+            clicked => { root.psbt-broadcast(); }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
     }

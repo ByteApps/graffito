@@ -10,7 +10,11 @@ members = ["app-core"]
 
 [dependencies]
 app-core = { path = "app-core" }
-slint = "=1.16.1"
+# renderer-software: headless offscreen render of screens to PNG for the
+# `--render` design-preview mode (the winit/femtovg default stays the norm).
+slint = { version = "=1.16.1", features = ["renderer-software"] }
+# PNG encode for `--render` snapshots.
+png = "0.17"
 # QR out: rendered into a slint Image.
 qrcode = "0.14"
 # QR in: camera frames (AVFoundation on Mac) → rqrr decode.
