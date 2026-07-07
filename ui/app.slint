@@ -361,6 +361,10 @@ export component AppWindow inherits Window {
     in-out property <string> rate-text;
     in-out property <int> fee-tier: 1;
     in property <string> cost-line;
+    // "Note too large to broadcast" dialog (per-tx ~100 kB ceiling).
+    in-out property <bool> show-oversize-modal;
+    in property <bool> oversize-offer-bump; // true → offer to switch to Standard
+    in property <string> oversize-message;
     in-out property <string> change-address;
     in-out property <bool> change-expanded;
     in property <string> change-amount;
@@ -453,6 +457,7 @@ export component AppWindow inherits Window {
     callback pick-account(int);
     callback account-cancel();
     callback set-chunk(string);
+    callback oversize-bump(); // raise chunk size to Standard from the compose dialog
     callback set-esplora(string);
     callback reveal-backup();
     callback go-home();
@@ -1650,6 +1655,50 @@ PrimaryButton {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.show-consolidate-confirm = false; } }
                     PrimaryButton { text: "Consolidate"; clicked => { root.consolidate(); } }
+                }
+            }
+        }
+    }
+
+    // ---------- note-too-large dialog (modal overlay) ----------
+    if root.show-oversize-modal: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.show-oversize-modal = false; } }
+        Rectangle {
+            width: 400px;
+            height: ol.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 200px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { }
+            ol := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Note too large";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Body {
+                    text: root.oversize-message;
+                    font-size: 12px;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton {
+                        text: root.oversize-offer-bump ? "Cancel" : "OK";
+                        clicked => { root.show-oversize-modal = false; }
+                    }
+                    if root.oversize-offer-bump: PrimaryButton {
+                        text: "Switch to Standard";
+                        clicked => { root.oversize-bump(); }
+                    }
                 }
             }
         }
