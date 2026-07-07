@@ -12,6 +12,8 @@ export struct SpendCoin { outpoint: string, value: string, confirmed: bool, sele
 // One input/output row in the Sparrow-style PSBT confirmation. `kind` drives
 // the accent: note · self · recipient · change · input · other.
 export struct PsbtRow { title: string, subtitle: string, amount: string, kind: string }
+// A saved funding wallet in the manager list.
+export struct FundingWalletRow { id: string, label: string, meta: string, active: bool }
 export struct ActivityItem {
     ref-id: string, is-note: bool, kind: string, title: string,
     txid: string, fee-line: string, status: string, explorer: string,
@@ -462,6 +464,9 @@ export component AppWindow inherits Window {
     in property <[PsbtRow]> confirm-outputs;
     in property <string> confirm-note;         // decoded note text (public) or placeholder
     in property <string> confirm-fee-line;
+    in property <[FundingWalletRow]> funding-wallets;   // saved wallet manager
+    in-out property <string> fund-rename-id;            // non-empty = rename modal open
+    in-out property <string> fund-rename-input;
     in property <[ContactItem]> contacts;
     in-out property <string> contact-input;
     in-out property <string> rename-address;
@@ -546,7 +551,14 @@ export component AppWindow inherits Window {
     callback set-coin-strategy(int);
     // external funding (PSBT)
     callback toggle-fund-external(bool);
-    callback open-funding();       // compose → funding-wallet screen
+    callback open-funding();       // compose → saved funding-wallets list
+    callback add-funding-wallet();     // list → add-wallet entry screen
+    callback use-funding-wallet(string);   // pick a saved wallet (scans it)
+    callback remove-funding-wallet(string);
+    callback refresh-funding-wallet(string);
+    callback fund-rename-start(string, string);   // (id, current-label)
+    callback fund-rename-save(string);
+    callback fund-rename-cancel();
     callback funding-changed(string);
     callback funding-scan();       // scan a descriptor/xpub QR
     callback funding-file();       // load a descriptor from file
@@ -1613,8 +1625,8 @@ export component AppWindow inherits Window {
         spacing: 12px;
         alignment: start;
         Header {
-            title: "Funding wallet";
-            back => { root.screen = 6; }
+            title: "Add wallet";
+            back => { root.open-funding(); }
         }
         Caption {
             text: "Paste or scan an output descriptor (or xpub) for the wallet that pays. Its key never leaves that wallet — you'll sign the transaction there.";
@@ -1651,7 +1663,7 @@ export component AppWindow inherits Window {
             }
         }
         PrimaryButton {
-            text: "Use this wallet";
+            text: "Save & use";
             tint: root.funding-valid ? Pal.accent : Pal.faint;
             tint-hover: root.funding-valid ? Pal.accent-hover : Pal.faint;
             clicked => { if (root.funding-valid) { root.funding-use(); } }
@@ -1829,6 +1841,135 @@ export component AppWindow inherits Window {
             clicked => { root.psbt-broadcast(); }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
+    }
+
+    // ---------- 15 · funding wallets (manager list) ----------
+    if screen == 15: VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Funding wallets";
+            back => { root.screen = 6; }
+        }
+        Caption {
+            text: "Watch-only wallets that can pay for your notes. Tap one to use it, or add another.";
+        }
+        if root.funding-wallets.length == 0: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: 60px;
+            Caption {
+                text: "No funding wallets yet — add one below.";
+                horizontal-alignment: center;
+                x: 0; width: parent.width;
+                y: (parent.height - self.preferred-height) / 2;
+            }
+        }
+        Flickable {
+            viewport-height: fw-col.preferred-height;
+            fw-col := VerticalLayout {
+                spacing: 8px;
+                alignment: start;
+                for fw in root.funding-wallets: Rectangle {
+                    height: fw-row.preferred-height;
+                    border-radius: 10px;
+                    background: fwta.has-hover ? Pal.card-hover : Pal.card;
+                    border-width: 1px;
+                    border-color: fw.active ? Pal.accent : Pal.line;
+                    fwta := TouchArea { clicked => { root.use-funding-wallet(fw.id); } }
+                    fw-row := HorizontalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            horizontal-stretch: 1;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                Text {
+                                    text: fw.label;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: Pal.text;
+                                    overflow: elide;
+                                }
+                                if fw.active: Badge { label: "active"; tint: Pal.accent; }
+                            }
+                            Caption { text: fw.meta; }
+                        }
+                        PencilButton { clicked => { root.fund-rename-start(fw.id, fw.label); } }
+                        IconButton {
+                            glyph: "↻";
+                            glyph-size: 15px;
+                            width: 32px;
+                            height: 32px;
+                            clicked => { root.refresh-funding-wallet(fw.id); }
+                        }
+                        IconButton {
+                            glyph: "×";
+                            glyph-size: 18px;
+                            glyph-color: Pal.bad;
+                            width: 32px;
+                            height: 32px;
+                            clicked => { root.remove-funding-wallet(fw.id); }
+                        }
+                    }
+                }
+            }
+        }
+        Rectangle { }
+        PrimaryButton {
+            text: "+  Add wallet";
+            clicked => { root.add-funding-wallet(); }
+        }
+        if root.status != "": Caption { text: root.status; color: Pal.bad; }
+    }
+
+    // ---------- funding-wallet rename (modal overlay) ----------
+    if root.fund-rename-id != "": Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.fund-rename-cancel(); } }
+        Rectangle {
+            width: 400px;
+            height: frl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { }
+            frl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Name this wallet";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                LineEdit {
+                    text <=> root.fund-rename-input;
+                    placeholder-text: "wallet name";
+                    accepted(t) => { root.fund-rename-save(t); }
+                    init => {
+                        self.focus();
+                        self.select-all();
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.fund-rename-cancel(); } }
+                    PrimaryButton { text: "Save"; clicked => { root.fund-rename-save(root.fund-rename-input); } }
+                }
+            }
+        }
     }
 
     // ---------- rename dialog (modal overlay) ----------
