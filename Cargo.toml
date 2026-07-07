@@ -40,3 +40,12 @@ bip39 = "2"
 
 [build-dependencies]
 slint-build = "=1.16.1"
+
+# Slint's text shaper (harfrust, via parley) has an integer add that overflows
+# on very large single text runs. Release wraps it (overflow-checks off by
+# default), but debug builds panic-abort — crashing the app on a huge paste
+# into the compose field. Match release behaviour in debug so the shaper can't
+# abort. NB: still present in harfrust 0.8.4 (Slint 1.17), so a Slint bump does
+# NOT remove the need for this — verified 2026-07-06.
+[profile.dev.package.harfrust]
+overflow-checks = false
