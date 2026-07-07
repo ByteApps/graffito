@@ -401,3 +401,22 @@ fn identity_mismatch_rejected_and_persistence_roundtrip() {
     assert_eq!(serde_json::to_string(&store).unwrap(), serde_json::to_string(&loaded).unwrap());
     assert_eq!(loaded.contacts[0].name, "someone");
 }
+
+/// Back-compat: stores written before the Settings rename used a bare
+/// `"esplora"` key for the custom Bitcoin-node URL. The serde `alias` must
+/// keep those loading into `node_url` so upgrading never silently drops a
+/// user's custom node.
+#[test]
+fn legacy_esplora_key_loads_into_node_url() {
+    let json = r#"{
+        "version": 1,
+        "network": "regtest",
+        "identity_fingerprint": "00",
+        "address": "bcrt1p",
+        "esplora": "http://127.0.0.1:3002"
+    }"#;
+    let store: Store = serde_json::from_str(json).unwrap();
+    assert_eq!(store.node_url.as_deref(), Some("http://127.0.0.1:3002"));
+    // And it re-serializes under the new key.
+    assert!(serde_json::to_string(&store).unwrap().contains("node_url"));
+}

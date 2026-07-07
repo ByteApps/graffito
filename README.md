@@ -19,13 +19,19 @@ from the chain plus your key alone.
   optional custom change address.
 - **Manage**: an Activity screen listing every transaction with retry
   (rebroadcast) and RBF fee-bump for stuck ones; a Coins screen to view
-  and consolidate UTXOs; sweep-all; per-coin/-note links to the tx on
-  mempool.space and to notes in the web viewer.
-- **Networks**: mainnet · testnet4 · signet · regtest (custom esplora
-  endpoint supported). Verified live on testnet4 — including a directed
-  private note decrypted by the Passport Prime app's own core — and
-  hermetically against bitcoind -regtest. Mainnet deliberately untested
-  (user decision; testnet4 + regtest are the acceptance bar).
+  and consolidate UTXOs; sweep-all; per-coin/-note links to the tx in
+  your chosen block explorer and to notes in the web viewer.
+- **Settings**: a **Bitcoin node** dropdown (mempool.space / Blockstream
+  / your own Esplora-compatible node) selects the API used for scans and
+  broadcasts; a separate **Block explorer** dropdown (mempool.space /
+  Blockstream / a self-hosted mempool) selects where "Explorer" links
+  open. Both offer a Custom URL and are set entirely through the UI.
+- **Networks**: mainnet · testnet4 · signet · regtest (point the Bitcoin
+  node at any Esplora/mempool-compatible endpoint). Verified live on
+  testnet4 — including a directed private note decrypted by the Passport
+  Prime app's own core — and hermetically against bitcoind -regtest.
+  Mainnet deliberately untested (user decision; testnet4 + regtest are
+  the acceptance bar).
 - **UI**: Slint (Rust end-to-end), dark card-based design, driven by a
   scripted CGEvents e2e (`../ui-automation/tests/chain-notes-app.sh`).
 

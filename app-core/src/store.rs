@@ -151,9 +151,15 @@ pub struct Store {
     pub last_scan_time: u64,
     #[serde(default = "default_chunk")]
     pub chunk_size: usize,
-    /// Custom esplora base URL (Settings); None = network default.
+    /// Custom Bitcoin node base URL (Settings) — must be an Esplora/mempool-
+    /// compatible HTTP API; None = network default. `alias` keeps stores
+    /// written before the rename (field was `esplora`) loading unchanged.
+    #[serde(default, alias = "esplora")]
+    pub node_url: Option<String>,
+    /// Custom block-explorer website base (Settings), everything before
+    /// `/tx/{txid}`; None = network default (mempool.space).
     #[serde(default)]
-    pub esplora: Option<String>,
+    pub explorer: Option<String>,
 }
 
 fn default_chunk() -> usize {
@@ -174,7 +180,8 @@ impl Store {
             tip_height: 0,
             last_scan_time: 0,
             chunk_size: DEFAULT_CHUNK,
-            esplora: None,
+            node_url: None,
+            explorer: None,
         }
     }
 

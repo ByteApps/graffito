@@ -278,6 +278,76 @@ component SelectPill inherits Rectangle {
     }
 }
 
+// A dark-themed dropdown: a button showing the current option, a popup list on
+// click. `options` is the label model (caller appends a trailing "Custom…"),
+// `current-index` the selected row; `selected(i)` fires on pick.
+component Dropdown inherits Rectangle {
+    in property <[string]> options;
+    in property <int> current-index;
+    callback selected(int);
+    height: 40px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Pal.line;
+    background: ta.has-hover ? Pal.card-hover : Pal.bg;
+    ta := TouchArea { clicked => { popup.show(); } }
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 8px;
+        Text {
+            text: (root.current-index >= 0 && root.current-index < root.options.length)
+                ? root.options[root.current-index] : "";
+            vertical-alignment: center;
+            horizontal-alignment: left;
+            color: Pal.text;
+            font-size: 13px;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Image {
+            source: @image-url("icons/caret-down.svg");
+            colorize: Pal.muted;
+            width: 14px;
+            height: 14px;
+            y: (parent.height - 14px) / 2;
+        }
+    }
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: root.width;
+        Rectangle {
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Pal.line;
+            background: Pal.card;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000088;
+            VerticalLayout {
+                padding: 4px;
+                for opt[i] in root.options: Rectangle {
+                    height: 36px;
+                    border-radius: 8px;
+                    background: ota.has-hover ? Pal.card-hover
+                        : (i == root.current-index ? Pal.accent.with-alpha(0.18) : transparent);
+                    ota := TouchArea { clicked => { root.selected(i); popup.close(); } }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: opt;
+                            vertical-alignment: center;
+                            color: i == root.current-index ? Pal.accent : Pal.text;
+                            font-size: 13px;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 component SettingsCard inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
@@ -389,7 +459,15 @@ export component AppWindow inherits Window {
     in-out property <bool> show-reset-confirm;
     in-out property <string> chunk-text;
     in-out property <bool> chunk-custom;
-    in-out property <string> esplora-text;
+    // Bitcoin node picker (URLs must be Esplora/mempool-compatible): option
+    // labels (last = "Custom…"), selected index, custom-URL text when active.
+    in property <[string]> node-options;
+    in-out property <int> node-index;
+    in-out property <string> node-custom-text;
+    // Block-explorer picker: same shape.
+    in property <[string]> explorer-options;
+    in-out property <int> explorer-index;
+    in-out property <string> explorer-custom-text;
     in property <string> reveal-text;
     in property <[CoinItem]> coins;
     in property <string> coins-summary;
@@ -458,7 +536,10 @@ export component AppWindow inherits Window {
     callback account-cancel();
     callback set-chunk(string);
     callback oversize-bump(); // raise chunk size to Standard from the compose dialog
-    callback set-esplora(string);
+    callback set-node-preset(int);
+    callback set-node-custom(string);
+    callback set-explorer-preset(int);
+    callback set-explorer-custom(string);
     callback reveal-backup();
     callback go-home();
 
@@ -1169,12 +1250,31 @@ PrimaryButton {
             }
         }
         SettingsCard {
-            title: "Esplora endpoint";
-            subtitle: "Scans and broadcasts go through this server — it learns your address and IP. Leave empty for the network default (mempool.space). Press Return to apply.";
-            LineEdit {
-                text <=> root.esplora-text;
-                placeholder-text: "https://mempool.space/… (network default)";
-                accepted(t) => { root.set-esplora(t); }
+            title: "Bitcoin node";
+            subtitle: "Scans and broadcasts go through this server — it learns your address and IP. Pick a provider, or point at your own Esplora/mempool-compatible node.";
+            Dropdown {
+                options: root.node-options;
+                current-index: root.node-index;
+                selected(i) => { root.node-index = i; root.set-node-preset(i); }
+            }
+            if root.node-index == root.node-options.length - 1: LineEdit {
+                text <=> root.node-custom-text;
+                placeholder-text: "https://mempool.example/api  or  http://127.0.0.1:3002";
+                accepted(t) => { root.set-node-custom(t); }
+            }
+        }
+        SettingsCard {
+            title: "Block explorer";
+            subtitle: "Where the app's Explorer links open a transaction. Pick a site or use your own (e.g. a self-hosted mempool); the link becomes <base>/tx/<txid>.";
+            Dropdown {
+                options: root.explorer-options;
+                current-index: root.explorer-index;
+                selected(i) => { root.explorer-index = i; root.set-explorer-preset(i); }
+            }
+            if root.explorer-index == root.explorer-options.length - 1: LineEdit {
+                text <=> root.explorer-custom-text;
+                placeholder-text: "https://your-mempool-host  (no trailing /tx)";
+                accepted(t) => { root.set-explorer-custom(t); }
             }
         }
         SettingsCard {

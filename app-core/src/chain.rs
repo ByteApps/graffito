@@ -34,6 +34,65 @@ pub fn default_base(network: Network) -> Option<&'static str> {
     }
 }
 
+/// Named Bitcoin-node presets for the Settings dropdown (each is an Esplora/
+/// mempool-compatible API base). `Some(url)` is an explicit base; `None` means
+/// "network default" — stored as `node_url = None` so the choice keeps
+/// tracking [`default_base`]. A trailing "Custom…"
+/// entry (raw URL text field) is a UI concern and not listed here, so an empty
+/// list (regtest) still yields a one-option dropdown of just Custom.
+pub fn node_presets(network: Network) -> Vec<(&'static str, Option<&'static str>)> {
+    match network {
+        // Blockstream's Esplora is mainnet + testnet3 only — not testnet4 or
+        // signet — so it's offered on mainnet alone.
+        Network::Mainnet => vec![
+            ("mempool.space", None),
+            ("Blockstream", Some("https://blockstream.info/api")),
+        ],
+        Network::Testnet4 => vec![("mempool.space", None)],
+        Network::Signet => vec![("mempool.space", None)],
+        Network::Regtest => vec![],
+    }
+}
+
+/// Default block-explorer website base — everything before `/tx/{txid}`. None
+/// where there's no public explorer (regtest).
+pub fn default_explorer_base(network: Network) -> Option<&'static str> {
+    match network {
+        Network::Mainnet => Some("https://mempool.space"),
+        Network::Testnet4 => Some("https://mempool.space/testnet4"),
+        Network::Signet => Some("https://mempool.space/signet"),
+        Network::Regtest => None,
+    }
+}
+
+/// Named block-explorer presets for the Settings dropdown (website base, i.e.
+/// everything before `/tx/{txid}`). Same `None = network default` convention
+/// as [`node_presets`]; Custom is a UI concern appended by the caller.
+pub fn explorer_presets(network: Network) -> Vec<(&'static str, Option<&'static str>)> {
+    match network {
+        Network::Mainnet => vec![
+            ("mempool.space", None),
+            ("Blockstream", Some("https://blockstream.info")),
+        ],
+        Network::Testnet4 => vec![("mempool.space", None)],
+        Network::Signet => vec![("mempool.space", None)],
+        Network::Regtest => vec![],
+    }
+}
+
+/// Block-explorer tx permalink. `explorer` = the custom website base from
+/// Settings (None = network default). Returns "" when no explorer is available
+/// (regtest with no custom base set), matching the "no link" UI convention.
+pub fn explorer_tx_url(explorer: Option<&str>, network: Network, txid: &str) -> String {
+    match explorer
+        .map(str::to_string)
+        .or_else(|| default_explorer_base(network).map(String::from))
+    {
+        Some(base) => format!("{}/tx/{txid}", base.trim_end_matches('/')),
+        None => String::new(),
+    }
+}
+
 pub struct HttpTransport {
     base: String,
     client: reqwest::blocking::Client,

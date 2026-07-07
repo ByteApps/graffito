@@ -13,7 +13,9 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use app_core::chain::{default_base, ChainClient, HttpTransport};
+use app_core::chain::{
+    default_base, explorer_presets, explorer_tx_url, node_presets, ChainClient, HttpTransport,
+};
 use app_core::compose::{compose_and_record, ComposeRequest};
 use app_core::identity::{generate_mnemonic, parse_key_material, realize, AppIdentity};
 use app_core::notes_core::address::Recipient;
@@ -65,10 +67,13 @@ impl State {
         )
     }
 
+    /// The Bitcoin-node base URL: the per-identity Settings choice, else the
+    /// network default. Configured only through the Settings screen — there is
+    /// no env override, so tests exercise the same path a user does.
     fn base_url(&self) -> Option<String> {
-        std::env::var("APP_ESPLORA")
-            .ok()
-            .or_else(|| self.store.as_ref().and_then(|s| s.esplora.clone()))
+        self.store
+            .as_ref()
+            .and_then(|s| s.node_url.clone())
             .or_else(|| default_base(self.network).map(String::from))
     }
 
@@ -155,13 +160,42 @@ fn note_web_url(network: Network, address: &str, note_id: &str) -> String {
     }
 }
 
-/// mempool.space tx permalink, or empty on regtest (no public explorer).
-fn explorer_tx_url(network: Network, txid: &str) -> String {
-    match network {
-        Network::Regtest => String::new(),
-        Network::Mainnet => format!("https://mempool.space/tx/{txid}"),
-        net => format!("https://mempool.space/{}/tx/{txid}", net.as_str()),
+/// Populate the Settings node + explorer dropdown models, selected indices,
+/// and custom-URL text from the current store. The stored value is matched
+/// against the network's presets; a non-preset value selects the trailing
+/// "Custom…" row and prefills its text field. `stored == cur`:
+/// `None` (network default) matches the first preset (mempool.space).
+fn load_backend_settings(w: &AppWindow, st: &State) {
+    fn fill(
+        presets: Vec<(&'static str, Option<&'static str>)>,
+        cur: Option<&str>,
+    ) -> (Vec<SharedString>, i32, SharedString) {
+        let mut opts: Vec<SharedString> = presets.iter().map(|(l, _)| (*l).into()).collect();
+        opts.push("Custom…".into());
+        let idx = presets
+            .iter()
+            .position(|(_, u)| match (u, cur) {
+                (None, None) => true,
+                (Some(a), Some(b)) => *a == b,
+                _ => false,
+            })
+            .unwrap_or(presets.len());
+        let custom = if idx == presets.len() { cur.unwrap_or("") } else { "" };
+        (opts, idx as i32, custom.into())
     }
+
+    let net = st.network;
+    let (n_opts, n_idx, n_custom) =
+        fill(node_presets(net), st.store.as_ref().and_then(|s| s.node_url.as_deref()));
+    w.set_node_options(VecModel::from_slice(&n_opts));
+    w.set_node_index(n_idx);
+    w.set_node_custom_text(n_custom);
+
+    let (e_opts, e_idx, e_custom) =
+        fill(explorer_presets(net), st.store.as_ref().and_then(|s| s.explorer.as_deref()));
+    w.set_explorer_options(VecModel::from_slice(&e_opts));
+    w.set_explorer_index(e_idx);
+    w.set_explorer_custom_text(e_custom);
 }
 
 /// Build the unified activity list (note txs + sweep/consolidate),
@@ -169,6 +203,7 @@ fn explorer_tx_url(network: Network, txid: &str) -> String {
 fn update_activity(w: &AppWindow, st: &State) {
     let Some(store) = &st.store else { return };
     let net = st.network;
+    let ex = store.explorer.as_deref();
     let mut items: Vec<(u64, bool, ActivityItem)> = Vec::new(); // (created, confirmed, item)
 
     for n in &store.notes {
@@ -200,7 +235,7 @@ fn update_activity(w: &AppWindow, st: &State) {
                 txid: txid.clone().into(),
                 fee_line: fee_line_str(n.fee, n.vsize).into(),
                 status: status.into(),
-                explorer: explorer_tx_url(net, txid).into(),
+                explorer: explorer_tx_url(ex, net, txid).into(),
                 pending: n.status == NoteStatus::Pending && n.raw_hex.is_some(),
                 replaced: replaced_label(n.txids.len()).into(),
             },
@@ -230,7 +265,7 @@ fn update_activity(w: &AppWindow, st: &State) {
                 txid: txid.clone().into(),
                 fee_line: fee_line_str(Some(t.fee), Some(t.vsize)).into(),
                 status: status.into(),
-                explorer: explorer_tx_url(net, txid).into(),
+                explorer: explorer_tx_url(ex, net, txid).into(),
                 pending: t.status == NoteStatus::Pending && t.raw_hex.is_some(),
                 replaced: replaced_label(t.txids.len()).into(),
             },
@@ -407,7 +442,7 @@ fn update_home(w: &AppWindow, st: &State) {
         );
     }
     w.set_chunk_text(store.chunk_size.to_string().into());
-    w.set_esplora_text(store.esplora.clone().unwrap_or_default().into());
+    load_backend_settings(w, st);
     // Coins (spendable UTXOs) list + summary.
     let coins: Vec<CoinItem> = store
         .utxos
@@ -437,7 +472,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
         return;
     }
     let Some(base) = st.base_url() else {
-        w.set_status("no esplora endpoint for this network — set one in Settings".into());
+        w.set_status("no Bitcoin node for this network — set one in Settings".into());
         return;
     };
     let client = ChainClient::new(HttpTransport::new(base), st.network);
@@ -653,7 +688,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             confirmed: u.height.is_some(),
             selected,
             txid_short: u.txid[..8.min(u.txid.len())].to_string().into(),
-            explorer: explorer_tx_url(net, &u.txid).into(),
+            explorer: explorer_tx_url(store.explorer.as_deref(), net, &u.txid).into(),
         });
     }
     w.set_spend_coins(VecModel::from_slice(&coins));
@@ -1572,7 +1607,7 @@ fn main() {
         let net = s.network;
         let to = s.to_address.clone();
         let Some(base) = s.base_url() else {
-            w.set_status("no esplora endpoint — set one in Settings".into());
+            w.set_status("no Bitcoin node — set one in Settings".into());
             return;
         };
         if !w.get_spend_enough() {
@@ -1635,10 +1670,10 @@ fn main() {
 
     cb!(on_settings_open, |w, s| {
         println!("cb: settings-open");
-        let _ = &mut s;
         w.set_reveal_text("".into());
         w.set_status("".into());
         w.set_chunk_custom(false);
+        load_backend_settings(&w, &s);
         w.set_screen(8);
     });
 
@@ -1782,13 +1817,61 @@ fn main() {
         refresh_compose(&w, &mut s);
     });
 
-    cb!(on_set_esplora, |w, s, t: SharedString| {
+    // Bitcoin node dropdown: a preset row writes its base (None = network
+    // default) to the store; the trailing "Custom…" row just reveals the text
+    // field (the Slint side already moved node-index) — the value follows when
+    // the user submits it via set-node-custom.
+    cb!(on_set_node_preset, |w, s, i: i32| {
+        let presets = node_presets(s.network);
+        let i = i as usize;
+        if i < presets.len() {
+            let url = presets[i].1.map(String::from);
+            if let Some(store) = &mut s.store {
+                store.node_url = url;
+            }
+            s.save_store();
+            println!("cb: set-node-preset {}", presets[i].0);
+        } else {
+            println!("cb: set-node-preset custom");
+        }
+        w.set_status("".into());
+    });
+
+    cb!(on_set_node_custom, |w, s, t: SharedString| {
         let v = t.trim().to_string();
         if let Some(store) = &mut s.store {
-            store.esplora = if v.is_empty() { None } else { Some(v.clone()) };
+            store.node_url = if v.is_empty() { None } else { Some(v.clone()) };
         }
         s.save_store();
-        println!("cb: set-esplora {}", if v.is_empty() { "default" } else { &v });
+        println!("cb: set-node-custom {}", if v.is_empty() { "default" } else { &v });
+        w.set_status("".into());
+    });
+
+    cb!(on_set_explorer_preset, |w, s, i: i32| {
+        let presets = explorer_presets(s.network);
+        let i = i as usize;
+        if i < presets.len() {
+            let url = presets[i].1.map(String::from);
+            if let Some(store) = &mut s.store {
+                store.explorer = url;
+            }
+            s.save_store();
+            update_activity(&w, &s); // refresh live Explorer links
+            println!("cb: set-explorer-preset {}", presets[i].0);
+        } else {
+            println!("cb: set-explorer-preset custom");
+        }
+        w.set_status("".into());
+    });
+
+    cb!(on_set_explorer_custom, |w, s, t: SharedString| {
+        let v = t.trim().to_string();
+        if let Some(store) = &mut s.store {
+            store.explorer = if v.is_empty() { None } else { Some(v.clone()) };
+        }
+        s.save_store();
+        update_activity(&w, &s); // refresh live Explorer links
+        println!("cb: set-explorer-custom {}", if v.is_empty() { "default" } else { &v });
         w.set_status("".into());
     });
 
