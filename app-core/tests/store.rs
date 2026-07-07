@@ -49,6 +49,7 @@ fn onchain(tx: &NoteTx, height: u64, from_self: bool, sender: Option<&str>, reci
             .collect(),
         pays_self: true,
         sender: sender.map(String::from),
+        author_candidates: sender.map(|s| vec![String::from(s)]).unwrap_or_default(),
         recipient: recipient.map(String::from),
     }
 }

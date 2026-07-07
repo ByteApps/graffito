@@ -14,11 +14,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use app_core::bitcoin;
 use app_core::chain::{
     default_base, explorer_presets, explorer_tx_url, node_presets, ChainClient, HttpTransport,
 };
 use app_core::compose::{compose_and_record, ComposeRequest};
+use app_core::funding::{FundingSource, FundingUtxo};
 use app_core::identity::{generate_mnemonic, parse_key_material, realize, AppIdentity};
+use app_core::psbt_build::{build_funding_psbt, BuiltPsbt, FundingPlan, NoteParams};
+use app_core::psbt_finalize::{
+    finalize_extract, parse_psbt, summarize, validate_signed, OutputRole, SummaryContext,
+};
 use app_core::notes_core::address::Recipient;
 use app_core::notes_core::bundle::{estimate_note_cost, FeeRates};
 use app_core::notes_core::Network;
@@ -62,6 +68,15 @@ struct State {
     /// ceiling, so the "too large" dialog pops once on crossing — not on
     /// every keystroke while the draft stays too big.
     compose_oversize: bool,
+    /// External-funding session (screens 12–14). The parsed funding source,
+    /// its scanned spendable coins + next change index, the built unsigned
+    /// PSBT, its animated-UR export frames, and the imported signed PSBT.
+    funding: Option<FundingSource>,
+    funding_coins: Vec<FundingUtxo>,
+    funding_change_index: u32,
+    built_psbt: Option<BuiltPsbt>,
+    ur_frames: Vec<String>,
+    signed_psbt: Option<bitcoin::Psbt>,
 }
 
 impl State {
@@ -653,6 +668,12 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     let text = w.get_compose_text().to_string();
     let private = w.get_compose_private();
     let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
+    // External-funding mode: the coin panel shows the funding wallet's coins,
+    // not the self-funded store coins. Handled on its own isolated path.
+    if w.get_fund_external() {
+        funding_compose_ui(w, st, &text);
+        return;
+    }
     let spk_len = st
         .to_address
         .as_deref()
@@ -805,6 +826,152 @@ impl CloneFields for app_core::notes_core::bundle::Identity {
     }
 }
 
+/// External-funding variant of the compose coin panel: show the funding
+/// wallet's scanned coins (all spent) and a source summary, instead of the
+/// self-funded store coins. Keeps the intricate self-funded path untouched.
+fn funding_compose_ui(w: &AppWindow, st: &State, text: &str) {
+    let total: u64 = st.funding_coins.iter().map(|c| c.value).sum();
+    let n = st.funding_coins.len();
+    let ready = st.funding.is_some() && n > 0;
+    w.set_funding_ready(ready);
+    match &st.funding {
+        Some(src) => w.set_funding_summary(
+            format!("{} · {n} coin{} · {total} sats", src.kind.label(), if n == 1 { "" } else { "s" }).into(),
+        ),
+        None => w.set_funding_summary("Set a funding wallet".into()),
+    }
+    let net = st.network;
+    let exb = st.explorer_base();
+    let coins: Vec<SpendCoin> = st
+        .funding_coins
+        .iter()
+        .map(|c| SpendCoin {
+            outpoint: format!("{}:{}", c.txid, c.vout).into(),
+            value: c.value.to_string().into(),
+            confirmed: c.confirmed,
+            selected: true,
+            txid_short: c.txid[..8.min(c.txid.len())].to_string().into(),
+            explorer: explorer_tx_url(exb.as_deref(), net, &c.txid).into(),
+        })
+        .collect();
+    w.set_spend_coins(VecModel::from_slice(&coins));
+    w.set_spend_title(format!("Funding {n} coin{} · {total} sats", if n == 1 { "" } else { "s" }).into());
+    w.set_cost_line(if text.is_empty() { String::new() } else { "funded from the external wallet".into() }.into());
+    w.set_spend_enough(ready && !text.is_empty());
+    w.set_change_error("".into());
+}
+
+/// Import a signed PSBT (from file bytes, a base64/hex string, or a UR string),
+/// validate it against the tx we built, render the Sparrow-style confirmation,
+/// and advance to the review screen.
+fn load_signed_psbt(w: &AppWindow, st: &mut State, data: &[u8]) {
+    let psbt: Result<bitcoin::Psbt, String> = if data.starts_with(b"psbt\xff") {
+        bitcoin::Psbt::deserialize(data).map_err(|e| e.to_string())
+    } else {
+        let text = String::from_utf8_lossy(data);
+        let t = text.trim();
+        if t.to_lowercase().starts_with("ur:") {
+            let mut dec = app_core::ur::PsbtUrDecoder::new();
+            match dec.receive(t) {
+                Ok(true) => dec
+                    .psbt_bytes()
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| bitcoin::Psbt::deserialize(&b).map_err(|e| e.to_string())),
+                Ok(false) => Err("multi-frame UR — import the .psbt file instead".into()),
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            parse_psbt(t).map_err(|e| e.to_string())
+        }
+    };
+    match psbt {
+        Ok(p) => set_confirm_from_psbt(w, st, p),
+        Err(e) => w.set_status(format!("import: {e}").into()),
+    }
+}
+
+/// Validate + summarize a signed PSBT into the confirmation screen.
+fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
+    let Some(built) = st.built_psbt.as_ref() else {
+        w.set_status("build a transaction first".into());
+        return;
+    };
+    if let Err(e) = validate_signed(&psbt, &built.txid) {
+        w.set_status(format!("{e}").into());
+        return;
+    }
+    let Some(ident) = st.ident.as_ref() else { return };
+    let identity = ident.identity.clone_fields();
+    let recipient_addr = st.to_address.clone();
+    let change_addr = st
+        .funding
+        .as_ref()
+        .and_then(|src| src.derive(1, st.funding_change_index).ok())
+        .map(|d| d.address);
+    let ctx = SummaryContext {
+        identity: &identity,
+        network: st.network,
+        recipient_addr: recipient_addr.as_deref(),
+        change_addr: change_addr.as_deref(),
+    };
+    let sum = match summarize(&psbt, &ctx) {
+        Ok(s) => s,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
+    let inputs: Vec<PsbtRow> = sum
+        .inputs
+        .iter()
+        .map(|i| PsbtRow {
+            title: i.address.clone().unwrap_or_else(|| "(unknown)".into()).into(),
+            subtitle: i.outpoint.clone().into(),
+            amount: i.value.to_string().into(),
+            kind: "input".into(),
+        })
+        .collect();
+    let mut note_text = String::new();
+    let outputs: Vec<PsbtRow> = sum
+        .outputs
+        .iter()
+        .map(|o| {
+            let (kind, title, subtitle) = match &o.role {
+                OutputRole::Note { text, chunks } => {
+                    if let Some(t) = text {
+                        note_text = t.clone();
+                    }
+                    (
+                        "note",
+                        String::new(),
+                        if text.is_some() {
+                            "OP_RETURN · PNTE note".to_string()
+                        } else {
+                            format!("OP_RETURN · encrypted note ({chunks} chunk)")
+                        },
+                    )
+                }
+                OutputRole::SelfDust => ("self", o.address.clone().unwrap_or_default(), "your notebook (keeps the note yours)".into()),
+                OutputRole::Recipient => ("recipient", o.address.clone().unwrap_or_default(), "directed recipient".into()),
+                OutputRole::Change => ("change", o.address.clone().unwrap_or_default(), "change back to the funding wallet".into()),
+                OutputRole::Other => ("other", o.address.clone().unwrap_or_default(), String::new()),
+            };
+            PsbtRow { title: title.into(), subtitle: subtitle.into(), amount: o.value.to_string().into(), kind: kind.into() }
+        })
+        .collect();
+    if note_text.is_empty() {
+        note_text = "Encrypted note — readable only by you and the recipient.".into();
+    }
+    w.set_confirm_note(note_text.into());
+    w.set_confirm_inputs(VecModel::from_slice(&inputs));
+    w.set_confirm_outputs(VecModel::from_slice(&outputs));
+    w.set_confirm_fee_line(format!("{} sats", sum.fee).into());
+    st.signed_psbt = Some(psbt);
+    w.set_psbt_signed(true);
+    w.set_status("".into());
+    w.set_screen(14);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--spike") {
@@ -820,6 +987,17 @@ fn main() {
             eprintln!("cb: spike err={e}");
             std::process::exit(1);
         }
+        return;
+    }
+    // Headless design preview: `--render <out-dir> <screen>[,<screen>...]`
+    // renders each screen to a PNG via the software renderer (no window).
+    if args.get(1).map(String::as_str) == Some("--render") {
+        let out_dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
+        let screens: Vec<i32> = args
+            .get(3)
+            .map(|s| s.split(',').filter_map(|n| n.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![6, 12, 13, 14]);
+        render_previews(480, 900, &screens, &out_dir);
         return;
     }
 
@@ -876,6 +1054,12 @@ fn main() {
         pending_mnemonic: None,
         quiz_indices: Vec::new(),
         compose_oversize: false,
+        funding: None,
+        funding_coins: Vec::new(),
+        funding_change_index: 0,
+        built_psbt: None,
+        ur_frames: Vec::new(),
+        signed_psbt: None,
     }));
     let window = AppWindow::new().expect("window");
 
@@ -1538,6 +1722,56 @@ fn main() {
         });
     }
 
+    // Scan a funding descriptor / xpub QR → prefill + validate.
+    {
+        let weak = window.as_weak();
+        window.on_funding_scan(move || {
+            println!("cb: funding-scan start");
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let text = match camera::capture_and_decode(30, |_, _, _| {}) {
+                    Ok(Some(p)) => String::from_utf8_lossy(&p).to_string(),
+                    _ => String::new(),
+                };
+                let _ = weak.upgrade_in_event_loop(move |w| {
+                    if text.trim().is_empty() {
+                        w.set_status("scan: no QR seen".into());
+                    } else {
+                        println!("cb: funding-scan ok");
+                        let t: SharedString = text.trim().into();
+                        w.set_funding_descriptor(t.clone());
+                        w.invoke_funding_changed(t);
+                    }
+                });
+            });
+        });
+    }
+
+    // Scan a signed PSBT QR (single-frame crypto-psbt) → validate + confirm.
+    // The decode/validate runs back on the UI thread via the psbt-loaded
+    // callback (which has state access), so no Rc crosses the thread boundary.
+    {
+        let weak = window.as_weak();
+        window.on_psbt_import_scan(move || {
+            println!("cb: psbt-scan start");
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let text = match camera::capture_and_decode(30, |_, _, _| {}) {
+                    Ok(Some(p)) => String::from_utf8_lossy(&p).to_string(),
+                    _ => String::new(),
+                };
+                let _ = weak.upgrade_in_event_loop(move |w| {
+                    if text.trim().is_empty() {
+                        w.set_status("scan: no QR seen".into());
+                    } else {
+                        println!("cb: psbt-scan ok");
+                        w.invoke_psbt_loaded(text.into());
+                    }
+                });
+            });
+        });
+    }
+
     cb!(on_start_rename, |w, s, addr: SharedString, name: SharedString| {
         let _ = &mut s;
         println!("cb: rename-start addr={addr}");
@@ -1628,6 +1862,237 @@ fn main() {
         refresh(&w, &mut s);
         w.set_status("".into());
         refresh_compose(&w, &mut s);
+    });
+
+    // ---------- external funding (PSBT) ----------
+    cb!(on_toggle_fund_external, |w, s, on: bool| {
+        println!("cb: fund-external {on}");
+        if !on {
+            s.funding_coins.clear();
+        }
+        w.set_status("".into());
+        refresh_compose(&w, &mut s);
+    });
+
+    cb!(on_open_funding, |w, s| {
+        let _ = &mut s;
+        println!("cb: open-funding");
+        w.set_status("".into());
+        w.set_screen(12);
+    });
+
+    cb!(on_funding_changed, |w, s, text: SharedString| {
+        let net = s.network;
+        let _ = &mut s;
+        let t = text.trim();
+        if t.is_empty() {
+            w.set_funding_feedback("".into());
+            w.set_funding_valid(false);
+            return;
+        }
+        match FundingSource::parse(t, net) {
+            Ok(src) => {
+                let a0 = src.derive(0, 0).map(|d| d.address).unwrap_or_default();
+                w.set_funding_feedback(format!("{} wallet · first address\n{a0}", src.kind.label()).into());
+                w.set_funding_valid(true);
+            }
+            Err(e) => {
+                w.set_funding_feedback(format!("{e}").into());
+                w.set_funding_valid(false);
+            }
+        }
+    });
+
+    cb!(on_funding_use, |w, s| {
+        let desc = w.get_funding_descriptor().to_string();
+        let net = s.network;
+        let src = match FundingSource::parse(desc.trim(), net) {
+            Ok(src) => src,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let Some(base) = s.base_url() else {
+            w.set_status("no Bitcoin node — set one in Settings".into());
+            return;
+        };
+        w.set_status("scanning funding wallet…".into());
+        let client = ChainClient::new(HttpTransport::new(&base), net);
+        match client.scan_funding(&src, 20) {
+            Ok(scan) if scan.utxos.is_empty() => {
+                let _ = scan;
+                w.set_status("no spendable coins at that wallet".into());
+            }
+            Ok(scan) => {
+                s.funding_coins = scan.utxos;
+                s.funding_change_index = scan.next_change_index;
+                s.funding = Some(src);
+                w.set_status("".into());
+                w.set_fund_external(true);
+                w.set_spend_expanded(true);
+                w.set_screen(6);
+                refresh_compose(&w, &mut s);
+            }
+            Err(e) => w.set_status(format!("scan failed: {e}").into()),
+        }
+    });
+
+    cb!(on_funding_clear, |w, s| {
+        s.funding = None;
+        s.funding_coins.clear();
+        s.built_psbt = None;
+        s.signed_psbt = None;
+        w.set_funding_descriptor("".into());
+        w.set_funding_feedback("".into());
+        w.set_funding_valid(false);
+        refresh_compose(&w, &mut s);
+    });
+
+    cb!(on_fund_build, |w, s| {
+        let text = w.get_compose_text().to_string();
+        let private = w.get_compose_private();
+        let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(0.0);
+        if text.is_empty() || rate <= 0.0 {
+            w.set_status("empty note or bad fee rate".into());
+            return;
+        }
+        if s.funding.is_none() || s.funding_coins.is_empty() {
+            w.set_status("set a funding wallet first".into());
+            return;
+        }
+        let net = s.network;
+        let to = s.to_address.clone();
+        let recipient = match to.as_deref() {
+            Some(a) => match Recipient::parse(net, a) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    w.set_status(format!("{e}").into());
+                    return;
+                }
+            },
+            None => None,
+        };
+        let src = s.funding.clone().unwrap();
+        let coins = s.funding_coins.clone();
+        let change_index = s.funding_change_index;
+        let identity = s.ident.as_ref().unwrap().identity.clone_fields();
+        let r = app_core::notes_core::keys::generate_aux_rand()
+            .map(|x| [x[0], x[1], x[2], x[3]])
+            .unwrap_or([1, 2, 3, 4]);
+        let plan = FundingPlan { source: &src, coins: &coins, change_index, fee_rate: rate };
+        let np = NoteParams {
+            identity: &identity,
+            text: &text,
+            private,
+            recipient: recipient.as_ref(),
+            note_id: r,
+            max_op_return_bytes: DEFAULT_CHUNK,
+            network: net,
+        };
+        match build_funding_psbt(&plan, &np) {
+            Ok(built) => {
+                let frames = app_core::ur::encode_psbt(&built.to_bytes(), 300);
+                let n = coins.len();
+                w.set_psbt_cost_line(
+                    format!("fee {} sats · {n} input{}", built.fee, if n == 1 { "" } else { "s" }).into(),
+                );
+                w.set_psbt_qr(qr::qr_image(&frames[0]).unwrap_or_default());
+                w.set_psbt_frame_label(
+                    if frames.len() > 1 { format!("frame 1 / {}", frames.len()).into() } else { "".into() },
+                );
+                s.ur_frames = frames;
+                s.built_psbt = Some(built);
+                s.signed_psbt = None;
+                w.set_psbt_signed(false);
+                w.set_status("".into());
+                w.set_screen(13);
+                println!("cb: fund-build ok");
+            }
+            Err(e) => w.set_status(format!("{e}").into()),
+        }
+    });
+
+    cb!(on_psbt_save, |w, s| {
+        let Some(built) = s.built_psbt.as_ref() else { return };
+        let bytes = built.to_bytes();
+        if let Some(path) = rfd::FileDialog::new().set_file_name("note.psbt").save_file() {
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => w.set_status("saved .psbt".into()),
+                Err(e) => w.set_status(format!("save failed: {e}").into()),
+            }
+        }
+    });
+
+    cb!(on_psbt_copy, |w, s| {
+        use std::io::Write;
+        let b64 = s.built_psbt.as_ref().map(|b| b.to_base64()).unwrap_or_default();
+        if b64.is_empty() {
+            return;
+        }
+        let ok = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                c.stdin.as_mut().expect("piped").write_all(b64.as_bytes())?;
+                c.wait()
+            })
+            .is_ok();
+        w.set_status(if ok { "copied PSBT (base64)" } else { "copy failed" }.into());
+    });
+
+    cb!(on_psbt_goto_import, |w, s| {
+        let _ = &mut s;
+        w.set_status("".into());
+        w.set_screen(14);
+    });
+
+    cb!(on_psbt_loaded, |w, s, text: SharedString| {
+        load_signed_psbt(&w, &mut s, text.as_bytes());
+    });
+
+    cb!(on_psbt_import_file, |w, s| {
+        if let Some(path) = rfd::FileDialog::new().add_filter("PSBT", &["psbt", "txt"]).pick_file() {
+            match std::fs::read(&path) {
+                Ok(bytes) => load_signed_psbt(&w, &mut s, &bytes),
+                Err(e) => w.set_status(format!("read failed: {e}").into()),
+            }
+        }
+    });
+
+    cb!(on_psbt_broadcast, |w, s| {
+        let Some(psbt) = s.signed_psbt.clone() else {
+            w.set_status("no signed PSBT".into());
+            return;
+        };
+        let Some(base) = s.base_url() else {
+            w.set_status("no Bitcoin node — set one in Settings".into());
+            return;
+        };
+        let (raw, txid, _v) = match finalize_extract(psbt) {
+            Ok(x) => x,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let client = ChainClient::new(HttpTransport::new(&base), s.network);
+        match client.broadcast(&raw) {
+            Ok(_got) => {
+                println!("cb: fund-broadcast txid={txid} ok");
+                w.set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
+                s.funding_coins.clear();
+                s.built_psbt = None;
+                s.signed_psbt = None;
+                s.ur_frames.clear();
+                w.set_compose_text("".into());
+                w.set_fund_external(false);
+                w.set_psbt_signed(false);
+                w.set_screen(4);
+                refresh(&w, &mut s);
+            }
+            Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
+        }
     });
 
     cb!(on_compose_send, |w, s| {
@@ -1965,7 +2430,118 @@ fn main() {
         );
     }
 
+    // Design-preview harness: `CN_PREVIEW=<screen>` boots straight into a
+    // funding screen with mock data so the UI can be screenshotted and
+    // iterated without wiring or clicking through onboarding. Dev-only.
+    if let Ok(scr) = std::env::var("CN_PREVIEW") {
+        if let Ok(n) = scr.parse::<i32>() {
+            preview_mock(&window);
+            window.set_screen(n);
+        }
+    }
+
     window.run().expect("event loop");
+}
+
+/// Populate every external-funding screen with representative mock data for
+/// the `CN_PREVIEW` design harness.
+fn preview_mock(w: &AppWindow) {
+    w.set_fund_external(true);
+    w.set_funding_ready(true);
+    w.set_funding_summary("taproot · 2 coins · 220,000 sats".into());
+    w.set_funding_descriptor("tr([a1b2c3d4/86h/1h/0h]tpub…/<0;1>/*)".into());
+    w.set_funding_feedback(
+        "Taproot wallet · fingerprint a1b2c3d4 · first address\nbcrt1p2caqg0ht8m7dykfrx2lnrcc85kxs09m3vgur9fl6emljxktnu7es6hrewe"
+            .into(),
+    );
+    w.set_funding_valid(true);
+    w.set_to_label("To  bcrt1pxs94vakt8gnq…rqmeyu58".into());
+    w.set_compose_text("Happy birthday! Paid from cold storage.".into());
+    w.set_rate_text("2".into());
+    w.set_cost_line("1 chunk · ~180 vB · ~360 sats".into());
+
+    let coins = [
+        SpendCoin { outpoint: "aa:0".into(), value: "200,000".into(), confirmed: true, selected: true, txid_short: "aaaa…aaaa".into(), explorer: "".into() },
+        SpendCoin { outpoint: "bb:1".into(), value: "20,000".into(), confirmed: false, selected: false, txid_short: "bbbb…bbbb".into(), explorer: "".into() },
+    ];
+    w.set_spend_coins(VecModel::from_slice(&coins));
+    w.set_spend_title("Spending 1 coin · 200,000 sats".into());
+    w.set_spend_expanded(true);
+
+    w.set_psbt_qr(qr::qr_image("UR:CRYPTO-PSBT/1-1/HKADCSJNCPFGAXHDMOCKPREVIEWFRAME").unwrap_or_default());
+    w.set_psbt_cost_line("fee 360 sats · 1 input · 180 vB".into());
+    w.set_psbt_frame_label("frame 1 / 1".into());
+
+    w.set_psbt_signed(true);
+    w.set_confirm_note("Happy birthday! Paid from cold storage.".into());
+    w.set_confirm_fee_line("360 sats · 2.0 sat/vB".into());
+    let ins = [PsbtRow {
+        title: "bcrt1p2caqg0ht8m7dykfrx2lnrcc85kx…".into(),
+        subtitle: "aaaaaaaa…aaaaaaaa : 0".into(),
+        amount: "200,000".into(),
+        kind: "input".into(),
+    }];
+    w.set_confirm_inputs(VecModel::from_slice(&ins));
+    let outs = [
+        PsbtRow { title: "".into(), subtitle: "OP_RETURN · PNTE note".into(), amount: "0".into(), kind: "note".into() },
+        PsbtRow { title: "bcrt1pxs94vakt8gnqrwhuxdscwkx5e…".into(), subtitle: "directed recipient".into(), amount: "330".into(), kind: "recipient".into() },
+        PsbtRow { title: "bcrt1p8wpt9v4frpf3tkn0srd97pks…".into(), subtitle: "your notebook (keeps the note yours)".into(), amount: "330".into(), kind: "self".into() },
+        PsbtRow { title: "bcrt1p2caqg0ht8m7dykfrx2lnrcc…".into(), subtitle: "change back to the funding wallet".into(), amount: "198,980".into(), kind: "change".into() },
+    ];
+    w.set_confirm_outputs(VecModel::from_slice(&outs));
+}
+
+/// Render each screen to `<out_dir>/screen-<n>.png` via the software renderer,
+/// with no on-screen window — for headless design iteration.
+fn render_previews(w: u32, h: u32, screens: &[i32], out_dir: &str) {
+    use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
+    use std::rc::Rc;
+
+    struct HeadlessPlatform {
+        win: Rc<MinimalSoftwareWindow>,
+    }
+    impl slint::platform::Platform for HeadlessPlatform {
+        fn create_window_adapter(
+            &self,
+        ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+            Ok(self.win.clone())
+        }
+    }
+
+    let win = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(HeadlessPlatform { win: win.clone() }))
+        .expect("set_platform");
+    let app = AppWindow::new().expect("window");
+    win.set_size(slint::PhysicalSize::new(w, h));
+
+    for &n in screens {
+        preview_mock(&app);
+        app.set_screen(n);
+        slint::platform::update_timers_and_animations();
+        win.request_redraw();
+        let mut buf = vec![Rgb565Pixel(0); (w * h) as usize];
+        win.draw_if_needed(|renderer| {
+            renderer.render(&mut buf, w as usize);
+        });
+        // Rgb565 → RGB8.
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        for px in &buf {
+            let v = px.0;
+            let r = ((v >> 11) & 0x1f) as u8;
+            let g = ((v >> 5) & 0x3f) as u8;
+            let b = (v & 0x1f) as u8;
+            rgb.push((r << 3) | (r >> 2));
+            rgb.push((g << 2) | (g >> 4));
+            rgb.push((b << 3) | (b >> 2));
+        }
+        let path = format!("{out_dir}/screen-{n}.png");
+        let file = std::fs::File::create(&path).expect("create png");
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&rgb).unwrap();
+        eprintln!("rendered screen {n} -> {path}");
+    }
 }
 
 fn getrandom_fill(buf: &mut [u8]) -> Result<(), ()> {
