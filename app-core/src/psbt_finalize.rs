@@ -211,7 +211,7 @@ mod tests {
         let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
         let to_bob = Recipient::parse(NET, &bob.address(NET)).unwrap();
         // build owns `coins`; move it into a leaked-free local via closure scope.
-        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 2.0 };
+        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 2.0, change_override: None };
         let np = NoteParams {
             identity: &alice,
             text: "public hi",
@@ -292,7 +292,7 @@ mod tests {
             confirmed: true,
         }];
         let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
-        let plan = crate::psbt_build::FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 2.0 };
+        let plan = crate::psbt_build::FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 2.0, change_override: None };
         let np = crate::psbt_build::NoteParams {
             identity: &alice,
             text: "paid by an external wallet",
