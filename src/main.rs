@@ -19,7 +19,7 @@ use app_core::chain::{
     default_base, explorer_presets, explorer_tx_url, node_presets, ChainClient, HttpTransport,
 };
 use app_core::compose::{compose_and_record, ComposeRequest};
-use app_core::funding::{FundingSource, FundingUtxo};
+use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
 use app_core::identity::{generate_mnemonic, parse_key_material, realize, AppIdentity};
 use app_core::psbt_build::{build_funding_psbt, BuiltPsbt, FundingPlan, NoteParams};
 use app_core::psbt_finalize::{
@@ -77,6 +77,10 @@ struct State {
     built_psbt: Option<BuiltPsbt>,
     ur_frames: Vec<String>,
     signed_psbt: Option<bitcoin::Psbt>,
+    /// Saved watch-only funding wallets (device-level, persisted); and which
+    /// one is currently active for the compose in progress.
+    funding_wallets: Vec<FundingWallet>,
+    active_funding_id: Option<String>,
 }
 
 impl State {
@@ -123,6 +127,12 @@ impl State {
             })
             .to_string(),
         );
+    }
+
+    fn save_funding_wallets(&self) {
+        if let Ok(json) = serde_json::to_string_pretty(&self.funding_wallets) {
+            let _ = std::fs::write(self.data_dir.join("funding-wallets.json"), json);
+        }
     }
 }
 
@@ -881,6 +891,69 @@ fn funding_compose_ui(w: &AppWindow, st: &State, text: &str) {
     }
 }
 
+/// Populate the saved-wallet manager list (screen 15).
+fn refresh_funding_list(w: &AppWindow, st: &State) {
+    let active = st.active_funding_id.clone();
+    let rows: Vec<FundingWalletRow> = st
+        .funding_wallets
+        .iter()
+        .map(|fw| {
+            let meta = if fw.scanned {
+                format!("{} · {} sats · {} coin{}", fw.kind, fw.balance, fw.coins, if fw.coins == 1 { "" } else { "s" })
+            } else {
+                format!("{} · tap to scan for funds", fw.kind)
+            };
+            FundingWalletRow {
+                id: fw.id.clone().into(),
+                label: fw.label.clone().into(),
+                meta: meta.into(),
+                active: active.as_deref() == Some(fw.id.as_str()),
+            }
+        })
+        .collect();
+    w.set_funding_wallets(VecModel::from_slice(&rows));
+}
+
+/// Make a saved wallet the active funding source: scan it, cache its balance,
+/// and return to compose in external-funding mode.
+fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
+    let net = st.network;
+    let Some(idx) = st.funding_wallets.iter().position(|fw| fw.id == id) else { return };
+    let descriptor = st.funding_wallets[idx].descriptor.clone();
+    let src = match FundingSource::parse(&descriptor, net) {
+        Ok(src) => src,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
+    let Some(base) = st.base_url() else {
+        w.set_status("no Bitcoin node — set one in Settings".into());
+        return;
+    };
+    w.set_status("scanning funding wallet…".into());
+    let client = ChainClient::new(HttpTransport::new(&base), net);
+    match client.scan_funding(&src, 20) {
+        Ok(scan) => {
+            st.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
+            st.funding_wallets[idx].coins = scan.utxos.len();
+            st.funding_wallets[idx].scanned = true;
+            st.save_funding_wallets();
+            let empty = scan.utxos.is_empty();
+            st.funding_coins = scan.utxos;
+            st.funding_change_index = scan.next_change_index;
+            st.funding = Some(src);
+            st.active_funding_id = Some(id.to_string());
+            w.set_status(if empty { "wallet has no spendable coins yet".to_string() } else { String::new() }.into());
+            w.set_fund_external(true);
+            w.set_spend_expanded(true);
+            w.set_screen(6);
+            refresh_compose(w, st);
+        }
+        Err(e) => w.set_status(format!("scan failed: {e}").into()),
+    }
+}
+
 /// Shorten a bech32 address for display: `bcrt1p2caqg…6hrewe`.
 fn short_addr(a: &str) -> String {
     if a.len() > 20 {
@@ -905,6 +978,14 @@ fn extract_descriptor(text: &str) -> String {
         }
     }
     t.to_string()
+}
+
+/// Load the device-level saved funding wallets (empty if the file is absent).
+fn load_funding_wallets(dir: &std::path::Path) -> Vec<FundingWallet> {
+    std::fs::read_to_string(dir.join("funding-wallets.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Import a signed PSBT (from file bytes, a base64/hex string, or a UR string),
@@ -1080,6 +1161,7 @@ fn main() {
     };
     let node_urls = str_map("nodes");
     let explorers = str_map("explorers");
+    let funding_wallets = load_funding_wallets(&data_dir);
 
     let st = Rc::new(RefCell::new(State {
         data_dir,
@@ -1106,6 +1188,8 @@ fn main() {
         built_psbt: None,
         ur_frames: Vec::new(),
         signed_psbt: None,
+        funding_wallets,
+        active_funding_id: None,
     }));
     let window = AppWindow::new().expect("window");
 
@@ -1918,17 +2002,88 @@ fn main() {
         }
         w.set_status("".into());
         refresh_compose(&w, &mut s);
-        // Turning it on with no wallet yet → go straight to the funding screen.
+        // Turning it on with no wallet active → go to the saved-wallets list.
         if on && s.funding.is_none() {
-            w.set_screen(12);
+            refresh_funding_list(&w, &s);
+            w.set_screen(15);
         }
     });
 
     cb!(on_open_funding, |w, s| {
-        let _ = &mut s;
         println!("cb: open-funding");
         w.set_status("".into());
+        refresh_funding_list(&w, &s);
+        w.set_screen(15);
+    });
+
+    cb!(on_add_funding_wallet, |w, s| {
+        let _ = &mut s;
+        w.set_status("".into());
+        w.set_funding_descriptor("".into());
+        w.set_funding_feedback("".into());
+        w.set_funding_valid(false);
         w.set_screen(12);
+    });
+
+    cb!(on_use_funding_wallet, |w, s, id: SharedString| {
+        activate_funding_wallet(&w, &mut s, id.as_str());
+    });
+
+    cb!(on_remove_funding_wallet, |w, s, id: SharedString| {
+        println!("cb: remove-funding-wallet");
+        s.funding_wallets.retain(|fw| fw.id != id.as_str());
+        if s.active_funding_id.as_deref() == Some(id.as_str()) {
+            s.active_funding_id = None;
+            s.funding = None;
+            s.funding_coins.clear();
+        }
+        s.save_funding_wallets();
+        refresh_funding_list(&w, &s);
+    });
+
+    cb!(on_refresh_funding_wallet, |w, s, id: SharedString| {
+        let net = s.network;
+        let Some(idx) = s.funding_wallets.iter().position(|fw| fw.id == id.as_str()) else { return };
+        let descriptor = s.funding_wallets[idx].descriptor.clone();
+        let Some(base) = s.base_url() else {
+            w.set_status("no Bitcoin node — set one in Settings".into());
+            return;
+        };
+        let Ok(src) = FundingSource::parse(&descriptor, net) else { return };
+        w.set_status("scanning…".into());
+        let client = ChainClient::new(HttpTransport::new(&base), net);
+        if let Ok(scan) = client.scan_funding(&src, 20) {
+            s.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
+            s.funding_wallets[idx].coins = scan.utxos.len();
+            s.funding_wallets[idx].scanned = true;
+            s.save_funding_wallets();
+        }
+        w.set_status("".into());
+        refresh_funding_list(&w, &s);
+    });
+
+    cb!(on_fund_rename_start, |w, s, id: SharedString, label: SharedString| {
+        let _ = &mut s;
+        w.set_fund_rename_input(label);
+        w.set_fund_rename_id(id);
+    });
+
+    cb!(on_fund_rename_save, |w, s, text: SharedString| {
+        let id = w.get_fund_rename_id().to_string();
+        let name = text.trim();
+        if !name.is_empty() {
+            if let Some(fw) = s.funding_wallets.iter_mut().find(|fw| fw.id == id) {
+                fw.label = name.to_string();
+            }
+            s.save_funding_wallets();
+        }
+        w.set_fund_rename_id("".into());
+        refresh_funding_list(&w, &s);
+    });
+
+    cb!(on_fund_rename_cancel, |w, s| {
+        let _ = &mut s;
+        w.set_fund_rename_id("".into());
     });
 
     cb!(on_funding_changed, |w, s, text: SharedString| {
@@ -1954,38 +2109,21 @@ fn main() {
     });
 
     cb!(on_funding_use, |w, s| {
-        let desc = extract_descriptor(&w.get_funding_descriptor());
+        // Add-wallet screen commit: validate, save to the list if new, activate.
+        let input = extract_descriptor(&w.get_funding_descriptor());
         let net = s.network;
-        let src = match FundingSource::parse(&desc, net) {
-            Ok(src) => src,
+        let wallet = match FundingWallet::create(&input, "", net) {
+            Ok(fw) => fw,
             Err(e) => {
                 w.set_status(format!("{e}").into());
                 return;
             }
         };
-        let Some(base) = s.base_url() else {
-            w.set_status("no Bitcoin node — set one in Settings".into());
-            return;
-        };
-        w.set_status("scanning funding wallet…".into());
-        let client = ChainClient::new(HttpTransport::new(&base), net);
-        match client.scan_funding(&src, 20) {
-            Ok(scan) if scan.utxos.is_empty() => {
-                let _ = scan;
-                w.set_status("no spendable coins at that wallet".into());
-            }
-            Ok(scan) => {
-                s.funding_coins = scan.utxos;
-                s.funding_change_index = scan.next_change_index;
-                s.funding = Some(src);
-                w.set_status("".into());
-                w.set_fund_external(true);
-                w.set_spend_expanded(true);
-                w.set_screen(6);
-                refresh_compose(&w, &mut s);
-            }
-            Err(e) => w.set_status(format!("scan failed: {e}").into()),
+        if !s.funding_wallets.iter().any(|x| x.id == wallet.id) {
+            s.funding_wallets.push(wallet.clone());
+            s.save_funding_wallets();
         }
+        activate_funding_wallet(&w, &mut s, &wallet.id);
     });
 
     cb!(on_funding_file, |w, s| {
@@ -2572,6 +2710,13 @@ fn preview_mock(w: &AppWindow) {
         PsbtRow { title: "bcrt1p2caqg0ht8m7dykfrx2lnrcc…".into(), subtitle: "change back to the funding wallet".into(), amount: "198,980".into(), kind: "change".into() },
     ];
     w.set_confirm_outputs(VecModel::from_slice(&outs));
+
+    let wallets = [
+        FundingWalletRow { id: "aa".into(), label: "Signer · bc1p5cyxnux…".into(), meta: "taproot · 220,000 sats · 2 coins".into(), active: true },
+        FundingWalletRow { id: "bb".into(), label: "Sparrow hot wallet".into(), meta: "segwit · 45,000 sats · 1 coin".into(), active: false },
+        FundingWalletRow { id: "cc".into(), label: "segwit · tb1qr8k2p9…".into(), meta: "segwit · tap to scan for funds".into(), active: false },
+    ];
+    w.set_funding_wallets(VecModel::from_slice(&wallets));
 }
 
 /// Render each screen to `<out_dir>/screen-<n>.png` via the software renderer,
