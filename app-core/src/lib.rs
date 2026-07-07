@@ -11,7 +11,15 @@
 pub mod chain;
 pub mod compose;
 pub mod derive;
+pub mod funding;
 pub mod identity;
+pub mod psbt_build;
+pub mod psbt_finalize;
+pub mod ur;
+
+/// Re-export so the binary uses the exact same `bitcoin` (and `Psbt` type) as
+/// app-core — no version-skew risk across the crate boundary.
+pub use bitcoin;
 pub mod seedqr;
 pub mod store;
 
@@ -49,6 +57,10 @@ pub enum Error {
     Json(String),
     /// Store I/O, (de)serialization, or identity-mismatch failure.
     Store(String),
+    /// External funding descriptor: parse, derivation, or unsupported type.
+    Funding(String),
+    /// Animated UR (crypto-psbt) framing/parse/reassembly failure.
+    Ur(String),
 }
 
 impl core::fmt::Display for Error {
@@ -77,6 +89,8 @@ impl core::fmt::Display for Error {
             Error::Http(m) => write!(f, "http: {m}"),
             Error::Json(m) => write!(f, "response: {m}"),
             Error::Store(m) => write!(f, "store: {m}"),
+            Error::Funding(m) => write!(f, "funding: {m}"),
+            Error::Ur(m) => write!(f, "ur: {m}"),
         }
     }
 }

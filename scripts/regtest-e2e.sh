@@ -79,6 +79,36 @@ grep -q "text=hello public from app" "$WORK/notes2" || fail "public text not rec
 [[ "$(grep -c '^note ' "$WORK/notes2")" == 2 ]] || fail "expected exactly 2 recovered notes"
 pass "wipe recovery: private + public notes rebuilt from chain + key alone"
 
+echo "== external funding (PSBT): build → sign (sim HW) → finalize → broadcast =="
+# The shim genesis-rescans each newly-watched address, so touch the minimum:
+# gap 0 = only index 0 per chain (the funded coin is at 0/0). Run here — while
+# the chain is small — after wipe-recovery so its note count is unaffected.
+export CN_FUND_GAP=0
+FUND_SEED="1111111111111111111111111111111111111111111111111111111111111111"
+IFS=$'\t' read -r F_DESC F_XPRV F_ADDR <<<"$("$APP" fund-keygen regtest "$FUND_SEED")"
+[[ -n "$F_ADDR" ]] || fail "fund-keygen produced no address"
+curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$F_ADDR\",\"amount\":0.002}" >/dev/null
+curl -sf -X POST "$BASE/mine?blocks=1" >/dev/null
+# App identity AUTHORS a directed-private note to prime; the FUNDING wallet pays.
+PSBT="$("$APP" fund-build "$BASE" regtest "$F_DESC" private 2.0 "funded by cold storage" "$P_ADDR" 2>"$WORK/fb.log")"
+grep -q "fund-build txid=" "$WORK/fb.log" || fail "fund-build: $(cat "$WORK/fb.log")"
+SIGNED="$("$APP" fund-sign "$PSBT" "$F_XPRV" 2>"$WORK/fs.log")"
+grep -q "inputs_signed=[1-9]" "$WORK/fs.log" || fail "fund-sign signed no inputs: $(cat "$WORK/fs.log")"
+FTXID="$("$APP" fund-finalize "$BASE" regtest "$SIGNED" 2>"$WORK/ff.log")"
+grep -q "broadcast=ok" "$WORK/ff.log" || fail "fund-finalize: $(cat "$WORK/ff.log")"
+pass "external-funded directed note built+signed+finalized+broadcast (txid=$FTXID)"
+
+# Prime decrypts it via the candidate-key path: the author key is not the
+# spending input (the funder) but the dust-to-self output — and it is attributed
+# to the app identity, not the funder.
+"$APP" bundle "$P_ADDR" regtest "$BASE" "$WORK/prime2.json" >/dev/null
+"$NOTES" scan "$WORK/prime2.json" >"$WORK/prime2-scan.json"
+jq -e --arg from "$A_ADDR" \
+    '.[] | select(.received and .private and .from == $from and .text == "funded by cold storage")' \
+    "$WORK/prime2-scan.json" >/dev/null \
+    || fail "prime did not decrypt externally-funded note: $(cat "$WORK/prime2-scan.json")"
+pass "prime decrypted externally-funded note via candidate key, attributed to the app identity"
+
 echo "== app → prime: directed PRIVATE note =="
 "$APP" compose "$STORE" "$BASE" private 1.0 "psst prime, from the app" "$P_ADDR" | grep -q broadcast=ok || fail "directed compose"
 "$APP" bundle "$P_ADDR" regtest "$BASE" "$WORK/prime.json" >/dev/null
@@ -98,4 +128,4 @@ curl -sf -X POST "$BASE/tx" --data-binary "$RAW" >/dev/null || fail "broadcast p
 pass "prime → app directed private: received, attributed, decrypted by app-core"
 
 echo
-pass "M4 interop matrix complete (work dir: $WORK)"
+pass "M4 interop matrix + external funding complete (work dir: $WORK)"

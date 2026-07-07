@@ -264,6 +264,65 @@ impl<T: Transport> ChainClient<T> {
         Ok(txs)
     }
 
+    /// Scan a funding source's receive + change chains (gap-limited) for
+    /// spendable UTXOs. An address counts as "used" if it has ANY history
+    /// (so a spent-then-empty address doesn't prematurely end the gap walk);
+    /// UTXOs are collected for used addresses. Also reports the first unused
+    /// change index for a new change output.
+    pub fn scan_funding(
+        &self,
+        src: &crate::funding::FundingSource,
+        gap: u32,
+    ) -> Result<crate::funding::FundingScan, Error> {
+        use crate::funding::{FundingScan, FundingUtxo};
+        let mut utxos = Vec::new();
+        let mut seen_addr = std::collections::HashSet::new();
+        let mut next_change_index = 0u32;
+        let ranged = src.is_ranged();
+
+        for chain in [0usize, 1usize] {
+            let mut consecutive_unused = 0u32;
+            let mut index = 0u32;
+            let mut first_unused_change: Option<u32> = None;
+            loop {
+                let d = src.derive(chain, index)?;
+                // Fixed (non-multipath) descriptors can share an address
+                // across chains — stop the chain once we revisit one.
+                if !seen_addr.insert(d.address.clone()) {
+                    break;
+                }
+                let used = !self.full_history(&d.address)?.is_empty();
+                if used {
+                    consecutive_unused = 0;
+                    for u in self.utxos(&d.address)? {
+                        utxos.push(FundingUtxo {
+                            txid: u.txid,
+                            vout: u.vout,
+                            value: u.value,
+                            address: d.address.clone(),
+                            chain,
+                            index,
+                            confirmed: u.height.is_some(),
+                        });
+                    }
+                } else {
+                    if chain == 1 && first_unused_change.is_none() {
+                        first_unused_change = Some(index);
+                    }
+                    consecutive_unused += 1;
+                }
+                index += 1;
+                if !ranged || consecutive_unused >= gap {
+                    break;
+                }
+            }
+            if chain == 1 {
+                next_change_index = first_unused_change.unwrap_or(0);
+            }
+        }
+        Ok(FundingScan { utxos, next_change_index })
+    }
+
     /// Broadcast raw tx hex; returns the txid mempool.space echoes back.
     pub fn broadcast(&self, raw_hex: &str) -> Result<String, Error> {
         Ok(self.transport.post_text("/tx", raw_hex.to_string())?.trim().to_string())
@@ -352,6 +411,23 @@ pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
         .or(externals.first())
         .map(|a| a.to_string());
 
+    // Every taproot address in the tx (input prevouts AND outputs) except our
+    // own — candidate authors for a received directed-private note. Under
+    // external funding the author's key rides on a dust-to-self output, not the
+    // spending input, so the decoder tries each of these (see notes-core).
+    let mut author_candidates: Vec<String> = Vec::new();
+    let input_addrs = tx
+        .vin
+        .iter()
+        .filter_map(|i| i.prevout.as_ref())
+        .filter_map(|p| p.scriptpubkey_address.as_deref());
+    let output_addrs = tx.vout.iter().filter_map(|o| o.scriptpubkey_address.as_deref());
+    for a in input_addrs.chain(output_addrs) {
+        if is_taproot_addr(a) && a != address && !author_candidates.iter().any(|c| c == a) {
+            author_candidates.push(a.to_string());
+        }
+    }
+
     Some(OnchainTx {
         txid: tx.txid.clone(),
         height: tx.status.block_height.filter(|_| tx.status.confirmed),
@@ -360,6 +436,7 @@ pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
         payloads,
         pays_self,
         sender: if spends_from_self { None } else { sender },
+        author_candidates,
         recipient: if spends_from_self { recipient } else { None },
     })
 }
