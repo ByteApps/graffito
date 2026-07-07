@@ -33,7 +33,7 @@ app-core/               # UI-free core: cargo test -p app-core
 src/main.rs             # all screen callbacks + --spike modes
 src/{camera,keychain,qr}.rs  # Mac glue: nokhwa→rqrr, Keychain+LAContext, QR-out
 ui/app.slint            # design system (Pal palette, Card/PrimaryButton/
-                        #   GhostButton/SelectPill/SettingsCard/DoorCard/Badge,
+                        #   GhostButton/SelectPill/Dropdown/SettingsCard/DoorCard/Badge,
                         #   fluent-dark std widgets) + 10 screens + modals
 ui/icons/*.svg          # icon assets (@image-url + colorize — see icon rule)
 scripts/bundle-mac.sh   # minimal .app (TCC camera permission needs a bundle)
@@ -62,8 +62,11 @@ gated on sufficiency; and a collapsible **custom change address** with live
 validation) · 7 send-to (Self card,
 address input + QR-icon scan [scan-to-pick] + Use, recents w/ pencil-
 rename dialog + confirmed remove) · 8 settings (Identity card w/
-account switch + reset, network/chunk pills, esplora, Coins card,
-Funds/sweep, Touch ID reveal — Flickable-scrollable) · 9 account
+account switch + reset, network/chunk pills, **Bitcoin node** +
+**Block explorer** dropdowns [network-aware presets + a "Custom…" row
+that reveals a URL text field — the `Dropdown` component in app.slint,
+a PopupWindow-backed picker; on regtest both lists are Custom-only],
+Coins card, Funds/sweep, Touch ID reveal — Flickable-scrollable) · 9 account
 picker (paginated, 5/page, current badge) · 10 coins (spendable UTXO
 list + consolidate-to-self) · 11 activity (all note + sweep/consolidate
 txs; pending get Bump-fee/Rebroadcast/Explorer). Modals
@@ -172,6 +175,8 @@ feeds notes_cli's scan directly.
 confirm-remove/remove-contact` · `cb: import hierarchical → account
 picker` · `cb: pick-account <n>` · `cb: account-picker open` ·
 `cb: set-network <net>` · `cb: set-chunk-size <n> ok` ·
+`cb: set-node-preset <name|custom>` · `cb: set-node-custom <url|default>` ·
+`cb: set-explorer-preset <name|custom>` · `cb: set-explorer-custom <url|default>` ·
 `cb: reveal-backup ok|cancelled` · `cb: reset-identity` ·
 `cb: open-note-web url=…` · `cb: toggle-coin selected=<n>` ·
 `cb: refresh-coins` · `cb: act-explorer` · `cb: bump-open`/`act-bump`.
