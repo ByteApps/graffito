@@ -65,7 +65,9 @@ rename dialog + confirmed remove) · 8 settings (Identity card w/
 account switch + reset, network/chunk pills, **Bitcoin node** +
 **Block explorer** dropdowns [network-aware presets + a "Custom…" row
 that reveals a URL text field — the `Dropdown` component in app.slint,
-a PopupWindow-backed picker; on regtest both lists are Custom-only],
+a PopupWindow-backed picker; on regtest both lists are Custom-only;
+these two live in config.json keyed by network (device-level, NOT the
+per-identity store), so switching identity keeps them],
 Coins card, Funds/sweep, Touch ID reveal — Flickable-scrollable) · 9 account
 picker (paginated, 5/page, current badge) · 10 coins (spendable UTXO
 list + consolidate-to-self) · 11 activity (all note + sweep/consolidate
@@ -78,9 +80,14 @@ account chosen on a paginated picker after hierarchical imports and
 switchable later from Settings without re-import (each account = its
 own address AND enc key). Store files are per-identity:
 `store-<network>-<fp8>.json` — switching keys/accounts never mixes
-notebooks. `config.json` persists {network, account}. Reset ("Switch
-identity") deletes the keychain item and returns to onboarding; notes
-recover from chain on re-import.
+notebooks. `config.json` is device-level and persists {network, account,
+nodes{net→url}, explorers{net→url}} — the Bitcoin-node / block-explorer
+choices live here (per network, not per identity) so they survive
+identity switches; base_url()/explorer_base() read them, the Settings
+dropdowns write them via save_config(). A legacy per-identity node URL
+(old `esplora`/`node_url` store field) is migrated into config on load.
+Reset ("Switch identity") deletes the keychain item and returns to
+onboarding; notes recover from chain on re-import.
 
 M5 platform facts: **slint is pinned `=1.16.1`** — 1.17 needs rustc
 1.92 and the SDK nix shell ships 1.91-nightly; bump the pin only with a

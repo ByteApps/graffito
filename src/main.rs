@@ -10,6 +10,7 @@ mod keychain;
 mod qr;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -33,6 +34,13 @@ struct State {
     data_dir: PathBuf,
     network: Network,
     account: u32,
+    /// Device-level Settings (config.json, NOT the per-identity store): the
+    /// custom Bitcoin-node / block-explorer URLs, keyed by network. Device-
+    /// level so switching identity keeps them; per-network because a custom
+    /// URL only makes sense on the chain it serves. Absent key = network
+    /// default (mempool.space).
+    node_urls: HashMap<String, String>,
+    explorers: HashMap<String, String>,
     ident: Option<AppIdentity>,
     store: Option<Store>,
     fees: Option<FeeRates>,
@@ -67,14 +75,20 @@ impl State {
         )
     }
 
-    /// The Bitcoin-node base URL: the per-identity Settings choice, else the
-    /// network default. Configured only through the Settings screen — there is
-    /// no env override, so tests exercise the same path a user does.
+    /// The Bitcoin-node base URL: the device-level Settings choice for this
+    /// network, else the network default. Configured only through the Settings
+    /// screen — no env override, so tests exercise the same path a user does.
     fn base_url(&self) -> Option<String> {
-        self.store
-            .as_ref()
-            .and_then(|s| s.node_url.clone())
+        self.node_urls
+            .get(self.network.as_str())
+            .cloned()
             .or_else(|| default_base(self.network).map(String::from))
+    }
+
+    /// The custom block-explorer base for this network (Settings), or None for
+    /// the network default — see [`explorer_tx_url`].
+    fn explorer_base(&self) -> Option<String> {
+        self.explorers.get(self.network.as_str()).cloned()
     }
 
     fn save_store(&self) {
@@ -89,6 +103,8 @@ impl State {
             serde_json::json!({
                 "network": self.network.as_str(),
                 "account": self.account,
+                "nodes": self.node_urls,
+                "explorers": self.explorers,
             })
             .to_string(),
         );
@@ -161,10 +177,10 @@ fn note_web_url(network: Network, address: &str, note_id: &str) -> String {
 }
 
 /// Populate the Settings node + explorer dropdown models, selected indices,
-/// and custom-URL text from the current store. The stored value is matched
-/// against the network's presets; a non-preset value selects the trailing
-/// "Custom…" row and prefills its text field. `stored == cur`:
-/// `None` (network default) matches the first preset (mempool.space).
+/// and custom-URL text from the device-level config (this network's entry).
+/// The value is matched against the network's presets; a non-preset value
+/// selects the trailing "Custom…" row and prefills its text field. An absent
+/// entry (None) matches the first preset (mempool.space, the network default).
 fn load_backend_settings(w: &AppWindow, st: &State) {
     fn fill(
         presets: Vec<(&'static str, Option<&'static str>)>,
@@ -186,13 +202,13 @@ fn load_backend_settings(w: &AppWindow, st: &State) {
 
     let net = st.network;
     let (n_opts, n_idx, n_custom) =
-        fill(node_presets(net), st.store.as_ref().and_then(|s| s.node_url.as_deref()));
+        fill(node_presets(net), st.node_urls.get(net.as_str()).map(String::as_str));
     w.set_node_options(VecModel::from_slice(&n_opts));
     w.set_node_index(n_idx);
     w.set_node_custom_text(n_custom);
 
     let (e_opts, e_idx, e_custom) =
-        fill(explorer_presets(net), st.store.as_ref().and_then(|s| s.explorer.as_deref()));
+        fill(explorer_presets(net), st.explorers.get(net.as_str()).map(String::as_str));
     w.set_explorer_options(VecModel::from_slice(&e_opts));
     w.set_explorer_index(e_idx);
     w.set_explorer_custom_text(e_custom);
@@ -203,7 +219,8 @@ fn load_backend_settings(w: &AppWindow, st: &State) {
 fn update_activity(w: &AppWindow, st: &State) {
     let Some(store) = &st.store else { return };
     let net = st.network;
-    let ex = store.explorer.as_deref();
+    let exb = st.explorer_base();
+    let ex = exb.as_deref();
     let mut items: Vec<(u64, bool, ActivityItem)> = Vec::new(); // (created, confirmed, item)
 
     for n in &store.notes {
@@ -310,7 +327,13 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     let path = st
         .data_dir
         .join(format!("store-{}-{}.json", st.network.as_str(), &fp[..8]));
-    let store = Store::load(&path).unwrap_or_else(|_| Store::new(&ident.identity, st.network));
+    let mut store = Store::load(&path).unwrap_or_else(|_| Store::new(&ident.identity, st.network));
+    // Migrate a legacy per-identity node URL (shipped as `esplora`) into the
+    // device-level per-network config, then drop it from the store. Only if
+    // this network has no node set yet, so a real config choice always wins.
+    if let Some(url) = store.node_url.take() {
+        st.node_urls.entry(st.network.as_str().to_string()).or_insert(url);
+    }
     println!(
         "cb: identity kind={} account={} network={} address={}",
         ident.kind,
@@ -668,6 +691,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             suggested_coins(store, text.len(), private, rate, spk_len, change_spk_len, sent, consolidate);
     }
     let store = st.store.as_ref().unwrap();
+    let exb = st.explorer_base();
     let sel: std::collections::HashSet<(String, u32)> = st.selected_coins.iter().cloned().collect();
 
     let mut coins: Vec<SpendCoin> = Vec::new();
@@ -688,7 +712,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             confirmed: u.height.is_some(),
             selected,
             txid_short: u.txid[..8.min(u.txid.len())].to_string().into(),
-            explorer: explorer_tx_url(store.explorer.as_deref(), net, &u.txid).into(),
+            explorer: explorer_tx_url(exb.as_deref(), net, &u.txid).into(),
         });
     }
     w.set_spend_coins(VecModel::from_slice(&coins));
@@ -818,11 +842,27 @@ fn main() {
         .and_then(|a| a.parse().ok())
         .or_else(|| config.get("account").and_then(|v| v.as_u64()).map(|v| v as u32))
         .unwrap_or(0);
+    // Device-level per-network Settings (Bitcoin node / block explorer URLs).
+    let str_map = |key: &str| -> HashMap<String, String> {
+        config
+            .get(key)
+            .and_then(|v| v.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let node_urls = str_map("nodes");
+    let explorers = str_map("explorers");
 
     let st = Rc::new(RefCell::new(State {
         data_dir,
         network,
         account,
+        node_urls,
+        explorers,
         ident: None,
         store: None,
         fees: None,
@@ -1818,18 +1858,19 @@ fn main() {
     });
 
     // Bitcoin node dropdown: a preset row writes its base (None = network
-    // default) to the store; the trailing "Custom…" row just reveals the text
-    // field (the Slint side already moved node-index) — the value follows when
-    // the user submits it via set-node-custom.
+    // default) to the device config for this network; the trailing "Custom…"
+    // row just reveals the text field (the Slint side already moved node-index)
+    // — the value follows when the user submits it via set-node-custom.
     cb!(on_set_node_preset, |w, s, i: i32| {
+        let net = s.network.as_str().to_string();
         let presets = node_presets(s.network);
         let i = i as usize;
         if i < presets.len() {
-            let url = presets[i].1.map(String::from);
-            if let Some(store) = &mut s.store {
-                store.node_url = url;
+            match presets[i].1 {
+                Some(url) => { s.node_urls.insert(net, url.to_string()); }
+                None => { s.node_urls.remove(&net); }
             }
-            s.save_store();
+            s.save_config();
             println!("cb: set-node-preset {}", presets[i].0);
         } else {
             println!("cb: set-node-preset custom");
@@ -1838,24 +1879,28 @@ fn main() {
     });
 
     cb!(on_set_node_custom, |w, s, t: SharedString| {
+        let net = s.network.as_str().to_string();
         let v = t.trim().to_string();
-        if let Some(store) = &mut s.store {
-            store.node_url = if v.is_empty() { None } else { Some(v.clone()) };
+        if v.is_empty() {
+            s.node_urls.remove(&net);
+        } else {
+            s.node_urls.insert(net, v.clone());
         }
-        s.save_store();
+        s.save_config();
         println!("cb: set-node-custom {}", if v.is_empty() { "default" } else { &v });
         w.set_status("".into());
     });
 
     cb!(on_set_explorer_preset, |w, s, i: i32| {
+        let net = s.network.as_str().to_string();
         let presets = explorer_presets(s.network);
         let i = i as usize;
         if i < presets.len() {
-            let url = presets[i].1.map(String::from);
-            if let Some(store) = &mut s.store {
-                store.explorer = url;
+            match presets[i].1 {
+                Some(url) => { s.explorers.insert(net, url.to_string()); }
+                None => { s.explorers.remove(&net); }
             }
-            s.save_store();
+            s.save_config();
             update_activity(&w, &s); // refresh live Explorer links
             println!("cb: set-explorer-preset {}", presets[i].0);
         } else {
@@ -1865,11 +1910,14 @@ fn main() {
     });
 
     cb!(on_set_explorer_custom, |w, s, t: SharedString| {
+        let net = s.network.as_str().to_string();
         let v = t.trim().to_string();
-        if let Some(store) = &mut s.store {
-            store.explorer = if v.is_empty() { None } else { Some(v.clone()) };
+        if v.is_empty() {
+            s.explorers.remove(&net);
+        } else {
+            s.explorers.insert(net, v.clone());
         }
-        s.save_store();
+        s.save_config();
         update_activity(&w, &s); // refresh live Explorer links
         println!("cb: set-explorer-custom {}", if v.is_empty() { "default" } else { &v });
         w.set_status("".into());
