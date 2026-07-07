@@ -13,9 +13,59 @@
 use std::str::FromStr;
 
 use miniscript::descriptor::{Descriptor, DescriptorPublicKey, DescriptorType};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::derive::btc_network;
 use crate::Error;
+
+/// A saved external funding wallet (watch-only), persisted device-level so the
+/// same hardware/software wallet can fund notes across identities and sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FundingWallet {
+    /// Stable key = first 8 bytes of SHA-256(descriptor), for dedup + row ids.
+    pub id: String,
+    pub label: String,
+    /// The descriptor (or bare xpub) string exactly as imported; re-parsed
+    /// with `source()`.
+    pub descriptor: String,
+    /// "taproot" | "segwit".
+    pub kind: String,
+    /// Cached from the last scan (for the list display; coins are re-scanned
+    /// fresh when the wallet is actually used).
+    #[serde(default)]
+    pub balance: u64,
+    #[serde(default)]
+    pub coins: usize,
+    #[serde(default)]
+    pub scanned: bool,
+}
+
+impl FundingWallet {
+    /// Validate an imported descriptor/xpub and build a saved wallet. A blank
+    /// `label` gets a default (`taproot · bc1p…`).
+    pub fn create(input: &str, label: &str, network: notes_core::Network) -> Result<Self, Error> {
+        let descriptor = input.trim().to_string();
+        let src = FundingSource::parse(&descriptor, network)?;
+        let mut id = String::new();
+        for b in &Sha256::digest(descriptor.as_bytes())[..8] {
+            id.push_str(&format!("{b:02x}"));
+        }
+        let label = if label.trim().is_empty() {
+            let addr0 = src.derive(0, 0).map(|d| d.address).unwrap_or_default();
+            let short = if addr0.len() > 16 { format!("{}…", &addr0[..12]) } else { addr0 };
+            format!("{} · {short}", src.kind.label())
+        } else {
+            label.trim().to_string()
+        };
+        Ok(FundingWallet { id, label, descriptor, kind: src.kind.label().into(), balance: 0, coins: 0, scanned: false })
+    }
+
+    /// Re-parse the stored descriptor into a live `FundingSource`.
+    pub fn source(&self, network: notes_core::Network) -> Result<FundingSource, Error> {
+        FundingSource::parse(&self.descriptor, network)
+    }
+}
 
 /// Address type of a funding descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
