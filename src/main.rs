@@ -1938,17 +1938,32 @@ fn main() {
             println!("cb: psbt-scan start");
             let weak = weak.clone();
             std::thread::spawn(move || {
-                let text = match camera::capture_and_decode(30, |_, _, _| {}) {
-                    Ok(Some(p)) => String::from_utf8_lossy(&p).to_string(),
-                    _ => String::new(),
-                };
-                let _ = weak.upgrade_in_event_loop(move |w| {
-                    if text.trim().is_empty() {
-                        w.set_status("scan: no QR seen".into());
+                // Reassemble an animated crypto-psbt UR across frames (a hardware
+                // wallet hands the signed PSBT back as a multi-part QR); a single
+                // non-UR QR (hex/base64) completes on the first frame.
+                let mut dec = app_core::ur::PsbtUrDecoder::new();
+                let mut single: Option<String> = None;
+                let done = camera::capture_frames(45, |_, _, _| {}, |payload| {
+                    let s = String::from_utf8_lossy(payload);
+                    let t = s.trim();
+                    if t.to_lowercase().starts_with("ur:") {
+                        let _ = dec.receive(t);
+                        dec.is_complete()
                     } else {
+                        single = Some(t.to_string());
+                        true
+                    }
+                });
+                let result: Option<String> = match done {
+                    Ok(true) => single.or_else(|| dec.psbt_bytes().ok().map(hex::encode)),
+                    _ => None,
+                };
+                let _ = weak.upgrade_in_event_loop(move |w| match result {
+                    Some(text) => {
                         println!("cb: psbt-scan ok");
                         w.invoke_psbt_loaded(text.into());
                     }
+                    None => w.set_status("scan: no complete PSBT seen".into()),
                 });
             });
         });
