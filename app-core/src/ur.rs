@@ -28,8 +28,15 @@ pub fn encode_psbt(psbt_bytes: &[u8], max_fragment: usize) -> Vec<String> {
     // crypto-psbt = a CBOR byte string wrapping the serialized PSBT.
     let mut cbor = Vec::with_capacity(psbt_bytes.len() + 5);
     ciborium::into_writer(&Value::Bytes(psbt_bytes.to_vec()), &mut cbor).expect("cbor bstr");
+    encode_ur(PSBT_UR_TYPE, &cbor, max_fragment)
+}
+
+/// Frame an already-encoded UR payload (raw CBOR) into animated UR parts — one
+/// per QR frame. Used to emit `crypto-account`/`crypto-output-descriptor`/
+/// `crypto-hdkey` test QRs whose CBOR the caller built.
+pub fn encode_ur(ur_type: &str, payload: &[u8], max_fragment: usize) -> Vec<String> {
     let mut enc = Encoder::new();
-    enc.start(PSBT_UR_TYPE, &cbor, max_fragment.max(1));
+    enc.start(ur_type, payload, max_fragment.max(1));
     let n = enc.sequence_count();
     (0..n).map(|_| enc.next_part().to_string()).collect()
 }
