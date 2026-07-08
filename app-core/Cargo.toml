@@ -25,6 +25,9 @@ miniscript = "12"
 # Animated crypto-psbt UR (BCR-2020-006) framing for QR export/import — the
 # EXACT codec the KeyOS scanner runs, so the Prime app reassembles our frames.
 foundation-ur = "0.4"
+# CBOR decode for UR crypto-account / crypto-output-descriptor / crypto-hdkey
+# (BCR-2020-007/010/015) — hardware-wallet account-export QR import.
+ciborium = "0.2"
 bip39 = "2"
 hkdf = "0.12"
 sha2 = "0.10"

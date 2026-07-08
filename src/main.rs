@@ -954,6 +954,55 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
     }
 }
 
+/// If `text` is a UR account/descriptor export (BCR crypto-account etc.),
+/// decode it, save every supported descriptor as a funding wallet, and show the
+/// manager list. Returns true if the input was a UR (handled — possibly with an
+/// error message); false to fall through to plain descriptor handling.
+fn try_import_ur_account(w: &AppWindow, st: &mut State, text: &str) -> bool {
+    let t = text.trim();
+    if !t.to_lowercase().starts_with("ur:") {
+        return false;
+    }
+    let net = st.network;
+    let (ty, bytes) = match app_core::ur::decode_ur_string(t) {
+        Ok(x) => x,
+        Err(e) => {
+            w.set_status(format!("UR: {e}").into());
+            return true;
+        }
+    };
+    if ty == "crypto-psbt" {
+        w.set_status("that's a transaction QR, not a wallet".into());
+        return true;
+    }
+    match app_core::ur_account::descriptors_from_ur(&ty, &bytes, net) {
+        Ok(descs) if !descs.is_empty() => {
+            let mut added = 0;
+            for d in &descs {
+                if let Ok(fw) = FundingWallet::create(&d.descriptor, "", net) {
+                    if !st.funding_wallets.iter().any(|x| x.id == fw.id) {
+                        st.funding_wallets.push(fw);
+                        added += 1;
+                    }
+                }
+            }
+            st.save_funding_wallets();
+            refresh_funding_list(w, st);
+            w.set_screen(15);
+            w.set_status(format!("imported {added} account(s) from {ty}").into());
+            true
+        }
+        Ok(_) => {
+            w.set_status("no taproot/segwit accounts in that export".into());
+            true
+        }
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            true
+        }
+    }
+}
+
 /// Shorten a bech32 address for display: `bcrt1p2caqg…6hrewe`.
 fn short_addr(a: &str) -> String {
     if a.len() > 20 {
@@ -1866,6 +1915,9 @@ fn main() {
                 let _ = weak.upgrade_in_event_loop(move |w| {
                     if text.trim().is_empty() {
                         w.set_status("scan: no QR seen".into());
+                    } else if text.trim().to_lowercase().starts_with("ur:") {
+                        println!("cb: funding-scan ur");
+                        w.invoke_funding_import_ur(text.trim().into());
                     } else {
                         println!("cb: funding-scan ok");
                         let t: SharedString = extract_descriptor(&text).into();
@@ -2095,6 +2147,11 @@ fn main() {
             w.set_funding_valid(false);
             return;
         }
+        if t.to_lowercase().starts_with("ur:") {
+            w.set_funding_feedback("Hardware-wallet export (UR) — press Save & use to import.".into());
+            w.set_funding_valid(true);
+            return;
+        }
         match FundingSource::parse(&extract_descriptor(t), net) {
             Ok(src) => {
                 let a0 = src.derive(0, 0).map(|d| d.address).unwrap_or_default();
@@ -2109,7 +2166,11 @@ fn main() {
     });
 
     cb!(on_funding_use, |w, s| {
-        // Add-wallet screen commit: validate, save to the list if new, activate.
+        // A UR hardware-wallet export imports its account(s) into the list.
+        if try_import_ur_account(&w, &mut s, &w.get_funding_descriptor()) {
+            return;
+        }
+        // Otherwise: validate the descriptor, save to the list if new, activate.
         let input = extract_descriptor(&w.get_funding_descriptor());
         let net = s.network;
         let wallet = match FundingWallet::create(&input, "", net) {
@@ -2127,13 +2188,15 @@ fn main() {
     });
 
     cb!(on_funding_file, |w, s| {
-        let _ = &mut s;
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Descriptor / wallet export", &["txt", "json", "desc"])
+            .add_filter("Descriptor / wallet export", &["txt", "json", "desc", "ur"])
             .pick_file()
         {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
+                    if try_import_ur_account(&w, &mut s, &content) {
+                        return;
+                    }
                     let d = extract_descriptor(&content);
                     w.set_funding_descriptor(d.clone().into());
                     w.invoke_funding_changed(d.into());
@@ -2141,6 +2204,10 @@ fn main() {
                 Err(e) => w.set_status(format!("read failed: {e}").into()),
             }
         }
+    });
+
+    cb!(on_funding_import_ur, |w, s, text: SharedString| {
+        try_import_ur_account(&w, &mut s, text.as_str());
     });
 
     cb!(on_funding_clear, |w, s| {

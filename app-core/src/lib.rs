@@ -16,6 +16,7 @@ pub mod identity;
 pub mod psbt_build;
 pub mod psbt_finalize;
 pub mod ur;
+pub mod ur_account;
 
 /// Re-export so the binary uses the exact same `bitcoin` (and `Psbt` type) as
 /// app-core — no version-skew risk across the crate boundary.

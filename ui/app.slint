@@ -560,7 +560,8 @@ export component AppWindow inherits Window {
     callback fund-rename-save(string);
     callback fund-rename-cancel();
     callback funding-changed(string);
-    callback funding-scan();       // scan a descriptor/xpub QR
+    callback funding-scan();       // scan a descriptor/xpub/UR-account QR
+    callback funding-import-ur(string);   // a scanned UR account string → import
     callback funding-file();       // load a descriptor from file
     callback funding-use();        // accept the source, scan its coins, back to compose
     callback funding-clear();      // forget the funding wallet
@@ -1629,7 +1630,7 @@ export component AppWindow inherits Window {
             back => { root.open-funding(); }
         }
         Caption {
-            text: "Paste or scan an output descriptor (or xpub) for the wallet that pays. Its key never leaves that wallet — you'll sign the transaction there.";
+            text: "Paste or scan an output descriptor / xpub, or scan your hardware wallet's account-export QR. Its key never leaves that wallet — you'll sign there.";
         }
         HorizontalLayout {
             spacing: 8px;
