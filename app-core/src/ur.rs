@@ -128,6 +128,36 @@ impl PsbtUrDecoder {
     }
 }
 
+/// Type-agnostic incremental UR reassembler — feed scanned frame strings until
+/// complete, for animated account exports (`crypto-account` etc.) that span
+/// several QR frames. Get the type + bytes with [`Self::message`].
+#[derive(Default)]
+pub struct UrDecoder {
+    inner: Decoder,
+}
+
+impl UrDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one scanned UR string; returns `true` once fully reassembled.
+    /// Non-UR / malformed frames return `Err` so the caller keeps scanning.
+    pub fn receive(&mut self, part: &str) -> Result<bool, Error> {
+        let lo = part.trim().to_lowercase();
+        if !lo.starts_with("ur:") {
+            return Err(Error::Ur("not a UR string".into()));
+        }
+        let ur = UR::parse(&lo).map_err(|e| Error::Ur(format!("parse: {e:?}")))?;
+        self.inner.receive(ur).map_err(|e| Error::Ur(format!("receive: {e:?}")))?;
+        Ok(self.inner.is_complete())
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

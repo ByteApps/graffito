@@ -977,18 +977,8 @@ fn try_import_ur_account(w: &AppWindow, st: &mut State, text: &str) -> bool {
     }
     match app_core::ur_account::descriptors_from_ur(&ty, &bytes, net) {
         Ok(descs) if !descs.is_empty() => {
-            let mut added = 0;
-            for d in &descs {
-                if let Ok(fw) = FundingWallet::create(&d.descriptor, "", net) {
-                    if !st.funding_wallets.iter().any(|x| x.id == fw.id) {
-                        st.funding_wallets.push(fw);
-                        added += 1;
-                    }
-                }
-            }
-            st.save_funding_wallets();
-            refresh_funding_list(w, st);
-            w.set_screen(15);
+            let ds: Vec<String> = descs.iter().map(|d| d.descriptor.clone()).collect();
+            let added = save_funding_descriptors(w, st, &ds);
             w.set_status(format!("imported {added} account(s) from {ty}").into());
             true
         }
@@ -1027,6 +1017,57 @@ fn extract_descriptor(text: &str) -> String {
         }
     }
     t.to_string()
+}
+
+/// Pull EVERY `tr()`/`wpkh()` descriptor out of pasted text or a wallet-export
+/// file — a single export can list several script types. Falls back to the
+/// whole trimmed input as one candidate when no `tr(`/`wpkh(` token is present.
+fn extract_all_descriptors(text: &str) -> Vec<String> {
+    let t = text.trim();
+    let mut found: Vec<String> = Vec::new();
+    for pat in ["tr(", "wpkh("] {
+        let mut from = 0;
+        while let Some(rel) = t[from..].find(pat) {
+            let start = from + rel;
+            let rest = &t[start..];
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == '}')
+                .unwrap_or(rest.len());
+            let desc = rest[..end].to_string();
+            if !found.contains(&desc) {
+                found.push(desc);
+            }
+            from = start + end.max(1);
+        }
+    }
+    if found.is_empty() {
+        vec![t.to_string()]
+    } else {
+        found
+    }
+}
+
+/// Create + persist a funding wallet for each descriptor (dedup by id), refresh
+/// the manager list, and show it. Returns how many NEW wallets were added.
+/// Shared by UR account import and multi-descriptor wallet files — the user
+/// then picks which one to use from the list.
+fn save_funding_descriptors(w: &AppWindow, st: &mut State, descriptors: &[String]) -> usize {
+    let net = st.network;
+    let mut added = 0;
+    for d in descriptors {
+        if let Ok(fw) = FundingWallet::create(d, "", net) {
+            if !st.funding_wallets.iter().any(|x| x.id == fw.id) {
+                st.funding_wallets.push(fw);
+                added += 1;
+            }
+        }
+    }
+    if added > 0 {
+        st.save_funding_wallets();
+    }
+    refresh_funding_list(w, st);
+    w.set_screen(15);
+    added
 }
 
 /// Load the device-level saved funding wallets (empty if the file is absent).
@@ -1908,22 +1949,44 @@ fn main() {
             println!("cb: funding-scan start");
             let weak = weak.clone();
             std::thread::spawn(move || {
-                let text = match camera::capture_and_decode(30, |_, _, _| {}) {
-                    Ok(Some(p)) => String::from_utf8_lossy(&p).to_string(),
-                    _ => String::new(),
-                };
-                let _ = weak.upgrade_in_event_loop(move |w| {
-                    if text.trim().is_empty() {
-                        w.set_status("scan: no QR seen".into());
-                    } else if text.trim().to_lowercase().starts_with("ur:") {
-                        println!("cb: funding-scan ur");
-                        w.invoke_funding_import_ur(text.trim().into());
+                // Reassemble an animated account UR across frames (a hardware
+                // wallet's crypto-account export can span several QR frames); a
+                // single non-UR descriptor/xpub QR completes on the first frame.
+                let mut dec = app_core::ur::UrDecoder::new();
+                let mut parts: Vec<String> = Vec::new();
+                let mut single: Option<String> = None;
+                let done = camera::capture_frames(45, |_, _, _| {}, |payload| {
+                    let s = String::from_utf8_lossy(payload);
+                    let t = s.trim();
+                    if t.to_lowercase().starts_with("ur:") {
+                        let complete = dec.receive(t).unwrap_or(false);
+                        parts.push(t.to_string());
+                        complete
                     } else {
+                        single = Some(t.to_string());
+                        true
+                    }
+                });
+                let result: Option<Result<String, String>> = match done {
+                    Ok(true) => match single {
+                        Some(d) => Some(Ok(d)),           // non-UR descriptor
+                        None if !parts.is_empty() => Some(Err(parts.join(" "))), // UR frames
+                        None => None,
+                    },
+                    _ => None,
+                };
+                let _ = weak.upgrade_in_event_loop(move |w| match result {
+                    Some(Err(ur)) => {
+                        println!("cb: funding-scan ur (multi-frame)");
+                        w.invoke_funding_import_ur(ur.into());
+                    }
+                    Some(Ok(desc)) => {
                         println!("cb: funding-scan ok");
-                        let t: SharedString = extract_descriptor(&text).into();
+                        let t: SharedString = extract_descriptor(&desc).into();
                         w.set_funding_descriptor(t.clone());
                         w.invoke_funding_changed(t);
                     }
+                    None => w.set_status("scan: no complete QR seen".into()),
                 });
             });
         });
@@ -2212,9 +2275,16 @@ fn main() {
                     if try_import_ur_account(&w, &mut s, &content) {
                         return;
                     }
-                    let d = extract_descriptor(&content);
-                    w.set_funding_descriptor(d.clone().into());
-                    w.invoke_funding_changed(d.into());
+                    // A wallet-export file can list several script-type descriptors.
+                    let descs = extract_all_descriptors(&content);
+                    if descs.len() > 1 {
+                        let added = save_funding_descriptors(&w, &mut s, &descs);
+                        w.set_status(format!("imported {added} wallet(s) from file — pick one").into());
+                    } else {
+                        let d = descs.into_iter().next().unwrap_or_default();
+                        w.set_funding_descriptor(d.clone().into());
+                        w.invoke_funding_changed(d.into());
+                    }
                 }
                 Err(e) => w.set_status(format!("read failed: {e}").into()),
             }
