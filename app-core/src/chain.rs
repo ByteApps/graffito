@@ -242,25 +242,28 @@ impl<T: Transport> ChainClient<T> {
     pub fn full_history(&self, address: &str) -> Result<Vec<EsploraTx>, Error> {
         let mut txs: Vec<EsploraTx> =
             parse_json(&self.transport.get_text(&format!("/address/{address}/txs"))?)?;
-        let mut last = txs
-            .iter()
-            .filter(|t| t.status.confirmed)
-            .last()
-            .map(|t| t.txid.clone());
+        let mut seen: std::collections::HashSet<String> =
+            txs.iter().map(|t| t.txid.clone()).collect();
+        // Esplora paginates with the last-seen txid as a PATH segment
+        // (`/txs/chain/:txid`). The `?after_txid=` query form is ignored by
+        // mempool.space (returns the same page → would loop forever), and the
+        // regtest companion only reads the query form — so pagesize/param
+        // handling differs by backend. Guard on it: keep paging while a page
+        // brings NEW txids; stop as soon as one adds nothing (empty, or a
+        // backend that ignored the cursor and echoed a page we've seen).
+        let mut last = txs.iter().filter(|t| t.status.confirmed).last().map(|t| t.txid.clone());
         while let Some(after) = last.take() {
             let page: Vec<EsploraTx> = parse_json(&self.transport.get_text(&format!(
-                "/address/{address}/txs/chain?after_txid={after}"
+                "/address/{address}/txs/chain/{after}"
             ))?)?;
-            if page.is_empty() {
+            let fresh: Vec<EsploraTx> =
+                page.into_iter().filter(|t| seen.insert(t.txid.clone())).collect();
+            if fresh.is_empty() {
                 break;
             }
-            if page.len() >= 25 {
-                last = Some(page[page.len() - 1].txid.clone());
-            }
-            txs.extend(page);
+            last = fresh.iter().filter(|t| t.status.confirmed).last().map(|t| t.txid.clone());
+            txs.extend(fresh);
         }
-        let mut seen = std::collections::HashSet::new();
-        txs.retain(|t| seen.insert(t.txid.clone()));
         Ok(txs)
     }
 
