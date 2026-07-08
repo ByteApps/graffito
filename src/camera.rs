@@ -49,6 +49,51 @@ pub fn capture_and_decode(
     Ok(None)
 }
 
+/// Capture frames for up to `seconds`, feeding each decoded QR payload to
+/// `feed`. Stops when `feed` returns `true` (e.g. an animated-UR sequence has
+/// fully reassembled) or on timeout. Returns whether it completed. Used for
+/// multi-frame `crypto-psbt` UR imports (a hardware wallet hands back an
+/// animated QR, not a single frame).
+pub fn capture_frames(
+    seconds: u64,
+    mut progress: impl FnMut(u64, u32, u32),
+    mut feed: impl FnMut(&[u8]) -> bool,
+) -> Result<bool, String> {
+    let format = RequestedFormat::new::<LumaFormat>(RequestedFormatType::AbsoluteHighestResolution);
+    let mut cam = Camera::new(CameraIndex::Index(0), format).map_err(|e| e.to_string())?;
+    cam.open_stream().map_err(|e| e.to_string())?;
+
+    let start = std::time::Instant::now();
+    let mut frames = 0u64;
+    let mut last_tick = 0u64;
+    while start.elapsed().as_secs() < seconds {
+        let frame = cam.frame().map_err(|e| e.to_string())?;
+        let gray = frame.decode_image::<LumaFormat>().map_err(|e| e.to_string())?;
+        frames += 1;
+        let (w, h) = (gray.width(), gray.height());
+        let tick = start.elapsed().as_secs();
+        if tick > last_tick {
+            last_tick = tick;
+            progress(frames, w, h);
+        }
+        let raw = gray.into_raw();
+        let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(
+            w as usize,
+            h as usize,
+            |x, y| raw[y * w as usize + x],
+        );
+        for grid in prepared.detect_grids() {
+            let mut payload = Vec::new();
+            if grid.decode_to(&mut payload).is_ok() && feed(&payload) {
+                let _ = cam.stop_stream();
+                return Ok(true);
+            }
+        }
+    }
+    let _ = cam.stop_stream();
+    Ok(false)
+}
+
 /// Headless spike: open the camera (TCC prompt on first run), report
 /// frame flow, decode whatever QR is held up to it.
 pub fn spike(seconds: u64) -> Result<(), String> {
