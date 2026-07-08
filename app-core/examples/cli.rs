@@ -323,6 +323,75 @@ fn main() {
                 Err(_) => println!("{ty}\t{}", hex::encode(&bytes)),
             }
         }
+        Some("ur-encode-psbt") => {
+            // ur-encode-psbt <psbt-base64> [frag] → crypto-psbt UR frames (test QR)
+            let psbt = parse_psbt(&args[2]).expect("psbt");
+            let frag: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200);
+            for f in app_core::ur::encode_psbt(&psbt.serialize(), frag) {
+                println!("{f}");
+            }
+        }
+        Some("ur-encode-account") => {
+            // ur-encode-account <account|outdesc|hdkey> <tr()/wpkh() descriptor> [frag]
+            // Build the BCR CBOR from the descriptor's xpub + origin and emit UR
+            // frames — for generating hardware-wallet account-export test QRs.
+            use bitcoin::bip32::Xpub;
+            use ciborium::value::Value;
+            let kind = args[2].as_str();
+            let desc = args[3].as_str();
+            let frag: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(200);
+            let tag: u64 = if desc.starts_with("tr(") { 409 } else { 404 };
+            let origin = desc.split('[').nth(1).and_then(|s| s.split(']').next()).expect("[origin]");
+            let mut it = origin.split('/');
+            let fp = u32::from_str_radix(it.next().expect("fp"), 16).expect("fp hex");
+            let path: Vec<(u32, bool)> = it
+                .map(|c| {
+                    let hard = c.ends_with('h') || c.ends_with('\'');
+                    (c.trim_end_matches(['h', '\'']).parse::<u32>().expect("idx"), hard)
+                })
+                .collect();
+            let xpub_str = desc.split(']').nth(1).and_then(|s| s.split('/').next()).expect("xpub");
+            let xpub = Xpub::from_str(xpub_str).expect("xpub");
+            let mut comps = Vec::new();
+            for (idx, hard) in &path {
+                comps.push(Value::from(*idx as u64));
+                comps.push(Value::Bool(*hard));
+            }
+            let keypath = Value::Map(vec![
+                (Value::from(1u64), Value::Array(comps)),
+                (Value::from(2u64), Value::from(fp as u64)),
+                (Value::from(3u64), Value::from(path.len() as u64)),
+            ]);
+            let parent_fp = u32::from_be_bytes(xpub.parent_fingerprint.to_bytes());
+            let hdkey = Value::Map(vec![
+                (Value::from(3u64), Value::Bytes(xpub.public_key.serialize().to_vec())),
+                (Value::from(4u64), Value::Bytes(xpub.chain_code.to_bytes().to_vec())),
+                (Value::from(6u64), keypath),
+                (Value::from(8u64), Value::from(parent_fp as u64)),
+            ]);
+            let (ur_type, value): (&str, Value) = match kind {
+                "hdkey" => ("crypto-hdkey", hdkey),
+                "outdesc" => (
+                    "crypto-output-descriptor",
+                    Value::Tag(tag, Box::new(Value::Tag(303, Box::new(hdkey)))),
+                ),
+                _ => (
+                    "crypto-account",
+                    Value::Map(vec![
+                        (Value::from(1u64), Value::from(fp as u64)),
+                        (
+                            Value::from(2u64),
+                            Value::Array(vec![Value::Tag(tag, Box::new(Value::Tag(303, Box::new(hdkey))))]),
+                        ),
+                    ]),
+                ),
+            };
+            let mut cbor = Vec::new();
+            ciborium::into_writer(&value, &mut cbor).expect("cbor");
+            for f in app_core::ur::encode_ur(ur_type, &cbor, frag) {
+                println!("{f}");
+            }
+        }
         Some("fund-sign") => {
             // fund-sign <psbt-base64> <xprv>   (the "external wallet")
             let mut psbt = parse_psbt(&args[2]).expect("psbt");
