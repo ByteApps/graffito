@@ -256,6 +256,73 @@ fn main() {
             );
             println!("{}", built.to_base64());
         }
+        Some("fund-build-fake") => {
+            // fund-build-fake <network> <descriptor> <public|private> <rate> <text> [to]
+            // OFFLINE: fabricate one UTXO at receive index 0 (witness_utxo only),
+            // for feeding a signer that never touches the chain (the stock KeyOS
+            // Bitcoin Wallet). No node, no real funding.
+            let net = network(&args[2]);
+            let ident = identity(net);
+            let src = FundingSource::parse(&args[3], net).expect("descriptor");
+            let private = match args[4].as_str() {
+                "private" => true,
+                "public" => false,
+                o => panic!("visibility must be public|private, got {o}"),
+            };
+            let fee_rate: f64 = args[5].parse().expect("fee rate");
+            let text = args[6].clone();
+            let to = args.get(7).cloned();
+            let d0 = src.derive(0, 0).expect("derive 0/0");
+            let coins = vec![app_core::funding::FundingUtxo {
+                txid: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b".into(),
+                vout: 0,
+                value: 200_000,
+                address: d0.address.clone(),
+                chain: 0,
+                index: 0,
+                confirmed: true,
+            }];
+            let recipient = to.as_deref().map(|a| Recipient::parse(net, a).expect("recipient"));
+            let r = app_core::notes_core::keys::generate_aux_rand().expect("rng");
+            let note_id = [r[0], r[1], r[2], r[3]];
+            let plan = FundingPlan {
+                source: &src,
+                coins: &coins,
+                change_index: 0,
+                fee_rate,
+                change_override: None,
+            };
+            let np = NoteParams {
+                identity: &ident.identity,
+                text: &text,
+                private,
+                recipient: recipient.as_ref(),
+                note_id,
+                max_op_return_bytes: 100_000,
+                network: net,
+            };
+            let built = build_funding_psbt(&plan, &np).expect("build funding psbt");
+            eprintln!(
+                "cli: fund-build-fake txid={} fee={} change={} addr={} to={} private={}",
+                built.txid,
+                built.fee,
+                built.change,
+                d0.address,
+                to.as_deref().unwrap_or("self"),
+                private,
+            );
+            println!("{}", built.to_base64());
+        }
+        Some("ur-decode") => {
+            // ur-decode <file>  → reassemble UR part lines; print "<type>\t<msg>".
+            let parts = std::fs::read_to_string(&args[2]).expect("read ur parts");
+            let (ty, bytes) = app_core::ur::decode_ur_string(&parts).expect("decode ur");
+            eprintln!("cli: ur-decode type={ty} bytes={}", bytes.len());
+            match String::from_utf8(bytes.clone()) {
+                Ok(s) => println!("{ty}\t{s}"),
+                Err(_) => println!("{ty}\t{}", hex::encode(&bytes)),
+            }
+        }
         Some("fund-sign") => {
             // fund-sign <psbt-base64> <xprv>   (the "external wallet")
             let mut psbt = parse_psbt(&args[2]).expect("psbt");
