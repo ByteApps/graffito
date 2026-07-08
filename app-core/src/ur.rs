@@ -2,10 +2,17 @@
 //!
 //! Uses `foundation-ur` — the exact multipart-UR codec the KeyOS system QR
 //! scanner runs — so frames we render are byte-for-byte reassemblable by the
-//! Prime app (and, being spec `crypto-psbt`, by Sparrow etc.). A
-//! `crypto-psbt` is CBOR-identical to the `bytes` type (a single byte string),
-//! so the payload is the raw serialized PSBT.
+//! Prime app (and, being spec `crypto-psbt`, by Sparrow etc.).
+//!
+//! Per BCR-2020-006 a `crypto-psbt` UR message is a **CBOR byte string** that
+//! wraps the serialized PSBT — NOT the raw PSBT bytes. `foundation-ur` is a
+//! raw-payload codec (it byteword-encodes whatever bytes it's given, no CBOR
+//! layer), so we add/remove that CBOR bstr wrapper ourselves. This is exactly
+//! what the Passport firmware does on both sides (`minicbor` ByteVec on export,
+//! `UrValue::from_ur` on import — verified in gui-app-bitcoin), so our QRs
+//! interoperate with the stock Bitcoin Wallet and other UR wallets.
 
+use ciborium::value::Value;
 use foundation_ur::{Decoder, Encoder, UR};
 
 use crate::Error;
@@ -18,10 +25,25 @@ pub const PSBT_UR_TYPE: &str = "crypto-psbt";
 /// A small PSBT yields a single fragment (`ur:crypto-psbt/<bytewords>`); a
 /// large one yields a `ur:crypto-psbt/<i>-<n>/…` sequence.
 pub fn encode_psbt(psbt_bytes: &[u8], max_fragment: usize) -> Vec<String> {
+    // crypto-psbt = a CBOR byte string wrapping the serialized PSBT.
+    let mut cbor = Vec::with_capacity(psbt_bytes.len() + 5);
+    ciborium::into_writer(&Value::Bytes(psbt_bytes.to_vec()), &mut cbor).expect("cbor bstr");
     let mut enc = Encoder::new();
-    enc.start(PSBT_UR_TYPE, psbt_bytes, max_fragment.max(1));
+    enc.start(PSBT_UR_TYPE, &cbor, max_fragment.max(1));
     let n = enc.sequence_count();
     (0..n).map(|_| enc.next_part().to_string()).collect()
+}
+
+/// Unwrap a `crypto-psbt` UR message (a CBOR byte string) to the serialized
+/// PSBT. Tolerates an already-unwrapped (raw) message for backward-compat.
+fn unwrap_crypto_psbt(msg: Vec<u8>) -> Vec<u8> {
+    if msg.starts_with(b"psbt\xff") {
+        return msg; // raw PSBT, not CBOR-wrapped
+    }
+    match ciborium::from_reader::<Value, _>(msg.as_slice()) {
+        Ok(Value::Bytes(b)) => b,
+        _ => msg,
+    }
 }
 
 /// Decode a UR string (one part, or whitespace/newline-separated multi-part)
@@ -96,11 +118,13 @@ impl PsbtUrDecoder {
             Some(t) => return Err(Error::Ur(format!("UR type {t}, expected crypto-psbt"))),
             None => return Err(Error::Ur("no UR type".into())),
         }
-        self.inner
+        let msg = self
+            .inner
             .message()
             .map_err(|e| Error::Ur(format!("message: {e:?}")))?
             .map(<[u8]>::to_vec)
-            .ok_or_else(|| Error::Ur("no message".into()))
+            .ok_or_else(|| Error::Ur("no message".into()))?;
+        Ok(unwrap_crypto_psbt(msg))
     }
 }
 
@@ -122,6 +146,28 @@ mod tests {
         }
         assert!(done && dec.is_complete());
         assert_eq!(dec.psbt_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn crypto_psbt_message_is_cbor_wrapped() {
+        // Interop contract with the Passport (and Sparrow etc.): the on-wire
+        // UR message is a CBOR byte string wrapping the PSBT (BCR-2020-006), the
+        // shape `UrValue::from_ur("crypto-psbt", ..)` decodes — not the raw PSBT.
+        let psbt = b"psbt\xff\x01\x02\x03";
+        let frames = encode_psbt(psbt, 400);
+        let (ty, msg) = decode_ur_string(&frames.join(" ")).unwrap();
+        assert_eq!(ty, "crypto-psbt");
+        match ciborium::from_reader::<Value, _>(msg.as_slice()).unwrap() {
+            Value::Bytes(b) => assert_eq!(b, psbt),
+            other => panic!("expected CBOR bstr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tolerates_unwrapped_legacy_message() {
+        // A raw (non-CBOR) PSBT message still decodes, for backward-compat.
+        let psbt = b"psbt\xff\xaa\xbb".to_vec();
+        assert_eq!(unwrap_crypto_psbt(psbt.clone()), psbt);
     }
 
     #[test]
