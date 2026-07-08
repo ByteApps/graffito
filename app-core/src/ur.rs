@@ -24,6 +24,34 @@ pub fn encode_psbt(psbt_bytes: &[u8], max_fragment: usize) -> Vec<String> {
     (0..n).map(|_| enc.next_part().to_string()).collect()
 }
 
+/// Decode a UR string (one part, or whitespace/newline-separated multi-part)
+/// into its type and reassembled CBOR message bytes. Used to dispatch account
+/// exports (`crypto-account`, `crypto-output-descriptor`, `crypto-hdkey`).
+pub fn decode_ur_string(s: &str) -> Result<(String, Vec<u8>), Error> {
+    let mut dec = Decoder::default();
+    for part in s.split_whitespace() {
+        let lo = part.to_lowercase();
+        if !lo.starts_with("ur:") {
+            continue;
+        }
+        let ur = UR::parse(&lo).map_err(|e| Error::Ur(format!("parse: {e:?}")))?;
+        dec.receive(ur).map_err(|e| Error::Ur(format!("receive: {e:?}")))?;
+        if dec.is_complete() {
+            break;
+        }
+    }
+    if !dec.is_complete() {
+        return Err(Error::Ur("incomplete UR (scan all frames)".into()));
+    }
+    let ty = dec.ur_type().ok_or_else(|| Error::Ur("no UR type".into()))?.to_string();
+    let msg = dec
+        .message()
+        .map_err(|e| Error::Ur(format!("message: {e:?}")))?
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| Error::Ur("no message".into()))?;
+    Ok((ty, msg))
+}
+
 /// Incrementally reassembles `crypto-psbt` UR fragments scanned from QR frames.
 #[derive(Default)]
 pub struct PsbtUrDecoder {
