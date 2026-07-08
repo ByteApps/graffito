@@ -338,6 +338,44 @@ fn main() {
             eprintln!("cli: fund-sign inputs_signed={signed}");
             println!("{psbt}");
         }
+        Some("wif-pubkey") => {
+            // wif-pubkey <wif> → compressed pubkey hex (for wpkh(<pubkey>) descriptor)
+            let sk = bitcoin::PrivateKey::from_wif(&args[2]).expect("wif");
+            let secp = Secp256k1::new();
+            println!("{}", sk.public_key(&secp).inner);
+        }
+        Some("fund-sign-wif") => {
+            // fund-sign-wif <psbt-base64> <wif>  (single-key p2wpkh external wallet)
+            use bitcoin::hashes::Hash;
+            use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+            use bitcoin::{ecdsa, PrivateKey, ScriptBuf};
+            let mut psbt = parse_psbt(&args[2]).expect("psbt");
+            let sk = PrivateKey::from_wif(&args[3]).expect("wif");
+            let secp = Secp256k1::new();
+            let pk = sk.public_key(&secp);
+            let wpkh = pk.wpubkey_hash().expect("compressed key");
+            let spk = ScriptBuf::new_p2wpkh(&wpkh);
+            let tx = psbt.unsigned_tx.clone();
+            let mut cache = SighashCache::new(&tx);
+            let mut signed = 0usize;
+            for i in 0..psbt.inputs.len() {
+                let Some(wu) = psbt.inputs[i].witness_utxo.clone() else { continue };
+                if wu.script_pubkey != spk {
+                    continue;
+                }
+                let sighash = cache
+                    .p2wpkh_signature_hash(i, &wu.script_pubkey, wu.value, EcdsaSighashType::All)
+                    .expect("sighash");
+                let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+                let sig = secp.sign_ecdsa(&msg, &sk.inner);
+                psbt.inputs[i]
+                    .partial_sigs
+                    .insert(pk, ecdsa::Signature { signature: sig, sighash_type: EcdsaSighashType::All });
+                signed += 1;
+            }
+            eprintln!("cli: fund-sign-wif inputs_signed={signed}");
+            println!("{psbt}");
+        }
         Some("fund-finalize") => {
             // fund-finalize <base> <network> <signed-psbt-base64>
             let net = network(&args[3]);
