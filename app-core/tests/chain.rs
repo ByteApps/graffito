@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use app_core::chain::{default_base, ChainClient, Transport};
 use app_core::derive::identity_from_leaf;
-use app_core::notes_core::bundle::extract_notes;
+use app_core::notes_core::bundle::{extract_notes, extract_notes_watch};
 use app_core::notes_core::Network;
 use app_core::Error;
 
@@ -217,4 +217,33 @@ fn default_bases() {
         Some("https://mempool.space/testnet4/api")
     );
     assert!(default_base(Network::Regtest).is_none());
+}
+
+/// The stage-1 watch-only story on real recorded chain data: a key-less
+/// scan of the sim identity sees the standing private note's metadata
+/// with its body sealed — identical shape to the foreign-key view.
+#[test]
+fn watch_scan_of_sim_identity_seals_private_note() {
+    let fx = Fixture::for_address(SIM_ADDR, "sim-txs.json", "sim-utxo.json");
+    let client = ChainClient::new(fx, Network::Testnet4);
+    let bundle = client.build_bundle(SIM_ADDR, None).unwrap();
+
+    let notes = extract_notes_watch(&bundle, Network::Testnet4);
+    let private = notes
+        .iter()
+        .find(|n| n.txids.contains(&SIM_PRIVATE_TXID.to_string()))
+        .expect("the standing private note");
+    assert!(private.private);
+    assert!(!private.received, "spends_from_self ⇒ own note");
+    assert_eq!(private.text, None, "watch scan must not decrypt");
+
+    // And the throwaway's public note still reads keylessly.
+    let fx = Fixture::for_address(THROWAWAY_ADDR, "throwaway-txs.json", "throwaway-utxo.json");
+    let client = ChainClient::new(fx, Network::Testnet4);
+    let bundle = client.build_bundle(THROWAWAY_ADDR, None).unwrap();
+    let public = extract_notes_watch(&bundle, Network::Testnet4)
+        .into_iter()
+        .find(|n| n.txids.contains(&THROWAWAY_PUBLIC_TXID.to_string()))
+        .expect("the relay-probe note");
+    assert!(public.text.is_some(), "public notes decode with no key");
 }

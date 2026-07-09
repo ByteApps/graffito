@@ -99,7 +99,7 @@ impl State {
     /// Per-identity, per-network store file — switching keys or accounts
     /// can never collide notebooks.
     fn store_path(&self) -> Option<PathBuf> {
-        let fp = hex::encode(self.ident.as_ref()?.identity.output_x);
+        let fp = hex::encode(self.ident.as_ref()?.output_x());
         Some(
             self.data_dir
                 .join(format!("store-{}-{}.json", self.network.as_str(), &fp[..8])),
@@ -374,11 +374,11 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
         keychain::store_secret_protected(KEYCHAIN_ACCOUNT, material_str.trim(), st.icloud_backup)?;
     }
     st.material = Some(Zeroizing::new(material_str.trim().to_string()));
-    let fp = hex::encode(ident.identity.output_x);
+    let fp = hex::encode(ident.output_x());
     let path = st
         .data_dir
         .join(format!("store-{}-{}.json", st.network.as_str(), &fp[..8]));
-    let mut store = Store::load(&path).unwrap_or_else(|_| Store::new(&ident.identity, st.network));
+    let mut store = Store::load(&path).unwrap_or_else(|_| Store::new(&ident.output_x(), st.network));
     // Migrate a legacy per-identity node URL (shipped as `esplora`) into the
     // device-level per-network config, then drop it from the store. Only if
     // this network has no node set yet, so a real config choice always wins.
@@ -452,6 +452,8 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
 fn update_home(w: &AppWindow, st: &State) {
     let Some(ident) = &st.ident else { return };
     let Some(store) = &st.store else { return };
+    let watch = ident.is_watch();
+    w.set_watch_only(watch);
     w.set_address(ident.address.as_str().into());
     if let Some(img) = qr::qr_image(&ident.address.to_uppercase()) {
         w.set_address_qr(img);
@@ -487,7 +489,11 @@ fn update_home(w: &AppWindow, st: &State) {
                     .as_deref()
                     .map(str::trim)
                     .filter(|t| !t.is_empty())
-                    .unwrap_or("(not decryptable)")
+                    .unwrap_or(if watch && n.private {
+                        "(private — key not on this device)"
+                    } else {
+                        "(not decryptable)"
+                    })
                     .into(),
                 badge: badge.into(),
                 meta: format!(
@@ -513,8 +519,9 @@ fn update_home(w: &AppWindow, st: &State) {
     if let Some(i) = &st.ident {
         w.set_settings_identity(
             format!(
-                "{}{} · {}",
+                "{}{}{} · {}",
                 i.kind,
+                if i.is_watch() { " · watch-only" } else { "" },
                 if matches!(i.kind, "mnemonic" | "xprv") {
                     format!(" · account {}", i.account)
                 } else {
@@ -565,9 +572,14 @@ fn refresh(w: &AppWindow, st: &mut State) {
         Ok(bundle) => {
             st.fees = Some(bundle.fee_rates.clone());
             st.usd = bundle.btc_usd;
-            let identity = st.ident.as_ref().unwrap().identity.clone_fields();
+            let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
+            let output_x = st.ident.as_ref().unwrap().output_x();
             let network = st.network;
-            match st.store.as_mut().unwrap().apply_bundle(&bundle, &identity, network) {
+            let applied = match &keyed {
+                Some(identity) => st.store.as_mut().unwrap().apply_bundle(&bundle, identity, network),
+                None => st.store.as_mut().unwrap().apply_bundle_watch(&bundle, &output_x, network),
+            };
+            match applied {
                 Ok(stats) => {
                     println!(
                         "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
@@ -1181,8 +1193,10 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
         w.set_status(format!("{e}").into());
         return;
     }
-    let Some(ident) = st.ident.as_ref() else { return };
-    let identity = ident.identity.clone_fields();
+    let Some(identity) = st.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+        w.set_status("watch-only identity — no signing key on this device".into());
+        return;
+    };
     let recipient_addr = st.to_address.clone();
     let change_addr = st
         .funding
@@ -1624,7 +1638,13 @@ pub fn run() {
             Ok(m) => match realize(&m, s.network, 0) {
                 Ok(p) => {
                     let a = &p.address;
-                    (format!("{} OK · {}…{}", m.kind(), &a[..12.min(a.len())], &a[a.len().saturating_sub(6)..]), true)
+                    let label = if m.is_watch() {
+                        "account xpub OK — watch-only: public notes and balance, no signing"
+                    } else {
+                        "OK"
+                    };
+                    let kind_prefix = if m.is_watch() { String::new() } else { format!("{} ", m.kind()) };
+                    (format!("{kind_prefix}{label} · {}…{}", &a[..12.min(a.len())], &a[a.len().saturating_sub(6)..]), true)
                 }
                 Err(e) => (format!("{e}"), false),
             },
@@ -1763,9 +1783,14 @@ pub fn run() {
         let Some(store) = &s.store else { return };
         if let Some(n) = store.notes.iter().find(|n| n.note_id.as_str() == id.as_str()) {
             println!("cb: open-note id={} status={:?}", n.note_id, n.status);
+            let watch = s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
             let detail = format!(
                 "{}\n\nid: {}\nkind: {}{}{}\ntxids: {}\nheight: {}\n{}{}",
-                n.text.as_deref().unwrap_or("(not decryptable)"),
+                n.text.as_deref().unwrap_or(if watch && n.private {
+                    "(private — the key that reads this note isn't on this device)"
+                } else {
+                    "(not decryptable)"
+                }),
                 n.note_id,
                 if n.received { "received" } else { "own" },
                 if n.directed { " · directed" } else { "" },
@@ -1934,7 +1959,10 @@ pub fn run() {
             w.set_bump_error(format!("below the {min_rate:.1} sat/vB minimum").into());
             return;
         }
-        let identity = s.ident.as_ref().unwrap().identity.clone_fields();
+        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+            w.set_bump_error("watch-only identity — no signing key on this device".into());
+            return;
+        };
         let result: Result<(String, String, u64), app_core::Error> = if is_note {
             app_core::compose::bump_fee(s.store.as_mut().unwrap(), &identity, net, &ref_id, new_rate)
                 .map(|c| (c.tx.raw_hex.clone(), c.tx.txid_hex.clone(), c.tx.fee))
@@ -1986,7 +2014,7 @@ pub fn run() {
         let net = s.network;
         let Some(ident) = s.ident.as_ref() else { return };
         let Ok(me) = Recipient::parse(net, &ident.address) else { return };
-        let identity = ident.identity.clone_fields();
+        let Some(identity) = ident.full().map(|i| i.clone_fields()) else { return };
         let Some(store) = s.store.as_ref() else { return };
         let coins = store.available_utxos();
         if coins.len() < 2 {
@@ -2027,7 +2055,10 @@ pub fn run() {
         // Self-send: consolidate all spendable coins into one output at
         // our own address.
         let Ok(me) = Recipient::parse(net, &ident.address) else { return };
-        let identity = ident.identity.clone_fields();
+        let Some(identity) = ident.full().map(|i| i.clone_fields()) else {
+            w.set_status("watch-only identity — no signing key on this device".into());
+            return;
+        };
         let store = s.store.as_mut().unwrap();
         if store.available_utxos().len() < 2 {
             w.set_status("nothing to consolidate (need 2+ coins)".into());
@@ -2074,7 +2105,10 @@ pub fn run() {
             w.set_status(format!("not a valid {} address", net.as_str()).into());
             return;
         };
-        let identity = s.ident.as_ref().unwrap().identity.clone_fields();
+        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+            w.set_status("watch-only identity — no signing key on this device".into());
+            return;
+        };
         let store = s.store.as_mut().unwrap();
         let inputs = spendable_inputs(store);
         let dest_spk_hex = hex::encode(&recipient.spk);
@@ -2659,7 +2693,10 @@ pub fn run() {
         let src = s.funding.clone().unwrap();
         let coins = s.funding_coins.clone();
         let change_index = s.funding_change_index;
-        let identity = s.ident.as_ref().unwrap().identity.clone_fields();
+        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+            w.set_status("watch-only identity — no signing key on this device".into());
+            return;
+        };
         let r = app_core::notes_core::keys::generate_aux_rand()
             .map(|x| [x[0], x[1], x[2], x[3]])
             .unwrap_or([1, 2, 3, 4]);
@@ -2803,9 +2840,10 @@ pub fn run() {
             w.set_status("selected coins don't cover the note + fee".into());
             return;
         }
-        let ident_ptr = s.ident.as_ref().map(|i| i.identity.output_x);
-        let Some(_) = ident_ptr else { return };
-        let identity = s.ident.as_ref().unwrap().identity.clone_fields();
+        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+            w.set_status("watch-only identity — no signing key on this device".into());
+            return;
+        };
         let coins_vec = s.selected_coins.clone();
         let result = compose_and_record(
             s.store.as_mut().unwrap(),

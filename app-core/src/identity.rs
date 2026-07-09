@@ -1,10 +1,11 @@
 //! Identity create/import: one parser behind every transport (typed,
 //! QR, file). Accepts BIP-39 mnemonic (12/24), xprv (depth 0 or 3), WIF
-//! (compressed), or 32-byte hex — network-aware, validated before
-//! anything is stored.
+//! (compressed), 32-byte hex, or a WATCH-ONLY account xpub (depth 3) —
+//! network-aware, validated before anything is stored.
 
-use bitcoin::bip32::Xpriv;
+use bitcoin::bip32::{Xpriv, Xpub};
 use bitcoin::key::PrivateKey;
+use notes_core::address::taproot_address;
 use notes_core::bundle::Identity;
 use notes_core::Network;
 use std::str::FromStr;
@@ -12,6 +13,7 @@ use zeroize::Zeroizing;
 
 use crate::derive::{
     btc_network, identity_from_leaf, leaf_from_account, leaf_from_master, leaf_from_mnemonic,
+    watch_output_from_account_xpub,
 };
 use crate::Error;
 
@@ -24,6 +26,9 @@ pub enum KeyMaterial {
     Xprv(Xpriv),
     Wif(PrivateKey),
     Hex([u8; 32]),
+    /// Watch-only: an account-level (depth-3, 86'/coin'/n') xpub. Public
+    /// notes and balance only — no signing, no note decryption.
+    Xpub(Xpub),
 }
 
 impl KeyMaterial {
@@ -33,19 +38,66 @@ impl KeyMaterial {
             KeyMaterial::Xprv(_) => "xprv",
             KeyMaterial::Wif(_) => "wif",
             KeyMaterial::Hex(_) => "hex",
+            KeyMaterial::Xpub(_) => "xpub",
         }
+    }
+
+    pub fn is_watch(&self) -> bool {
+        matches!(self, KeyMaterial::Xpub(_))
     }
 }
 
-/// A realized identity: leaf secret + notes-core Identity + address.
+/// What the realized identity can do. Watch-only carries NO secrets — no
+/// fabricated zero keys anywhere; every signing/decryption call site must
+/// go through [`AppIdentity::full`] and decide what watch-only means.
+pub enum IdentityKeys {
+    Full { leaf_secret: Zeroizing<[u8; 32]>, identity: Identity },
+    Watch { output_x: [u8; 32] },
+}
+
+/// A realized identity: keys (full or watch-only) + address.
 pub struct AppIdentity {
     pub kind: &'static str,
     /// BIP-86 account index (meaningful for mnemonic / master-xprv;
-    /// 0 and ignored for account-xprv / WIF / hex).
+    /// 0 and ignored for account-xprv / WIF / hex / xpub).
     pub account: u32,
-    pub leaf_secret: Zeroizing<[u8; 32]>,
-    pub identity: Identity,
+    pub keys: IdentityKeys,
     pub address: String,
+}
+
+impl AppIdentity {
+    pub fn output_x(&self) -> [u8; 32] {
+        match &self.keys {
+            IdentityKeys::Full { identity, .. } => identity.output_x,
+            IdentityKeys::Watch { output_x } => *output_x,
+        }
+    }
+
+    pub fn is_watch(&self) -> bool {
+        matches!(self.keys, IdentityKeys::Watch { .. })
+    }
+
+    /// The leaf internal-key secret — None for watch-only.
+    pub fn leaf_secret(&self) -> Option<&[u8; 32]> {
+        match &self.keys {
+            IdentityKeys::Full { leaf_secret, .. } => Some(leaf_secret),
+            IdentityKeys::Watch { .. } => None,
+        }
+    }
+
+    /// The full notes-core Identity — None for watch-only.
+    pub fn full(&self) -> Option<&Identity> {
+        match &self.keys {
+            IdentityKeys::Full { identity, .. } => Some(identity),
+            IdentityKeys::Watch { .. } => None,
+        }
+    }
+
+    /// Signing/decryption paths, all UI-gated off for watch-only; reaching
+    /// one with a watch identity is a bug, so panic rather than mis-sign.
+    pub fn expect_full(&self) -> &Identity {
+        self.full().expect("key-requiring path reached with a watch-only identity")
+    }
 }
 
 /// One parser for all transports. Dispatch: whitespace ⇒ mnemonic;
@@ -70,6 +122,18 @@ pub fn parse_key_material(input: &str, network: Network) -> Result<KeyMaterial, 
         match x.depth {
             0 | 3 => Ok(KeyMaterial::Xprv(x)),
             d => Err(Error::XprvDepth(d)),
+        }
+    } else if lower.starts_with("xpub") || lower.starts_with("tpub") {
+        let want_main = matches!(network, Network::Mainnet);
+        if lower.starts_with("xpub") != want_main {
+            return Err(Error::XpubNetwork);
+        }
+        let x = Xpub::from_str(s).map_err(|e| Error::Xpub(e.to_string()))?;
+        match x.depth {
+            // Only an account-level xpub works: the 86'/coin'/account'
+            // path is hardened, so a master xpub cannot derive anything.
+            3 => Ok(KeyMaterial::Xpub(x)),
+            d => Err(Error::XpubDepth(d)),
         }
     } else if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
         let mut key = [0u8; 32];
@@ -166,8 +230,23 @@ pub fn realize(
         },
         KeyMaterial::Wif(w) => w.inner.secret_bytes(),
         KeyMaterial::Hex(k) => *k,
+        KeyMaterial::Xpub(x) => {
+            let output_x = watch_output_from_account_xpub(x)?;
+            let address = taproot_address(network, &output_x);
+            return Ok(AppIdentity {
+                kind: material.kind(),
+                account: 0,
+                keys: IdentityKeys::Watch { output_x },
+                address,
+            });
+        }
     });
     let identity = identity_from_leaf(&leaf)?;
     let address = identity.address(network);
-    Ok(AppIdentity { kind: material.kind(), account, leaf_secret: leaf, identity, address })
+    Ok(AppIdentity {
+        kind: material.kind(),
+        account,
+        keys: IdentityKeys::Full { leaf_secret: leaf, identity },
+        address,
+    })
 }
