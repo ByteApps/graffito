@@ -146,6 +146,16 @@ fn build_session(latest: Latest) -> Result<(Retained<AVCaptureSession>, Retained
         } else {
             return Err("cannot add camera output".into());
         }
+        // Deliver portrait-upright frames. The app is portrait-locked, but the
+        // back-camera sensor is mounted landscape, so without this the preview
+        // is rotated 90°. AVCaptureVideoDataOutput physically rotates the
+        // buffers, so this must be set before startRunning; downstream code
+        // reads the (rotated) width/height straight from each buffer.
+        if let Some(conn) = output.connectionWithMediaType(media) {
+            if conn.isVideoRotationAngleSupported(90.0) {
+                conn.setVideoRotationAngle(90.0);
+            }
+        }
         session.startRunning();
         Ok((session, delegate))
     }
