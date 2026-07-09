@@ -58,8 +58,11 @@ control** — spendable UTXOs sorted low→high, auto-suggests CONFIRMED
 coins only [unconfirmed spendable but manual] via a **fewest-coins vs
 consolidate** strategy toggle [largest- vs smallest-first],
 tap-to-toggle, live total, ↻ refresh, per-coin mempool txid pill, Sign
-gated on sufficiency; and a collapsible **custom change address** with live
-validation) · 7 send-to (Self card,
+gated on sufficiency; a collapsible **custom change address** with live
+validation; and — for **directed notes only** — a collapsible **Gift ·
+N sats** panel [numeric input, default/min = dust 330, live cost
+"+ N sats to recipient"] that sets how much the recipient output carries)
+· 7 send-to (Self card,
 address input + QR-icon scan [scan-to-pick] + Use, recents w/ pencil-
 rename dialog + confirmed remove) · 8 settings (Identity card w/
 account switch + reset, network/chunk pills, **Bitcoin node** +
@@ -118,6 +121,13 @@ typed as text.
   `_exact` and `compose_*_with_change` / `_exact`; the original
   no-arg functions delegate (change=self, auto-select) so every
   existing caller stays byte-identical. Bump the pin, re-run all tests.
+  The **gift amount** followed the same pattern: `recipient_amount: u64`
+  on the tx builders + `compose_directed_note_with_change_amount` /
+  `_exact_amount`; the non-`_amount` variants delegate with `DUST_LIMIT`.
+  `ComposeRequest.gift_amount: Option<u64>` (None = dust) plumbs it;
+  `NoteRecord.gift_amount` (serde default) persists it so RBF preserves
+  the gift. notes-core rev `8fb7255` ships this on prime main — the
+  Prime app can adopt it the same way (see prime-chain-notes/CLAUDE.md).
 - Compose input paths: default = notes-core auto-select (largest-first);
   coin control = `compose_*_exact` spending EXACTLY the selected coins
   (change = leftover). Custom change goes to any spk and is NOT tracked
