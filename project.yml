@@ -19,6 +19,8 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
         GENERATE_INFOPLIST_FILE: NO
+        # No custom app icon; without this actool errors once a catalog exists.
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
     info:
       path: Info.plist
       properties:
@@ -26,11 +28,15 @@ targets:
         CFBundleExecutable: chain-notes-app
         NSCameraUsageDescription: "Scan QR codes (keys, addresses, PSBTs, sync bundles)."
         NSFaceIDUsageDescription: "Unlock your notes key to reveal your backup."
-        UILaunchScreen: {}
+        # Dark launch background (matches Pal.bg) so the cold-start flash isn't
+        # white — the colour lives in Assets.xcassets/LaunchBackground.colorset.
+        UILaunchScreen:
+          UIColorName: LaunchBackground
         ITSAppUsesNonExemptEncryption: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-    sources: []
+    sources:
+      - Assets.xcassets
     postCompileScripts:
       - name: Build Rust binary with cargo
         script: |

@@ -416,6 +416,10 @@ export component AppWindow inherits Window {
     // home indicator). 0 on macOS. Applied as padding on each screen root.
     in property <length> safe-top: 0px;
     in property <length> safe-bottom: 0px;
+    // Set true by Rust once the safe-area inset is known; until then a splash
+    // cover hides the content so it never slides down from under the status
+    // bar on cold start.
+    in property <bool> ready: false;
 
     // iCloud Keychain backup opt-in (current stored state) + restore-availability.
     in-out property <bool> icloud-backup: false;
@@ -889,8 +893,14 @@ export component AppWindow inherits Window {
         }
         PrimaryButton { text: "+  Compose note"; clicked => { root.compose-open(); } }
         Caption { text: root.notes.length == 0 ? "No notes yet — fund the address above, then compose." : "Notebook"; }
-        ListView {
-            for note in root.notes: Rectangle {
+        // Notebook list — top-aligned + scrollable (a plain ListView vertically
+        // centres a short list). Matches the Settings-screen Flickable pattern.
+        Flickable {
+            viewport-height: notes-col.preferred-height;
+            notes-col := VerticalLayout {
+                alignment: start;
+                spacing: 6px;
+                for note in root.notes: Rectangle {
                 height: 62px;
                 nt := TouchArea { clicked => { root.open-note(note.id); } }
                 Rectangle {
@@ -950,6 +960,7 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            }
         }
     }
 
@@ -997,7 +1008,9 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Compose";
-            back => { root.screen = 7; }
+            // Clear the typed address on the way back — it's saved in recents
+            // now, so leaving it in the field is redundant.
+            back => { root.contact-input = ""; root.screen = 7; }
         }
         Flickable {
             viewport-height: compose-col.preferred-height;
@@ -1052,15 +1065,6 @@ export component AppWindow inherits Window {
                 toggled => { root.compose-changed(); }
             }
             Rectangle { }
-            LineEdit {
-                width: 84px;
-                text <=> root.rate-text;
-                edited => {
-                    root.fee-tier = 3;
-                    root.compose-changed();
-                }
-            }
-            Caption { text: "sat/vB"; vertical-alignment: center; }
         }
         HorizontalLayout {
             spacing: 8px;
@@ -1069,6 +1073,18 @@ export component AppWindow inherits Window {
             SelectPill { text: "normal"; active: root.fee-tier == 1; clicked => { root.set-fee-tier(1); } }
             SelectPill { text: "fast"; active: root.fee-tier == 2; clicked => { root.set-fee-tier(2); } }
             SelectPill { text: "custom"; active: root.fee-tier == 3; clicked => { root.fee-tier = 3; } }
+        }
+        // Custom sat/vB field — revealed only when the Custom tier is
+        // selected (the pill above is the toggle); hidden for the presets.
+        if root.fee-tier == 3: HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            LineEdit {
+                width: 84px;
+                text <=> root.rate-text;
+                edited => { root.compose-changed(); }
+            }
+            Caption { text: "sat/vB"; vertical-alignment: center; }
         }
         if root.cost-line != "": Text {
             text: root.cost-line;
@@ -1342,7 +1358,7 @@ export component AppWindow inherits Window {
         }
         Caption {
             text: root.compose-private
-                ? "Encrypted forever on-chain; only your key (and a directed recipient) can read it."
+                ? "Encrypted forever on-chain — XChaCha20-Poly1305, 256-bit key; only your key (and a directed recipient) can read it."
                 : "⚠  Public notes are world-readable, forever.";
         }
         if !root.fund-external: PrimaryButton {
@@ -1372,6 +1388,7 @@ export component AppWindow inherits Window {
     if screen == 7: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
+        alignment: start;
         Header {
             title: "Send to";
             back => { root.go-home(); }
@@ -1382,6 +1399,8 @@ export component AppWindow inherits Window {
             subtitle: "A private note only you can read back.";
             clicked => { root.pick-contact("self"); }
         }
+        // Divider between the Self card and the address-entry section.
+        Rectangle { height: 1px; background: Pal.line; }
         HorizontalLayout {
             spacing: 10px;
             LineEdit {
@@ -1393,54 +1412,60 @@ export component AppWindow inherits Window {
             GhostButton { width: 64px; text: "Use"; clicked => { root.pick-contact(root.contact-input); } }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
-        Caption { text: root.contacts.length == 0 ? "" : "Recent"; }
-        ListView {
+        if root.contacts.length > 0: Caption { text: "Recently used"; }
+        // Recents list. A ListView / stretched Flickable vertically CENTRES a
+        // short list, leaving a big gap under the "Recently used" separator.
+        // Instead: a content-sized column that sits directly under the
+        // separator, and a trailing stretch spacer that soaks up the leftover
+        // space — so the rows always start at the top and grow downward.
+        recents-col := VerticalLayout {
+            spacing: 6px;
             for c in root.contacts: Rectangle {
                 height: 52px;
-                ct := TouchArea { clicked => { root.pick-contact(c.address); } }
-                Rectangle {
-                    y: 2px;
-                    height: parent.height - 6px;
-                    border-radius: 10px;
-                    background: ct.has-hover ? Pal.card-hover : Pal.card;
-                    border-width: 1px;
-                    border-color: Pal.line;
-                    HorizontalLayout {
-                        padding-left: 14px;
-                        padding-right: 6px;
-                        spacing: 2px;
-                        VerticalLayout {
-                            spacing: 3px;
-                            alignment: center;
-                            Text {
-                                text: c.name == "" ? c.address : c.name;
-                                font-size: 12px;
-                                color: Pal.text;
-                                overflow: elide;
+                    ct := TouchArea { clicked => { root.pick-contact(c.address); } }
+                    Rectangle {
+                        y: 2px;
+                        height: parent.height - 6px;
+                        border-radius: 10px;
+                        background: ct.has-hover ? Pal.card-hover : Pal.card;
+                        border-width: 1px;
+                        border-color: Pal.line;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 6px;
+                            spacing: 2px;
+                            VerticalLayout {
+                                spacing: 3px;
+                                alignment: center;
+                                Text {
+                                    text: c.name == "" ? c.address : c.name;
+                                    font-size: 12px;
+                                    color: Pal.text;
+                                    overflow: elide;
+                                }
+                                if c.name != "": Caption { text: c.address; overflow: elide; }
                             }
-                            if c.name != "": Caption { text: c.address; overflow: elide; }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            PencilButton {
-                                clicked => { root.start-rename(c.address, c.name); }
+                            VerticalLayout {
+                                alignment: center;
+                                PencilButton {
+                                    clicked => { root.start-rename(c.address, c.name); }
+                                }
                             }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            IconButton {
-                                glyph: "×";
-                                glyph-size: 20px;
-                                width: 32px;
-                                height: 32px;
-                                glyph-color: Pal.bad;
-                                clicked => { root.confirm-remove(c.address, c.name); }
+                            VerticalLayout {
+                                alignment: center;
+                                IconButton {
+                                    glyph: "×";
+                                    glyph-size: 20px;
+                                    width: 32px;
+                                    height: 32px;
+                                    glyph-color: Pal.bad;
+                                    clicked => { root.confirm-remove(c.address, c.name); }
+                                }
                             }
                         }
                     }
                 }
             }
-        }
     }
 
     // ---------- 8 · settings ----------
@@ -2566,5 +2591,14 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // Splash cover — the topmost child, so it hides everything until Rust
+    // flips `ready` (once the safe-area inset is known). Prevents the content
+    // from visibly sliding down from under the status bar on cold start.
+    if !root.ready: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Pal.bg;
     }
 }
