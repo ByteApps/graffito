@@ -2888,7 +2888,27 @@ fn main() {
         }
     }
 
+    // Apply safe-area insets (iOS status bar / Dynamic Island / home indicator)
+    // once the window exists. Repeated so rotation / late window creation are
+    // picked up; no-op on macOS (returns 0,0). Kept alive for the run's lifetime.
+    let safe_area_timer = slint::Timer::default();
+    {
+        let w = window.as_weak();
+        safe_area_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(500),
+            move || {
+                if let Some(win) = w.upgrade() {
+                    let (top, bottom) = platform::safe_area_insets();
+                    win.set_safe_top(top);
+                    win.set_safe_bottom(bottom);
+                }
+            },
+        );
+    }
+
     window.run().expect("event loop");
+    let _ = safe_area_timer;
 }
 
 /// Populate every external-funding screen with representative mock data for

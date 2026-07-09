@@ -52,6 +52,9 @@ rfd = "0.14"
 # iOS: winit + Skia (Metal); femtovg/GL-ES and nokhwa/rfd are not available.
 [target.'cfg(target_os = "ios")'.dependencies]
 slint = { version = "=1.16.1", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-skia"] }
+# Safe-area insets (status bar / Dynamic Island / home indicator).
+objc2-ui-kit = { version = "0.3", features = ["UIApplication", "UIWindow", "UIView", "UIResponder", "objc2-core-foundation"] }
+objc2-core-foundation = "0.3"
 
 [build-dependencies]
 slint-build = "=1.16.1"
