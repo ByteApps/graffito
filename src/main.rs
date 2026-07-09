@@ -21,7 +21,9 @@ use app_core::chain::{
 };
 use app_core::compose::{compose_and_record, ComposeRequest};
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
-use app_core::identity::{generate_mnemonic, parse_key_material, realize, AppIdentity};
+use app_core::identity::{
+    generate_mnemonic, generate_mnemonic_with_salt, parse_key_material, realize, AppIdentity,
+};
 use app_core::psbt_build::{build_funding_psbt, BuiltPsbt, FundingPlan, NoteParams};
 use app_core::psbt_finalize::{
     finalize_extract, parse_psbt, summarize, validate_signed, OutputRole, SummaryContext,
@@ -65,6 +67,10 @@ struct State {
     /// true = consolidate (smallest-first).
     consolidate_coins: bool,
     material: Option<Zeroizing<String>>, // session cache: avoids re-prompting Touch ID
+    /// iCloud Keychain backup opt-in: when true the key is stored as a
+    /// synchronizable Keychain item (syncs across the user's Apple devices and
+    /// survives reinstall). Reflects the current stored item's sync state.
+    icloud_backup: bool,
     pending_import: Option<Zeroizing<String>>, // hierarchical import awaiting account pick
     pending_mnemonic: Option<String>,
     quiz_indices: Vec<usize>,
@@ -349,7 +355,7 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
         parse_key_material(material_str, st.network).map_err(|e| e.to_string())?;
     let ident = realize(&material, st.network, st.account).map_err(|e| e.to_string())?;
     if persist {
-        keychain::store_secret_protected(KEYCHAIN_ACCOUNT, material_str.trim())?;
+        keychain::store_secret_protected(KEYCHAIN_ACCOUNT, material_str.trim(), st.icloud_backup)?;
     }
     st.material = Some(Zeroizing::new(material_str.trim().to_string()));
     let fp = hex::encode(ident.identity.output_x);
@@ -1298,6 +1304,7 @@ fn main() {
         coins_overridden: false,
         consolidate_coins: false,
         material: None,
+        icloud_backup: false,
         pending_import: None,
         pending_mnemonic: None,
         quiz_indices: Vec::new(),
@@ -1400,7 +1407,8 @@ fn main() {
             .as_ref()
             .map(|m| m.split(' ').count())
             .unwrap_or(12);
-        match generate_mnemonic(count) {
+        let salt = w.get_entropy_salt().to_string();
+        match generate_mnemonic_with_salt(count, &salt) {
             Ok(m) => {
                 let phrase = m.to_string();
                 let grid: String = phrase
@@ -1418,6 +1426,25 @@ fn main() {
                 s.pending_mnemonic = Some(phrase);
             }
             Err(e) => w.set_status(format!("{e}").into()),
+        }
+    });
+
+    // iCloud backup toggle (backup screen + Settings). Sets the sync mode; if a
+    // key is already stored this session, re-stores it with the new mode.
+    cb!(on_set_icloud_backup, |w, s, enabled: bool| {
+        s.icloud_backup = enabled;
+        println!("cb: set-icloud-backup {enabled}");
+        if let Some(material) = s.material.clone() {
+            match keychain::store_secret_protected(KEYCHAIN_ACCOUNT, material.trim(), enabled) {
+                Ok(()) => w.set_status(
+                    if enabled { "iCloud backup on" } else { "iCloud backup off" }.into(),
+                ),
+                Err(e) => {
+                    w.set_status(format!("iCloud: {e}").into());
+                    s.icloud_backup = !enabled;
+                    w.set_icloud_backup(!enabled);
+                }
+            }
         }
     });
 
