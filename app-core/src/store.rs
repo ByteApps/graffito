@@ -72,6 +72,10 @@ pub struct NoteRecord {
     /// Custom change destination (None = change returned to self).
     #[serde(default)]
     pub change_to: Option<String>,
+    /// Directed notes: sats sent to the recipient (the "gift"). None for
+    /// self-notes; preserved across RBF so a fee-bump keeps the same gift.
+    #[serde(default)]
+    pub gift_amount: Option<u64>,
 }
 
 /// One input spent by a sweep/consolidate tx — kept for RBF re-signing.
@@ -385,6 +389,7 @@ impl Store {
                     fee: None,
                     vsize: None,
                     change_to: None,
+                    gift_amount: None,
                 });
                 true
             }
