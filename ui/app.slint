@@ -412,6 +412,11 @@ export component AppWindow inherits Window {
     in-out property <int> screen: 0;
     in property <string> status;
 
+    // Safe-area insets (set from Rust on iOS: status bar / Dynamic Island /
+    // home indicator). 0 on macOS. Applied as padding on each screen root.
+    in property <length> safe-top: 0px;
+    in property <length> safe-bottom: 0px;
+
     in-out property <string> import-text;
     in property <string> import-feedback;
     in property <string> import-suggestions;
@@ -597,7 +602,7 @@ export component AppWindow inherits Window {
     callback go-home();
 
     // ---------- 0 · onboarding ----------
-    if screen == 0: VerticalLayout {
+    if screen == 0: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 24px;
         spacing: 14px;
         alignment: start;
@@ -638,7 +643,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 1 · import ----------
-    if screen == 1: VerticalLayout {
+    if screen == 1: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -674,7 +679,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 2 · backup ----------
-    if screen == 2: VerticalLayout {
+    if screen == 2: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -705,7 +710,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 3 · quiz ----------
-    if screen == 3: VerticalLayout {
+    if screen == 3: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -717,7 +722,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 4 · home ----------
-    if screen == 4: VerticalLayout {
+    if screen == 4: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         HorizontalLayout {
@@ -847,7 +852,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 5 · note view ----------
-    if screen == 5: VerticalLayout {
+    if screen == 5: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -884,7 +889,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 6 · compose ----------
-    if screen == 6: VerticalLayout {
+    if screen == 6: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1196,7 +1201,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 7 · contacts ----------
-    if screen == 7: VerticalLayout {
+    if screen == 7: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -1271,7 +1276,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 8 · settings ----------
-    if screen == 8: VerticalLayout {
+    if screen == 8: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -1425,7 +1430,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 9 · account picker ----------
-    if screen == 9: VerticalLayout {
+    if screen == 9: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1487,7 +1492,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 10 · coins ----------
-    if screen == 10: VerticalLayout {
+    if screen == 10: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -1550,7 +1555,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 11 · activity (transactions) ----------
-    if screen == 11: VerticalLayout {
+    if screen == 11: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -1627,7 +1632,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 12 · funding wallet (external PSBT source) ----------
-    if screen == 12: VerticalLayout {
+    if screen == 12: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1679,7 +1684,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 13 · export PSBT (sign externally) ----------
-    if screen == 13: VerticalLayout {
+    if screen == 13: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1727,7 +1732,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 14 · import signed PSBT + confirmation ----------
-    if screen == 14: VerticalLayout {
+    if screen == 14: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1851,7 +1856,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 15 · funding wallets (manager list) ----------
-    if screen == 15: VerticalLayout {
+    if screen == 15: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;

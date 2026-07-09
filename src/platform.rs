@@ -29,3 +29,26 @@ pub fn save_file(name: &str) -> Option<PathBuf> {
 pub fn save_file(_name: &str) -> Option<PathBuf> {
     None
 }
+
+/// Safe-area insets (top, bottom) in logical px. Must be called on the main
+/// thread once the UIWindow exists. Non-iOS returns (0, 0).
+#[cfg(target_os = "ios")]
+pub fn safe_area_insets() -> (f32, f32) {
+    use objc2::MainThreadMarker;
+    use objc2_ui_kit::UIApplication;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return (0.0, 0.0);
+    };
+    let app = UIApplication::sharedApplication(mtm);
+    let windows = app.windows();
+    if let Some(w) = windows.firstObject() {
+        let i = w.safeAreaInsets();
+        return (i.top as f32, i.bottom as f32);
+    }
+    (0.0, 0.0)
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn safe_area_insets() -> (f32, f32) {
+    (0.0, 0.0)
+}
