@@ -53,7 +53,9 @@ Screens (`screen` property): 0 onboarding (3 doors) · 1 import (typed/
 QR/file, live format feedback + word autocomplete) · 2 backup words ·
 3 quiz · 4 home (balance card, QR, notes list w/ badge pills) · 5 note
 view (+ web-viewer permalink link, hidden on regtest) · 6 compose
-(picker-first, Private default, live cost line; collapsible **coin
+(picker-first, Private default, live cost line; economy/normal/fast/**custom**
+fee tiers where the sat/vB field is revealed only when Custom is selected;
+collapsible **coin
 control** — spendable UTXOs sorted low→high, auto-suggests CONFIRMED
 coins only [unconfirmed spendable but manual] via a **fewest-coins vs
 consolidate** strategy toggle [largest- vs smallest-first],

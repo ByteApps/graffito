@@ -435,6 +435,20 @@ fn show_account_picker(w: &AppWindow, material: &str, network: Network, page: u3
     w.set_screen(9);
 }
 
+/// Push the store's saved recipients into the "Send to" recents list. Kept
+/// separate from `update_home` so it can be called the moment a contact is
+/// added (pick-contact) — otherwise a freshly-used address only appears after
+/// the next full home refresh, not when you press Back from compose.
+fn refresh_contacts(w: &AppWindow, st: &State) {
+    let Some(store) = &st.store else { return };
+    let contacts: Vec<ContactItem> = store
+        .contacts
+        .iter()
+        .map(|c| ContactItem { address: c.address.clone().into(), name: c.name.clone().into() })
+        .collect();
+    w.set_contacts(VecModel::from_slice(&contacts));
+}
+
 fn update_home(w: &AppWindow, st: &State) {
     let Some(ident) = &st.ident else { return };
     let Some(store) = &st.store else { return };
@@ -488,12 +502,7 @@ fn update_home(w: &AppWindow, st: &State) {
         .collect();
     items.sort_by_key(|i| i.badge == "confirmed");
     w.set_notes(VecModel::from_slice(&items));
-    let contacts: Vec<ContactItem> = store
-        .contacts
-        .iter()
-        .map(|c| ContactItem { address: c.address.clone().into(), name: c.name.clone().into() })
-        .collect();
-    w.set_contacts(VecModel::from_slice(&contacts));
+    refresh_contacts(w, st);
     w.set_settings_network(st.network.as_str().into());
     w.set_settings_hierarchical(
         st.material
@@ -1242,6 +1251,23 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
     w.set_psbt_signed(true);
     w.set_status("".into());
     w.set_screen(14);
+}
+
+/// Read the platform safe-area insets (converting with the window's scale
+/// factor) and push them into the UI. Cheap; called on a few startup ticks
+/// and a slow rotation poll. No-op on desktop (insets are 0).
+fn apply_safe_area(win: &AppWindow) {
+    let scale = win.window().scale_factor();
+    let (top, bottom) = platform::safe_area_insets(scale);
+    win.set_safe_top(top);
+    win.set_safe_bottom(bottom);
+    // Reveal the UI once the inset is known — immediately on desktop (no
+    // insets), or as soon as a mobile window reports a real top inset. Until
+    // then a splash cover hides the content so it never visibly slides down
+    // from under the status bar on cold start.
+    if !platform::has_insets() || top > 0.0 {
+        win.set_ready(true);
+    }
 }
 
 /// Shared entry point. The desktop/iOS bin calls this from `fn main`;
@@ -2036,7 +2062,7 @@ pub fn run() {
 
     cb!(on_compose_open, |w, s| {
         println!("cb: compose-open");
-        let _ = &mut s;
+        refresh_contacts(&w, &s);
         w.set_contact_input("".into());
         w.set_status("".into());
         w.set_screen(7);
@@ -2065,6 +2091,9 @@ pub fn run() {
                 store.touch_contact(&a);
             }
             s.save_store();
+            // Rebuild the recents now so the address is in the list when the
+            // user presses Back from compose.
+            refresh_contacts(&w, &s);
             w.set_to_label(format!("To: {a}").into());
             s.to_address = Some(a);
             w.set_directed(true);
@@ -3042,9 +3071,31 @@ pub fn run() {
         }
     }
 
-    // Apply safe-area insets (iOS status bar / Dynamic Island / home indicator)
-    // once the window exists. Repeated so rotation / late window creation are
-    // picked up; no-op on macOS (returns 0,0). Kept alive for the run's lifetime.
+    // Apply safe-area insets (iOS status bar / Dynamic Island / home
+    // indicator; Android status/nav bars). Applied on the very first
+    // event-loop ticks (0/100/250 ms) so the layout is positioned correctly
+    // from the first painted frame — no visible "slide down" on cold start —
+    // with a couple of quick retries covering the window/insets not being
+    // ready at tick 0. Then polled at a slow cadence for rotation. No-op on
+    // desktop (returns 0,0). The timer is kept alive for the run's lifetime.
+    for delay_ms in [0_u64, 16, 50, 100, 250] {
+        let w = window.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(delay_ms), move || {
+            if let Some(win) = w.upgrade() {
+                apply_safe_area(&win);
+            }
+        });
+    }
+    // Fallback: reveal the UI after a short delay no matter what, so the splash
+    // cover can never stick if the inset never reports a value.
+    {
+        let w = window.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(700), move || {
+            if let Some(win) = w.upgrade() {
+                win.set_ready(true);
+            }
+        });
+    }
     let safe_area_timer = slint::Timer::default();
     {
         let w = window.as_weak();
@@ -3053,9 +3104,7 @@ pub fn run() {
             std::time::Duration::from_millis(500),
             move || {
                 if let Some(win) = w.upgrade() {
-                    let (top, bottom) = platform::safe_area_insets();
-                    win.set_safe_top(top);
-                    win.set_safe_bottom(bottom);
+                    apply_safe_area(&win);
                 }
             },
         );
@@ -3190,11 +3239,24 @@ fn getrandom_fill(buf: &mut [u8]) -> Result<(), ()> {
 /// `HOME` and no CLI args on Android, so we point the store at the app's
 /// private internal storage before handing off to the shared `run()`.
 #[cfg(target_os = "android")]
+static ANDROID_APP: std::sync::OnceLock<slint::android::AndroidApp> = std::sync::OnceLock::new();
+
+/// The `AndroidApp` handle, stashed in `android_main`, so `platform::
+/// safe_area_insets` can read the content rect (status-bar / nav-bar insets).
+#[cfg(target_os = "android")]
+pub(crate) fn android_app() -> Option<&'static slint::android::AndroidApp> {
+    ANDROID_APP.get()
+}
+
+#[cfg(target_os = "android")]
 #[no_mangle]
 fn android_main(app: slint::android::AndroidApp) {
     if let Some(path) = app.internal_data_path() {
         std::env::set_var("APP_DATA_DIR", path);
     }
+    // Keep a handle for safe-area insets (content_rect); AndroidApp is a
+    // cheap clonable handle.
+    let _ = ANDROID_APP.set(app.clone());
     // Stash the JavaVM + Activity so the keystore/camera JNI backends can
     // reach them (ndk-context is populated by android-activity at startup;
     // this is a belt-and-suspenders no-op if already set).
