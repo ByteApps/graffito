@@ -7,6 +7,7 @@
 
 mod camera;
 mod keychain;
+mod platform;
 mod qr;
 
 use std::cell::RefCell;
@@ -1233,14 +1234,18 @@ fn main() {
     }
     // Headless design preview: `--render <out-dir> <screen>[,<screen>...]`
     // renders each screen to a PNG via the software renderer (no window).
-    if args.get(1).map(String::as_str) == Some("--render") {
-        let out_dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
-        let screens: Vec<i32> = args
-            .get(3)
-            .map(|s| s.split(',').filter_map(|n| n.trim().parse().ok()).collect())
-            .unwrap_or_else(|| vec![6, 12, 13, 14]);
-        render_previews(480, 900, &screens, &out_dir);
-        return;
+    // macOS-only dev tool (the software renderer isn't in the mobile builds).
+    #[cfg(target_os = "macos")]
+    {
+        if args.get(1).map(String::as_str) == Some("--render") {
+            let out_dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
+            let screens: Vec<i32> = args
+                .get(3)
+                .map(|s| s.split(',').filter_map(|n| n.trim().parse().ok()).collect())
+                .unwrap_or_else(|| vec![6, 12, 13, 14]);
+            render_previews(480, 900, &screens, &out_dir);
+            return;
+        }
     }
 
     let data_dir = std::env::var("APP_DATA_DIR").map(PathBuf::from).unwrap_or_else(|_| {
@@ -1551,7 +1556,7 @@ fn main() {
 
     cb!(on_import_file, |w, s| {
         let _ = &mut s;
-        if let Some(path) = rfd::FileDialog::new().pick_file() {
+        if let Some(path) = platform::pick_file(&[]) {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
                     println!("cb: import-file len={}", text.trim().len());
@@ -2338,9 +2343,8 @@ fn main() {
     });
 
     cb!(on_funding_file, |w, s| {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Descriptor / wallet export", &["txt", "json", "desc", "ur"])
-            .pick_file()
+        if let Some(path) =
+            platform::pick_file(&[("Descriptor / wallet export", &["txt", "json", "desc", "ur"])])
         {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
@@ -2460,7 +2464,7 @@ fn main() {
     cb!(on_psbt_save, |w, s| {
         let Some(built) = s.built_psbt.as_ref() else { return };
         let bytes = built.to_bytes();
-        if let Some(path) = rfd::FileDialog::new().set_file_name("note.psbt").save_file() {
+        if let Some(path) = platform::save_file("note.psbt") {
             match std::fs::write(&path, &bytes) {
                 Ok(()) => w.set_status("saved .psbt".into()),
                 Err(e) => w.set_status(format!("save failed: {e}").into()),
@@ -2496,7 +2500,7 @@ fn main() {
     });
 
     cb!(on_psbt_import_file, |w, s| {
-        if let Some(path) = rfd::FileDialog::new().add_filter("PSBT", &["psbt", "txt"]).pick_file() {
+        if let Some(path) = platform::pick_file(&[("PSBT", &["psbt", "txt"])]) {
             match std::fs::read(&path) {
                 Ok(bytes) => load_signed_psbt(&w, &mut s, &bytes),
                 Err(e) => w.set_status(format!("read failed: {e}").into()),
@@ -2944,7 +2948,8 @@ fn preview_mock(w: &AppWindow) {
 }
 
 /// Render each screen to `<out_dir>/screen-<n>.png` via the software renderer,
-/// with no on-screen window — for headless design iteration.
+/// with no on-screen window — for headless design iteration. macOS-only.
+#[cfg(target_os = "macos")]
 fn render_previews(w: u32, h: u32, screens: &[i32], out_dir: &str) {
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
     use std::rc::Rc;
