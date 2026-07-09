@@ -8,6 +8,15 @@ description = "Native Mac/iOS/Android peer for chain notes (PNTE protocol)"
 [workspace]
 members = ["app-core"]
 
+# The code lives in a lib so BOTH the desktop/iOS bin (fn main) and the
+# Android cdylib (android_main, loaded by NativeActivity) can share it.
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "chain-notes-app"
+path = "src/main.rs"
+
 # Cross-platform (macOS desktop + iOS/Android mobile). Platform-specific glue
 # (Slint renderer, camera, file dialogs, keychain) is target-gated below and
 # cfg-split in the modules; app logic + UI (app.slint) are shared.
@@ -63,6 +72,32 @@ objc2-av-foundation = { version = "0.3", features = [
 objc2-core-media = { version = "0.3", features = ["CMSampleBuffer", "CMFormatDescription", "CMTime"] }
 objc2-core-video = { version = "0.3", features = ["CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVReturn", "CVBase"] }
 dispatch2 = "0.3"
+
+# Android: winit/android-activity + Skia (GL-ES). Keystore + camera go
+# through JNI (jni + ndk-context give the JavaVM + Activity from the
+# android-activity NativeActivity that Slint boots).
+[target.'cfg(target_os = "android")'.dependencies]
+slint = { version = "=1.16.1", default-features = false, features = ["compat-1-2", "backend-android-activity-06", "renderer-skia"] }
+jni = "0.21"
+ndk-context = "0.1"
+
+# cargo-apk packaging (NativeActivity via android-activity). Build:
+#   cargo apk build --lib --target aarch64-linux-android
+[package.metadata.android]
+package = "xyz.foundation.chainnotes.app"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 35
+
+[package.metadata.android.application]
+label = "Chain Notes"
+
+# QR scan (camera) — also requested at runtime via BiometricPrompt-free
+# NDK Camera2; the manifest permission is the install-time half.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CAMERA"
 
 [build-dependencies]
 slint-build = "=1.16.1"
