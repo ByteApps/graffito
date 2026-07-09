@@ -1401,6 +1401,15 @@ export component AppWindow inherits Window {
             }
         }
         SettingsCard {
+            title: "iCloud backup";
+            subtitle: "Sync your key to iCloud Keychain — it's restored automatically after a reinstall or on your other Apple devices. Reveal still needs Face ID.";
+            Switch {
+                text: "Back up to iCloud";
+                checked <=> root.icloud-backup;
+                toggled => { root.set-icloud-backup(root.icloud-backup); }
+            }
+        }
+        SettingsCard {
             title: "Network";
             subtitle: "Which chain this notebook lives on. Every network keeps its own separate notebook for the same key.";
             HorizontalLayout {
@@ -2286,6 +2295,10 @@ export component AppWindow inherits Window {
                 Caption {
                     text: "Your notes and funds stay on-chain. Re-import the same key + account and everything comes back. Make sure the backup is written down — without it, this identity is gone.";
                     color: Pal.warn;
+                }
+                if root.icloud-backup: Caption {
+                    text: "iCloud backup is ON — this also deletes the key from iCloud, so it will NOT return on reinstall. Your written backup is the only recovery.";
+                    color: Pal.bad;
                 }
                 HorizontalLayout {
                     spacing: 10px;
