@@ -461,6 +461,7 @@ export component AppWindow inherits Window {
 
     in-out property <string> import-text;
     in property <string> import-feedback;
+    in property <bool> import-feedback-ok;
     in property <string> import-suggestions;
 
     in property <string> backup-words;
@@ -729,11 +730,9 @@ export component AppWindow inherits Window {
         if root.import-feedback != "": Body {
             text: root.import-feedback;
             font-size: 12px;
-            color: root.import-feedback == "" ? Pal.muted
-                : (root.import-feedback == "✓ recognized: mnemonic"
-                   || root.import-feedback == "✓ recognized: xprv"
-                   || root.import-feedback == "✓ recognized: wif"
-                   || root.import-feedback == "✓ recognized: hex" ? Pal.good : Pal.warn);
+            // Rust sets the flag alongside the text (string-matching the
+            // feedback here rotted once already).
+            color: root.import-feedback-ok ? Pal.good : Pal.warn;
         }
         HorizontalLayout {
             spacing: 10px;
@@ -1968,7 +1967,7 @@ export component AppWindow inherits Window {
             GhostButton { text: "Copy"; clicked => { root.psbt-copy(); } }
         }
         PrimaryButton {
-            text: "I've signed it  →  Review";
+            text: "I've signed it — Review";
             clicked => { root.psbt-goto-import(); }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
@@ -2482,7 +2481,7 @@ export component AppWindow inherits Window {
                 }
                 Body { text: root.balance-line; font-size: 12px; }
                 Mono {
-                    text: "→ " + root.sweep-dest;
+                    text: "To " + root.sweep-dest;
                     font-size: 10px;
                     color: Pal.muted;
                     wrap: no-wrap;
