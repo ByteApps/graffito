@@ -142,10 +142,13 @@ pub fn capture_and_decode(
 }
 } // mod imp (macOS)
 
-// ---- non-macOS backends (iOS/Android) ---------------------------------------
-// Same API; real capture (AVFoundation video-data-output / NDK Camera2) is the
-// next step — stubbed so the UI builds and every non-camera flow works.
-#[cfg(not(target_os = "macos"))]
+// ---- iOS backend (AVFoundation) ---------------------------------------------
+#[cfg(target_os = "ios")]
+#[path = "camera_ios.rs"]
+mod imp;
+
+// ---- other platforms (Android — NDK Camera2 backend slots in here) ----------
+#[cfg(all(not(target_os = "macos"), not(target_os = "ios")))]
 mod imp {
     use std::sync::atomic::AtomicBool;
 
