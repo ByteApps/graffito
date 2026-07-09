@@ -530,6 +530,7 @@ export component AppWindow inherits Window {
     callback import-file();
     callback quiz-submit(string);
     callback backup-continue();
+    callback regenerate-words();
     callback refresh();
     callback open-note(string);
     callback open-note-web-url(string);
@@ -683,7 +684,15 @@ export component AppWindow inherits Window {
         padding: 20px;
         spacing: 12px;
         alignment: start;
-        Header { title: "Write these words down"; show-back: false; }
+        Header {
+            title: "Write these words down";
+            show-back: true;
+            back => { root.screen = 0; }
+            IconButton {
+                glyph: "↻";
+                clicked => { root.regenerate-words(); }
+            }
+        }
         Rectangle {
             border-radius: 10px;
             background: Pal.warn.with-alpha(0.12);
@@ -705,6 +714,11 @@ export component AppWindow inherits Window {
                 text: root.backup-words;
                 font-size: 13px;
             }
+        }
+        HorizontalLayout {
+            height: 26px;
+            Rectangle { }
+            CopyButton { clicked => { root.copy-text("backup-words", root.backup-words); } }
         }
         PrimaryButton { text: "I wrote them down"; clicked => { root.backup-continue(); } }
     }
