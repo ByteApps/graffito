@@ -2942,7 +2942,7 @@ fn main() {
 
     cb!(on_reveal_backup, |w, s| {
         let _ = &mut s;
-        match keychain::load_secret_protected(KEYCHAIN_ACCOUNT, "reveal your backup words") {
+        match keychain::reveal_secret(KEYCHAIN_ACCOUNT, "reveal your backup words") {
             Ok(Some(secret)) => {
                 println!("cb: reveal-backup ok len={}", secret.len());
                 w.set_reveal_text(secret.into());
