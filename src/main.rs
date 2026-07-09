@@ -1392,6 +1392,35 @@ fn main() {
         }
     });
 
+    // "New words" (↻) on the backup screen: reroll a fresh mnemonic of the same
+    // length, in case the user didn't like the ones shown.
+    cb!(on_regenerate_words, |w, s| {
+        let count = s
+            .pending_mnemonic
+            .as_ref()
+            .map(|m| m.split(' ').count())
+            .unwrap_or(12);
+        match generate_mnemonic(count) {
+            Ok(m) => {
+                let phrase = m.to_string();
+                let grid: String = phrase
+                    .split(' ')
+                    .enumerate()
+                    .map(|(i, wd)| {
+                        format!("{:>2}. {:<9}{}", i + 1, wd, if i % 3 == 2 { "\n" } else { " " })
+                    })
+                    .collect();
+                if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
+                    println!("cb-test: words={phrase}");
+                }
+                println!("cb: regenerate-words count={count}");
+                w.set_backup_words(grid.into());
+                s.pending_mnemonic = Some(phrase);
+            }
+            Err(e) => w.set_status(format!("{e}").into()),
+        }
+    });
+
     cb!(on_backup_continue, |w, s| {
         let Some(phrase) = s.pending_mnemonic.clone() else { return };
         let count = phrase.split(' ').count();
@@ -2914,6 +2943,10 @@ fn main() {
 /// Populate every external-funding screen with representative mock data for
 /// the `CN_PREVIEW` design harness.
 fn preview_mock(w: &AppWindow) {
+    w.set_backup_words(
+        " 1. legal      2. winner    3. thank\n 4. year       5. wave      6. sausage\n 7. worth      8. useful    9. dawn\n10. absorb    11. pledge   12. yellow\n"
+            .into(),
+    );
     w.set_fund_external(true);
     w.set_funding_ready(true);
     w.set_funding_summary("taproot · bcrt1p2caq…6hrewe · 2 coins · 220,000 sats".into());
