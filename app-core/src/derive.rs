@@ -7,7 +7,7 @@
 //! - hierarchical path = m/86'/{coin}'/0'/0/0, coin 0 mainnet / 1 otherwise
 //! - raw keys (WIF/hex) ARE the leaf secret directly (no hierarchy)
 
-use bitcoin::bip32::{ChildNumber, Xpriv};
+use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
 use bitcoin::secp256k1::Secp256k1;
 use hkdf::Hkdf;
 use notes_core::bundle::Identity;
@@ -65,6 +65,19 @@ pub fn leaf_from_master(master: &Xpriv, network: Network, account: u32) -> Resul
         .derive_priv(&secp, &path)
         .map_err(|e| Error::Xprv(e.to_string()))?;
     Ok(leaf.private_key.secret_bytes())
+}
+
+/// Watch-only: 0/0 below an account-level (depth-3, 86'/coin'/n') xpub →
+/// tweaked output x-only key (the notes-address key). Public derivation
+/// only — no leaf secret exists on this device, so no enc key either.
+pub fn watch_output_from_account_xpub(account: &Xpub) -> Result<[u8; 32], Error> {
+    let secp = Secp256k1::verification_only();
+    let leaf = account
+        .derive_pub(&secp, &[normal(0), normal(0)])
+        .map_err(|e| Error::Xpub(e.to_string()))?;
+    let internal_x = leaf.public_key.x_only_public_key().0.serialize();
+    let (output_x, _) = taproot_tweak_pubkey(&internal_x, None)?;
+    Ok(output_x)
 }
 
 /// 0/0 below an account-level (depth-3, e.g. 86'/coin'/n') xprv.

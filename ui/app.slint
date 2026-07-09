@@ -536,6 +536,9 @@ export component AppWindow inherits Window {
     in property <string> settings-network;
     in property <string> settings-identity;
     in property <bool> settings-hierarchical;
+    // Watch-only identity (account-xpub import): no signing key, no private
+    // notes — compose/sweep/consolidate/bump are hidden everywhere.
+    in property <bool> watch-only;
     in property <[AccountItem]> accounts;
     in-out property <int> account-page;
     in-out property <bool> show-reset-confirm;
@@ -682,7 +685,7 @@ export component AppWindow inherits Window {
         DoorCard {
             highlight: true;
             title: "Import a key";
-            subtitle: "Any mnemonic, xprv, WIF, or 32-byte hex key — e.g. a BIP-85 child from your hardware wallet. Type, scan, or open a file.";
+            subtitle: "Any mnemonic, xprv, WIF, or 32-byte hex key — e.g. a BIP-85 child from your hardware wallet. An account xpub imports as watch-only. Type, scan, or open a file.";
             clicked => { root.door-import(); }
         }
         DoorCard {
@@ -717,7 +720,7 @@ export component AppWindow inherits Window {
             title: "Import key";
             back => { root.screen = 0; }
         }
-        Caption { text: "Mnemonic (12/24 words), xprv, WIF, or 32-byte hex."; }
+        Caption { text: "Mnemonic (12/24 words), xprv, WIF, 32-byte hex — or an account xpub for a watch-only notebook (public notes and balance; private notes stay sealed, no composing)."; }
         TextEdit {
             height: 110px;
             text <=> root.import-text;
@@ -924,12 +927,19 @@ export component AppWindow inherits Window {
                             CopyButton { clicked => { root.copy-text("address", root.address); } }
                         }
                     }
+                    if root.watch-only: HorizontalLayout {
+                        alignment: start;
+                        Badge { label: "watch-only"; tint: Pal.warn; }
+                    }
                     Caption { text: root.status; }
                 }
             }
         }
-        PrimaryButton { text: "+  Compose note"; clicked => { root.compose-open(); } }
-        Caption { text: root.notes.length == 0 ? "No notes yet — fund the address above, then compose." : "Notebook"; }
+        if !root.watch-only: PrimaryButton { text: "+  Compose note"; clicked => { root.compose-open(); } }
+        if root.watch-only: Caption { text: "Watch-only — this device can read the notebook but holds no key to compose."; }
+        Caption { text: root.notes.length == 0
+            ? (root.watch-only ? "No notes on this address yet." : "No notes yet — fund the address above, then compose.")
+            : "Notebook"; }
         // Notebook list — top-aligned + scrollable (a plain ListView vertically
         // centres a short list). Matches the Settings-screen Flickable pattern.
         Flickable {
@@ -1627,7 +1637,7 @@ export component AppWindow inherits Window {
                 clicked => { root.open-coins(); }
             }
         }
-        SettingsCard {
+        if !root.watch-only: SettingsCard {
             title: "Funds";
             subtitle: "Move everything off the notes address (minus the fee) — e.g. returning testnet coins.";
             HorizontalLayout {
@@ -1642,9 +1652,11 @@ export component AppWindow inherits Window {
             }
         }
         SettingsCard {
-            title: "Backup";
-            subtitle: "Shows the exact key material you imported or created. Anyone who sees it controls the funds and every private note.";
-            GhostButton { text: "Reveal backup  ·  asks for Touch ID"; clicked => { root.reveal-backup(); } }
+            title: root.watch-only ? "Watch-only key" : "Backup";
+            subtitle: root.watch-only
+                ? "Shows the account xpub you imported. It can't spend and can't read private notes — safe to share, but it does reveal this notebook."
+                : "Shows the exact key material you imported or created. Anyone who sees it controls the funds and every private note.";
+            GhostButton { text: root.watch-only ? "Reveal xpub  ·  asks for Touch ID" : "Reveal backup  ·  asks for Touch ID"; clicked => { root.reveal-backup(); } }
             if root.reveal-text != "": VerticalLayout {
                 spacing: 8px;
                 Rectangle {
@@ -1739,9 +1751,11 @@ export component AppWindow inherits Window {
             back => { root.screen = 8; }
         }
         Caption {
-            text: "Each note tx spends these unspent outputs. Consolidating combines them into one coin at your address, so future notes need fewer inputs (lower fees).";
+            text: root.watch-only
+                ? "Each note tx spends these unspent outputs. Watch-only — viewing only, no key to move them."
+                : "Each note tx spends these unspent outputs. Consolidating combines them into one coin at your address, so future notes need fewer inputs (lower fees).";
         }
-        HorizontalLayout {
+        if !root.watch-only: HorizontalLayout {
             spacing: 8px;
             LineEdit { width: 84px; text <=> root.consolidate-rate; }
             Caption { text: "sat/vB"; vertical-alignment: center; }
@@ -1847,13 +1861,13 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 8px;
                             alignment: start;
-                            if a.pending: GhostButton {
+                            if a.pending && !root.watch-only: GhostButton {
                                 width: 96px;
                                 height: 30px;
                                 text: "Speed up";
                                 clicked => { root.act-bump-open(a.ref-id, a.is-note); }
                             }
-                            if a.pending: GhostButton {
+                            if a.pending && !root.watch-only: GhostButton {
                                 width: 108px;
                                 height: 30px;
                                 text: "Rebroadcast";

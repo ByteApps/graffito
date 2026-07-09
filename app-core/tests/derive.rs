@@ -32,7 +32,7 @@ fn address_cross_checks_with_rust_bitcoin() {
     let ident = realize(&material, Network::Mainnet, 0).unwrap();
 
     let secp = Secp256k1::new();
-    let internal = XOnlyPublicKey::from_slice(&ident.identity.internal_x).unwrap();
+    let internal = XOnlyPublicKey::from_slice(&ident.expect_full().internal_x).unwrap();
     let addr = bitcoin::Address::p2tr(&secp, internal, None, bitcoin::Network::Bitcoin);
     assert_eq!(ident.address, addr.to_string());
 }
@@ -75,7 +75,7 @@ fn account_xprv_equals_master_derivation() {
     assert_eq!(from_account.address, from_master.address);
 
     let leaf = leaf_from_account(&account).unwrap();
-    assert_eq!(*from_master.leaf_secret, leaf);
+    assert_eq!(from_master.leaf_secret().unwrap(), &leaf);
 }
 
 /// Different BIP-86 accounts are fully separate identities: different
@@ -86,7 +86,7 @@ fn accounts_are_separate_identities() {
     let a0 = realize(&material, Network::Mainnet, 0).unwrap();
     let a1 = realize(&material, Network::Mainnet, 1).unwrap();
     assert_ne!(a0.address, a1.address);
-    assert_ne!(a0.identity.enc_key, a1.identity.enc_key);
+    assert_ne!(a0.expect_full().enc_key, a1.expect_full().enc_key);
     assert_eq!(a1.account, 1);
 }
 
@@ -98,4 +98,51 @@ fn identity_wiring() {
     let ident = identity_from_leaf(&leaf).unwrap();
     assert_eq!(ident.enc_key, enc_key_from_leaf(&leaf));
     assert_ne!(ident.internal_x, ident.output_x);
+}
+
+/// Watch-only xpub import: same address/output key as the full import of
+/// the same account, no secrets anywhere, unusable depths and wrong
+/// networks rejected.
+#[test]
+fn watch_xpub_import_matches_full_identity() {
+    let material = parse_key_material(BIP86_MNEMONIC, Network::Mainnet).unwrap();
+    let full = realize(&material, Network::Mainnet, 0).unwrap();
+
+    let KeyMaterial::Mnemonic(m) = &material else { panic!("parsed as mnemonic") };
+    let secp = Secp256k1::new();
+    let master = Xpriv::new_master(bitcoin::Network::Bitcoin, &m.to_seed("")).unwrap();
+    let account = master
+        .derive_priv(
+            &secp,
+            &[
+                ChildNumber::from_hardened_idx(86).unwrap(),
+                ChildNumber::from_hardened_idx(0).unwrap(),
+                ChildNumber::from_hardened_idx(0).unwrap(),
+            ],
+        )
+        .unwrap();
+    let xpub = bitcoin::bip32::Xpub::from_priv(&secp, &account);
+
+    let parsed = parse_key_material(&xpub.to_string(), Network::Mainnet).unwrap();
+    assert!(parsed.is_watch());
+    let watch = realize(&parsed, Network::Mainnet, 0).unwrap();
+    assert_eq!(watch.kind, "xpub");
+    assert!(watch.is_watch());
+    assert_eq!(watch.address, BIP86_ADDR_0, "xpub lands on the BIP-86 spec address");
+    assert_eq!(watch.output_x(), full.output_x());
+    assert!(watch.full().is_none());
+    assert!(watch.leaf_secret().is_none());
+
+    // Master (depth-0) xpub: the hardened account path makes it useless.
+    let master_pub = bitcoin::bip32::Xpub::from_priv(&secp, &master);
+    assert!(matches!(
+        parse_key_material(&master_pub.to_string(), Network::Mainnet),
+        Err(app_core::Error::XpubDepth(0))
+    ));
+
+    // Network mismatch both ways.
+    assert!(matches!(
+        parse_key_material(&xpub.to_string(), Network::Testnet4),
+        Err(app_core::Error::XpubNetwork)
+    ));
 }

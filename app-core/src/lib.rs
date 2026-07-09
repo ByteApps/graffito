@@ -39,6 +39,12 @@ pub enum Error {
     /// xprv at a depth we don't interpret (only 0 = master, 3 = account).
     XprvDepth(u8),
     Xprv(String),
+    /// xpub/tpub prefix does not match the active network.
+    XpubNetwork,
+    /// Watch-only xpub at a depth we can't use (only 3 = 86' account —
+    /// the hardened account path makes a master xpub underivable).
+    XpubDepth(u8),
+    Xpub(String),
     /// WIF network byte does not match the active network.
     WifNetwork,
     /// Uncompressed WIF — taproot identities require compressed keys.
@@ -77,6 +83,11 @@ impl core::fmt::Display for Error {
                 write!(f, "xprv depth {d} unsupported (need master or 86' account)")
             }
             Error::Xprv(m) => write!(f, "xprv: {m}"),
+            Error::XpubNetwork => write!(f, "xpub is for a different network"),
+            Error::XpubDepth(d) => {
+                write!(f, "xpub depth {d} unsupported (need an 86' account-level xpub)")
+            }
+            Error::Xpub(m) => write!(f, "xpub: {m}"),
             Error::WifNetwork => write!(f, "WIF is for a different network"),
             Error::WifUncompressed => write!(f, "uncompressed WIF unsupported"),
             Error::Wif(m) => write!(f, "WIF: {m}"),

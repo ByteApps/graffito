@@ -8,7 +8,8 @@
 //! plaintext wins over a missing cache, and re-applying the same bundle
 //! is a no-op.
 
-use notes_core::bundle::{extract_notes, Identity, RecoveredNote, SyncBundle};
+use notes_core::address::taproot_address;
+use notes_core::bundle::{extract_notes, extract_notes_watch, Identity, RecoveredNote, SyncBundle};
 use notes_core::tx::Utxo;
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
@@ -168,12 +169,12 @@ fn default_chunk() -> usize {
 }
 
 impl Store {
-    pub fn new(identity: &Identity, network: Network) -> Self {
+    pub fn new(output_x: &[u8; 32], network: Network) -> Self {
         Store {
             version: 1,
             network: network.as_str().to_string(),
-            identity_fingerprint: hex::encode(identity.output_x),
-            address: identity.address(network),
+            identity_fingerprint: hex::encode(output_x),
+            address: taproot_address(network, output_x),
             notes: Vec::new(),
             utxos: Vec::new(),
             contacts: Vec::new(),
@@ -248,12 +249,35 @@ impl Store {
         identity: &Identity,
         network: Network,
     ) -> Result<ApplyStats, Error> {
-        if hex::encode(identity.output_x) != self.identity_fingerprint {
+        self.check_identity(&identity.output_x)?;
+        self.apply_recovered(bundle, extract_notes(bundle, identity, network))
+    }
+
+    /// Watch-only [`Self::apply_bundle`]: same merge, but notes extract
+    /// without keys — every private body stays sealed (text: None).
+    pub fn apply_bundle_watch(
+        &mut self,
+        bundle: &SyncBundle,
+        output_x: &[u8; 32],
+        network: Network,
+    ) -> Result<ApplyStats, Error> {
+        self.check_identity(output_x)?;
+        self.apply_recovered(bundle, extract_notes_watch(bundle, network))
+    }
+
+    fn check_identity(&self, output_x: &[u8; 32]) -> Result<(), Error> {
+        if hex::encode(output_x) != self.identity_fingerprint {
             return Err(Error::Store("bundle applied to a different identity".into()));
         }
+        Ok(())
+    }
 
+    fn apply_recovered(
+        &mut self,
+        bundle: &SyncBundle,
+        recovered: Vec<RecoveredNote>,
+    ) -> Result<ApplyStats, Error> {
         let mut stats = ApplyStats::default();
-        let recovered = extract_notes(bundle, identity, network);
         for note in &recovered {
             stats.notes_seen += 1;
             if self.upsert_note(note) {

@@ -22,7 +22,7 @@ fn bob() -> Identity {
 }
 
 fn funded_store(identity: &Identity) -> Store {
-    let mut store = Store::new(identity, NET);
+    let mut store = Store::new(&identity.output_x, NET);
     store.utxos.push(LedgerUtxo {
         txid: "aa".repeat(32),
         vout: 0,
@@ -126,7 +126,7 @@ fn compose_confirm_recover_lifecycle() {
 
     // Wipe recovery: fresh store + bare key + full bundle = notebook
     // back, INCLUDING the private note's plaintext.
-    let mut fresh = Store::new(&a, NET);
+    let mut fresh = Store::new(&a.output_x, NET);
     fresh.apply_bundle(&b, &a, NET).unwrap();
     assert_eq!(fresh.notes.len(), 2);
     let recovered_private = fresh.notes.iter().find(|n| n.private).unwrap();
@@ -170,7 +170,7 @@ fn directed_private_note_both_sides() {
         vec![change_utxo(&sent.tx, Some(105))],
         105,
     );
-    let mut alice_fresh = Store::new(&a, NET);
+    let mut alice_fresh = Store::new(&a.output_x, NET);
     alice_fresh.apply_bundle(&alice_bundle, &a, NET).unwrap();
     let note = &alice_fresh.notes[0];
     assert!(note.directed && note.private && !note.received);
@@ -184,7 +184,7 @@ fn directed_private_note_both_sides() {
         vec![BundleUtxo { txid: sent.tx.txid_hex.clone(), vout: 1, value: 330, height: Some(105) }],
         105,
     );
-    let mut bob_store = Store::new(&b, NET);
+    let mut bob_store = Store::new(&b.output_x, NET);
     bob_store.apply_bundle(&bob_bundle, &b, NET).unwrap();
     let received = &bob_store.notes[0];
     assert!(received.received && received.private && received.directed);
@@ -195,7 +195,7 @@ fn directed_private_note_both_sides() {
 #[test]
 fn unconfirmed_scanned_utxo_is_spendable() {
     let a = alice();
-    let mut store = Store::new(&a, NET);
+    let mut store = Store::new(&a.output_x, NET);
     // A scan that returns one UNCONFIRMED utxo (height None) paying us.
     let b = bundle(
         vec![],
@@ -221,7 +221,7 @@ fn unconfirmed_scanned_utxo_is_spendable() {
 #[test]
 fn coin_control_spends_exactly_selected() {
     let a = alice();
-    let mut store = Store::new(&a, NET);
+    let mut store = Store::new(&a.output_x, NET);
     // Three coins.
     for (i, v) in [(0u32, 60_000u64), (1, 40_000), (2, 20_000)] {
         store.utxos.push(LedgerUtxo {
@@ -475,4 +475,55 @@ fn directed_gift_amount_plumbs_through() {
     .unwrap();
     assert_eq!(d.tx.sent, app_core::notes_core::DUST_LIMIT, "default gift is dust");
     assert_eq!(store2.notes[0].gift_amount, Some(app_core::notes_core::DUST_LIMIT));
+}
+
+/// Watch-only recovery: a key-less store rebuilds the same notebook from
+/// the same bundle — public text readable, private bodies sealed, balance
+/// identical — idempotently, and the fingerprint guard still holds.
+#[test]
+fn watch_store_recovers_notebook_without_keys() {
+    let a = alice();
+    let mut store = funded_store(&a);
+    let n1 = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest { text: "first, public", private: false, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1000 },
+    )
+    .unwrap();
+    let n2 = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest { text: "second, private", private: true, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 2000 },
+    )
+    .unwrap();
+    let b = bundle(
+        vec![onchain(&n1.tx, 101, true, None, None), onchain(&n2.tx, 102, true, None, None)],
+        vec![change_utxo(&n2.tx, Some(102))],
+        102,
+    );
+
+    let mut keyed = Store::new(&a.output_x, NET);
+    keyed.apply_bundle(&b, &a, NET).unwrap();
+    let mut watch = Store::new(&a.output_x, NET);
+    let stats = watch.apply_bundle_watch(&b, &a.output_x, NET).unwrap();
+    assert_eq!(stats.notes_new, 2);
+    assert_eq!(watch.address, keyed.address);
+    assert_eq!(watch.balance(), keyed.balance());
+
+    let wpub = watch.notes.iter().find(|n| !n.private).unwrap();
+    assert_eq!(wpub.text.as_deref(), Some("first, public"));
+    let wpriv = watch.notes.iter().find(|n| n.private).unwrap();
+    assert!(wpriv.text.is_none(), "watch store must hold ciphertext only");
+    assert_eq!(wpriv.note_id, n2.note_id);
+    assert_eq!(keyed.notes.iter().find(|n| n.private).unwrap().text.as_deref(), Some("second, private"));
+
+    // Idempotent re-apply: private stays sealed, nothing duplicates.
+    let snapshot = serde_json::to_string(&watch).unwrap();
+    watch.apply_bundle_watch(&b, &a.output_x, NET).unwrap();
+    assert_eq!(serde_json::to_string(&watch).unwrap(), snapshot);
+
+    // Fingerprint guard works keyless too.
+    assert!(watch.apply_bundle_watch(&b, &bob().output_x, NET).is_err());
 }

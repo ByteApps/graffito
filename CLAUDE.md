@@ -13,6 +13,20 @@ typed text, QR, or file; SeedQR supported). Flagship import path: a
 dedicated **BIP-85 child from `prime-bip85`**. Also the standalone
 on-ramp for users with no Prime or hardware wallet at all.
 
+**Watch-only identities (stage 1)**: importing an account-level xpub
+(depth 3 — the hardened 86' path makes a master xpub underivable) makes
+a key-less notebook — same address as the full key, public notes and
+balance/coins/activity readable, every private body sealed ("key not on
+this device"), compose/sweep/consolidate/bump hidden (`watch-only` slint
+property; Rust callbacks gate too via `AppIdentity::full()` — never
+fabricate zero keys). `KeyMaterial::Xpub` → `IdentityKeys::Watch` in
+app-core; scans go through notes-core's additive `extract_notes_watch` /
+store's `apply_bundle_watch`. The xpub is stored in the keychain
+verbatim like any key material. `cli xpub <network>` prints the account
+xpub for hierarchical APP_KEY material (feeds watch e2e). Stage 2 (not
+built): compose-to-PSBT for an external signer, public notes only —
+directed-private needs the identity key at compose time (ECDH).
+
 Design doc + milestone plan (M0–M7): **`../PLAN-chain-notes-app.md`** in
 the prime workspace (this repo is a workspace submodule sibling of the
 Prime apps). Protocol invariants live in
