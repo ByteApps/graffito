@@ -1345,6 +1345,8 @@ pub fn run() {
         active_funding_id: None,
     }));
     let window = AppWindow::new().expect("window");
+    // iCloud UI is Apple-only; Android's keystore is device-bound.
+    window.set_apple_platform(cfg!(target_vendor = "apple"));
 
     // Boot identity: APP_KEY env (dev/tests) or the keychain.
     {

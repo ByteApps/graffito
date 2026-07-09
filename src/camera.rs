@@ -147,8 +147,13 @@ pub fn capture_and_decode(
 #[path = "camera_ios.rs"]
 mod imp;
 
-// ---- other platforms (Android — NDK Camera2 backend slots in here) ----------
-#[cfg(all(not(target_os = "macos"), not(target_os = "ios")))]
+// ---- Android backend (NDK Camera2) ------------------------------------------
+#[cfg(target_os = "android")]
+#[path = "camera_android.rs"]
+mod imp;
+
+// ---- other platforms (no camera) --------------------------------------------
+#[cfg(all(not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
 mod imp {
     use std::sync::atomic::AtomicBool;
 

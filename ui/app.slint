@@ -420,6 +420,9 @@ export component AppWindow inherits Window {
     // iCloud Keychain backup opt-in (current stored state) + restore-availability.
     in-out property <bool> icloud-backup: false;
     in property <bool> icloud-available: false;
+    // Apple-only UI (iCloud Keychain sync) — hidden on Android, where the
+    // keystore is device-bound and there is no iCloud.
+    in property <bool> apple-platform: true;
 
     // Backup screen: "Advanced" collapsible + optional user entropy ("salt").
     in-out property <bool> advanced-expanded: false;
@@ -700,7 +703,7 @@ export component AppWindow inherits Window {
             GhostButton { text: "Scan QR"; clicked => { root.import-scan(); } }
             GhostButton { text: "From file…"; clicked => { root.import-file(); } }
         }
-        Switch {
+        if root.apple-platform: Switch {
             text: "Back up to iCloud";
             checked <=> root.icloud-backup;
             toggled => { root.set-icloud-backup(root.icloud-backup); }
@@ -796,12 +799,12 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        Switch {
+        if root.apple-platform: Switch {
             text: "Back up to iCloud";
             checked <=> root.icloud-backup;
             toggled => { root.set-icloud-backup(root.icloud-backup); }
         }
-        Caption {
+        if root.apple-platform: Caption {
             text: "Syncs your key to your Apple devices and lets you restore after reinstall. Change anytime in Settings.";
             color: Pal.muted;
         }
@@ -1472,7 +1475,7 @@ export component AppWindow inherits Window {
                 clicked => { root.show-reset-confirm = true; }
             }
         }
-        SettingsCard {
+        if root.apple-platform: SettingsCard {
             title: "iCloud backup";
             subtitle: "Sync your key to iCloud Keychain — it's restored automatically after a reinstall or on your other Apple devices. Reveal still needs Face ID.";
             Switch {
