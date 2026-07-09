@@ -1,9 +1,15 @@
-//! Mac camera glue: AVFoundation via nokhwa → grayscale frames → rqrr, plus a
-//! downscaled RGBA `preview` callback per frame so the UI can show a live view.
-//! Behind the CameraSource idea from the PLAN — iOS/Android backends slot in at
-//! phase 4. First open triggers the macOS TCC camera prompt (bundled app:
-//! NSCameraUsageDescription via scripts/bundle-mac.sh).
+//! Camera glue → grayscale frames → rqrr, with a downscaled RGBA `preview`
+//! callback per frame for the live view. The CameraSource idea from the PLAN:
+//! macOS is AVFoundation via nokhwa (below); iOS/Android backends (AVFoundation
+//! video-data-output / NDK Camera2, both spike-proven) slot in behind the same
+//! `capture_frames`/`capture_and_decode` API. First open triggers the platform
+//! camera-permission prompt.
 
+use std::sync::atomic::AtomicBool;
+
+// ---- macOS backend (nokhwa) --------------------------------------------------
+#[cfg(target_os = "macos")]
+mod imp {
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nokhwa::pixel_format::LumaFormat;
@@ -134,6 +140,34 @@ pub fn capture_and_decode(
     })?;
     Ok(out)
 }
+} // mod imp (macOS)
+
+// ---- non-macOS backends (iOS/Android) ---------------------------------------
+// Same API; real capture (AVFoundation video-data-output / NDK Camera2) is the
+// next step — stubbed so the UI builds and every non-camera flow works.
+#[cfg(not(target_os = "macos"))]
+mod imp {
+    use std::sync::atomic::AtomicBool;
+
+    pub fn capture_frames(
+        _seconds: u64,
+        _cancel: &AtomicBool,
+        _preview: impl FnMut(&[u8], u32, u32),
+        _feed: impl FnMut(&[u8]) -> bool,
+    ) -> Result<bool, String> {
+        Err("camera not yet wired on this platform".into())
+    }
+
+    pub fn capture_and_decode(
+        _seconds: u64,
+        _cancel: &AtomicBool,
+        _preview: impl FnMut(&[u8], u32, u32),
+    ) -> Result<Option<Vec<u8>>, String> {
+        Err("camera not yet wired on this platform".into())
+    }
+}
+
+pub use imp::{capture_and_decode, capture_frames};
 
 /// Headless spike: open the camera (TCC prompt on first run), decode whatever QR
 /// is held up to it.

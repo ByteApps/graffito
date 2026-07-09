@@ -1,2 +1,6 @@
 /target
 /target-mobile
+# XcodeGen-generated (source of truth: project.yml)
+/build
+*.xcodeproj/
+/Info.plist
