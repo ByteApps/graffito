@@ -67,9 +67,7 @@ impl Fixture {
             .last()
             .and_then(|t| t["txid"].as_str().map(String::from));
         match last_confirmed {
-            Some(txid) => {
-                fx.body(&format!("/address/{addr}/txs/chain?after_txid={txid}"), "[]")
-            }
+            Some(txid) => fx.body(&format!("/address/{addr}/txs/chain/{txid}"), "[]"),
             None => fx,
         }
     }
@@ -174,26 +172,30 @@ fn pagination_follows_full_pages() {
     let page1: Vec<_> = (0..25).map(mk_tx).collect();
     let last1 = format!("{:064x}", 24);
     let page2: Vec<_> = (25..30).map(mk_tx).collect();
+    let last2 = format!("{:064x}", 29);
 
     let fx = Fixture::new()
         .body(&format!("/address/{addr}/txs"), &serde_json::to_string(&page1).unwrap())
         .body(
-            &format!("/address/{addr}/txs/chain?after_txid={last1}"),
+            &format!("/address/{addr}/txs/chain/{last1}"),
             &serde_json::to_string(&page2).unwrap(),
-        );
+        )
+        // Completion isn't inferred from a short page (backends disagree on
+        // page size) — the client probes once more and stops on an empty page.
+        .body(&format!("/address/{addr}/txs/chain/{last2}"), "[]");
     let client = ChainClient::new(fx, Network::Testnet4);
     let history = client.full_history(addr).unwrap();
     assert_eq!(history.len(), 30);
-    // Short page (5 < 25) ⇒ no third request.
+    // Two continuation probes: after page1 (→ page2) and after page2 (→ empty).
     assert_eq!(
         client
             .transport
             .requests
             .borrow()
             .iter()
-            .filter(|p| p.contains("after_txid"))
+            .filter(|p| p.contains("/txs/chain/"))
             .count(),
-        1
+        2
     );
 }
 

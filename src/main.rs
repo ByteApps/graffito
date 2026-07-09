@@ -29,6 +29,9 @@ use app_core::notes_core::address::Recipient;
 use app_core::notes_core::bundle::{estimate_note_cost, FeeRates};
 use app_core::notes_core::Network;
 use app_core::store::{NoteStatus, Store, DEFAULT_CHUNK};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use slint::{ComponentHandle, SharedString, VecModel};
 use zeroize::Zeroizing;
 
@@ -891,6 +894,28 @@ fn funding_compose_ui(w: &AppWindow, st: &State, text: &str) {
     }
 }
 
+/// A per-frame preview closure for [`camera::capture_frames`] — pushes each
+/// downscaled frame to the shared `camera-frame` image so the scan overlay
+/// shows a live view (QR detection, not the preview, is what's throttled).
+fn scan_preview(weak: slint::Weak<AppWindow>) -> impl FnMut(&[u8], u32, u32) {
+    move |rgba: &[u8], pw: u32, ph: u32| {
+        let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(pw, ph);
+        buf.make_mut_bytes().copy_from_slice(rgba);
+        let _ = weak.upgrade_in_event_loop(move |w| w.set_camera_frame(slint::Image::from_rgba8(buf)));
+    }
+}
+
+/// Show the shared scan overlay and clear the cancel flag (call on the UI thread
+/// before spawning the capture thread).
+fn begin_scan(weak: &slint::Weak<AppWindow>, cancel: &Arc<AtomicBool>, hint: &str) {
+    cancel.store(false, Ordering::Relaxed);
+    if let Some(w) = weak.upgrade() {
+        w.set_scan_hint(hint.into());
+        w.set_scan_progress(0.0);
+        w.set_scanning(true);
+    }
+}
+
 /// Populate the saved-wallet manager list (screen 15).
 fn refresh_funding_list(w: &AppWindow, st: &State) {
     let active = st.active_funding_id.clone();
@@ -1477,13 +1502,29 @@ fn main() {
         }
     });
 
+    // Shared cancel flag for every "Scan QR" path (set by the overlay's Cancel).
+    let scan_cancel = Arc::new(AtomicBool::new(false));
+    {
+        let sc = scan_cancel.clone();
+        let weak = window.as_weak();
+        window.on_cancel_scan(move || {
+            sc.store(true, Ordering::Relaxed);
+            if let Some(w) = weak.upgrade() {
+                w.set_scanning(false);
+            }
+        });
+    }
     {
         let weak = window.as_weak();
+        let scan_cancel = scan_cancel.clone();
         window.on_import_scan(move || {
             println!("cb: import-scan start");
             let weak = weak.clone();
+            let cancel = scan_cancel.clone();
+            begin_scan(&weak, &cancel, "Point your key or SeedQR at the camera");
             std::thread::spawn(move || {
-                let text = match camera::capture_and_decode(20, |_, _, _| {}) {
+                let preview = scan_preview(weak.clone());
+                let text = match camera::capture_and_decode(30, &cancel, preview) {
                     Ok(Some(payload)) => match app_core::seedqr::decode(&payload) {
                         Ok(m) => m.to_string(),
                         Err(_) => String::from_utf8_lossy(&payload).to_string(),
@@ -1495,6 +1536,7 @@ fn main() {
                     }
                 };
                 let _ = weak.upgrade_in_event_loop(move |w| {
+                    w.set_scanning(false);
                     if !text.is_empty() {
                         println!("cb: import-scan ok len={}", text.len());
                         w.set_import_text(text.clone().into());
@@ -1893,15 +1935,20 @@ fn main() {
 
     {
         let weak = window.as_weak();
+        let scan_cancel = scan_cancel.clone();
         window.on_contact_scan(move || {
             println!("cb: contact-scan start");
             let weak = weak.clone();
+            let cancel = scan_cancel.clone();
+            begin_scan(&weak, &cancel, "Point the recipient's address QR at the camera");
             std::thread::spawn(move || {
-                let text = match camera::capture_and_decode(20, |_, _, _| {}) {
+                let preview = scan_preview(weak.clone());
+                let text = match camera::capture_and_decode(30, &cancel, preview) {
                     Ok(Some(p)) => String::from_utf8_lossy(&p).to_string(),
                     _ => String::new(),
                 };
                 let _ = weak.upgrade_in_event_loop(move |w| {
+                    w.set_scanning(false);
                     if text.is_empty() {
                         w.set_status("scan: no QR seen".into());
                     } else {
@@ -1920,15 +1967,20 @@ fn main() {
 
     {
         let weak = window.as_weak();
+        let scan_cancel = scan_cancel.clone();
         window.on_change_scan(move || {
             println!("cb: change-scan start");
             let weak = weak.clone();
+            let cancel = scan_cancel.clone();
+            begin_scan(&weak, &cancel, "Point the change-address QR at the camera");
             std::thread::spawn(move || {
-                let text = match camera::capture_and_decode(20, |_, _, _| {}) {
+                let preview = scan_preview(weak.clone());
+                let text = match camera::capture_and_decode(30, &cancel, preview) {
                     Ok(Some(p)) => String::from_utf8_lossy(&p).to_string(),
                     _ => String::new(),
                 };
                 let _ = weak.upgrade_in_event_loop(move |w| {
+                    w.set_scanning(false);
                     if text.is_empty() {
                         w.set_status("scan: no QR seen".into());
                     } else {
@@ -1942,25 +1994,32 @@ fn main() {
         });
     }
 
-    // Scan a funding descriptor / xpub QR → prefill + validate.
+    // Scan a funding descriptor / xpub / account-UR QR → prefill + validate.
     {
         let weak = window.as_weak();
+        let scan_cancel = scan_cancel.clone();
         window.on_funding_scan(move || {
             println!("cb: funding-scan start");
             let weak = weak.clone();
+            let cancel = scan_cancel.clone();
+            begin_scan(&weak, &cancel, "Point the funding-wallet QR at the camera");
             std::thread::spawn(move || {
+                let preview = scan_preview(weak.clone());
+                let pweak = weak.clone();
                 // Reassemble an animated account UR across frames (a hardware
                 // wallet's crypto-account export can span several QR frames); a
                 // single non-UR descriptor/xpub QR completes on the first frame.
                 let mut dec = app_core::ur::UrDecoder::new();
                 let mut parts: Vec<String> = Vec::new();
                 let mut single: Option<String> = None;
-                let done = camera::capture_frames(45, |_, _, _| {}, |payload| {
+                let done = camera::capture_frames(45, &cancel, preview, |payload| {
                     let s = String::from_utf8_lossy(payload);
                     let t = s.trim();
                     if t.to_lowercase().starts_with("ur:") {
                         let complete = dec.receive(t).unwrap_or(false);
                         parts.push(t.to_string());
+                        let p = dec.progress();
+                        let _ = pweak.upgrade_in_event_loop(move |w| w.set_scan_progress(p));
                         complete
                     } else {
                         single = Some(t.to_string());
@@ -1975,18 +2034,21 @@ fn main() {
                     },
                     _ => None,
                 };
-                let _ = weak.upgrade_in_event_loop(move |w| match result {
-                    Some(Err(ur)) => {
-                        println!("cb: funding-scan ur (multi-frame)");
-                        w.invoke_funding_import_ur(ur.into());
+                let _ = weak.upgrade_in_event_loop(move |w| {
+                    w.set_scanning(false);
+                    match result {
+                        Some(Err(ur)) => {
+                            println!("cb: funding-scan ur (multi-frame)");
+                            w.invoke_funding_import_ur(ur.into());
+                        }
+                        Some(Ok(desc)) => {
+                            println!("cb: funding-scan ok");
+                            let t: SharedString = extract_descriptor(&desc).into();
+                            w.set_funding_descriptor(t.clone());
+                            w.invoke_funding_changed(t);
+                        }
+                        None => w.set_status("scan: no complete QR seen".into()),
                     }
-                    Some(Ok(desc)) => {
-                        println!("cb: funding-scan ok");
-                        let t: SharedString = extract_descriptor(&desc).into();
-                        w.set_funding_descriptor(t.clone());
-                        w.invoke_funding_changed(t);
-                    }
-                    None => w.set_status("scan: no complete QR seen".into()),
                 });
             });
         });
@@ -1997,20 +2059,27 @@ fn main() {
     // callback (which has state access), so no Rc crosses the thread boundary.
     {
         let weak = window.as_weak();
+        let scan_cancel = scan_cancel.clone();
         window.on_psbt_import_scan(move || {
             println!("cb: psbt-scan start");
             let weak = weak.clone();
+            let cancel = scan_cancel.clone();
+            begin_scan(&weak, &cancel, "Point the signed-transaction QR at the camera");
             std::thread::spawn(move || {
+                let preview = scan_preview(weak.clone());
+                let pweak = weak.clone();
                 // Reassemble an animated crypto-psbt UR across frames (a hardware
                 // wallet hands the signed PSBT back as a multi-part QR); a single
                 // non-UR QR (hex/base64) completes on the first frame.
                 let mut dec = app_core::ur::PsbtUrDecoder::new();
                 let mut single: Option<String> = None;
-                let done = camera::capture_frames(45, |_, _, _| {}, |payload| {
+                let done = camera::capture_frames(45, &cancel, preview, |payload| {
                     let s = String::from_utf8_lossy(payload);
                     let t = s.trim();
                     if t.to_lowercase().starts_with("ur:") {
                         let _ = dec.receive(t);
+                        let p = dec.progress();
+                        let _ = pweak.upgrade_in_event_loop(move |w| w.set_scan_progress(p));
                         dec.is_complete()
                     } else {
                         single = Some(t.to_string());
@@ -2021,12 +2090,15 @@ fn main() {
                     Ok(true) => single.or_else(|| dec.psbt_bytes().ok().map(hex::encode)),
                     _ => None,
                 };
-                let _ = weak.upgrade_in_event_loop(move |w| match result {
-                    Some(text) => {
-                        println!("cb: psbt-scan ok");
-                        w.invoke_psbt_loaded(text.into());
+                let _ = weak.upgrade_in_event_loop(move |w| {
+                    w.set_scanning(false);
+                    match result {
+                        Some(text) => {
+                            println!("cb: psbt-scan ok");
+                            w.invoke_psbt_loaded(text.into());
+                        }
+                        None => w.set_status("scan: no complete PSBT seen".into()),
                     }
-                    None => w.set_status("scan: no complete PSBT seen".into()),
                 });
             });
         });
