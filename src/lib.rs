@@ -304,9 +304,9 @@ fn update_activity(w: &AppWindow, st: &State) {
             NoteStatus::Orphaned => "orphaned",
         };
         let title = if t.dest == "self" {
-            format!("Consolidate → your address · {} sats", t.value)
+            format!("Consolidate to your address · {} sats", t.value)
         } else {
-            format!("→ {} · {} sats", t.dest, t.value)
+            format!("To {} · {} sats", t.dest, t.value)
         };
         items.push((
             t.created_at.unwrap_or(0),
@@ -790,7 +790,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
 
     if text.is_empty() {
         w.set_cost_line("".into());
-        w.set_change_amount(format!("Change → {change_dest}").into());
+        w.set_change_amount(format!("Change to {change_dest}").into());
         w.set_spend_enough(true);
         st.compose_oversize = false;
         return;
@@ -816,7 +816,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             w.set_cost_line(
                 format!("{chunks} chunk(s) · ~{vsize} vB · ~{fee} sats{usd}{gift_line}").into(),
             );
-            w.set_change_amount(format!("Change → {change_dest} · ~{change} sats").into());
+            w.set_change_amount(format!("Change to {change_dest} · ~{change} sats").into());
             w.set_spend_enough(enough);
         }
         // Over the per-tx broadcast ceiling: vsize > 100 kB (Ok arm) or the
@@ -922,13 +922,13 @@ fn funding_compose_ui(w: &AppWindow, st: &State, text: &str) {
     // overrides it. Same validation/label pattern as the self-funded path.
     let change_trim = w.get_change_address().trim().to_string();
     if change_trim.is_empty() {
-        w.set_change_amount("Change → funding wallet".into());
+        w.set_change_amount("Change to funding wallet".into());
         w.set_change_error("".into());
     } else if Recipient::parse(net, &normalize_addr(&change_trim)).is_ok() {
-        w.set_change_amount(format!("Change → {}…", &change_trim[..14.min(change_trim.len())]).into());
+        w.set_change_amount(format!("Change to {}…", &change_trim[..14.min(change_trim.len())]).into());
         w.set_change_error("".into());
     } else {
-        w.set_change_amount("Change → ⚠ invalid".into());
+        w.set_change_amount("Change: ⚠ invalid".into());
         w.set_change_error(format!("Not a valid {} address.", net.as_str()).into());
     }
 }
@@ -1617,19 +1617,20 @@ pub fn run() {
             String::new()
         };
         w.set_import_suggestions(sugg.into());
-        let fb = match parse_key_material(&t, s.network) {
+        let (fb, ok) = match parse_key_material(&t, s.network) {
             Ok(m) if is_hierarchical(&t, s.network) => {
-                format!("✓ {} — you'll choose an account next", m.kind())
+                (format!("{} OK — you'll choose an account next", m.kind()), true)
             }
             Ok(m) => match realize(&m, s.network, 0) {
                 Ok(p) => {
                     let a = &p.address;
-                    format!("✓ {} → {}…{}", m.kind(), &a[..12.min(a.len())], &a[a.len().saturating_sub(6)..])
+                    (format!("{} OK · {}…{}", m.kind(), &a[..12.min(a.len())], &a[a.len().saturating_sub(6)..]), true)
                 }
-                Err(e) => format!("{e}"),
+                Err(e) => (format!("{e}"), false),
             },
-            Err(e) => format!("{e}"),
+            Err(e) => (format!("{e}"), false),
         };
+        w.set_import_feedback_ok(ok);
         w.set_import_feedback(fb.into());
     });
 
@@ -1652,6 +1653,7 @@ pub fn run() {
             }
             Err(e) => {
                 println!("cb: import err={e}");
+                w.set_import_feedback_ok(false);
                 w.set_import_feedback(format!("{e}").into());
             }
         }
@@ -1697,6 +1699,7 @@ pub fn run() {
                         w.set_import_text(text.clone().into());
                         w.invoke_import_changed(text.into());
                     } else {
+                        w.set_import_feedback_ok(false);
                         w.set_import_feedback("scan: no QR seen".into());
                     }
                 });
@@ -1716,7 +1719,10 @@ pub fn run() {
                     w.invoke_import_changed(text.into());
                 });
             }
-            None => w.set_import_feedback("clipboard empty".into()),
+            None => {
+                w.set_import_feedback_ok(false);
+                w.set_import_feedback("clipboard empty".into());
+            }
         }
     });
 
@@ -1741,7 +1747,10 @@ pub fn run() {
                     w.set_import_text(text.trim().into());
                     w.invoke_import_changed(text.trim().into());
                 }
-                Err(e) => w.set_import_feedback(format!("file: {e}").into()),
+                Err(e) => {
+                    w.set_import_feedback_ok(false);
+                    w.set_import_feedback(format!("file: {e}").into());
+                }
             }
         }
     });
@@ -1941,7 +1950,7 @@ pub fn run() {
                 match client.broadcast(&raw) {
                     Ok(bt) => {
                         println!("cb: act-bump ref={ref_id} txid={txid} fee={fee} rate={new_rate:.1} ok");
-                        w.set_status(format!("sped up → {}…", &bt[..12.min(bt.len())]).into());
+                        w.set_status(format!("sped up: {}…", &bt[..12.min(bt.len())]).into());
                     }
                     Err(e) => {
                         println!("cb: act-bump ref={ref_id} broadcast err={e}");
@@ -1996,7 +2005,7 @@ pub fn run() {
                 println!("cb: consolidate-preview coins={} fee={} vsize={}", coins.len(), tx.fee, tx.vsize);
                 w.set_consolidate_fee_line(
                     format!(
-                        "fee {} sats · {} coins → 1 · {} vB @ {} sat/vB",
+                        "fee {} sats · combines {} coins · {} vB @ {} sat/vB",
                         tx.fee,
                         coins.len(),
                         tx.vsize,
@@ -2045,7 +2054,7 @@ pub fn run() {
                         store.record_tx("consolidate", txid.clone(), tx.tx.outputs[0].value, tx.fee, tx.vsize as u64, tx.raw_hex.clone(), "self".into(), inputs, dest_spk_hex, now());
                         s.save_store();
                         println!("cb: consolidate txid={txid} value={} fee={}", tx.tx.outputs[0].value, tx.fee);
-                        w.set_status(format!("consolidating → {}…", &txid[..12.min(txid.len())]).into());
+                        w.set_status(format!("consolidating: {}…", &txid[..12.min(txid.len())]).into());
                         update_home(&w, &s);
                     }
                     Err(e) => w.set_status(format!("consolidate broadcast failed: {e}").into()),
@@ -2091,7 +2100,7 @@ pub fn run() {
                             "cb: sweep txid={txid} value={} fee={}",
                             tx.tx.outputs[0].value, tx.fee
                         );
-                        w.set_status(format!("swept {} sats → {}…", tx.tx.outputs[0].value, &dest[..14.min(dest.len())]).into());
+                        w.set_status(format!("swept {} sats to {}…", tx.tx.outputs[0].value, &dest[..14.min(dest.len())]).into());
                         update_home(&w, &s);
                     }
                     Err(e) => w.set_status(format!("sweep broadcast failed: {e}").into()),
@@ -3176,7 +3185,7 @@ fn preview_mock(w: &AppWindow) {
     w.set_fund_external(true);
     w.set_funding_ready(true);
     w.set_funding_summary("taproot · bcrt1p2caq…6hrewe · 2 coins · 220,000 sats".into());
-    w.set_change_amount("Change → funding wallet".into());
+    w.set_change_amount("Change to funding wallet".into());
     w.set_funding_descriptor("tr([a1b2c3d4/86h/1h/0h]tpub…/<0;1>/*)".into());
     w.set_funding_feedback(
         "Taproot wallet · fingerprint a1b2c3d4 · first address\nbcrt1p2caqg0ht8m7dykfrx2lnrcc85kxs09m3vgur9fl6emljxktnu7es6hrewe"
