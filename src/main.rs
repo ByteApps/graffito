@@ -1355,6 +1355,16 @@ fn main() {
         }
     }
 
+    // Reflect the stored key's iCloud-sync state, and whether a synced backup
+    // exists to offer a restore in onboarding.
+    {
+        let mut s = st.borrow_mut();
+        let synced = keychain::is_synced(KEYCHAIN_ACCOUNT);
+        s.icloud_backup = synced;
+        window.set_icloud_backup(synced);
+        window.set_icloud_available(synced);
+    }
+
     macro_rules! cb {
         ($name:ident, |$w:ident, $s:ident $(, $arg:ident : $ty:ty)*| $body:block) => {{
             let st = st.clone();
@@ -1445,6 +1455,28 @@ fn main() {
                     w.set_icloud_backup(!enabled);
                 }
             }
+        }
+    });
+
+    // Restore from an existing iCloud-synced key (onboarding, after reinstall
+    // or on a new device).
+    cb!(on_restore_icloud, |w, s| {
+        match keychain::load_secret_protected(KEYCHAIN_ACCOUNT, "restore your Chain Notes identity") {
+            Ok(Some(material)) => {
+                s.icloud_backup = true;
+                match activate(&mut s, &material, false) {
+                    Ok(()) => {
+                        println!("cb: restore-icloud ok");
+                        w.set_icloud_backup(true);
+                        w.set_screen(4);
+                        update_home(&w, &s);
+                        refresh(&w, &mut s);
+                    }
+                    Err(e) => w.set_status(format!("restore: {e}").into()),
+                }
+            }
+            Ok(None) => w.set_status("no iCloud backup found".into()),
+            Err(e) => w.set_status(format!("restore: {e}").into()),
         }
     });
 

@@ -646,6 +646,12 @@ export component AppWindow inherits Window {
             subtitle: "Same, with a longer phrase.";
             clicked => { root.door-create(24); }
         }
+        if root.icloud-available: DoorCard {
+            highlight: true;
+            title: "Restore from iCloud";
+            subtitle: "A key you backed up to iCloud Keychain is available — restore it on this device.";
+            clicked => { root.restore-icloud(); }
+        }
         Rectangle { height: 6px; }
         Caption {
             text: "⚠  This app holds a hot key on an online computer. Fund it with note-fee money only.";
@@ -685,6 +691,11 @@ export component AppWindow inherits Window {
             spacing: 10px;
             GhostButton { text: "Scan QR"; clicked => { root.import-scan(); } }
             GhostButton { text: "From file…"; clicked => { root.import-file(); } }
+        }
+        Switch {
+            text: "Back up to iCloud";
+            checked <=> root.icloud-backup;
+            toggled => { root.set-icloud-backup(root.icloud-backup); }
         }
         PrimaryButton { text: "Import"; clicked => { root.import-confirm(root.import-text); } }
     }
