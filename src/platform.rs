@@ -52,3 +52,28 @@ pub fn safe_area_insets() -> (f32, f32) {
 pub fn safe_area_insets() -> (f32, f32) {
     (0.0, 0.0)
 }
+
+/// Read the system clipboard. Needed because Slint's iOS text fields don't
+/// surface the native paste menu — an in-app Paste button reads UIPasteboard.
+#[cfg(target_os = "ios")]
+pub fn clipboard_text() -> Option<String> {
+    use objc2_ui_kit::UIPasteboard;
+    let pb = unsafe { UIPasteboard::generalPasteboard() };
+    let s = unsafe { pb.string() }?;
+    Some(s.to_string())
+}
+
+#[cfg(target_os = "macos")]
+pub fn clipboard_text() -> Option<String> {
+    // The app already shells out to pbcopy for copy; pbpaste for read.
+    std::process::Command::new("pbpaste")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+pub fn clipboard_text() -> Option<String> {
+    None
+}
