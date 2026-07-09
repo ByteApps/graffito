@@ -113,8 +113,22 @@ automation); Reveal prompts fresh every time.
 **Icon rule:** femtovg (the default renderer) has no font fallback —
 non-Latin glyphs (✎ ✕ ▦ ＋ emoji) render as tofu. Icons are SVG assets
 in `ui/icons/` via `@image-url` + `colorize` (resvg ships in slint's
-default features); only universally-safe chars ("×", "‹", "Aa") may be
-typed as text.
+default features); only universally-safe chars ("×", "Aa") may be typed
+as text ("‹" and "₿" both burned us — now `chevron-left.svg` /
+`bitcoin.svg`). Android's Roboto is the strictest renderer; check new
+glyphs there first.
+
+**Header back-chevron alignment** is per-platform: the title `Text`
+sits high in its row (fonts reserve descent space), and the offset
+differs per font/renderer. The `Metrics` global in `app.slint` carries
+`back-dy` — Apple `-1.25px` (default), Android `+1.5px` (set from Rust
+in `run()`). Values were calibrated by measuring rendered ink centers
+from screenshots; don't eyeball them. Related Android gotcha: without
+`theme = "@android:style/Theme.DeviceDefault.NoActionBar"` in the
+cargo-apk manifest, the NativeActivity content rect includes a phantom
+56dp ActionBar and `safe_area_insets` over-pads the top of every screen
+(boot logs `cb: safe-area top=… bottom=… scale=…` for a quick check —
+the Pixel 6 emulator's true status bar is ~48.8dp).
 
 ## Invariants
 

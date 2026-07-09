@@ -93,6 +93,11 @@ target_sdk_version = 34
 
 [package.metadata.android.application]
 label = "Chain Notes"
+# NoActionBar: the device-default theme carries a 56dp ActionBar the GL
+# surface never draws, but it still inflates the NativeActivity content rect —
+# safe_area_insets read ~105dp of top inset instead of the ~49dp status bar,
+# pushing every screen's header way down (found on the Pixel 6 emulator).
+theme = "@android:style/Theme.DeviceDefault.NoActionBar"
 
 # Dev/emulator release signing uses the standard Android debug keystore
 # (a real Play release would swap in a private upload key).
