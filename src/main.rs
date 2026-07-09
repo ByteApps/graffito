@@ -350,6 +350,20 @@ fn normalize_addr(raw: &str) -> String {
     s
 }
 
+/// Group digits with thousands separators: 143473 → "143,473".
+fn commas(n: u64) -> String {
+    let s = n.to_string();
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in b.iter().enumerate() {
+        if i > 0 && (b.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*c as char);
+    }
+    out
+}
+
 fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), String> {
     let material =
         parse_key_material(material_str, st.network).map_err(|e| e.to_string())?;
@@ -427,7 +441,8 @@ fn update_home(w: &AppWindow, st: &State) {
         w.set_address_qr(img);
     }
     w.set_balance_line(
-        format!("{} sats · height {}", store.balance(), store.tip_height).into(),
+        format!("{} sats · block {}", commas(store.balance()), commas(store.tip_height as u64))
+            .into(),
     );
     let address = ident.address.clone();
     let net = st.network;
@@ -1655,6 +1670,18 @@ fn main() {
                 });
             }
             None => w.set_import_feedback("clipboard empty".into()),
+        }
+    });
+
+    // Paste into the compose note (appends clipboard to the current text).
+    cb!(on_paste_compose, |w, s| {
+        let _ = &mut s;
+        if let Some(text) = platform::clipboard_text() {
+            let combined = format!("{}{}", w.get_compose_text(), text);
+            let _ = w.as_weak().upgrade_in_event_loop(move |w| {
+                w.set_compose_text(combined.clone().into());
+                w.invoke_compose_changed();
+            });
         }
     });
 

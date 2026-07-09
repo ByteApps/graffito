@@ -567,6 +567,7 @@ export component AppWindow inherits Window {
     callback confirm-remove(string, string);
     callback cancel-remove();
     callback compose-changed();
+    callback paste-compose();
     callback compose-send();
     callback change-scan();
     callback toggle-coin(string);
@@ -990,6 +991,10 @@ export component AppWindow inherits Window {
             title: "Compose";
             back => { root.screen = 7; }
         }
+        Flickable {
+            viewport-height: compose-col.preferred-height;
+            compose-col := VerticalLayout {
+                spacing: 12px;
         Rectangle {
             border-radius: 10px;
             background: Pal.card;
@@ -1007,7 +1012,14 @@ export component AppWindow inherits Window {
                 overflow: elide;
             }
         }
-        TextEdit {
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: "Note"; font-size: 12px; color: Pal.muted; vertical-alignment: center; }
+            Rectangle { }
+            GhostButton { text: "Paste"; clicked => { root.paste-compose(); } }
+            GhostButton { text: "Done"; clicked => { note-edit.clear-focus(); } }
+        }
+        note-edit := TextEdit {
             height: 150px;
             text <=> root.compose-text;
             edited => { root.compose-changed(); }
@@ -1291,6 +1303,8 @@ export component AppWindow inherits Window {
             }
         }
         Caption { text: root.status; color: Pal.bad; }
+            }
+        }
     }
 
     // ---------- 7 · contacts ----------
