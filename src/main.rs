@@ -2803,6 +2803,9 @@ fn main() {
         s.material = None;
         s.account = 0;
         s.to_address = None;
+        s.icloud_backup = false;
+        w.set_icloud_backup(false);
+        w.set_icloud_available(false);
         w.set_show_reset_confirm(false);
         w.set_reveal_text("".into());
         w.set_status("".into());
