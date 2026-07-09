@@ -183,9 +183,12 @@ fn read_synced(account: &str) -> Result<Option<String>, String> {
 }
 
 pub fn load_secret_protected(account: &str, prompt: &str) -> Result<Option<String>, String> {
-    // iCloud-synced item carries no biometric ACL — gate the read in-app.
+    // iCloud-synced item has no biometric ACL — read it silently (it's
+    // protected by the device passcode / accessible-when-unlocked). Boot MUST
+    // NOT block on a Face ID prompt here: doing so on the main thread at launch
+    // blanks the UI and trips the iOS watchdog. The Reveal-backup action gates
+    // Face ID separately via `reveal_secret`.
     if is_synced(account) {
-        user_presence_check(prompt)?;
         return read_synced(account);
     }
     let mut pairs = base_query(account);
@@ -219,6 +222,18 @@ pub fn load_secret_protected(account: &str, prompt: &str) -> Result<Option<Strin
         ERR_CANCELED => Err("cancelled".into()),
         other => Err(format!("SecItemCopyMatching failed ({other})")),
     }
+}
+
+/// Read the key for the Reveal-backup action — ALWAYS gated on user presence.
+/// For the local ACL item the OS prompts; for the synced item (no ACL) we gate
+/// with LAContext here. Unlike boot, this is invoked from a user action while
+/// the UI is up, so a blocking Face ID prompt is fine.
+pub fn reveal_secret(account: &str, prompt: &str) -> Result<Option<String>, String> {
+    if is_synced(account) {
+        user_presence_check(prompt)?;
+        return read_synced(account);
+    }
+    load_secret_protected(account, prompt)
 }
 
 pub fn delete_secret(account: &str) -> Result<(), String> {
