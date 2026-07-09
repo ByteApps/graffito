@@ -163,6 +163,11 @@ impl UrDecoder {
     pub fn is_complete(&self) -> bool {
         self.inner.is_complete()
     }
+
+    /// Fraction reassembled so far, for a progress indicator (0.0..=1.0).
+    pub fn progress(&self) -> f32 {
+        self.inner.estimated_percent_complete() as f32 / 100.0
+    }
 }
 
 #[cfg(test)]

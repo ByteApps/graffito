@@ -467,6 +467,12 @@ export component AppWindow inherits Window {
     in property <[FundingWalletRow]> funding-wallets;   // saved wallet manager
     in-out property <string> fund-rename-id;            // non-empty = rename modal open
     in-out property <string> fund-rename-input;
+    // shared camera-scan overlay (every "Scan QR" path uses it)
+    in-out property <bool> scanning;
+    in-out property <image> camera-frame;
+    in-out property <float> scan-progress;   // 0..1 multi-frame reassembly
+    in property <string> scan-hint: "Point the QR code at the camera";
+    callback cancel-scan();
     in property <[ContactItem]> contacts;
     in-out property <string> contact-input;
     in-out property <string> rename-address;
@@ -1928,6 +1934,85 @@ export component AppWindow inherits Window {
             clicked => { root.add-funding-wallet(); }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
+    }
+
+    // ---------- shared camera-scan overlay (live preview) ----------
+    if root.scanning: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.86);
+        z: 200;
+        TouchArea { }
+        VerticalLayout {
+            alignment: center;
+            spacing: 16px;
+            padding: 24px;
+            HorizontalLayout {
+                alignment: center;
+                Text {
+                    text: root.scan-hint;
+                    color: Pal.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                    max-width: 340px;
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 300px;
+                    height: 300px;
+                    border-radius: 16px;
+                    clip: true;
+                    background: #0a0a0a;
+                    border-width: 2px;
+                    border-color: Pal.accent;
+                    Image {
+                        source: root.camera-frame;
+                        width: 100%;
+                        height: 100%;
+                        image-fit: cover;
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 300px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: Pal.line;
+                    Rectangle {
+                        x: 0;
+                        y: 0;
+                        height: 100%;
+                        width: parent.width * clamp(root.scan-progress, 0, 1);
+                        background: Pal.accent;
+                        border-radius: 3px;
+                        animate width { duration: 150ms; }
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                Caption {
+                    text: root.scan-progress > 0.001
+                        ? "Collecting frames · \{round(root.scan-progress * 100)}%"
+                        : "Hold your phone steady and fill the frame.";
+                    horizontal-alignment: center;
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                GhostButton {
+                    text: "Cancel";
+                    min-width: 220px;
+                    clicked => { root.cancel-scan(); }
+                }
+            }
+        }
     }
 
     // ---------- funding-wallet rename (modal overlay) ----------
