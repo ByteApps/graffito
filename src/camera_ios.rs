@@ -1,10 +1,13 @@
 //! iOS camera backend: AVCaptureSession + AVCaptureVideoDataOutput. An objc2
-//! delegate copies each frame's Y (luma) plane over a channel; `capture_frames`
+//! delegate keeps only the LATEST frame's Y (luma) plane; `capture_frames`
 //! drains it, pushing a downscaled RGBA preview and feeding decoded QR payloads
 //! to `feed` — matching the macOS (nokhwa) backend's API.
+//!
+//! Perf: the session is capped to 640x480 (plenty for QR, ~30 fps) and only the
+//! newest frame is kept (no backlog) — a full-res, queued pipeline crawls.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
@@ -13,20 +16,21 @@ use objc2::runtime::{Bool, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
 use objc2_av_foundation::{
     AVAuthorizationStatus, AVCaptureConnection, AVCaptureDevice, AVCaptureDeviceInput,
-    AVCaptureOutput, AVCaptureSession, AVCaptureVideoDataOutput,
+    AVCaptureOutput, AVCaptureSession, AVCaptureSessionPreset640x480, AVCaptureVideoDataOutput,
     AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaTypeVideo,
 };
 use objc2_core_media::CMSampleBufferGetImageBuffer;
 use objc2_core_video::{
     CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
     CVPixelBufferGetHeightOfPlane, CVPixelBufferGetWidthOfPlane, CVPixelBufferLockBaseAddress,
-    CVPixelBufferUnlockBaseAddress, CVPixelBufferLockFlags,
+    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
 
 type Frame = (Vec<u8>, u32, u32); // tightly-packed luma, width, height
+type Latest = Arc<Mutex<Option<Frame>>>;
 
 struct Ivars {
-    tx: Sender<Frame>,
+    latest: Latest,
 }
 
 define_class!(
@@ -60,13 +64,10 @@ define_class!(
                 let mut luma = vec![0u8; w * h];
                 let src = base as *const u8;
                 for y in 0..h {
-                    std::ptr::copy_nonoverlapping(
-                        src.add(y * stride),
-                        luma.as_mut_ptr().add(y * w),
-                        w,
-                    );
+                    std::ptr::copy_nonoverlapping(src.add(y * stride), luma.as_mut_ptr().add(y * w), w);
                 }
-                let _ = self.ivars().tx.send((luma, w as u32, h as u32));
+                // Keep only the newest frame — drop any un-consumed one.
+                *self.ivars().latest.lock().unwrap() = Some((luma, w as u32, h as u32));
             }
             CVPixelBufferUnlockBaseAddress(&pb, flags);
         }
@@ -74,8 +75,8 @@ define_class!(
 );
 
 impl Delegate {
-    fn new(tx: Sender<Frame>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(Ivars { tx });
+    fn new(latest: Latest) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(Ivars { latest });
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -92,9 +93,7 @@ fn ensure_authorized() -> bool {
             let block = RcBlock::new(move |granted: Bool| {
                 let _ = tx.send(granted.as_bool());
             });
-            unsafe {
-                AVCaptureDevice::requestAccessForMediaType_completionHandler(media, &block);
-            }
+            unsafe { AVCaptureDevice::requestAccessForMediaType_completionHandler(media, &block) };
             rx.recv_timeout(Duration::from_secs(60)).unwrap_or(false)
         }
     }
@@ -119,7 +118,7 @@ fn gray_to_rgba_scaled(raw: &[u8], w: usize, h: usize, maxdim: usize) -> (Vec<u8
     (out, ow as u32, oh as u32)
 }
 
-fn build_session(tx: Sender<Frame>) -> Result<(Retained<AVCaptureSession>, Retained<Delegate>), String> {
+fn build_session(latest: Latest) -> Result<(Retained<AVCaptureSession>, Retained<Delegate>), String> {
     unsafe {
         let media = AVMediaTypeVideo.expect("AVMediaTypeVideo");
         let device = AVCaptureDevice::defaultDeviceWithMediaType(media)
@@ -127,6 +126,11 @@ fn build_session(tx: Sender<Frame>) -> Result<(Retained<AVCaptureSession>, Retai
         let input = AVCaptureDeviceInput::deviceInputWithDevice_error(&device)
             .map_err(|e| format!("camera input: {e}"))?;
         let session = AVCaptureSession::new();
+        // Cap resolution — 640x480 decodes QRs fine and stays smooth.
+        let preset = AVCaptureSessionPreset640x480;
+        if session.canSetSessionPreset(preset) {
+            session.setSessionPreset(preset);
+        }
         if session.canAddInput(&input) {
             session.addInput(&input);
         } else {
@@ -134,12 +138,9 @@ fn build_session(tx: Sender<Frame>) -> Result<(Retained<AVCaptureSession>, Retai
         }
         let output = AVCaptureVideoDataOutput::new();
         output.setAlwaysDiscardsLateVideoFrames(true);
-        let delegate = Delegate::new(tx);
+        let delegate = Delegate::new(latest);
         let queue = dispatch2::DispatchQueue::new("cn.camera", None);
-        output.setSampleBufferDelegate_queue(
-            Some(ProtocolObject::from_ref(&*delegate)),
-            Some(&queue),
-        );
+        output.setSampleBufferDelegate_queue(Some(ProtocolObject::from_ref(&*delegate)), Some(&queue));
         if session.canAddOutput(&output) {
             session.addOutput(&output);
         } else {
@@ -159,17 +160,16 @@ pub fn capture_frames(
     if !ensure_authorized() {
         return Err("camera permission denied".into());
     }
-    let (tx, rx): (Sender<Frame>, Receiver<Frame>) = std::sync::mpsc::channel();
-    let (session, _delegate) = build_session(tx)?;
+    let latest: Latest = Arc::new(Mutex::new(None));
+    let (session, _delegate) = build_session(latest.clone())?;
 
     let start = Instant::now();
     let mut done = false;
     let mut frames = 0u64;
     while start.elapsed().as_secs() < seconds && !cancel.load(Ordering::Relaxed) {
-        let (raw, w, h) = match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(f) => f,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(_) => break,
+        let Some((raw, w, h)) = latest.lock().unwrap().take() else {
+            std::thread::sleep(Duration::from_millis(12));
+            continue;
         };
         let (wz, hz) = (w as usize, h as usize);
         frames += 1;

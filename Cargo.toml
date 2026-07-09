@@ -57,8 +57,8 @@ objc2-ui-kit = { version = "0.3", features = ["UIApplication", "UIWindow", "UIVi
 objc2-core-foundation = "0.3"
 # Camera capture: AVCaptureSession + video-data-output → CVPixelBuffer luma → rqrr.
 objc2-av-foundation = { version = "0.3", features = [
-    "AVCaptureSession", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutput",
-    "AVCaptureVideoDataOutput", "AVMediaFormat", "dispatch2",
+    "AVCaptureSession", "AVCaptureSessionPreset", "AVCaptureDevice", "AVCaptureInput",
+    "AVCaptureOutput", "AVCaptureVideoDataOutput", "AVMediaFormat", "dispatch2",
 ] }
 objc2-core-media = { version = "0.3", features = ["CMSampleBuffer", "CMFormatDescription", "CMTime"] }
 objc2-core-video = { version = "0.3", features = ["CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVReturn", "CVBase"] }
