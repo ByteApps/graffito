@@ -192,13 +192,20 @@ fn main() {
         }
         // ---- external funding (PSBT) — simulates a hardware/software signer ----
         Some("fund-keygen") => {
-            // fund-keygen <network> <seed-hex> → "<watch-descriptor>\t<xprv>\t<addr0/0>"
+            // fund-keygen <network> <seed-hex> [tr|wpkh]
+            //   → "<watch-descriptor>\t<xprv>\t<addr0/0>"
+            // Default tr (P2TR); wpkh emits a P2WPKH (segwit v0) funding source.
             let net = network(&args[2]);
             let seed = hex::decode(&args[3]).expect("seed hex");
+            let kind = args.get(4).map(String::as_str).unwrap_or("tr");
             let master = Xpriv::new_master(app_core::derive::btc_network(net), &seed).expect("master");
             let secp = Secp256k1::new();
             let xpub = Xpub::from_priv(&secp, &master);
-            let desc = format!("tr({xpub}/<0;1>/*)");
+            let desc = match kind {
+                "tr" => format!("tr({xpub}/<0;1>/*)"),
+                "wpkh" => format!("wpkh({xpub}/<0;1>/*)"),
+                o => panic!("descriptor kind must be tr|wpkh, got {o}"),
+            };
             let src = FundingSource::parse(&desc, net).expect("descriptor");
             let addr0 = src.derive(0, 0).expect("derive").address;
             println!("{desc}\t{master}\t{addr0}");
@@ -460,7 +467,7 @@ fn main() {
                 "usage: cli address <net> | init <store> <net> | scan <store> <base> | \
                  notes <store> | compose <store> <base> <public|private> <rate> <text> [to] | \
                  bundle <addr> <net> <base> <out> | \
-                 fund-keygen <net> <seed-hex> | \
+                 fund-keygen <net> <seed-hex> [tr|wpkh] | \
                  fund-build <base> <net> <desc> <public|private> <rate> <text> [to] | \
                  fund-sign <psbt> <xprv> | fund-finalize <base> <net> <psbt>   \
                  (identity from APP_KEY)"
