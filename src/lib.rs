@@ -1259,6 +1259,9 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
 fn apply_safe_area(win: &AppWindow) {
     let scale = win.window().scale_factor();
     let (top, bottom) = platform::safe_area_insets(scale);
+    if (win.get_safe_top() - top).abs() > 0.5 || (win.get_safe_bottom() - bottom).abs() > 0.5 {
+        println!("cb: safe-area top={top:.1} bottom={bottom:.1} scale={scale:.2}");
+    }
     win.set_safe_top(top);
     win.set_safe_bottom(bottom);
     // Reveal the UI once the inset is known — immediately on desktop (no
@@ -1373,6 +1376,11 @@ pub fn run() {
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
     window.set_apple_platform(cfg!(target_vendor = "apple"));
+    // Back-chevron optical nudge: Roboto's line box differs from the Apple
+    // system font's, so Android gets its own calibrated value (see the
+    // Metrics global in app.slint; Apple platforms keep the -1.25px default).
+    #[cfg(target_os = "android")]
+    window.global::<Metrics>().set_back_dy(1.5);
 
     // Boot identity: APP_KEY env (dev/tests) or the keychain.
     {
@@ -1957,6 +1965,48 @@ pub fn run() {
         }
         println!("cb: act-explorer");
         let _ = std::process::Command::new("open").arg(url.as_str()).spawn();
+    });
+
+    // Fee preview for the consolidate dialog: dry-run the SAME builder the
+    // Consolidate button broadcasts. Key-spend signatures are constant-size,
+    // so the previewed fee/vsize match the broadcast tx exactly.
+    cb!(on_consolidate_preview, |w, s| {
+        let _ = &mut s;
+        w.set_consolidate_fee_line("".into());
+        let rate: f64 = w.get_consolidate_rate().trim().parse().unwrap_or(1.0);
+        let net = s.network;
+        let Some(ident) = s.ident.as_ref() else { return };
+        let Ok(me) = Recipient::parse(net, &ident.address) else { return };
+        let identity = ident.identity.clone_fields();
+        let Some(store) = s.store.as_ref() else { return };
+        let coins = store.available_utxos();
+        if coins.len() < 2 {
+            w.set_consolidate_fee_line("nothing to consolidate — need 2+ spendable coins".into());
+            return;
+        }
+        match app_core::notes_core::tx::build_sweep_tx(
+            &coins,
+            &identity.output_x,
+            me.spk,
+            rate,
+            &identity.tweaked_seckey,
+            app_core::notes_core::keys::generate_aux_rand,
+        ) {
+            Ok(tx) => {
+                println!("cb: consolidate-preview coins={} fee={} vsize={}", coins.len(), tx.fee, tx.vsize);
+                w.set_consolidate_fee_line(
+                    format!(
+                        "fee {} sats · {} coins → 1 · {} vB @ {} sat/vB",
+                        tx.fee,
+                        coins.len(),
+                        tx.vsize,
+                        rate
+                    )
+                    .into(),
+                );
+            }
+            Err(e) => w.set_consolidate_fee_line(format!("estimate failed: {e}").into()),
+        }
     });
 
     cb!(on_consolidate, |w, s| {
