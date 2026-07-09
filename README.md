@@ -15,8 +15,9 @@ from the chain plus your key alone.
   ask for Touch ID.
 - **Compose**: public or private notes, directed notes to other taproot
   addresses, live cost/change preview, fee-tier picker, coin control
-  (pick exactly which UTXOs to spend, incl. unconfirmed), and an
-  optional custom change address.
+  (pick exactly which UTXOs to spend, incl. unconfirmed), an optional
+  custom change address, and a **gift amount** for directed notes
+  (choose how many sats reach the recipient; default/minimum is dust).
 - **Manage**: an Activity screen listing every transaction with retry
   (rebroadcast) and RBF fee-bump for stuck ones; a Coins screen to view
   and consolidate UTXOs; sweep-all; per-coin/-note links to the tx in
