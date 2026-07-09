@@ -706,7 +706,7 @@ export component AppWindow inherits Window {
             }
         }
         Card {
-            height: words-t.preferred-height + 32px;
+            height: words-t.preferred-height + 52px;
             words-t := Mono {
                 x: 16px;
                 y: 16px;
@@ -714,11 +714,11 @@ export component AppWindow inherits Window {
                 text: root.backup-words;
                 font-size: 13px;
             }
-        }
-        HorizontalLayout {
-            height: 26px;
-            Rectangle { }
-            CopyButton { clicked => { root.copy-text("backup-words", root.backup-words); } }
+            CopyButton {
+                x: parent.width - self.width - 8px;
+                y: parent.height - self.height - 8px;
+                clicked => { root.copy-text("backup-words", root.backup-words); }
+            }
         }
         PrimaryButton { text: "I wrote them down"; clicked => { root.backup-continue(); } }
     }
