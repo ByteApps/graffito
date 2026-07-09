@@ -56,11 +56,43 @@ fn main() {
             let net = network(&args[2]);
             println!("{}", identity(net).address);
         }
+        Some("xpub") => {
+            // xpub <network> — the account-level xpub for hierarchical
+            // APP_KEY material (APP_ACCOUNT selects the account): the
+            // string a watch-only import takes.
+            let net = network(&args[2]);
+            let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | xprv");
+            let account: u32 =
+                std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
+            let material = parse_key_material(&key, net).expect("APP_KEY parse");
+            let secp = Secp256k1::new();
+            let master = match material {
+                app_core::identity::KeyMaterial::Mnemonic(m) => {
+                    Xpriv::new_master(app_core::derive::btc_network(net), &m.to_seed(""))
+                        .expect("master xprv")
+                }
+                app_core::identity::KeyMaterial::Xprv(x) if x.depth == 0 => x,
+                app_core::identity::KeyMaterial::Xprv(x) => {
+                    // Already account-level: just neuter it.
+                    println!("{}", Xpub::from_priv(&secp, &x));
+                    return;
+                }
+                _ => panic!("xpub needs hierarchical material (mnemonic or xprv)"),
+            };
+            let path = [
+                bitcoin::bip32::ChildNumber::from_hardened_idx(86).unwrap(),
+                bitcoin::bip32::ChildNumber::from_hardened_idx(app_core::derive::coin_type(net))
+                    .unwrap(),
+                bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
+            ];
+            let acct = master.derive_priv(&secp, &path).expect("derive account");
+            println!("{}", Xpub::from_priv(&secp, &acct));
+        }
         Some("init") => {
             // init <store.json> <network>
             let net = network(&args[3]);
             let ident = identity(net);
-            let store = Store::new(&ident.identity, net);
+            let store = Store::new(&ident.output_x(), net);
             save(&store, &args[2]);
             println!(
                 "cli: init kind={} network={} address={}",
@@ -76,7 +108,7 @@ fn main() {
             let ident = identity(net);
             let client = ChainClient::new(HttpTransport::new(&args[3]), net);
             let bundle = client.build_bundle(&store.address, None).expect("build bundle");
-            let stats = store.apply_bundle(&bundle, &ident.identity, net).expect("apply");
+            let stats = store.apply_bundle(&bundle, ident.expect_full(), net).expect("apply");
             save(&store, &args[2]);
             println!(
                 "cli: scan notes={} new={} orphaned={} balance={} tip={}",
@@ -118,7 +150,7 @@ fn main() {
             let to = args.get(7).map(String::as_str);
             let composed = compose_and_record(
                 &mut store,
-                &ident.identity,
+                ident.expect_full(),
                 net,
                 &ComposeRequest {
                     text: &args[6],
@@ -158,10 +190,10 @@ fn main() {
             let rate: f64 = args[5].parse().expect("fee rate");
             let sweep = app_core::notes_core::tx::build_sweep_tx(
                 &store.available_utxos(),
-                &ident.identity.output_x,
+                &ident.expect_full().output_x,
                 dest.spk,
                 rate,
-                &ident.identity.tweaked_seckey,
+                &ident.expect_full().tweaked_seckey,
                 app_core::notes_core::keys::generate_aux_rand,
             )
             .expect("sweep build");
@@ -243,7 +275,7 @@ fn main() {
                 change_override: None,
             };
             let np = NoteParams {
-                identity: &ident.identity,
+                identity: ident.expect_full(),
                 text: &text,
                 private,
                 recipient: recipient.as_ref(),
@@ -300,7 +332,7 @@ fn main() {
                 change_override: None,
             };
             let np = NoteParams {
-                identity: &ident.identity,
+                identity: ident.expect_full(),
                 text: &text,
                 private,
                 recipient: recipient.as_ref(),
