@@ -89,10 +89,21 @@ build_targets = ["aarch64-linux-android"]
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
-target_sdk_version = 35
+target_sdk_version = 34
 
 [package.metadata.android.application]
 label = "Chain Notes"
+
+# Dev/emulator release signing uses the standard Android debug keystore
+# (a real Play release would swap in a private upload key).
+[package.metadata.android.signing.release]
+path = "/Users/sal/.android/debug.keystore"
+keystore_password = "android"
+
+# Chain sync + broadcast (esplora/mempool.space over HTTPS). cargo-apk
+# does NOT add INTERNET automatically for NativeActivity apps.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
 
 # QR scan (camera) — also requested at runtime via BiometricPrompt-free
 # NDK Camera2; the manifest permission is the install-time half.
@@ -110,3 +121,8 @@ slint-build = "=1.16.1"
 # NOT remove the need for this — verified 2026-07-06.
 [profile.dev.package.harfrust]
 overflow-checks = false
+
+# Android/iOS release .so ships stripped — the debug cdylib is ~370 MB
+# (skia + full debug info) and blows past the emulator's internal storage.
+[profile.release]
+strip = true
