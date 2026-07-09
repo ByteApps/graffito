@@ -120,6 +120,33 @@ pub fn generate_mnemonic(word_count: usize) -> Result<bip39::Mnemonic, Error> {
         .map_err(|e| Error::Mnemonic(e.to_string()))
 }
 
+/// Like [`generate_mnemonic`], but folds optional user-provided `salt` (dice
+/// rolls, extra words…) into the entropy: `entropy = SHA256(csprng ‖ salt)`.
+/// Hashing the FULL device-CSPRNG output with the salt means the salt can only
+/// ADD randomness — it can never reduce the entropy below what the OS CSPRNG
+/// already provides (belt-and-suspenders against a compromised RNG). Empty salt
+/// falls back to the plain CSPRNG path.
+pub fn generate_mnemonic_with_salt(word_count: usize, salt: &str) -> Result<bip39::Mnemonic, Error> {
+    let entropy_len = match word_count {
+        12 => 16,
+        24 => 32,
+        n => return Err(Error::MnemonicWordCount(n)),
+    };
+    if salt.trim().is_empty() {
+        return generate_mnemonic(word_count);
+    }
+    use sha2::{Digest, Sha256};
+    let mut csprng = Zeroizing::new([0u8; 32]);
+    getrandom::getrandom(&mut csprng[..]).map_err(|_| Error::Entropy)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&csprng[..]);
+    hasher.update(salt.as_bytes());
+    let mut entropy = Zeroizing::new([0u8; 32]);
+    entropy.copy_from_slice(&hasher.finalize());
+    bip39::Mnemonic::from_entropy_in(bip39::Language::English, &entropy[..entropy_len])
+        .map_err(|e| Error::Mnemonic(e.to_string()))
+}
+
 /// Material → leaf secret → Identity + address on `network`.
 /// `account` = BIP-86 account index for mnemonic / master-xprv imports
 /// (each account is a fully separate identity: its own address AND its

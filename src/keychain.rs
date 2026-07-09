@@ -28,6 +28,9 @@ use security_framework_sys::item::{
 extern "C" {
     static kSecUseOperationPrompt: core_foundation_sys::string::CFStringRef;
     static kSecUseDataProtectionKeychain: core_foundation_sys::string::CFStringRef;
+    // iCloud Keychain sync: the attribute key + the "match either" query value.
+    static kSecAttrSynchronizable: core_foundation_sys::string::CFStringRef;
+    static kSecAttrSynchronizableAny: core_foundation_sys::string::CFStringRef;
 }
 use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete};
 
@@ -85,8 +88,31 @@ fn la_account(account: &str) -> String {
     format!("{account}#la")
 }
 
-pub fn store_secret_protected(account: &str, secret: &str) -> Result<(), String> {
-    delete_secret(account)?; // also migrates away any pre-ACL item
+pub fn store_secret_protected(account: &str, secret: &str, synced: bool) -> Result<(), String> {
+    delete_secret(account)?; // also migrates away any pre-ACL / previously-synced item
+    if synced {
+        // iCloud Keychain: a synchronizable item. It can't also carry a
+        // biometric ACL (that is inherently device-local), so the reveal is
+        // gated in-app via LAContext instead — see load_secret_protected.
+        let mut pairs = base_query(account);
+        pairs.push((
+            key(unsafe { kSecValueData }),
+            CFData::from_buffer(secret.as_bytes()).as_CFType(),
+        ));
+        pairs.push((
+            key(unsafe { kSecAttrSynchronizable }),
+            CFBoolean::true_value().as_CFType(),
+        ));
+        let dict = CFDictionary::from_CFType_pairs(&pairs);
+        let status = unsafe { SecItemAdd(dict.as_concrete_TypeRef(), std::ptr::null_mut()) };
+        return match status {
+            0 => {
+                println!("cb: keychain stored synced=1");
+                Ok(())
+            }
+            other => Err(format!("SecItemAdd(sync) failed ({other})")),
+        };
+    }
     let acl = SecAccessControl::create_with_protection(
         Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
         kSecAccessControlUserPresence,
@@ -117,7 +143,51 @@ pub fn store_secret_protected(account: &str, secret: &str) -> Result<(), String>
 /// Read the protected item — the OS shows a Touch ID / password prompt
 /// with `prompt` as the reason. Ok(None) = no item; Err carries
 /// "cancelled" when the user dismissed the prompt.
+/// Does an iCloud-synced item exist for this account?
+pub fn is_synced(account: &str) -> bool {
+    let mut pairs = base_query(account);
+    pairs.push((
+        key(unsafe { kSecAttrSynchronizable }),
+        CFBoolean::true_value().as_CFType(),
+    ));
+    pairs.push((key(unsafe { kSecReturnData }), CFBoolean::true_value().as_CFType()));
+    let dict = CFDictionary::from_CFType_pairs(&pairs);
+    let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
+    let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
+    if status == 0 && !result.is_null() {
+        // Release the returned data we don't use.
+        unsafe { CFData::wrap_under_create_rule(result as _) };
+    }
+    status == 0
+}
+
+/// Read the synced item (no biometric ACL — caller gates auth if needed).
+fn read_synced(account: &str) -> Result<Option<String>, String> {
+    let mut pairs = base_query(account);
+    pairs.push((
+        key(unsafe { kSecAttrSynchronizable }),
+        CFBoolean::true_value().as_CFType(),
+    ));
+    pairs.push((key(unsafe { kSecReturnData }), CFBoolean::true_value().as_CFType()));
+    let dict = CFDictionary::from_CFType_pairs(&pairs);
+    let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
+    let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
+    match status {
+        0 => {
+            let data = unsafe { CFData::wrap_under_create_rule(result as _) };
+            String::from_utf8(data.bytes().to_vec()).map(Some).map_err(|e| e.to_string())
+        }
+        ERR_NOT_FOUND => Ok(None),
+        other => Err(format!("SecItemCopyMatching(sync) failed ({other})")),
+    }
+}
+
 pub fn load_secret_protected(account: &str, prompt: &str) -> Result<Option<String>, String> {
+    // iCloud-synced item carries no biometric ACL — gate the read in-app.
+    if is_synced(account) {
+        user_presence_check(prompt)?;
+        return read_synced(account);
+    }
     let mut pairs = base_query(account);
     pairs.push((key(unsafe { kSecReturnData }), CFBoolean::true_value().as_CFType()));
     pairs.push((
@@ -152,7 +222,13 @@ pub fn load_secret_protected(account: &str, prompt: &str) -> Result<Option<Strin
 }
 
 pub fn delete_secret(account: &str) -> Result<(), String> {
-    let dict = CFDictionary::from_CFType_pairs(&base_query(account));
+    // synchronizable=Any removes both the local (ACL) item and any synced one.
+    let mut pairs = base_query(account);
+    pairs.push((
+        key(unsafe { kSecAttrSynchronizable }),
+        key(unsafe { kSecAttrSynchronizableAny }).as_CFType(),
+    ));
+    let dict = CFDictionary::from_CFType_pairs(&pairs);
     let status = unsafe { SecItemDelete(dict.as_concrete_TypeRef()) };
     if status != 0 && status != ERR_NOT_FOUND {
         return Err(format!("SecItemDelete failed ({status})"));
@@ -183,7 +259,7 @@ pub fn spike() -> Result<(), String> {
 /// Touch ID / password. Run by a human.
 pub fn spike_auth() -> Result<(), String> {
     let account = "spike-auth-test";
-    store_secret_protected(account, "protected test secret")?;
+    store_secret_protected(account, "protected test secret", false)?;
     println!("cb: spike-keychain-auth stored (expect a Touch ID prompt now)");
     let loaded = load_secret_protected(account, "chain-notes-app keychain spike")?;
     delete_secret(account)?;
