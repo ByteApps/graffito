@@ -110,6 +110,10 @@ name = "android.permission.INTERNET"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.CAMERA"
 
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.camera.any"
+required = false
+
 [build-dependencies]
 slint-build = "=1.16.1"
 
