@@ -6,8 +6,8 @@
 use notes_core::address::Recipient;
 use notes_core::address::address_to_script_pubkey;
 use notes_core::bundle::{
-    compose_directed_note_exact, compose_directed_note_with_change, compose_note_exact,
-    compose_note_with_change, Identity,
+    compose_directed_note_exact_amount, compose_directed_note_with_change_amount,
+    compose_note_exact, compose_note_with_change, Identity,
 };
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::tx::NoteTx;
@@ -29,6 +29,9 @@ pub struct ComposeRequest<'a> {
     /// None = auto-select (largest-first).
     pub coins: Option<&'a [(String, u32)]>,
     pub fee_rate: f64,
+    /// Directed notes only: sats to send the recipient (the "gift"). None =
+    /// DUST_LIMIT (the minimum, and the default). Ignored for self-notes.
+    pub gift_amount: Option<u64>,
     /// Local wall-clock seconds for created_at (display only).
     pub now: u64,
 }
@@ -82,13 +85,14 @@ pub fn compose_and_record(
         None => None,
     };
 
+    let gift = req.gift_amount.unwrap_or(notes_core::DUST_LIMIT);
     let tx = match (&recipient, &selected) {
-        (Some(r), Some(ins)) => compose_directed_note_exact(
-            identity, ins, req.text, req.private, note_id, r, change_spk,
+        (Some(r), Some(ins)) => compose_directed_note_exact_amount(
+            identity, ins, req.text, req.private, note_id, r, gift, change_spk,
             store.chunk_size, req.fee_rate, generate_aux_rand,
         ),
-        (Some(r), None) => compose_directed_note_with_change(
-            identity, &utxos, req.text, req.private, note_id, r, change_spk,
+        (Some(r), None) => compose_directed_note_with_change_amount(
+            identity, &utxos, req.text, req.private, note_id, r, gift, change_spk,
             store.chunk_size, req.fee_rate, generate_aux_rand,
         ),
         (None, Some(ins)) => compose_note_exact(
@@ -140,6 +144,7 @@ pub fn compose_and_record(
         fee: Some(tx.fee),
         vsize: Some(tx.vsize as u64),
         change_to: req.change_to.map(str::to_string),
+        gift_amount: recipient.as_ref().map(|_| tx.sent),
     };
     store.record_signed(record, change_utxo);
 
@@ -169,6 +174,7 @@ pub fn bump_fee(
     let text = rec.text.clone().ok_or(Error::Store("no cached text".into()))?;
     let private = rec.private;
     let recipient_addr = rec.recipient.clone();
+    let gift = rec.gift_amount.unwrap_or(notes_core::DUST_LIMIT);
     let change_to = rec.change_to.clone();
     let old_txids = rec.txids.clone();
     let spent = rec.spent.clone();
@@ -203,8 +209,8 @@ pub fn bump_fee(
     };
     let change_spk = change_spk_vec.as_deref();
     let tx = match &recipient {
-        Some(r) => compose_directed_note_with_change(
-            identity, &utxos, &text, private, note_id, r, change_spk,
+        Some(r) => compose_directed_note_with_change_amount(
+            identity, &utxos, &text, private, note_id, r, gift, change_spk,
             store.chunk_size, new_rate, generate_aux_rand,
         ),
         None => compose_note_with_change(

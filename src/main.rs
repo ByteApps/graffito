@@ -41,6 +41,8 @@ use zeroize::Zeroizing;
 slint::include_modules!();
 
 const KEYCHAIN_ACCOUNT: &str = "identity-key";
+/// Minimum (and default) sats sent to a directed-note recipient.
+const DUST_SATS: u64 = app_core::notes_core::DUST_LIMIT;
 
 struct State {
     data_dir: PathBuf,
@@ -714,7 +716,9 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         .as_deref()
         .and_then(|a| Recipient::parse(net, a).ok())
         .map(|r| r.spk.len());
-    let sent = if spk_len.is_some() { 330u64 } else { 0 };
+    // Directed notes send a "gift" to the recipient (>= dust); self-notes send 0.
+    let gift = w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS);
+    let sent = if spk_len.is_some() { gift } else { 0 };
 
     // Change-address destination label + validation. A valid custom change
     // address also yields its scriptPubKey length so the fee/change preview
@@ -795,9 +799,13 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
                 .usd
                 .map(|p| format!(" (~${:.2})", fee as f64 * p / 1e8))
                 .unwrap_or_default();
-            let dust = if spk_len.is_some() { " + 330 sats to recipient" } else { "" };
+            let gift_line = if spk_len.is_some() {
+                format!(" + {} sats to recipient", commas(sent))
+            } else {
+                String::new()
+            };
             w.set_cost_line(
-                format!("{chunks} chunk(s) · ~{vsize} vB · ~{fee} sats{usd}{dust}").into(),
+                format!("{chunks} chunk(s) · ~{vsize} vB · ~{fee} sats{usd}{gift_line}").into(),
             );
             w.set_change_amount(format!("Change → {change_dest} · ~{change} sats").into());
             w.set_spend_enough(enough);
@@ -2033,6 +2041,7 @@ fn main() {
         if addr.as_str() == "self" {
             s.to_address = None;
             w.set_to_label("To: Self (my notebook)".into());
+            w.set_directed(false);
             println!("cb: pick-contact to=self");
         } else {
             let mut a = normalize_addr(addr.as_str());
@@ -2051,8 +2060,9 @@ fn main() {
                 store.touch_contact(&a);
             }
             s.save_store();
-            w.set_to_label(format!("To: {a} (+330 sat dust delivery)").into());
+            w.set_to_label(format!("To: {a}").into());
             s.to_address = Some(a);
+            w.set_directed(true);
         }
         let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
         w.set_fee_tier(1);
@@ -2063,6 +2073,8 @@ fn main() {
         s.coins_overridden = false;
         s.consolidate_coins = false;
         w.set_coin_strategy(0);
+        w.set_gift_sats(format!("{DUST_SATS}").into());
+        w.set_gift_expanded(false);
         s.selected_coins.clear();
         w.set_status("".into());
         w.set_screen(6);
@@ -2713,6 +2725,9 @@ fn main() {
                 change_to: (!change_addr.is_empty()).then_some(change_addr.as_str()),
                 coins: (!coins_vec.is_empty()).then_some(coins_vec.as_slice()),
                 fee_rate: rate,
+                gift_amount: to.as_ref().map(|_| {
+                    w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+                }),
                 now: now(),
             },
         );
@@ -3048,6 +3063,8 @@ fn main() {
 /// Populate every external-funding screen with representative mock data for
 /// the `CN_PREVIEW` design harness.
 fn preview_mock(w: &AppWindow) {
+    w.set_directed(true);
+    w.set_gift_sats("330".into());
     w.set_backup_words(
         " 1. legal      2. winner    3. thank\n 4. year       5. wave      6. sausage\n 7. worth      8. useful    9. dawn\n10. absorb    11. pledge   12. yellow\n"
             .into(),
