@@ -1013,11 +1013,23 @@ export component AppWindow inherits Window {
             }
         }
         HorizontalLayout {
-            spacing: 8px;
+            spacing: 16px;
             Text { text: "Note"; font-size: 12px; color: Pal.muted; vertical-alignment: center; }
             Rectangle { }
-            GhostButton { text: "Paste"; clicked => { root.paste-compose(); } }
-            GhostButton { text: "Done"; clicked => { note-edit.clear-focus(); } }
+            Text {
+                text: "Paste";
+                font-size: 13px;
+                color: Pal.accent;
+                vertical-alignment: center;
+                TouchArea { clicked => { root.paste-compose(); } }
+            }
+            Text {
+                text: "Done";
+                font-size: 13px;
+                color: Pal.accent;
+                vertical-alignment: center;
+                TouchArea { clicked => { note-edit.clear-focus(); } }
+            }
         }
         note-edit := TextEdit {
             height: 150px;
