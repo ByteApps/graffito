@@ -1642,6 +1642,22 @@ fn main() {
         });
     }
 
+    // Paste from the system clipboard — Slint's iOS text fields don't surface
+    // the native paste menu, so this reads UIPasteboard directly. Deferred to
+    // the event loop so import-changed re-runs without a State double-borrow.
+    cb!(on_paste_import, |w, s| {
+        let _ = &mut s;
+        match platform::clipboard_text() {
+            Some(text) => {
+                let _ = w.as_weak().upgrade_in_event_loop(move |w| {
+                    w.set_import_text(text.clone().into());
+                    w.invoke_import_changed(text.into());
+                });
+            }
+            None => w.set_import_feedback("clipboard empty".into()),
+        }
+    });
+
     cb!(on_import_file, |w, s| {
         let _ = &mut s;
         if let Some(path) = platform::pick_file(&[]) {
