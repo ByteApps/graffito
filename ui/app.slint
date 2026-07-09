@@ -19,6 +19,15 @@ export struct ActivityItem {
     txid: string, fee-line: string, status: string, explorer: string,
     pending: bool, replaced: string }
 
+// Per-platform optical calibration, set from Rust at startup. The header
+// title Text sits differently inside its line box per platform font (macOS/
+// iOS system font vs Roboto), so the back chevron's vertical nudge is
+// calibrated by measuring rendered ink centers on each platform:
+// macOS -1.25px · iOS -1.25px (default) · Android +1.5px.
+export global Metrics {
+    in-out property <length> back-dy: -1.25px;
+}
+
 // ---- palette ----
 global Pal {
     out property <color> bg: #0B0F14;
@@ -127,17 +136,53 @@ component IconButton inherits Rectangle {
     }
 }
 
+component SvgIconButton inherits Rectangle {
+    in property <string> icon;
+    in property <length> size: 19px;
+    in property <color> tint: Pal.muted;
+    callback clicked;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Image {
+        source: root.icon == "activity" ? @image-url("icons/activity.svg")
+              : @image-url("icons/copy.svg");
+        colorize: root.tint;
+        width: root.size;
+        height: root.size;
+        x: (parent.width - root.size) / 2;
+        y: (parent.height - root.size) / 2;
+    }
+}
+
+// Back chevron, shifted off the button's geometric center onto the title's
+// visual center by the per-platform Metrics.back-dy (see the global above).
+component BackButton inherits Rectangle {
+    callback clicked;
+    width: 44px;
+    height: 40px;
+    border-radius: 10px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Image {
+        source: @image-url("icons/chevron-left.svg");
+        colorize: Pal.text;
+        width: 22px;
+        height: 22px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2 + Metrics.back-dy;
+    }
+}
+
 component Header inherits HorizontalLayout {
     in property <string> title;
     in property <bool> show-back: true;
     callback back;
     spacing: 8px;
     height: 40px;
-    if root.show-back: IconButton {
-        glyph: "‹";
-        glyph-size: 30px;
-        glyph-color: Pal.text;
-        width: 44px;
+    if root.show-back: BackButton {
         clicked => { root.back(); }
     }
     Text {
@@ -167,24 +212,6 @@ component Badge inherits Rectangle {
         color: root.tint;
         font-size: 10px;
         font-weight: 600;
-    }
-}
-
-component SvgIconButton inherits Rectangle {
-    in property <string> icon;
-    callback clicked;
-    width: 40px;
-    height: 40px;
-    border-radius: 10px;
-    background: ta.has-hover ? Pal.card-hover : transparent;
-    ta := TouchArea { clicked => { root.clicked(); } }
-    Image {
-        source: root.icon == "activity" ? @image-url("icons/activity.svg") : @image-url("icons/copy.svg");
-        colorize: Pal.muted;
-        width: 19px;
-        height: 19px;
-        x: (parent.width - 19px) / 2;
-        y: (parent.height - 19px) / 2;
     }
 }
 
@@ -538,6 +565,7 @@ export component AppWindow inherits Window {
     in-out property <string> bump-rate;
     in-out property <string> consolidate-rate: "1";
     in-out property <bool> show-consolidate-confirm;
+    in property <string> consolidate-fee-line;
     in-out property <string> sweep-dest;
     in-out property <string> sweep-rate: "1";
     in-out property <bool> show-sweep-confirm;
@@ -563,6 +591,7 @@ export component AppWindow inherits Window {
     callback sweep();
     callback open-coins();
     callback consolidate();
+    callback consolidate-preview();
     callback open-activity();
     callback act-retry(string, bool);
     callback act-bump-open(string, bool);
@@ -627,16 +656,21 @@ export component AppWindow inherits Window {
     callback go-home();
 
     // ---------- 0 · onboarding ----------
-    if screen == 0: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 0: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 24px;
         spacing: 14px;
         alignment: start;
         Rectangle { height: 26px; }
-        Text {
-            text: "₿";
-            font-size: 34px;
-            color: Pal.accent;
-            horizontal-alignment: center;
+        // SVG, not a typed "₿": Android's Roboto has no U+20BF glyph and
+        // skia/femtovg have no font fallback (the icon rule).
+        HorizontalLayout {
+            alignment: center;
+            Image {
+                source: @image-url("icons/bitcoin.svg");
+                colorize: Pal.accent;
+                width: 34px;
+                height: 34px;
+            }
         }
         H1 { text: "Chain Notes"; horizontal-alignment: center; }
         Caption {
@@ -674,7 +708,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 1 · import ----------
-    if screen == 1: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 1: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -716,7 +750,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 2 · backup ----------
-    if screen == 2: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 2: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -816,11 +850,15 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 3 · quiz ----------
-    if screen == 3: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 3: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
-        Header { title: "Spot check"; show-back: false; }
+        Header {
+            title: "Spot check";
+            show-back: true;
+            back => { root.screen = 2; }
+        }
         Body { text: root.quiz-prompt; }
         LineEdit { text <=> root.quiz-answer; placeholder-text: "word  word  word"; }
         PrimaryButton { text: "Verify"; clicked => { root.quiz-submit(root.quiz-answer); } }
@@ -828,7 +866,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 4 · home ----------
-    if screen == 4: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 4: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         HorizontalLayout {
@@ -965,7 +1003,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 5 · note view ----------
-    if screen == 5: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 5: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1002,7 +1040,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 6 · compose ----------
-    if screen == 6: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 6: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1385,7 +1423,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 7 · contacts ----------
-    if screen == 7: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 7: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1469,7 +1507,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 8 · settings ----------
-    if screen == 8: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 8: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -1632,7 +1670,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 9 · account picker ----------
-    if screen == 9: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 9: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1694,7 +1732,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 10 · coins ----------
-    if screen == 10: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 10: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -1712,7 +1750,10 @@ export component AppWindow inherits Window {
             GhostButton {
                 width: 200px;
                 text: "Consolidate into one coin";
-                clicked => { root.show-consolidate-confirm = true; }
+                clicked => {
+                    root.consolidate-preview();
+                    root.show-consolidate-confirm = true;
+                }
             }
         }
         Body { text: root.coins-summary; font-size: 12px; }
@@ -1757,7 +1798,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 11 · activity (transactions) ----------
-    if screen == 11: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 11: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -1834,7 +1875,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 12 · funding wallet (external PSBT source) ----------
-    if screen == 12: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 12: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1886,7 +1927,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 13 · export PSBT (sign externally) ----------
-    if screen == 13: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 13: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1934,7 +1975,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 14 · import signed PSBT + confirmation ----------
-    if screen == 14: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 14: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -2058,7 +2099,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 15 · funding wallets (manager list) ----------
-    if screen == 15: VerticalLayout { padding-top: root.safe-top; padding-bottom: root.safe-bottom;
+    if screen == 15: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -2492,6 +2533,15 @@ export component AppWindow inherits Window {
                     font-size: 12px;
                 }
                 Caption { text: root.coins-summary; }
+                // Exact fee preview: a dry-run of the same tx builder the
+                // Consolidate button broadcasts (same inputs → same vsize).
+                if root.consolidate-fee-line != "": Text {
+                    text: root.consolidate-fee-line;
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: Pal.accent;
+                    wrap: word-wrap;
+                }
                 HorizontalLayout {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.show-consolidate-confirm = false; } }
