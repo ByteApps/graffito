@@ -87,7 +87,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "first, public", private: false, recipient: None, change_to: None, coins: None, fee_rate: 1.0, now: 1000 },
+        &ComposeRequest { text: "first, public", private: false, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1000 },
     )
     .unwrap();
     assert_eq!(store.notes.len(), 1);
@@ -98,7 +98,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "second, private", private: true, recipient: None, change_to: None, coins: None, fee_rate: 1.0, now: 2000 },
+        &ComposeRequest { text: "second, private", private: true, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 2000 },
     )
     .unwrap();
     assert_eq!(
@@ -156,7 +156,7 @@ fn directed_private_note_both_sides() {
             change_to: None,
             coins: None,
             fee_rate: 1.0,
-            now: 3000,
+            gift_amount: None, now: 3000,
         },
     )
     .unwrap();
@@ -211,7 +211,7 @@ fn unconfirmed_scanned_utxo_is_spendable() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "spend unconfirmed", private: false, recipient: None,
-            change_to: None, coins: None, fee_rate: 1.0, now: 1,
+            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1,
         },
     )
     .unwrap();
@@ -238,7 +238,7 @@ fn coin_control_spends_exactly_selected() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "coin control", private: false, recipient: None,
-            change_to: None, coins: Some(&picks), fee_rate: 1.0, now: 1,
+            change_to: None, coins: Some(&picks), fee_rate: 1.0, gift_amount: None, now: 1,
         },
     )
     .unwrap();
@@ -264,7 +264,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "change goes to bob", private: false, recipient: None,
-            change_to: Some(&bob_addr), coins: None, fee_rate: 1.0, now: 1,
+            change_to: Some(&bob_addr), coins: None, fee_rate: 1.0, gift_amount: None, now: 1,
         },
     )
     .unwrap();
@@ -281,7 +281,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
         &mut store2, &a, NET,
         &ComposeRequest {
             text: "change to self", private: false, recipient: None,
-            change_to: None, coins: None, fee_rate: 1.0, now: 1,
+            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1,
         },
     )
     .unwrap();
@@ -295,7 +295,7 @@ fn bump_fee_same_note_id_same_inputs_higher_fee() {
     let mut store = funded_store(&a);
     let n1 = compose_and_record(
         &mut store, &a, NET,
-        &ComposeRequest { text: "bump me", private: true, recipient: None, change_to: None, coins: None, fee_rate: 1.0, now: 1 },
+        &ComposeRequest { text: "bump me", private: true, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1 },
     )
     .unwrap();
     assert!(store.notes[0].raw_hex.is_some(), "raw kept for rebroadcast");
@@ -331,7 +331,7 @@ fn orphaned_when_inputs_spent_elsewhere() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "never broadcast", private: false, recipient: None, change_to: None, coins: None, fee_rate: 1.0, now: 1 },
+        &ComposeRequest { text: "never broadcast", private: false, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1 },
     )
     .unwrap();
 
@@ -420,4 +420,59 @@ fn legacy_esplora_key_loads_into_node_url() {
     assert_eq!(store.node_url.as_deref(), Some("http://127.0.0.1:3002"));
     // And it re-serializes under the new key.
     assert!(serde_json::to_string(&store).unwrap().contains("node_url"));
+}
+
+#[test]
+fn directed_gift_amount_plumbs_through() {
+    let a = alice();
+    let bob_addr = bob().address(NET);
+    let gift = 25_000u64;
+
+    // A custom gift reaches the recipient output and is recorded.
+    let mut store = funded_store(&a);
+    let n = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "happy birthday",
+            private: false,
+            recipient: Some(&bob_addr),
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: Some(gift),
+            now: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(n.tx.sent, gift, "gift reaches the recipient output");
+    assert!(store.notes[0].directed);
+    assert_eq!(store.notes[0].gift_amount, Some(gift), "gift stored on the record");
+
+    // RBF fee-bump keeps the same gift (not reset to dust).
+    let id = store.notes[0].note_id.clone();
+    let bumped = app_core::compose::bump_fee(&mut store, &a, NET, &id, 5.0).unwrap();
+    assert_eq!(bumped.tx.sent, gift, "fee-bump preserves the gift");
+
+    // A None gift defaults to dust.
+    let mut store2 = funded_store(&a);
+    let d = compose_and_record(
+        &mut store2,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "hi",
+            private: false,
+            recipient: Some(&bob_addr),
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            now: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(d.tx.sent, app_core::notes_core::DUST_LIMIT, "default gift is dust");
+    assert_eq!(store2.notes[0].gift_amount, Some(app_core::notes_core::DUST_LIMIT));
 }

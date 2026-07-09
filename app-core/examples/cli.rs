@@ -127,7 +127,7 @@ fn main() {
                     change_to: None,
                     coins: None,
                     fee_rate,
-                    now: std::time::SystemTime::now()
+                    gift_amount: None, now: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
