@@ -1,0 +1,39 @@
+name: chain-notes-app
+options:
+  bundleIdPrefix: xyz.foundation.chainnotes
+  createIntermediateGroups: true
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  chain-notes-app:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.foundation.chainnotes.app
+        PRODUCT_NAME: chain-notes-app
+        EXECUTABLE_NAME: chain-notes-app
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: VU7QD3Z26Y
+        GENERATE_INFOPLIST_FILE: NO
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Chain Notes
+        CFBundleExecutable: chain-notes-app
+        NSCameraUsageDescription: "Scan QR codes (keys, addresses, PSBTs, sync bundles)."
+        NSFaceIDUsageDescription: "Unlock your notes key to reveal your backup."
+        UILaunchScreen: {}
+        ITSAppUsesNonExemptEncryption: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    sources: []
+    postCompileScripts:
+      - name: Build Rust binary with cargo
+        script: |
+          bash "${SRCROOT}/build_ios.bash" chain-notes-app
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)

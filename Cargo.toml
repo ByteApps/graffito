@@ -8,39 +8,50 @@ description = "Native Mac/iOS/Android peer for chain notes (PNTE protocol)"
 [workspace]
 members = ["app-core"]
 
+# Cross-platform (macOS desktop + iOS/Android mobile). Platform-specific glue
+# (Slint renderer, camera, file dialogs, keychain) is target-gated below and
+# cfg-split in the modules; app logic + UI (app.slint) are shared.
 [dependencies]
 app-core = { path = "app-core" }
-# renderer-software: headless offscreen render of screens to PNG for the
-# `--render` design-preview mode (the winit/femtovg default stays the norm).
-slint = { version = "=1.16.1", features = ["renderer-software"] }
-# PNG encode for `--render` snapshots.
+# PNG encode for `--render` snapshots (macOS dev tool).
 png = "0.17"
 # QR out: rendered into a slint Image.
 qrcode = "0.14"
-# QR in: camera frames (AVFoundation on Mac) → rqrr decode.
-nokhwa = { version = "0.10", features = ["input-avfoundation"] }
+# QR in: camera frames → rqrr decode.
 rqrr = "0.7"
-# Key material at rest: macOS Keychain (SecretStore spec in the PLAN).
-security-framework = "3"
-# Raw SecItemAdd/CopyMatching for the UserPresence ACL item (the high-
-# level item API has no access-control setter).
-security-framework-sys = "2"
-core-foundation = "0.10"
-core-foundation-sys = "0.8"
-# Dev-build fallback: LAContext user-presence gate (unsigned binaries
-# cannot use SecAccessControl items — errSecMissingEntitlement).
-objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-local-authentication = "0.3"
-block2 = "0.6"
-# Native file-open dialog (import-from-file door).
-rfd = "0.14"
 serde_json = "1"
 hex = "0.4"
 zeroize = "1"
 # Quiz word picks + misc entropy.
 getrandom = "0.2"
 bip39 = "2"
+
+# Apple platforms (macOS + iOS) — Keychain + LAContext biometric reveal.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# Key material at rest: Keychain (SecretStore spec in the PLAN).
+security-framework = "3"
+# Raw SecItemAdd/CopyMatching for the UserPresence ACL item (the high-
+# level item API has no access-control setter).
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+# LAContext user-presence gate; on iOS the SecAccessControl reveal prompt.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-local-authentication = "0.3"
+block2 = "0.6"
+
+# macOS desktop: femtovg default + software renderer for --render; native glue.
+[target.'cfg(target_os = "macos")'.dependencies]
+slint = { version = "=1.16.1", features = ["renderer-software"] }
+# QR in: camera frames (AVFoundation via nokhwa) → rqrr decode.
+nokhwa = { version = "0.10", features = ["input-avfoundation"] }
+# Native file-open dialog (import-from-file door).
+rfd = "0.14"
+
+# iOS: winit + Skia (Metal); femtovg/GL-ES and nokhwa/rfd are not available.
+[target.'cfg(target_os = "ios")'.dependencies]
+slint = { version = "=1.16.1", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-skia"] }
 
 [build-dependencies]
 slint-build = "=1.16.1"
