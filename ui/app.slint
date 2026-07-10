@@ -437,7 +437,7 @@ export component AppWindow inherits Window {
     // 0 onboard · 1 import · 2 backup · 3 quiz · 4 home · 5 note ·
     // 6 compose · 7 contacts · 8 settings
     in-out property <int> screen: 0;
-    in property <string> status;
+    in-out property <string> status; // in-out: back buttons clear stale messages
 
     // Safe-area insets (set from Rust on iOS: status bar / Dynamic Island /
     // home indicator). 0 on macOS. Applied as padding on each screen root.
@@ -1074,8 +1074,9 @@ export component AppWindow inherits Window {
         Header {
             title: "Compose";
             // Clear the typed address on the way back — it's saved in recents
-            // now, so leaving it in the field is redundant.
-            back => { root.contact-input = ""; root.screen = 7; }
+            // now, so leaving it in the field is redundant. Status too: its
+            // message belonged to this screen.
+            back => { root.contact-input = ""; root.status = ""; root.screen = 7; }
         }
         Flickable {
             viewport-height: compose-col.preferred-height;
@@ -1983,17 +1984,23 @@ export component AppWindow inherits Window {
             color: Pal.accent;
             horizontal-alignment: center;
         }
-        Rectangle {
-            height: 296px;
-            border-radius: 14px;
-            background: #FFFFFF;
-            Image {
-                source: root.psbt-qr;
-                width: 256px;
-                height: 256px;
-                x: (parent.width - 256px) / 2;
-                y: (parent.height - 256px) / 2;
-                image-rendering: pixelated;
+        // Square card snug around the code — the old full-width card left
+        // walls of white either side of the QR.
+        HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: 312px;
+                height: 312px;
+                border-radius: 14px;
+                background: #FFFFFF;
+                Image {
+                    source: root.psbt-qr;
+                    width: 288px;
+                    height: 288px;
+                    x: (parent.width - 288px) / 2;
+                    y: (parent.height - 288px) / 2;
+                    image-rendering: pixelated;
+                }
             }
         }
         if root.psbt-frame-label != "": Caption {
@@ -2229,7 +2236,9 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Sweep";
-            back => { root.pick-mode = "sweep"; root.screen = 7; }
+            // Clear the typed address + any stale status on the way back —
+            // success messages otherwise linger red on the picker.
+            back => { root.contact-input = ""; root.status = ""; root.pick-mode = "sweep"; root.screen = 7; }
         }
         Flickable {
             viewport-height: sweep-col.preferred-height;
