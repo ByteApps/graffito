@@ -25,8 +25,9 @@ use app_core::identity::{
     generate_mnemonic, generate_mnemonic_with_salt, parse_key_material, realize, AppIdentity,
 };
 use app_core::psbt_build::{
-    build_funded_sweep_psbt, sign_own_taproot_inputs,    build_funding_psbt, build_watch_bump_psbt, build_watch_spend_psbt, predict_keyspend_vsize,
-    BuiltPsbt, FundingPlan, NoteParams, WatchCoin,
+    build_funded_sweep_psbt, build_funding_psbt, build_watch_bump_psbt, build_watch_note_psbt,
+    build_watch_spend_psbt, predict_keyspend_vsize, sign_own_taproot_inputs, BuiltPsbt,
+    FundingPlan, NoteParams, WatchCoin,
 };
 use app_core::psbt_finalize::{
     finalize_extract, parse_psbt, summarize, validate_signed, OutputRole, SummaryContext,
@@ -103,6 +104,21 @@ struct State {
     /// Chain data behind an open watch-mode bump dialog (fetched once at
     /// open; confirm rebuilds from it).
     watch_bump: Option<WatchBump>,
+    /// Watch-mode compose awaiting external signature (screen 13/14).
+    watch_note: Option<WatchNote>,
+}
+
+/// Watch-mode compose in progress on the sign screen: everything needed
+/// to record the (public) note after the externally signed broadcast.
+struct WatchNote {
+    note_id: [u8; 4],
+    text: String,
+    recipient: Option<String>,
+    gift: u64,
+    chunks: usize,
+    fee: u64,
+    change: u64,
+    spent: Vec<app_core::store::OutPointRef>,
 }
 
 struct WatchSpend {
@@ -233,6 +249,45 @@ fn tx_rate(store: &Store, ref_id: &str, is_note: bool) -> Option<(f64, u64, u64)
     }
 }
 
+/// Post-broadcast bookkeeping for a watch-mode compose: record the public
+/// note as Pending with the same ledger effects as a keyed compose —
+/// inputs locked, change (last vout) spendable unconfirmed, raw hex kept
+/// for rebroadcast until confirmation.
+fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsize: u64) {
+    let Some(store) = st.store.as_mut() else { return };
+    let change = (wn.change > 0).then(|| app_core::store::LedgerUtxo {
+        txid: txid.to_string(),
+        vout: (wn.chunks + usize::from(wn.recipient.is_some())) as u32,
+        value: wn.change,
+        height: None,
+        pending_spend: false,
+    });
+    store.record_signed(
+        app_core::store::NoteRecord {
+            note_id: hex::encode(wn.note_id),
+            status: NoteStatus::Pending,
+            text: Some(wn.text.clone()),
+            private: false,
+            directed: wn.recipient.is_some(),
+            received: false,
+            sender: None,
+            recipient: wn.recipient.clone(),
+            txids: vec![txid.to_string()],
+            height: None,
+            blocktime: None,
+            created_at: Some(now()),
+            spent: wn.spent.clone(),
+            raw_hex: Some(raw.to_string()),
+            fee: Some(wn.fee),
+            vsize: Some(vsize),
+            change_to: None,
+            gift_amount: wn.recipient.is_some().then_some(wn.gift),
+        },
+        change,
+    );
+    st.save_store();
+}
+
 /// Post-broadcast bookkeeping for a watch-mode external-sign spend: sweep/
 /// consolidate become TxRecords (Activity lifecycle + rebroadcast/RBF), a
 /// bump rides on the record it replaces; spent coins get pending-locked.
@@ -322,6 +377,7 @@ fn watch_spend_build(
                 coins.len(),
                 if coins.len() == 1 { "" } else { "s" }
             );
+            st.watch_note = None;
             st.watch_spend = Some(WatchSpend {
                 kind,
                 dest,
@@ -442,6 +498,7 @@ fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
                 &wb.txid[..12.min(wb.txid.len())],
                 built.fee
             );
+            st.watch_note = None;
             st.watch_spend = Some(WatchSpend {
                 kind: "bump",
                 dest,
@@ -1799,6 +1856,7 @@ pub fn run() {
         active_funding_id: None,
         watch_spend: None,
         watch_bump: None,
+        watch_note: None,
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -2756,6 +2814,7 @@ pub fn run() {
                         "sweep · {} sats arrive in full · fee {} sats from the funding wallet",
                         built.sent_to_recipient, built.fee
                     );
+                    s.watch_note = None;
                     s.watch_spend = Some(WatchSpend {
                         kind: "sweep",
                         dest: dest.clone(),
@@ -2867,6 +2926,9 @@ pub fn run() {
             w.set_directed(true);
         }
         let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            w.set_compose_private(false); // no sealing key on this device
+        }
         w.set_fee_tier(1);
         w.set_rate_text(format!("{rate}").into());
         w.set_change_address("".into());
@@ -3393,6 +3455,7 @@ pub fn run() {
                 let cost =
                     format!("fee {} sats · {n} input{}", built.fee, if n == 1 { "" } else { "s" });
                 s.watch_spend = None; // this sign screen serves external funding
+                s.watch_note = None;
                 show_psbt_sign_screen(&w, &mut s, built, cost);
                 println!("cb: fund-build ok");
             }
@@ -3466,7 +3529,19 @@ pub fn run() {
         let client = ChainClient::new(HttpTransport::new(&base), s.network);
         match client.broadcast(&raw) {
             Ok(_got) => {
-                if let Some(ws) = s.watch_spend.take() {
+                if let Some(wn) = s.watch_note.take() {
+                    // Watch-mode compose: the note enters the store as
+                    // Pending exactly like a keyed compose (inputs locked,
+                    // change spendable, raw hex kept for rebroadcast).
+                    record_watch_note(&mut s, &wn, &txid, &raw, vsize as u64);
+                    println!(
+                        "cb: compose id={} txid={txid} fee={} vsize={vsize} to={} private=false gift={} watch=1 broadcast=ok",
+                        hex::encode(wn.note_id),
+                        wn.fee,
+                        wn.recipient.as_deref().unwrap_or("self"),
+                        wn.gift
+                    );
+                } else if let Some(ws) = s.watch_spend.take() {
                     // Watch-mode spend: record it so Activity gets the
                     // pending→confirmed lifecycle, and lock the coins.
                     record_watch_spend(&mut s, &ws, &txid, &raw, vsize as u64);
@@ -3513,8 +3588,104 @@ pub fn run() {
             w.set_status("selected coins don't cover the note + fee".into());
             return;
         }
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            // Watch compose: PUBLIC note as an external-sign PSBT over the
+            // selected coins; recorded on broadcast like a keyed compose.
+            if private {
+                w.set_status("watch-only identities can only compose public notes".into());
+                return;
+            }
+            let Some(src) = s.ident.as_ref().and_then(|i| i.watch_source()).cloned() else { return };
+            let recipient = match to.as_deref() {
+                Some(a) => match Recipient::parse(net, a) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        w.set_status(format!("{e}").into());
+                        return;
+                    }
+                },
+                None => None,
+            };
+            let gift = if recipient.is_some() {
+                w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+            } else {
+                0
+            };
+            let Some(store) = s.store.as_ref() else { return };
+            let sel: std::collections::HashSet<(String, u32)> =
+                s.selected_coins.iter().cloned().collect();
+            let coins: Vec<WatchCoin> = store
+                .utxos
+                .iter()
+                .filter(|u| !u.pending_spend && sel.contains(&(u.txid.clone(), u.vout)))
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                .collect();
+            if coins.is_empty() {
+                w.set_status("no coins selected".into());
+                return;
+            }
+            let mut note_id = [0u8; 4];
+            loop {
+                let r = app_core::notes_core::keys::generate_aux_rand()
+                    .map(|x| [x[0], x[1], x[2], x[3]])
+                    .unwrap_or([1, 2, 3, 4]);
+                note_id = r;
+                if !store.note_id_taken(&note_id) {
+                    break;
+                }
+            }
+            let chunk = store.chunk_size;
+            match build_watch_note_psbt(
+                &src,
+                &coins,
+                &text,
+                recipient.as_ref().map(|r| r.spk.clone()),
+                gift,
+                note_id,
+                chunk,
+                rate,
+            ) {
+                Ok(built) => {
+                    let payload_outputs = built
+                        .psbt
+                        .unsigned_tx
+                        .output
+                        .iter()
+                        .filter(|o| o.script_pubkey.is_op_return())
+                        .count();
+                    s.watch_spend = None;
+                    s.watch_note = Some(WatchNote {
+                        note_id,
+                        text: text.clone(),
+                        recipient: to.clone(),
+                        gift,
+                        chunks: payload_outputs,
+                        fee: built.fee,
+                        change: built.change,
+                        spent: coins
+                            .iter()
+                            .map(|c| app_core::store::OutPointRef { txid: c.txid.clone(), vout: c.vout })
+                            .collect(),
+                    });
+                    let cost = format!(
+                        "public note · fee {} sats{} · sign with your external wallet",
+                        built.fee,
+                        if gift > 0 { format!(" · {gift} sats to recipient") } else { String::new() }
+                    );
+                    println!(
+                        "cb: watch-note-build id={} txid={} fee={} chunks={payload_outputs}",
+                        hex::encode(note_id),
+                        built.txid,
+                        built.fee
+                    );
+                    show_psbt_sign_screen(&w, &mut s, built, cost);
+                }
+                Err(e) => w.set_status(format!("{e}").into()),
+            }
+            return;
+        }
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-            w.set_status("watch-only identity — no signing key on this device".into());
+            w.set_status("no identity".into());
             return;
         };
         let coins_vec = s.selected_coins.clone();

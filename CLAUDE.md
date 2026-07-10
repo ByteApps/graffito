@@ -38,9 +38,17 @@ that check the master fingerprint; bare xpubs still view fine. Verified:
 signs consolidate+sweep on regtest, headless) and a live testnet4 pass
 (app-UI sweep signed by the CC sim incl. RBF replacement through
 mempool.space). `cli xpub|spend-build|bump-build|spend-broadcast`
-subcommands feed the e2e. NOT built: compose-to-PSBT (public notes
-could sign externally; directed-private never can — ECDH needs the
-identity key at compose time).
+subcommands feed the e2e. **Compose works watch-only for PUBLIC notes**
+(self or directed, gift supported): the compose screen stays available
+with Private and pay-from-another-wallet hidden, and Sign becomes
+"Build transaction to sign" — `build_watch_note_psbt` (self-funded:
+OP_RETURNs via `envelope::encode_chunks` — no key needed for public
+flags — then optional recipient output + change-to-self, own-note rule
+holds since the tx spends from self); the broadcast records the note
+Pending exactly like a keyed compose (`record_watch_note`). `cli
+note-build` + a CC e2e leg prove a watch identity can POST a note.
+Directed-PRIVATE can never work watch-only — the ECDH needs the
+identity key at compose time.
 
 Design doc + milestone plan (M0–M7): **`../PLAN-chain-notes-app.md`** in
 the prime workspace (this repo is a workspace submodule sibling of the
