@@ -24,11 +24,14 @@ use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
 use app_core::identity::{
     generate_mnemonic, generate_mnemonic_with_salt, parse_key_material, realize, AppIdentity,
 };
-use app_core::psbt_build::{build_funding_psbt, BuiltPsbt, FundingPlan, NoteParams};
+use app_core::psbt_build::{
+    build_funding_psbt, build_watch_bump_psbt, build_watch_spend_psbt, predict_keyspend_vsize,
+    BuiltPsbt, FundingPlan, NoteParams, WatchCoin,
+};
 use app_core::psbt_finalize::{
     finalize_extract, parse_psbt, summarize, validate_signed, OutputRole, SummaryContext,
 };
-use app_core::notes_core::address::Recipient;
+use app_core::notes_core::address::{p2tr_script_pubkey, Recipient};
 use app_core::notes_core::bundle::{estimate_note_cost, FeeRates};
 use app_core::notes_core::Network;
 use app_core::store::{NoteStatus, Store, DEFAULT_CHUNK};
@@ -93,6 +96,34 @@ struct State {
     /// one is currently active for the compose in progress.
     funding_wallets: Vec<FundingWallet>,
     active_funding_id: Option<String>,
+    /// Watch-only external-sign flow in progress: what the built PSBT on
+    /// the sign screen is (sweep/consolidate/bump) and how to record it
+    /// after broadcast. None while the sign screen serves external funding.
+    watch_spend: Option<WatchSpend>,
+    /// Chain data behind an open watch-mode bump dialog (fetched once at
+    /// open; confirm rebuilds from it).
+    watch_bump: Option<WatchBump>,
+}
+
+struct WatchSpend {
+    kind: &'static str, // "sweep" | "consolidate" | "bump"
+    dest: String,
+    dest_spk_hex: String,
+    value: u64,
+    fee: u64,
+    inputs: Vec<app_core::store::TxInput>,
+    /// (ref_id, is_note) of the record being replaced when kind == "bump".
+    bump_ref: Option<(String, bool)>,
+}
+
+struct WatchBump {
+    ref_id: String,
+    is_note: bool,
+    txid: String,
+    coins: Vec<WatchCoin>,
+    outputs: Vec<(Vec<u8>, u64)>,
+    old_fee: u64,
+    vsize: u64,
 }
 
 impl State {
@@ -199,6 +230,234 @@ fn tx_rate(store: &Store, ref_id: &str, is_note: bool) -> Option<(f64, u64, u64)
     } else {
         let t = store.txs.iter().find(|t| t.txids.iter().any(|x| x == ref_id))?;
         (t.vsize > 0).then(|| (t.fee as f64 / t.vsize as f64, t.fee, t.vsize))
+    }
+}
+
+/// Post-broadcast bookkeeping for a watch-mode external-sign spend: sweep/
+/// consolidate become TxRecords (Activity lifecycle + rebroadcast/RBF), a
+/// bump rides on the record it replaces; spent coins get pending-locked.
+fn record_watch_spend(st: &mut State, ws: &WatchSpend, txid: &str, raw: &str, vsize: u64) {
+    let Some(store) = st.store.as_mut() else { return };
+    match &ws.bump_ref {
+        Some((ref_id, is_note)) => {
+            if *is_note {
+                if let Some(n) = store.notes.iter_mut().find(|n| n.note_id == *ref_id) {
+                    if !n.txids.contains(&txid.to_string()) {
+                        n.txids.push(txid.to_string());
+                    }
+                    n.fee = Some(ws.fee);
+                    n.vsize = Some(vsize);
+                }
+            } else if let Some(t) =
+                store.txs.iter_mut().find(|t| t.txids.iter().any(|x| x == ref_id))
+            {
+                if !t.txids.contains(&txid.to_string()) {
+                    t.txids.push(txid.to_string());
+                }
+                t.fee = ws.fee;
+                t.vsize = vsize;
+                t.raw_hex = Some(raw.to_string());
+            }
+        }
+        None => {
+            store.record_tx(
+                ws.kind,
+                txid.to_string(),
+                ws.value,
+                ws.fee,
+                vsize,
+                raw.to_string(),
+                ws.dest.clone(),
+                ws.inputs.clone(),
+                ws.dest_spk_hex.clone(),
+                now(),
+            );
+            for i in &ws.inputs {
+                if let Some(u) =
+                    store.utxos.iter_mut().find(|u| u.txid == i.txid && u.vout == i.vout)
+                {
+                    u.pending_spend = true;
+                }
+            }
+        }
+    }
+    st.save_store();
+}
+
+/// Watch mode: build the external-sign PSBT spending every spendable coin
+/// into `dest_spk` and open the sign screen (13). The signed PSBT comes
+/// back through the same import paths external funding uses.
+fn watch_spend_build(
+    w: &AppWindow,
+    st: &mut State,
+    kind: &'static str,
+    dest: String,
+    dest_spk: Vec<u8>,
+    rate: f64,
+) {
+    let Some(src) = st.ident.as_ref().and_then(|i| i.watch_source()).cloned() else { return };
+    let Some(store) = st.store.as_ref() else { return };
+    let coins: Vec<WatchCoin> = store
+        .utxos
+        .iter()
+        .filter(|u| !u.pending_spend)
+        .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
+        .collect();
+    if coins.is_empty() || (kind == "consolidate" && coins.len() < 2) {
+        w.set_status(
+            if kind == "consolidate" { "nothing to consolidate (need 2+ coins)" } else { "nothing to sweep" }.into(),
+        );
+        return;
+    }
+    let inputs: Vec<app_core::store::TxInput> = coins
+        .iter()
+        .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
+        .collect();
+    match build_watch_spend_psbt(&src, &coins, dest_spk.clone(), rate) {
+        Ok(built) => {
+            let cost = format!(
+                "{kind} · {} sats · fee {} sats · {} input{} · sign with your external wallet",
+                built.sent_to_recipient,
+                built.fee,
+                coins.len(),
+                if coins.len() == 1 { "" } else { "s" }
+            );
+            st.watch_spend = Some(WatchSpend {
+                kind,
+                dest,
+                dest_spk_hex: hex::encode(&dest_spk),
+                value: built.sent_to_recipient,
+                fee: built.fee,
+                inputs,
+                bump_ref: None,
+            });
+            println!(
+                "cb: watch-spend-build kind={kind} txid={} fee={} inputs={}",
+                built.txid,
+                built.fee,
+                coins.len()
+            );
+            show_psbt_sign_screen(w, st, built, cost);
+        }
+        Err(e) => w.set_status(format!("{e}").into()),
+    }
+}
+
+/// Watch mode bump, step 1: fetch the pending tx from the node (chain-
+/// recovered records carry no fee/vsize/raw hex), price it, open the dialog.
+fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool) {
+    let Some(base) = st.base_url() else {
+        w.set_status("no Bitcoin node — set one in Settings".into());
+        return;
+    };
+    let txid = {
+        let Some(store) = st.store.as_ref() else { return };
+        if is_note {
+            store.notes.iter().find(|n| n.note_id == ref_id).and_then(|n| n.txids.last().cloned())
+        } else {
+            store
+                .txs
+                .iter()
+                .find(|t| t.txids.iter().any(|x| *x == ref_id))
+                .and_then(|t| t.txids.last().cloned())
+        }
+    };
+    let Some(txid) = txid else {
+        w.set_status("transaction not found".into());
+        return;
+    };
+    let client = ChainClient::new(HttpTransport::new(base), st.network);
+    match client.fetch_tx_io(&txid) {
+        Ok((coins, outputs, confirmed)) => {
+            if confirmed {
+                w.set_status("already confirmed — nothing to speed up".into());
+                return;
+            }
+            let in_v: u64 = coins.iter().map(|c| c.value).sum();
+            let out_v: u64 = outputs.iter().map(|(_, v)| *v).sum();
+            let old_fee = in_v.saturating_sub(out_v);
+            let vsize = predict_keyspend_vsize(coins.len(), outputs.iter().map(|(s, _)| s.len()));
+            let old_rate = if vsize > 0 { old_fee as f64 / vsize as f64 } else { 0.0 };
+            let min_rate = old_rate + 1.0;
+            let fast = st.fees.as_ref().map(|f| f.fastest).unwrap_or(min_rate);
+            let recommended = fast.max(min_rate);
+            println!("cb: bump-open ref={ref_id} old={old_rate:.1} min={min_rate:.1} watch=1");
+            w.set_bump_ref(ref_id.clone().into());
+            w.set_bump_is_note(is_note);
+            w.set_bump_kind(if is_note { "Note transaction" } else { "Sweep / consolidate" }.into());
+            w.set_bump_current(format!("Currently {old_rate:.1} sat/vB · {old_fee} sats fee").into());
+            w.set_bump_min(format!("Minimum {min_rate:.1} sat/vB — RBF must add ≥1 sat/vB.").into());
+            w.set_bump_error("".into());
+            w.set_bump_rate(format!("{recommended:.1}").into());
+            w.set_bump_new_fee(new_fee_line(recommended, vsize, old_fee).into());
+            st.watch_bump = Some(WatchBump { ref_id, is_note, txid, coins, outputs, old_fee, vsize });
+            w.set_show_bump_dialog(true);
+        }
+        Err(e) => w.set_status(format!("can't fetch the pending tx: {e}").into()),
+    }
+}
+
+/// Watch mode bump, step 2: rebuild the replacement PSBT (same in/outs, fee
+/// delta out of our own output) and open the external-sign screen.
+fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
+    let Some(wb) = st.watch_bump.take() else {
+        w.set_bump_error("bump context lost — reopen the dialog".into());
+        return;
+    };
+    let min_rate = (wb.old_fee as f64 / wb.vsize.max(1) as f64) + 1.0;
+    if new_rate + 1e-9 < min_rate {
+        w.set_bump_error(format!("below the {min_rate:.1} sat/vB minimum").into());
+        st.watch_bump = Some(wb);
+        return;
+    }
+    let Some(src) = st.ident.as_ref().and_then(|i| i.watch_source()).cloned() else { return };
+    let self_spk = p2tr_script_pubkey(&st.ident.as_ref().map(|i| i.output_x()).unwrap_or_default());
+    // Take the fee delta from our own output (largest), else the largest
+    // non-OP_RETURN output (a sweep pays the fee out of the swept amount).
+    let reduce = wb
+        .outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, (spk, _))| *spk == self_spk)
+        .max_by_key(|(_, (_, v))| *v)
+        .map(|(i, _)| i)
+        .or_else(|| {
+            wb.outputs
+                .iter()
+                .enumerate()
+                .filter(|(_, (spk, _))| spk.first() != Some(&0x6a))
+                .max_by_key(|(_, (_, v))| *v)
+                .map(|(i, _)| i)
+        });
+    let Some(reduce) = reduce else {
+        w.set_bump_error("no output can absorb the fee bump".into());
+        return;
+    };
+    match build_watch_bump_psbt(&src, &wb.coins, &wb.outputs, reduce, new_rate) {
+        Ok(built) => {
+            w.set_show_bump_dialog(false);
+            let dest = st.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
+            let cost = format!(
+                "speed-up · replaces {}… · new fee {} sats · sign with your external wallet",
+                &wb.txid[..12.min(wb.txid.len())],
+                built.fee
+            );
+            st.watch_spend = Some(WatchSpend {
+                kind: "bump",
+                dest,
+                dest_spk_hex: hex::encode(&wb.outputs[reduce].0),
+                value: built.sent_to_recipient,
+                fee: built.fee,
+                inputs: Vec::new(),
+                bump_ref: Some((wb.ref_id.clone(), wb.is_note)),
+            });
+            println!("cb: watch-bump-build ref={} txid={} fee={}", wb.ref_id, built.txid, built.fee);
+            show_psbt_sign_screen(w, st, built, cost);
+        }
+        Err(e) => {
+            w.set_bump_error(format!("{e}").into());
+            st.watch_bump = Some(wb);
+        }
     }
 }
 
@@ -1183,6 +1442,24 @@ fn load_signed_psbt(w: &AppWindow, st: &mut State, data: &[u8]) {
     }
 }
 
+/// Put a freshly built unsigned PSBT on the sign screen (13): animated-UR
+/// QR, cost line, save/copy state. Shared by external funding and the
+/// watch-mode spend flows.
+fn show_psbt_sign_screen(w: &AppWindow, st: &mut State, built: BuiltPsbt, cost_line: String) {
+    let frames = app_core::ur::encode_psbt(&built.to_bytes(), 300);
+    w.set_psbt_cost_line(cost_line.into());
+    w.set_psbt_qr(qr::qr_image(&frames[0]).unwrap_or_default());
+    w.set_psbt_frame_label(
+        if frames.len() > 1 { format!("frame 1 / {}", frames.len()).into() } else { "".into() },
+    );
+    st.ur_frames = frames;
+    st.built_psbt = Some(built);
+    st.signed_psbt = None;
+    w.set_psbt_signed(false);
+    w.set_status("".into());
+    w.set_screen(13);
+}
+
 /// Validate + summarize a signed PSBT into the confirmation screen.
 fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
     let Some(built) = st.built_psbt.as_ref() else {
@@ -1193,18 +1470,23 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
         w.set_status(format!("{e}").into());
         return;
     }
-    let Some(identity) = st.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-        w.set_status("watch-only identity — no signing key on this device".into());
-        return;
+    let Some(output_x) = st.ident.as_ref().map(|i| i.output_x()) else { return };
+    // Watch spends label their destination as the recipient; the funding
+    // flow labels the compose recipient + the funding wallet's change.
+    let recipient_addr = match &st.watch_spend {
+        Some(ws) => Some(ws.dest.clone()),
+        None => st.to_address.clone(),
     };
-    let recipient_addr = st.to_address.clone();
-    let change_addr = st
-        .funding
-        .as_ref()
-        .and_then(|src| src.derive(1, st.funding_change_index).ok())
-        .map(|d| d.address);
+    let change_addr = match &st.watch_spend {
+        Some(_) => None,
+        None => st
+            .funding
+            .as_ref()
+            .and_then(|src| src.derive(1, st.funding_change_index).ok())
+            .map(|d| d.address),
+    };
     let ctx = SummaryContext {
-        identity: &identity,
+        identity_output_x: output_x,
         network: st.network,
         recipient_addr: recipient_addr.as_deref(),
         change_addr: change_addr.as_deref(),
@@ -1255,7 +1537,10 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
         })
         .collect();
     if note_text.is_empty() {
-        note_text = "Encrypted note — readable only by you and the recipient.".into();
+        note_text = match &st.watch_spend {
+            Some(ws) => format!("{} · {} sats → {}", ws.kind, ws.value, ws.dest),
+            None => "Encrypted note — readable only by you and the recipient.".into(),
+        };
     }
     w.set_confirm_note(note_text.into());
     w.set_confirm_inputs(VecModel::from_slice(&inputs));
@@ -1386,6 +1671,8 @@ pub fn run() {
         signed_psbt: None,
         funding_wallets,
         active_funding_id: None,
+        watch_spend: None,
+        watch_bump: None,
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -1875,22 +2162,29 @@ pub fn run() {
 
     cb!(on_act_retry, |w, s, ref_id: SharedString, is_note: bool| {
         let Some(base) = s.base_url() else { return };
-        let raw = if is_note {
-            s.store
-                .as_ref()
-                .and_then(|st| st.notes.iter().find(|n| n.note_id.as_str() == ref_id.as_str()))
-                .and_then(|n| n.raw_hex.clone())
-        } else {
-            s.store
-                .as_ref()
-                .and_then(|st| st.txs.iter().find(|t| t.txids.iter().any(|x| x == ref_id.as_str())))
-                .and_then(|t| t.raw_hex.clone())
-        };
-        let Some(raw) = raw else {
-            w.set_status("nothing to rebroadcast".into());
-            return;
-        };
         let client = ChainClient::new(HttpTransport::new(base), s.network);
+        let (raw, last_txid) = if is_note {
+            let n = s
+                .store
+                .as_ref()
+                .and_then(|st| st.notes.iter().find(|n| n.note_id.as_str() == ref_id.as_str()));
+            (n.and_then(|n| n.raw_hex.clone()), n.and_then(|n| n.txids.last().cloned()))
+        } else {
+            let t = s
+                .store
+                .as_ref()
+                .and_then(|st| st.txs.iter().find(|t| t.txids.iter().any(|x| x == ref_id.as_str())));
+            (t.and_then(|t| t.raw_hex.clone()), t.and_then(|t| t.txids.last().cloned()))
+        };
+        // Chain-recovered records (watch mode) carry no raw hex — the node
+        // that already knows the tx is the keyless rebroadcast source.
+        let raw = match raw.or_else(|| last_txid.and_then(|t| client.fetch_tx_hex(&t).ok())) {
+            Some(r) if !r.is_empty() => r,
+            _ => {
+                w.set_status("nothing to rebroadcast".into());
+                return;
+            }
+        };
         match client.broadcast(&raw) {
             Ok(txid) => {
                 println!("cb: act-retry ref={ref_id} txid={txid} ok");
@@ -1904,6 +2198,10 @@ pub fn run() {
     });
 
     cb!(on_act_bump_open, |w, s, ref_id: SharedString, is_note: bool| {
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            watch_bump_open(&w, &mut s, ref_id.to_string(), is_note);
+            return;
+        }
         let Some(store) = &s.store else { return };
         let Some((old_rate, fee, vsize)) = tx_rate(store, ref_id.as_str(), is_note) else {
             w.set_status("can't determine current fee rate".into());
@@ -1929,6 +2227,15 @@ pub fn run() {
     cb!(on_act_bump_rate_changed, |w, s, rate_s: SharedString| {
         let ref_id = w.get_bump_ref().to_string();
         let is_note = w.get_bump_is_note();
+        if let Some(wb) =
+            s.watch_bump.as_ref().filter(|wb| wb.ref_id == ref_id && wb.is_note == is_note)
+        {
+            match rate_s.trim().parse::<f64>() {
+                Ok(r) if r > 0.0 => w.set_bump_new_fee(new_fee_line(r, wb.vsize, wb.old_fee).into()),
+                _ => w.set_bump_new_fee("".into()),
+            }
+            return;
+        }
         let Some((_, old_fee, vsize)) = s.store.as_ref().and_then(|st| tx_rate(st, &ref_id, is_note))
         else {
             return;
@@ -1948,6 +2255,10 @@ pub fn run() {
         };
         let net = s.network;
         let Some(base) = s.base_url() else { return };
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            watch_bump_confirm(&w, &mut s, new_rate);
+            return;
+        }
         let min_rate = match s.store.as_ref().and_then(|st| tx_rate(st, &ref_id, is_note)) {
             Some((old_rate, _, _)) => old_rate + 1.0,
             None => {
@@ -1960,7 +2271,7 @@ pub fn run() {
             return;
         }
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-            w.set_bump_error("watch-only identity — no signing key on this device".into());
+            w.set_bump_error("no identity".into());
             return;
         };
         let result: Result<(String, String, u64), app_core::Error> = if is_note {
@@ -2014,6 +2325,34 @@ pub fn run() {
         let net = s.network;
         let Some(ident) = s.ident.as_ref() else { return };
         let Ok(me) = Recipient::parse(net, &ident.address) else { return };
+        if ident.is_watch() {
+            // Dry-run the same builder the watch consolidate signs externally.
+            let Some(src) = ident.watch_source() else { return };
+            let Some(store) = s.store.as_ref() else { return };
+            let coins: Vec<WatchCoin> = store
+                .utxos
+                .iter()
+                .filter(|u| !u.pending_spend)
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                .collect();
+            if coins.len() < 2 {
+                w.set_consolidate_fee_line("nothing to consolidate — need 2+ spendable coins".into());
+                return;
+            }
+            match build_watch_spend_psbt(src, &coins, me.spk.clone(), rate) {
+                Ok(b) => w.set_consolidate_fee_line(
+                    format!(
+                        "fee {} sats · combines {} coins @ {} sat/vB · signs on your external wallet",
+                        b.fee,
+                        coins.len(),
+                        rate
+                    )
+                    .into(),
+                ),
+                Err(e) => w.set_consolidate_fee_line(format!("{e}").into()),
+            }
+            return;
+        }
         let Some(identity) = ident.full().map(|i| i.clone_fields()) else { return };
         let Some(store) = s.store.as_ref() else { return };
         let coins = store.available_utxos();
@@ -2051,12 +2390,18 @@ pub fn run() {
         let rate: f64 = w.get_consolidate_rate().trim().parse().unwrap_or(1.0);
         let net = s.network;
         let Some(base) = s.base_url() else { return };
-        let ident = s.ident.as_ref().unwrap();
         // Self-send: consolidate all spendable coins into one output at
         // our own address.
-        let Ok(me) = Recipient::parse(net, &ident.address) else { return };
-        let Some(identity) = ident.full().map(|i| i.clone_fields()) else {
-            w.set_status("watch-only identity — no signing key on this device".into());
+        let Some(self_addr) = s.ident.as_ref().map(|i| i.address.clone()) else { return };
+        let Ok(me) = Recipient::parse(net, &self_addr) else { return };
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            let spk = me.spk.clone();
+            watch_spend_build(&w, &mut s, "consolidate", self_addr, spk, rate);
+            return;
+        }
+        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields())
+        else {
+            w.set_status("no identity".into());
             return;
         };
         let store = s.store.as_mut().unwrap();
@@ -2105,8 +2450,12 @@ pub fn run() {
             w.set_status(format!("not a valid {} address", net.as_str()).into());
             return;
         };
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            watch_spend_build(&w, &mut s, "sweep", dest.clone(), recipient.spk.clone(), rate);
+            return;
+        }
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-            w.set_status("watch-only identity — no signing key on this device".into());
+            w.set_status("no identity".into());
             return;
         };
         let store = s.store.as_mut().unwrap();
@@ -2713,21 +3062,11 @@ pub fn run() {
         };
         match build_funding_psbt(&plan, &np) {
             Ok(built) => {
-                let frames = app_core::ur::encode_psbt(&built.to_bytes(), 300);
                 let n = coins.len();
-                w.set_psbt_cost_line(
-                    format!("fee {} sats · {n} input{}", built.fee, if n == 1 { "" } else { "s" }).into(),
-                );
-                w.set_psbt_qr(qr::qr_image(&frames[0]).unwrap_or_default());
-                w.set_psbt_frame_label(
-                    if frames.len() > 1 { format!("frame 1 / {}", frames.len()).into() } else { "".into() },
-                );
-                s.ur_frames = frames;
-                s.built_psbt = Some(built);
-                s.signed_psbt = None;
-                w.set_psbt_signed(false);
-                w.set_status("".into());
-                w.set_screen(13);
+                let cost =
+                    format!("fee {} sats · {n} input{}", built.fee, if n == 1 { "" } else { "s" });
+                s.watch_spend = None; // this sign screen serves external funding
+                show_psbt_sign_screen(&w, &mut s, built, cost);
                 println!("cb: fund-build ok");
             }
             Err(e) => w.set_status(format!("{e}").into()),
@@ -2790,7 +3129,7 @@ pub fn run() {
             w.set_status("no Bitcoin node — set one in Settings".into());
             return;
         };
-        let (raw, txid, _v) = match finalize_extract(psbt) {
+        let (raw, txid, vsize) = match finalize_extract(psbt) {
             Ok(x) => x,
             Err(e) => {
                 w.set_status(format!("{e}").into());
@@ -2800,7 +3139,14 @@ pub fn run() {
         let client = ChainClient::new(HttpTransport::new(&base), s.network);
         match client.broadcast(&raw) {
             Ok(_got) => {
-                println!("cb: fund-broadcast txid={txid} ok");
+                if let Some(ws) = s.watch_spend.take() {
+                    // Watch-mode spend: record it so Activity gets the
+                    // pending→confirmed lifecycle, and lock the coins.
+                    record_watch_spend(&mut s, &ws, &txid, &raw, vsize as u64);
+                    println!("cb: watch-{} txid={txid} fee={} ok", ws.kind, ws.fee);
+                } else {
+                    println!("cb: fund-broadcast txid={txid} ok");
+                }
                 w.set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
                 s.funding_coins.clear();
                 s.built_psbt = None;
