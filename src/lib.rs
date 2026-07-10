@@ -1978,7 +1978,20 @@ pub fn run() {
                 Ok(()) => {
                     window.set_screen(4);
                     update_home(&window, &s);
-                    refresh(&window, &mut s);
+                    // Initial sync AFTER the first frame. Blocking the launch
+                    // path on network I/O gets the app killed by the iOS
+                    // launch watchdog (black screen, then 0x8badf00d) when
+                    // started from the home screen — devicectl/Xcode launches
+                    // relax the watchdog, which masked this. A single-shot
+                    // timer lets winit attach the scene and paint first; the
+                    // sync itself stays synchronous, same as a manual ↻.
+                    let w = window.as_weak();
+                    let st_boot = st.clone();
+                    slint::Timer::single_shot(std::time::Duration::from_millis(300), move || {
+                        if let Some(win) = w.upgrade() {
+                            refresh(&win, &mut st_boot.borrow_mut());
+                        }
+                    });
                 }
                 Err(e) => window.set_status(format!("stored key failed: {e}").into()),
             }
