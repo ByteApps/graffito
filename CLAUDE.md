@@ -174,6 +174,18 @@ as text ("‹" and "₿" both burned us — now `chevron-left.svg` /
 `bitcoin.svg`). Android's Roboto is the strictest renderer; check new
 glyphs there first.
 
+**Mobile parity (platform shims + gating).** `src/platform.rs` is the one
+place platform behavior forks: file dialogs (rfd) are macOS-only and every
+file-only button ("From file…", "Load from file…", "Save .psbt",
+"Load .psbt file") is hidden behind the `desktop-platform` slint property
+(set from `cfg!(target_os = "macos")`; captions adapt too) — QR + clipboard
+carry those flows on mobile. `set_clipboard_text` (pbcopy / UIPasteboard /
+JNI ClipboardManager) and `open_url` (`open` / UIApplication
+openURL:options: / JNI ACTION_VIEW intent) are implemented on ALL three
+platforms — never call `pbcopy`/`open` directly. Glyph rule reminder: ↻ and
+⚙ are emulator-proven on Android; ✓ → ⟳ ⚠ tofu — keep glyphs out of caption
+text and use the SVG icons.
+
 **Header back-chevron alignment** is per-platform: the title `Text`
 sits high in its row (fonts reserve descent space), and the offset
 differs per font/renderer. The `Metrics` global in `app.slint` carries

@@ -1104,7 +1104,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
         }
         Err(e) => {
             println!("cb: refresh err={e}");
-            w.set_status("couldn't reach the network — tap ↻ to retry".into());
+            w.set_status("couldn't reach the network — tap refresh to retry".into());
         }
     }
     update_home(w, st);
@@ -1933,6 +1933,17 @@ pub fn run() {
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
     window.set_apple_platform(cfg!(target_vendor = "apple"));
+    window.set_desktop_platform(cfg!(target_os = "macos"));
+    window.set_biometric_name(
+        if cfg!(target_os = "ios") {
+            "Face ID"
+        } else if cfg!(target_os = "android") {
+            "biometrics"
+        } else {
+            "Touch ID"
+        }
+        .into(),
+    );
     // Back-chevron optical nudge: Roboto's line box differs from the Apple
     // system font's, so Android gets its own calibrated value (see the
     // Metrics global in app.slint; Apple platforms keep the -1.25px default).
@@ -2370,21 +2381,13 @@ pub fn run() {
             return;
         }
         println!("cb: open-note-web url={url}");
-        let _ = std::process::Command::new("open").arg(&url).spawn();
+        let _ = platform::open_url(&url);
     });
 
     cb!(on_copy_text, |w, s, kind: SharedString, text: SharedString| {
         let _ = &mut s;
         let _ = &w;
-        use std::io::Write;
-        let ok = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut c| {
-                c.stdin.as_mut().expect("piped").write_all(text.as_bytes())?;
-                c.wait()
-            })
-            .is_ok();
+        let ok = platform::set_clipboard_text(text.as_str());
         println!("cb: copy kind={kind} len={} ok={ok}", text.len());
     });
 
@@ -2568,7 +2571,7 @@ pub fn run() {
             return;
         }
         println!("cb: act-explorer");
-        let _ = std::process::Command::new("open").arg(url.as_str()).spawn();
+        let _ = platform::open_url(url.as_str());
     });
 
     // Fee preview for the consolidate dialog: dry-run the SAME builder the
@@ -2694,7 +2697,7 @@ pub fn run() {
             return;
         }
         println!("cb: open-note-web-url");
-        let _ = std::process::Command::new("open").arg(url.as_str()).spawn();
+        let _ = platform::open_url(url.as_str());
     });
 
     cb!(on_compose_open, |w, s| {
@@ -3583,19 +3586,11 @@ pub fn run() {
     });
 
     cb!(on_psbt_copy, |w, s| {
-        use std::io::Write;
         let b64 = s.built_psbt.as_ref().map(|b| b.to_base64()).unwrap_or_default();
         if b64.is_empty() {
             return;
         }
-        let ok = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut c| {
-                c.stdin.as_mut().expect("piped").write_all(b64.as_bytes())?;
-                c.wait()
-            })
-            .is_ok();
+        let ok = platform::set_clipboard_text(&b64);
         w.set_status(if ok { "copied PSBT (base64)" } else { "copy failed" }.into());
     });
 
