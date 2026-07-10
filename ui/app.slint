@@ -1202,7 +1202,7 @@ export component AppWindow inherits Window {
             }
         }
         // ---- pay from another wallet (external PSBT) ----
-        if !root.watch-only: HorizontalLayout {
+        HorizontalLayout {
             Switch {
                 text: "Pay from another wallet";
                 checked <=> root.fund-external;

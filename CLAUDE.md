@@ -47,8 +47,14 @@ flags — then optional recipient output + change-to-self, own-note rule
 holds since the tx spends from self); the broadcast records the note
 Pending exactly like a keyed compose (`record_watch_note`). `cli
 note-build` + a CC e2e leg prove a watch identity can POST a note.
-Directed-PRIVATE can never work watch-only — the ECDH needs the
-identity key at compose time.
+"Pay from another wallet" works in watch mode too
+(`build_watch_funded_note_psbt`: funding coins pay, dust-to-self keeps
+the note discoverable, gift supported; `cli note-funded-build` + CC e2e
+leg 6) — with the FROZEN-SCAN caveat asserted there: an externally
+funded PUBLIC note re-scans as RECEIVED from the funder (ownership is
+only provable for directed-private; the local record keeps it own; true
+for keyed identities as well). Directed-PRIVATE can never work
+watch-only — the ECDH needs the identity key at compose time.
 
 Design doc + milestone plan (M0–M7): **`../PLAN-chain-notes-app.md`** in
 the prime workspace (this repo is a workspace submodule sibling of the
