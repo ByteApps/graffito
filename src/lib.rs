@@ -3431,15 +3431,78 @@ pub fn run() {
         let src = s.funding.clone().unwrap();
         let coins = s.funding_coins.clone();
         let change_index = s.funding_change_index;
-        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-            w.set_status("watch-only identity — no signing key on this device".into());
-            return;
-        };
         let r = app_core::notes_core::keys::generate_aux_rand()
             .map(|x| [x[0], x[1], x[2], x[3]])
             .unwrap_or([1, 2, 3, 4]);
         let plan =
             FundingPlan { source: &src, coins: &coins, change_index, fee_rate: rate, change_override };
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            // Watch identity + funding wallet: PUBLIC note paid entirely by
+            // the funding coins; both signatures happen externally. Frozen-
+            // scan caveat: a rescan attributes an externally funded PUBLIC
+            // note as received-from-funder — the local record keeps it own.
+            if private {
+                w.set_status("watch-only identities can only compose public notes".into());
+                return;
+            }
+            let output_x = s.ident.as_ref().map(|i| i.output_x()).unwrap_or_default();
+            let gift = if recipient.is_some() {
+                w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+            } else {
+                0
+            };
+            let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
+            match app_core::psbt_build::build_watch_funded_note_psbt(
+                &output_x,
+                &plan,
+                &text,
+                recipient.as_ref().map(|rc| rc.spk.clone()),
+                gift,
+                r,
+                chunk,
+            ) {
+                Ok(built) => {
+                    let payload_outputs = built
+                        .psbt
+                        .unsigned_tx
+                        .output
+                        .iter()
+                        .filter(|o| o.script_pubkey.is_op_return())
+                        .count();
+                    s.watch_spend = None;
+                    s.watch_note = Some(WatchNote {
+                        note_id: r,
+                        text: text.clone(),
+                        recipient: to.clone(),
+                        gift,
+                        chunks: payload_outputs,
+                        fee: built.fee,
+                        change: 0, // funding change isn't an own coin
+                        spent: Vec::new(),
+                    });
+                    let n = coins.len();
+                    let cost = format!(
+                        "public note · fee {} sats · {n} funding input{} · sign with your external wallet{}",
+                        built.fee,
+                        if n == 1 { "" } else { "s" },
+                        if gift > 0 { format!(" · {gift} sats to recipient") } else { String::new() }
+                    );
+                    println!(
+                        "cb: watch-note-build id={} txid={} fee={} chunks={payload_outputs} funded=1",
+                        hex::encode(r),
+                        built.txid,
+                        built.fee
+                    );
+                    show_psbt_sign_screen(&w, &mut s, built, cost);
+                }
+                Err(e) => w.set_status(format!("{e}").into()),
+            }
+            return;
+        }
+        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+            w.set_status("no identity".into());
+            return;
+        };
         let np = NoteParams {
             identity: &identity,
             text: &text,
