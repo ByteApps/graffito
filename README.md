@@ -13,15 +13,25 @@ from the chain plus your key alone.
   a paginated BIP-86 account picker; accounts are switchable later in
   Settings. Key material lives in the macOS Keychain; reveal and unlock
   ask for Touch ID.
+- **Watch-only**: import an account xpub, a key-origin xpub
+  (`[fp/86'/…]xpub…`), or a `tr()` descriptor instead — same address as
+  the full key, public notes and balance visible, private bodies sealed.
+  Everything that needs a signature still works: sweep, consolidate,
+  RBF speed-up, and PUBLIC-note compose build PSBTs signed on your
+  hardware wallet (verified with a real signer), with an optional separate
+  fee wallet ("Pay from another wallet").
 - **Compose**: public or private notes, directed notes to other taproot
   addresses, live cost/change preview, fee-tier picker, coin control
   (pick exactly which UTXOs to spend, incl. unconfirmed), an optional
   custom change address, and a **gift amount** for directed notes
   (choose how many sats reach the recipient; default/minimum is dust).
 - **Manage**: an Activity screen listing every transaction with retry
-  (rebroadcast) and RBF fee-bump for stuck ones; a Coins screen to view
-  and consolidate UTXOs; sweep-all; per-coin/-note links to the tx in
-  your chosen block explorer and to notes in the web viewer.
+  (rebroadcast) and RBF fee-bump for stuck ones; a viewer-first Coins
+  screen whose Consolidate button opens the same compose-like flow as
+  Sweep (fee tiers, live cost line, read-only inputs, optional fee
+  wallet); sweep-all picks its destination like a contact; per-coin/
+  -note links to the tx in your chosen block explorer and to notes in
+  the web viewer.
 - **Settings**: a **Bitcoin node** dropdown (mempool.space / Blockstream
   / your own Esplora-compatible node) selects the API used for scans and
   broadcasts; a separate **Block explorer** dropdown (mempool.space /

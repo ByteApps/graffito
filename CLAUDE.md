@@ -83,14 +83,20 @@ scripts/bundle-mac.sh   # minimal .app (TCC camera permission needs a bundle)
 scripts/regtest-e2e.sh  # app↔Prime interop matrix (host CLIs vs bitcoind)
 ```
 
-Two UI e2e suites in `../ui-automation/tests/` (simtap on the real Mac
-window): `chain-notes-app.sh` (compose→sign→broadcast smoke) and
-`chain-notes-app-matrix.sh` (full journey: hex/WIF/mnemonic import +
-account picker + settings account-switch + reset; create-seed →
-backup/quiz → fund → fee-tier directed private note decrypted by a CLI
-identity → contact rename/remove → chunk/network pills → coins list +
-consolidate → activity). Point offsets are calibrated to the current
-layout — recalibrate from screenshots when app.slint moves controls.
+Three e2e suites in `../ui-automation/tests/`: `chain-notes-app.sh`
+(simtap smoke: compose→sign→broadcast + the sweep flow: Settings button
+→ destination picker → screen 16 → confirm → broadcast) and
+`chain-notes-app-matrix.sh` (full simtap journey: hex/WIF/mnemonic
+import + account picker + settings account-switch + reset; create-seed
+→ backup/quiz → fund → fee-tier directed private note decrypted by a
+CLI identity → contact rename/remove → chunk/network pills → coins
+list + consolidate via screen 16 → activity) drive the real Mac window
+— point offsets are calibrated to the current layout; recalibrate from
+screenshots when app.slint moves controls. The headless
+`chain-notes-watch-signer.sh` drives the hardware-signer sim over its
+socket: watch import → consolidate → sweep → funded sweep →
+public-note compose (self- and fee-wallet-funded), every tx
+signer-signed against live regtest coins.
 
 Screens (`screen` property): 0 onboarding (3 doors) · 1 import (typed/
 QR/file, live format feedback + word autocomplete) · 2 backup words ·
