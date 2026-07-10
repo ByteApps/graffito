@@ -323,6 +323,14 @@ impl<T: Transport> ChainClient<T> {
                 if !ranged || consecutive_unused >= gap {
                     break;
                 }
+                // Backstop against a backend that reports history for EVERY
+                // address (a server-side filter bug once walked this loop
+                // forever): no sane wallet needs more indexes than this.
+                if index >= 10_000 {
+                    return Err(Error::Funding(
+                        "descriptor scan ran away (backend reports every address as used?)".into(),
+                    ));
+                }
             }
             if chain == 1 {
                 next_change_index = first_unused_change.unwrap_or(0);

@@ -16,7 +16,7 @@ use app_core::identity::{parse_key_material, realize, AppIdentity};
 use app_core::notes_core::address::Recipient;
 use app_core::notes_core::Network;
 use app_core::psbt_build::{
-    build_funding_psbt, build_watch_bump_psbt, build_watch_spend_psbt, FundingPlan, NoteParams,
+    build_funded_sweep_psbt,    build_funding_psbt, build_watch_bump_psbt, build_watch_spend_psbt, FundingPlan, NoteParams,
     WatchCoin,
 };
 use app_core::psbt_finalize::{finalize_extract, parse_psbt, validate_signed};
@@ -193,6 +193,55 @@ fn main() {
             println!(
                 "cli: bump-build replaces={} txid={} fee={} -> {}",
                 args[4], built.txid, built.fee, args[6]
+            );
+        }
+        Some("sweep-funded-build") => {
+            // sweep-funded-build <store.json> <base-url> <funding-descriptor> <rate> <out.psbt> <dest>
+            // Watch identity + external fee wallet: the destination receives
+            // the FULL notes balance; the fee comes out of the funding
+            // wallet's coins and its change returns there. Both input sets
+            // carry key origins — sign externally, then spend-broadcast.
+            let store = load(&args[2]);
+            let net = network(&store.network.clone());
+            let ident = identity(net);
+            let src = ident
+                .watch_source()
+                .expect("sweep-funded-build needs watch-only APP_KEY (xpub / descriptor)")
+                .clone();
+            let fund_src = FundingSource::parse(&args[4], net).expect("funding descriptor");
+            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let scan = client.scan_funding(&fund_src, 20).expect("funding scan");
+            assert!(!scan.utxos.is_empty(), "funding wallet has no spendable coins");
+            let rate: f64 = args[5].parse().expect("fee rate");
+            let notes_coins: Vec<WatchCoin> = store
+                .utxos
+                .iter()
+                .filter(|u| !u.pending_spend)
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                .collect();
+            let dest = Recipient::parse(net, &args[7]).expect("dest address");
+            let identity_spk =
+                app_core::notes_core::address::p2tr_script_pubkey(&ident.output_x());
+            let plan = FundingPlan {
+                source: &fund_src,
+                coins: &scan.utxos,
+                change_index: scan.next_change_index,
+                fee_rate: rate,
+                change_override: None,
+            };
+            let built =
+                build_funded_sweep_psbt(identity_spk, Some(&src), &notes_coins, &plan, dest.spk)
+                    .expect("build funded sweep");
+            std::fs::write(&args[6], built.to_bytes()).expect("write psbt");
+            println!(
+                "cli: sweep-funded-build txid={} value={} fee={} change={} notes_in={} fund_in={} -> {}",
+                built.txid,
+                built.sent_to_recipient,
+                built.fee,
+                built.change,
+                notes_coins.len(),
+                scan.utxos.len(),
+                args[6]
             );
         }
         Some("spend-broadcast") => {
