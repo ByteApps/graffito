@@ -1,6 +1,10 @@
-//! Small per-platform shims. On macOS these use native dialogs (rfd); on
-//! mobile they return None for now (file import/export via the platform
-//! document picker is a later step — the QR path covers the mobile flows).
+//! Small per-platform shims. On macOS the file dialogs use rfd; on mobile
+//! they return None (file import/export via the platform document picker is
+//! a later step — the QR + clipboard paths carry the mobile flows, and the
+//! file-only buttons are hidden behind the `desktop-platform` slint
+//! property). Clipboard writes and URL opens ARE implemented per platform:
+//! pbcopy/`open` on macOS, UIPasteboard/UIApplication on iOS,
+//! ClipboardManager/ACTION_VIEW-intent JNI on Android.
 
 use std::path::PathBuf;
 
@@ -106,7 +110,223 @@ pub fn clipboard_text() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(target_os = "android")]
+pub fn clipboard_text() -> Option<String> {
+    match android_jni::clipboard_text() {
+        Ok(t) => t.filter(|s| !s.is_empty()),
+        Err(e) => {
+            eprintln!("clipboard: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 pub fn clipboard_text() -> Option<String> {
     None
+}
+
+/// Write the system clipboard. macOS keeps the pbcopy shell-out the app has
+/// always used; iOS sets UIPasteboard; Android goes through the framework
+/// ClipboardManager over JNI. Returns whether the write took.
+#[cfg(target_os = "macos")]
+pub fn set_clipboard_text(text: &str) -> bool {
+    use std::io::Write;
+    std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            c.stdin.as_mut().expect("piped").write_all(text.as_bytes())?;
+            c.wait()
+        })
+        .is_ok()
+}
+
+#[cfg(target_os = "ios")]
+pub fn set_clipboard_text(text: &str) -> bool {
+    use objc2_foundation::NSString;
+    use objc2_ui_kit::UIPasteboard;
+    let pb = unsafe { UIPasteboard::generalPasteboard() };
+    unsafe { pb.setString(Some(&NSString::from_str(text))) };
+    true
+}
+
+#[cfg(target_os = "android")]
+pub fn set_clipboard_text(text: &str) -> bool {
+    android_jni::set_clipboard(text).map_err(|e| eprintln!("clipboard: {e}")).is_ok()
+}
+
+/// Open a URL in the system browser. macOS `open`, iOS UIApplication,
+/// Android an ACTION_VIEW intent. Returns whether the hand-off happened.
+#[cfg(target_os = "macos")]
+pub fn open_url(url: &str) -> bool {
+    std::process::Command::new("open").arg(url).spawn().is_ok()
+}
+
+#[cfg(target_os = "ios")]
+pub fn open_url(url: &str) -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_foundation::{NSDictionary, NSString, NSURL};
+    use objc2_ui_kit::UIApplication;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let Some(nsurl) = (unsafe { NSURL::URLWithString(&NSString::from_str(url)) }) else {
+        return false;
+    };
+    let app = UIApplication::sharedApplication(mtm);
+    unsafe { app.openURL_options_completionHandler(&nsurl, &NSDictionary::new(), None) };
+    true
+}
+
+#[cfg(target_os = "android")]
+pub fn open_url(url: &str) -> bool {
+    android_jni::open_url(url).map_err(|e| eprintln!("open-url: {e}")).is_ok()
+}
+
+/// Android framework calls used by the shims above — same JNI plumbing as
+/// the Keystore backend (JavaVM + Activity context via ndk_context).
+#[cfg(target_os = "android")]
+mod android_jni {
+    use jni::objects::{JObject, JValue};
+    use jni::JNIEnv;
+
+    const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+
+    fn with_env_ctx<T>(
+        f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<T>,
+    ) -> Result<T, String> {
+        let ctx = ndk_context::android_context();
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }
+            .map_err(|e| format!("JavaVM: {e}"))?;
+        let mut env = vm.attach_current_thread().map_err(|e| format!("attach: {e}"))?;
+        let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+        match f(&mut env, &context) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+                Err(format!("{e}"))
+            }
+        }
+    }
+
+    /// context.getSystemService("clipboard").setPrimaryClip(
+    ///     ClipData.newPlainText("chain-notes", text))
+    pub fn set_clipboard(text: &str) -> Result<(), String> {
+        with_env_ctx(|env, context| {
+            let name = env.new_string("clipboard")?;
+            let cm = env
+                .call_method(
+                    context,
+                    "getSystemService",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                    &[JValue::Object(&name)],
+                )?
+                .l()?;
+            let label = env.new_string("chain-notes")?;
+            let value = env.new_string(text)?;
+            let clip = env
+                .call_static_method(
+                    "android/content/ClipData",
+                    "newPlainText",
+                    "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;",
+                    &[JValue::Object(&label), JValue::Object(&value)],
+                )?
+                .l()?;
+            env.call_method(
+                &cm,
+                "setPrimaryClip",
+                "(Landroid/content/ClipData;)V",
+                &[JValue::Object(&clip)],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// clipboard.getPrimaryClip().getItemAt(0).coerceToText(context)
+    pub fn clipboard_text() -> Result<Option<String>, String> {
+        with_env_ctx(|env, context| {
+            let name = env.new_string("clipboard")?;
+            let cm = env
+                .call_method(
+                    context,
+                    "getSystemService",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                    &[JValue::Object(&name)],
+                )?
+                .l()?;
+            let clip = env
+                .call_method(&cm, "getPrimaryClip", "()Landroid/content/ClipData;", &[])?
+                .l()?;
+            if clip.is_null() {
+                return Ok(None);
+            }
+            let n = env.call_method(&clip, "getItemCount", "()I", &[])?.i()?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let item = env
+                .call_method(
+                    &clip,
+                    "getItemAt",
+                    "(I)Landroid/content/ClipData$Item;",
+                    &[JValue::Int(0)],
+                )?
+                .l()?;
+            let cs = env
+                .call_method(
+                    &item,
+                    "coerceToText",
+                    "(Landroid/content/Context;)Ljava/lang/CharSequence;",
+                    &[JValue::Object(context)],
+                )?
+                .l()?;
+            if cs.is_null() {
+                return Ok(None);
+            }
+            let s = env
+                .call_method(&cs, "toString", "()Ljava/lang/String;", &[])?
+                .l()?;
+            let js = jni::objects::JString::from(s);
+            let out = env.get_string(&js).map(|v| v.to_string_lossy().into_owned())?;
+            Ok(Some(out))
+        })
+    }
+
+    /// context.startActivity(new Intent(ACTION_VIEW, Uri.parse(url))
+    ///     .addFlags(FLAG_ACTIVITY_NEW_TASK))
+    pub fn open_url(url: &str) -> Result<(), String> {
+        with_env_ctx(|env, context| {
+            let url = env.new_string(url)?;
+            let uri = env
+                .call_static_method(
+                    "android/net/Uri",
+                    "parse",
+                    "(Ljava/lang/String;)Landroid/net/Uri;",
+                    &[JValue::Object(&url)],
+                )?
+                .l()?;
+            let action = env.new_string("android.intent.action.VIEW")?;
+            let intent = env.new_object(
+                "android/content/Intent",
+                "(Ljava/lang/String;Landroid/net/Uri;)V",
+                &[JValue::Object(&action), JValue::Object(&uri)],
+            )?;
+            env.call_method(
+                &intent,
+                "addFlags",
+                "(I)Landroid/content/Intent;",
+                &[JValue::Int(FLAG_ACTIVITY_NEW_TASK)],
+            )?;
+            env.call_method(
+                context,
+                "startActivity",
+                "(Landroid/content/Intent;)V",
+                &[JValue::Object(&intent)],
+            )?;
+            Ok(())
+        })
+    }
 }

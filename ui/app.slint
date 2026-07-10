@@ -148,6 +148,7 @@ component SvgIconButton inherits Rectangle {
     ta := TouchArea { clicked => { root.clicked(); } }
     Image {
         source: root.icon == "activity" ? @image-url("icons/activity.svg")
+              : root.icon == "refresh" ? @image-url("icons/refresh.svg")
               : @image-url("icons/copy.svg");
         colorize: root.tint;
         width: root.size;
@@ -454,6 +455,13 @@ export component AppWindow inherits Window {
     // Apple-only UI (iCloud Keychain sync) — hidden on Android, where the
     // keystore is device-bound and there is no iCloud.
     in property <bool> apple-platform: true;
+    // Desktop-only UI (native file dialogs via rfd) — hidden on iOS/Android,
+    // where platform::pick_file/save_file return None and the QR + clipboard
+    // paths carry the flows instead.
+    in property <bool> desktop-platform: true;
+    // What the reveal prompt authenticates with, per platform ("Touch ID" /
+    // "Face ID" / "biometrics") — copy only, the gating is in keychain.rs.
+    in property <string> biometric-name: "Touch ID";
 
     // Backup screen: "Advanced" collapsible + optional user entropy ("salt").
     in-out property <bool> advanced-expanded: false;
@@ -728,7 +736,7 @@ export component AppWindow inherits Window {
         }
         Rectangle { height: 6px; }
         Caption {
-            text: "⚠  This app holds a hot key on an online computer. Fund it with note-fee money only.";
+            text: "This app holds a hot key on an online device — fund it with note-fee money only.";
         }
         Caption { text: root.status; color: Pal.bad; }
     }
@@ -763,7 +771,7 @@ export component AppWindow inherits Window {
             spacing: 10px;
             GhostButton { text: "Paste"; clicked => { root.paste-import(); } }
             GhostButton { text: "Scan QR"; clicked => { root.import-scan(); } }
-            GhostButton { text: "From file…"; clicked => { root.import-file(); } }
+            if root.desktop-platform: GhostButton { text: "From file…"; clicked => { root.import-file(); } }
         }
         if root.apple-platform: Switch {
             text: "Back up to iCloud";
@@ -844,7 +852,7 @@ export component AppWindow inherits Window {
                     }
                 }
                 if root.advanced-expanded: Caption {
-                    text: "Add extra entropy — dice rolls, random words, anything. It's hashed with the device's secure RNG, so it can only ADD randomness. Press ↻ or Enter to reroll.";
+                    text: "Add extra entropy — dice rolls, random words, anything. It's hashed with the device's secure RNG, so it can only ADD randomness. Press the reroll button or Enter to reroll.";
                 }
                 if root.advanced-expanded: HorizontalLayout {
                     spacing: 8px;
@@ -853,9 +861,9 @@ export component AppWindow inherits Window {
                         text <=> root.entropy-salt;
                         accepted => { root.regenerate-words(); }
                     }
-                    IconButton {
-                        glyph: "↻";
-                        glyph-color: Pal.text;
+                    SvgIconButton {
+                        icon: "refresh";
+                        tint: Pal.text;
                         clicked => { root.regenerate-words(); }
                     }
                 }
@@ -904,7 +912,7 @@ export component AppWindow inherits Window {
                 vertical-alignment: center;
             }
             Rectangle { }
-            IconButton { glyph: "↻"; clicked => { root.refresh(); } }
+            SvgIconButton { icon: "refresh"; clicked => { root.refresh(); } }
             SvgIconButton { icon: "activity"; clicked => { root.open-activity(); } }
             IconButton { glyph: "⚙"; clicked => { root.settings-open(); } }
         }
@@ -1058,7 +1066,7 @@ export component AppWindow inherits Window {
             GhostButton { text: "Copy txid"; clicked => { root.copy-text("txid", root.note-txid); } }
         }
         if root.note-pending: Caption {
-            text: "Still unconfirmed — speed it up or rebroadcast from Activity (⟳ icon on the home screen).";
+            text: "Still unconfirmed — speed it up or rebroadcast from Activity (the pulse icon on the home screen).";
         }
         if root.note-web-url != "": GhostButton {
             text: "Open in web viewer";
@@ -1258,9 +1266,9 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                         Rectangle { }
-                        IconButton {
-                            glyph: "↻";
-                            glyph-size: 15px;
+                        SvgIconButton {
+                            icon: "refresh";
+                            size: 14px;
                             width: 28px;
                             height: 22px;
                             clicked => { root.refresh-coins(); }
@@ -1685,7 +1693,7 @@ export component AppWindow inherits Window {
             subtitle: root.watch-only
                 ? "Shows the watch-only key material (xpub) you imported — stored in your keychain, and in iCloud if enabled, like any key. It can't spend and can't read private notes."
                 : "Shows the exact key material you imported or created. Anyone who sees it controls the funds and every private note.";
-            GhostButton { text: "Reveal backup  ·  asks for Touch ID"; clicked => { root.reveal-backup(); } }
+            GhostButton { text: "Reveal backup  ·  asks for \{root.biometric-name}"; clicked => { root.reveal-backup(); } }
             if root.reveal-text != "": VerticalLayout {
                 spacing: 8px;
                 Rectangle {
@@ -1929,7 +1937,7 @@ export component AppWindow inherits Window {
             }
             ScanButton { clicked => { root.funding-scan(); } }
         }
-        HorizontalLayout {
+        if root.desktop-platform: HorizontalLayout {
             alignment: start;
             GhostButton {
                 width: 140px;
@@ -1971,7 +1979,9 @@ export component AppWindow inherits Window {
             back => { root.screen = root.watch-only ? 8 : 6; }
         }
         Caption {
-            text: "Scan this with your wallet (or save the file), sign it there, then bring the signed PSBT back.";
+            text: root.desktop-platform
+                ? "Scan this with your wallet (or save the file), sign it there, then bring the signed PSBT back."
+                : "Scan this with your wallet, sign it there, then bring the signed PSBT back.";
         }
         if root.psbt-cost-line != "": Text {
             text: root.psbt-cost-line;
@@ -2005,7 +2015,7 @@ export component AppWindow inherits Window {
         }
         HorizontalLayout {
             spacing: 10px;
-            GhostButton { text: "Save .psbt"; clicked => { root.psbt-save(); } }
+            if root.desktop-platform: GhostButton { text: "Save .psbt"; clicked => { root.psbt-save(); } }
             GhostButton { text: "Copy"; clicked => { root.psbt-copy(); } }
         }
         PrimaryButton {
@@ -2025,11 +2035,13 @@ export component AppWindow inherits Window {
             back => { root.screen = 13; }
         }
         if !root.psbt-signed: Caption {
-            text: "Load the signed PSBT from your wallet — file or QR.";
+            text: root.desktop-platform
+                ? "Load the signed PSBT from your wallet — file or QR."
+                : "Scan the signed PSBT from your wallet.";
         }
         if !root.psbt-signed: HorizontalLayout {
             spacing: 10px;
-            GhostButton { text: "Load .psbt file"; clicked => { root.psbt-import-file(); } }
+            if root.desktop-platform: GhostButton { text: "Load .psbt file"; clicked => { root.psbt-import-file(); } }
             GhostButton { text: "Scan QR"; clicked => { root.psbt-import-scan(); } }
         }
         if root.psbt-signed: Flickable {
@@ -2198,9 +2210,9 @@ export component AppWindow inherits Window {
                             Caption { text: fw.meta; }
                         }
                         PencilButton { clicked => { root.fund-rename-start(fw.id, fw.label); } }
-                        IconButton {
-                            glyph: "↻";
-                            glyph-size: 15px;
+                        SvgIconButton {
+                            icon: "refresh";
+                            size: 14px;
                             width: 32px;
                             height: 32px;
                             clicked => { root.refresh-funding-wallet(fw.id); }
