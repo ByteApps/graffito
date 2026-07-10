@@ -216,6 +216,161 @@ pub fn build_watch_bump_psbt(
     })
 }
 
+/// Sweep where an EXTERNAL wallet pays the fee: every notes coin rides in
+/// FULL to `dest_spk`, the fee comes out of the funding coins, and change
+/// (when ≥ dust) returns to the funding wallet. `identity_source` adds key
+/// origins to the notes inputs for watch identities (their signer must
+/// recognize them); keyed identities pass None and sign their own inputs
+/// via [`sign_own_taproot_inputs`].
+pub fn build_funded_sweep_psbt(
+    identity_spk: Vec<u8>,
+    identity_source: Option<&FundingSource>,
+    notes_coins: &[WatchCoin],
+    plan: &FundingPlan,
+    dest_spk: Vec<u8>,
+) -> Result<BuiltPsbt, Error> {
+    if notes_coins.is_empty() {
+        return Err(Error::Funding("nothing to sweep".into()));
+    }
+    if plan.coins.is_empty() {
+        return Err(Error::Funding("no funding coins selected".into()));
+    }
+    let notes_spk = ScriptBuf::from_bytes(identity_spk);
+    let mut inputs = Vec::new();
+    let mut prevouts = Vec::new();
+    let mut weights = Vec::new();
+    for coin in notes_coins {
+        let txid = Txid::from_str(&coin.txid).map_err(|e| Error::Funding(format!("bad txid: {e}")))?;
+        inputs.push(TxIn {
+            previous_output: OutPoint { txid, vout: coin.vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        });
+        prevouts.push(TxOut { value: Amount::from_sat(coin.value), script_pubkey: notes_spk.clone() });
+        weights.push(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH);
+    }
+    let funding_weight = match plan.source.kind {
+        crate::funding::FundingKind::Taproot => InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH,
+        crate::funding::FundingKind::Wpkh => InputWeightPrediction::P2WPKH_MAX,
+    };
+    for coin in plan.coins {
+        let txid = Txid::from_str(&coin.txid).map_err(|e| Error::Funding(format!("bad txid: {e}")))?;
+        inputs.push(TxIn {
+            previous_output: OutPoint { txid, vout: coin.vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        });
+        let spk = ScriptBuf::from_bytes(plan.source.derive(coin.chain, coin.index)?.spk);
+        prevouts.push(TxOut { value: Amount::from_sat(coin.value), script_pubkey: spk });
+        weights.push(funding_weight);
+    }
+
+    let notes_total: u64 = notes_coins.iter().map(|c| c.value).sum();
+    let funding_total: u64 = plan.coins.iter().map(|c| c.value).sum();
+    let mut outputs =
+        vec![TxOut { value: Amount::from_sat(notes_total), script_pubkey: ScriptBuf::from_bytes(dest_spk) }];
+    let change_spk = match &plan.change_override {
+        Some(spk) => ScriptBuf::from_bytes(spk.clone()),
+        None => ScriptBuf::from_bytes(plan.source.derive(1, plan.change_index)?.spk),
+    };
+    // Fee entirely from the funding side: prefer a change output, else fold
+    // the sub-dust remainder into the fee (same policy as build_funding_psbt).
+    let base_lens: Vec<usize> = outputs.iter().map(|o| o.script_pubkey.len()).collect();
+    let mut selected: Option<(u64, u64, bool)> = None;
+    for with_change in [true, false] {
+        let mut lens = base_lens.clone();
+        if with_change {
+            lens.push(change_spk.len());
+        }
+        let vsize = predict_weight(weights.iter().copied(), lens.iter().copied()).to_vbytes_ceil();
+        let fee = (vsize as f64 * plan.fee_rate).ceil() as u64;
+        if funding_total < fee {
+            continue;
+        }
+        let change = funding_total - fee;
+        if with_change {
+            if change >= DUST_LIMIT {
+                selected = Some((fee, change, true));
+                break;
+            }
+        } else {
+            selected = Some((funding_total, 0, false));
+            break;
+        }
+    }
+    let (fee, change, with_change) = selected
+        .ok_or_else(|| Error::Funding("funding coins don't cover the sweep fee".into()))?;
+    if with_change {
+        outputs.push(TxOut { value: Amount::from_sat(change), script_pubkey: change_spk });
+    }
+
+    let tx = Transaction { version: Version::TWO, lock_time: LockTime::ZERO, input: inputs, output: outputs };
+    let txid = tx.compute_txid().to_string();
+    let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| Error::Funding(format!("psbt: {e}")))?;
+    for (i, prevout) in prevouts.iter().enumerate() {
+        psbt.inputs[i].witness_utxo = Some(prevout.clone());
+    }
+    if let Some(src) = identity_source {
+        let def = src.definite(0, 0)?;
+        for i in 0..notes_coins.len() {
+            psbt.inputs[i]
+                .update_with_descriptor_unchecked(&def)
+                .map_err(|e| Error::Funding(format!("identity key origins: {e}")))?;
+        }
+    }
+    for (j, coin) in plan.coins.iter().enumerate() {
+        let i = notes_coins.len() + j;
+        let def = plan.source.definite(coin.chain, coin.index)?;
+        psbt.inputs[i]
+            .update_with_descriptor_unchecked(&def)
+            .map_err(|e| Error::Funding(format!("funding key origins: {e}")))?;
+    }
+    Ok(BuiltPsbt { psbt, fee, change, sent_to_recipient: notes_total, dust_to_self: 0, txid })
+}
+
+/// Sign every PSBT input whose prevout is `p2tr(output_x)` with the
+/// identity's tweaked key (BIP-341 key-path, ALL-prevouts, default
+/// sighash) — the app's half of a mixed sweep (its own coins + an
+/// external fee wallet's). Returns how many inputs it signed.
+pub fn sign_own_taproot_inputs(
+    psbt: &mut Psbt,
+    output_x: &[u8; 32],
+    tweaked_seckey: &[u8; 32],
+) -> Result<usize, Error> {
+    use bitcoin::sighash::{Prevouts, SighashCache};
+    use bitcoin::TapSighashType;
+    let self_spk = ScriptBuf::from_bytes(notes_core::address::p2tr_script_pubkey(output_x));
+    let prevouts: Vec<TxOut> = psbt
+        .inputs
+        .iter()
+        .map(|i| i.witness_utxo.clone().ok_or_else(|| Error::Funding("input missing witness_utxo".into())))
+        .collect::<Result<_, _>>()?;
+    let tx = psbt.unsigned_tx.clone();
+    let mut cache = SighashCache::new(&tx);
+    let mut signed = 0;
+    for (i, pin) in psbt.inputs.iter_mut().enumerate() {
+        if prevouts[i].script_pubkey != self_spk {
+            continue;
+        }
+        let sighash = cache
+            .taproot_key_spend_signature_hash(i, &Prevouts::All(&prevouts), TapSighashType::Default)
+            .map_err(|e| Error::Funding(format!("sighash: {e}")))?;
+        let msg: [u8; 32] = *sighash.as_ref();
+        let aux = notes_core::keys::generate_aux_rand()
+            .map_err(|_| Error::Funding("aux randomness unavailable".into()))?;
+        let sig = notes_core::sign::schnorr_sign(tweaked_seckey, &msg, &aux)?;
+        pin.tap_key_sig = Some(bitcoin::taproot::Signature {
+            signature: bitcoin::secp256k1::schnorr::Signature::from_slice(&sig)
+                .map_err(|e| Error::Funding(e.to_string()))?,
+            sighash_type: TapSighashType::Default,
+        });
+        signed += 1;
+    }
+    Ok(signed)
+}
+
 /// Build the unsigned funding PSBT. Fails with `Error::Funding` on bad coins,
 /// insufficient funds, or descriptor derivation problems.
 pub fn build_funding_psbt(plan: &FundingPlan, note: &NoteParams) -> Result<BuiltPsbt, Error> {
@@ -501,6 +656,112 @@ mod tests {
         // Sweeping less than fee+dust is rejected.
         let tiny = vec![WatchCoin { txid: "c".repeat(64), vout: 0, value: 400 }];
         assert!(build_watch_spend_psbt(&src, &tiny, dest, 2.0).is_err());
+    }
+
+    /// Fee-funded sweep, both identity flavors: the notes balance rides in
+    /// FULL to the destination, the external wallet pays the fee. Keyed:
+    /// the app signs its own taproot inputs (sign_own_taproot_inputs) and
+    /// the funding master signs the rest. Watch: both sides sign via key
+    /// origins. Finalizes to a valid network tx either way.
+    #[test]
+    fn funded_sweep_full_value_mixed_signing() {
+        use crate::psbt_finalize::{finalize_extract, validate_signed};
+        use bitcoin::bip32::{Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+        use notes_core::sign::schnorr_verify;
+
+        let secp = Secp256k1::new();
+        // Funding wallet (external), taproot descriptor with origin.
+        let acct_path = [
+            bitcoin::bip32::ChildNumber::from_hardened_idx(86).unwrap(),
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+        ];
+        let fund_master = Xpriv::new_master(bitcoin::Network::Bitcoin, &[0x33u8; 32]).unwrap();
+        let fund_xpub = Xpub::from_priv(&secp, &fund_master.derive_priv(&secp, &acct_path).unwrap());
+        let fp = fund_master.fingerprint(&secp);
+        let fund_src =
+            FundingSource::parse(&format!("tr([{fp}/86'/0'/0']{fund_xpub}/<0;1>/*)"), NET).unwrap();
+        let fund_addr = fund_src.derive(0, 0).unwrap();
+        let fund_coins = vec![FundingUtxo {
+            txid: "d".repeat(64),
+            vout: 0,
+            value: 5_000,
+            address: fund_addr.address,
+            chain: 0,
+            index: 0,
+            confirmed: true,
+        }];
+        let plan = FundingPlan {
+            source: &fund_src,
+            coins: &fund_coins,
+            change_index: 0,
+            fee_rate: 2.0,
+            change_override: None,
+        };
+        let dest = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let dest_spk = notes_core::address::p2tr_script_pubkey(&dest.output_x);
+
+        // ---- keyed identity: app signs its inputs, funding master the rest.
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let alice_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
+        let notes_coins = vec![
+            WatchCoin { txid: "e".repeat(64), vout: 0, value: 60_000 },
+            WatchCoin { txid: "f".repeat(64), vout: 1, value: 40_000 },
+        ];
+        let built =
+            build_funded_sweep_psbt(alice_spk.clone(), None, &notes_coins, &plan, dest_spk.clone())
+                .unwrap();
+        assert_eq!(built.sent_to_recipient, 100_000, "full notes balance to dest");
+        let tx = &built.psbt.unsigned_tx;
+        assert!(tx.output.iter().any(|o| o.script_pubkey.as_bytes() == dest_spk && o.value.to_sat() == 100_000));
+        assert_eq!(5_000, built.fee + built.change, "fee comes from the funding side only");
+
+        let mut psbt = built.psbt.clone();
+        let n = sign_own_taproot_inputs(&mut psbt, &alice.output_x, &alice.tweaked_seckey).unwrap();
+        assert_eq!(n, 2, "both notes inputs signed by the app");
+        // The app's signatures verify against the identity's output key.
+        {
+            use bitcoin::sighash::{Prevouts, SighashCache};
+            let prevouts: Vec<_> =
+                psbt.inputs.iter().map(|i| i.witness_utxo.clone().unwrap()).collect();
+            let mut cache = SighashCache::new(&psbt.unsigned_tx);
+            for i in 0..2 {
+                let sh = cache
+                    .taproot_key_spend_signature_hash(
+                        i,
+                        &Prevouts::All(&prevouts),
+                        bitcoin::TapSighashType::Default,
+                    )
+                    .unwrap();
+                let sig = psbt.inputs[i].tap_key_sig.unwrap();
+                assert!(schnorr_verify(&alice.output_x, sh.as_ref(), sig.signature.as_ref()));
+            }
+        }
+        let _ = psbt.sign(&fund_master, &secp); // funding wallet signs its input
+        validate_signed(&psbt, &built.txid).expect("all inputs signed");
+        let (raw, txid, _) = finalize_extract(psbt).expect("finalize mixed tx");
+        assert_eq!(txid, built.txid);
+        assert!(!raw.is_empty());
+
+        // ---- watch identity: notes inputs carry origins; its master signs.
+        let id_master = Xpriv::new_master(bitcoin::Network::Bitcoin, &[0x44u8; 32]).unwrap();
+        let id_xpub = Xpub::from_priv(&secp, &id_master.derive_priv(&secp, &acct_path).unwrap());
+        let id_fp = id_master.fingerprint(&secp);
+        let id_src = FundingSource::parse(
+            &format!("tr([{id_fp}/86'/0'/0']{id_xpub}/<0;1>/*)"),
+            NET,
+        )
+        .unwrap();
+        let id_spk = id_src.derive(0, 0).unwrap().spk;
+        let built =
+            build_funded_sweep_psbt(id_spk, Some(&id_src), &notes_coins, &plan, dest_spk).unwrap();
+        assert!(!built.psbt.inputs[0].tap_key_origins.is_empty(), "identity origins present");
+        let mut psbt = built.psbt.clone();
+        let _ = psbt.sign(&id_master, &secp);
+        let _ = psbt.sign(&fund_master, &secp);
+        validate_signed(&psbt, &built.txid).expect("two external signers");
+        assert!(finalize_extract(psbt).is_ok());
     }
 
     #[test]
