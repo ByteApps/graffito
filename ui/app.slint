@@ -953,8 +953,8 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        if !root.watch-only: PrimaryButton { text: "+  Compose note"; clicked => { root.compose-open(); } }
-        if root.watch-only: Caption { text: "Watch-only — this device can read the notebook but holds no key to compose."; }
+        PrimaryButton { text: "+  Compose note"; clicked => { root.compose-open(); } }
+        if root.watch-only: Caption { text: "Watch-only — public notes only, signed on your external wallet. Private notes need the key."; }
         Caption { text: root.notes.length == 0
             ? (root.watch-only ? "No notes on this address yet." : "No notes yet — fund the address above, then compose.")
             : "Notebook"; }
@@ -1122,7 +1122,7 @@ export component AppWindow inherits Window {
             text <=> root.compose-text;
             edited => { root.compose-changed(); }
         }
-        HorizontalLayout {
+        if !root.watch-only: HorizontalLayout {
             spacing: 12px;
             Switch {
                 text: "Private";
@@ -1130,6 +1130,9 @@ export component AppWindow inherits Window {
                 toggled => { root.compose-changed(); }
             }
             Rectangle { }
+        }
+        if root.watch-only: Caption {
+            text: "Watch-only: public notes only — sealing needs the encryption key, which stays on your other device.";
         }
         HorizontalLayout {
             spacing: 8px;
@@ -1199,7 +1202,7 @@ export component AppWindow inherits Window {
             }
         }
         // ---- pay from another wallet (external PSBT) ----
-        HorizontalLayout {
+        if !root.watch-only: HorizontalLayout {
             Switch {
                 text: "Pay from another wallet";
                 checked <=> root.fund-external;
@@ -1427,7 +1430,7 @@ export component AppWindow inherits Window {
                 : "⚠  Public notes are world-readable, forever.";
         }
         if !root.fund-external: PrimaryButton {
-            text: "Sign + broadcast";
+            text: root.watch-only ? "Build transaction to sign" : "Sign + broadcast";
             tint: root.spend-enough ? Pal.accent : Pal.faint;
             tint-hover: root.spend-enough ? Pal.accent-hover : Pal.faint;
             clicked => { if (root.spend-enough) { root.compose-send(); } }
