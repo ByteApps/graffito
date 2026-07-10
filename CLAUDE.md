@@ -186,6 +186,14 @@ platforms — never call `pbcopy`/`open` directly. Glyph rule reminder: ↻ and
 ⚙ are emulator-proven on Android; ✓ → ⟳ ⚠ tofu — keep glyphs out of caption
 text and use the SVG icons.
 
+**iOS launch-path rule (watchdog).** NOTHING network-bound may run before
+the first frame: the boot-identity sync runs from a 300 ms single-shot
+timer after the scene attaches (`81d6c2e`). Blocking launch on HTTP got
+the app killed by the iOS launch watchdog on a home-screen tap (black
+screen → `0x8badf00d`) — and devicectl/Xcode launches RELAX the watchdog,
+so the bug is invisible from tooling; always confirm a device build by
+tapping the icon. Verified working on Satoshi's iPhone.
+
 **Header back-chevron alignment** is per-platform: the title `Text`
 sits high in its row (fonts reserve descent space), and the offset
 differs per font/renderer. The `Metrics` global in `app.slint` carries

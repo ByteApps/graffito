@@ -1,6 +1,8 @@
 # chain-notes-app
 
-Native Mac app (iOS/Android planned — phase 4) for **chain notes**:
+Native Mac + mobile app for **chain notes** (the iOS/Android port is
+merged and runs on real hardware — iPhone-verified; Android green on the
+emulator; see `../PLAN-chain-notes-app-phase4.md` in the prime workspace):
 personal notes on the bitcoin blockchain (PNTE protocol, shared with
 [prime-chain-notes](https://github.com/ObjSal/prime-chain-notes)).
 Compose public or encrypted notes, send directed private notes to other
