@@ -16,7 +16,7 @@ use app_core::identity::{parse_key_material, realize, AppIdentity};
 use app_core::notes_core::address::Recipient;
 use app_core::notes_core::Network;
 use app_core::psbt_build::{
-    build_funded_sweep_psbt,    build_funding_psbt, build_watch_bump_psbt, build_watch_spend_psbt, FundingPlan, NoteParams,
+    build_funded_sweep_psbt, build_watch_note_psbt,    build_funding_psbt, build_watch_bump_psbt, build_watch_spend_psbt, FundingPlan, NoteParams,
     WatchCoin,
 };
 use app_core::psbt_finalize::{finalize_extract, parse_psbt, validate_signed};
@@ -242,6 +242,52 @@ fn main() {
                 notes_coins.len(),
                 scan.utxos.len(),
                 args[6]
+            );
+        }
+        Some("note-build") => {
+            // note-build <store.json> <text> <rate> <out.psbt> [dest] [gift]
+            // Watch identity: PUBLIC note PSBT over every spendable coin
+            // (dest ⇒ directed-public with a gift, default dust). Sign
+            // externally, then spend-broadcast; the note comes back via scan.
+            let store = load(&args[2]);
+            let net = network(&store.network.clone());
+            let ident = identity(net);
+            let src = ident
+                .watch_source()
+                .expect("note-build needs watch-only APP_KEY (xpub / descriptor)")
+                .clone();
+            let text = &args[3];
+            let rate: f64 = args[4].parse().expect("fee rate");
+            let coins: Vec<WatchCoin> = store
+                .utxos
+                .iter()
+                .filter(|u| !u.pending_spend)
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                .collect();
+            let recipient = args.get(6).map(|a| Recipient::parse(net, a).expect("dest address"));
+            let gift: u64 = args.get(7).and_then(|g| g.parse().ok()).unwrap_or(330);
+            let aux = app_core::notes_core::keys::generate_aux_rand().expect("rng");
+            let note_id = [aux[0], aux[1], aux[2], aux[3]];
+            let built = build_watch_note_psbt(
+                &src,
+                &coins,
+                text,
+                recipient.as_ref().map(|r| r.spk.clone()),
+                if recipient.is_some() { gift } else { 0 },
+                note_id,
+                store.chunk_size,
+                rate,
+            )
+            .expect("build note psbt");
+            std::fs::write(&args[5], built.to_bytes()).expect("write psbt");
+            println!(
+                "cli: note-build id={} txid={} fee={} gift={} inputs={} -> {}",
+                hex::encode(note_id),
+                built.txid,
+                built.fee,
+                built.sent_to_recipient,
+                coins.len(),
+                args[5]
             );
         }
         Some("spend-broadcast") => {

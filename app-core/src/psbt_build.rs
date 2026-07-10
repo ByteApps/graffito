@@ -216,6 +216,88 @@ pub fn build_watch_bump_psbt(
     })
 }
 
+/// A WATCH identity's self-funded PUBLIC note: OP_RETURN chunks + an
+/// optional directed-recipient output (`recipient_amount` ≥ dust, the
+/// gift) + change back to the notes address, spending the identity's own
+/// coins — the tx spends from self, so the own-note rule holds on scan.
+/// Output order matches the on-device compose (OP_RETURNs, recipient,
+/// change), keeping the ledger's change-vout convention. PUBLIC only:
+/// sealing needs the enc/DM keys, which a watch device doesn't hold.
+pub fn build_watch_note_psbt(
+    source: &FundingSource,
+    coins: &[WatchCoin],
+    text: &str,
+    recipient_spk: Option<Vec<u8>>,
+    recipient_amount: u64,
+    note_id: [u8; 4],
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+) -> Result<BuiltPsbt, Error> {
+    if coins.is_empty() {
+        return Err(Error::Funding("no coins selected".into()));
+    }
+    if text.is_empty() {
+        return Err(Error::Funding("empty note".into()));
+    }
+    let flags = if recipient_spk.is_some() { notes_core::envelope::FLAG_DIRECTED } else { 0 };
+    let payloads =
+        notes_core::envelope::encode_chunks(note_id, flags, text.as_bytes(), max_op_return_bytes)?;
+    let (inputs, prevouts, weights) = taproot_keyspend_inputs(source, coins)?;
+    let self_spk = ScriptBuf::from_bytes(source.derive(0, 0)?.spk);
+
+    let mut outputs: Vec<TxOut> = payloads
+        .iter()
+        .map(|p| TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(op_return_script(p)) })
+        .collect();
+    let mut sent_to_recipient = 0u64;
+    if let Some(spk) = &recipient_spk {
+        if recipient_amount < DUST_LIMIT {
+            return Err(Error::Funding(format!("gift below dust ({DUST_LIMIT} sats minimum)")));
+        }
+        outputs.push(TxOut {
+            value: Amount::from_sat(recipient_amount),
+            script_pubkey: ScriptBuf::from_bytes(spk.clone()),
+        });
+        sent_to_recipient = recipient_amount;
+    }
+
+    // Fee/change: prefer change back to self; a sub-dust remainder folds
+    // into the fee (build_funding_psbt's policy).
+    let in_value: u64 = coins.iter().map(|c| c.value).sum();
+    let base_lens: Vec<usize> = outputs.iter().map(|o| o.script_pubkey.len()).collect();
+    let mut selected: Option<(u64, u64, bool)> = None;
+    for with_change in [true, false] {
+        let mut lens = base_lens.clone();
+        if with_change {
+            lens.push(self_spk.len());
+        }
+        let vsize = predict_weight(weights.iter().copied(), lens.iter().copied()).to_vbytes_ceil();
+        let fee = (vsize as f64 * fee_rate).ceil() as u64;
+        if in_value < sent_to_recipient + fee {
+            continue;
+        }
+        let change = in_value - sent_to_recipient - fee;
+        if with_change {
+            if change >= DUST_LIMIT {
+                selected = Some((fee, change, true));
+                break;
+            }
+        } else {
+            selected = Some((in_value - sent_to_recipient, 0, false));
+            break;
+        }
+    }
+    let (fee, change, with_change) =
+        selected.ok_or_else(|| Error::Funding("selected coins don't cover the note + fee".into()))?;
+    let mut outputs = outputs;
+    if with_change {
+        outputs.push(TxOut { value: Amount::from_sat(change), script_pubkey: self_spk });
+    }
+
+    let (psbt, txid) = assemble_watch_psbt(source, coins, inputs, prevouts, outputs)?;
+    Ok(BuiltPsbt { psbt, fee, change, sent_to_recipient, dust_to_self: 0, txid })
+}
+
 /// Sweep where an EXTERNAL wallet pays the fee: every notes coin rides in
 /// FULL to `dest_spk`, the fee comes out of the funding coins, and change
 /// (when ≥ dust) returns to the funding wallet. `identity_source` adds key
@@ -762,6 +844,96 @@ mod tests {
         let _ = psbt.sign(&fund_master, &secp);
         validate_signed(&psbt, &built.txid).expect("two external signers");
         assert!(finalize_extract(psbt).is_ok());
+    }
+
+    /// Watch compose (public notes): the PSBT spends the identity's own
+    /// coins (own-note rule), its OP_RETURN bytes decode as the note, a
+    /// directed variant delivers the gift to the recipient, and the
+    /// identity's external master signs it into a valid network tx.
+    #[test]
+    fn watch_note_psbt_public_own_and_directed() {
+        use crate::psbt_finalize::{finalize_extract, validate_signed};
+        use bitcoin::bip32::{Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+        use notes_core::bundle::{extract_notes_watch, OnchainTx, SyncBundle};
+
+        let secp = Secp256k1::new();
+        let acct_path = [
+            bitcoin::bip32::ChildNumber::from_hardened_idx(86).unwrap(),
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+        ];
+        let master = Xpriv::new_master(bitcoin::Network::Bitcoin, &[0x55u8; 32]).unwrap();
+        let xpub = Xpub::from_priv(&secp, &master.derive_priv(&secp, &acct_path).unwrap());
+        let fp = master.fingerprint(&secp);
+        let src = FundingSource::parse(&format!("tr([{fp}/86'/0'/0']{xpub}/<0;1>/*)"), NET).unwrap();
+        let self_addr = src.derive(0, 0).unwrap();
+        let coins = vec![WatchCoin { txid: "9".repeat(64), vout: 0, value: 50_000 }];
+
+        // Self public note.
+        let built = build_watch_note_psbt(
+            &src, &coins, "public from a watch device", None, 0, [1, 2, 3, 4], 80, 2.0,
+        )
+        .unwrap();
+        assert_eq!(built.sent_to_recipient, 0);
+        assert_eq!(50_000, built.fee + built.change);
+        let mut psbt = built.psbt.clone();
+        let _ = psbt.sign(&master, &secp);
+        validate_signed(&psbt, &built.txid).expect("identity master signs");
+        let (_raw, txid, _) = finalize_extract(psbt).expect("finalize");
+        assert_eq!(txid, built.txid);
+
+        // The scan sees an OWN public note (tx spends from self).
+        let payloads: Vec<String> = built
+            .psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .filter_map(|o| notes_core::tx::op_return_payload(o.script_pubkey.as_bytes()).map(hex::encode))
+            .collect();
+        let bundle = SyncBundle {
+            network: "mainnet".into(),
+            notes_onchain: vec![OnchainTx {
+                txid: built.txid.clone(),
+                height: Some(1),
+                blocktime: Some(1),
+                spends_from_self: true,
+                payloads,
+                pays_self: true,
+                sender: None,
+                author_candidates: vec![],
+                recipient: None,
+            }],
+            ..Default::default()
+        };
+        let notes = extract_notes_watch(&bundle, NET);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].text.as_deref(), Some("public from a watch device"));
+        assert!(!notes[0].private && !notes[0].received);
+
+        // Directed public with a gift: recipient output carries the sats,
+        // change returns to self, and sub-dust gifts are rejected.
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let to_bob = Recipient::parse(NET, &bob.address(NET)).unwrap();
+        let built = build_watch_note_psbt(
+            &src, &coins, "hi bob", Some(to_bob.spk.clone()), 1_000, [5, 6, 7, 8], 80, 2.0,
+        )
+        .unwrap();
+        assert_eq!(built.sent_to_recipient, 1_000);
+        assert_eq!(50_000, built.fee + built.change + 1_000);
+        let tx = &built.psbt.unsigned_tx;
+        assert!(tx.output.iter().any(|o| o.script_pubkey.as_bytes() == to_bob.spk && o.value.to_sat() == 1_000));
+        // Change is the LAST output, back to the notes address (ledger rule).
+        let self_spk = src.derive(0, 0).unwrap().spk;
+        assert_eq!(tx.output.last().unwrap().script_pubkey.as_bytes(), self_spk);
+        let mut psbt = built.psbt.clone();
+        let _ = psbt.sign(&master, &secp);
+        assert!(finalize_extract(psbt).is_ok());
+        assert!(build_watch_note_psbt(
+            &src, &coins, "hi", Some(to_bob.spk.clone()), 100, [5, 6, 7, 9], 80, 2.0
+        )
+        .is_err(), "sub-dust gift rejected");
+        let _ = self_addr;
     }
 
     #[test]
