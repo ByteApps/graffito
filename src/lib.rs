@@ -25,7 +25,7 @@ use app_core::identity::{
     generate_mnemonic, generate_mnemonic_with_salt, parse_key_material, realize, AppIdentity,
 };
 use app_core::psbt_build::{
-    build_funding_psbt, build_watch_bump_psbt, build_watch_spend_psbt, predict_keyspend_vsize,
+    build_funded_sweep_psbt, sign_own_taproot_inputs,    build_funding_psbt, build_watch_bump_psbt, build_watch_spend_psbt, predict_keyspend_vsize,
     BuiltPsbt, FundingPlan, NoteParams, WatchCoin,
 };
 use app_core::psbt_finalize::{
@@ -458,6 +458,113 @@ fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
             w.set_bump_error(format!("{e}").into());
             st.watch_bump = Some(wb);
         }
+    }
+}
+
+/// The sweep screen's fee rate: tier pill (economy/hour/fastest) or the
+/// custom sat/vB field — the compose mapping, mirrored.
+fn resolve_sweep_rate(w: &AppWindow, st: &State) -> f64 {
+    let f = st.fees.clone().unwrap_or_default();
+    match w.get_sweep_tier() {
+        0 => f.economy.max(1.0),
+        2 => f.fastest.max(1.0),
+        3 => w.get_sweep_rate_text().trim().parse().unwrap_or(0.0),
+        _ => f.hour.max(1.0),
+    }
+}
+
+/// Refresh the sweep screen (16): read-only inputs list (a sweep spends
+/// every spendable coin), inputs title, and the live cost line for the
+/// current fee tier / funding mode.
+fn update_sweep_screen(w: &AppWindow, st: &mut State) {
+    let net = st.network;
+    let Some(store) = st.store.as_ref() else { return };
+    let exb = st.explorer_base();
+    let spendable: Vec<&app_core::store::LedgerUtxo> =
+        store.utxos.iter().filter(|u| !u.pending_spend).collect();
+    let total: u64 = spendable.iter().map(|u| u.value).sum();
+    let n = spendable.len();
+    let mut rows: Vec<SpendCoin> = spendable
+        .iter()
+        .map(|u| SpendCoin {
+            outpoint: format!("{}:{}", u.txid, u.vout).into(),
+            value: u.value.to_string().into(),
+            confirmed: u.height.is_some(),
+            selected: true,
+            txid_short: u.txid[..8.min(u.txid.len())].to_string().into(),
+            explorer: explorer_tx_url(exb.as_deref(), net, &u.txid).into(),
+        })
+        .collect();
+    rows.sort_by_key(|r| r.value.parse::<u64>().unwrap_or(0));
+    w.set_sweep_coins(VecModel::from_slice(&rows));
+    let plural = if n == 1 { "" } else { "s" };
+    w.set_sweep_inputs_title(format!("Inputs · {n} coin{plural} · {total} sats (all)").into());
+
+    if n == 0 {
+        w.set_sweep_cost_line("nothing to sweep — no spendable coins".into());
+        return;
+    }
+    let rate = resolve_sweep_rate(w, st);
+    if rate <= 0.0 {
+        w.set_sweep_cost_line("enter a fee rate".into());
+        return;
+    }
+    let dest_spk_len = w
+        .get_sweep_dest()
+        .to_string()
+        .parse_dest_len(net)
+        .unwrap_or(34);
+    if w.get_sweep_fund_external() {
+        if st.funding.is_none() || st.funding_coins.is_empty() {
+            w.set_sweep_cost_line(format!("sweeps {total} sats in full — pick a funding wallet for the fee").into());
+            return;
+        }
+        // notes inputs (taproot) + funding inputs + dest + funding change.
+        use app_core::bitcoin::transaction::{predict_weight, InputWeightPrediction};
+        let fund_kind = st.funding.as_ref().map(|f| f.kind);
+        let fund_w = match fund_kind {
+            Some(app_core::funding::FundingKind::Wpkh) => InputWeightPrediction::P2WPKH_MAX,
+            _ => InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH,
+        };
+        let weights = std::iter::repeat(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH)
+            .take(n)
+            .chain(std::iter::repeat(fund_w).take(st.funding_coins.len()));
+        let vsize = predict_weight(weights, [dest_spk_len, 34usize].into_iter()).to_vbytes_ceil();
+        let fee = (vsize as f64 * rate).ceil() as u64;
+        let funding_total: u64 = st.funding_coins.iter().map(|c| c.value).sum();
+        if funding_total < fee {
+            w.set_sweep_cost_line(
+                format!("funding wallet holds {funding_total} sats — fee needs ~{fee}").into(),
+            );
+            return;
+        }
+        w.set_sweep_cost_line(
+            format!(
+                "destination receives {total} sats in full · fee ~{fee} sats from the funding wallet ({} sats change back)",
+                funding_total.saturating_sub(fee)
+            )
+            .into(),
+        );
+    } else {
+        let vsize = predict_keyspend_vsize(n, std::iter::once(dest_spk_len));
+        let fee = (vsize as f64 * rate).ceil() as u64;
+        if total <= fee {
+            w.set_sweep_cost_line(format!("balance {total} sats can't cover the ~{fee} sat fee").into());
+            return;
+        }
+        w.set_sweep_cost_line(
+            format!("sweeps {total} sats · fee ~{fee} sats · destination receives {}", total - fee)
+                .into(),
+        );
+    }
+}
+
+trait DestLen {
+    fn parse_dest_len(&self, net: Network) -> Option<usize>;
+}
+impl DestLen for String {
+    fn parse_dest_len(&self, net: Network) -> Option<usize> {
+        Recipient::parse(net, self).ok().map(|r| r.spk.len())
     }
 }
 
@@ -1292,10 +1399,17 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
             st.funding = Some(src);
             st.active_funding_id = Some(id.to_string());
             w.set_status(if empty { "wallet has no spendable coins yet".to_string() } else { String::new() }.into());
-            w.set_fund_external(true);
-            w.set_spend_expanded(true);
-            w.set_screen(6);
-            refresh_compose(w, st);
+            if w.get_funding_return() == 16 {
+                // Came from the sweep screen — return there, funding armed.
+                w.set_sweep_fund_external(true);
+                w.set_screen(16);
+                update_sweep_screen(w, st);
+            } else {
+                w.set_fund_external(true);
+                w.set_spend_expanded(true);
+                w.set_screen(6);
+                refresh_compose(w, st);
+            }
         }
         Err(e) => w.set_status(format!("scan failed: {e}").into()),
     }
@@ -2516,13 +2630,213 @@ pub fn run() {
 
     cb!(on_compose_open, |w, s| {
         println!("cb: compose-open");
+        w.set_pick_mode("compose".into());
         refresh_contacts(&w, &s);
         w.set_contact_input("".into());
         w.set_status("".into());
         w.set_screen(7);
     });
 
+    cb!(on_sweep_open, |w, s| {
+        println!("cb: sweep-open");
+        w.set_pick_mode("sweep".into());
+        refresh_contacts(&w, &s);
+        w.set_contact_input("".into());
+        w.set_status("".into());
+        w.set_screen(7);
+    });
+
+    cb!(on_set_sweep_tier, |w, s, tier: i32| {
+        w.set_sweep_tier(tier);
+        let f = s.fees.clone().unwrap_or_default();
+        let rate = match tier {
+            0 => f.economy,
+            2 => f.fastest,
+            _ => f.hour,
+        }
+        .max(1.0);
+        if tier != 3 {
+            w.set_sweep_rate_text(format!("{rate}").into());
+        }
+        println!("cb: sweep-tier {tier} rate={rate}");
+        update_sweep_screen(&w, &mut s);
+    });
+
+    cb!(on_sweep_rate_changed, |w, s| {
+        update_sweep_screen(&w, &mut s);
+    });
+
+    cb!(on_toggle_sweep_fund_external, |w, s, on: bool| {
+        println!("cb: sweep-fund-external {on}");
+        w.set_status("".into());
+        if on && s.funding.is_none() {
+            // No funding wallet active yet — pick one; Back returns here.
+            w.set_funding_return(16);
+            refresh_funding_list(&w, &s);
+            w.set_screen(15);
+            return;
+        }
+        update_sweep_screen(&w, &mut s);
+    });
+
+    cb!(on_sweep_send, |w, s| {
+        let dest = w.get_sweep_dest().to_string();
+        let net = s.network;
+        let Ok(recipient) = Recipient::parse(net, &dest) else {
+            w.set_status(format!("not a valid {} address", net.as_str()).into());
+            return;
+        };
+        let rate = resolve_sweep_rate(&w, &s);
+        if rate <= 0.0 {
+            w.set_status("enter a fee rate".into());
+            return;
+        }
+        if w.get_sweep_fund_external() {
+            // Fee from the funding wallet: the FULL balance rides to the
+            // destination, funding change returns to the funding wallet.
+            let Some(fund_src) = s.funding.clone() else {
+                w.set_status("set a funding wallet first".into());
+                return;
+            };
+            if s.funding_coins.is_empty() {
+                w.set_status("funding wallet has no spendable coins".into());
+                return;
+            }
+            let notes_coins: Vec<WatchCoin> = s
+                .store
+                .as_ref()
+                .map(|store| {
+                    store
+                        .utxos
+                        .iter()
+                        .filter(|u| !u.pending_spend)
+                        .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if notes_coins.is_empty() {
+                w.set_status("nothing to sweep".into());
+                return;
+            }
+            let inputs: Vec<app_core::store::TxInput> = notes_coins
+                .iter()
+                .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
+                .collect();
+            let Some(ident) = s.ident.as_ref() else { return };
+            let identity_spk = p2tr_script_pubkey(&ident.output_x());
+            let identity_source = ident.watch_source().cloned();
+            let fund_coins = s.funding_coins.clone();
+            let plan = FundingPlan {
+                source: &fund_src,
+                coins: &fund_coins,
+                change_index: s.funding_change_index,
+                fee_rate: rate,
+                change_override: None,
+            };
+            match build_funded_sweep_psbt(
+                identity_spk,
+                identity_source.as_ref(),
+                &notes_coins,
+                &plan,
+                recipient.spk.clone(),
+            ) {
+                Ok(mut built) => {
+                    // Keyed identity: the app signs its own inputs here and
+                    // now — only the funding wallet still needs to sign.
+                    if let Some(id) = s.ident.as_ref().and_then(|i| i.full()) {
+                        match sign_own_taproot_inputs(&mut built.psbt, &id.output_x, &id.tweaked_seckey) {
+                            Ok(k) => println!("cb: sweep-own-signed inputs={k}"),
+                            Err(e) => {
+                                w.set_status(format!("{e}").into());
+                                return;
+                            }
+                        }
+                    }
+                    let cost = format!(
+                        "sweep · {} sats arrive in full · fee {} sats from the funding wallet",
+                        built.sent_to_recipient, built.fee
+                    );
+                    s.watch_spend = Some(WatchSpend {
+                        kind: "sweep",
+                        dest: dest.clone(),
+                        dest_spk_hex: hex::encode(&recipient.spk),
+                        value: built.sent_to_recipient,
+                        fee: built.fee,
+                        inputs,
+                        bump_ref: None,
+                    });
+                    println!(
+                        "cb: sweep-build funded=1 txid={} fee={} notes_in={} fund_in={}",
+                        built.txid,
+                        built.fee,
+                        notes_coins.len(),
+                        fund_coins.len()
+                    );
+                    show_psbt_sign_screen(&w, &mut s, built, cost);
+                }
+                Err(e) => w.set_status(format!("{e}").into()),
+            }
+            return;
+        }
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            watch_spend_build(&w, &mut s, "sweep", dest, recipient.spk.clone(), rate);
+            return;
+        }
+        // Keyed, self-paid: resolved rate feeds the classic confirm modal →
+        // on_sweep signs + broadcasts in-app.
+        w.set_sweep_rate(format!("{rate}").into());
+        w.set_show_sweep_confirm(true);
+    });
+
     cb!(on_pick_contact, |w, s, addr: SharedString| {
+        // Sweep mode: the picker chooses the sweep DESTINATION, then opens
+        // the compose-like sweep screen (16) instead of compose.
+        if w.get_pick_mode().as_str() == "sweep" {
+            let mut a = normalize_addr(addr.as_str());
+            if a == "self" || a.is_empty() {
+                w.set_status("pick a destination address".into());
+                return;
+            }
+            if Recipient::parse(s.network, &a).is_err() {
+                let lower = a.to_lowercase();
+                if Recipient::parse(s.network, &lower).is_ok() {
+                    a = lower;
+                } else {
+                    println!("cb: sweep-pick err=bad-address");
+                    w.set_status(format!("not a valid {} address", s.network.as_str()).into());
+                    return;
+                }
+            }
+            println!("cb: sweep-pick to={a}");
+            if let Some(store) = &mut s.store {
+                store.touch_contact(&a);
+            }
+            s.save_store();
+            refresh_contacts(&w, &s);
+            let name = s
+                .store
+                .as_ref()
+                .and_then(|st| st.contacts.iter().find(|c| c.address == a))
+                .map(|c| c.name.clone())
+                .filter(|n| !n.is_empty());
+            w.set_sweep_to_label(
+                match &name {
+                    Some(n) => format!("Everything to: {n} · {a}"),
+                    None => format!("Everything to: {a}"),
+                }
+                .into(),
+            );
+            w.set_sweep_dest(a.into());
+            w.set_sweep_tier(1);
+            let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+            w.set_sweep_rate_text(format!("{rate}").into());
+            w.set_sweep_fund_external(false);
+            w.set_sweep_inputs_expanded(false);
+            w.set_status("".into());
+            update_sweep_screen(&w, &mut s);
+            w.set_screen(16);
+            return;
+        }
         if addr.as_str() == "self" {
             s.to_address = None;
             w.set_to_label("To: Self (my notebook)".into());
@@ -2842,6 +3156,7 @@ pub fn run() {
         refresh_compose(&w, &mut s);
         // Turning it on with no wallet active → go to the saved-wallets list.
         if on && s.funding.is_none() {
+            w.set_funding_return(6);
             refresh_funding_list(&w, &s);
             w.set_screen(15);
         }
