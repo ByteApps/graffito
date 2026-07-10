@@ -1,11 +1,12 @@
 //! Identity create/import: one parser behind every transport (typed,
 //! QR, file). Accepts BIP-39 mnemonic (12/24), xprv (depth 0 or 3), WIF
-//! (compressed), 32-byte hex, or a WATCH-ONLY account xpub (depth 3) —
-//! network-aware, validated before anything is stored.
+//! (compressed), 32-byte hex, or WATCH-ONLY material — a bare account
+//! xpub (depth 3), a key-origin xpub (`[fp/86'/…]xpub…`, the hardware-
+//! wallet export form), or a full `tr(...)` descriptor. Network-aware,
+//! validated before anything is stored.
 
 use bitcoin::bip32::{Xpriv, Xpub};
 use bitcoin::key::PrivateKey;
-use notes_core::address::taproot_address;
 use notes_core::bundle::Identity;
 use notes_core::Network;
 use std::str::FromStr;
@@ -13,8 +14,8 @@ use zeroize::Zeroizing;
 
 use crate::derive::{
     btc_network, identity_from_leaf, leaf_from_account, leaf_from_master, leaf_from_mnemonic,
-    watch_output_from_account_xpub,
 };
+use crate::funding::{FundingKind, FundingSource};
 use crate::Error;
 
 /// Parsed, validated key material. The original user string should be
@@ -26,9 +27,11 @@ pub enum KeyMaterial {
     Xprv(Xpriv),
     Wif(PrivateKey),
     Hex([u8; 32]),
-    /// Watch-only: an account-level (depth-3, 86'/coin'/n') xpub. Public
-    /// notes and balance only — no signing, no note decryption.
-    Xpub(Xpub),
+    /// Watch-only: an account-level (depth-3, 86'/coin'/n') xpub — bare,
+    /// key-origin form, or tr() descriptor, held as a FundingSource so
+    /// external-signer PSBTs carry the key origins hardware wallets need.
+    /// Public notes and balance on-device; spends sign externally.
+    Xpub(FundingSource),
 }
 
 impl KeyMaterial {
@@ -50,9 +53,11 @@ impl KeyMaterial {
 /// What the realized identity can do. Watch-only carries NO secrets — no
 /// fabricated zero keys anywhere; every signing/decryption call site must
 /// go through [`AppIdentity::full`] and decide what watch-only means.
+/// Watch keeps its FundingSource so spend PSBTs (sweep/consolidate/bump,
+/// signed by an external wallet) carry key origins.
 pub enum IdentityKeys {
     Full { leaf_secret: Zeroizing<[u8; 32]>, identity: Identity },
-    Watch { output_x: [u8; 32] },
+    Watch { output_x: [u8; 32], source: FundingSource },
 }
 
 /// A realized identity: keys (full or watch-only) + address.
@@ -69,7 +74,16 @@ impl AppIdentity {
     pub fn output_x(&self) -> [u8; 32] {
         match &self.keys {
             IdentityKeys::Full { identity, .. } => identity.output_x,
-            IdentityKeys::Watch { output_x } => *output_x,
+            IdentityKeys::Watch { output_x, .. } => *output_x,
+        }
+    }
+
+    /// The descriptor behind a watch-only identity (None for full keys) —
+    /// the source spend PSBTs derive inputs and key origins from.
+    pub fn watch_source(&self) -> Option<&FundingSource> {
+        match &self.keys {
+            IdentityKeys::Watch { source, .. } => Some(source),
+            IdentityKeys::Full { .. } => None,
         }
     }
 
@@ -123,18 +137,12 @@ pub fn parse_key_material(input: &str, network: Network) -> Result<KeyMaterial, 
             0 | 3 => Ok(KeyMaterial::Xprv(x)),
             d => Err(Error::XprvDepth(d)),
         }
-    } else if lower.starts_with("xpub") || lower.starts_with("tpub") {
-        let want_main = matches!(network, Network::Mainnet);
-        if lower.starts_with("xpub") != want_main {
-            return Err(Error::XpubNetwork);
-        }
-        let x = Xpub::from_str(s).map_err(|e| Error::Xpub(e.to_string()))?;
-        match x.depth {
-            // Only an account-level xpub works: the 86'/coin'/account'
-            // path is hardened, so a master xpub cannot derive anything.
-            3 => Ok(KeyMaterial::Xpub(x)),
-            d => Err(Error::XpubDepth(d)),
-        }
+    } else if lower.starts_with("xpub")
+        || lower.starts_with("tpub")
+        || lower.starts_with("tr(")
+        || lower.starts_with('[')
+    {
+        parse_watch(s, network).map(KeyMaterial::Xpub)
     } else if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
         let mut key = [0u8; 32];
         hex::decode_to_slice(&lower, &mut key).map_err(|_| Error::HexLength(0))?;
@@ -153,6 +161,48 @@ pub fn parse_key_material(input: &str, network: Network) -> Result<KeyMaterial, 
     } else {
         Err(Error::UnrecognizedFormat)
     }
+}
+
+/// Watch-only material → FundingSource. Accepts a bare account xpub, the
+/// hardware-wallet key-origin form (`[fp/86'/…]xpub…`, with or without a
+/// trailing `/<0;1>/*`), or a full `tr(...)` descriptor. The embedded
+/// xpub must be account-level (depth 3): the hardened 86' path makes a
+/// master xpub underivable. Key origins, when present, ride into every
+/// spend PSBT so external signers recognize their inputs.
+fn parse_watch(s: &str, network: Network) -> Result<FundingSource, Error> {
+    // Network by embedded key prefix: xpub = mainnet, tpub = the rest.
+    let has_xpub = s.contains("xpub");
+    let has_tpub = s.contains("tpub");
+    if has_xpub == has_tpub {
+        return Err(Error::Xpub("need exactly one xpub/tpub".into()));
+    }
+    if has_xpub != matches!(network, Network::Mainnet) {
+        return Err(Error::XpubNetwork);
+    }
+    let token_start = s.find(if has_xpub { "xpub" } else { "tpub" }).expect("checked above");
+    let token: String =
+        s[token_start..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+    let x = Xpub::from_str(&token).map_err(|e| Error::Xpub(e.to_string()))?;
+    if x.depth != 3 {
+        return Err(Error::XpubDepth(x.depth));
+    }
+
+    let desc = if s.starts_with('[') {
+        // Key-origin xpub: wrap into a taproot descriptor, adding the
+        // receive/change wildcard unless the user already included one.
+        if s.contains('*') {
+            format!("tr({s})")
+        } else {
+            format!("tr({s}/<0;1>/*)")
+        }
+    } else {
+        s.to_string() // tr(...) descriptor, or bare xpub (FundingSource wraps)
+    };
+    let src = FundingSource::parse(&desc, network)?;
+    if src.kind != FundingKind::Taproot {
+        return Err(Error::Xpub("identity must be a taproot (tr) descriptor".into()));
+    }
+    Ok(src)
 }
 
 fn parse_mnemonic(s: &str) -> Result<bip39::Mnemonic, Error> {
@@ -230,14 +280,19 @@ pub fn realize(
         },
         KeyMaterial::Wif(w) => w.inner.secret_bytes(),
         KeyMaterial::Hex(k) => *k,
-        KeyMaterial::Xpub(x) => {
-            let output_x = watch_output_from_account_xpub(x)?;
-            let address = taproot_address(network, &output_x);
+        KeyMaterial::Xpub(src) => {
+            // The notes address is the descriptor's receive leaf at index 0.
+            let d = src.derive(0, 0)?;
+            if d.spk.len() != 34 || d.spk[0] != 0x51 {
+                return Err(Error::Xpub("descriptor does not derive a taproot output".into()));
+            }
+            let mut output_x = [0u8; 32];
+            output_x.copy_from_slice(&d.spk[2..34]);
             return Ok(AppIdentity {
                 kind: material.kind(),
                 account: 0,
-                keys: IdentityKeys::Watch { output_x },
-                address,
+                keys: IdentityKeys::Watch { output_x, source: src.clone() },
+                address: d.address,
             });
         }
     });

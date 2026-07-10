@@ -76,6 +76,146 @@ impl BuiltPsbt {
     }
 }
 
+/// A coin a watch identity spends — always the descriptor's receive leaf
+/// at index 0 (the notes address).
+#[derive(Debug, Clone)]
+pub struct WatchCoin {
+    pub txid: String,
+    pub vout: u32,
+    pub value: u64,
+}
+
+/// Predicted vsize of an all-taproot-keyspend tx with these output script
+/// lengths — what the watch bump dialog prices old/new rates against.
+pub fn predict_keyspend_vsize(n_inputs: usize, out_lens: impl Iterator<Item = usize>) -> u64 {
+    predict_weight(
+        std::iter::repeat(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH).take(n_inputs),
+        out_lens,
+    )
+    .to_vbytes_ceil()
+}
+
+fn taproot_keyspend_inputs(
+    source: &FundingSource,
+    coins: &[WatchCoin],
+) -> Result<(Vec<TxIn>, Vec<TxOut>, Vec<InputWeightPrediction>), Error> {
+    let leaf_spk = ScriptBuf::from_bytes(source.derive(0, 0)?.spk);
+    let mut inputs = Vec::with_capacity(coins.len());
+    let mut prevouts = Vec::with_capacity(coins.len());
+    let mut weights = Vec::with_capacity(coins.len());
+    for coin in coins {
+        let txid = Txid::from_str(&coin.txid).map_err(|e| Error::Funding(format!("bad txid: {e}")))?;
+        inputs.push(TxIn {
+            previous_output: OutPoint { txid, vout: coin.vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        });
+        prevouts.push(TxOut { value: Amount::from_sat(coin.value), script_pubkey: leaf_spk.clone() });
+        weights.push(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH);
+    }
+    Ok((inputs, prevouts, weights))
+}
+
+fn assemble_watch_psbt(
+    source: &FundingSource,
+    coins: &[WatchCoin],
+    inputs: Vec<TxIn>,
+    prevouts: Vec<TxOut>,
+    outputs: Vec<TxOut>,
+) -> Result<(Psbt, String), Error> {
+    let tx = Transaction { version: Version::TWO, lock_time: LockTime::ZERO, input: inputs, output: outputs };
+    let txid = tx.compute_txid().to_string();
+    let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| Error::Funding(format!("psbt: {e}")))?;
+    let def = source.definite(0, 0)?;
+    for i in 0..coins.len() {
+        psbt.inputs[i].witness_utxo = Some(prevouts[i].clone());
+        psbt.inputs[i]
+            .update_with_descriptor_unchecked(&def)
+            .map_err(|e| Error::Funding(format!("psbt key origins: {e}")))?;
+    }
+    Ok((psbt, txid))
+}
+
+/// Sweep/consolidate for a WATCH identity: spend `coins` (all at the notes
+/// leaf) into ONE `dest_spk` output carrying total − fee, RBF-enabled.
+/// An external wallet signs; key origins come from the identity descriptor.
+pub fn build_watch_spend_psbt(
+    source: &FundingSource,
+    coins: &[WatchCoin],
+    dest_spk: Vec<u8>,
+    fee_rate: f64,
+) -> Result<BuiltPsbt, Error> {
+    if coins.is_empty() {
+        return Err(Error::Funding("no coins to spend".into()));
+    }
+    let (inputs, prevouts, weights) = taproot_keyspend_inputs(source, coins)?;
+    let weight = predict_weight(weights.iter().copied(), std::iter::once(dest_spk.len()));
+    let fee = (weight.to_vbytes_ceil() as f64 * fee_rate).ceil() as u64;
+    let in_value: u64 = coins.iter().map(|c| c.value).sum();
+    if in_value <= fee || in_value - fee < DUST_LIMIT {
+        return Err(Error::Funding("not enough to cover the fee".into()));
+    }
+    let out_value = in_value - fee;
+    let outputs = vec![TxOut {
+        value: Amount::from_sat(out_value),
+        script_pubkey: ScriptBuf::from_bytes(dest_spk),
+    }];
+    let (psbt, txid) = assemble_watch_psbt(source, coins, inputs, prevouts, outputs)?;
+    Ok(BuiltPsbt { psbt, fee, change: 0, sent_to_recipient: out_value, dust_to_self: 0, txid })
+}
+
+/// RBF replacement for a WATCH identity's pending tx: identical inputs and
+/// outputs, fee raised to `new_rate` sat/vB, the delta taken from the
+/// output at `reduce_vout` (the caller picks it — normally the own-address
+/// change/consolidation output, or the destination on a sweep).
+pub fn build_watch_bump_psbt(
+    source: &FundingSource,
+    coins: &[WatchCoin],
+    prev_outputs: &[(Vec<u8>, u64)],
+    reduce_vout: usize,
+    new_rate: f64,
+) -> Result<BuiltPsbt, Error> {
+    if coins.is_empty() || prev_outputs.is_empty() {
+        return Err(Error::Funding("nothing to bump".into()));
+    }
+    if reduce_vout >= prev_outputs.len() {
+        return Err(Error::Funding("bad output index".into()));
+    }
+    let (inputs, prevouts, weights) = taproot_keyspend_inputs(source, coins)?;
+    let weight =
+        predict_weight(weights.iter().copied(), prev_outputs.iter().map(|(spk, _)| spk.len()));
+    let new_fee = (weight.to_vbytes_ceil() as f64 * new_rate).ceil() as u64;
+    let in_value: u64 = coins.iter().map(|c| c.value).sum();
+    let out_value: u64 = prev_outputs.iter().map(|(_, v)| v).sum();
+    let old_fee = in_value.saturating_sub(out_value);
+    if new_fee <= old_fee {
+        return Err(Error::Funding("new fee must exceed the current fee (BIP-125)".into()));
+    }
+    let delta = new_fee - old_fee;
+    let (_, reduce_value) = &prev_outputs[reduce_vout];
+    if *reduce_value < delta + DUST_LIMIT {
+        return Err(Error::Funding("output too small to absorb the fee bump".into()));
+    }
+    let outputs: Vec<TxOut> = prev_outputs
+        .iter()
+        .enumerate()
+        .map(|(i, (spk, v))| TxOut {
+            value: Amount::from_sat(if i == reduce_vout { v - delta } else { *v }),
+            script_pubkey: ScriptBuf::from_bytes(spk.clone()),
+        })
+        .collect();
+    let (psbt, txid) = assemble_watch_psbt(source, coins, inputs, prevouts, outputs)?;
+    Ok(BuiltPsbt {
+        psbt,
+        fee: new_fee,
+        change: 0,
+        sent_to_recipient: out_value - delta,
+        dust_to_self: 0,
+        txid,
+    })
+}
+
 /// Build the unsigned funding PSBT. Fails with `Error::Funding` on bad coins,
 /// insufficient funds, or descriptor derivation problems.
 pub fn build_funding_psbt(plan: &FundingPlan, note: &NoteParams) -> Result<BuiltPsbt, Error> {
@@ -290,6 +430,77 @@ mod tests {
         assert_eq!(built.sent_to_recipient, 0);
         assert_eq!(built.dust_to_self, 330);
         assert_eq!(100_000, built.fee + built.change + 330);
+    }
+
+    /// Watch spend (sweep/consolidate) + bump: build from the identity
+    /// descriptor, sign in-process with the matching master key, finalize —
+    /// the exact pipeline the external-signer e2e runs against a real node.
+    #[test]
+    fn watch_spend_and_bump_sign_roundtrip() {
+        use crate::psbt_finalize::{finalize_extract, validate_signed};
+        use bitcoin::bip32::{Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(bitcoin::Network::Bitcoin, &[0x22u8; 32]).unwrap();
+        let account = master
+            .derive_priv(
+                &secp,
+                &[
+                    bitcoin::bip32::ChildNumber::from_hardened_idx(86).unwrap(),
+                    bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+                    bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+                ],
+            )
+            .unwrap();
+        let xpub = Xpub::from_priv(&secp, &account);
+        let fp = master.fingerprint(&secp);
+        let src =
+            FundingSource::parse(&format!("tr([{fp}/86'/0'/0']{xpub}/<0;1>/*)"), NET).unwrap();
+
+        let coins = vec![
+            WatchCoin { txid: "a".repeat(64), vout: 0, value: 60_000 },
+            WatchCoin { txid: "b".repeat(64), vout: 1, value: 40_000 },
+        ];
+        let dest = src.derive(0, 0).unwrap().spk; // consolidate to self
+        let built = build_watch_spend_psbt(&src, &coins, dest.clone(), 2.0).unwrap();
+        assert_eq!(built.psbt.unsigned_tx.output.len(), 1);
+        assert_eq!(100_000, built.fee + built.sent_to_recipient);
+        assert!(built.psbt.inputs.iter().all(|i| i.tap_internal_key.is_some()
+            && i.witness_utxo.is_some()
+            && !i.tap_key_origins.is_empty()));
+
+        // Sign with the master (BIP-32 origins route it), finalize.
+        let mut psbt = built.psbt.clone();
+        let _ = psbt.sign(&master, &secp);
+        validate_signed(&psbt, &built.txid).expect("master signs via key origins");
+        let (raw, txid, _) = finalize_extract(psbt).expect("finalize");
+        assert_eq!(txid, built.txid);
+        assert!(!raw.is_empty());
+
+        // Bump the same tx: outputs preserved, fee delta out of output 0.
+        let prev_outputs = vec![(dest.clone(), built.sent_to_recipient)];
+        let bumped = build_watch_bump_psbt(&src, &coins, &prev_outputs, 0, 5.0).unwrap();
+        assert!(bumped.fee > built.fee, "BIP-125: fee must rise");
+        assert_eq!(
+            bumped.psbt.unsigned_tx.output[0].value.to_sat(),
+            built.sent_to_recipient - (bumped.fee - built.fee)
+        );
+        // Same inputs → same outpoints (a true replacement).
+        assert_eq!(
+            built.psbt.unsigned_tx.input[0].previous_output,
+            bumped.psbt.unsigned_tx.input[0].previous_output
+        );
+        let mut psbt = bumped.psbt.clone();
+        let _ = psbt.sign(&master, &secp);
+        validate_signed(&psbt, &bumped.txid).expect("bump signs too");
+        assert!(finalize_extract(psbt).is_ok());
+
+        // A bump at (or below) the old rate is rejected.
+        assert!(build_watch_bump_psbt(&src, &coins, &prev_outputs, 0, 2.0).is_err());
+        // Sweeping less than fee+dust is rejected.
+        let tiny = vec![WatchCoin { txid: "c".repeat(64), vout: 0, value: 400 }];
+        assert!(build_watch_spend_psbt(&src, &tiny, dest, 2.0).is_err());
     }
 
     #[test]

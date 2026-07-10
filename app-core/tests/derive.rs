@@ -133,6 +133,23 @@ fn watch_xpub_import_matches_full_identity() {
     assert!(watch.full().is_none());
     assert!(watch.leaf_secret().is_none());
 
+    // The hardware-wallet export forms land on the same identity: key-origin
+    // xpub (hardware-wallet style) and a full tr() descriptor.
+    let fp = master.fingerprint(&secp);
+    for form in [
+        format!("[{fp}/86'/0'/0']{xpub}"),
+        format!("[{fp}/86h/0h/0h]{xpub}/<0;1>/*"),
+        format!("tr([{fp}/86'/0'/0']{xpub}/<0;1>/*)"),
+        format!("tr({xpub}/<0;1>/*)"),
+    ] {
+        let m = parse_key_material(&form, Network::Mainnet).unwrap_or_else(|e| panic!("{form}: {e}"));
+        assert!(m.is_watch());
+        let w = realize(&m, Network::Mainnet, 0).unwrap();
+        assert_eq!(w.address, BIP86_ADDR_0, "form {form} must land on the BIP-86 address");
+        assert_eq!(w.output_x(), full.output_x());
+        assert!(w.watch_source().is_some());
+    }
+
     // Master (depth-0) xpub: the hardened account path makes it useless.
     let master_pub = bitcoin::bip32::Xpub::from_priv(&secp, &master);
     assert!(matches!(

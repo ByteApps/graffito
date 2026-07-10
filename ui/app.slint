@@ -1637,9 +1637,11 @@ export component AppWindow inherits Window {
                 clicked => { root.open-coins(); }
             }
         }
-        if !root.watch-only: SettingsCard {
+        SettingsCard {
             title: "Funds";
-            subtitle: "Move everything off the notes address (minus the fee) — e.g. returning testnet coins.";
+            subtitle: root.watch-only
+                ? "Move everything off the notes address (minus the fee). Watch-only: you'll sign the transaction on your external wallet."
+                : "Move everything off the notes address (minus the fee) — e.g. returning testnet coins.";
             HorizontalLayout {
                 spacing: 8px;
                 LineEdit { text <=> root.sweep-dest; placeholder-text: "destination address"; }
@@ -1652,11 +1654,11 @@ export component AppWindow inherits Window {
             }
         }
         SettingsCard {
-            title: root.watch-only ? "Watch-only key" : "Backup";
+            title: "Backup";
             subtitle: root.watch-only
-                ? "Shows the account xpub you imported. It can't spend and can't read private notes — safe to share, but it does reveal this notebook."
+                ? "Shows the watch-only key material (xpub) you imported — stored in your keychain, and in iCloud if enabled, like any key. It can't spend and can't read private notes."
                 : "Shows the exact key material you imported or created. Anyone who sees it controls the funds and every private note.";
-            GhostButton { text: root.watch-only ? "Reveal xpub  ·  asks for Touch ID" : "Reveal backup  ·  asks for Touch ID"; clicked => { root.reveal-backup(); } }
+            GhostButton { text: "Reveal backup  ·  asks for Touch ID"; clicked => { root.reveal-backup(); } }
             if root.reveal-text != "": VerticalLayout {
                 spacing: 8px;
                 Rectangle {
@@ -1752,10 +1754,10 @@ export component AppWindow inherits Window {
         }
         Caption {
             text: root.watch-only
-                ? "Each note tx spends these unspent outputs. Watch-only — viewing only, no key to move them."
+                ? "Each note tx spends these unspent outputs. Consolidating combines them into one coin — watch-only signs the transaction on your external wallet."
                 : "Each note tx spends these unspent outputs. Consolidating combines them into one coin at your address, so future notes need fewer inputs (lower fees).";
         }
-        if !root.watch-only: HorizontalLayout {
+        HorizontalLayout {
             spacing: 8px;
             LineEdit { width: 84px; text <=> root.consolidate-rate; }
             Caption { text: "sat/vB"; vertical-alignment: center; }
@@ -1861,13 +1863,13 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 8px;
                             alignment: start;
-                            if a.pending && !root.watch-only: GhostButton {
+                            if a.pending: GhostButton {
                                 width: 96px;
                                 height: 30px;
                                 text: "Speed up";
                                 clicked => { root.act-bump-open(a.ref-id, a.is-note); }
                             }
-                            if a.pending && !root.watch-only: GhostButton {
+                            if a.pending: GhostButton {
                                 width: 108px;
                                 height: 30px;
                                 text: "Rebroadcast";
@@ -1946,7 +1948,8 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Sign externally";
-            back => { root.screen = 6; }
+            // Funding flow came from compose (6); watch spends from settings (8).
+            back => { root.screen = root.watch-only ? 8 : 6; }
         }
         Caption {
             text: "Scan this with your wallet (or save the file), sign it there, then bring the signed PSBT back.";

@@ -15,8 +15,11 @@ use app_core::funding::FundingSource;
 use app_core::identity::{parse_key_material, realize, AppIdentity};
 use app_core::notes_core::address::Recipient;
 use app_core::notes_core::Network;
-use app_core::psbt_build::{build_funding_psbt, FundingPlan, NoteParams};
-use app_core::psbt_finalize::{finalize_extract, parse_psbt};
+use app_core::psbt_build::{
+    build_funding_psbt, build_watch_bump_psbt, build_watch_spend_psbt, FundingPlan, NoteParams,
+    WatchCoin,
+};
+use app_core::psbt_finalize::{finalize_extract, parse_psbt, validate_signed};
 use app_core::store::{NoteStatus, Store};
 use bitcoin::bip32::{Xpriv, Xpub};
 use bitcoin::secp256k1::Secp256k1;
@@ -108,7 +111,10 @@ fn main() {
             let ident = identity(net);
             let client = ChainClient::new(HttpTransport::new(&args[3]), net);
             let bundle = client.build_bundle(&store.address, None).expect("build bundle");
-            let stats = store.apply_bundle(&bundle, ident.expect_full(), net).expect("apply");
+            let stats = match ident.full() {
+                Some(id) => store.apply_bundle(&bundle, id, net).expect("apply"),
+                None => store.apply_bundle_watch(&bundle, &ident.output_x(), net).expect("apply"),
+            };
             save(&store, &args[2]);
             println!(
                 "cli: scan notes={} new={} orphaned={} balance={} tip={}",
@@ -118,6 +124,92 @@ fn main() {
                 store.balance(),
                 store.tip_height
             );
+        }
+        Some("spend-build") => {
+            // spend-build <store.json> <sweep|consolidate> <rate> <out.psbt> [dest]
+            // Watch identity: unsigned PSBT spending every spendable coin to
+            // dest (default = self). Sign it externally, then spend-broadcast.
+            let store = load(&args[2]);
+            let net = network(&store.network.clone());
+            let ident = identity(net);
+            let src = ident
+                .watch_source()
+                .expect("spend-build needs watch-only APP_KEY (xpub / descriptor)")
+                .clone();
+            let kind = args[3].as_str();
+            let rate: f64 = args[4].parse().expect("fee rate");
+            let coins: Vec<WatchCoin> = store
+                .utxos
+                .iter()
+                .filter(|u| !u.pending_spend)
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                .collect();
+            let dest_addr = args.get(6).cloned().unwrap_or_else(|| ident.address.clone());
+            let dest = Recipient::parse(net, &dest_addr).expect("dest address");
+            let built = build_watch_spend_psbt(&src, &coins, dest.spk, rate).expect("build");
+            std::fs::write(&args[5], built.to_bytes()).expect("write psbt");
+            println!(
+                "cli: spend-build kind={kind} txid={} fee={} value={} inputs={} -> {}",
+                built.txid,
+                built.fee,
+                built.sent_to_recipient,
+                coins.len(),
+                args[5]
+            );
+        }
+        Some("bump-build") => {
+            // bump-build <store.json> <base-url> <pending-txid> <rate> <out.psbt>
+            // Watch identity: RBF replacement of a pending tx, rebuilt from
+            // chain data; delta comes out of our own output (else largest).
+            let store = load(&args[2]);
+            let net = network(&store.network.clone());
+            let ident = identity(net);
+            let src = ident.watch_source().expect("bump-build needs watch-only APP_KEY").clone();
+            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let (coins, outputs, confirmed) = client.fetch_tx_io(&args[4]).expect("fetch tx");
+            assert!(!confirmed, "tx already confirmed");
+            let rate: f64 = args[5].parse().expect("fee rate");
+            let self_spk =
+                app_core::notes_core::address::p2tr_script_pubkey(&ident.output_x());
+            let reduce = outputs
+                .iter()
+                .enumerate()
+                .filter(|(_, (spk, _))| *spk == self_spk)
+                .max_by_key(|(_, (_, v))| *v)
+                .map(|(i, _)| i)
+                .or_else(|| {
+                    outputs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (spk, _))| spk.first() != Some(&0x6a))
+                        .max_by_key(|(_, (_, v))| *v)
+                        .map(|(i, _)| i)
+                })
+                .expect("no reducible output");
+            let built =
+                build_watch_bump_psbt(&src, &coins, &outputs, reduce, rate).expect("build bump");
+            std::fs::write(&args[6], built.to_bytes()).expect("write psbt");
+            println!(
+                "cli: bump-build replaces={} txid={} fee={} -> {}",
+                args[4], built.txid, built.fee, args[6]
+            );
+        }
+        Some("spend-broadcast") => {
+            // spend-broadcast <base-url> <network> <signed.psbt> <expected-txid>
+            // Validate the externally signed PSBT, finalize, broadcast.
+            let net = network(&args[3]);
+            let bytes = std::fs::read(&args[4]).expect("read signed psbt");
+            let psbt = if bytes.starts_with(b"psbt\xff") {
+                app_core::bitcoin::Psbt::deserialize(&bytes).expect("psbt binary")
+            } else {
+                parse_psbt(&String::from_utf8_lossy(&bytes)).expect("psbt text")
+            };
+            validate_signed(&psbt, &args[5]).expect("signed PSBT must match the built tx");
+            let (raw, txid, vsize) = finalize_extract(psbt).expect("finalize");
+            let client = ChainClient::new(HttpTransport::new(&args[2]), net);
+            let got = client.broadcast(&raw).expect("broadcast");
+            assert_eq!(got, txid, "node echoed a different txid");
+            println!("cli: spend-broadcast txid={txid} vsize={vsize} ok");
         }
         Some("notes") => {
             // notes <store.json>

@@ -13,19 +13,34 @@ typed text, QR, or file; SeedQR supported). Flagship import path: a
 dedicated **BIP-85 child from `prime-bip85`**. Also the standalone
 on-ramp for users with no Prime or hardware wallet at all.
 
-**Watch-only identities (stage 1)**: importing an account-level xpub
-(depth 3 — the hardened 86' path makes a master xpub underivable) makes
-a key-less notebook — same address as the full key, public notes and
-balance/coins/activity readable, every private body sealed ("key not on
-this device"), compose/sweep/consolidate/bump hidden (`watch-only` slint
-property; Rust callbacks gate too via `AppIdentity::full()` — never
-fabricate zero keys). `KeyMaterial::Xpub` → `IdentityKeys::Watch` in
-app-core; scans go through notes-core's additive `extract_notes_watch` /
-store's `apply_bundle_watch`. The xpub is stored in the keychain
-verbatim like any key material. `cli xpub <network>` prints the account
-xpub for hierarchical APP_KEY material (feeds watch e2e). Stage 2 (not
-built): compose-to-PSBT for an external signer, public notes only —
-directed-private needs the identity key at compose time (ECDH).
+**Watch-only identities**: importing an account-level xpub (depth 3 —
+the hardened 86' path makes a master xpub underivable), a key-origin
+xpub (`[fp/86'/…]xpub…`, the hardware-wallet export form), or a `tr()`
+descriptor makes a key-less notebook — same address as the full key,
+public notes and balance/coins/activity readable, every private body
+sealed ("key not on this device"), compose hidden (`watch-only` slint
+property; Rust callbacks gate via `AppIdentity::full()` — never
+fabricate zero keys). `KeyMaterial::Xpub(FundingSource)` →
+`IdentityKeys::Watch { output_x, source }` in app-core; scans go through
+notes-core's additive `extract_notes_watch` / store's
+`apply_bundle_watch`. The material is stored in the keychain verbatim
+(iCloud backup applies) like any key. **Spends still work** — sweep,
+consolidate, and Speed-up (RBF) build unsigned PSBTs
+(`build_watch_spend_psbt` / `build_watch_bump_psbt`, key origins from
+the descriptor so hardware wallets recognize their inputs) and route
+through the SAME sign screen (13) + review/broadcast (14) external
+funding uses (`State.watch_spend` carries post-broadcast bookkeeping;
+bump fetches the pending tx via `ChainClient::fetch_tx_io` since
+chain-recovered records have no raw hex); Rebroadcast is keyless via
+`fetch_tx_hex`. Import an origin-full descriptor for signers
+that check the master fingerprint; bare xpubs still view fine. Verified:
+`ui-automation/tests/chain-notes-watch-signer.sh` (the signer sim
+signs consolidate+sweep on regtest, headless) and a live testnet4 pass
+(app-UI sweep signed by the CC sim incl. RBF replacement through
+mempool.space). `cli xpub|spend-build|bump-build|spend-broadcast`
+subcommands feed the e2e. NOT built: compose-to-PSBT (public notes
+could sign externally; directed-private never can — ECDH needs the
+identity key at compose time).
 
 Design doc + milestone plan (M0–M7): **`../PLAN-chain-notes-app.md`** in
 the prime workspace (this repo is a workspace submodule sibling of the
