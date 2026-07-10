@@ -573,6 +573,19 @@ export component AppWindow inherits Window {
     in-out property <string> sweep-dest;
     in-out property <string> sweep-rate: "1";
     in-out property <bool> show-sweep-confirm;
+    // Sweep flow (picker → dedicated screen 15, compose-like): the send-to
+    // picker doubles as the sweep destination picker via pick-mode.
+    in-out property <string> pick-mode: "compose";   // "compose" | "sweep"
+    in property <string> sweep-to-label;
+    in-out property <int> sweep-tier: 1;
+    in-out property <string> sweep-rate-text: "1";
+    in property <string> sweep-cost-line;
+    in property <string> sweep-inputs-title;
+    in-out property <bool> sweep-inputs-expanded;
+    in property <[SpendCoin]> sweep-coins;
+    in-out property <bool> sweep-fund-external;
+    // Which screen the funding-wallet manager returns to (6 compose, 16 sweep).
+    in-out property <int> funding-return: 6;
 
     callback door-import();
     callback door-create(int);
@@ -593,6 +606,11 @@ export component AppWindow inherits Window {
     callback copy-text(string, string);
     callback set-fee-tier(int);
     callback sweep();
+    callback sweep-open();                 // settings → destination picker
+    callback set-sweep-tier(int);
+    callback sweep-rate-changed();
+    callback toggle-sweep-fund-external(bool);
+    callback sweep-send();                 // screen 15 primary action
     callback open-coins();
     callback consolidate();
     callback consolidate-preview();
@@ -1195,7 +1213,7 @@ export component AppWindow inherits Window {
             border-width: 1px;
             border-color: root.funding-ready ? Pal.line : Pal.accent.with-alpha(0.5);
             height: 44px;
-            ftap := TouchArea { clicked => { root.open-funding(); } }
+            ftap := TouchArea { clicked => { root.funding-return = 6; root.open-funding(); } }
             HorizontalLayout {
                 padding-left: 12px;
                 padding-right: 12px;
@@ -1437,17 +1455,24 @@ export component AppWindow inherits Window {
         spacing: 12px;
         alignment: start;
         Header {
-            title: "Send to";
-            back => { root.go-home(); }
+            title: root.pick-mode == "sweep" ? "Sweep to" : "Send to";
+            back => {
+                if (root.pick-mode == "sweep") {
+                    root.pick-mode = "compose";
+                    root.screen = 8;
+                } else {
+                    root.go-home();
+                }
+            }
         }
-        DoorCard {
+        if root.pick-mode != "sweep": DoorCard {
             highlight: true;
             title: "Self — my notebook";
             subtitle: "A private note only you can read back.";
             clicked => { root.pick-contact("self"); }
         }
         // Divider between the Self card and the address-entry section.
-        Rectangle { height: 1px; background: Pal.line; }
+        if root.pick-mode != "sweep": Rectangle { height: 1px; background: Pal.line; }
         HorizontalLayout {
             spacing: 10px;
             LineEdit {
@@ -1642,15 +1667,9 @@ export component AppWindow inherits Window {
             subtitle: root.watch-only
                 ? "Move everything off the notes address (minus the fee). Watch-only: you'll sign the transaction on your external wallet."
                 : "Move everything off the notes address (minus the fee) — e.g. returning testnet coins.";
-            HorizontalLayout {
-                spacing: 8px;
-                LineEdit { text <=> root.sweep-dest; placeholder-text: "destination address"; }
-                LineEdit { width: 64px; text <=> root.sweep-rate; }
-                Caption { text: "sat/vB"; vertical-alignment: center; }
-            }
             GhostButton {
                 text: "Sweep all funds…";
-                clicked => { root.show-sweep-confirm = true; }
+                clicked => { root.sweep-open(); }
             }
         }
         SettingsCard {
@@ -2121,7 +2140,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Funding wallets";
-            back => { root.screen = 6; }
+            back => { root.screen = root.funding-return; }
         }
         Caption {
             text: "Watch-only wallets that can pay for your notes. Tap one to use it, or add another.";
@@ -2198,6 +2217,219 @@ export component AppWindow inherits Window {
             clicked => { root.add-funding-wallet(); }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
+    }
+
+    // ---------- 16 · sweep (compose-like, minus the note text) ----------
+    if screen == 16: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Sweep";
+            back => { root.pick-mode = "sweep"; root.screen = 7; }
+        }
+        Flickable {
+            viewport-height: sweep-col.preferred-height;
+            sweep-col := VerticalLayout {
+                spacing: 12px;
+                Rectangle {
+                    border-radius: 10px;
+                    background: Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    height: 34px;
+                    Text {
+                        x: 12px;
+                        width: parent.width - 24px;
+                        height: parent.height;
+                        vertical-alignment: center;
+                        text: root.sweep-to-label;
+                        font-size: 12px;
+                        color: Pal.muted;
+                        overflow: elide;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    SelectPill { text: "economy"; active: root.sweep-tier == 0; clicked => { root.set-sweep-tier(0); } }
+                    SelectPill { text: "normal"; active: root.sweep-tier == 1; clicked => { root.set-sweep-tier(1); } }
+                    SelectPill { text: "fast"; active: root.sweep-tier == 2; clicked => { root.set-sweep-tier(2); } }
+                    SelectPill { text: "custom"; active: root.sweep-tier == 3; clicked => { root.sweep-tier = 3; root.sweep-rate-changed(); } }
+                }
+                if root.sweep-tier == 3: HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    LineEdit {
+                        width: 84px;
+                        text <=> root.sweep-rate-text;
+                        edited => { root.sweep-rate-changed(); }
+                    }
+                    Caption { text: "sat/vB"; vertical-alignment: center; }
+                }
+                if root.sweep-cost-line != "": Text {
+                    text: root.sweep-cost-line;
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: Pal.accent;
+                }
+                // ---- pay the fee from another wallet ----
+                HorizontalLayout {
+                    Switch {
+                        text: "Pay the fee from another wallet";
+                        checked <=> root.sweep-fund-external;
+                        toggled => { root.toggle-sweep-fund-external(self.checked); }
+                    }
+                    Rectangle { }
+                }
+                if root.sweep-fund-external: Caption {
+                    text: "The full balance arrives at the destination. The fee comes out of the funding wallet; its change returns there.";
+                }
+                if root.sweep-fund-external: Rectangle {
+                    border-radius: 10px;
+                    background: sftap.has-hover ? Pal.card-hover : Pal.card;
+                    border-width: 1px;
+                    border-color: root.funding-ready ? Pal.line : Pal.accent.with-alpha(0.5);
+                    height: 44px;
+                    sftap := TouchArea { clicked => { root.funding-return = 16; root.open-funding(); } }
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 8px;
+                        Text {
+                            text: root.funding-summary;
+                            font-size: 12px;
+                            color: root.funding-ready ? Pal.text : Pal.accent;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        Text { text: "›"; font-size: 22px; color: Pal.muted; vertical-alignment: center; }
+                    }
+                }
+                // ---- inputs (read-only: a sweep spends everything) ----
+                Rectangle {
+                    border-radius: 10px;
+                    background: Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    height: sw-in-col.preferred-height;
+                    sw-in-col := VerticalLayout {
+                        padding: 10px;
+                        spacing: 8px;
+                        Rectangle {
+                            height: 22px;
+                            TouchArea { clicked => { root.sweep-inputs-expanded = !root.sweep-inputs-expanded; } }
+                            HorizontalLayout {
+                                Text {
+                                    text: root.sweep-inputs-title;
+                                    font-size: 12px;
+                                    color: Pal.muted;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { }
+                                Image {
+                                    source: root.sweep-inputs-expanded
+                                        ? @image-url("icons/caret-up.svg")
+                                        : @image-url("icons/caret-down.svg");
+                                    colorize: Pal.muted;
+                                    width: 16px;
+                                    height: 16px;
+                                    y: (parent.height - 16px) / 2;
+                                }
+                            }
+                        }
+                        if root.sweep-inputs-expanded: Caption {
+                            text: "A sweep spends every spendable coin, so the inputs are fixed.";
+                        }
+                        if root.sweep-inputs-expanded: VerticalLayout {
+                            spacing: 6px;
+                            for c in root.sweep-coins: Rectangle {
+                                height: 42px;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: Pal.accent;
+                                background: Pal.accent.with-alpha(0.10);
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 10px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Text {
+                                            text: c.value + " sats";
+                                            font-size: 12px;
+                                            color: Pal.text;
+                                        }
+                                    }
+                                    Rectangle { }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Badge {
+                                            label: c.confirmed ? "confirmed" : "unconfirmed";
+                                            tint: c.confirmed ? Pal.good : Pal.warn;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Rectangle {
+                                            height: 22px;
+                                            width: swpill.preferred-width + 14px;
+                                            border-radius: 11px;
+                                            border-width: 1px;
+                                            border-color: Pal.line;
+                                            background: swpta.has-hover && c.explorer != "" ? Pal.card-hover : transparent;
+                                            swpta := TouchArea {
+                                                clicked => { if (c.explorer != "") { root.act-explorer(c.explorer); } }
+                                            }
+                                            swpill := HorizontalLayout {
+                                                padding-left: 8px;
+                                                padding-right: 7px;
+                                                spacing: 4px;
+                                                Text {
+                                                    text: c.txid-short;
+                                                    font-family: "Menlo";
+                                                    font-size: 10px;
+                                                    color: Pal.muted;
+                                                    vertical-alignment: center;
+                                                }
+                                                if c.explorer != "": Image {
+                                                    source: @image-url("icons/external.svg");
+                                                    colorize: Pal.accent;
+                                                    width: 11px;
+                                                    height: 11px;
+                                                    y: (parent.height - 11px) / 2;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !root.sweep-fund-external && !root.watch-only: PrimaryButton {
+                    text: "Sweep — sign + broadcast";
+                    clicked => { root.sweep-send(); }
+                }
+                if !root.sweep-fund-external && root.watch-only: PrimaryButton {
+                    text: "Build transaction to sign";
+                    clicked => { root.sweep-send(); }
+                }
+                if root.sweep-fund-external: PrimaryButton {
+                    text: root.funding-ready ? "Build transaction to sign" : "Set a funding wallet first";
+                    clicked => {
+                        if (!root.funding-ready) {
+                            root.funding-return = 16;
+                            root.open-funding();
+                        } else {
+                            root.sweep-send();
+                        }
+                    }
+                }
+                Caption { text: root.status; color: Pal.bad; }
+            }
+        }
     }
 
     // ---------- shared camera-scan overlay (live preview) ----------
