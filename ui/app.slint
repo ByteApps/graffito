@@ -2,7 +2,7 @@
 // layout. Property/callback names are the contract with main.rs — do
 // not rename. Router: `screen` property; every action emits a cb: line
 // on the Rust side.
-import { LineEdit, TextEdit, ListView, Switch } from "std-widgets.slint";
+import { ListView, Switch } from "std-widgets.slint";
 
 export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string, private: bool }
 export struct ContactItem { address: string, name: string }
@@ -43,6 +43,419 @@ global Pal {
     out property <color> good: #3FB950;
     out property <color> warn: #D29922;
     out property <color> bad: #F85149;
+    // text-field looks (shared by EditField/EditArea)
+    out property <color> field: #10151C;
+    out property <color> field-focus-line: #4CC2FF;
+    out property <color> sel-bg: #4CC2FF;
+    out property <color> sel-fg: #0B0F14;
+}
+
+// ---- text-input layer --------------------------------------------------
+// EditField/EditArea replace std LineEdit/TextEdit so the app can reach
+// TextInput's byte-offset cursor API (double-tap word-select, clipboard on
+// touch platforms via the UIPasteboard/ClipboardManager shims, paste at
+// the cursor) and ship a reliable touch edit toolbar. Std widgets hide
+// their inner TextInput; upstream iOS has no edit menu/selection UI, std
+// LineEdit doesn't even take tap-focus on iOS, and Android's native
+// selection toolbar is one-shot — see UPSTREAM-ISSUES.md.
+
+// Pure text helpers + platform clipboard, implemented in Rust (run()).
+// Offsets are UTF-8 byte offsets, matching TextInput's cursor API.
+export global EditOps {
+    pure callback slice(text: string, start: int, end: int) -> string;
+    pure callback splice(text: string, start: int, end: int, insert: string) -> string;
+    pure callback byte-len(text: string) -> int;
+    pure callback word-start(text: string, offset: int) -> int;
+    pure callback word-end(text: string, offset: int) -> int;
+    callback clip-set(text: string);
+    callback clip-get() -> string;
+    // true on iOS/Android (set from Rust): show the touch toolbar and
+    // enable double-tap word selection.
+    in-out property <bool> touch: false;
+    // true on iOS only: TextInput's internal clipboard is a no-op there
+    // (winit has no iOS clipboard), so cut/copy/paste go through the
+    // UIPasteboard shim + byte-offset splicing. Everywhere else the native
+    // TextInput ops are used — they hit the system clipboard AND keep the
+    // undo stack coherent (splicing via `text =` corrupts undo history).
+    in-out property <bool> ios: false;
+}
+
+component ToolbarAction inherits Rectangle {
+    in property <string> text;
+    callback clicked;
+    width: label.preferred-width + 18px;
+    border-radius: 14px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    label := Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        font-size: 12px;
+        color: Pal.text;
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// Floating Select all / Copy / Paste / Cut pill shown above a focused
+// field on touch platforms. Drawn outside the field's bounds; the caller
+// anchors it to the screen's left edge via absolute-position.
+component EditToolbar inherits Rectangle {
+    callback action(string); // select-all | copy | paste | cut
+    width: 258px;
+    height: 30px;
+    border-radius: 15px;
+    background: #262E3A;
+    border-width: 1px;
+    border-color: Pal.line;
+    HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 4px;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        spacing: 2px;
+        ToolbarAction { text: "Select all"; clicked => { root.action("select-all"); } }
+        ToolbarAction { text: "Copy"; clicked => { root.action("copy"); } }
+        ToolbarAction { text: "Paste"; clicked => { root.action("paste"); } }
+        ToolbarAction { text: "Cut"; clicked => { root.action("cut"); } }
+    }
+}
+
+// Single-line text field (drop-in for the std LineEdit call sites).
+component EditField inherits Rectangle {
+    in-out property <string> text <=> ti.text;
+    in property <string> placeholder-text;
+    in property <InputType> input-type <=> ti.input-type;
+    in property <bool> read-only <=> ti.read-only;
+    out property <bool> has-focus: ti.has-focus;
+    callback edited(string);
+    callback accepted(string);
+
+    public function select-all() { ti.select-all(); }
+    public function paste-clip() {
+        if (EditOps.ios) { do-paste(EditOps.clip-get()); }
+        else { ti.paste(); }
+    }
+
+    // scratch for statement-order tricks (slint functions have no locals)
+    property <int> scratch;
+    property <int> last-tap-off: -1;
+    property <string> last-tap-text;
+
+    pure function sel-start() -> int {
+        min(ti.cursor-position-byte-offset, ti.anchor-position-byte-offset)
+    }
+    pure function sel-end() -> int {
+        max(ti.cursor-position-byte-offset, ti.anchor-position-byte-offset)
+    }
+    function do-copy() {
+        if (self.sel-start() == self.sel-end()) {
+            EditOps.clip-set(ti.text);
+        } else {
+            EditOps.clip-set(EditOps.slice(ti.text, self.sel-start(), self.sel-end()));
+        }
+    }
+    function do-cut() {
+        if (self.sel-start() != self.sel-end()) {
+            EditOps.clip-set(EditOps.slice(ti.text, self.sel-start(), self.sel-end()));
+            scratch = self.sel-start();
+            ti.text = EditOps.splice(ti.text, self.sel-start(), self.sel-end(), "");
+            ti.set-selection-offsets(scratch, scratch);
+            root.edited(ti.text);
+        }
+    }
+    function do-paste(clip: string) {
+        if (clip != "") {
+            scratch = self.sel-start() + EditOps.byte-len(clip);
+            ti.text = EditOps.splice(ti.text, self.sel-start(), self.sel-end(), clip);
+            ti.set-selection-offsets(scratch, scratch);
+            root.edited(ti.text);
+        }
+    }
+    function toolbar-action(a: string) {
+        if (a == "select-all") { ti.select-all(); }
+        if (a == "copy" && EditOps.ios) { do-copy(); }
+        if (a == "copy" && !EditOps.ios) { ti.copy(); }
+        if (a == "paste") { self.paste-clip(); }
+        if (a == "cut" && EditOps.ios) { do-cut(); }
+        if (a == "cut" && !EditOps.ios) { ti.cut(); }
+    }
+
+    min-width: 120px;
+    min-height: 32px;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    background: Pal.field;
+    border-width: 1px;
+    border-color: ti.has-focus ? #33404E : Pal.line;
+    forward-focus: ti;
+
+    // double-tap → select word (touch only): two caret placements at
+    // (nearly) the same offset within the window, text unchanged, no
+    // selection in progress. `edited` disarms so typing can't misfire.
+    dbl := Timer {
+        interval: 350ms;
+        running: false;
+        triggered => { self.running = false; }
+    }
+
+    // placeholder — declared BELOW the input stack: a Text element laid
+    // over the TextInput swallows touches on iOS (fine with a mouse on
+    // macOS); underneath it shows through and never sees a tap.
+    Text {
+        x: 12px;
+        width: parent.width - 24px;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.text == "" ? root.placeholder-text : "";
+        font-size: 13px;
+        color: Pal.muted;
+        overflow: elide;
+    }
+
+    ContextMenuArea {
+        enabled: !EditOps.touch;
+        Menu {
+            MenuItem { title: "Cut"; enabled: !root.read-only; activated => { ti.cut(); } }
+            MenuItem { title: "Copy"; activated => { ti.copy(); } }
+            MenuItem { title: "Paste"; enabled: !root.read-only; activated => { ti.paste(); } }
+            MenuItem { title: "Select All"; activated => { ti.select-all(); } }
+        }
+
+        clip-rect := Rectangle {
+            x: 12px;
+            width: parent.width - 24px - (clear-btn.visible ? 20px : 0px);
+            height: parent.height;
+            clip: true;
+            ti := TextInput {
+                property <length> computed-x;
+                x: min(0px, max(parent.width - self.width, self.computed-x));
+                width: max(parent.width, self.preferred-width);
+                height: parent.height;
+                vertical-alignment: center;
+                single-line: true;
+                wrap: no-wrap;
+                font-size: 13px;
+                color: Pal.text;
+                selection-background-color: Pal.sel-bg;
+                selection-foreground-color: Pal.sel-fg;
+                edited => {
+                    dbl.running = false;
+                    root.edited(self.text);
+                }
+                accepted => { root.accepted(self.text); }
+                cursor-position-changed(cpos) => {
+                    if (cpos.x + self.computed-x < 12px) {
+                        self.computed-x = -cpos.x + 12px;
+                    } else if (cpos.x + self.computed-x > parent.width - 12px - self.text-cursor-width) {
+                        self.computed-x = parent.width - cpos.x - 12px - self.text-cursor-width;
+                    }
+                    if (EditOps.touch) {
+                        if (dbl.running && ti.text == root.last-tap-text && root.sel-start() == root.sel-end() && abs(ti.cursor-position-byte-offset - root.last-tap-off) <= 2) {
+                            dbl.running = false;
+                            ti.set-selection-offsets(
+                                EditOps.word-start(ti.text, ti.cursor-position-byte-offset),
+                                EditOps.word-end(ti.text, ti.cursor-position-byte-offset));
+                        } else {
+                            root.last-tap-off = ti.cursor-position-byte-offset;
+                            root.last-tap-text = ti.text;
+                            dbl.running = false;
+                            dbl.running = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // fluent-style clear button, kept from the std LineEdit UX
+    // (SVG, not a text glyph — femtovg has no font fallback)
+    clear-btn := Image {
+        visible: ti.has-focus && ti.text != "" && !ti.read-only;
+        x: parent.width - 22px;
+        y: (parent.height - self.height) / 2;
+        width: 11px;
+        height: 11px;
+        source: @image-url("icons/dismiss.svg");
+        colorize: Pal.muted;
+        TouchArea {
+            clicked => {
+                ti.text = "";
+                root.edited("");
+                ti.focus();
+            }
+        }
+    }
+
+    // focus underline (fluent look)
+    Rectangle {
+        visible: ti.has-focus;
+        x: parent.border-radius;
+        y: parent.height - self.height;
+        width: parent.width - 2 * parent.border-radius;
+        height: 2px;
+        background: Pal.field-focus-line;
+    }
+
+    if EditOps.touch && ti.has-focus: EditToolbar {
+        x: 8px - root.absolute-position.x;
+        y: -38px;
+        action(a) => { root.toolbar-action(a); }
+    }
+}
+
+// Multi-line text editor (drop-in for the std TextEdit call sites).
+component EditArea inherits Rectangle {
+    in-out property <string> text <=> ti.text;
+    in property <string> placeholder-text;
+    out property <bool> has-focus: ti.has-focus;
+    callback edited(string);
+
+    public function select-all() { ti.select-all(); }
+    public function paste-clip() {
+        if (EditOps.ios) { do-paste(EditOps.clip-get()); }
+        else { ti.paste(); }
+    }
+
+    property <int> scratch;
+    property <int> last-tap-off: -1;
+    property <string> last-tap-text;
+
+    pure function sel-start() -> int {
+        min(ti.cursor-position-byte-offset, ti.anchor-position-byte-offset)
+    }
+    pure function sel-end() -> int {
+        max(ti.cursor-position-byte-offset, ti.anchor-position-byte-offset)
+    }
+    function do-copy() {
+        if (self.sel-start() == self.sel-end()) {
+            EditOps.clip-set(ti.text);
+        } else {
+            EditOps.clip-set(EditOps.slice(ti.text, self.sel-start(), self.sel-end()));
+        }
+    }
+    function do-cut() {
+        if (self.sel-start() != self.sel-end()) {
+            EditOps.clip-set(EditOps.slice(ti.text, self.sel-start(), self.sel-end()));
+            scratch = self.sel-start();
+            ti.text = EditOps.splice(ti.text, self.sel-start(), self.sel-end(), "");
+            ti.set-selection-offsets(scratch, scratch);
+            root.edited(ti.text);
+        }
+    }
+    function do-paste(clip: string) {
+        if (clip != "") {
+            scratch = self.sel-start() + EditOps.byte-len(clip);
+            ti.text = EditOps.splice(ti.text, self.sel-start(), self.sel-end(), clip);
+            ti.set-selection-offsets(scratch, scratch);
+            root.edited(ti.text);
+        }
+    }
+    function toolbar-action(a: string) {
+        if (a == "select-all") { ti.select-all(); }
+        if (a == "copy" && EditOps.ios) { do-copy(); }
+        if (a == "copy" && !EditOps.ios) { ti.copy(); }
+        if (a == "paste") { self.paste-clip(); }
+        if (a == "cut" && EditOps.ios) { do-cut(); }
+        if (a == "cut" && !EditOps.ios) { ti.cut(); }
+    }
+
+    min-height: 60px;
+    horizontal-stretch: 1;
+    border-radius: 6px;
+    background: Pal.field;
+    border-width: 1px;
+    border-color: ti.has-focus ? #33404E : Pal.line;
+    forward-focus: ti;
+
+    dbl := Timer {
+        interval: 350ms;
+        running: false;
+        triggered => { self.running = false; }
+    }
+
+    Text {
+        x: 10px;
+        y: 8px;
+        width: parent.width - 20px;
+        vertical-alignment: top;
+        text: root.text == "" ? root.placeholder-text : "";
+        font-size: 13px;
+        color: Pal.muted;
+        overflow: elide;
+    }
+
+    ContextMenuArea {
+        enabled: !EditOps.touch;
+        Menu {
+            MenuItem { title: "Cut"; activated => { ti.cut(); } }
+            MenuItem { title: "Copy"; activated => { ti.copy(); } }
+            MenuItem { title: "Paste"; activated => { ti.paste(); } }
+            MenuItem { title: "Select All"; activated => { ti.select-all(); } }
+        }
+
+        fli := Flickable {
+            x: 10px;
+            y: 8px;
+            width: parent.width - 20px;
+            height: parent.height - 16px;
+            viewport-width: self.width;
+            viewport-height: max(self.height, ti.preferred-height);
+            ti := TextInput {
+                width: fli.viewport-width;
+                height: fli.viewport-height;
+                single-line: false;
+                wrap: word-wrap;
+                font-size: 13px;
+                color: Pal.text;
+                selection-background-color: Pal.sel-bg;
+                selection-foreground-color: Pal.sel-fg;
+                page-height: fli.height;
+                edited => {
+                    dbl.running = false;
+                    root.edited(self.text);
+                }
+                cursor-position-changed(cpos) => {
+                    // keep the caret in view (pattern from std textedit-base)
+                    if (cpos.y + fli.viewport-y < 0px) {
+                        fli.viewport-y = min(0px, max(fli.height - self.height, -cpos.y));
+                    } else if (cpos.y + fli.viewport-y > fli.height - 20px) {
+                        fli.viewport-y = min(0px, max(fli.height - self.height, fli.height - cpos.y - 20px));
+                    }
+                    if (EditOps.touch) {
+                        if (dbl.running && ti.text == root.last-tap-text && root.sel-start() == root.sel-end() && abs(ti.cursor-position-byte-offset - root.last-tap-off) <= 2) {
+                            dbl.running = false;
+                            ti.set-selection-offsets(
+                                EditOps.word-start(ti.text, ti.cursor-position-byte-offset),
+                                EditOps.word-end(ti.text, ti.cursor-position-byte-offset));
+                        } else {
+                            root.last-tap-off = ti.cursor-position-byte-offset;
+                            root.last-tap-text = ti.text;
+                            dbl.running = false;
+                            dbl.running = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        visible: ti.has-focus;
+        x: parent.border-radius;
+        y: parent.height - self.height;
+        width: parent.width - 2 * parent.border-radius;
+        height: 2px;
+        background: Pal.field-focus-line;
+    }
+
+    if EditOps.touch && ti.has-focus: EditToolbar {
+        x: 8px - root.absolute-position.x;
+        y: -38px;
+        action(a) => { root.toolbar-action(a); }
+    }
 }
 
 component H1 inherits Text {
@@ -751,7 +1164,7 @@ export component AppWindow inherits Window {
             back => { root.screen = 0; }
         }
         Caption { text: "Mnemonic (12/24 words), xprv, WIF, 32-byte hex — or an account xpub for a watch-only notebook (public notes and balance; private notes stay sealed, no composing)."; }
-        TextEdit {
+        EditArea {
             height: 110px;
             text <=> root.import-text;
             edited => { root.import-changed(self.text); }
@@ -856,7 +1269,7 @@ export component AppWindow inherits Window {
                 }
                 if root.advanced-expanded: HorizontalLayout {
                     spacing: 8px;
-                    LineEdit {
+                    EditField {
                         placeholder-text: "extra entropy (optional)";
                         text <=> root.entropy-salt;
                         accepted => { root.regenerate-words(); }
@@ -892,7 +1305,7 @@ export component AppWindow inherits Window {
             back => { root.screen = 2; }
         }
         Body { text: root.quiz-prompt; }
-        LineEdit { text <=> root.quiz-answer; placeholder-text: "word  word  word"; }
+        EditField { text <=> root.quiz-answer; placeholder-text: "word  word  word"; }
         PrimaryButton { text: "Verify"; clicked => { root.quiz-submit(root.quiz-answer); } }
         Caption { text: root.status; color: Pal.bad; }
     }
@@ -1120,7 +1533,10 @@ export component AppWindow inherits Window {
                 font-size: 13px;
                 color: Pal.accent;
                 vertical-alignment: center;
-                TouchArea { clicked => { root.paste-compose(); } }
+                // paste-clip inserts at the cursor (replacing any selection)
+                // via the platform clipboard — the old paste-compose Rust
+                // path appended to the end.
+                TouchArea { clicked => { note-edit.paste-clip(); } }
             }
             Text {
                 text: "Done";
@@ -1130,7 +1546,7 @@ export component AppWindow inherits Window {
                 TouchArea { clicked => { note-edit.clear-focus(); } }
             }
         }
-        note-edit := TextEdit {
+        note-edit := EditArea {
             height: 150px;
             text <=> root.compose-text;
             edited => { root.compose-changed(); }
@@ -1160,7 +1576,7 @@ export component AppWindow inherits Window {
         if root.fee-tier == 3: HorizontalLayout {
             spacing: 8px;
             alignment: start;
-            LineEdit {
+            EditField {
                 width: 84px;
                 text <=> root.rate-text;
                 edited => { root.compose-changed(); }
@@ -1207,7 +1623,7 @@ export component AppWindow inherits Window {
                 if root.gift-expanded: Caption {
                     text: "Sats sent to the recipient along with your note. Minimum 330 (dust).";
                 }
-                if root.gift-expanded: LineEdit {
+                if root.gift-expanded: EditField {
                     text <=> root.gift-sats;
                     input-type: number;
                     edited => { root.compose-changed(); }
@@ -1427,7 +1843,7 @@ export component AppWindow inherits Window {
                 }
                 if root.change-expanded: HorizontalLayout {
                     spacing: 8px;
-                    LineEdit {
+                    EditField {
                         text <=> root.change-address;
                         placeholder-text: "change address (blank = back to you)";
                         edited => { root.compose-changed(); }
@@ -1491,7 +1907,7 @@ export component AppWindow inherits Window {
         if root.pick-mode != "sweep": Rectangle { height: 1px; background: Pal.line; }
         HorizontalLayout {
             spacing: 10px;
-            LineEdit {
+            EditField {
                 text <=> root.contact-input;
                 placeholder-text: "taproot / segwit address";
                 accepted(t) => { root.pick-contact(t); }
@@ -1633,7 +2049,7 @@ export component AppWindow inherits Window {
             }
             if root.chunk-custom || (root.chunk-text != "100000" && root.chunk-text != "80"): HorizontalLayout {
                 spacing: 8px;
-                LineEdit {
+                EditField {
                     width: 130px;
                     text <=> root.chunk-text;
                     placeholder-text: "20 – 100000";
@@ -1650,7 +2066,7 @@ export component AppWindow inherits Window {
                 current-index: root.node-index;
                 selected(i) => { root.node-index = i; root.set-node-preset(i); }
             }
-            if root.node-index == root.node-options.length - 1: LineEdit {
+            if root.node-index == root.node-options.length - 1: EditField {
                 text <=> root.node-custom-text;
                 placeholder-text: "https://mempool.example/api  or  http://127.0.0.1:3002";
                 accepted(t) => { root.set-node-custom(t); }
@@ -1664,7 +2080,7 @@ export component AppWindow inherits Window {
                 current-index: root.explorer-index;
                 selected(i) => { root.explorer-index = i; root.set-explorer-preset(i); }
             }
-            if root.explorer-index == root.explorer-options.length - 1: LineEdit {
+            if root.explorer-index == root.explorer-options.length - 1: EditField {
                 text <=> root.explorer-custom-text;
                 placeholder-text: "https://your-mempool-host  (no trailing /tx)";
                 accepted(t) => { root.set-explorer-custom(t); }
@@ -1930,7 +2346,7 @@ export component AppWindow inherits Window {
         }
         HorizontalLayout {
             spacing: 8px;
-            LineEdit {
+            EditField {
                 text <=> root.funding-descriptor;
                 placeholder-text: "tr([…]xpub…/<0;1>/*)  or  xpub…";
                 edited => { root.funding-changed(self.text); }
@@ -2290,7 +2706,7 @@ export component AppWindow inherits Window {
                 if root.sweep-tier == 3: HorizontalLayout {
                     spacing: 8px;
                     alignment: start;
-                    LineEdit {
+                    EditField {
                         width: 84px;
                         text <=> root.sweep-rate-text;
                         edited => { root.sweep-rate-changed(); }
@@ -2566,7 +2982,7 @@ export component AppWindow inherits Window {
                     font-weight: 700;
                     color: Pal.text;
                 }
-                LineEdit {
+                EditField {
                     text <=> root.fund-rename-input;
                     placeholder-text: "wallet name";
                     accepted(t) => { root.fund-rename-save(t); }
@@ -2616,7 +3032,7 @@ export component AppWindow inherits Window {
                     wrap: no-wrap;
                     overflow: elide;
                 }
-                rename-edit := LineEdit {
+                rename-edit := EditField {
                     text <=> root.rename-input;
                     placeholder-text: "name (empty clears it)";
                     accepted(t) => { root.save-rename(t); }
@@ -2902,7 +3318,7 @@ export component AppWindow inherits Window {
                 Caption { text: root.bump-current; }
                 HorizontalLayout {
                     spacing: 8px;
-                    LineEdit {
+                    EditField {
                         width: 96px;
                         text <=> root.bump-rate;
                         edited => { root.act-bump-rate-changed(self.text); }
