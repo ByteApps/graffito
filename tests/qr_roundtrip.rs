@@ -6,7 +6,7 @@ fn render_gray(data: &str, scale: usize) -> (Vec<u8>, usize) {
     let code = qrcode::QrCode::new(data.as_bytes()).unwrap();
     let width = code.width();
     let colors = code.to_colors();
-    let quiet = 4 * scale;
+    let quiet = 2 * scale; // mirrors src/qr.rs (2 embedded modules; the UI card pads the rest)
     let side = width * scale + quiet * 2;
     let mut img = vec![255u8; side * side];
     for y in 0..width {
