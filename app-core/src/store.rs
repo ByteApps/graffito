@@ -308,21 +308,11 @@ impl Store {
 
         if bundle.full {
             self.reconcile_utxos_full(bundle, &mut stats);
-            // Sweep/consolidate txs: confirmed once every input they spent
-            // is gone from the authoritative UTXO set (server auto-mines;
-            // the funds left, so the tx landed). RBF replacements share
-            // the same inputs, so this resolves either way.
-            let present: std::collections::HashSet<(&str, u32)> =
-                bundle.utxos.iter().map(|u| (u.txid.as_str(), u.vout)).collect();
-            for t in &mut self.txs {
-                if t.status == NoteStatus::Pending
-                    && !t.inputs.is_empty()
-                    && t.inputs.iter().all(|i| !present.contains(&(i.txid.as_str(), i.vout)))
-                {
-                    t.status = NoteStatus::Confirmed;
-                    t.raw_hex = None;
-                }
-            }
+            // Sweep/consolidate records do NOT confirm here: their inputs
+            // vanish from the UTXO set on mere mempool acceptance (esplora
+            // drops mempool-spent coins immediately), which is not
+            // finality. The caller resolves them against real tx statuses
+            // via [`Self::resolve_spend_statuses`] after every scan.
         } else {
             self.merge_utxos_incremental(bundle);
         }
@@ -330,6 +320,29 @@ impl Store {
         self.tip_height = self.tip_height.max(bundle.tip_height);
         self.last_scan_time = bundle.bundle_time;
         Ok(stats)
+    }
+
+    /// Resolve pending sweep/consolidate records against REAL tx statuses.
+    /// `lookup(txid)` returns Some(confirmed?) from the node, or None when
+    /// the txid is unknown there (evicted/replaced, or transport error).
+    /// A record settles when ANY of its txids (original or RBF bumps —
+    /// they accumulate in `txids`) is in a block; while every known txid
+    /// is only in the mempool it stays Pending, keeping Speed-up and
+    /// Rebroadcast available exactly when RBF is still possible. Returns
+    /// how many records confirmed.
+    pub fn resolve_spend_statuses(&mut self, lookup: impl Fn(&str) -> Option<bool>) -> usize {
+        let mut confirmed = 0;
+        for t in &mut self.txs {
+            if t.status != NoteStatus::Pending {
+                continue;
+            }
+            if t.txids.iter().any(|x| lookup(x) == Some(true)) {
+                t.status = NoteStatus::Confirmed;
+                t.raw_hex = None; // on-chain now — no rebroadcast needed
+                confirmed += 1;
+            }
+        }
+        confirmed
     }
 
     /// Record a broadcast sweep/consolidate for the activity view + RBF.

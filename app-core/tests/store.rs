@@ -374,9 +374,14 @@ fn sweep_tx_record_bump_and_confirm() {
     assert_eq!(store.txs[0].txids, vec![tx.txid_hex.clone(), bumped.txid_hex.clone()]);
     assert_eq!(store.txs[0].raw_hex.as_deref(), Some(bumped.raw_hex.as_str()));
 
-    // Confirm on full scan: the inputs are gone from the UTXO set.
+    // A full scan alone no longer confirms (inputs vanishing only proves
+    // mempool acceptance); the record settles when the node reports the
+    // REPLACEMENT txid in a block.
     let b = bundle(vec![], vec![change_utxo(&bumped, Some(120))], 120);
     store.apply_bundle(&b, &a, NET).unwrap();
+    assert_eq!(store.txs[0].status, NoteStatus::Pending);
+    let winner = bumped.txid_hex.clone();
+    store.resolve_spend_statuses(|t| if t == winner { Some(true) } else { None });
     assert_eq!(store.txs[0].status, NoteStatus::Confirmed);
     assert!(store.txs[0].raw_hex.is_none());
 }
@@ -526,4 +531,49 @@ fn watch_store_recovers_notebook_without_keys() {
 
     // Fingerprint guard works keyless too.
     assert!(watch.apply_bundle_watch(&b, &bob().output_x, NET).is_err());
+}
+
+/// Spend records settle on REAL confirmation, not on their inputs
+/// vanishing: mempool-only keeps them Pending (Speed-up/Rebroadcast
+/// stay possible), a block-confirmed RBF replacement settles via ANY
+/// txid in the record, and unknown txids alone never confirm.
+#[test]
+fn spend_records_confirm_by_tx_status_not_utxo_disappearance() {
+    let a = alice();
+    let mut store = funded_store(&a);
+    store.record_tx(
+        "sweep",
+        "aa".repeat(32),
+        90_000,
+        500,
+        110,
+        "raw".into(),
+        "tb1qdest".into(),
+        vec![app_core::store::TxInput { txid: "aa".repeat(32), vout: 0, value: 100_000 }],
+        "0014".into(),
+        1_000,
+    );
+
+    // Full bundle WITHOUT the spent coin: the old inference would have
+    // confirmed here. It must stay Pending now.
+    let empty = bundle(vec![], vec![], 200);
+    store.apply_bundle(&empty, &a, NET).unwrap();
+    assert_eq!(store.txs[0].status, NoteStatus::Pending, "mempool-spent is not finality");
+    assert!(store.txs[0].raw_hex.is_some(), "rebroadcast must stay possible");
+
+    // Node says: original in mempool only → still pending.
+    assert_eq!(store.resolve_spend_statuses(|_| Some(false)), 0);
+    assert_eq!(store.txs[0].status, NoteStatus::Pending);
+
+    // RBF bump replaced it: original unknown, bump txid confirmed.
+    let bump = "bb".repeat(32);
+    store.txs[0].txids.push(bump.clone());
+    assert_eq!(store.resolve_spend_statuses(|t| if t == bump { Some(true) } else { None }), 1);
+    assert_eq!(store.txs[0].status, NoteStatus::Confirmed);
+    assert!(store.txs[0].raw_hex.is_none());
+
+    // All-unknown never confirms (node outage ≠ mined).
+    store.record_tx("consolidate", "cc".repeat(32), 1, 1, 1, "r".into(), "self".into(), vec![], "51".into(), 2_000);
+    assert_eq!(store.resolve_spend_statuses(|_| None), 0);
+    assert_eq!(store.txs[1].status, NoteStatus::Pending);
 }

@@ -341,6 +341,14 @@ impl<T: Transport> ChainClient<T> {
         Ok(self.transport.get_text(&format!("/tx/{txid}/hex"))?.trim().to_string())
     }
 
+    /// Real confirmation status of a txid: Some(true) = in a block,
+    /// Some(false) = in the mempool, None = unknown there (evicted /
+    /// replaced / transport error). Feeds `Store::resolve_spend_statuses`.
+    pub fn fetch_tx_status(&self, txid: &str) -> Option<bool> {
+        let text = self.transport.get_text(&format!("/tx/{txid}")).ok()?;
+        parse_json::<EsploraTx>(&text).ok().map(|t| t.status.confirmed)
+    }
+
     /// A pending tx's inputs (as spendable outpoints with values) and
     /// outputs (spk bytes + value) — what a watch-mode RBF bump rebuilds
     /// from. Input values come from the vin prevout when the backend sends
