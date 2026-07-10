@@ -456,9 +456,6 @@ pub fn sign_own_taproot_inputs(
 /// Build the unsigned funding PSBT. Fails with `Error::Funding` on bad coins,
 /// insufficient funds, or descriptor derivation problems.
 pub fn build_funding_psbt(plan: &FundingPlan, note: &NoteParams) -> Result<BuiltPsbt, Error> {
-    if plan.coins.is_empty() {
-        return Err(Error::Funding("no funding coins selected".into()));
-    }
     let (payloads, recipient_spk) = sealed_note_payloads(
         note.identity,
         note.text,
@@ -467,6 +464,52 @@ pub fn build_funding_psbt(plan: &FundingPlan, note: &NoteParams) -> Result<Built
         note.note_id,
         note.max_op_return_bytes,
     )?;
+    let self_spk = notes_core::address::p2tr_script_pubkey(&note.identity.output_x);
+    assemble_funded_note_psbt(plan, &payloads, recipient_spk, DUST_LIMIT, self_spk)
+}
+
+/// A WATCH identity's externally funded PUBLIC note: the funding wallet's
+/// coins pay for OP_RETURN chunks + an optional directed-recipient output
+/// (the gift) + the dust-to-self that keeps the note discoverable, change
+/// back to the funding wallet. NOTE the frozen-scan caveat: without the
+/// key, a rescan attributes an externally funded PUBLIC note as RECEIVED
+/// from the funding wallet (ownership is only provable for
+/// directed-private) — the app's own record keeps it "own" locally.
+pub fn build_watch_funded_note_psbt(
+    self_output_x: &[u8; 32],
+    plan: &FundingPlan,
+    text: &str,
+    recipient_spk: Option<Vec<u8>>,
+    recipient_amount: u64,
+    note_id: [u8; 4],
+    max_op_return_bytes: usize,
+) -> Result<BuiltPsbt, Error> {
+    if text.is_empty() {
+        return Err(Error::Funding("empty note".into()));
+    }
+    if recipient_spk.is_some() && recipient_amount < DUST_LIMIT {
+        return Err(Error::Funding(format!("gift below dust ({DUST_LIMIT} sats minimum)")));
+    }
+    let flags = if recipient_spk.is_some() { notes_core::envelope::FLAG_DIRECTED } else { 0 };
+    let payloads =
+        notes_core::envelope::encode_chunks(note_id, flags, text.as_bytes(), max_op_return_bytes)?;
+    let self_spk = notes_core::address::p2tr_script_pubkey(self_output_x);
+    assemble_funded_note_psbt(plan, &payloads, recipient_spk, recipient_amount, self_spk)
+}
+
+/// Shared tail of both funded-note builders: payloads → outputs (OP_RETURNs,
+/// recipient carrying `recipient_amount`, dust-to-self, funding change) →
+/// PSBT with witness data + key origins on every funding input.
+fn assemble_funded_note_psbt(
+    plan: &FundingPlan,
+    payloads: &[Vec<u8>],
+    recipient_spk: Option<Vec<u8>>,
+    recipient_amount: u64,
+    self_spk: Vec<u8>,
+) -> Result<BuiltPsbt, Error> {
+    if plan.coins.is_empty() {
+        return Err(Error::Funding("no funding coins selected".into()));
+    }
 
     // --- inputs ---
     let mut inputs = Vec::with_capacity(plan.coins.len());
@@ -497,12 +540,11 @@ pub fn build_funding_psbt(plan: &FundingPlan, note: &NoteParams) -> Result<Built
     let mut sent_to_recipient = 0u64;
     if let Some(spk) = &recipient_spk {
         outputs.push(TxOut {
-            value: Amount::from_sat(DUST_LIMIT),
+            value: Amount::from_sat(recipient_amount),
             script_pubkey: ScriptBuf::from_bytes(spk.clone()),
         });
-        sent_to_recipient = DUST_LIMIT;
+        sent_to_recipient = recipient_amount;
     }
-    let self_spk = notes_core::address::p2tr_script_pubkey(&note.identity.output_x);
     outputs.push(TxOut { value: Amount::from_sat(DUST_LIMIT), script_pubkey: ScriptBuf::from_bytes(self_spk) });
     let dust_to_self = DUST_LIMIT;
 
@@ -934,6 +976,105 @@ mod tests {
         )
         .is_err(), "sub-dust gift rejected");
         let _ = self_addr;
+    }
+
+    /// Watch + external funding compose: the funding wallet pays for the
+    /// note, dust-to-self keeps it discoverable, the gift rides to the
+    /// recipient, and a key-less rescan attributes it received-from-funder
+    /// (the frozen scan rule for externally funded PUBLIC notes).
+    #[test]
+    fn watch_funded_note_psbt_public() {
+        use crate::psbt_finalize::{finalize_extract, validate_signed};
+        use bitcoin::bip32::{Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+        use notes_core::bundle::{extract_notes_watch, OnchainTx, SyncBundle};
+
+        let secp = Secp256k1::new();
+        let acct_path = [
+            bitcoin::bip32::ChildNumber::from_hardened_idx(86).unwrap(),
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+        ];
+        let fund_master = Xpriv::new_master(bitcoin::Network::Bitcoin, &[0x66u8; 32]).unwrap();
+        let fund_xpub = Xpub::from_priv(&secp, &fund_master.derive_priv(&secp, &acct_path).unwrap());
+        let fp = fund_master.fingerprint(&secp);
+        let fund_src =
+            FundingSource::parse(&format!("tr([{fp}/86'/0'/0']{fund_xpub}/<0;1>/*)"), NET).unwrap();
+        let fund_addr = fund_src.derive(0, 0).unwrap();
+        let fund_coins = vec![FundingUtxo {
+            txid: "c".repeat(64),
+            vout: 0,
+            value: 30_000,
+            address: fund_addr.address.clone(),
+            chain: 0,
+            index: 0,
+            confirmed: true,
+        }];
+        let plan = FundingPlan {
+            source: &fund_src,
+            coins: &fund_coins,
+            change_index: 0,
+            fee_rate: 2.0,
+            change_override: None,
+        };
+        let me = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let to_bob = Recipient::parse(NET, &bob.address(NET)).unwrap();
+
+        let built = build_watch_funded_note_psbt(
+            &me.output_x,
+            &plan,
+            "funded public note",
+            Some(to_bob.spk.clone()),
+            700,
+            [4, 4, 4, 4],
+            80,
+        )
+        .unwrap();
+        assert_eq!(built.sent_to_recipient, 700, "gift carried");
+        assert_eq!(built.dust_to_self, 330);
+        assert_eq!(30_000, built.fee + built.change + 700 + 330);
+        let tx = &built.psbt.unsigned_tx;
+        let self_spk = notes_core::address::p2tr_script_pubkey(&me.output_x);
+        assert!(tx.output.iter().any(|o| o.script_pubkey.as_bytes() == self_spk && o.value.to_sat() == 330));
+
+        let mut psbt = built.psbt.clone();
+        let _ = psbt.sign(&fund_master, &secp);
+        validate_signed(&psbt, &built.txid).expect("funding master signs");
+        assert!(finalize_extract(psbt).is_ok());
+
+        // Frozen scan rule: key-less rescan sees it received-from-funder.
+        let payloads: Vec<String> = tx
+            .output
+            .iter()
+            .filter_map(|o| notes_core::tx::op_return_payload(o.script_pubkey.as_bytes()).map(hex::encode))
+            .collect();
+        let bundle = SyncBundle {
+            network: "mainnet".into(),
+            notes_onchain: vec![OnchainTx {
+                txid: built.txid.clone(),
+                height: Some(1),
+                blocktime: Some(1),
+                spends_from_self: false,
+                payloads,
+                pays_self: true,
+                sender: Some(fund_addr.address.clone()),
+                author_candidates: vec![],
+                recipient: None,
+            }],
+            ..Default::default()
+        };
+        let notes = extract_notes_watch(&bundle, NET);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].text.as_deref(), Some("funded public note"));
+        assert!(notes[0].received, "external funding ⇒ received on a key-less rescan");
+        assert_eq!(notes[0].sender.as_deref(), Some(fund_addr.address.as_str()));
+
+        // Sub-dust gift rejected.
+        assert!(build_watch_funded_note_psbt(
+            &me.output_x, &plan, "x", Some(to_bob.spk), 100, [4, 4, 4, 5], 80
+        )
+        .is_err());
     }
 
     #[test]

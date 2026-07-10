@@ -290,6 +290,53 @@ fn main() {
                 args[5]
             );
         }
+        Some("note-funded-build") => {
+            // note-funded-build <store.json> <base-url> <funding-descriptor> <text> <rate> <out.psbt> [dest] [gift]
+            // Watch identity + funding wallet: PUBLIC note paid by the
+            // funding coins (dust-to-self keeps it discoverable; a key-less
+            // rescan shows it received-from-funder — frozen scan rule).
+            let store = load(&args[2]);
+            let net = network(&store.network.clone());
+            let ident = identity(net);
+            assert!(ident.watch_source().is_some(), "note-funded-build needs watch-only APP_KEY");
+            let fund_src = FundingSource::parse(&args[4], net).expect("funding descriptor");
+            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let scan = client.scan_funding(&fund_src, 20).expect("funding scan");
+            assert!(!scan.utxos.is_empty(), "funding wallet has no spendable coins");
+            let text = &args[5];
+            let rate: f64 = args[6].parse().expect("fee rate");
+            let recipient = args.get(8).map(|a| Recipient::parse(net, a).expect("dest address"));
+            let gift: u64 = args.get(9).and_then(|g| g.parse().ok()).unwrap_or(330);
+            let aux = app_core::notes_core::keys::generate_aux_rand().expect("rng");
+            let note_id = [aux[0], aux[1], aux[2], aux[3]];
+            let plan = FundingPlan {
+                source: &fund_src,
+                coins: &scan.utxos,
+                change_index: scan.next_change_index,
+                fee_rate: rate,
+                change_override: None,
+            };
+            let built = app_core::psbt_build::build_watch_funded_note_psbt(
+                &ident.output_x(),
+                &plan,
+                text,
+                recipient.as_ref().map(|r| r.spk.clone()),
+                if recipient.is_some() { gift } else { 0 },
+                note_id,
+                store.chunk_size,
+            )
+            .expect("build funded note psbt");
+            std::fs::write(&args[7], built.to_bytes()).expect("write psbt");
+            println!(
+                "cli: note-funded-build id={} txid={} fee={} gift={} fund_in={} -> {}",
+                hex::encode(note_id),
+                built.txid,
+                built.fee,
+                built.sent_to_recipient,
+                scan.utxos.len(),
+                args[7]
+            );
+        }
         Some("spend-broadcast") => {
             // spend-broadcast <base-url> <network> <signed.psbt> <expected-txid>
             // Validate the externally signed PSBT, finalize, broadcast.
