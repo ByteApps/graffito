@@ -117,9 +117,16 @@ a PopupWindow-backed picker; on regtest both lists are Custom-only;
 these two live in config.json keyed by network (device-level, NOT the
 per-identity store), so switching identity keeps them],
 Coins card, Funds/sweep, Touch ID reveal — Flickable-scrollable) · 9 account
-picker (paginated, 5/page, current badge) · 10 coins (spendable UTXO
-list + consolidate-to-self) · 11 activity (all note + sweep/consolidate
-txs; pending get Bump-fee/Rebroadcast/Explorer). Modals
+picker (paginated, 5/page, current badge) · 10 coins (viewer-first:
+spendable UTXO list with ONE "Consolidate into one coin…" button on top
+that opens 16) · 11 activity (all note + sweep/consolidate txs; pending
+get Bump-fee/Rebroadcast/Explorer) · 16 sweep/consolidate (compose-like,
+shared via `sweep-kind`: destination line, fee tier pills + custom
+field, live cost line, "Pay the fee from another wallet", READ-ONLY
+inputs collapsible; sweep is reached from Settings→Funds through the
+send-to picker in `pick-mode` "sweep" — no Self card — consolidate from
+Coins with dest = self; keyed unfunded routes to the classic confirm
+modals, watch or fee-funded to the external-sign screen 13). Modals
 (overlays as LAST children of the window root): rename, remove-confirm,
 reset-confirm, sweep-confirm, consolidate-confirm.
 

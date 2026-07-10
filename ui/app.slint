@@ -584,6 +584,9 @@ export component AppWindow inherits Window {
     in-out property <bool> sweep-inputs-expanded;
     in property <[SpendCoin]> sweep-coins;
     in-out property <bool> sweep-fund-external;
+    // Screen 16 serves both flows: "sweep" (dest from the picker) and
+    // "consolidate" (dest = self, opened from the Coins screen).
+    in-out property <string> sweep-kind: "sweep";
     // Which screen the funding-wallet manager returns to (6 compose, 16 sweep).
     in-out property <int> funding-return: 6;
 
@@ -607,6 +610,7 @@ export component AppWindow inherits Window {
     callback set-fee-tier(int);
     callback sweep();
     callback sweep-open();                 // settings → destination picker
+    callback consolidate-open();           // coins → consolidate screen (16)
     callback set-sweep-tier(int);
     callback sweep-rate-changed();
     callback toggle-sweep-fund-external(bool);
@@ -1780,19 +1784,11 @@ export component AppWindow inherits Window {
                 ? "Each note tx spends these unspent outputs. Consolidating combines them into one coin — watch-only signs the transaction on your external wallet."
                 : "Each note tx spends these unspent outputs. Consolidating combines them into one coin at your address, so future notes need fewer inputs (lower fees).";
         }
-        HorizontalLayout {
-            spacing: 8px;
-            LineEdit { width: 84px; text <=> root.consolidate-rate; }
-            Caption { text: "sat/vB"; vertical-alignment: center; }
-            Rectangle { }
-            GhostButton {
-                width: 200px;
-                text: "Consolidate into one coin";
-                clicked => {
-                    root.consolidate-preview();
-                    root.show-consolidate-confirm = true;
-                }
-            }
+        // Viewer-first: the list is the point; consolidation is one button
+        // that opens its own compose-like screen (16, shared with sweep).
+        GhostButton {
+            text: "Consolidate into one coin…";
+            clicked => { root.consolidate-open(); }
         }
         Body { text: root.coins-summary; font-size: 12px; }
         Flickable {
@@ -2235,10 +2231,20 @@ export component AppWindow inherits Window {
         spacing: 12px;
         alignment: start;
         Header {
-            title: "Sweep";
+            title: root.sweep-kind == "consolidate" ? "Consolidate" : "Sweep";
             // Clear the typed address + any stale status on the way back —
-            // success messages otherwise linger red on the picker.
-            back => { root.contact-input = ""; root.status = ""; root.pick-mode = "sweep"; root.screen = 7; }
+            // success messages otherwise linger red on the picker. Sweep
+            // returns to its destination picker, consolidate to the coins.
+            back => {
+                root.contact-input = "";
+                root.status = "";
+                if (root.sweep-kind == "consolidate") {
+                    root.screen = 10;
+                } else {
+                    root.pick-mode = "sweep";
+                    root.screen = 7;
+                }
+            }
         }
         Flickable {
             viewport-height: sweep-col.preferred-height;
@@ -2421,7 +2427,7 @@ export component AppWindow inherits Window {
                     }
                 }
                 if !root.sweep-fund-external && !root.watch-only: PrimaryButton {
-                    text: "Sweep — sign + broadcast";
+                    text: root.sweep-kind == "consolidate" ? "Consolidate — sign + broadcast" : "Sweep — sign + broadcast";
                     clicked => { root.sweep-send(); }
                 }
                 if !root.sweep-fund-external && root.watch-only: PrimaryButton {

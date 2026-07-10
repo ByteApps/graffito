@@ -249,6 +249,76 @@ fn tx_rate(store: &Store, ref_id: &str, is_note: bool) -> Option<(f64, u64, u64)
     }
 }
 
+/// Refresh the consolidate confirm-dialog fee line. Free function (not
+/// just the callback) so on_sweep_send can call it WITHOUT re-invoking
+/// the slint callback — that re-borrows the State RefCell and panics.
+fn refresh_consolidate_preview(w: &AppWindow, s: &mut State) {
+    let _ = &s;
+    w.set_consolidate_fee_line("".into());
+    let rate: f64 = w.get_consolidate_rate().trim().parse().unwrap_or(1.0);
+    let net = s.network;
+    let Some(ident) = s.ident.as_ref() else { return };
+    let Ok(me) = Recipient::parse(net, &ident.address) else { return };
+    if ident.is_watch() {
+        // Dry-run the same builder the watch consolidate signs externally.
+        let Some(src) = ident.watch_source() else { return };
+        let Some(store) = s.store.as_ref() else { return };
+        let coins: Vec<WatchCoin> = store
+            .utxos
+            .iter()
+            .filter(|u| !u.pending_spend)
+            .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
+            .collect();
+        if coins.len() < 2 {
+            w.set_consolidate_fee_line("nothing to consolidate — need 2+ spendable coins".into());
+            return;
+        }
+        match build_watch_spend_psbt(src, &coins, me.spk.clone(), rate) {
+            Ok(b) => w.set_consolidate_fee_line(
+                format!(
+                    "fee {} sats · combines {} coins @ {} sat/vB · signs on your external wallet",
+                    b.fee,
+                    coins.len(),
+                    rate
+                )
+                .into(),
+            ),
+            Err(e) => w.set_consolidate_fee_line(format!("{e}").into()),
+        }
+        return;
+    }
+    let Some(identity) = ident.full().map(|i| i.clone_fields()) else { return };
+    let Some(store) = s.store.as_ref() else { return };
+    let coins = store.available_utxos();
+    if coins.len() < 2 {
+        w.set_consolidate_fee_line("nothing to consolidate — need 2+ spendable coins".into());
+        return;
+    }
+    match app_core::notes_core::tx::build_sweep_tx(
+        &coins,
+        &identity.output_x,
+        me.spk,
+        rate,
+        &identity.tweaked_seckey,
+        app_core::notes_core::keys::generate_aux_rand,
+    ) {
+        Ok(tx) => {
+            println!("cb: consolidate-preview coins={} fee={} vsize={}", coins.len(), tx.fee, tx.vsize);
+            w.set_consolidate_fee_line(
+                format!(
+                    "fee {} sats · combines {} coins · {} vB @ {} sat/vB",
+                    tx.fee,
+                    coins.len(),
+                    tx.vsize,
+                    rate
+                )
+                .into(),
+            );
+        }
+        Err(e) => w.set_consolidate_fee_line(format!("estimate failed: {e}").into()),
+    }
+}
+
 /// Post-broadcast bookkeeping for a watch-mode compose: record the public
 /// note as Pending with the same ledger effects as a keyed compose —
 /// inputs locked, change (last vout) spendable unconfirmed, raw hex kept
@@ -609,10 +679,12 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
             w.set_sweep_cost_line(format!("balance {total} sats can't cover the ~{fee} sat fee").into());
             return;
         }
-        w.set_sweep_cost_line(
+        let line = if w.get_sweep_kind().as_str() == "consolidate" {
+            format!("combines {n} coins → 1 · fee ~{fee} sats · keeps {}", total - fee)
+        } else {
             format!("sweeps {total} sats · fee ~{fee} sats · destination receives {}", total - fee)
-                .into(),
-        );
+        };
+        w.set_sweep_cost_line(line.into());
     }
 }
 
@@ -2503,70 +2575,7 @@ pub fn run() {
     // Consolidate button broadcasts. Key-spend signatures are constant-size,
     // so the previewed fee/vsize match the broadcast tx exactly.
     cb!(on_consolidate_preview, |w, s| {
-        let _ = &mut s;
-        w.set_consolidate_fee_line("".into());
-        let rate: f64 = w.get_consolidate_rate().trim().parse().unwrap_or(1.0);
-        let net = s.network;
-        let Some(ident) = s.ident.as_ref() else { return };
-        let Ok(me) = Recipient::parse(net, &ident.address) else { return };
-        if ident.is_watch() {
-            // Dry-run the same builder the watch consolidate signs externally.
-            let Some(src) = ident.watch_source() else { return };
-            let Some(store) = s.store.as_ref() else { return };
-            let coins: Vec<WatchCoin> = store
-                .utxos
-                .iter()
-                .filter(|u| !u.pending_spend)
-                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
-                .collect();
-            if coins.len() < 2 {
-                w.set_consolidate_fee_line("nothing to consolidate — need 2+ spendable coins".into());
-                return;
-            }
-            match build_watch_spend_psbt(src, &coins, me.spk.clone(), rate) {
-                Ok(b) => w.set_consolidate_fee_line(
-                    format!(
-                        "fee {} sats · combines {} coins @ {} sat/vB · signs on your external wallet",
-                        b.fee,
-                        coins.len(),
-                        rate
-                    )
-                    .into(),
-                ),
-                Err(e) => w.set_consolidate_fee_line(format!("{e}").into()),
-            }
-            return;
-        }
-        let Some(identity) = ident.full().map(|i| i.clone_fields()) else { return };
-        let Some(store) = s.store.as_ref() else { return };
-        let coins = store.available_utxos();
-        if coins.len() < 2 {
-            w.set_consolidate_fee_line("nothing to consolidate — need 2+ spendable coins".into());
-            return;
-        }
-        match app_core::notes_core::tx::build_sweep_tx(
-            &coins,
-            &identity.output_x,
-            me.spk,
-            rate,
-            &identity.tweaked_seckey,
-            app_core::notes_core::keys::generate_aux_rand,
-        ) {
-            Ok(tx) => {
-                println!("cb: consolidate-preview coins={} fee={} vsize={}", coins.len(), tx.fee, tx.vsize);
-                w.set_consolidate_fee_line(
-                    format!(
-                        "fee {} sats · combines {} coins · {} vB @ {} sat/vB",
-                        tx.fee,
-                        coins.len(),
-                        tx.vsize,
-                        rate
-                    )
-                    .into(),
-                );
-            }
-            Err(e) => w.set_consolidate_fee_line(format!("estimate failed: {e}").into()),
-        }
+        refresh_consolidate_preview(&w, &mut s);
     });
 
     cb!(on_consolidate, |w, s| {
@@ -2615,6 +2624,7 @@ pub fn run() {
                         s.save_store();
                         println!("cb: consolidate txid={txid} value={} fee={}", tx.tx.outputs[0].value, tx.fee);
                         w.set_status(format!("consolidating: {}…", &txid[..12.min(txid.len())]).into());
+                        w.set_screen(4); // done — home, like the PSBT flow
                         update_home(&w, &s);
                     }
                     Err(e) => w.set_status(format!("consolidate broadcast failed: {e}").into()),
@@ -2668,6 +2678,7 @@ pub fn run() {
                             tx.tx.outputs[0].value, tx.fee
                         );
                         w.set_status(format!("swept {} sats to {}…", tx.tx.outputs[0].value, &dest[..14.min(dest.len())]).into());
+                        w.set_screen(4); // done — home, like the PSBT flow
                         update_home(&w, &s);
                     }
                     Err(e) => w.set_status(format!("sweep broadcast failed: {e}").into()),
@@ -2697,11 +2708,37 @@ pub fn run() {
 
     cb!(on_sweep_open, |w, s| {
         println!("cb: sweep-open");
+        w.set_sweep_kind("sweep".into());
         w.set_pick_mode("sweep".into());
         refresh_contacts(&w, &s);
         w.set_contact_input("".into());
         w.set_status("".into());
         w.set_screen(7);
+    });
+
+    cb!(on_consolidate_open, |w, s| {
+        let spendable = s
+            .store
+            .as_ref()
+            .map(|st| st.utxos.iter().filter(|u| !u.pending_spend).count())
+            .unwrap_or(0);
+        if spendable < 2 {
+            w.set_status("nothing to consolidate (need 2+ coins)".into());
+            return;
+        }
+        let Some(addr) = s.ident.as_ref().map(|i| i.address.clone()) else { return };
+        println!("cb: consolidate-open coins={spendable}");
+        w.set_sweep_kind("consolidate".into());
+        w.set_sweep_dest(addr.clone().into());
+        w.set_sweep_to_label(format!("Consolidate to your address · {addr}").into());
+        w.set_sweep_tier(1);
+        let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+        w.set_sweep_rate_text(format!("{rate}").into());
+        w.set_sweep_fund_external(false);
+        w.set_sweep_inputs_expanded(false);
+        w.set_status("".into());
+        update_sweep_screen(&w, &mut s);
+        w.set_screen(16);
     });
 
     cb!(on_set_sweep_tier, |w, s, tier: i32| {
@@ -2816,7 +2853,7 @@ pub fn run() {
                     );
                     s.watch_note = None;
                     s.watch_spend = Some(WatchSpend {
-                        kind: "sweep",
+                        kind: if w.get_sweep_kind().as_str() == "consolidate" { "consolidate" } else { "sweep" },
                         dest: dest.clone(),
                         dest_spk_hex: hex::encode(&recipient.spk),
                         value: built.sent_to_recipient,
@@ -2837,14 +2874,22 @@ pub fn run() {
             }
             return;
         }
+        let consolidate = w.get_sweep_kind().as_str() == "consolidate";
         if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
-            watch_spend_build(&w, &mut s, "sweep", dest, recipient.spk.clone(), rate);
+            let kind = if consolidate { "consolidate" } else { "sweep" };
+            watch_spend_build(&w, &mut s, kind, dest, recipient.spk.clone(), rate);
             return;
         }
-        // Keyed, self-paid: resolved rate feeds the classic confirm modal →
-        // on_sweep signs + broadcasts in-app.
-        w.set_sweep_rate(format!("{rate}").into());
-        w.set_show_sweep_confirm(true);
+        // Keyed, self-paid: resolved rate feeds the classic confirm modal —
+        // on_sweep / on_consolidate sign + broadcast in-app.
+        if consolidate {
+            w.set_consolidate_rate(format!("{rate}").into());
+            refresh_consolidate_preview(&w, &mut s);
+            w.set_show_consolidate_confirm(true);
+        } else {
+            w.set_sweep_rate(format!("{rate}").into());
+            w.set_show_sweep_confirm(true);
+        }
     });
 
     cb!(on_pick_contact, |w, s, addr: SharedString| {
