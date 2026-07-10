@@ -52,7 +52,7 @@ block2 = "0.6"
 
 # macOS desktop: femtovg default + software renderer for --render; native glue.
 [target.'cfg(target_os = "macos")'.dependencies]
-slint = { version = "=1.16.1", features = ["renderer-software"] }
+slint = { version = "=1.17.1", features = ["renderer-software"] }
 # QR in: camera frames (AVFoundation via nokhwa) → rqrr decode.
 nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 # Native file-open dialog (import-from-file door).
@@ -60,7 +60,7 @@ rfd = "0.14"
 
 # iOS: winit + Skia (Metal); femtovg/GL-ES and nokhwa/rfd are not available.
 [target.'cfg(target_os = "ios")'.dependencies]
-slint = { version = "=1.16.1", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-skia"] }
+slint = { version = "=1.17.1", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-skia"] }
 # Safe-area insets (status bar / Dynamic Island / home indicator).
 objc2-ui-kit = { version = "0.3", features = ["UIApplication", "UIWindow", "UIView", "UIResponder", "UIPasteboard", "objc2-core-foundation"] }
 objc2-core-foundation = "0.3"
@@ -77,7 +77,7 @@ dispatch2 = "0.3"
 # through JNI (jni + ndk-context give the JavaVM + Activity from the
 # android-activity NativeActivity that Slint boots).
 [target.'cfg(target_os = "android")'.dependencies]
-slint = { version = "=1.16.1", default-features = false, features = ["compat-1-2", "backend-android-activity-06", "renderer-skia"] }
+slint = { version = "=1.17.1", default-features = false, features = ["compat-1-2", "backend-android-activity-06", "renderer-skia"] }
 jni = "0.21"
 ndk-context = "0.1"
 
@@ -120,7 +120,7 @@ name = "android.hardware.camera.any"
 required = false
 
 [build-dependencies]
-slint-build = "=1.16.1"
+slint-build = "=1.17.1"
 
 # Slint's text shaper (harfrust, via parley) has an integer add that overflows
 # on very large single text runs. Release wraps it (overflow-checks off by

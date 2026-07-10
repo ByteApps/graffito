@@ -150,9 +150,30 @@ dropdowns write them via save_config(). A legacy per-identity node URL
 Reset ("Switch identity") deletes the keychain item and returns to
 onboarding; notes recover from chain on re-import.
 
-M5 platform facts: **slint is pinned `=1.16.1`** — 1.17 needs rustc
-1.92 and the SDK nix shell ships 1.91-nightly; bump the pin only with a
-newer toolchain. Camera spike: `cargo run -- --spike camera [secs]`
+M5 platform facts: **slint is pinned `=1.17.1`** (bumped from 1.16.1 on
+2026-07-10 for the text-input work — 1.17.1 fixed Mac TextEdit
+double/triple-click selection and iOS TextEdit tap-focus/caret/keyboard;
+see ../PLAN-chain-notes-app-text-input.md for the per-platform behavior
+matrix). 1.17 needs rustc 1.92, so host builds moved off the SDK nix
+shell (1.91-nightly) onto the standalone rustup.
+
+**Text-input layer (2026-07-10):** all fields are the app's own
+`EditField`/`EditArea` components (ui/app.slint) wrapping a raw
+`TextInput` — NOT std LineEdit/TextEdit — so the app can use the
+byte-offset cursor API. They provide: desktop right-click Cut/Copy/Paste/
+Select-All menu, a floating touch toolbar on iOS/Android (shown while a
+field has focus; actions go through `EditOps`, Rust-backed in lib.rs),
+double-tap word selection on touch (350 ms window, text-equality guard),
+paste-at-cursor (compose header Paste calls `note-edit.paste-clip()`),
+and a fluent-style ✕ clear button (`icons/dismiss.svg` — SVG, not a
+glyph). Clipboard routing: native TextInput cut/copy/paste everywhere
+EXCEPT iOS (winit's iOS clipboard is a no-op) where `EditOps.clip-*` uses
+the UIPasteboard shim + splicing; natives also keep undo coherent —
+programmatic `text =` splices corrupt the undo stack, which is why the
+iOS-only gate exists. iOS paste triggers the standard system paste
+prompt (allow once, or Settings → app → Paste from Other Apps).
+Upstream findings + retractions live in UPSTREAM-ISSUES.md (policy: file
+nothing upstream until we carry a proper fix). Camera spike: `cargo run -- --spike camera [secs]`
 (first run pops the TCC prompt; 1080p Luma frames → rqrr). Keychain
 spike: `--spike keychain` (plain round-trip, automation-safe) and
 `--spike keychain-auth` (interactive user-presence round-trip).
@@ -258,15 +279,21 @@ the Pixel 6 emulator's true status bar is ~48.8dp).
 
 ## Build / test
 
-No system Rust on this machine — use the Foundation SDK's Nix shell as a
-plain host toolchain (ssh-agent passes through; `.cargo/config.toml`
-forces git-CLI fetch for the ssh:// dep):
+ALL builds (host + mobile) use the **standalone rustup** stable
+(`~/.cargo/bin`, 1.96.1) — switched from the SDK Nix shell 2026-07-10 when
+slint was bumped to 1.17.1 (needs rustc 1.92; the Nix shell's fixed
+nightly is 1.91). ssh-agent + `.cargo/config.toml`'s git-CLI fetch cover
+the ssh:// notes-core dep as before:
 
 ```bash
-nix develop ~/.foundation/sdk/current --command cargo test -p app-core
-nix develop ~/.foundation/sdk/current --command bash scripts/regtest-e2e.sh  # app↔Prime interop matrix vs real bitcoind
-nix develop ~/.foundation/sdk/current --command cargo run
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo test -p app-core
+bash scripts/regtest-e2e.sh   # app↔Prime interop matrix vs real bitcoind
+cargo run
 ```
+
+(The Foundation SDK Nix shell still works as a host toolchain for
+anything that fits its rustc; it just can't build slint ≥1.17.)
 
 The e2e script reuses ../prime-chain-notes' `companion/server.py
 --regtest` (manages its own throwaway bitcoind; auto-mines on POST /tx
