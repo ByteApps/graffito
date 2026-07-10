@@ -115,6 +115,7 @@ fn main() {
                 Some(id) => store.apply_bundle(&bundle, id, net).expect("apply"),
                 None => store.apply_bundle_watch(&bundle, &ident.output_x(), net).expect("apply"),
             };
+            store.resolve_spend_statuses(|t| client.fetch_tx_status(t));
             save(&store, &args[2]);
             println!(
                 "cli: scan notes={} new={} orphaned={} balance={} tip={}",

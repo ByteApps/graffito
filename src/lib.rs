@@ -840,6 +840,18 @@ fn refresh(w: &AppWindow, st: &mut State) {
             };
             match applied {
                 Ok(stats) => {
+                    // Sweep/consolidate records settle on REAL confirmation
+                    // (any of their txids in a block), asked of the node —
+                    // mempool acceptance alone keeps them Pending so
+                    // Speed-up/Rebroadcast stay available while RBF is.
+                    let n = st
+                        .store
+                        .as_mut()
+                        .unwrap()
+                        .resolve_spend_statuses(|t| client.fetch_tx_status(t));
+                    if n > 0 {
+                        println!("cb: spend-confirmed n={n}");
+                    }
                     println!(
                         "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
                         stats.notes_seen,
