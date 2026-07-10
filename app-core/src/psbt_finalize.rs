@@ -69,10 +69,10 @@ pub struct PsbtSummary {
 }
 
 /// Context that lets the summary label outputs precisely (the app knows these
-/// from the build): our identity address, the directed recipient, and the
-/// funding change address.
+/// from the build): our identity output key (works for watch-only too), the
+/// directed recipient, and the funding change address.
 pub struct SummaryContext<'a> {
-    pub identity: &'a Identity,
+    pub identity_output_x: [u8; 32],
     pub network: Network,
     pub recipient_addr: Option<&'a str>,
     pub change_addr: Option<&'a str>,
@@ -116,7 +116,7 @@ pub fn summarize(psbt: &Psbt, ctx: &SummaryContext) -> Result<PsbtSummary, Error
         });
     }
 
-    let self_spk = p2tr_script_pubkey(&ctx.identity.output_x);
+    let self_spk = p2tr_script_pubkey(&ctx.identity_output_x);
     // Group all OP_RETURN outputs into a single note payload set.
     let note_payloads: Vec<Vec<u8>> = tx
         .output
@@ -230,7 +230,7 @@ mod tests {
         let (b, alice, to_bob, src) = built();
         let change_addr = src.derive(1, 0).unwrap().address;
         let ctx = SummaryContext {
-            identity: &alice,
+            identity_output_x: alice.output_x,
             network: NET,
             recipient_addr: Some(&to_bob.address),
             change_addr: Some(&change_addr),

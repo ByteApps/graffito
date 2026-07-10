@@ -174,6 +174,11 @@ fn is_taproot_addr(addr: &str) -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EsploraVin {
+    /// Outpoint being spent (present on real esplora and server.py alike).
+    #[serde(default)]
+    pub txid: Option<String>,
+    #[serde(default)]
+    pub vout: Option<u32>,
     #[serde(default)]
     pub prevout: Option<EsploraOut>,
 }
@@ -329,6 +334,53 @@ impl<T: Transport> ChainClient<T> {
     /// Broadcast raw tx hex; returns the txid mempool.space echoes back.
     pub fn broadcast(&self, raw_hex: &str) -> Result<String, Error> {
         Ok(self.transport.post_text("/tx", raw_hex.to_string())?.trim().to_string())
+    }
+
+    /// Raw hex of an on-chain/mempool tx — the keyless rebroadcast source.
+    pub fn fetch_tx_hex(&self, txid: &str) -> Result<String, Error> {
+        Ok(self.transport.get_text(&format!("/tx/{txid}/hex"))?.trim().to_string())
+    }
+
+    /// A pending tx's inputs (as spendable outpoints with values) and
+    /// outputs (spk bytes + value) — what a watch-mode RBF bump rebuilds
+    /// from. Input values come from the vin prevout when the backend sends
+    /// one, else from fetching the parent tx.
+    pub fn fetch_tx_io(
+        &self,
+        txid: &str,
+    ) -> Result<(Vec<crate::psbt_build::WatchCoin>, Vec<(Vec<u8>, u64)>, bool), Error> {
+        let t: EsploraTx = parse_json(&self.transport.get_text(&format!("/tx/{txid}"))?)?;
+        let mut coins = Vec::with_capacity(t.vin.len());
+        for vin in &t.vin {
+            let (ptxid, pvout) = match (&vin.txid, vin.vout) {
+                (Some(x), Some(v)) => (x.clone(), v),
+                _ => return Err(Error::Json("vin without outpoint".into())),
+            };
+            let value = match vin.prevout.as_ref().map(|p| p.value) {
+                Some(v) if v > 0 => v,
+                _ => {
+                    // Backend sent no prevout value — read the parent tx.
+                    let parent: EsploraTx =
+                        parse_json(&self.transport.get_text(&format!("/tx/{ptxid}"))?)?;
+                    parent
+                        .vout
+                        .get(pvout as usize)
+                        .map(|o| o.value)
+                        .ok_or_else(|| Error::Json("parent vout missing".into()))?
+                }
+            };
+            coins.push(crate::psbt_build::WatchCoin { txid: ptxid, vout: pvout, value });
+        }
+        let mut outputs = Vec::with_capacity(t.vout.len());
+        for o in &t.vout {
+            let spk = o
+                .scriptpubkey
+                .as_deref()
+                .and_then(|h| hex::decode(h).ok())
+                .ok_or_else(|| Error::Json("vout without script".into()))?;
+            outputs.push((spk, o.value));
+        }
+        Ok((coins, outputs, t.status.confirmed))
     }
 
     /// Assemble the in-memory SyncBundle notes-core's extract_notes eats —
