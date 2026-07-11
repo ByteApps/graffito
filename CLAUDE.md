@@ -175,9 +175,15 @@ BIP-86 account. `notebooks-<net>-<masterfp8>.json` (app-core
 key (`identity::index_fp8`) is shared across accounts, so one identity
 = one index. Store gains `excluded_senders` + `seen_received` (unread =
 received notes not yet seen; `mark_seen` fires when LEAVING home for
-the list, so the badge only counts what arrived since). Create = next
-unused account (activate() ensures the index entry); archive guards:
-never the last active notebook, never one holding sats (sweep first);
+the list, so the badge only counts what arrived since). Create is
+NAME-FIRST: "+ New notebook" only opens the naming dialog
+(`nb-rename-account == -2` = create mode; ≥ 0 = rename); nothing is
+derived until Save/Create, so Cancel leaves no phantom row. ONE archive
+guard: a notebook holding sats refuses (sweep first). ZERO active
+notebooks is a legitimate state (Sal 2026-07-11) — archive-all is
+allowed and the list shows "All notebooks are archived." / "No
+notebooks yet…" empty-state captions; boot never resurrects archived
+entries (activate()'s ensure() only ADDS missing accounts).
 reset-identity deletes notebooks-*.json alongside stores.
 
 **Identity lifecycle:** key material verbatim in the keychain; BIP-86

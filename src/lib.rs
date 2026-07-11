@@ -4438,26 +4438,17 @@ pub fn run() {
     });
 
     cb!(on_create_notebook, |w, s| {
+        // Name-first: this only opens the dialog in CREATE mode (-2).
+        // Nothing is derived or persisted until Save — Cancel leaves no
+        // phantom unnamed notebook behind.
         let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
             return;
         };
         if !is_hierarchical(&material, s.network) {
             return; // button is hidden; a stray call must not add phantom rows
         }
-        let Some(account) = s.notebooks.as_ref().map(|ix| ix.next_account()) else { return };
-        println!("cb: create-notebook account={account}");
-        s.account = account;
-        // activate() adds the account to the index, persists it, and
-        // rebuilds the address cache — the new row appears behind the
-        // naming dialog.
-        match activate(&mut s, &material, false) {
-            Ok(()) => {
-                update_notebook_list(&w, &s);
-                w.set_nb_rename_input("".into());
-                w.set_nb_rename_account(account as i32);
-            }
-            Err(e) => w.set_status(format!("{e}").into()),
-        }
+        w.set_nb_rename_input("".into());
+        w.set_nb_rename_account(-2);
     });
 
     cb!(on_nb_rename_start, |w, s, account: i32, _display: SharedString| {
@@ -4475,18 +4466,45 @@ pub fn run() {
     });
 
     cb!(on_nb_rename_save, |w, s, name: SharedString| {
-        let account = w.get_nb_rename_account();
-        if account < 0 {
+        let sel = w.get_nb_rename_account();
+        if sel == -1 {
             return;
         }
-        let account = account as u32;
+        w.set_nb_rename_account(-1);
+        w.set_nb_rename_input("".into());
+        if sel == -2 {
+            // CREATE mode: derive the next unused account, name it, and
+            // switch to it (activate() adds + persists the index entry).
+            let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+                return;
+            };
+            if !is_hierarchical(&material, s.network) {
+                return;
+            }
+            let Some(account) = s.notebooks.as_ref().map(|ix| ix.next_account()) else { return };
+            println!("cb: create-notebook account={account}");
+            s.account = account;
+            match activate(&mut s, &material, false) {
+                Ok(()) => {
+                    if !name.trim().is_empty() {
+                        if let Some(ix) = s.notebooks.as_mut() {
+                            ix.rename(account, name.as_str());
+                            s.save_notebooks();
+                            println!("cb: rename-notebook account={account}");
+                        }
+                    }
+                    update_notebook_list(&w, &s);
+                }
+                Err(e) => w.set_status(format!("{e}").into()),
+            }
+            return;
+        }
+        let account = sel as u32;
         if let Some(ix) = s.notebooks.as_mut() {
             ix.rename(account, name.as_str());
             s.save_notebooks();
             println!("cb: rename-notebook account={account}");
         }
-        w.set_nb_rename_account(-1);
-        w.set_nb_rename_input("".into());
         update_notebook_list(&w, &s);
         if s.ident.as_ref().map(|i| i.account) == Some(account) {
             w.set_notebook_title(s.notebook_display_name(account).into());
@@ -4501,14 +4519,13 @@ pub fn run() {
 
     cb!(on_nb_archive, |w, s, account: i32, archived: bool| {
         let account = account.max(0) as u32;
-        let Some(ix) = s.notebooks.as_ref() else { return };
+        if s.notebooks.is_none() {
+            return;
+        }
         if archived {
-            // Guards: the list must keep at least one active notebook, and
-            // funds never disappear from view silently — sweep first.
-            if ix.active().count() <= 1 {
-                w.set_status("can't archive the last notebook".into());
-                return;
-            }
+            // One guard only: funds never disappear from view silently —
+            // sweep first. Archiving EVERY notebook is allowed (the list
+            // shows its empty state); Restore brings any of them back.
             let balance = notebook_store(&s, account).map(|st2| st2.balance()).unwrap_or(0);
             if balance > 0 {
                 w.set_status(
