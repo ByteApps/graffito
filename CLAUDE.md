@@ -235,6 +235,25 @@ platforms — never call `pbcopy`/`open` directly. Glyph rule reminder: ↻ and
 ⚙ are emulator-proven on Android; ✓ → ⟳ ⚠ tofu — keep glyphs out of caption
 text and use the SVG icons.
 
+**Android system back** (button AND gesture — both arrive as slint
+`Key.Back`; unhandled key events finish the NativeActivity, which used to
+quit the app from any screen): `back-scope`, a FocusScope wrapping every
+window child in app.slint, feeds `root.nav-back()` — the single source of
+truth the header chevrons call too. Order: topmost modal closes first,
+then the current screen navigates exactly like its chevron; screens 0/4
+return false → the key is rejected → Android's default runs (activity
+finishes cleanly to the launcher, process stays cached — relaunch into
+that cached process re-runs `android_main` and is verified working).
+Logs `cb: sys-back handled=<b> screen=<n>` (screen = AFTER navigating).
+Two invariants keep it alive: (1) key events are only delivered while
+SOMETHING has focus, so back-scope takes focus at init, on `changed
+screen`, and when the two self-focusing rename dialogs close — NEVER call
+`clear-focus()` anywhere, focus `back-scope` instead (the compose "Done"
+button does this); (2) the Up half of the key pair must replay the Down's
+accept/reject verdict (`back-eaten`) or Android's tracked-back detection
+misfires. With the keyboard up, the IME consumes the first Back itself
+(that's why the e2e's `keyevent 4` keyboard-dismiss still works).
+
 **iOS launch-path rule (watchdog).** NOTHING network-bound may run before
 the first frame: the boot-identity sync runs from a 300 ms single-shot
 timer after the scene attaches (`8927e6c`). Blocking launch on HTTP got
@@ -343,7 +362,9 @@ picker` · `cb: pick-account <n>` · `cb: account-picker open` ·
 `cb: set-explorer-preset <name|custom>` · `cb: set-explorer-custom <url|default>` ·
 `cb: reveal-backup ok|cancelled` · `cb: reset-identity` ·
 `cb: open-note-web url=…` · `cb: toggle-coin selected=<n>` ·
-`cb: refresh-coins` · `cb: act-explorer` · `cb: bump-open`/`act-bump`.
+`cb: refresh-coins` · `cb: act-explorer` · `cb: bump-open`/`act-bump` ·
+`cb: sys-back handled=<b> screen=<n>` (Android system back; screen is
+where back landed us).
 UI e2e:
 `../ui-automation/tests/chain-notes-app.sh` (simtap point offsets from
 the window origin — recalibrate from screenshots when app.slint moves
