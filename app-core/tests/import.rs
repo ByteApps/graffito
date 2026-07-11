@@ -64,6 +64,16 @@ fn network_mismatches_rejected() {
     ));
 }
 
+/// 18-word mnemonics (a BIP-85 length prime-bip85 emits) import like 12/24.
+#[test]
+fn eighteen_word_mnemonic_imports() {
+    let m = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &[0xA5u8; 24]).unwrap();
+    let parsed = parse_key_material(&m.to_string(), Network::Mainnet).unwrap();
+    assert!(matches!(parsed, KeyMaterial::Mnemonic(_)));
+    let ident = realize(&parsed, Network::Mainnet, 0).unwrap();
+    assert!(ident.address.starts_with("bc1p"));
+}
+
 #[test]
 fn malformed_inputs_rejected() {
     // 15-word mnemonics are valid BIP-39 but not accepted here.

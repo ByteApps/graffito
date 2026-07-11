@@ -1,17 +1,17 @@
-//! SeedQR round-trips, standard and compact, 12 and 24 words.
+//! SeedQR round-trips, standard and compact, 12/18/24 words.
 
 use app_core::seedqr::{decode, decode_compact, decode_standard, encode_compact, encode_standard};
 use app_core::Error;
 use bip39::{Language, Mnemonic};
 
 fn fixed(words: usize) -> Mnemonic {
-    let entropy = vec![0xA5u8; if words == 12 { 16 } else { 32 }];
+    let entropy = vec![0xA5u8; words * 4 / 3]; // 12→16, 18→24, 24→32 bytes
     Mnemonic::from_entropy_in(Language::English, &entropy).unwrap()
 }
 
 #[test]
 fn standard_roundtrip() {
-    for words in [12usize, 24] {
+    for words in [12usize, 18, 24] {
         let m = fixed(words);
         let digits = encode_standard(&m);
         assert_eq!(digits.len(), words * 4);
@@ -22,10 +22,10 @@ fn standard_roundtrip() {
 
 #[test]
 fn compact_roundtrip() {
-    for words in [12usize, 24] {
+    for words in [12usize, 18, 24] {
         let m = fixed(words);
         let entropy = encode_compact(&m);
-        assert_eq!(entropy.len(), if words == 12 { 16 } else { 32 });
+        assert_eq!(entropy.len(), words * 4 / 3);
         assert_eq!(decode_compact(&entropy).unwrap(), m);
         assert_eq!(decode(&entropy).unwrap(), m);
     }
