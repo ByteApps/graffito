@@ -102,6 +102,22 @@ socket: watch import → consolidate → sweep → funded sweep →
 public-note compose (self- and fee-wallet-funded), every tx
 signer-signed against live regtest coins.
 
+**Product screenshots** (`screenshots/{home,compose,activity}.png`, wired
+into README.md): capture the real Mac window — pin it first
+(`set frontmost` + `set position {60,60}` via System Events, bounds via
+`get {position, size} of window 1`), then
+`screencapture -x -R "$X,$Y,$W,$H"` (system python3 has no Quartz module,
+so window-id capture isn't scriptable; the native title bar in a region
+capture is fine — only the Prime device frame was unwanted). Stage
+realistic state the same way the e2e does: `server.py <port> --regtest`
++ `POST /regtest/api/faucet`, launch with `APP_DATA_DIR=<fresh tmp>
+APP_KEY=<mnemonic> APP_NETWORK=regtest`, set the node through Settings
+(no env override exists), then compose real notes through the UI so
+home/Activity show confirmed cards. Recapture with this recipe whenever
+app.slint moves things. (Prime-app READMEs use the simulator control
+window's Screenshot button with Capture=Screen instead — see the
+workspace CLAUDE.md.)
+
 Screens (`screen` property): 0 onboarding (3 doors) · 1 import (typed/
 QR/file, live format feedback + word autocomplete) · 2 backup words ·
 3 quiz · 4 home (balance card, QR, notes list w/ badge pills) · 5 note
