@@ -8,8 +8,9 @@ cd "$REPO"
 cargo build --release
 APP="$REPO/target/Chain Notes.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/chain-notes-app "$APP/Contents/MacOS/"
+cp assets/icon/mac/AppIcon.icns "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -19,6 +20,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key><string>Chain Notes</string>
     <key>CFBundleExecutable</key><string>chain-notes-app</string>
     <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>NSCameraUsageDescription</key>
     <string>Chain Notes scans QR codes: key imports (SeedQR) and contact addresses.</string>
     <key>NSHighResolutionCapable</key><true/>

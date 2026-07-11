@@ -19,8 +19,10 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
         GENERATE_INFOPLIST_FILE: NO
-        # No custom app icon; without this actool errors once a catalog exists.
-        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        # Single-size 1024px icon in Assets.xcassets/AppIcon.appiconset,
+        # rendered from the full-bleed variant of assets/icon/icon.svg
+        # (iOS applies its own corner mask).
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     info:
       path: Info.plist
       properties:
