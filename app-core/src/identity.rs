@@ -1,5 +1,5 @@
 //! Identity create/import: one parser behind every transport (typed,
-//! QR, file). Accepts BIP-39 mnemonic (12/24), xprv (depth 0 or 3), WIF
+//! QR, file). Accepts BIP-39 mnemonic (12/18/24), xprv (depth 0 or 3), WIF
 //! (compressed), 32-byte hex, or WATCH-ONLY material — a bare account
 //! xpub (depth 3), a key-origin xpub (`[fp/86'/…]xpub…`, the hardware-
 //! wallet export form), or a full `tr(...)` descriptor. Network-aware,
