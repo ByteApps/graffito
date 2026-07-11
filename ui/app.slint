@@ -5,6 +5,12 @@
 import { ListView, Switch } from "std-widgets.slint";
 
 export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string, private: bool }
+// One notebook row: `unread` is a preformatted badge label ("3 new"), empty =
+// no badge; `meta` is "addr-short · balance · note count".
+export struct NotebookItem { account: int, name: string, snippet: string, meta: string, unread: string, active: bool }
+// One sender-filter row: `key` is the raw sender address (the exclusion-set
+// entry), `label` the resolved display name, `sub` the note count line.
+export struct SenderItem { key: string, label: string, sub: string, excluded: bool }
 export struct ContactItem { address: string, name: string }
 export struct AccountItem { index: int, address: string, active: bool }
 export struct CoinItem { outpoint: string, value: string, status: string }
@@ -661,6 +667,7 @@ component SvgIconButton inherits Rectangle {
     Image {
         source: root.icon == "activity" ? @image-url("icons/activity.svg")
               : root.icon == "refresh" ? @image-url("icons/refresh.svg")
+              : root.icon == "archive" ? @image-url("icons/archive.svg")
               : @image-url("icons/copy.svg");
         colorize: root.tint;
         width: root.size;
@@ -1203,6 +1210,28 @@ export component AppWindow inherits Window {
     callback reveal-backup();
     callback go-home();
 
+    // ---------- notebooks (screen 17 = the main list; 4 = one notebook) ----------
+    in-out property <[NotebookItem]> notebooks;
+    in-out property <[NotebookItem]> archived-notebooks;
+    in-out property <bool> show-archived;
+    in-out property <string> archived-toggle-label;   // "Archived (2)" — preformatted
+    in-out property <bool> can-create-notebook;       // hierarchical identities only
+    in-out property <string> notebook-title: "Chain Notes"; // home header = open notebook's name
+    in-out property <int> nb-rename-account: -1;      // >= 0 = rename modal open
+    in-out property <string> nb-rename-input;
+    // sender filter (home): exclusions persist per notebook, all-on default
+    in-out property <[SenderItem]> senders;
+    in-out property <bool> filter-expanded;
+    in-out property <string> hidden-senders-label;    // "2 senders hidden", empty = none
+    callback open-notebooks();
+    callback open-notebook(int);
+    callback create-notebook();
+    callback nb-rename-start(int, string);
+    callback nb-rename-save(string);
+    callback nb-rename-cancel();
+    callback nb-archive(int, bool);
+    callback toggle-sender(string, bool);
+
     // ---------- system back (Android hardware/gesture back) ----------
     // slint delivers Android's back button/gesture as Key.Back to whatever
     // has keyboard focus and lets it bubble up from there — so back-scope
@@ -1225,9 +1254,11 @@ export component AppWindow inherits Window {
         if (root.confirm-remove-address != "") { root.cancel-remove(); return true; }
         if (root.rename-address != "") { root.cancel-rename(); return true; }
         if (root.fund-rename-id != "") { root.fund-rename-cancel(); return true; }
+        if (root.nb-rename-account >= 0) { root.nb-rename-cancel(); return true; }
         if (root.scanning) { root.cancel-scan(); return true; }
         // Screens: one branch per header chevron.
         if (root.screen == 1 || root.screen == 2) { root.screen = 0; return true; }
+        if (root.screen == 4) { root.open-notebooks(); return true; }
         if (root.screen == 3) { root.screen = 2; return true; }
         if (root.screen == 5 || root.screen == 8 || root.screen == 11) { root.go-home(); return true; }
         if (root.screen == 6) {
@@ -1268,7 +1299,7 @@ export component AppWindow inherits Window {
             }
             return true;
         }
-        return false; // 0 onboarding / 4 home: nothing to go back to
+        return false; // 0 onboarding / 17 notebook list: nothing to go back to
     }
     // Focus must never be nobody's, or key events (incl. Back) are dropped
     // before they can bubble anywhere: re-take it whenever the focused
@@ -1277,6 +1308,7 @@ export component AppWindow inherits Window {
     changed screen => { back-scope.focus(); }
     changed rename-address => { if (root.rename-address == "") { back-scope.focus(); } }
     changed fund-rename-id => { if (root.fund-rename-id == "") { back-scope.focus(); } }
+    changed nb-rename-account => { if (root.nb-rename-account < 0) { back-scope.focus(); } }
 
     back-scope := FocusScope {
         focus-on-click: false; // never steal a tap's focus from a field
@@ -1525,12 +1557,14 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             spacing: 8px;
             height: 40px;
+            BackButton { clicked => { root.open-notebooks(); } }
             Text {
-                text: "Chain Notes";
+                text: root.notebook-title;
                 font-size: 19px;
                 font-weight: 700;
                 color: Pal.text;
                 vertical-alignment: center;
+                overflow: elide;
             }
             Rectangle { }
             SvgIconButton { icon: "refresh"; clicked => { root.refresh(); } }
@@ -1588,9 +1622,83 @@ export component AppWindow inherits Window {
         }
         PrimaryButton { text: "+  Compose note"; clicked => { root.compose-open(); } }
         if root.watch-only: Caption { text: "Watch-only — public notes only, signed on your external wallet. Private notes need the key."; }
-        Caption { text: root.notes.length == 0
-            ? (root.watch-only ? "No notes on this address yet." : "No notes yet — fund the address above, then compose.")
-            : "Notebook"; }
+        // Sender filter header: tap to expand the per-sender checklist; the
+        // warn pill flags a persisted exclusion so hidden notes are never a
+        // silent mystery.
+        Rectangle {
+            height: 24px;
+            if root.senders.length > 1: TouchArea { clicked => { root.filter-expanded = !root.filter-expanded; } }
+            HorizontalLayout {
+                spacing: 8px;
+                Caption {
+                    text: root.notes.length == 0
+                        ? (root.watch-only ? "No notes on this address yet." : "No notes yet — fund the address above, then compose.")
+                        : "Notes";
+                    vertical-alignment: center;
+                }
+                if root.hidden-senders-label != "": Badge { label: root.hidden-senders-label; tint: Pal.warn; }
+                Rectangle { }
+                if root.senders.length > 1: HorizontalLayout {
+                    spacing: 6px;
+                    Caption { text: "Senders"; vertical-alignment: center; }
+                    VerticalLayout {
+                        alignment: center;
+                        Image {
+                            source: root.filter-expanded
+                                ? @image-url("icons/caret-up.svg")
+                                : @image-url("icons/caret-down.svg");
+                            colorize: Pal.muted;
+                            width: 12px;
+                            height: 12px;
+                        }
+                    }
+                }
+            }
+        }
+        if root.filter-expanded: VerticalLayout {
+            spacing: 4px;
+            for s in root.senders: Rectangle {
+                height: 36px;
+                border-radius: 8px;
+                background: s-ta.has-hover ? Pal.card-hover : Pal.card;
+                border-width: 1px;
+                border-color: Pal.line;
+                s-ta := TouchArea { clicked => { root.toggle-sender(s.key, !s.excluded); } }
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 12px;
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 16px;
+                            height: 16px;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: s.excluded ? Pal.line : Pal.accent;
+                            background: s.excluded ? transparent : Pal.accent.with-alpha(0.18);
+                            if !s.excluded: Image {
+                                source: @image-url("icons/check.svg");
+                                colorize: Pal.accent;
+                                width: 11px;
+                                height: 11px;
+                                x: 2.5px;
+                                y: 2.5px;
+                            }
+                        }
+                    }
+                    Text {
+                        text: s.label;
+                        font-size: 12px;
+                        color: s.excluded ? Pal.muted : Pal.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Rectangle { }
+                    Caption { text: s.sub; vertical-alignment: center; }
+                }
+            }
+        }
         // Notebook list — top-aligned + scrollable (a plain ListView vertically
         // centres a short list). Matches the Settings-screen Flickable pattern.
         Flickable {
@@ -1658,6 +1766,140 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            }
+        }
+    }
+
+    // ---------- 17 · notebooks (the main screen) ----------
+    if screen == 17: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        HorizontalLayout {
+            spacing: 8px;
+            height: 40px;
+            Text {
+                text: "Chain Notes";
+                font-size: 19px;
+                font-weight: 700;
+                color: Pal.text;
+                vertical-alignment: center;
+            }
+            Rectangle { }
+            SvgIconButton { icon: "activity"; clicked => { root.open-activity(); } }
+            IconButton { glyph: "⚙"; clicked => { root.settings-open(); } }
+        }
+        if root.can-create-notebook: PrimaryButton { text: "+  New notebook"; clicked => { root.create-notebook(); } }
+        Caption { text: root.status; }
+        Flickable {
+            viewport-height: nb-col.preferred-height;
+            nb-col := VerticalLayout {
+                alignment: start;
+                spacing: 6px;
+                for nb in root.notebooks: Rectangle {
+                    height: 86px;
+                    nb-ta := TouchArea { clicked => { root.open-notebook(nb.account); } }
+                    Rectangle {
+                        y: 2px;
+                        height: parent.height - 6px;
+                        border-radius: 10px;
+                        background: nb-ta.has-hover ? Pal.card-hover : Pal.card;
+                        border-width: 1px;
+                        border-color: nb.active ? Pal.accent.with-alpha(0.55) : Pal.line;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 4px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 5px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Text {
+                                        text: nb.name;
+                                        font-size: 14px;
+                                        font-weight: 700;
+                                        color: Pal.text;
+                                        overflow: elide;
+                                    }
+                                    if nb.unread != "": Badge { label: nb.unread; tint: Pal.good; }
+                                }
+                                Caption { text: nb.snippet; overflow: elide; }
+                                Caption { text: nb.meta; color: Pal.faint; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                PencilButton { clicked => { root.nb-rename-start(nb.account, nb.name); } }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                SvgIconButton {
+                                    icon: "archive";
+                                    size: 15px;
+                                    width: 32px;
+                                    height: 32px;
+                                    clicked => { root.nb-archive(nb.account, true); }
+                                }
+                            }
+                        }
+                    }
+                }
+                if root.archived-toggle-label != "": Rectangle {
+                    height: 34px;
+                    arch-ta := TouchArea { clicked => { root.show-archived = !root.show-archived; } }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Caption { text: root.archived-toggle-label; vertical-alignment: center; }
+                        VerticalLayout {
+                            alignment: center;
+                            Image {
+                                source: root.show-archived
+                                    ? @image-url("icons/caret-up.svg")
+                                    : @image-url("icons/caret-down.svg");
+                                colorize: Pal.muted;
+                                width: 12px;
+                                height: 12px;
+                            }
+                        }
+                    }
+                }
+                if root.show-archived: VerticalLayout {
+                    spacing: 6px;
+                    for nb in root.archived-notebooks: Rectangle {
+                        height: 56px;
+                        anb-ta := TouchArea { clicked => { root.open-notebook(nb.account); } }
+                        Rectangle {
+                            y: 2px;
+                            height: parent.height - 6px;
+                            border-radius: 10px;
+                            background: anb-ta.has-hover ? Pal.card-hover : Pal.card;
+                            border-width: 1px;
+                            border-color: Pal.line;
+                            HorizontalLayout {
+                                padding-left: 14px;
+                                padding-right: 10px;
+                                spacing: 8px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 4px;
+                                    Text {
+                                        text: nb.name;
+                                        font-size: 13px;
+                                        color: Pal.muted;
+                                        overflow: elide;
+                                    }
+                                    Caption { text: nb.meta; color: Pal.faint; }
+                                }
+                                Rectangle { }
+                                VerticalLayout {
+                                    alignment: center;
+                                    GhostButton { text: "Restore"; clicked => { root.nb-archive(nb.account, false); } }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -3234,6 +3476,50 @@ export component AppWindow inherits Window {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.cancel-rename(); } }
                     PrimaryButton { text: "Save"; clicked => { root.save-rename(root.rename-input); } }
+                }
+            }
+        }
+    }
+
+    // ---------- notebook rename dialog (modal overlay) ----------
+    if root.nb-rename-account >= 0: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.nb-rename-cancel(); } }
+        Rectangle {
+            width: 400px;
+            height: nbl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { } // swallow clicks on the card body
+            nbl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Name this notebook";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Caption { text: "The name stays on this device — it is never published."; }
+                nb-rename-edit := EditField {
+                    text <=> root.nb-rename-input;
+                    placeholder-text: "name (empty = address short form)";
+                    accepted(t) => { root.nb-rename-save(t); }
+                    init => {
+                        self.focus();
+                        self.select-all();
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.nb-rename-cancel(); } }
+                    PrimaryButton { text: "Save"; clicked => { root.nb-rename-save(root.nb-rename-input); } }
                 }
             }
         }

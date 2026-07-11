@@ -22,8 +22,10 @@ use app_core::chain::{
 use app_core::compose::{compose_and_record, ComposeRequest};
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
 use app_core::identity::{
-    generate_mnemonic, generate_mnemonic_with_salt, parse_key_material, realize, AppIdentity,
+    generate_mnemonic, generate_mnemonic_with_salt, index_fp8, parse_key_material, realize,
+    AppIdentity,
 };
+use app_core::notebooks::NotebookIndex;
 use app_core::psbt_build::{
     build_funded_sweep_psbt, build_funding_psbt, build_watch_bump_psbt, build_watch_note_psbt,
     build_watch_spend_psbt, predict_keyspend_vsize, sign_own_taproot_inputs, BuiltPsbt,
@@ -106,6 +108,14 @@ struct State {
     watch_bump: Option<WatchBump>,
     /// Watch-mode compose awaiting external signature (screen 13/14).
     watch_note: Option<WatchNote>,
+    /// Notebook index of the active identity (accounts-as-notebooks:
+    /// names + archive flags, `notebooks-<net>-<fp8>.json`), plus its
+    /// filename key and the derived (account, address, store-fp8) cache
+    /// the list and sender labels read — rebuilt on activate, never per
+    /// frame.
+    notebooks: Option<NotebookIndex>,
+    notebooks_fp8: Option<String>,
+    nb_addrs: Vec<(u32, String, String)>,
 }
 
 /// Watch-mode compose in progress on the sign screen: everything needed
@@ -192,6 +202,54 @@ impl State {
         if let Ok(json) = serde_json::to_string_pretty(&self.funding_wallets) {
             let _ = std::fs::write(self.data_dir.join("funding-wallets.json"), json);
         }
+    }
+
+    /// The notebook index file of the active identity: keyed by the BIP-32
+    /// master fingerprint so every account's notebook shares one index (and
+    /// switching identities can never mix indexes).
+    fn notebooks_path(&self) -> Option<PathBuf> {
+        let fp8 = self.notebooks_fp8.as_ref()?;
+        Some(self.data_dir.join(format!("notebooks-{}-{}.json", self.network.as_str(), fp8)))
+    }
+
+    fn save_notebooks(&self) {
+        if let (Some(ix), Some(p)) = (&self.notebooks, self.notebooks_path()) {
+            let _ = ix.save(&p);
+        }
+    }
+
+    /// A notebook's display name: its local name, else the short form of
+    /// its address (never empty — rows and the home title read this).
+    fn notebook_display_name(&self, account: u32) -> String {
+        let named = self
+            .notebooks
+            .as_ref()
+            .and_then(|ix| ix.get(account))
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        if !named.is_empty() {
+            return named;
+        }
+        self.nb_addrs
+            .iter()
+            .find(|(a, ..)| *a == account)
+            .map(|(_, addr, _)| addr_short(addr))
+            .unwrap_or_else(|| format!("Notebook {account}"))
+    }
+
+    /// The store file of another (not necessarily active) notebook.
+    fn store_path_for(&self, address_output_x_fp8: &str) -> PathBuf {
+        self.data_dir
+            .join(format!("store-{}-{}.json", self.network.as_str(), address_output_x_fp8))
+    }
+}
+
+/// "tb1p2ylq…q7ax" — the row/label short form of an address.
+fn addr_short(a: &str) -> String {
+    if a.len() > 14 {
+        format!("{}…{}", &a[..9], &a[a.len() - 4..])
+    } else {
+        a.to_string()
     }
 }
 
@@ -887,6 +945,29 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
         st.network.as_str(),
         ident.address
     );
+    // Notebook index: load (or start) this identity's account→name/archive
+    // map, make sure the activated account is in it, and rebuild the
+    // (account, address) cache the notebook list + sender labels read.
+    let fp8 = index_fp8(&material, st.network).map_err(|e| e.to_string())?;
+    let ix_path = st
+        .data_dir
+        .join(format!("notebooks-{}-{}.json", st.network.as_str(), fp8));
+    let mut ix = NotebookIndex::load(&ix_path).unwrap_or_default();
+    let added = ix.ensure(ident.account);
+    if added {
+        let _ = ix.save(&ix_path);
+    }
+    st.nb_addrs = ix
+        .notebooks
+        .iter()
+        .filter_map(|m| {
+            realize(&material, st.network, m.account)
+                .ok()
+                .map(|i| (m.account, i.address.clone(), hex::encode(&i.output_x()[..4])))
+        })
+        .collect();
+    st.notebooks_fp8 = Some(fp8);
+    st.notebooks = Some(ix);
     st.ident = Some(ident);
     st.store = Some(store);
     st.save_store();
@@ -944,11 +1025,112 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
     w.set_contacts(VecModel::from_slice(&contacts));
 }
 
+/// A (possibly inactive) notebook's store, read from its file on disk;
+/// the ACTIVE notebook prefers the live in-memory store.
+fn notebook_store(st: &State, account: u32) -> Option<Store> {
+    if st.ident.as_ref().map(|i| i.account) == Some(account) {
+        if let Some(s) = &st.store {
+            return Some(s.clone());
+        }
+    }
+    let (_, _, fp8) = st.nb_addrs.iter().find(|(a, ..)| *a == account)?;
+    Store::load(&st.store_path_for(fp8)).ok()
+}
+
+/// Sender-filter label rules: "Self · <notebook>" when the sender is one
+/// of our own addresses (this notebook's own notes, or directed notes
+/// from a sibling notebook), the contact name when known, else the short
+/// address form.
+fn sender_label(st: &State, store: &Store, key: &str) -> String {
+    if let Some((account, ..)) = st.nb_addrs.iter().find(|(_, a, _)| a == key) {
+        return format!("Self · {}", st.notebook_display_name(*account));
+    }
+    if let Some(c) = store.contacts.iter().find(|c| c.address == key && !c.name.is_empty()) {
+        return c.name.clone();
+    }
+    addr_short(key)
+}
+
+/// Build the notebook-list rows (screen 17) from the index plus each
+/// notebook's store on disk. Snippet and unread respect that notebook's
+/// sender filter, so the row preview matches what opening it reveals.
+fn update_notebook_list(w: &AppWindow, st: &State) {
+    let Some(ix) = &st.notebooks else { return };
+    w.set_can_create_notebook(
+        st.material
+            .as_deref()
+            .map(|m| is_hierarchical(m, st.network))
+            .unwrap_or(false),
+    );
+    let mut active_rows: Vec<NotebookItem> = Vec::new();
+    let mut archived_rows: Vec<NotebookItem> = Vec::new();
+    for meta in &ix.notebooks {
+        let Some((_, address, _)) = st.nb_addrs.iter().find(|(a, ..)| *a == meta.account) else {
+            continue;
+        };
+        let store = notebook_store(st, meta.account);
+        let (snippet, meta_line, unread) = match &store {
+            Some(s) => {
+                let visible: Vec<&app_core::store::NoteRecord> = s.visible_notes().collect();
+                let snippet = visible
+                    .last()
+                    .map(|n| {
+                        n.text
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or("(encrypted)")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "No notes yet".into());
+                let meta_line = format!(
+                    "{} · {} sats · {} note{}",
+                    addr_short(address),
+                    commas(s.balance()),
+                    visible.len(),
+                    if visible.len() == 1 { "" } else { "s" }
+                );
+                (snippet, meta_line, s.unread_visible_count())
+            }
+            None => ("No notes yet".into(), format!("{} · not scanned yet", addr_short(address)), 0),
+        };
+        let row = NotebookItem {
+            account: meta.account as i32,
+            name: st.notebook_display_name(meta.account).into(),
+            snippet: snippet.into(),
+            meta: meta_line.into(),
+            unread: match unread {
+                0 => "".into(),
+                1 => "1 new".into(),
+                n => format!("{n} new").into(),
+            },
+            active: st.ident.as_ref().map(|i| i.account) == Some(meta.account),
+        };
+        if meta.archived {
+            archived_rows.push(row);
+        } else {
+            active_rows.push(row);
+        }
+    }
+    println!("cb: notebooks list n={} archived={}", active_rows.len(), archived_rows.len());
+    w.set_notebooks(VecModel::from_slice(&active_rows));
+    w.set_archived_notebooks(VecModel::from_slice(&archived_rows));
+    w.set_archived_toggle_label(
+        if archived_rows.is_empty() {
+            String::new()
+        } else {
+            format!("Archived ({})", archived_rows.len())
+        }
+        .into(),
+    );
+}
+
 fn update_home(w: &AppWindow, st: &State) {
     let Some(ident) = &st.ident else { return };
     let Some(store) = &st.store else { return };
     let watch = ident.is_watch();
     w.set_watch_only(watch);
+    w.set_notebook_title(st.notebook_display_name(ident.account).into());
     w.set_address(ident.address.as_str().into());
     if let Some(img) = qr::qr_image(&ident.address.to_uppercase()) {
         w.set_address_qr(img);
@@ -957,12 +1139,35 @@ fn update_home(w: &AppWindow, st: &State) {
         format!("{} sats · block {}", commas(store.balance()), commas(store.tip_height as u64))
             .into(),
     );
+    // Sender filter: the checklist model + the "hidden" pill, then the
+    // notes list itself filtered through the persisted exclusion set.
+    let senders: Vec<SenderItem> = store
+        .senders()
+        .into_iter()
+        .map(|(key, count)| SenderItem {
+            label: sender_label(st, store, &key).into(),
+            sub: format!("{count} note{}", if count == 1 { "" } else { "s" }).into(),
+            excluded: store.is_excluded(&key),
+            key: key.into(),
+        })
+        .collect();
+    let hidden = senders.iter().filter(|s| s.excluded).count();
+    w.set_senders(VecModel::from_slice(&senders));
+    w.set_hidden_senders_label(
+        match hidden {
+            0 => String::new(),
+            1 => "1 sender hidden".into(),
+            n => format!("{n} senders hidden"),
+        }
+        .into(),
+    );
     let address = ident.address.clone();
     let net = st.network;
     let mut items: Vec<NoteItem> = store
         .notes
         .iter()
         .rev()
+        .filter(|n| !store.is_excluded(&store.sender_key(n)))
         .map(|n| {
             let badge = match n.status {
                 NoteStatus::Pending => "pending",
@@ -1929,6 +2134,9 @@ pub fn run() {
         watch_spend: None,
         watch_bump: None,
         watch_note: None,
+        notebooks: None,
+        notebooks_fp8: None,
+        nb_addrs: Vec::new(),
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -2061,8 +2269,11 @@ pub fn run() {
         if let Some(m) = material {
             match activate(&mut s, &m, false) {
                 Ok(()) => {
-                    window.set_screen(4);
+                    // The notebook list is the main screen; the active
+                    // notebook's home is one tap in.
                     update_home(&window, &s);
+                    update_notebook_list(&window, &s);
+                    window.set_screen(17);
                     // Initial sync AFTER the first frame. Blocking the launch
                     // path on network I/O gets the app killed by the iOS
                     // launch watchdog (black screen, then 0x8badf00d) when
@@ -4019,7 +4230,9 @@ pub fn run() {
         if let Ok(entries) = std::fs::read_dir(&s.data_dir) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if name.starts_with("store-") && name.ends_with(".json") {
+                if (name.starts_with("store-") || name.starts_with("notebooks-"))
+                    && name.ends_with(".json")
+                {
                     let _ = std::fs::remove_file(e.path());
                 }
             }
@@ -4028,6 +4241,9 @@ pub fn run() {
         s.store = None;
         s.material = None;
         s.account = 0;
+        s.notebooks = None;
+        s.notebooks_fp8 = None;
+        s.nb_addrs.clear();
         s.to_address = None;
         s.icloud_backup = false;
         w.set_icloud_backup(false);
@@ -4189,6 +4405,138 @@ pub fn run() {
         w.set_reveal_text("".into());
         update_home(&w, &s);
         w.set_screen(4);
+    });
+
+    cb!(on_open_notebooks, |w, s| {
+        // Leaving the open notebook: everything that was on screen counts
+        // as read, so the list badge only flags what arrived since.
+        if let Some(store) = s.store.as_mut() {
+            if store.mark_seen() > 0 {
+                s.save_store();
+            }
+        }
+        w.set_status("".into());
+        update_notebook_list(&w, &s);
+        w.set_screen(17);
+    });
+
+    cb!(on_open_notebook, |w, s, account: i32| {
+        let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+            return;
+        };
+        s.account = account.max(0) as u32;
+        println!("cb: open-notebook account={}", s.account);
+        match activate(&mut s, &material, false) {
+            Ok(()) => {
+                w.set_status("".into());
+                update_home(&w, &s);
+                w.set_screen(4);
+                refresh(&w, &mut s);
+            }
+            Err(e) => w.set_status(format!("{e}").into()),
+        }
+    });
+
+    cb!(on_create_notebook, |w, s| {
+        let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+            return;
+        };
+        if !is_hierarchical(&material, s.network) {
+            return; // button is hidden; a stray call must not add phantom rows
+        }
+        let Some(account) = s.notebooks.as_ref().map(|ix| ix.next_account()) else { return };
+        println!("cb: create-notebook account={account}");
+        s.account = account;
+        // activate() adds the account to the index, persists it, and
+        // rebuilds the address cache — the new row appears behind the
+        // naming dialog.
+        match activate(&mut s, &material, false) {
+            Ok(()) => {
+                update_notebook_list(&w, &s);
+                w.set_nb_rename_input("".into());
+                w.set_nb_rename_account(account as i32);
+            }
+            Err(e) => w.set_status(format!("{e}").into()),
+        }
+    });
+
+    cb!(on_nb_rename_start, |w, s, account: i32, _display: SharedString| {
+        let _ = &mut s;
+        // Prefill the RAW local name (the display name may be the address
+        // short form, which must not become a name by accident).
+        let raw = s
+            .notebooks
+            .as_ref()
+            .and_then(|ix| ix.get(account.max(0) as u32))
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        w.set_nb_rename_input(raw.into());
+        w.set_nb_rename_account(account);
+    });
+
+    cb!(on_nb_rename_save, |w, s, name: SharedString| {
+        let account = w.get_nb_rename_account();
+        if account < 0 {
+            return;
+        }
+        let account = account as u32;
+        if let Some(ix) = s.notebooks.as_mut() {
+            ix.rename(account, name.as_str());
+            s.save_notebooks();
+            println!("cb: rename-notebook account={account}");
+        }
+        w.set_nb_rename_account(-1);
+        w.set_nb_rename_input("".into());
+        update_notebook_list(&w, &s);
+        if s.ident.as_ref().map(|i| i.account) == Some(account) {
+            w.set_notebook_title(s.notebook_display_name(account).into());
+        }
+    });
+
+    cb!(on_nb_rename_cancel, |w, s| {
+        let _ = &mut s;
+        w.set_nb_rename_account(-1);
+        w.set_nb_rename_input("".into());
+    });
+
+    cb!(on_nb_archive, |w, s, account: i32, archived: bool| {
+        let account = account.max(0) as u32;
+        let Some(ix) = s.notebooks.as_ref() else { return };
+        if archived {
+            // Guards: the list must keep at least one active notebook, and
+            // funds never disappear from view silently — sweep first.
+            if ix.active().count() <= 1 {
+                w.set_status("can't archive the last notebook".into());
+                return;
+            }
+            let balance = notebook_store(&s, account).map(|st2| st2.balance()).unwrap_or(0);
+            if balance > 0 {
+                w.set_status(
+                    format!(
+                        "this notebook holds {} sats — sweep it first (Settings → Funds)",
+                        commas(balance)
+                    )
+                    .into(),
+                );
+                return;
+            }
+        }
+        if let Some(ix) = s.notebooks.as_mut() {
+            ix.set_archived(account, archived);
+            s.save_notebooks();
+            println!("cb: archive-notebook account={account} archived={archived}");
+        }
+        w.set_status("".into());
+        update_notebook_list(&w, &s);
+    });
+
+    cb!(on_toggle_sender, |w, s, key: SharedString, excluded: bool| {
+        let Some(store) = s.store.as_mut() else { return };
+        store.set_excluded(key.as_str(), excluded);
+        let hidden = store.excluded_senders.len();
+        println!("cb: toggle-sender excluded={excluded} hidden={hidden}");
+        s.save_store();
+        update_home(&w, &s);
     });
 
     let auto_refresh = slint::Timer::default();
