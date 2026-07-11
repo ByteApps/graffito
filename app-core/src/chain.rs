@@ -339,6 +339,17 @@ impl<T: Transport> ChainClient<T> {
         Ok(FundingScan { utxos, next_change_index })
     }
 
+    /// One-page probe for the notebook picker: has this address ANY
+    /// on-chain history (first /txs page non-empty), and what do its
+    /// UTXOs sum to right now? Deliberately cheap — two requests, no
+    /// history paging.
+    pub fn address_probe(&self, address: &str) -> Result<(bool, u64), Error> {
+        let txs: Vec<EsploraTx> =
+            parse_json(&self.transport.get_text(&format!("/address/{address}/txs"))?)?;
+        let balance = self.utxos(address)?.iter().map(|u| u.value).sum();
+        Ok((!txs.is_empty(), balance))
+    }
+
     /// Broadcast raw tx hex; returns the txid mempool.space echoes back.
     pub fn broadcast(&self, raw_hex: &str) -> Result<String, Error> {
         Ok(self.transport.post_text("/tx", raw_hex.to_string())?.trim().to_string())

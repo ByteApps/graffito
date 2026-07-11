@@ -116,6 +116,9 @@ struct State {
     notebooks: Option<NotebookIndex>,
     notebooks_fp8: Option<String>,
     nb_addrs: Vec<(u32, String, String)>,
+    /// The account chosen in the create-notebook picker, consumed by the
+    /// naming dialog's Create.
+    create_account: Option<u32>,
 }
 
 /// Watch-mode compose in progress on the sign screen: everything needed
@@ -931,6 +934,7 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     let path = st
         .data_dir
         .join(format!("store-{}-{}.json", st.network.as_str(), &fp[..8]));
+    let store_existed = path.exists();
     let mut store = Store::load(&path).unwrap_or_else(|_| Store::new(&ident.output_x(), st.network));
     // Migrate a legacy per-identity node URL (shipped as `esplora`) into the
     // device-level per-network config, then drop it from the store. Only if
@@ -946,15 +950,31 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
         ident.address
     );
     // Notebook index: load (or start) this identity's account→name/archive
-    // map, make sure the activated account is in it, and rebuild the
-    // (account, address) cache the notebook list + sender labels read.
+    // map and rebuild the (account, address) cache the notebook list +
+    // sender labels read. Notebooks are created DELIBERATELY (the
+    // name-first dialog, an import's account pick — via ensure_notebook);
+    // activate() itself adds one only for:
+    //   * migration: a pre-notebooks install (no index file yet, but this
+    //     account already has a store on disk) becomes notebook "Main";
+    //   * non-hierarchical identities (WIF/hex/xpub): exactly one
+    //     intrinsic notebook — nothing to choose, nothing to create.
+    // Saving the (possibly empty) index on first touch marks the identity
+    // as initialized, so later boots respect an emptied list.
     let fp8 = index_fp8(&material, st.network).map_err(|e| e.to_string())?;
     let ix_path = st
         .data_dir
         .join(format!("notebooks-{}-{}.json", st.network.as_str(), fp8));
+    let index_existed = ix_path.exists();
     let mut ix = NotebookIndex::load(&ix_path).unwrap_or_default();
-    let added = ix.ensure(ident.account);
-    if added {
+    let migrate = !index_existed && store_existed;
+    let mut dirty = !index_existed;
+    if (migrate || !material.is_hierarchical()) && ix.ensure(ident.account) {
+        if migrate {
+            ix.rename(ident.account, app_core::notebooks::FIRST_NOTEBOOK_NAME);
+        }
+        dirty = true;
+    }
+    if dirty {
         let _ = ix.save(&ix_path);
     }
     st.nb_addrs = ix
@@ -1000,9 +1020,45 @@ fn account_rows(
                 index: i as i32,
                 address: ident.address.into(),
                 active: active == Some(i),
+                pill: "".into(),
+                balance: "".into(),
             })
         })
         .collect()
+}
+
+/// The create-notebook flavor of the account picker: same 5-per-page rows,
+/// plus a "notebook" pill for accounts already in the index and — when a
+/// node is configured — a used/new pill with the address's current balance,
+/// so recovering an already-used address is a visible, deliberate choice.
+fn show_notebook_picker(w: &AppWindow, st: &State, page: u32) {
+    let Some(material_str) = st.material.as_deref() else { return };
+    let client = st
+        .base_url()
+        .map(|base| ChainClient::new(HttpTransport::new(base), st.network));
+    let mut rows = account_rows(material_str, st.network, page, None);
+    for row in &mut rows {
+        let account = row.index as u32;
+        if st.notebooks.as_ref().and_then(|ix| ix.get(account)).is_some() {
+            row.pill = "notebook".into();
+            continue;
+        }
+        if let Some(client) = &client {
+            match client.address_probe(row.address.as_str()) {
+                Ok((used, balance)) => {
+                    row.pill = if used { "used" } else { "new" }.into();
+                    if used {
+                        row.balance = format!("{} sats", commas(balance)).into();
+                    }
+                }
+                Err(_) => {} // no probe → plain row (offline is fine)
+            }
+        }
+    }
+    w.set_account_page(page as i32);
+    w.set_accounts(VecModel::from_slice(&rows));
+    w.set_account_pick_mode("notebook".into());
+    w.set_screen(9);
 }
 
 fn show_account_picker(w: &AppWindow, material: &str, network: Network, page: u32, active: Option<u32>) {
@@ -1023,6 +1079,50 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
         .map(|c| ContactItem { address: c.address.clone().into(), name: c.name.clone().into() })
         .collect();
     w.set_contacts(VecModel::from_slice(&contacts));
+}
+
+/// Deliberate notebook creation for `account`: add it to the index (if
+/// missing), persist, and extend the address cache. The ONLY entry points
+/// are user intent — the create dialog, an import's account pick, and
+/// APP_KEY automation boots (their account choice is explicit config).
+fn ensure_notebook(st: &mut State, account: u32) {
+    let Some(ix) = st.notebooks.as_mut() else { return };
+    if !ix.ensure(account) {
+        return;
+    }
+    st.save_notebooks();
+    if !st.nb_addrs.iter().any(|(a, ..)| *a == account) {
+        if let Some(material_str) = st.material.as_deref() {
+            if let Ok(material) = parse_key_material(material_str, st.network) {
+                if let Ok(i) = realize(&material, st.network, account) {
+                    st.nb_addrs.push((
+                        account,
+                        i.address.clone(),
+                        hex::encode(&i.output_x()[..4]),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// "Home" for flows that end at the active notebook — unless the active
+/// account has no notebook entry (create-seed just finished, an iCloud
+/// restore onto a fresh install), in which case home would be a trap only
+/// reachable by accident: land on the notebook list instead.
+fn go_home_or_list(w: &AppWindow, st: &State) {
+    let listed = st
+        .ident
+        .as_ref()
+        .and_then(|i| st.notebooks.as_ref().map(|ix| ix.get(i.account).is_some()))
+        .unwrap_or(false);
+    if listed {
+        update_home(w, st);
+        w.set_screen(4);
+    } else {
+        update_notebook_list(w, st);
+        w.set_screen(17);
+    }
 }
 
 /// A (possibly inactive) notebook's store, read from its file on disk;
@@ -2137,6 +2237,7 @@ pub fn run() {
         notebooks: None,
         notebooks_fp8: None,
         nb_addrs: Vec::new(),
+        create_account: None,
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -2269,6 +2370,15 @@ pub fn run() {
         if let Some(m) = material {
             match activate(&mut s, &m, false) {
                 Ok(()) => {
+                    // APP_KEY boots (automation, dev) name their account via
+                    // APP_ACCOUNT/config — that's an explicit choice, so it
+                    // counts as deliberate notebook creation. Keychain boots
+                    // never auto-create: the index is whatever onboarding
+                    // and the user left behind.
+                    if std::env::var("APP_KEY").is_ok() {
+                        let account = s.account;
+                        ensure_notebook(&mut s, account);
+                    }
                     // The notebook list is the main screen; the active
                     // notebook's home is one tap in.
                     update_home(&window, &s);
@@ -2415,8 +2525,10 @@ pub fn run() {
                     Ok(()) => {
                         println!("cb: restore-icloud ok");
                         w.set_icloud_backup(true);
-                        w.set_screen(4);
-                        update_home(&w, &s);
+                        // A fresh install restoring a hierarchical key has no
+                        // notebook index yet — land on the (empty) list, not
+                        // an unlisted account's home.
+                        go_home_or_list(&w, &s);
                         refresh(&w, &mut s);
                     }
                     Err(e) => w.set_status(format!("restore: {e}").into()),
@@ -2473,8 +2585,10 @@ pub fn run() {
             Ok(()) => {
                 s.pending_mnemonic = None;
                 w.set_status("".into());
-                w.set_screen(4);
-                update_home(&w, &s);
+                // A brand-new seed has NO notebooks (Sal 2026-07-11:
+                // onboarding must not auto-create one) — land on the empty
+                // list; the first notebook is created deliberately there.
+                go_home_or_list(&w, &s);
                 refresh(&w, &mut s);
             }
             Err(e) => w.set_status(format!("{e}").into()),
@@ -4180,6 +4294,10 @@ pub fn run() {
 
     cb!(on_accounts_page, |w, s, delta: i32| {
         let page = (w.get_account_page() + delta).max(0) as u32;
+        if w.get_account_pick_mode() == "notebook" {
+            show_notebook_picker(&w, &s, page);
+            return;
+        }
         let material = s
             .pending_import
             .as_ref()
@@ -4191,6 +4309,21 @@ pub fn run() {
     });
 
     cb!(on_pick_account, |w, s, idx: i32| {
+        if w.get_account_pick_mode() == "notebook" {
+            // Create flow: the pick chooses the new notebook's address; the
+            // naming dialog (over the picker) finishes or cancels it.
+            let account = idx.max(0) as u32;
+            if s.notebooks.as_ref().and_then(|ix| ix.get(account)).is_some() {
+                w.set_status("that address is already a notebook".into());
+                return;
+            }
+            println!("cb: pick-account {account} (new notebook)");
+            s.create_account = Some(account);
+            w.set_status("".into());
+            w.set_nb_rename_input("".into());
+            w.set_nb_rename_account(-2);
+            return;
+        }
         let first_import = s.pending_import.is_some();
         let Some(material) = s
             .pending_import
@@ -4204,6 +4337,10 @@ pub fn run() {
         println!("cb: pick-account {}", s.account);
         match activate(&mut s, &material, first_import) {
             Ok(()) => {
+                // Picking an account IS deliberate — it becomes a notebook
+                // (unnamed; renameable from the list).
+                let account = s.account;
+                ensure_notebook(&mut s, account);
                 w.set_import_text("".into());
                 w.set_status("".into());
                 w.set_screen(4);
@@ -4215,6 +4352,15 @@ pub fn run() {
     });
 
     cb!(on_account_cancel, |w, s| {
+        if w.get_account_pick_mode() == "notebook" {
+            // Abandon create → back to the notebook list, untouched.
+            w.set_account_pick_mode("switch".into());
+            s.create_account = None;
+            w.set_status("".into());
+            update_notebook_list(&w, &s);
+            w.set_screen(17);
+            return;
+        }
         if s.pending_import.take().is_some() {
             w.set_screen(1); // abandon import → back to the import form
         } else {
@@ -4402,9 +4548,9 @@ pub fn run() {
     });
 
     cb!(on_go_home, |w, s| {
+        let _ = &mut s;
         w.set_reveal_text("".into());
-        update_home(&w, &s);
-        w.set_screen(4);
+        go_home_or_list(&w, &s);
     });
 
     cb!(on_open_notebooks, |w, s| {
@@ -4438,17 +4584,18 @@ pub fn run() {
     });
 
     cb!(on_create_notebook, |w, s| {
-        // Name-first: this only opens the dialog in CREATE mode (-2).
-        // Nothing is derived or persisted until Save — Cancel leaves no
-        // phantom unnamed notebook behind.
+        // Address-first, then name-first: "+ New notebook" opens the
+        // account picker (used/new pills + balances) so recovering a used
+        // address is a visible choice; the naming dialog follows the pick.
+        // Nothing is derived or persisted until the dialog's Create.
         let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
             return;
         };
         if !is_hierarchical(&material, s.network) {
             return; // button is hidden; a stray call must not add phantom rows
         }
-        w.set_nb_rename_input("".into());
-        w.set_nb_rename_account(-2);
+        println!("cb: create-notebook picker open");
+        show_notebook_picker(&w, &s, 0);
     });
 
     cb!(on_nb_rename_start, |w, s, account: i32, _display: SharedString| {
@@ -4473,19 +4620,26 @@ pub fn run() {
         w.set_nb_rename_account(-1);
         w.set_nb_rename_input("".into());
         if sel == -2 {
-            // CREATE mode: derive the next unused account, name it, and
-            // switch to it (activate() adds + persists the index entry).
+            // CREATE mode: the picker chose the account (fallback: next
+            // unused); derive it, add the index entry, name it, switch.
             let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
                 return;
             };
             if !is_hierarchical(&material, s.network) {
                 return;
             }
-            let Some(account) = s.notebooks.as_ref().map(|ix| ix.next_account()) else { return };
+            let Some(account) = s
+                .create_account
+                .take()
+                .or_else(|| s.notebooks.as_ref().map(|ix| ix.next_account()))
+            else {
+                return;
+            };
             println!("cb: create-notebook account={account}");
             s.account = account;
             match activate(&mut s, &material, false) {
                 Ok(()) => {
+                    ensure_notebook(&mut s, account);
                     if !name.trim().is_empty() {
                         if let Some(ix) = s.notebooks.as_mut() {
                             ix.rename(account, name.as_str());
@@ -4493,7 +4647,9 @@ pub fn run() {
                             println!("cb: rename-notebook account={account}");
                         }
                     }
+                    w.set_account_pick_mode("switch".into());
                     update_notebook_list(&w, &s);
+                    w.set_screen(17);
                 }
                 Err(e) => w.set_status(format!("{e}").into()),
             }
@@ -4512,7 +4668,9 @@ pub fn run() {
     });
 
     cb!(on_nb_rename_cancel, |w, s| {
-        let _ = &mut s;
+        // In create mode this closes the dialog back onto the picker —
+        // pick another address or back out entirely from there.
+        s.create_account = None;
         w.set_nb_rename_account(-1);
         w.set_nb_rename_input("".into());
     });
