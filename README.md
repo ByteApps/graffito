@@ -65,3 +65,26 @@ nix develop ~/.foundation/sdk/current --command cargo run
 ```
 
 Design + milestones: `PLAN-chain-notes-app.md` in the parent workspace.
+
+## License & disclaimer
+
+Licensed under either of the [MIT license](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE), at your option. Both licenses disclaim all warranty and liability; the notes below restate that in plain language.
+
+This is experimental software and it has **not been independently audited**.
+It is provided **"as is", without warranty of any kind**, express or implied,
+including but not limited to the warranties of merchantability, fitness for a
+particular purpose, and non-infringement.
+
+**Use it at your own risk.** To the maximum extent permitted by law, in no
+event shall the authors, copyright holders, or contributors be liable for any
+claim, damages, or other liability — including, without limitation,
+**loss of bitcoin or other funds, loss of keys or seeds, or loss of data** — whether in an action of contract, tort, or
+otherwise, arising from, out of, or in connection with this software or its
+use.
+
+Nothing in this project is financial, investment, legal, or tax advice. You
+are solely responsible for verifying addresses, amounts, fees, and backups
+before moving funds, and for complying with the laws of your jurisdiction.
+Test on test networks, or with amounts you can afford to lose, first.
+
+Everything this app writes to the blockchain is **public and permanent** — including the transaction metadata around encrypted notes (addresses, timing, amounts). Notes cannot be edited or deleted once broadcast. Do not put anything on-chain you may later need gone.
