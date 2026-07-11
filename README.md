@@ -27,6 +27,12 @@ from the chain plus your key alone.
   (pick exactly which UTXOs to spend, incl. unconfirmed), an optional
   custom change address, and a **gift amount** for directed notes
   (choose how many sats reach the recipient; default/minimum is dust).
+- **Text editing that feels native**: right-click Cut/Copy/Paste/
+  Select-All on the Mac plus all the usual shortcuts; on iOS/Android an
+  edit bubble with native trigger rules — tap the caret to summon it,
+  double-tap selects a word, triple-tap selects everything, typing hides
+  it — and Paste always inserts at the cursor. (Drag across text to
+  select a range; selection handles await upstream Slint support.)
 - **Manage**: an Activity screen listing every transaction with retry
   (rebroadcast) and RBF fee-bump for stuck ones; a viewer-first Coins
   screen whose Consolidate button opens the same compose-like flow as
