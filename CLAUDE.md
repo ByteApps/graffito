@@ -8,8 +8,9 @@ Guidance for Claude Code when working in this repository.
 that is a full peer of `prime-chain-notes`: compose/encrypt/sign PNTE
 notes, **broadcast directly**, and read them back from the chain. It
 holds the notes private key — created in-app (12/24 BIP-39 with backup
-flow) or imported (BIP-39 / xprv / WIF / 32-byte hex; every format via
-typed text, QR, or file; SeedQR supported). Flagship import path: a
+flow) or imported (BIP-39 12/18/24 words / xprv / WIF / 32-byte hex; every
+format via typed text, QR, or file; SeedQR supported, incl. 18-word/
+24-byte forms). Flagship import path: a
 dedicated **BIP-85 child from `prime-bip85`**. Also the standalone
 on-ramp for users with no Prime or hardware wallet at all.
 
