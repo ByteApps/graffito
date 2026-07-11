@@ -32,8 +32,9 @@ pub struct NotebookIndex {
     pub notebooks: Vec<NotebookMeta>,
 }
 
-/// The default name the FIRST notebook of an identity gets on migration
-/// (an existing single-account identity becomes notebook "Main").
+/// The name a pre-notebooks identity's existing account gets when it is
+/// MIGRATED into a fresh index (the only auto-created notebook — every
+/// other notebook is created deliberately and starts unnamed).
 pub const FIRST_NOTEBOOK_NAME: &str = "Main";
 
 impl NotebookIndex {
@@ -57,15 +58,14 @@ impl NotebookIndex {
         self.notebooks.iter().find(|n| n.account == account)
     }
 
-    /// Make sure `account` exists in the index; the identity's very first
-    /// notebook is named [`FIRST_NOTEBOOK_NAME`] (the migration rule),
-    /// later ones start unnamed. Returns true when it was added.
+    /// Make sure `account` exists in the index, unnamed (naming is the
+    /// caller's business — the create dialog, or the migration rule).
+    /// Returns true when it was added.
     pub fn ensure(&mut self, account: u32) -> bool {
         if self.get(account).is_some() {
             return false;
         }
-        let name = if self.notebooks.is_empty() { FIRST_NOTEBOOK_NAME.to_string() } else { String::new() };
-        self.notebooks.push(NotebookMeta { account, name, archived: false });
+        self.notebooks.push(NotebookMeta { account, name: String::new(), archived: false });
         self.notebooks.sort_by_key(|n| n.account);
         true
     }
@@ -107,14 +107,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ensure_names_first_main_and_sorts() {
+    fn ensure_adds_unnamed_and_sorts() {
         let mut ix = NotebookIndex::new();
         assert!(ix.ensure(3));
         assert!(ix.ensure(0));
         assert!(!ix.ensure(3)); // idempotent
         assert_eq!(ix.notebooks.len(), 2);
-        // First-added (account 3) got the migration name, later ones none.
-        assert_eq!(ix.get(3).unwrap().name, FIRST_NOTEBOOK_NAME);
+        // ensure() never names — naming belongs to the caller (create
+        // dialog / migration).
+        assert_eq!(ix.get(3).unwrap().name, "");
         assert_eq!(ix.get(0).unwrap().name, "");
         // Sorted by account regardless of insertion order.
         assert_eq!(ix.notebooks[0].account, 0);
