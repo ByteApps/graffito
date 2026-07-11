@@ -698,7 +698,7 @@ dependencies = [
 [[package]]
 name = "bip85-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ObjSal/prime-bip85.git?rev=89a42a5dce05489035009d67b01ea62c086209fb#89a42a5dce05489035009d67b01ea62c086209fb"
+source = "git+ssh://git@github.com/ObjSal/prime-bip85.git?rev=70557655b68354a00b96a6afd36ad0251865a8ae#70557655b68354a00b96a6afd36ad0251865a8ae"
 dependencies = [
  "bs58",
  "hmac",
@@ -4078,7 +4078,7 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 [[package]]
 name = "notes-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ObjSal/prime-chain-notes.git?rev=1434bff9a5824d8000319db59c2047ada14f797e#1434bff9a5824d8000319db59c2047ada14f797e"
+source = "git+ssh://git@github.com/ObjSal/prime-chain-notes.git?rev=6f618e50cb5d7e93f3a85848f567aad2d6383229#6f618e50cb5d7e93f3a85848f567aad2d6383229"
 dependencies = [
  "bech32",
  "chacha20poly1305",
