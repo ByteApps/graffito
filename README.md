@@ -4,6 +4,14 @@
 
 Chain Notes writes personal notes into real bitcoin transactions — public ones anyone can read, private ones only your key can open, and directed notes delivered to any taproot address like unstoppable mail. This is the online, full-featured peer of the [Passport Prime app](https://github.com/ObjSal/prime-chain-notes): the same protocol, byte-identical transactions, but with its own keys, direct broadcasting, and a native interface on Mac, iPhone, and Android. Lose the device, keep the key — the entire notebook rebuilds itself from the chain.
 
+<p align="center">
+  <img src="screenshots/home.png" alt="Home — balance, address QR, and the notebook" width="290">
+  &nbsp;
+  <img src="screenshots/compose.png" alt="Compose — live cost preview, fee tiers, coin control" width="290">
+  &nbsp;
+  <img src="screenshots/activity.png" alt="Activity — every transaction with rebroadcast and RBF" width="290">
+</p>
+
 ## Features
 
 - **Your key, your way** — create a 12/24-word seed in-app with a backup-and-quiz flow, or import what you have: BIP-39 words (with autocomplete), xprv, WIF, or raw hex — typed, scanned from QR (SeedQR included), or loaded from file. Hierarchical keys get a paginated account picker, switchable anytime.
