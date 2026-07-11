@@ -48,6 +48,39 @@ impl KeyMaterial {
     pub fn is_watch(&self) -> bool {
         matches!(self, KeyMaterial::Xpub(_))
     }
+
+    /// Hierarchical material can derive many BIP-86 accounts — the
+    /// multi-notebook (and account-picker) capability gate.
+    pub fn is_hierarchical(&self) -> bool {
+        match self {
+            KeyMaterial::Mnemonic(_) => true,
+            KeyMaterial::Xprv(x) => x.depth == 0,
+            _ => false,
+        }
+    }
+}
+
+/// A stable 8-hex key for the notebook-index filename: the BIP-32 master
+/// fingerprint for hierarchical material (identical across every account,
+/// so all of one identity's notebooks share one index), else the account-0
+/// identity's output-x prefix (those formats have exactly one notebook).
+pub fn index_fp8(material: &KeyMaterial, network: Network) -> Result<String, Error> {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let master = match material {
+        KeyMaterial::Mnemonic(m) => {
+            let seed = Zeroizing::new(m.to_seed(""));
+            Some(
+                Xpriv::new_master(btc_network(network), seed.as_ref())
+                    .map_err(|e| Error::Xprv(e.to_string()))?,
+            )
+        }
+        KeyMaterial::Xprv(x) if x.depth == 0 => Some(*x),
+        _ => None,
+    };
+    match master {
+        Some(x) => Ok(hex::encode(x.fingerprint(&secp).as_bytes())),
+        None => Ok(hex::encode(&realize(material, network, 0)?.output_x()[..4])),
+    }
 }
 
 /// What the realized identity can do. Watch-only carries NO secrets — no
