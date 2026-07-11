@@ -227,6 +227,7 @@ fn validate_scalar(key: &[u8; 32]) -> Result<(), Error> {
 pub fn generate_mnemonic(word_count: usize) -> Result<bip39::Mnemonic, Error> {
     let entropy_len = match word_count {
         12 => 16,
+        18 => 24,
         24 => 32,
         n => return Err(Error::MnemonicWordCount(n)),
     };
@@ -245,6 +246,7 @@ pub fn generate_mnemonic(word_count: usize) -> Result<bip39::Mnemonic, Error> {
 pub fn generate_mnemonic_with_salt(word_count: usize, salt: &str) -> Result<bip39::Mnemonic, Error> {
     let entropy_len = match word_count {
         12 => 16,
+        18 => 24,
         24 => 32,
         n => return Err(Error::MnemonicWordCount(n)),
     };

@@ -1238,8 +1238,13 @@ export component AppWindow inherits Window {
             clicked => { root.door-create(12); }
         }
         DoorCard {
-            title: "Create a new 24-word seed";
+            title: "Create a new 18-word seed";
             subtitle: "Same, with a longer phrase.";
+            clicked => { root.door-create(18); }
+        }
+        DoorCard {
+            title: "Create a new 24-word seed";
+            subtitle: "Same, with the longest phrase.";
             clicked => { root.door-create(24); }
         }
         if root.icloud-available: DoorCard {
