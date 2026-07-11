@@ -161,12 +161,19 @@ shell (1.91-nightly) onto the standalone rustup.
 `EditField`/`EditArea` components (ui/app.slint) wrapping a raw
 `TextInput` — NOT std LineEdit/TextEdit — so the app can use the
 byte-offset cursor API. They provide: desktop right-click Cut/Copy/Paste/
-Select-All menu, a floating touch toolbar on iOS/Android (shown while a
-field has focus; actions go through `EditOps`, Rust-backed in lib.rs),
-double-tap word selection on touch (350 ms window, text-equality guard),
-paste-at-cursor (compose header Paste calls `note-edit.paste-clip()`),
-and a fluent-style ✕ clear button (`icons/dismiss.svg` — SVG, not a
-glyph). Clipboard routing: native TextInput cut/copy/paste everywhere
+Select-All menu; on iOS/Android a floating **edit bubble** (Select all/
+Copy/Paste/Cut, actions through `EditOps`, Rust-backed in lib.rs) with
+NATIVE-iOS trigger rules — never on plain focus, tap ON the resting
+caret toggles it, double-tap selects the word, triple-tap selects all,
+typing hides it (350 ms tap window, text-equality guard makes fast
+typing/tap-then-type safe), Copy/Paste/Cut dismiss it, content-fit pill
+centered above the caret line, clamped to the FIELD's left edge and the
+screen's right, flipping below the line when out of room (Sal-approved
+2026-07-10 — keep these semantics); paste-at-cursor (compose header
+Paste calls `note-edit.paste-clip()`); and a fluent-style ✕ clear button
+(`icons/dismiss.svg` — SVG, not a glyph). Still missing vs native:
+draggable selection dot-handles (needs a pixel→byte-offset API upstream
+slint doesn't expose; drag-across-text selection works). Clipboard routing: native TextInput cut/copy/paste everywhere
 EXCEPT iOS (winit's iOS clipboard is a no-op) where `EditOps.clip-*` uses
 the UIPasteboard shim + splicing; natives also keep undo coherent —
 programmatic `text =` splices corrupt the undo stack, which is why the
