@@ -153,9 +153,32 @@ field, live cost line, "Pay the fee from another wallet", READ-ONLY
 inputs collapsible; sweep is reached from Settings→Funds through the
 send-to picker in `pick-mode` "sweep" — no Self card — consolidate from
 Coins with dest = self; keyed unfunded routes to the classic confirm
-modals, watch or fee-funded to the external-sign screen 13). Modals
-(overlays as LAST children of the window root): rename, remove-confirm,
-reset-confirm, sweep-confirm, consolidate-confirm.
+modals, watch or fee-funded to the external-sign screen 13) · 17
+**notebooks** (the MAIN screen since the notebooks feature — boot lands
+here; one row per notebook [name, filter-respecting snippet + note
+count, "N new" unread badge, balance, active accent border, pencil-
+rename + archive icons], "+ New notebook" [hierarchical identities
+only], collapsed "Archived (N)" section with Restore). Home (4) is one
+notebook's view: back chevron → 17, title = notebook name, and a
+**sender filter** under the compose button ("Senders" caret when >1
+sender) — checklist rows labeled contact-name / "Self · <notebook>" /
+addr-short, tap to exclude; exclusions persist per notebook (the
+EXCLUSION set, so new senders always show), a "N senders hidden" warn
+pill flags active filters, and the notes list + list-row previews
+respect them. Modals (overlays as LAST children of the window root):
+rename, nb-rename, remove-confirm, reset-confirm, sweep-confirm,
+consolidate-confirm.
+
+**Notebooks** (design: `../PLAN-chain-notes-notebooks.md`): notebook =
+BIP-86 account. `notebooks-<net>-<masterfp8>.json` (app-core
+`notebooks.rs`) maps account → {name, archived}; the master fingerprint
+key (`identity::index_fp8`) is shared across accounts, so one identity
+= one index. Store gains `excluded_senders` + `seen_received` (unread =
+received notes not yet seen; `mark_seen` fires when LEAVING home for
+the list, so the badge only counts what arrived since). Create = next
+unused account (activate() ensures the index entry); archive guards:
+never the last active notebook, never one holding sats (sweep first);
+reset-identity deletes notebooks-*.json alongside stores.
 
 **Identity lifecycle:** key material verbatim in the keychain; BIP-86
 account chosen on a paginated picker after hierarchical imports and
@@ -364,11 +387,18 @@ picker` · `cb: pick-account <n>` · `cb: account-picker open` ·
 `cb: open-note-web url=…` · `cb: toggle-coin selected=<n>` ·
 `cb: refresh-coins` · `cb: act-explorer` · `cb: bump-open`/`act-bump` ·
 `cb: sys-back handled=<b> screen=<n>` (Android system back; screen is
-where back landed us).
+where back landed us) ·
+`cb: notebooks list n=<n> archived=<n>` · `cb: open-notebook
+account=<n>` · `cb: create-notebook account=<n>` ·
+`cb: rename-notebook account=<n>` · `cb: archive-notebook account=<n>
+archived=<b>` · `cb: toggle-sender excluded=<b> hidden=<n>`.
 UI e2e:
 `../ui-automation/tests/chain-notes-app.sh` (simtap point offsets from
 the window origin — recalibrate from screenshots when app.slint moves
-controls; simtap also has `scroll <x> <y> <dy>`).
+controls; simtap also has `scroll <x> <y> <dy>`). NOTE: the two simtap
+suites predate notebooks — boot now lands on the LIST (17), not home,
+so their tap sequences need a "tap the notebook row" step + offset
+recalibration (tracked as a notebooks phase-1 follow-up).
 
 ## CLI log contract (grep targets)
 
