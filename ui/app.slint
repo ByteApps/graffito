@@ -12,7 +12,10 @@ export struct NotebookItem { account: int, name: string, snippet: string, meta: 
 // entry), `label` the resolved display name, `sub` the note count line.
 export struct SenderItem { key: string, label: string, sub: string, excluded: bool }
 export struct ContactItem { address: string, name: string }
-export struct AccountItem { index: int, address: string, active: bool }
+// `pill`/`balance` are set only by the notebook-create picker ("new" /
+// "used" / "notebook" + a sats line); the import/switch picker leaves them
+// empty and the row renders as before.
+export struct AccountItem { index: int, address: string, active: bool, pill: string, balance: string }
 export struct CoinItem { outpoint: string, value: string, status: string }
 export struct SpendCoin { outpoint: string, value: string, confirmed: bool, selected: bool, txid-short: string, explorer: string }
 // One input/output row in the Sparrow-style PSBT confirmation. `kind` drives
@@ -1225,6 +1228,10 @@ export component AppWindow inherits Window {
     in-out property <[SenderItem]> senders;
     in-out property <bool> filter-expanded;
     in-out property <string> hidden-senders-label;    // "2 senders hidden", empty = none
+    // The account picker (screen 9) serves two flows: "switch" = import /
+    // settings account change (pick activates), "notebook" = the create-
+    // notebook flow (pick chooses the new notebook's address, then names it).
+    in-out property <string> account-pick-mode: "switch";
     callback open-notebooks();
     callback open-notebook(int);
     callback create-notebook();
@@ -2593,11 +2600,13 @@ export component AppWindow inherits Window {
         spacing: 12px;
         alignment: start;
         Header {
-            title: "Choose account";
+            title: root.account-pick-mode == "notebook" ? "New notebook" : "Choose account";
             back => { root.nav-back(); }
         }
         Caption {
-            text: "One seed holds many BIP-86 accounts. Each is a completely separate notebook: its own address, its own encryption key, its own notes.";
+            text: root.account-pick-mode == "notebook"
+                ? "Pick the address for the new notebook. Used addresses already have on-chain history — picking one adopts its notes."
+                : "One seed holds many BIP-86 accounts. Each is a completely separate notebook: its own address, its own encryption key, its own notes.";
         }
         for a in root.accounts: Rectangle {
             border-radius: 12px;
@@ -2617,7 +2626,13 @@ export component AppWindow inherits Window {
                         font-weight: 700;
                         color: a.active ? Pal.accent : Pal.text;
                     }
+                    if a.pill != "": Badge {
+                        label: a.pill;
+                        tint: a.pill == "new" ? Pal.good
+                            : (a.pill == "used" ? Pal.warn : Pal.muted);
+                    }
                     Rectangle { }
+                    if a.balance != "": Caption { text: a.balance; vertical-alignment: center; }
                     if a.active: Badge { label: "current"; tint: Pal.accent; }
                 }
                 Mono {

@@ -176,15 +176,25 @@ key (`identity::index_fp8`) is shared across accounts, so one identity
 = one index. Store gains `excluded_senders` + `seen_received` (unread =
 received notes not yet seen; `mark_seen` fires when LEAVING home for
 the list, so the badge only counts what arrived since). Create is
-NAME-FIRST: "+ New notebook" only opens the naming dialog
-(`nb-rename-account == -2` = create mode; ≥ 0 = rename); nothing is
-derived until Save/Create, so Cancel leaves no phantom row. ONE archive
-guard: a notebook holding sats refuses (sweep first). ZERO active
-notebooks is a legitimate state (Sal 2026-07-11) — archive-all is
-allowed and the list shows "All notebooks are archived." / "No
-notebooks yet…" empty-state captions; boot never resurrects archived
-entries (activate()'s ensure() only ADDS missing accounts).
-reset-identity deletes notebooks-*.json alongside stores.
+ADDRESS-FIRST then NAME-FIRST (Sal 2026-07-11): "+ New notebook" opens
+the account picker (screen 9, `account-pick-mode == "notebook"`) whose
+rows carry a pill — grey "notebook" (already in the index), amber
+"used" (on-chain history, balance shown — `ChainClient::address_probe`,
+two cheap requests; offline → plain rows) or green "new" — so
+recovering a used address is a visible choice that adopts its notes;
+the pick opens the naming dialog (`nb-rename-account == -2` = create
+mode; ≥ 0 = rename) and NOTHING is derived or persisted until Create —
+Cancel at either step leaves no phantom row. Notebook creation is
+DELIBERATE everywhere: activate() only auto-adds for pre-notebooks
+migration (no index file + existing store → "Main") and non-hierarchical
+identities (single intrinsic notebook); explicit `ensure_notebook` runs
+at the import account pick, the create dialog, and APP_KEY automation
+boots. Onboarding a NEW seed lands on the EMPTY list (`go_home_or_list`
+sends "home" to the list while the active account is unlisted). ONE
+archive guard: a notebook holding sats refuses (sweep first). ZERO
+active notebooks is legitimate — archive-all allowed, empty-state
+captions, boot never resurrects archived entries. reset-identity
+deletes notebooks-*.json alongside stores.
 
 **Identity lifecycle:** key material verbatim in the keychain; BIP-86
 account chosen on a paginated picker after hierarchical imports and
@@ -395,7 +405,8 @@ picker` · `cb: pick-account <n>` · `cb: account-picker open` ·
 `cb: sys-back handled=<b> screen=<n>` (Android system back; screen is
 where back landed us) ·
 `cb: notebooks list n=<n> archived=<n>` · `cb: open-notebook
-account=<n>` · `cb: create-notebook account=<n>` ·
+account=<n>` · `cb: create-notebook picker open` · `cb: pick-account <n>
+(new notebook)` · `cb: create-notebook account=<n>` ·
 `cb: rename-notebook account=<n>` · `cb: archive-notebook account=<n>
 archived=<b>` · `cb: toggle-sender excluded=<b> hidden=<n>`.
 UI e2e:
