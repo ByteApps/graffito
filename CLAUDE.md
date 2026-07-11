@@ -79,6 +79,10 @@ ui/app.slint            # design system (Pal palette, Card/PrimaryButton/
                         #   GhostButton/SelectPill/Dropdown/SettingsCard/DoorCard/Badge,
                         #   fluent-dark std widgets) + 10 screens + modals
 ui/icons/*.svg          # icon assets (@image-url + colorize — see icon rule)
+assets/icon/            # app icon: icon.svg master (same design as the Prime
+                        #   app's resources/icon.svg) + generated mac/AppIcon.icns
+                        #   and android/res mipmaps — scripts/gen-icon-assets.sh
+                        #   regenerates all of them (+ the iOS appiconset PNG)
 scripts/bundle-mac.sh   # minimal .app (TCC camera permission needs a bundle)
 scripts/regtest-e2e.sh  # app↔Prime interop matrix (host CLIs vs bitcoind)
 ```
