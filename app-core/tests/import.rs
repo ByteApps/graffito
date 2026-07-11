@@ -112,7 +112,7 @@ fn malformed_inputs_rejected() {
 
 #[test]
 fn generated_mnemonics_are_valid_and_distinct() {
-    for words in [12usize, 24] {
+    for words in [12usize, 18, 24] {
         let m = generate_mnemonic(words).unwrap();
         assert_eq!(m.word_count(), words);
         // Round-trips through the importer.
@@ -123,5 +123,5 @@ fn generated_mnemonics_are_valid_and_distinct() {
     let b = generate_mnemonic(12).unwrap();
     assert_ne!(a.to_string(), b.to_string(), "entropy source is not varying");
 
-    assert!(matches!(generate_mnemonic(18), Err(Error::MnemonicWordCount(18))));
+    assert!(matches!(generate_mnemonic(15), Err(Error::MnemonicWordCount(15))));
 }
