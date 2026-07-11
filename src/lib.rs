@@ -2093,6 +2093,14 @@ pub fn run() {
         window.set_icloud_available(synced);
     }
 
+    // System back (Android): the ui-side nav-back() already navigated; this
+    // just emits the log-contract line (screen = where back landed us). No
+    // state borrow — nav-back may have gone through a state-borrowing
+    // callback (go-home etc.) synchronously before this fires.
+    window.on_back_logged(|handled, screen| {
+        println!("cb: sys-back handled={handled} screen={screen}");
+    });
+
     macro_rules! cb {
         ($name:ident, |$w:ident, $s:ident $(, $arg:ident : $ty:ty)*| $body:block) => {{
             let st = st.clone();

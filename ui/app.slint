@@ -1203,6 +1203,108 @@ export component AppWindow inherits Window {
     callback reveal-backup();
     callback go-home();
 
+    // ---------- system back (Android hardware/gesture back) ----------
+    // slint delivers Android's back button/gesture as Key.Back to whatever
+    // has keyboard focus and lets it bubble up from there — so back-scope
+    // below wraps every child of the window, and holds focus itself whenever
+    // no field does (key events aren't delivered at all while nothing has
+    // focus; the changed-handlers below re-take it). Handled = navigate
+    // exactly like the current screen's header chevron (single source of
+    // truth: the chevrons call nav-back() too); unhandled (onboarding/home)
+    // rejects the key so Android's default runs, which moves the task to
+    // the background instead of quitting.
+    callback back-logged(bool, int); // Rust: `cb: sys-back` log line
+    function nav-back() -> bool {
+        // Overlays first, topmost (= last window child) before the rest —
+        // back closes the same thing a tap on Cancel / the dim would.
+        if (root.show-bump-dialog) { root.show-bump-dialog = false; return true; }
+        if (root.show-oversize-modal) { root.show-oversize-modal = false; return true; }
+        if (root.show-consolidate-confirm) { root.show-consolidate-confirm = false; return true; }
+        if (root.show-sweep-confirm) { root.show-sweep-confirm = false; return true; }
+        if (root.show-reset-confirm) { root.show-reset-confirm = false; return true; }
+        if (root.confirm-remove-address != "") { root.cancel-remove(); return true; }
+        if (root.rename-address != "") { root.cancel-rename(); return true; }
+        if (root.fund-rename-id != "") { root.fund-rename-cancel(); return true; }
+        if (root.scanning) { root.cancel-scan(); return true; }
+        // Screens: one branch per header chevron.
+        if (root.screen == 1 || root.screen == 2) { root.screen = 0; return true; }
+        if (root.screen == 3) { root.screen = 2; return true; }
+        if (root.screen == 5 || root.screen == 8 || root.screen == 11) { root.go-home(); return true; }
+        if (root.screen == 6) {
+            // Clear the typed address on the way back — it's saved in recents
+            // now, so leaving it in the field is redundant. Status too: its
+            // message belonged to this screen.
+            root.contact-input = "";
+            root.status = "";
+            root.screen = 7;
+            return true;
+        }
+        if (root.screen == 7) {
+            if (root.pick-mode == "sweep") {
+                root.pick-mode = "compose";
+                root.screen = 8;
+            } else {
+                root.go-home();
+            }
+            return true;
+        }
+        if (root.screen == 9) { root.account-cancel(); return true; }
+        if (root.screen == 10) { root.screen = 8; return true; }
+        if (root.screen == 12) { root.open-funding(); return true; }
+        if (root.screen == 13) { root.screen = root.watch-only ? 8 : 6; return true; }
+        if (root.screen == 14) { root.screen = 13; return true; }
+        if (root.screen == 15) { root.screen = root.funding-return; return true; }
+        if (root.screen == 16) {
+            // Clear the typed address + any stale status on the way back —
+            // success messages otherwise linger red on the picker. Sweep
+            // returns to its destination picker, consolidate to the coins.
+            root.contact-input = "";
+            root.status = "";
+            if (root.sweep-kind == "consolidate") {
+                root.screen = 10;
+            } else {
+                root.pick-mode = "sweep";
+                root.screen = 7;
+            }
+            return true;
+        }
+        return false; // 0 onboarding / 4 home: nothing to go back to
+    }
+    // Focus must never be nobody's, or key events (incl. Back) are dropped
+    // before they can bubble anywhere: re-take it whenever the focused
+    // element may just have been destroyed — a screen change, or one of the
+    // two self-focusing rename dialogs closing.
+    changed screen => { back-scope.focus(); }
+    changed rename-address => { if (root.rename-address == "") { back-scope.focus(); } }
+    changed fund-rename-id => { if (root.fund-rename-id == "") { back-scope.focus(); } }
+
+    back-scope := FocusScope {
+        focus-on-click: false; // never steal a tap's focus from a field
+        focus-on-tab-navigation: false; // no invisible Tab stop between fields
+        init => { self.focus(); }
+        // The Down press decides (and navigates); the matching Up must replay
+        // the same verdict — Android only runs its own default when it saw
+        // the whole tracked down+up pair unhandled. Repeats replay too, so a
+        // long-press can't navigate several screens at once.
+        property <bool> back-eaten: false;
+        key-pressed(event) => {
+            if (event.text != Key.Back) { return reject; }
+            if (!event.repeat) {
+                back-eaten = root.nav-back();
+                root.back-logged(back-eaten, root.screen);
+            }
+            return back-eaten ? accept : reject;
+        }
+        key-released(event) => {
+            return (event.text == Key.Back && back-eaten) ? accept : reject;
+        }
+
+    // NOTE: back-scope wraps every window child from here down to its
+    // matching closing brace at the bottom of the file; the children keep
+    // their original one-level indent (mechanical wrap — slint is
+    // whitespace-insensitive, and re-indenting ~2200 lines would bury the
+    // file's history).
+
     // ---------- 0 · onboarding ----------
     if screen == 0: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 24px;
@@ -1267,7 +1369,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Import key";
-            back => { root.screen = 0; }
+            back => { root.nav-back(); }
         }
         Caption { text: "Mnemonic (12/18/24 words), xprv, WIF, 32-byte hex — or an account xpub for a watch-only notebook (public notes and balance; private notes stay sealed, no composing)."; }
         EditArea {
@@ -1308,7 +1410,7 @@ export component AppWindow inherits Window {
         Header {
             title: "Write these words down";
             show-back: true;
-            back => { root.screen = 0; }
+            back => { root.nav-back(); }
         }
         Rectangle {
             border-radius: 10px;
@@ -1408,7 +1510,7 @@ export component AppWindow inherits Window {
         Header {
             title: "Spot check";
             show-back: true;
-            back => { root.screen = 2; }
+            back => { root.nav-back(); }
         }
         Body { text: root.quiz-prompt; }
         EditField { text <=> root.quiz-answer; placeholder-text: "word  word  word"; }
@@ -1567,7 +1669,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Note";
-            back => { root.go-home(); }
+            back => { root.nav-back(); }
         }
         Card {
             height: nd.preferred-height + 32px;
@@ -1604,10 +1706,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Compose";
-            // Clear the typed address on the way back — it's saved in recents
-            // now, so leaving it in the field is redundant. Status too: its
-            // message belonged to this screen.
-            back => { root.contact-input = ""; root.status = ""; root.screen = 7; }
+            back => { root.nav-back(); }
         }
         Flickable {
             viewport-height: compose-col.preferred-height;
@@ -1649,7 +1748,10 @@ export component AppWindow inherits Window {
                 font-size: 13px;
                 color: Pal.accent;
                 vertical-alignment: center;
-                TouchArea { clicked => { note-edit.clear-focus(); } }
+                // Focus moves to back-scope rather than to nobody — same
+                // visible effect (field blurs, keyboard hides), but key
+                // events keep a destination (see back-scope).
+                TouchArea { clicked => { back-scope.focus(); } }
             }
         }
         note-edit := EditArea {
@@ -1994,14 +2096,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: root.pick-mode == "sweep" ? "Sweep to" : "Send to";
-            back => {
-                if (root.pick-mode == "sweep") {
-                    root.pick-mode = "compose";
-                    root.screen = 8;
-                } else {
-                    root.go-home();
-                }
-            }
+            back => { root.nav-back(); }
         }
         if root.pick-mode != "sweep": DoorCard {
             highlight: true;
@@ -2084,7 +2179,7 @@ export component AppWindow inherits Window {
         spacing: 12px;
         Header {
             title: "Settings";
-            back => { root.go-home(); }
+            back => { root.nav-back(); }
         }
         Flickable {
             viewport-height: settings-col.preferred-height;
@@ -2246,7 +2341,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Choose account";
-            back => { root.account-cancel(); }
+            back => { root.nav-back(); }
         }
         Caption {
             text: "One seed holds many BIP-86 accounts. Each is a completely separate notebook: its own address, its own encryption key, its own notes.";
@@ -2307,7 +2402,7 @@ export component AppWindow inherits Window {
         spacing: 12px;
         Header {
             title: "Coins";
-            back => { root.screen = 8; }
+            back => { root.nav-back(); }
         }
         Caption {
             text: root.watch-only
@@ -2367,7 +2462,7 @@ export component AppWindow inherits Window {
         spacing: 12px;
         Header {
             title: "Activity";
-            back => { root.go-home(); }
+            back => { root.nav-back(); }
         }
         Caption { text: root.activity-summary; }
         Flickable {
@@ -2445,7 +2540,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Add wallet";
-            back => { root.open-funding(); }
+            back => { root.nav-back(); }
         }
         Caption {
             text: "Paste or scan an output descriptor / xpub, or scan your hardware wallet's account-export QR. Its key never leaves that wallet — you'll sign there.";
@@ -2498,7 +2593,7 @@ export component AppWindow inherits Window {
         Header {
             title: "Sign externally";
             // Funding flow came from compose (6); watch spends from settings (8).
-            back => { root.screen = root.watch-only ? 8 : 6; }
+            back => { root.nav-back(); }
         }
         Caption {
             text: root.desktop-platform
@@ -2554,7 +2649,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Review + broadcast";
-            back => { root.screen = 13; }
+            back => { root.nav-back(); }
         }
         if !root.psbt-signed: Caption {
             text: root.desktop-platform
@@ -2680,7 +2775,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Funding wallets";
-            back => { root.screen = root.funding-return; }
+            back => { root.nav-back(); }
         }
         Caption {
             text: "Watch-only wallets that can pay for your notes. Tap one to use it, or add another.";
@@ -2766,19 +2861,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: root.sweep-kind == "consolidate" ? "Consolidate" : "Sweep";
-            // Clear the typed address + any stale status on the way back —
-            // success messages otherwise linger red on the picker. Sweep
-            // returns to its destination picker, consolidate to the coins.
-            back => {
-                root.contact-input = "";
-                root.status = "";
-                if (root.sweep-kind == "consolidate") {
-                    root.screen = 10;
-                } else {
-                    root.pick-mode = "sweep";
-                    root.screen = 7;
-                }
-            }
+            back => { root.nav-back(); }
         }
         Flickable {
             viewport-height: sweep-col.preferred-height;
@@ -3451,4 +3534,5 @@ export component AppWindow inherits Window {
         height: 100%;
         background: Pal.bg;
     }
+    } // end back-scope (system back)
 }
