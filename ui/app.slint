@@ -1217,7 +1217,9 @@ export component AppWindow inherits Window {
     in-out property <string> archived-toggle-label;   // "Archived (2)" — preformatted
     in-out property <bool> can-create-notebook;       // hierarchical identities only
     in-out property <string> notebook-title: "Chain Notes"; // home header = open notebook's name
-    in-out property <int> nb-rename-account: -1;      // >= 0 = rename modal open
+    // -1 = naming dialog closed · -2 = CREATE mode (nothing exists until
+    // Save) · >= 0 = renaming that existing account.
+    in-out property <int> nb-rename-account: -1;
     in-out property <string> nb-rename-input;
     // sender filter (home): exclusions persist per notebook, all-on default
     in-out property <[SenderItem]> senders;
@@ -1254,7 +1256,7 @@ export component AppWindow inherits Window {
         if (root.confirm-remove-address != "") { root.cancel-remove(); return true; }
         if (root.rename-address != "") { root.cancel-rename(); return true; }
         if (root.fund-rename-id != "") { root.fund-rename-cancel(); return true; }
-        if (root.nb-rename-account >= 0) { root.nb-rename-cancel(); return true; }
+        if (root.nb-rename-account != -1) { root.nb-rename-cancel(); return true; }
         if (root.scanning) { root.cancel-scan(); return true; }
         // Screens: one branch per header chevron.
         if (root.screen == 1 || root.screen == 2) { root.screen = 0; return true; }
@@ -1308,7 +1310,7 @@ export component AppWindow inherits Window {
     changed screen => { back-scope.focus(); }
     changed rename-address => { if (root.rename-address == "") { back-scope.focus(); } }
     changed fund-rename-id => { if (root.fund-rename-id == "") { back-scope.focus(); } }
-    changed nb-rename-account => { if (root.nb-rename-account < 0) { back-scope.focus(); } }
+    changed nb-rename-account => { if (root.nb-rename-account == -1) { back-scope.focus(); } }
 
     back-scope := FocusScope {
         focus-on-click: false; // never steal a tap's focus from a field
@@ -1790,6 +1792,15 @@ export component AppWindow inherits Window {
         }
         if root.can-create-notebook: PrimaryButton { text: "+  New notebook"; clicked => { root.create-notebook(); } }
         Caption { text: root.status; }
+        // Zero active notebooks is a legitimate state (fresh start, or
+        // everything archived) — say so instead of showing a blank page.
+        if root.notebooks.length == 0: Caption {
+            text: root.archived-toggle-label != ""
+                ? "All notebooks are archived."
+                : (root.can-create-notebook
+                    ? "No notebooks yet — create one to start writing."
+                    : "No notebooks yet.");
+        }
         Flickable {
             viewport-height: nb-col.preferred-height;
             nb-col := VerticalLayout {
@@ -3481,8 +3492,8 @@ export component AppWindow inherits Window {
         }
     }
 
-    // ---------- notebook rename dialog (modal overlay) ----------
-    if root.nb-rename-account >= 0: Rectangle {
+    // ---------- notebook name dialog (create + rename, modal overlay) ----------
+    if root.nb-rename-account != -1: Rectangle {
         width: 100%;
         height: 100%;
         background: #000000.with-alpha(0.55);
@@ -3501,7 +3512,7 @@ export component AppWindow inherits Window {
                 padding: 20px;
                 spacing: 12px;
                 Text {
-                    text: "Name this notebook";
+                    text: root.nb-rename-account == -2 ? "Name your new notebook" : "Name this notebook";
                     font-size: 16px;
                     font-weight: 700;
                     color: Pal.text;
@@ -3519,7 +3530,10 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.nb-rename-cancel(); } }
-                    PrimaryButton { text: "Save"; clicked => { root.nb-rename-save(root.nb-rename-input); } }
+                    PrimaryButton {
+                        text: root.nb-rename-account == -2 ? "Create" : "Save";
+                        clicked => { root.nb-rename-save(root.nb-rename-input); }
+                    }
                 }
             }
         }
