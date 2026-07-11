@@ -1,70 +1,37 @@
-# <img src="assets/icon/icon.svg" alt="" width="42" align="top" /> chain-notes-app
+# <img src="assets/icon/icon.svg" alt="" width="42" align="top" /> Chain Notes
 
-Native Mac + mobile app for **chain notes** (the iOS/Android port is
-merged and runs on real hardware — iPhone-verified; Android green on the
-emulator; see `../PLAN-chain-notes-app-phase4.md` in the prime workspace):
-personal notes on the bitcoin blockchain (PNTE protocol, shared with
-[prime-chain-notes](https://github.com/ObjSal/prime-chain-notes)).
-Compose public or encrypted notes, send directed private notes to other
-taproot addresses, broadcast directly, and rebuild the whole notebook
-from the chain plus your key alone.
+**Bitcoin · Notes · Mac / iOS / Android** — your notebook on the bitcoin blockchain, in a native app that goes where you go.
 
-- **Keys**: create a 12/24-word seed in-app (backup + quiz flow), or
-  import BIP-39 / xprv / WIF / hex — typed (with word autocomplete),
-  QR (incl. SeedQR via the Mac camera), or file. Hierarchical keys get
-  a paginated BIP-86 account picker; accounts are switchable later in
-  Settings. Key material lives in the macOS Keychain; reveal and unlock
-  ask for Touch ID.
-- **Watch-only**: import an account xpub, a key-origin xpub
-  (`[fp/86'/…]xpub…`), or a `tr()` descriptor instead — same address as
-  the full key, public notes and balance visible, private bodies sealed.
-  Everything that needs a signature still works: sweep, consolidate,
-  RBF speed-up, and PUBLIC-note compose build PSBTs signed on your
-  hardware wallet (verified with a real signer), with an optional separate
-  fee wallet ("Pay from another wallet").
-- **Compose**: public or private notes, directed notes to other taproot
-  addresses, live cost/change preview, fee-tier picker, coin control
-  (pick exactly which UTXOs to spend, incl. unconfirmed), an optional
-  custom change address, and a **gift amount** for directed notes
-  (choose how many sats reach the recipient; default/minimum is dust).
-- **Text editing that feels native**: right-click Cut/Copy/Paste/
-  Select-All on the Mac plus all the usual shortcuts; on iOS/Android an
-  edit bubble with native trigger rules — tap the caret to summon it,
-  double-tap selects a word, triple-tap selects everything, typing hides
-  it — and Paste always inserts at the cursor. (Drag across text to
-  select a range; selection handles await upstream Slint support.)
-- **Manage**: an Activity screen listing every transaction with retry
-  (rebroadcast) and RBF fee-bump for stuck ones; a viewer-first Coins
-  screen whose Consolidate button opens the same compose-like flow as
-  Sweep (fee tiers, live cost line, read-only inputs, optional fee
-  wallet); sweep-all picks its destination like a contact; per-coin/
-  -note links to the tx in your chosen block explorer and to notes in
-  the web viewer.
-- **Settings**: a **Bitcoin node** dropdown (mempool.space / Blockstream
-  / your own Esplora-compatible node) selects the API used for scans and
-  broadcasts; a separate **Block explorer** dropdown (mempool.space /
-  Blockstream / a self-hosted mempool) selects where "Explorer" links
-  open. Both offer a Custom URL, are set entirely through the UI, and are
-  remembered per network at the device level — so switching identity (or
-  account) keeps them.
-- **Networks**: mainnet · testnet4 · signet · regtest (point the Bitcoin
-  node at any Esplora/mempool-compatible endpoint). Verified live on
-  testnet4 — including a directed private note decrypted by the Passport
-  Prime app's own core — and hermetically against bitcoind -regtest.
-  Mainnet deliberately untested (user decision; testnet4 + regtest are
-  the acceptance bar).
-- **UI**: Slint (Rust end-to-end), dark card-based design, driven by a
-  scripted CGEvents e2e (`../ui-automation/tests/chain-notes-app.sh`).
+Chain Notes writes personal notes into real bitcoin transactions — public ones anyone can read, private ones only your key can open, and directed notes delivered to any taproot address like unstoppable mail. This is the online, full-featured peer of the [Passport Prime app](https://github.com/ObjSal/prime-chain-notes): the same protocol, byte-identical transactions, but with its own keys, direct broadcasting, and a native interface on Mac, iPhone, and Android. Lose the device, keep the key — the entire notebook rebuilds itself from the chain.
 
-Build/test (nix shell as host toolchain — see CLAUDE.md):
+## Features
+
+- **Your key, your way** — create a 12/24-word seed in-app with a backup-and-quiz flow, or import what you have: BIP-39 words (with autocomplete), xprv, WIF, or raw hex — typed, scanned from QR (SeedQR included), or loaded from file. Hierarchical keys get a paginated account picker, switchable anytime.
+- **Keys live in the platform vault** — the macOS Keychain behind Touch ID, iOS Keychain, Android Keystore. Reveal always re-authenticates.
+- **Watch-only mode** — import just an xpub or descriptor for a key-less notebook: balance and public notes visible, private bodies sealed. Everything that needs a signature — sweep, consolidate, fee bumps, even public-note compose — builds a PSBT your hardware wallet signs (verified against a real signer implementation), with an optional separate fee wallet.
+- **Serious compose tools** — live cost and change preview, fee tiers plus custom rates, full **coin control** with per-coin explorer links, a custom change address, and a **gift amount** to send chosen sats along with a directed note.
+- **Stay on top of your transactions** — an Activity screen with rebroadcast and RBF speed-up for stuck transactions, a Coins screen with one-tap consolidate, and a guided sweep flow.
+- **Your infrastructure or theirs** — pick your Bitcoin node (mempool.space, Blockstream, or your own Esplora-compatible endpoint) and your block explorer, per network, right in Settings.
+- **Every network** — mainnet, testnet4, signet, and regtest. Verified live on testnet4, including a directed private note decrypted by the Passport Prime app's own core.
+- **Text editing that feels native** — right-click menus and every shortcut on the Mac; on iOS/Android an edit bubble with the platform's own trigger rules, and paste that lands exactly at the cursor.
+
+## Compatible by construction
+
+The app reuses the Prime app's `notes-core` as a pinned dependency — envelope, encryption, and transaction signing are the same code, so notes from either app are interchangeable on-chain. The [web viewer](https://objsal.github.io/chain-notes-companion/) renders both.
+
+## Get it running
 
 ```bash
-nix develop ~/.foundation/sdk/current --command cargo test -p app-core
-nix develop ~/.foundation/sdk/current --command bash scripts/regtest-e2e.sh
-nix develop ~/.foundation/sdk/current --command cargo run
+cargo run
 ```
 
-Design + milestones: `PLAN-chain-notes-app.md` in the parent workspace.
+See **[DEVELOPMENT.md](DEVELOPMENT.md)** for toolchain setup, mobile builds, and the test suites.
+
+## Learn more
+
+- [DEVELOPMENT.md](DEVELOPMENT.md) — building (desktop + mobile), testing, architecture pointers
+- [THIRD-PARTY.md](THIRD-PARTY.md) — libraries this app is built on
+- `PLAN-chain-notes-app.md` (workspace repo) — design document and milestones
 
 ## License & disclaimer
 
