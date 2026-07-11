@@ -346,7 +346,7 @@ component EditField inherits Rectangle {
         // centered above the caret, clamped to the screen; flips below the
         // caret line when there is no room above.
         x: clamp(12px + ti.x + root.caret-x - self.width / 2,
-                 8px - root.absolute-position.x,
+                 0px,
                  EditOps.win-width - self.width - 8px - root.absolute-position.x);
         y: root.absolute-position.y + root.caret-y - self.height - 8px < 8px
             ? root.caret-y + 26px
@@ -545,7 +545,7 @@ component EditArea inherits Rectangle {
 
     if EditOps.touch && ti.has-focus && root.bubble: EditToolbar {
         x: clamp(10px + root.caret-x - self.width / 2,
-                 8px - root.absolute-position.x,
+                 0px,
                  EditOps.win-width - self.width - 8px - root.absolute-position.x);
         y: root.absolute-position.y + 8px + fli.viewport-y + root.caret-y - self.height - 8px < 8px
             ? 8px + fli.viewport-y + root.caret-y + 26px
