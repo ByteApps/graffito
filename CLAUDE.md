@@ -237,7 +237,7 @@ text and use the SVG icons.
 
 **iOS launch-path rule (watchdog).** NOTHING network-bound may run before
 the first frame: the boot-identity sync runs from a 300 ms single-shot
-timer after the scene attaches (`81d6c2e`). Blocking launch on HTTP got
+timer after the scene attaches (`8927e6c`). Blocking launch on HTTP got
 the app killed by the iOS launch watchdog on a home-screen tap (black
 screen → `0x8badf00d`) — and devicectl/Xcode launches RELAX the watchdog,
 so the bug is invisible from tooling; always confirm a device build by
@@ -267,7 +267,7 @@ the Pixel 6 emulator's true status bar is ~48.8dp).
   `_exact_amount`; the non-`_amount` variants delegate with `DUST_LIMIT`.
   `ComposeRequest.gift_amount: Option<u64>` (None = dust) plumbs it;
   `NoteRecord.gift_amount` (serde default) persists it so RBF preserves
-  the gift. notes-core rev `8fb7255` ships this on prime main — the
+  the gift. notes-core rev `5c6d23a` ships this on prime main — the
   Prime app can adopt it the same way (see prime-chain-notes/CLAUDE.md).
 - Compose input paths: default = notes-core auto-select (largest-first);
   coin control = `compose_*_exact` spending EXACTLY the selected coins
