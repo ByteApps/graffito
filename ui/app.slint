@@ -72,6 +72,9 @@ export global EditOps {
     // true on iOS/Android (set from Rust): show the touch toolbar and
     // enable double-tap word selection.
     in-out property <bool> touch: false;
+    // window width, kept current by the AppWindow root — used to clamp the
+    // floating edit bubble to the screen.
+    in-out property <length> win-width: 480px;
     // true on iOS only: TextInput's internal clipboard is a no-op there
     // (winit has no iOS clipboard), so cut/copy/paste go through the
     // UIPasteboard shim + byte-offset splicing. Everywhere else the native
@@ -103,13 +106,13 @@ component ToolbarAction inherits Rectangle {
 // anchors it to the screen's left edge via absolute-position.
 component EditToolbar inherits Rectangle {
     callback action(string); // select-all | copy | paste | cut
-    width: 258px;
+    width: l.preferred-width;
     height: 30px;
     border-radius: 15px;
     background: #262E3A;
     border-width: 1px;
     border-color: Pal.line;
-    HorizontalLayout {
+    l := HorizontalLayout {
         padding-left: 4px;
         padding-right: 4px;
         padding-top: 2px;
@@ -142,6 +145,11 @@ component EditField inherits Rectangle {
     property <int> scratch;
     property <int> last-tap-off: -1;
     property <string> last-tap-text;
+    property <int> tap-count;
+    property <bool> internal-sel: false; // guards reentrant cursor events
+    property <bool> bubble: false;       // floating edit bubble visible?
+    property <length> caret-x;           // last caret position, ti coords
+    property <length> caret-y;
 
     pure function sel-start() -> int {
         min(ti.cursor-position-byte-offset, ti.anchor-position-byte-offset)
@@ -195,6 +203,47 @@ component EditField inherits Rectangle {
     // double-tap → select word (touch only): two caret placements at
     // (nearly) the same offset within the window, text unchanged, no
     // selection in progress. `edited` disarms so typing can't misfire.
+    // Native-iOS-style bubble triggers: nothing on plain caret placement;
+    // 2 taps at the same spot select the word, 3 select everything, and a
+    // slow tap exactly ON the resting caret toggles the bubble. `edited`
+    // hides it and resets the tap chain; typing can't misfire the selectors
+    // because each keystroke's `edited` disarms the window and the text-
+    // equality guard kills tap-then-type.
+    function handle-tap() {
+        if (dbl.running && ti.text == root.last-tap-text && root.sel-start() == root.sel-end() && abs(ti.cursor-position-byte-offset - root.last-tap-off) <= 2) {
+            root.tap-count += 1;
+            if (root.tap-count == 2) {
+                root.internal-sel = true;
+                ti.set-selection-offsets(
+                    EditOps.word-start(ti.text, ti.cursor-position-byte-offset),
+                    EditOps.word-end(ti.text, ti.cursor-position-byte-offset));
+                root.internal-sel = false;
+                root.bubble = true;
+                dbl.running = false;
+                dbl.running = true;   // keep the window open for a 3rd tap
+            } else {
+                root.internal-sel = true;
+                ti.select-all();
+                root.internal-sel = false;
+                root.bubble = true;
+                root.tap-count = 0;
+                dbl.running = false;
+            }
+        } else if (!dbl.running && ti.text == root.last-tap-text && ti.cursor-position-byte-offset == root.last-tap-off && root.sel-start() == root.sel-end()) {
+            // slow tap exactly on the resting caret → toggle the bubble
+            root.bubble = !root.bubble;
+            root.tap-count = 1;
+            dbl.running = true;
+        } else {
+            root.bubble = false;
+            root.last-tap-off = ti.cursor-position-byte-offset;
+            root.last-tap-text = ti.text;
+            root.tap-count = 1;
+            dbl.running = false;
+            dbl.running = true;
+        }
+    }
+
     dbl := Timer {
         interval: 350ms;
         running: false;
@@ -243,6 +292,8 @@ component EditField inherits Rectangle {
                 selection-foreground-color: Pal.sel-fg;
                 edited => {
                     dbl.running = false;
+                    root.tap-count = 0;
+                    root.bubble = false;
                     root.edited(self.text);
                 }
                 accepted => { root.accepted(self.text); }
@@ -252,18 +303,10 @@ component EditField inherits Rectangle {
                     } else if (cpos.x + self.computed-x > parent.width - 12px - self.text-cursor-width) {
                         self.computed-x = parent.width - cpos.x - 12px - self.text-cursor-width;
                     }
-                    if (EditOps.touch) {
-                        if (dbl.running && ti.text == root.last-tap-text && root.sel-start() == root.sel-end() && abs(ti.cursor-position-byte-offset - root.last-tap-off) <= 2) {
-                            dbl.running = false;
-                            ti.set-selection-offsets(
-                                EditOps.word-start(ti.text, ti.cursor-position-byte-offset),
-                                EditOps.word-end(ti.text, ti.cursor-position-byte-offset));
-                        } else {
-                            root.last-tap-off = ti.cursor-position-byte-offset;
-                            root.last-tap-text = ti.text;
-                            dbl.running = false;
-                            dbl.running = true;
-                        }
+                    root.caret-x = cpos.x;
+                    root.caret-y = cpos.y;
+                    if (EditOps.touch && !root.internal-sel) {
+                        root.handle-tap();
                     }
                 }
             }
@@ -299,10 +342,19 @@ component EditField inherits Rectangle {
         background: Pal.field-focus-line;
     }
 
-    if EditOps.touch && ti.has-focus: EditToolbar {
-        x: 8px - root.absolute-position.x;
-        y: -38px;
-        action(a) => { root.toolbar-action(a); }
+    if EditOps.touch && ti.has-focus && root.bubble: EditToolbar {
+        // centered above the caret, clamped to the screen; flips below the
+        // caret line when there is no room above.
+        x: clamp(12px + ti.x + root.caret-x - self.width / 2,
+                 8px - root.absolute-position.x,
+                 EditOps.win-width - self.width - 8px - root.absolute-position.x);
+        y: root.absolute-position.y + root.caret-y - self.height - 8px < 8px
+            ? root.caret-y + 26px
+            : root.caret-y - self.height - 8px;
+        action(a) => {
+            root.toolbar-action(a);
+            if (a != "select-all") { root.bubble = false; }
+        }
     }
 }
 
@@ -322,6 +374,11 @@ component EditArea inherits Rectangle {
     property <int> scratch;
     property <int> last-tap-off: -1;
     property <string> last-tap-text;
+    property <int> tap-count;
+    property <bool> internal-sel: false; // guards reentrant cursor events
+    property <bool> bubble: false;       // floating edit bubble visible?
+    property <length> caret-x;           // last caret position, ti coords
+    property <length> caret-y;
 
     pure function sel-start() -> int {
         min(ti.cursor-position-byte-offset, ti.anchor-position-byte-offset)
@@ -370,6 +427,47 @@ component EditArea inherits Rectangle {
     border-color: ti.has-focus ? #33404E : Pal.line;
     forward-focus: ti;
 
+    // Native-iOS-style bubble triggers: nothing on plain caret placement;
+    // 2 taps at the same spot select the word, 3 select everything, and a
+    // slow tap exactly ON the resting caret toggles the bubble. `edited`
+    // hides it and resets the tap chain; typing can't misfire the selectors
+    // because each keystroke's `edited` disarms the window and the text-
+    // equality guard kills tap-then-type.
+    function handle-tap() {
+        if (dbl.running && ti.text == root.last-tap-text && root.sel-start() == root.sel-end() && abs(ti.cursor-position-byte-offset - root.last-tap-off) <= 2) {
+            root.tap-count += 1;
+            if (root.tap-count == 2) {
+                root.internal-sel = true;
+                ti.set-selection-offsets(
+                    EditOps.word-start(ti.text, ti.cursor-position-byte-offset),
+                    EditOps.word-end(ti.text, ti.cursor-position-byte-offset));
+                root.internal-sel = false;
+                root.bubble = true;
+                dbl.running = false;
+                dbl.running = true;   // keep the window open for a 3rd tap
+            } else {
+                root.internal-sel = true;
+                ti.select-all();
+                root.internal-sel = false;
+                root.bubble = true;
+                root.tap-count = 0;
+                dbl.running = false;
+            }
+        } else if (!dbl.running && ti.text == root.last-tap-text && ti.cursor-position-byte-offset == root.last-tap-off && root.sel-start() == root.sel-end()) {
+            // slow tap exactly on the resting caret → toggle the bubble
+            root.bubble = !root.bubble;
+            root.tap-count = 1;
+            dbl.running = true;
+        } else {
+            root.bubble = false;
+            root.last-tap-off = ti.cursor-position-byte-offset;
+            root.last-tap-text = ti.text;
+            root.tap-count = 1;
+            dbl.running = false;
+            dbl.running = true;
+        }
+    }
+
     dbl := Timer {
         interval: 350ms;
         running: false;
@@ -415,6 +513,8 @@ component EditArea inherits Rectangle {
                 page-height: fli.height;
                 edited => {
                     dbl.running = false;
+                    root.tap-count = 0;
+                    root.bubble = false;
                     root.edited(self.text);
                 }
                 cursor-position-changed(cpos) => {
@@ -424,18 +524,10 @@ component EditArea inherits Rectangle {
                     } else if (cpos.y + fli.viewport-y > fli.height - 20px) {
                         fli.viewport-y = min(0px, max(fli.height - self.height, fli.height - cpos.y - 20px));
                     }
-                    if (EditOps.touch) {
-                        if (dbl.running && ti.text == root.last-tap-text && root.sel-start() == root.sel-end() && abs(ti.cursor-position-byte-offset - root.last-tap-off) <= 2) {
-                            dbl.running = false;
-                            ti.set-selection-offsets(
-                                EditOps.word-start(ti.text, ti.cursor-position-byte-offset),
-                                EditOps.word-end(ti.text, ti.cursor-position-byte-offset));
-                        } else {
-                            root.last-tap-off = ti.cursor-position-byte-offset;
-                            root.last-tap-text = ti.text;
-                            dbl.running = false;
-                            dbl.running = true;
-                        }
+                    root.caret-x = cpos.x;
+                    root.caret-y = cpos.y;
+                    if (EditOps.touch && !root.internal-sel) {
+                        root.handle-tap();
                     }
                 }
             }
@@ -451,10 +543,17 @@ component EditArea inherits Rectangle {
         background: Pal.field-focus-line;
     }
 
-    if EditOps.touch && ti.has-focus: EditToolbar {
-        x: 8px - root.absolute-position.x;
-        y: -38px;
-        action(a) => { root.toolbar-action(a); }
+    if EditOps.touch && ti.has-focus && root.bubble: EditToolbar {
+        x: clamp(10px + root.caret-x - self.width / 2,
+                 8px - root.absolute-position.x,
+                 EditOps.win-width - self.width - 8px - root.absolute-position.x);
+        y: root.absolute-position.y + 8px + fli.viewport-y + root.caret-y - self.height - 8px < 8px
+            ? 8px + fli.viewport-y + root.caret-y + 26px
+            : 8px + fli.viewport-y + root.caret-y - self.height - 8px;
+        action(a) => {
+            root.toolbar-action(a);
+            if (a != "select-all") { root.bubble = false; }
+        }
     }
 }
 
@@ -847,6 +946,8 @@ export component AppWindow inherits Window {
     min-height: 620px;
     title: "Chain Notes";
     background: Pal.bg;
+    init => { EditOps.win-width = self.width; }
+    changed width => { EditOps.win-width = self.width; }
 
     // 0 onboard · 1 import · 2 backup · 3 quiz · 4 home · 5 note ·
     // 6 compose · 7 contacts · 8 settings
