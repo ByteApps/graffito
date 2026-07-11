@@ -1,4 +1,4 @@
-# chain-notes-app
+# <img src="assets/icon/icon.svg" alt="" width="42" align="top" /> chain-notes-app
 
 Native Mac + mobile app for **chain notes** (the iOS/Android port is
 merged and runs on real hardware — iPhone-verified; Android green on the

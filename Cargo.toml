@@ -86,6 +86,9 @@ ndk-context = "0.1"
 [package.metadata.android]
 package = "xyz.foundation.chainnotes.app"
 build_targets = ["aarch64-linux-android"]
+# Launcher icon: adaptive (anydpi-v26 fg/bg layers) + legacy mipmaps,
+# all generated from assets/icon/icon.svg.
+resources = "assets/icon/android/res"
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
@@ -93,6 +96,7 @@ target_sdk_version = 34
 
 [package.metadata.android.application]
 label = "Chain Notes"
+icon = "@mipmap/ic_launcher"
 # NoActionBar: the device-default theme carries a 56dp ActionBar the GL
 # surface never draws, but it still inflates the NativeActivity content rect —
 # safe_area_insets read ~105dp of top inset instead of the ~49dp status bar,
