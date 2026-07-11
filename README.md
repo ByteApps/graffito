@@ -14,7 +14,7 @@ Chain Notes writes personal notes into real bitcoin transactions — public ones
 
 ## Features
 
-- **Your key, your way** — create a 12/24-word seed in-app with a backup-and-quiz flow, or import what you have: BIP-39 words (12/18/24, with autocomplete), xprv, WIF, or raw hex — typed, scanned from QR (SeedQR included), or loaded from file. Hierarchical keys get a paginated account picker, switchable anytime.
+- **Your key, your way** — create a 12/18/24-word seed in-app with a backup-and-quiz flow, or import what you have: BIP-39 words (12/18/24, with autocomplete), xprv, WIF, or raw hex — typed, scanned from QR (SeedQR included), or loaded from file. Hierarchical keys get a paginated account picker, switchable anytime.
 - **Keys live in the platform vault** — the macOS Keychain behind Touch ID, iOS Keychain, Android Keystore. Reveal always re-authenticates.
 - **Watch-only mode** — import just an xpub or descriptor for a key-less notebook: balance and public notes visible, private bodies sealed. Everything that needs a signature — sweep, consolidate, fee bumps, even public-note compose — builds a PSBT your hardware wallet signs (verified against a real signer implementation), with an optional separate fee wallet.
 - **Serious compose tools** — live cost and change preview, fee tiers plus custom rates, full **coin control** with per-coin explorer links, a custom change address, and a **gift amount** to send chosen sats along with a directed note.
