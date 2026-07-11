@@ -35,6 +35,27 @@ fn bip39_child_and_its_seedqr() {
     assert_eq!(ident_qr.address, ident.address);
 }
 
+/// The 18-word application (a BIP-85 length the Prime app emits)
+/// imports through the same path as 12/24, typed and via SeedQR.
+#[test]
+fn bip39_18_word_child_imports() {
+    let child = derive(&root(), Application::Bip39 { words: 18 }, 0, bip85_core::Network::Mainnet)
+        .unwrap();
+    assert_eq!(child.display.split_whitespace().count(), 18);
+
+    let ident = realize(
+        &parse_key_material(&child.display, Network::Mainnet).unwrap(),
+        Network::Mainnet,
+        0,
+    )
+    .unwrap();
+    assert!(ident.address.starts_with("bc1p"));
+
+    let digits = bip85_core::seedqr::seedqr_digits(&child.entropy).unwrap();
+    assert_eq!(digits.len(), 72);
+    assert_eq!(decode_standard(&digits).unwrap().to_string(), child.display);
+}
+
 #[test]
 fn wif_child_matches_hex_of_same_entropy() {
     let child = derive(&root(), Application::Wif, 0, bip85_core::Network::Mainnet).unwrap();

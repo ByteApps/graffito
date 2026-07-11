@@ -75,7 +75,7 @@ impl core::fmt::Display for Error {
         match self {
             Error::Notes(e) => write!(f, "{e}"),
             Error::MnemonicWordCount(n) => {
-                write!(f, "mnemonic must be 12 or 24 words (got {n})")
+                write!(f, "mnemonic must be 12, 18 or 24 words (got {n})")
             }
             Error::Mnemonic(m) => write!(f, "mnemonic: {m}"),
             Error::XprvNetwork => write!(f, "xprv is for a different network"),

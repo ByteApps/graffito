@@ -206,8 +206,10 @@ fn parse_watch(s: &str, network: Network) -> Result<FundingSource, Error> {
 }
 
 fn parse_mnemonic(s: &str) -> Result<bip39::Mnemonic, Error> {
+    // 12/18/24 — the lengths BIP-85 emits (and hardware wallets import); 15/21
+    // stay rejected deliberately so a dropped word fails loudly here.
     let n = s.split_whitespace().count();
-    if !matches!(n, 12 | 24) {
+    if !matches!(n, 12 | 18 | 24) {
         return Err(Error::MnemonicWordCount(n));
     }
     let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();

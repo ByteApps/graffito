@@ -698,7 +698,7 @@ dependencies = [
 [[package]]
 name = "bip85-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ObjSal/prime-bip85.git?rev=0bf5b25206c05733997af66998ccd4c3e6f4eceb#0bf5b25206c05733997af66998ccd4c3e6f4eceb"
+source = "git+ssh://git@github.com/ObjSal/prime-bip85.git?rev=89a42a5dce05489035009d67b01ea62c086209fb#89a42a5dce05489035009d67b01ea62c086209fb"
 dependencies = [
  "bs58",
  "hmac",

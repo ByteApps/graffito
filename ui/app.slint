@@ -1264,7 +1264,7 @@ export component AppWindow inherits Window {
             title: "Import key";
             back => { root.screen = 0; }
         }
-        Caption { text: "Mnemonic (12/24 words), xprv, WIF, 32-byte hex — or an account xpub for a watch-only notebook (public notes and balance; private notes stay sealed, no composing)."; }
+        Caption { text: "Mnemonic (12/18/24 words), xprv, WIF, 32-byte hex — or an account xpub for a watch-only notebook (public notes and balance; private notes stay sealed, no composing)."; }
         EditArea {
             height: 110px;
             text <=> root.import-text;
