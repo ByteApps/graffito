@@ -395,10 +395,12 @@ archived=<b>` · `cb: toggle-sender excluded=<b> hidden=<n>`.
 UI e2e:
 `../ui-automation/tests/chain-notes-app.sh` (simtap point offsets from
 the window origin — recalibrate from screenshots when app.slint moves
-controls; simtap also has `scroll <x> <y> <dy>`). NOTE: the two simtap
-suites predate notebooks — boot now lands on the LIST (17), not home,
-so their tap sequences need a "tap the notebook row" step + offset
-recalibration (tracked as a notebooks phase-1 follow-up).
+controls; simtap also has `scroll <x> <y> <dy>`). Both simtap suites are
+notebooks-aware (2026-07-11): `chain-notes-app.sh` taps the Main row
+after boot (boot lands on the LIST, screen 17) and ends with a
+create→name→open→archive notebooks leg; the matrix suite needed no tap
+changes (its sessions start from onboarding, and import/quiz flows land
+directly on home) plus a notebooks-*.json wipe assert in reset.
 
 ## CLI log contract (grep targets)
 
