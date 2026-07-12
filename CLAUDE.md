@@ -198,9 +198,8 @@ active notebooks is legitimate — archive-all allowed, empty-state
 captions, boot never resurrects archived entries. reset-identity
 deletes notebooks-*.json alongside stores.
 
-**Sweep destinations** (Sal 2026-07-11; consolidate deliberately stays
-same-address — consolidate IS sweep-to-self): the sweep picker (screen
-7, `pick-mode == "sweep"`) offers, top to bottom: the address input
+**Sweep destinations** (Sal 2026-07-11): the sweep picker (screen 7,
+`pick-mode == "sweep"`) offers, top to bottom: the address input
 (other address), a "My notebooks" section (`sweep-notebooks` — every
 ACTIVE notebook except the current one, name + addr short + balance)
 and "+ New notebook…" (`sweep-new-notebook` → the create picker with
@@ -212,10 +211,33 @@ dests get an "Everything to: <name> · <short>" label, the amber
 on-chain-linkage caveat (`sweep-dest-note`), and NO contacts pollution;
 external dests keep the contact-name label + recents behavior.
 
+**Consolidate is WALLET-level** (Sal 2026-07-11, superseding the
+per-notebook framing): Settings → "Consolidate wallet…"
+(`consolidate-wallet-open`) snapshots every ACTIVE notebook's spendable
+coins (`State.wconsol`; needs 2+ coins total), opens the account picker
+in `"wconsol"` mode — title "Consolidate to", ALL rows enabled, inline
+name field; picking a non-notebook address CREATES it, an archived one
+UN-archives (the coin must never land hidden) — then a confirm modal
+(`show-wconsol-confirm`: coins/notebooks/dest/fee summary + the
+all-addresses-link warning) and ONE multi-key tx via notes-core's
+additive `build_sweep_tx_multi` (each input signed by its own account's
+key; pin bumped to rev 0440ac5). Bookkeeping spans stores: sources'
+inputs lock pending, the destination store (created if needed) gets the
+TxRecord + the unconfirmed coin, the active store reloads via
+activate(), and the flow lands on the notebook LIST (the wallet-level
+home). Watch-only routes to the old self-consolidate external-sign flow
+(`open_notebook_consolidate` — one notebook is all watch has). The
+Coins screen (10) is a pure per-notebook viewer now; Settings keeps
+per-notebook "View this notebook's coins…" and "Sweep this notebook's
+funds…" rows, and the "Change account…" row is GONE (the notebook list
+IS the account switcher). Wallet-consolidate RBF caveat: the TxRecord's
+Speed-up would re-sign with only the dest key and fail broadcast
+harmlessly; Rebroadcast works.
+
 **Identity lifecycle:** key material verbatim in the keychain; BIP-86
-account chosen on a paginated picker after hierarchical imports and
-switchable later from Settings without re-import (each account = its
-own address AND enc key). Store files are per-identity:
+account chosen on a paginated picker after hierarchical imports; later
+switching = the notebook list (each account = its own address AND enc
+key; the old settings Change-account row is gone). Store files are per-identity:
 `store-<network>-<fp8>.json` — switching keys/accounts never mixes
 notebooks. `config.json` is device-level and persists {network, account,
 nodes{net→url}, explorers{net→url}} — the Bitcoin-node / block-explorer
@@ -424,7 +446,10 @@ where back landed us) ·
 account=<n>` · `cb: create-notebook picker open[ (sweep dest)]` ·
 `cb: create-notebook account=<n>` · `cb: rename-notebook account=<n>` ·
 `cb: archive-notebook account=<n> archived=<b>` · `cb: toggle-sender
-excluded=<b> hidden=<n>` · `cb: sweep-pick to=<a>[ (notebook <n>)]`.
+excluded=<b> hidden=<n>` · `cb: sweep-pick to=<a>[ (notebook <n>)]` ·
+`cb: wallet-consolidate open coins=<n> notebooks=<m>` ·
+`cb: wallet-consolidate txid=<t> coins=<n> notebooks=<m> value=<v>
+fee=<f>`.
 UI e2e:
 `../ui-automation/tests/chain-notes-app.sh` (simtap point offsets from
 the window origin — recalibrate from screenshots when app.slint moves
