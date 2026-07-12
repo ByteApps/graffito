@@ -126,6 +126,17 @@ struct State {
     notebooks: Option<NotebookIndex>,
     notebooks_fp8: Option<String>,
     nb_addrs: Vec<(u32, String, String)>,
+    /// Cross-account self addresses: (account, address) for every OTHER
+    /// account's listed notebooks (rev-3 follow-up 3, Sal 2026-07-12) —
+    /// `sender_label` reads it so a directed note from a sibling account
+    /// labels "Self · account N" instead of a bare address. Rebuilt on
+    /// activate from the index file (cheap — it lists them all).
+    xacct_addrs: Vec<(u32, String)>,
+    /// Receive-chain gap discovery is due: activate() found a FRESH index
+    /// file for multi-notebook material (a seed re-import). Consumed by
+    /// `maybe_start_discovery` — the probe itself runs on a worker thread,
+    /// never inline on the (iOS-watchdogged) launch path.
+    discovery_pending: bool,
     /// Wallet-level consolidate in progress: sources snapshotted at open,
     /// destination + fee filled in by the picker, consumed by confirm.
     wconsol: Option<WConsol>,
@@ -163,6 +174,17 @@ struct WatchSpend {
     value: u64,
     fee: u64,
     inputs: Vec<app_core::store::TxInput>,
+    /// Owning notebook index per input (parallel to `inputs`) — watch
+    /// wallet-level spends span several notebooks (rev-3 follow-up 1):
+    /// bookkeeping locks each input in ITS store and the TxRecord carries
+    /// `input_indexes` so a later bump re-derives every leaf.
+    input_indexes: Vec<u32>,
+    /// Consolidate-to-notebook: the destination's receive index — the
+    /// TxRecord (+ the new unconfirmed coin) lands in THAT store,
+    /// mirroring the keyed wallet-consolidate bookkeeping. None = the
+    /// record stays in the active store (sweeps leave the wallet; bumps
+    /// ride their original record).
+    dest_index: Option<u32>,
     /// (ref_id, is_note) of the record being replaced when kind == "bump".
     bump_ref: Option<(String, bool)>,
 }
@@ -448,9 +470,12 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
 /// consolidate become TxRecords (Activity lifecycle + rebroadcast/RBF), a
 /// bump rides on the record it replaces; spent coins get pending-locked.
 fn record_watch_spend(st: &mut State, ws: &WatchSpend, txid: &str, raw: &str, vsize: u64) {
-    let Some(store) = st.store.as_mut() else { return };
+    if st.store.is_none() {
+        return;
+    }
     match &ws.bump_ref {
         Some((ref_id, is_note)) => {
+            let store = st.store.as_mut().expect("checked above");
             if *is_note {
                 if let Some(n) = store.notes.iter_mut().find(|n| n.note_id == *ref_id) {
                     if !n.txids.contains(&txid.to_string()) {
@@ -471,23 +496,95 @@ fn record_watch_spend(st: &mut State, ws: &WatchSpend, txid: &str, raw: &str, vs
             }
         }
         None => {
-            store.record_tx(
-                ws.kind,
-                txid.to_string(),
-                ws.value,
-                ws.fee,
-                vsize,
-                raw.to_string(),
-                ws.dest.clone(),
-                ws.inputs.clone(),
-                ws.dest_spk_hex.clone(),
-                now(),
-            );
-            for i in &ws.inputs {
-                if let Some(u) =
-                    store.utxos.iter_mut().find(|u| u.txid == i.txid && u.vout == i.vout)
-                {
-                    u.pending_spend = true;
+            // Wallet-level (rev 3): inputs may span notebooks — lock each
+            // one in ITS OWN store (the active store in memory, siblings on
+            // disk), mirroring the keyed sweep's bookkeeping.
+            let active_index = st.ident.as_ref().map(|i| i.index);
+            let mut owners: Vec<u32> = ws.input_indexes.clone();
+            owners.sort_unstable();
+            owners.dedup();
+            if owners.is_empty() {
+                owners.push(active_index.unwrap_or(0)); // legacy single-notebook shape
+            }
+            let lock = |store: &mut Store, index: u32| {
+                for (i, input) in ws.inputs.iter().enumerate() {
+                    let owner = ws.input_indexes.get(i).copied().unwrap_or(index);
+                    if owner != index {
+                        continue;
+                    }
+                    if let Some(u) =
+                        store.utxos.iter_mut().find(|u| u.txid == input.txid && u.vout == input.vout)
+                    {
+                        u.pending_spend = true;
+                    }
+                }
+            };
+            for index in &owners {
+                if active_index == Some(*index) {
+                    if let Some(store) = st.store.as_mut() {
+                        lock(store, *index);
+                    }
+                } else if let Some(mut store) = notebook_store(st, *index) {
+                    lock(&mut store, *index);
+                    if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == *index) {
+                        let _ = store.save(&st.store_path_for(fp8));
+                    }
+                }
+            }
+            // The TxRecord lands in the destination store for a consolidate-
+            // to-notebook (plus its unconfirmed coin, so the balance shows
+            // before the next scan); sweeps/legacy keep it in the ACTIVE
+            // store — Activity is wallet-wide either way.
+            let record = |store: &mut Store| {
+                store.record_tx(
+                    ws.kind,
+                    txid.to_string(),
+                    ws.value,
+                    ws.fee,
+                    vsize,
+                    raw.to_string(),
+                    ws.dest.clone(),
+                    ws.inputs.clone(),
+                    ws.dest_spk_hex.clone(),
+                    now(),
+                );
+                if let Some(rec) = store.txs.last_mut() {
+                    rec.input_indexes = ws.input_indexes.clone();
+                }
+            };
+            match ws.dest_index {
+                Some(dest) if active_index != Some(dest) => {
+                    if let Some(mut dstore) = notebook_store(st, dest) {
+                        record(&mut dstore);
+                        dstore.utxos.push(app_core::store::LedgerUtxo {
+                            txid: txid.to_string(),
+                            vout: 0,
+                            value: ws.value,
+                            height: None,
+                            pending_spend: false,
+                        });
+                        if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == dest) {
+                            let _ = dstore.save(&st.store_path_for(fp8));
+                        }
+                    }
+                }
+                Some(_) => {
+                    // Destination IS the active notebook.
+                    if let Some(store) = st.store.as_mut() {
+                        record(store);
+                        store.utxos.push(app_core::store::LedgerUtxo {
+                            txid: txid.to_string(),
+                            vout: 0,
+                            value: ws.value,
+                            height: None,
+                            pending_spend: false,
+                        });
+                    }
+                }
+                None => {
+                    if let Some(store) = st.store.as_mut() {
+                        record(store);
+                    }
                 }
             }
         }
@@ -495,9 +592,40 @@ fn record_watch_spend(st: &mut State, ws: &WatchSpend, txid: &str, raw: &str, vs
     st.save_store();
 }
 
-/// Watch mode: build the external-sign PSBT spending every spendable coin
-/// into `dest_spk` and open the sign screen (13). The signed PSBT comes
-/// back through the same import paths external funding uses.
+/// Every ACTIVE notebook's spendable coins as WatchCoins stamped with
+/// their owning receive index — the gather behind the watch wallet-level
+/// flows (rev-3 follow-up 1: sweep/consolidate span notebooks in ONE
+/// externally-signed PSBT). Falls back to the active store alone when no
+/// index is loaded.
+fn watch_wallet_coins(st: &State) -> Vec<WatchCoin> {
+    let mut coins = Vec::new();
+    if let Some(ix) = &st.notebooks {
+        for m in ix.active(st.account) {
+            let Some(store) = notebook_store(st, m.index) else { continue };
+            coins.extend(store.utxos.iter().filter(|u| !u.pending_spend).map(|u| WatchCoin {
+                txid: u.txid.clone(),
+                vout: u.vout,
+                value: u.value,
+                index: m.index,
+            }));
+        }
+    } else if let Some(store) = &st.store {
+        let nb = st.ident.as_ref().map(|i| i.index).unwrap_or(0);
+        coins.extend(store.utxos.iter().filter(|u| !u.pending_spend).map(|u| WatchCoin {
+            txid: u.txid.clone(),
+            vout: u.vout,
+            value: u.value,
+            index: nb,
+        }));
+    }
+    coins
+}
+
+/// Watch mode: build the external-sign PSBT spending every ACTIVE
+/// notebook's spendable coins into `dest_spk` and open the sign screen
+/// (13) — wallet-level, like the keyed sweep (rev-3 follow-up 1). The
+/// signed PSBT comes back through the same import paths external funding
+/// uses.
 fn watch_spend_build(
     w: &AppWindow,
     st: &mut State,
@@ -507,24 +635,24 @@ fn watch_spend_build(
     rate: f64,
 ) {
     let Some(src) = st.ident.as_ref().and_then(|i| i.watch_source()).cloned() else { return };
-    let Some(store) = st.store.as_ref() else { return };
-    let nb = st.ident.as_ref().map(|i| i.index).unwrap_or(0);
-    let coins: Vec<WatchCoin> = store
-        .utxos
-        .iter()
-        .filter(|u| !u.pending_spend)
-        .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: nb })
-        .collect();
+    let coins = watch_wallet_coins(st);
     if coins.is_empty() || (kind == "consolidate" && coins.len() < 2) {
         w.set_status(
             if kind == "consolidate" { "nothing to consolidate (need 2+ coins)" } else { "nothing to sweep" }.into(),
         );
         return;
     }
+    let notebooks = {
+        let mut ids: Vec<u32> = coins.iter().map(|c| c.index).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    };
     let inputs: Vec<app_core::store::TxInput> = coins
         .iter()
         .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
         .collect();
+    let input_indexes: Vec<u32> = coins.iter().map(|c| c.index).collect();
     match build_watch_spend_psbt(&src, &coins, dest_spk.clone(), rate) {
         Ok(built) => {
             let cost = format!(
@@ -542,10 +670,12 @@ fn watch_spend_build(
                 value: built.sent_to_recipient,
                 fee: built.fee,
                 inputs,
+                input_indexes,
+                dest_index: None,
                 bump_ref: None,
             });
             println!(
-                "cb: watch-spend-build kind={kind} txid={} fee={} inputs={}",
+                "cb: watch-spend-build kind={kind} txid={} fee={} inputs={} notebooks={notebooks}",
                 built.txid,
                 built.fee,
                 coins.len()
@@ -579,8 +709,13 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
         w.set_status("transaction not found".into());
         return;
     };
+    // Multi-notebook records: stamp each input's owning receive index by
+    // its prevout address (fetch_tx_io alone can't know our leaves) — the
+    // rebuild derives every input's spk/key-origin from that index.
+    let index_by_addr: HashMap<String, u32> =
+        st.nb_addrs.iter().map(|(i, a, _)| (a.clone(), *i)).collect();
     let client = ChainClient::new(HttpTransport::new(base), st.network);
-    match client.fetch_tx_io(&txid) {
+    match client.fetch_tx_io(&txid, |a| index_by_addr.get(a).copied()) {
         Ok((coins, outputs, confirmed)) => {
             if confirmed {
                 w.set_status("already confirmed — nothing to speed up".into());
@@ -663,6 +798,8 @@ fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
                 value: built.sent_to_recipient,
                 fee: built.fee,
                 inputs: Vec::new(),
+                input_indexes: Vec::new(),
+                dest_index: None,
                 bump_ref: Some((wb.ref_id.clone(), wb.is_note)),
             });
             println!("cb: watch-bump-build ref={} txid={} fee={}", wb.ref_id, built.txid, built.fee);
@@ -694,11 +831,11 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
     let net = st.network;
     let Some(store) = st.store.as_ref() else { return };
     let exb = st.explorer_base();
-    // A keyed SWEEP is wallet-level (leaving the wallet): every active
-    // notebook's coins ride — scoped to the ACTIVE account. Consolidate
-    // (kind) and watch flows stay on the active store.
-    let wallet_mode = w.get_sweep_kind().as_str() == "sweep"
-        && st.ident.as_ref().map(|i| !i.is_watch()).unwrap_or(false);
+    // A SWEEP is wallet-level (leaving the wallet): every active
+    // notebook's coins ride — scoped to the ACTIVE account, keyed AND
+    // watch alike (rev-3 follow-up 1). Consolidate (kind) stays on the
+    // active store (the legacy screen-16 flow).
+    let wallet_mode = w.get_sweep_kind().as_str() == "sweep";
     let spendable: Vec<app_core::store::LedgerUtxo> = if wallet_mode {
         let mut v = Vec::new();
         if let Some(ix) = &st.notebooks {
@@ -1058,6 +1195,27 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
                 .map(|i| (m.index, i.address.clone(), hex::encode(&i.output_x()[..4])))
         })
         .collect();
+    // Cross-account self labels (rev-3 follow-up 3, Sal 2026-07-12):
+    // realize every OTHER account's listed notebooks into an
+    // address → account map, so sender_label can say "Self · account N"
+    // for directed notes between our own accounts. Cheap — the index file
+    // lists exactly what to derive.
+    st.xacct_addrs = ix
+        .accounts
+        .iter()
+        .filter(|a| a.account != st.account)
+        .flat_map(|a| a.notebooks.iter().map(move |m| (a.account, m.index)))
+        .filter_map(|(acct, idx)| {
+            realize(&material, st.network, acct, idx).ok().map(|i| (acct, i.address.clone()))
+        })
+        .collect();
+    // Gap discovery is due when this identity's index file is FRESH for
+    // multi-notebook material (a seed re-import; rev-3 follow-up 2). The
+    // probe itself runs later on a worker thread (maybe_start_discovery)
+    // — NEVER here: activate() sits on the iOS-watchdogged launch path.
+    if !index_existed && material.is_multi_notebook() {
+        st.discovery_pending = true;
+    }
     st.notebooks_fp8 = Some(fp8);
     st.notebooks = Some(ix);
     st.ident = Some(ident);
@@ -1326,13 +1484,18 @@ fn notebook_store(st: &State, index: u32) -> Option<Store> {
     Store::load(&st.store_path_for(fp8)).ok()
 }
 
-/// Sender-filter label rules: "Self · <notebook>" when the sender is one
-/// of our own addresses (this notebook's own notes, or directed notes
-/// from a sibling notebook), the contact name when known, else the short
-/// address form.
+/// Sender-filter label rules, in priority order: "Self · <notebook>" when
+/// the sender is one of the ACTIVE account's addresses (this notebook's
+/// own notes, or directed notes from a sibling notebook),
+/// "Self · account N" when it belongs to another of our accounts (rev-3
+/// follow-up 3 — accounts are separate wallets, but the sender is still
+/// us), the contact name when known, else the short address form.
 fn sender_label(st: &State, store: &Store, key: &str) -> String {
     if let Some((index, ..)) = st.nb_addrs.iter().find(|(_, a, _)| a == key) {
         return format!("Self · {}", st.notebook_display_name(*index));
+    }
+    if let Some((acct, _)) = st.xacct_addrs.iter().find(|(_, a)| a == key) {
+        return format!("Self · account {acct}");
     }
     if let Some(c) = store.contacts.iter().find(|c| c.address == key && !c.name.is_empty()) {
         return c.name.clone();
@@ -1632,6 +1795,51 @@ struct RefreshResult {
 
 static REFRESH_RESULTS: std::sync::Mutex<Vec<RefreshResult>> = std::sync::Mutex::new(Vec::new());
 
+/// One finished notebook gap-discovery walk (worker thread), waiting to be
+/// applied on the UI thread. The identity/network/account snapshot guards
+/// staleness — switching identities mid-probe drops the result.
+struct DiscoveryResult {
+    fp8: String,
+    network: Network,
+    account: u32,
+    found: Vec<u32>,
+}
+
+static DISCOVERY_RESULTS: std::sync::Mutex<Vec<DiscoveryResult>> = std::sync::Mutex::new(Vec::new());
+
+/// Kick off receive-chain notebook gap discovery on a worker thread when
+/// activate() flagged a fresh index file (seed re-import; rev-3
+/// follow-up 2). Needs a configured node — with none the flag stays
+/// pending, so setting a node later (any refresh) retries. Results land
+/// through [`DISCOVERY_RESULTS`] + the `apply-pending-discovery`
+/// trampoline; callers are all post-first-frame (iOS launch rule).
+fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
+    if !st.discovery_pending {
+        return;
+    }
+    let Some(base) = st.base_url() else { return };
+    let Some(material_str) = st.material.clone() else { return };
+    let Some(fp8) = st.notebooks_fp8.clone() else { return };
+    st.discovery_pending = false;
+    let network = st.network;
+    let account = st.account;
+    let weak = w.as_weak();
+    std::thread::spawn(move || {
+        let found = parse_key_material(&material_str, network)
+            .map(|material| {
+                let client = ChainClient::new(HttpTransport::new(base), network);
+                app_core::chain::discover_indexes(&client, &material, network, account, 5)
+            })
+            .unwrap_or_default();
+        drop(material_str); // Zeroizing — wiped as soon as the walk is done
+        DISCOVERY_RESULTS
+            .lock()
+            .expect("discovery results mutex")
+            .push(DiscoveryResult { fp8, network, account, found });
+        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_discovery());
+    });
+}
+
 /// [`refresh`] with the network half on a worker thread (Sal 2026-07-11:
 /// opening a notebook took 3-4 s on the phone because the tap handler
 /// scanned synchronously — the screen never painted until it finished).
@@ -1644,6 +1852,7 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
     if st.ident.is_none() || st.store.is_none() {
         return;
     }
+    maybe_start_discovery(w, st);
     let Some(base) = st.base_url() else {
         w.set_status("no Bitcoin node for this network — set one in Settings".into());
         return;
@@ -1738,6 +1947,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
     if st.ident.is_none() || st.store.is_none() {
         return;
     }
+    maybe_start_discovery(w, st);
     let Some(base) = st.base_url() else {
         w.set_status("no Bitcoin node for this network — set one in Settings".into());
         return;
@@ -2622,6 +2832,8 @@ pub fn run() {
         notebooks: None,
         notebooks_fp8: None,
         nb_addrs: Vec::new(),
+        xacct_addrs: Vec::new(),
+        discovery_pending: false,
         wconsol: None,
     }));
     let window = AppWindow::new().expect("window");
@@ -3155,6 +3367,35 @@ pub fn run() {
     // loop; the UI thread applies it with full State access.
     cb!(on_apply_pending_refresh, |w, s| {
         apply_refresh_results(&w, &mut s);
+    });
+
+    // Trampoline: a finished notebook gap-discovery walk (seed re-import).
+    // Discovery is the sanctioned exception to deliberate notebook
+    // creation — every found index has on-chain history, so recovering it
+    // is what the user meant by importing the seed.
+    cb!(on_apply_pending_discovery, |w, s| {
+        let results: Vec<DiscoveryResult> =
+            DISCOVERY_RESULTS.lock().expect("discovery results mutex").drain(..).collect();
+        for r in results {
+            if s.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
+                || s.network != r.network
+                || s.account != r.account
+            {
+                println!("cb: notebook-discovery stale-drop");
+                continue;
+            }
+            let mut added = 0;
+            for index in &r.found {
+                if s.notebooks.as_ref().and_then(|ix| ix.get(r.account, *index)).is_none() {
+                    ensure_notebook(&mut s, *index);
+                    added += 1;
+                }
+            }
+            println!("cb: notebook-discovery found={} added={added}", r.found.len());
+            if added > 0 {
+                update_notebook_list(&w, &s);
+            }
+        }
     });
 
     cb!(on_open_note, |w, s, id: SharedString| {
@@ -3698,12 +3939,10 @@ pub fn run() {
     });
 
     cb!(on_consolidate_wallet_open, |w, s| {
-        // Watch-only identities have exactly one notebook and sign
-        // externally: route through the existing self-consolidate flow.
-        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
-            open_notebook_consolidate(&w, &mut s);
-            return;
-        }
+        // Keyed AND watch identities take the same wallet-level flow
+        // (rev-3 follow-up 1): snapshot every active notebook's coins,
+        // pick the destination notebook, confirm. Watch identities sign
+        // the one resulting PSBT externally (screens 13/14).
         let Some(ix) = &s.notebooks else { return };
         let mut sources: Vec<(u32, Vec<app_core::notes_core::tx::Utxo>, u64)> = Vec::new();
         let mut coins_total = 0usize;
@@ -3741,6 +3980,79 @@ pub fn run() {
         w.set_show_wconsol_confirm(false);
         w.set_account_pick_mode("switch".into());
         let Some(wc) = s.wconsol.take() else { return };
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            // Watch: ONE external-sign PSBT over every source notebook's
+            // coins — each input's key origin carries its own receive
+            // index, so the signer recognizes them all in one pass. The
+            // cross-store bookkeeping runs post-broadcast
+            // (record_watch_spend, dest_index = the picked notebook).
+            let Some(src) = s.ident.as_ref().and_then(|i| i.watch_source()).cloned() else {
+                return;
+            };
+            let dest_spk = match Recipient::parse(s.network, &wc.dest_addr) {
+                Ok(r) => r.spk,
+                Err(e) => {
+                    w.set_status(format!("{e}").into());
+                    return;
+                }
+            };
+            let coins: Vec<WatchCoin> = wc
+                .sources
+                .iter()
+                .flat_map(|(index, coins, _)| {
+                    coins.iter().map(move |u| {
+                        let mut t = u.txid;
+                        t.reverse();
+                        WatchCoin {
+                            txid: hex::encode(t),
+                            vout: u.vout,
+                            value: u.value,
+                            index: *index,
+                        }
+                    })
+                })
+                .collect();
+            let inputs: Vec<app_core::store::TxInput> = coins
+                .iter()
+                .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
+                .collect();
+            let input_indexes: Vec<u32> = coins.iter().map(|c| c.index).collect();
+            match build_watch_spend_psbt(&src, &coins, dest_spk.clone(), wc.rate) {
+                Ok(built) => {
+                    let cost = format!(
+                        "consolidate · {} sats · fee {} sats · {} input{} from {} notebook{} · sign with your external wallet",
+                        built.sent_to_recipient,
+                        built.fee,
+                        coins.len(),
+                        if coins.len() == 1 { "" } else { "s" },
+                        wc.sources.len(),
+                        if wc.sources.len() == 1 { "" } else { "s" }
+                    );
+                    s.watch_note = None;
+                    s.watch_spend = Some(WatchSpend {
+                        kind: "consolidate",
+                        dest: wc.dest_addr.clone(),
+                        dest_spk_hex: hex::encode(&dest_spk),
+                        value: built.sent_to_recipient,
+                        fee: built.fee,
+                        inputs,
+                        input_indexes,
+                        dest_index: Some(wc.dest_index),
+                        bump_ref: None,
+                    });
+                    println!(
+                        "cb: wallet-consolidate build txid={} coins={} notebooks={} fee={}",
+                        built.txid,
+                        coins.len(),
+                        wc.sources.len(),
+                        built.fee
+                    );
+                    show_psbt_sign_screen(&w, &mut s, built, cost);
+                }
+                Err(e) => w.set_status(format!("{e}").into()),
+            }
+            return;
+        }
         let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
             return;
         };
@@ -3958,19 +4270,27 @@ pub fn run() {
                 w.set_status("funding wallet has no spendable coins".into());
                 return;
             }
-            let nb = s.ident.as_ref().map(|i| i.index).unwrap_or(0);
-            let notes_coins: Vec<WatchCoin> = s
-                .store
-                .as_ref()
-                .map(|store| {
-                    store
-                        .utxos
-                        .iter()
-                        .filter(|u| !u.pending_spend)
-                        .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: nb })
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Watch identities sweep the whole WALLET (every active
+            // notebook's coins, per-index key origins); a keyed identity
+            // signs its own inputs with the one active key, so it stays on
+            // the active store.
+            let watch = s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
+            let notes_coins: Vec<WatchCoin> = if watch {
+                watch_wallet_coins(&s)
+            } else {
+                let nb = s.ident.as_ref().map(|i| i.index).unwrap_or(0);
+                s.store
+                    .as_ref()
+                    .map(|store| {
+                        store
+                            .utxos
+                            .iter()
+                            .filter(|u| !u.pending_spend)
+                            .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: nb })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
             if notes_coins.is_empty() {
                 w.set_status("nothing to sweep".into());
                 return;
@@ -3979,6 +4299,7 @@ pub fn run() {
                 .iter()
                 .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
                 .collect();
+            let input_indexes: Vec<u32> = notes_coins.iter().map(|c| c.index).collect();
             let Some(ident) = s.ident.as_ref() else { return };
             let identity_spk = p2tr_script_pubkey(&ident.output_x());
             let identity_source = ident.watch_source().cloned();
@@ -4021,6 +4342,8 @@ pub fn run() {
                         value: built.sent_to_recipient,
                         fee: built.fee,
                         inputs,
+                        input_indexes,
+                        dest_index: None,
                         bump_ref: None,
                     });
                     println!(
@@ -4765,6 +5088,10 @@ pub fn run() {
         let client = ChainClient::new(HttpTransport::new(&base), s.network);
         match client.broadcast(&raw) {
             Ok(_got) => {
+                // Wallet-level money flows (watch sweep/consolidate) land on
+                // the notebook LIST — the wallet's home — like their keyed
+                // twins; notes and bumps keep landing on the active notebook.
+                let mut wallet_flow = false;
                 if let Some(wn) = s.watch_note.take() {
                     // Watch-mode compose: the note enters the store as
                     // Pending exactly like a keyed compose (inputs locked,
@@ -4782,6 +5109,8 @@ pub fn run() {
                     // pending→confirmed lifecycle, and lock the coins.
                     record_watch_spend(&mut s, &ws, &txid, &raw, vsize as u64);
                     println!("cb: watch-{} txid={txid} fee={} ok", ws.kind, ws.fee);
+                    wallet_flow = ws.bump_ref.is_none()
+                        && (ws.kind == "sweep" || ws.kind == "consolidate");
                 } else {
                     println!("cb: fund-broadcast txid={txid} ok");
                 }
@@ -4793,8 +5122,14 @@ pub fn run() {
                 w.set_compose_text("".into());
                 w.set_fund_external(false);
                 w.set_psbt_signed(false);
-                w.set_screen(4);
-                refresh(&w, &mut s);
+                if wallet_flow {
+                    refresh(&w, &mut s); // active store first — the list rows read disk + memory
+                    update_notebook_list(&w, &s);
+                    w.set_screen(17);
+                } else {
+                    w.set_screen(4);
+                    refresh(&w, &mut s);
+                }
             }
             Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
         }
@@ -5054,9 +5389,14 @@ pub fn run() {
                 s.wconsol = None;
                 return;
             }
+            let watch_note = if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+                "\nSigns on your external wallet."
+            } else {
+                ""
+            };
             w.set_wconsol_summary(
                 format!(
-                    "{n} coin{} from {} notebook{} become one coin at {} · {}.\n{} sats arrive after a ~{} sats fee ({rate:.1} sat/vB).",
+                    "{n} coin{} from {} notebook{} become one coin at {} · {}.\n{} sats arrive after a ~{} sats fee ({rate:.1} sat/vB).{watch_note}",
                     if n == 1 { "" } else { "s" },
                     wc.sources.len(),
                     if wc.sources.len() == 1 { "" } else { "s" },
@@ -5196,6 +5536,8 @@ pub fn run() {
         s.notebooks = None;
         s.notebooks_fp8 = None;
         s.nb_addrs.clear();
+        s.xacct_addrs.clear();
+        s.discovery_pending = false;
         s.to_address = None;
         s.icloud_backup = false;
         w.set_icloud_backup(false);

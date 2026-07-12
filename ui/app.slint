@@ -1220,6 +1220,9 @@ export component AppWindow inherits Window {
     // Internal: a background scan finished — Rust invokes this from the
     // event loop to apply the result (never called from UI elements).
     callback apply-pending-refresh();
+    // Internal: a notebook gap-discovery walk finished (seed re-import) —
+    // same trampoline pattern as apply-pending-refresh.
+    callback apply-pending-discovery();
     // Where settings/activity return on back: the screen they were opened
     // from (the notebook list or a notebook's home). Set by their open
     // callbacks in Rust.

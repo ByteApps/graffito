@@ -160,6 +160,54 @@ fn main() {
                 args[5]
             );
         }
+        Some("wallet-spend-build") => {
+            // wallet-spend-build <sweep|consolidate> <rate> <out.psbt> <dest> <store:index> [...]
+            // Watch identity, WALLET-level (rev 3): ONE unsigned PSBT
+            // spending every listed notebook store's spendable coins to
+            // dest — each input's key origin carries its own receive
+            // index, so an external signer recognizes every notebook's
+            // coins in one pass. Sign externally, then spend-broadcast.
+            let kind = args[2].as_str();
+            let rate: f64 = args[3].parse().expect("fee rate");
+            let sources: Vec<(Store, u32)> = args[6..]
+                .iter()
+                .map(|pair| {
+                    let (path, index) =
+                        pair.rsplit_once(':').expect("source must be <store.json>:<index>");
+                    (load(path), index.parse().expect("notebook index"))
+                })
+                .collect();
+            assert!(!sources.is_empty(), "need at least one <store.json>:<index> source");
+            let net = network(&sources[0].0.network.clone());
+            let ident = identity(net);
+            let src = ident
+                .watch_source()
+                .expect("wallet-spend-build needs watch-only APP_KEY (xpub / descriptor)")
+                .clone();
+            let coins: Vec<WatchCoin> = sources
+                .iter()
+                .flat_map(|(store, index)| {
+                    store.utxos.iter().filter(|u| !u.pending_spend).map(move |u| WatchCoin {
+                        txid: u.txid.clone(),
+                        vout: u.vout,
+                        value: u.value,
+                        index: *index,
+                    })
+                })
+                .collect();
+            let dest = Recipient::parse(net, &args[5]).expect("dest address");
+            let built = build_watch_spend_psbt(&src, &coins, dest.spk, rate).expect("build");
+            std::fs::write(&args[4], built.to_bytes()).expect("write psbt");
+            println!(
+                "cli: wallet-spend-build kind={kind} txid={} fee={} value={} inputs={} notebooks={} -> {}",
+                built.txid,
+                built.fee,
+                built.sent_to_recipient,
+                coins.len(),
+                sources.len(),
+                args[4]
+            );
+        }
         Some("bump-build") => {
             // bump-build <store.json> <base-url> <pending-txid> <rate> <out.psbt>
             // Watch identity: RBF replacement of a pending tx, rebuilt from
@@ -169,7 +217,9 @@ fn main() {
             let ident = identity(net);
             let src = ident.watch_source().expect("bump-build needs watch-only APP_KEY").clone();
             let client = ChainClient::new(HttpTransport::new(&args[3]), net);
-            let (coins, outputs, confirmed) = client.fetch_tx_io(&args[4]).expect("fetch tx");
+            // Single-notebook cli identity: every input is at APP_INDEX.
+            let (coins, outputs, confirmed) =
+                client.fetch_tx_io(&args[4], |_| Some(ident.index)).expect("fetch tx");
             assert!(!confirmed, "tx already confirmed");
             let rate: f64 = args[5].parse().expect("fee rate");
             let self_spk =

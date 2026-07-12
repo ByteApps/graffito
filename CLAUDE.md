@@ -33,7 +33,16 @@ through the SAME sign screen (13) + review/broadcast (14) external
 funding uses (`State.watch_spend` carries post-broadcast bookkeeping;
 bump fetches the pending tx via `ChainClient::fetch_tx_io` since
 chain-recovered records have no raw hex); Rebroadcast is keyless via
-`fetch_tx_hex`. Import an origin-full descriptor for signers
+`fetch_tx_hex`. Watch spends are WALLET-level since 2026-07-12 (rev-3
+follow-up 1): sweep / consolidate / the funded sweep gather EVERY active
+notebook's coins (`watch_wallet_coins`) into ONE PSBT whose per-input
+key origins carry each coin's own receive index (signer-sim verified —
+`wallet-spend-build` cli + the watch-signer suite's two-notebook leg);
+consolidate goes through the same wconsol destination picker keyed
+identities use; `WatchSpend.input_indexes`/`dest_index` drive the
+cross-store bookkeeping and the TxRecord's `input_indexes`, and bump
+re-stamps each input's index from its prevout address (`fetch_tx_io`
+takes an address→index resolver). Import an origin-full descriptor for signers
 that check the master fingerprint; bare xpubs still view fine. Verified:
 `ui-automation/tests/chain-notes-watch-signer.sh` (the signer sim
 signs consolidate+sweep on regtest, headless) and a live testnet4 pass
@@ -95,13 +104,17 @@ Three e2e suites in `../ui-automation/tests/`: `chain-notes-app.sh`
 import + account picker + settings account-switch + reset; create-seed
 → backup/quiz → fund → fee-tier directed private note decrypted by a
 CLI identity → contact rename/remove → chunk/network pills → coins
-list + consolidate via screen 16 → activity) drive the real Mac window
+list + consolidate via screen 16 → activity → S5 gap-discovery re-import:
+fund receive indexes 0–2, import the seed fresh, expect all three
+notebooks rediscovered) drive the real Mac window
 — point offsets are calibrated to the current layout; recalibrate from
 screenshots when app.slint moves controls. The headless
 `chain-notes-watch-signer.sh` drives the hardware-signer sim over its
 socket: watch import → consolidate → sweep → funded sweep →
-public-note compose (self- and fee-wallet-funded), every tx
-signer-signed against live regtest coins.
+public-note compose (self- and fee-wallet-funded) → a TWO-NOTEBOOK
+wallet sweep (receive indexes 2+3, one PSBT via `cli
+wallet-spend-build`, both per-index key origins recognized in one
+signing pass), every tx signer-signed against live regtest coins.
 
 **Product screenshots** (`screenshots/{home,compose,activity}.png`, wired
 into README.md): capture the real Mac window — pin it first
@@ -184,9 +197,21 @@ address, same store file, metadata only). The master fingerprint key
 one index file. Multi-NOTEBOOK capability = mnemonic/xprv (any depth)
 /ranged watch xpub (`KeyMaterial::is_multi_notebook`); multi-ACCOUNT
 capability stays mnemonic/master-xprv (`is_hierarchical`). Watch
-wallet-ops remain single-notebook flows for now, but the watch PSBT
-builders take per-coin receive indexes (`WatchCoin.index`), so
-multi-notebook watch spends are builder-ready. Multi-key records:
+wallet-ops are multi-notebook since 2026-07-12 (see the watch paragraph
+above). **Gap discovery** (rev-3 follow-up 2): a FRESH index file for
+multi-notebook material (seed re-import) flags `discovery_pending`;
+`maybe_start_discovery` (called from refresh/refresh_async — post-first-
+frame, iOS launch rule) probes receive indexes on a worker thread via
+app-core `chain::discover_indexes` (stop after 5 consecutive never-used;
+host-tested with a canned transport) and `ensure_notebook`s each hit
+through the `apply-pending-discovery` trampoline — the sanctioned
+exception to deliberate creation (no node configured → the flag stays
+pending and the next refresh retries). **Cross-account Self labels**
+(rev-3 follow-up 3, Sal 2026-07-12): activate() realizes every OTHER
+account's listed notebooks into `State.xacct_addrs`; `sender_label`
+consults it after the active-account check, so a directed note from a
+sibling account reads "Self · account N" (then contact name, then
+addr-short — priority order unchanged). Multi-key records:
 rev-3 wallet sweeps/consolidates stamp `TxRecord.input_indexes`
 (owners = indexes within the record's account); legacy records keep
 `input_accounts` (accounts, index 0 implied) and still RBF correctly. Store gains `excluded_senders` + `seen_received` (unread =
@@ -226,7 +251,8 @@ lands in the ACTIVE store (kind "sweep", log gains `notebooks=<m>`);
 the flow lands on the notebook list. The "Pay the fee from another
 wallet" toggle on screen 16 is WATCH-ONLY now (a keyed exit pays its
 own fee; watch keeps it for the external-signer full-value transfer —
-watch flows are single-notebook and unchanged). `set_sweep_dest` still
+wallet-wide since 2026-07-12: the funding wallet pays the fee while
+every notebook's coins ride in full). `set_sweep_dest` still
 labels + linkage-warns if the typed dest happens to be one of our own
 addresses. The archive guard's remedy message points at Consolidate.
 
@@ -253,8 +279,11 @@ key; pin bumped to rev 0440ac5). Bookkeeping spans stores: sources'
 inputs lock pending, the destination store (created if needed) gets the
 TxRecord + the unconfirmed coin, the active store reloads via
 activate(), and the flow lands on the notebook LIST (the wallet-level
-home). Watch-only routes to the old self-consolidate external-sign flow
-(`open_notebook_consolidate` — one notebook is all watch has). The
+home). Watch-only takes the SAME picker + confirm flow since 2026-07-12
+and builds ONE external-sign PSBT (`build_watch_spend_psbt`, screens
+13/14; `record_watch_spend` mirrors the keyed cross-store bookkeeping —
+`open_notebook_consolidate` survives only as dead code behind the unused
+`consolidate-open` callback). The
 Coins screen (10) is WALLET-WIDE (Sal 2026-07-11): every active
 notebook's spendable coins, each row tagged with its notebook
 (`CoinItem.notebook`, `update_wallet_coins`), summary "N coins · X sats
@@ -517,7 +546,12 @@ index=<i>` · `cb: create-notebook picker open[ (sweep dest)]` ·
 excluded=<b> hidden=<n>` · `cb: sweep-pick to=<a>[ (notebook <n>)]` ·
 `cb: wallet-consolidate open coins=<n> notebooks=<m>` ·
 `cb: wallet-consolidate txid=<t> coins=<n> notebooks=<m> value=<v>
-fee=<f>` · `cb: sweep txid=<t> value=<v> fee=<f> notebooks=<m>`.
+fee=<f>` · `cb: sweep txid=<t> value=<v> fee=<f> notebooks=<m>` ·
+`cb: wallet-consolidate build txid=<t> coins=<n> notebooks=<m> fee=<f>`
+(watch: the external-sign PSBT was built) · `cb: watch-spend-build
+kind=<k> txid=<t> fee=<f> inputs=<n> notebooks=<m>` ·
+`cb: notebook-discovery found=<n> added=<k>` (gap discovery after a
+seed re-import; `stale-drop` when the identity changed mid-probe).
 UI e2e:
 `../ui-automation/tests/chain-notes-app.sh` (simtap point offsets from
 the window origin — recalibrate from screenshots when app.slint moves
