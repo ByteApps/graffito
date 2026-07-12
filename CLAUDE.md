@@ -215,9 +215,11 @@ external dests keep the contact-name label + recents behavior.
 per-notebook framing): Settings → "Consolidate wallet…"
 (`consolidate-wallet-open`) snapshots every ACTIVE notebook's spendable
 coins (`State.wconsol`; needs 2+ coins total), opens the account picker
-in `"wconsol"` mode — title "Consolidate to", ALL rows enabled, inline
-name field; picking a non-notebook address CREATES it, an archived one
-UN-archives (the coin must never land hidden) — then a confirm modal
+in `"wconsol"` mode — title "Consolidate to", ALL rows enabled, NO name
+field (a typed name would be dead input on existing-notebook picks;
+Sal 2026-07-11); picking a non-notebook address CREATES it unnamed
+(addr-short, renameable from the list), an archived one UN-archives
+(the coin must never land hidden) — then a confirm modal
 (`show-wconsol-confirm`: coins/notebooks/dest/fee summary + the
 all-addresses-link warning) and ONE multi-key tx via notes-core's
 additive `build_sweep_tx_multi` (each input signed by its own account's

@@ -4626,15 +4626,9 @@ pub fn run() {
                 }
             }
             if s.notebooks.as_ref().and_then(|ix| ix.get(account)).is_none() {
+                // Unnamed on purpose — the picker has no name field in this
+                // mode; the row shows the address short form until renamed.
                 ensure_notebook(&mut s, account);
-                let name = w.get_nb_create_name().trim().to_string();
-                if !name.is_empty() {
-                    if let Some(ix) = s.notebooks.as_mut() {
-                        ix.rename(account, &name);
-                        s.save_notebooks();
-                        println!("cb: rename-notebook account={account}");
-                    }
-                }
             }
             let Some(addr) =
                 s.nb_addrs.iter().find(|(a, ..)| *a == account).map(|(_, ad, _)| ad.clone())
