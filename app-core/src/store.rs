@@ -115,8 +115,14 @@ pub struct TxRecord {
     /// records (wallet sweep/consolidate) — a bump must re-sign each
     /// input with its own account's key. Empty = single-key record
     /// (every legacy record), bumped with the active identity.
+    /// LEGACY (pre-rev-3): implies notebook index 0 for every input.
     #[serde(default)]
     pub input_accounts: Vec<u32>,
+    /// Rev 3: owning NOTEBOOK INDEX per input (parallel to `inputs`),
+    /// within the record's account — wallet ops never span accounts now.
+    /// Empty on legacy records (see `input_accounts`).
+    #[serde(default)]
+    pub input_indexes: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +396,7 @@ impl Store {
             inputs,
             dest_spk_hex,
             input_accounts: Vec::new(),
+            input_indexes: Vec::new(),
         });
     }
 

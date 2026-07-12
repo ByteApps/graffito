@@ -76,13 +76,15 @@ impl BuiltPsbt {
     }
 }
 
-/// A coin a watch identity spends — always the descriptor's receive leaf
-/// at index 0 (the notes address).
+/// A coin a watch identity spends — at the descriptor's receive leaf
+/// `0/{index}` (rev 3: each notebook is one receive index; pre-rev-3
+/// coins are all index 0, the original notes address).
 #[derive(Debug, Clone)]
 pub struct WatchCoin {
     pub txid: String,
     pub vout: u32,
     pub value: u64,
+    pub index: u32,
 }
 
 /// Predicted vsize of an all-taproot-keyspend tx with these output script
@@ -99,11 +101,11 @@ fn taproot_keyspend_inputs(
     source: &FundingSource,
     coins: &[WatchCoin],
 ) -> Result<(Vec<TxIn>, Vec<TxOut>, Vec<InputWeightPrediction>), Error> {
-    let leaf_spk = ScriptBuf::from_bytes(source.derive(0, 0)?.spk);
     let mut inputs = Vec::with_capacity(coins.len());
     let mut prevouts = Vec::with_capacity(coins.len());
     let mut weights = Vec::with_capacity(coins.len());
     for coin in coins {
+        let leaf_spk = ScriptBuf::from_bytes(source.derive(0, coin.index)?.spk);
         let txid = Txid::from_str(&coin.txid).map_err(|e| Error::Funding(format!("bad txid: {e}")))?;
         inputs.push(TxIn {
             previous_output: OutPoint { txid, vout: coin.vout },
@@ -111,7 +113,7 @@ fn taproot_keyspend_inputs(
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         });
-        prevouts.push(TxOut { value: Amount::from_sat(coin.value), script_pubkey: leaf_spk.clone() });
+        prevouts.push(TxOut { value: Amount::from_sat(coin.value), script_pubkey: leaf_spk });
         weights.push(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH);
     }
     Ok((inputs, prevouts, weights))
@@ -127,8 +129,10 @@ fn assemble_watch_psbt(
     let tx = Transaction { version: Version::TWO, lock_time: LockTime::ZERO, input: inputs, output: outputs };
     let txid = tx.compute_txid().to_string();
     let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| Error::Funding(format!("psbt: {e}")))?;
-    let def = source.definite(0, 0)?;
-    for i in 0..coins.len() {
+    for (i, coin) in coins.iter().enumerate() {
+        // Per-coin definite descriptor: key origins carry each input's own
+        // receive index, so a signer recognizes every notebook's coins.
+        let def = source.definite(0, coin.index)?;
         psbt.inputs[i].witness_utxo = Some(prevouts[i].clone());
         psbt.inputs[i]
             .update_with_descriptor_unchecked(&def)
@@ -738,8 +742,8 @@ mod tests {
             FundingSource::parse(&format!("tr([{fp}/86'/0'/0']{xpub}/<0;1>/*)"), NET).unwrap();
 
         let coins = vec![
-            WatchCoin { txid: "a".repeat(64), vout: 0, value: 60_000 },
-            WatchCoin { txid: "b".repeat(64), vout: 1, value: 40_000 },
+            WatchCoin { txid: "a".repeat(64), vout: 0, value: 60_000, index: 0 },
+            WatchCoin { txid: "b".repeat(64), vout: 1, value: 40_000, index: 0 },
         ];
         let dest = src.derive(0, 0).unwrap().spk; // consolidate to self
         let built = build_watch_spend_psbt(&src, &coins, dest.clone(), 2.0).unwrap();
@@ -778,7 +782,7 @@ mod tests {
         // A bump at (or below) the old rate is rejected.
         assert!(build_watch_bump_psbt(&src, &coins, &prev_outputs, 0, 2.0).is_err());
         // Sweeping less than fee+dust is rejected.
-        let tiny = vec![WatchCoin { txid: "c".repeat(64), vout: 0, value: 400 }];
+        let tiny = vec![WatchCoin { txid: "c".repeat(64), vout: 0, value: 400, index: 0 }];
         assert!(build_watch_spend_psbt(&src, &tiny, dest, 2.0).is_err());
     }
 
@@ -830,8 +834,8 @@ mod tests {
         let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
         let alice_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
         let notes_coins = vec![
-            WatchCoin { txid: "e".repeat(64), vout: 0, value: 60_000 },
-            WatchCoin { txid: "f".repeat(64), vout: 1, value: 40_000 },
+            WatchCoin { txid: "e".repeat(64), vout: 0, value: 60_000, index: 0 },
+            WatchCoin { txid: "f".repeat(64), vout: 1, value: 40_000, index: 0 },
         ];
         let built =
             build_funded_sweep_psbt(alice_spk.clone(), None, &notes_coins, &plan, dest_spk.clone())
@@ -910,7 +914,7 @@ mod tests {
         let fp = master.fingerprint(&secp);
         let src = FundingSource::parse(&format!("tr([{fp}/86'/0'/0']{xpub}/<0;1>/*)"), NET).unwrap();
         let self_addr = src.derive(0, 0).unwrap();
-        let coins = vec![WatchCoin { txid: "9".repeat(64), vout: 0, value: 50_000 }];
+        let coins = vec![WatchCoin { txid: "9".repeat(64), vout: 0, value: 50_000, index: 0 }];
 
         // Self public note.
         let built = build_watch_note_psbt(
