@@ -16,12 +16,14 @@ fn wif_and_hex_same_key_same_address() {
         &parse_key_material(&wif.to_wif(), Network::Testnet4).unwrap(),
         Network::Testnet4,
             0,
+        0,
     )
     .unwrap();
     let via_hex = realize(
         &parse_key_material(&hex::encode(key), Network::Testnet4).unwrap(),
         Network::Testnet4,
             0,
+        0,
     )
     .unwrap();
 
@@ -35,6 +37,7 @@ fn wif_and_hex_same_key_same_address() {
         &parse_key_material(&hex::encode(key), Network::Regtest).unwrap(),
         Network::Regtest,
             0,
+        0,
     )
     .unwrap();
     assert!(via_hex_rt.address.starts_with("bcrt1p"));
@@ -70,7 +73,7 @@ fn eighteen_word_mnemonic_imports() {
     let m = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &[0xA5u8; 24]).unwrap();
     let parsed = parse_key_material(&m.to_string(), Network::Mainnet).unwrap();
     assert!(matches!(parsed, KeyMaterial::Mnemonic(_)));
-    let ident = realize(&parsed, Network::Mainnet, 0).unwrap();
+    let ident = realize(&parsed, Network::Mainnet, 0, 0).unwrap();
     assert!(ident.address.starts_with("bc1p"));
 }
 
@@ -117,7 +120,7 @@ fn generated_mnemonics_are_valid_and_distinct() {
         assert_eq!(m.word_count(), words);
         // Round-trips through the importer.
         let parsed = parse_key_material(&m.to_string(), Network::Mainnet).unwrap();
-        realize(&parsed, Network::Mainnet, 0).unwrap();
+        realize(&parsed, Network::Mainnet, 0, 0).unwrap();
     }
     let a = generate_mnemonic(12).unwrap();
     let b = generate_mnemonic(12).unwrap();
