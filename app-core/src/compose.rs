@@ -292,3 +292,169 @@ pub fn bump_raw_tx(
     rec.value = tx.tx.outputs[0].value;
     Ok(tx)
 }
+
+/// [`bump_raw_tx`] for MULTI-KEY records (wallet sweep/consolidate): the
+/// record's `input_accounts` says which account owns each input, and
+/// `identities` supplies each account's keys — every input is re-signed
+/// by its owner via `build_sweep_tx_multi`, same inputs, same
+/// destination, higher rate.
+pub fn bump_raw_tx_multi(
+    store: &mut Store,
+    identities: &[(u32, Identity)],
+    txid: &str,
+    new_rate: f64,
+) -> Result<notes_core::tx::NoteTx, Error> {
+    let rec = store
+        .txs
+        .iter()
+        .find(|t| {
+            t.txids.iter().any(|x| x == txid) && t.status == crate::store::NoteStatus::Pending
+        })
+        .ok_or(Error::Store("only pending sweeps/consolidations can be bumped".into()))?;
+    if rec.input_accounts.len() != rec.inputs.len() {
+        return Err(Error::Store("record has no per-input owners".into()));
+    }
+    // Group inputs per owning account, preserving first-seen order (the
+    // original build was source-grouped the same way).
+    let mut groups: Vec<(u32, Vec<notes_core::tx::Utxo>)> = Vec::new();
+    for (i, acct) in rec.inputs.iter().zip(&rec.input_accounts) {
+        let mut t = [0u8; 32];
+        hex::decode_to_slice(&i.txid, &mut t).map_err(|_| Error::Store("bad txid".into()))?;
+        t.reverse();
+        let u = notes_core::tx::Utxo { txid: t, vout: i.vout, value: i.value };
+        match groups.iter_mut().find(|(a, _)| a == acct) {
+            Some((_, v)) => v.push(u),
+            None => groups.push((*acct, vec![u])),
+        }
+    }
+    let dest_spk =
+        hex::decode(&rec.dest_spk_hex).map_err(|_| Error::Store("bad dest spk".into()))?;
+    let sources: Vec<notes_core::tx::SweepSource> = groups
+        .iter()
+        .map(|(acct, coins)| {
+            let (_, id) = identities
+                .iter()
+                .find(|(a, _)| a == acct)
+                .ok_or(Error::Store(format!("no key for account {acct}")))?;
+            Ok(notes_core::tx::SweepSource {
+                utxos: coins,
+                output_x: id.output_x,
+                tweaked_seckey: &id.tweaked_seckey,
+            })
+        })
+        .collect::<Result<_, Error>>()?;
+    let tx = notes_core::tx::build_sweep_tx_multi(&sources, dest_spk, new_rate, generate_aux_rand)?;
+    let rec = store
+        .txs
+        .iter_mut()
+        .find(|t| t.txids.iter().any(|x| x == txid))
+        .expect("checked above");
+    rec.txids.push(tx.txid_hex.clone());
+    rec.raw_hex = Some(tx.raw_hex.clone());
+    rec.fee = tx.fee;
+    rec.vsize = tx.vsize as u64;
+    rec.value = tx.tx.outputs[0].value;
+    Ok(tx)
+}
+
+#[cfg(test)]
+mod bump_tests {
+    use super::*;
+    use crate::store::{NoteStatus, Store, TxInput, TxRecord};
+    use notes_core::Network;
+
+    /// Multi-key RBF: a wallet sweep/consolidate record carrying
+    /// per-input owners re-signs EACH input with its own account's key at
+    /// the higher rate — rust-bitcoin recomputes both sighashes and
+    /// verifies every signature against the matching owner key.
+    #[test]
+    fn bump_raw_tx_multi_resigns_per_owner() {
+        use bitcoin::consensus::encode::deserialize;
+        use bitcoin::hashes::Hash;
+        use bitcoin::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
+        use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+        use bitcoin::{Amount, ScriptBuf, TxOut};
+
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let b = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let dest_spk = notes_core::address::p2tr_script_pubkey(
+            &Identity::from_app_seed(&[11u8; 32]).unwrap().output_x,
+        );
+
+        let mut store = Store::new(&a.output_x, Network::Regtest);
+        store.txs.push(TxRecord {
+            kind: "sweep".into(),
+            txids: vec!["00".repeat(32)],
+            status: NoteStatus::Pending,
+            value: 69_000,
+            fee: 100,
+            vsize: 160,
+            created_at: Some(1),
+            raw_hex: Some(String::new()),
+            dest: "ext".into(),
+            inputs: vec![
+                TxInput { txid: "11".repeat(32), vout: 0, value: 40_000 },
+                TxInput { txid: "22".repeat(32), vout: 1, value: 30_000 },
+            ],
+            dest_spk_hex: hex::encode(&dest_spk),
+            input_accounts: vec![0, 3],
+        });
+
+        fn dup(i: &Identity) -> Identity {
+            Identity {
+                internal_x: i.internal_x,
+                output_x: i.output_x,
+                tweaked_seckey: i.tweaked_seckey,
+                enc_key: i.enc_key,
+            }
+        }
+        let idents = vec![(0u32, dup(&a)), (3u32, dup(&b))];
+        let bumped =
+            bump_raw_tx_multi(&mut store, &idents, &"00".repeat(32), 5.0).unwrap();
+        assert!(bumped.fee > 100, "fee must rise");
+        assert_eq!(bumped.tx.inputs.len(), 2);
+
+        // The record swapped to the replacement.
+        let rec = &store.txs[0];
+        assert_eq!(rec.txids.len(), 2);
+        assert_eq!(rec.fee, bumped.fee);
+
+        // rust-bitcoin verifies each input against ITS OWNER's key.
+        let raw = hex::decode(&bumped.raw_hex).unwrap();
+        let btx: bitcoin::Transaction = deserialize(&raw).unwrap();
+        let spk_a = ScriptBuf::from_bytes(notes_core::address::p2tr_script_pubkey(&a.output_x));
+        let spk_b = ScriptBuf::from_bytes(notes_core::address::p2tr_script_pubkey(&b.output_x));
+        let prevouts = vec![
+            TxOut { value: Amount::from_sat(40_000), script_pubkey: spk_a },
+            TxOut { value: Amount::from_sat(30_000), script_pubkey: spk_b },
+        ];
+        let secp = Secp256k1::verification_only();
+        let keys = [
+            XOnlyPublicKey::from_slice(&a.output_x).unwrap(),
+            XOnlyPublicKey::from_slice(&b.output_x).unwrap(),
+        ];
+        let mut cache = SighashCache::new(&btx);
+        for (index, witness) in (0..btx.input.len()).zip(&bumped.tx.witnesses) {
+            let sighash = cache
+                .taproot_key_spend_signature_hash(
+                    index,
+                    &Prevouts::All(&prevouts),
+                    TapSighashType::Default,
+                )
+                .unwrap();
+            secp.verify_schnorr(
+                &Signature::from_slice(&witness[0]).unwrap(),
+                &Message::from_digest(sighash.to_byte_array()),
+                &keys[index],
+            )
+            .expect("each input re-signed by its own owner");
+        }
+
+        // A record WITHOUT owners must refuse the multi path (legacy →
+        // single-key bump_raw_tx).
+        store.txs[0].input_accounts.clear();
+        store.txs[0].status = NoteStatus::Pending;
+        let last = store.txs[0].txids.last().unwrap().clone();
+        assert!(bump_raw_tx_multi(&mut store, &idents, &last, 9.0).is_err());
+    }
+}
