@@ -294,10 +294,13 @@ pub fn bump_raw_tx(
 }
 
 /// [`bump_raw_tx`] for MULTI-KEY records (wallet sweep/consolidate): the
-/// record's `input_accounts` says which account owns each input, and
-/// `identities` supplies each account's keys — every input is re-signed
-/// by its owner via `build_sweep_tx_multi`, same inputs, same
-/// destination, higher rate.
+/// record's per-input owner list — `input_indexes` (rev 3, notebook
+/// indexes within the record's account) or `input_accounts` (legacy
+/// accounts-as-notebooks records) — says which owner key signs each
+/// input, and `identities` supplies each owner's keys under the SAME
+/// u32 keying the caller resolved — every input is re-signed by its
+/// owner via `build_sweep_tx_multi`, same inputs, same destination,
+/// higher rate.
 pub fn bump_raw_tx_multi(
     store: &mut Store,
     identities: &[(u32, Identity)],
@@ -311,13 +314,18 @@ pub fn bump_raw_tx_multi(
             t.txids.iter().any(|x| x == txid) && t.status == crate::store::NoteStatus::Pending
         })
         .ok_or(Error::Store("only pending sweeps/consolidations can be bumped".into()))?;
-    if rec.input_accounts.len() != rec.inputs.len() {
+    let owners: &[u32] = if !rec.input_indexes.is_empty() {
+        &rec.input_indexes
+    } else {
+        &rec.input_accounts
+    };
+    if owners.len() != rec.inputs.len() {
         return Err(Error::Store("record has no per-input owners".into()));
     }
-    // Group inputs per owning account, preserving first-seen order (the
+    // Group inputs per owner, preserving first-seen order (the
     // original build was source-grouped the same way).
     let mut groups: Vec<(u32, Vec<notes_core::tx::Utxo>)> = Vec::new();
-    for (i, acct) in rec.inputs.iter().zip(&rec.input_accounts) {
+    for (i, acct) in rec.inputs.iter().zip(owners) {
         let mut t = [0u8; 32];
         hex::decode_to_slice(&i.txid, &mut t).map_err(|_| Error::Store("bad txid".into()))?;
         t.reverse();
@@ -397,7 +405,11 @@ mod bump_tests {
                 TxInput { txid: "22".repeat(32), vout: 1, value: 30_000 },
             ],
             dest_spk_hex: hex::encode(&dest_spk),
+            // Legacy accounts-as-notebooks owner list — rev-3 records
+            // carry input_indexes instead (same re-sign path, owner u32s
+            // resolved by the caller).
             input_accounts: vec![0, 3],
+            input_indexes: Vec::new(),
         });
 
         fn dup(i: &Identity) -> Identity {
