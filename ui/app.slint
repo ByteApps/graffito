@@ -25,10 +25,13 @@ export struct SpendCoin { outpoint: string, value: string, confirmed: bool, sele
 export struct PsbtRow { title: string, subtitle: string, amount: string, kind: string }
 // A saved funding wallet in the manager list.
 export struct FundingWalletRow { id: string, label: string, meta: string, active: bool }
+// `notebook` = owning notebook's display name (Activity is wallet-wide);
+// `pending` also gates the action buttons — only the ACTIVE notebook's
+// rows are actionable (bump/rebroadcast sign with its key).
 export struct ActivityItem {
     ref-id: string, is-note: bool, kind: string, title: string,
     txid: string, fee-line: string, status: string, explorer: string,
-    pending: bool, replaced: string }
+    pending: bool, replaced: string, notebook: string }
 
 // Per-platform optical calibration, set from Rust at startup. The header
 // title Text sits differently inside its line box per platform font (macOS/
@@ -1236,11 +1239,7 @@ export component AppWindow inherits Window {
     // the notebook right away — rows already added are disabled).
     in-out property <string> account-pick-mode: "switch";
     in-out property <string> nb-create-name;
-    // sweep destinations: the other notebooks (+ create-and-sweep-into)
-    in-out property <[NotebookItem]> sweep-notebooks;
     in-out property <string> sweep-dest-note;   // linkage caveat, empty = none
-    callback pick-notebook-dest(int);
-    callback sweep-new-notebook();
     // wallet-level consolidate (Settings): dest picked on screen 9 in
     // "wconsol" mode, then a confirm modal, then one multi-key tx.
     in-out property <bool> show-wconsol-confirm;
@@ -2393,46 +2392,12 @@ export component AppWindow inherits Window {
             GhostButton { width: 64px; text: "Use"; clicked => { root.pick-contact(root.contact-input); } }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
-        // Sweep mode: in-wallet destinations first — the other notebooks,
-        // or a brand-new one created on the spot and swept into.
-        if root.pick-mode == "sweep" && root.sweep-notebooks.length > 0: Caption { text: "My notebooks"; }
-        if root.pick-mode == "sweep": VerticalLayout {
-            spacing: 6px;
-            for nb in root.sweep-notebooks: Rectangle {
-                height: 52px;
-                snb := TouchArea { clicked => { root.pick-notebook-dest(nb.account); } }
-                Rectangle {
-                    y: 2px;
-                    height: parent.height - 6px;
-                    border-radius: 10px;
-                    background: snb.has-hover ? Pal.card-hover : Pal.card;
-                    border-width: 1px;
-                    border-color: Pal.line;
-                    HorizontalLayout {
-                        padding-left: 14px;
-                        padding-right: 14px;
-                        spacing: 8px;
-                        VerticalLayout {
-                            spacing: 3px;
-                            alignment: center;
-                            Text {
-                                text: nb.name;
-                                font-size: 12px;
-                                color: Pal.text;
-                                overflow: elide;
-                            }
-                            Caption { text: nb.meta; overflow: elide; }
-                        }
-                        Rectangle { }
-                    }
-                }
-            }
-            if root.can-create-notebook: GhostButton {
-                text: "+  New notebook…";
-                clicked => { root.sweep-new-notebook(); }
-            }
+        // Sweep = leaving the wallet: destinations are EXTERNAL addresses
+        // (moving coins between notebooks is Consolidate's job).
+        if root.pick-mode == "sweep": Caption {
+            text: "The whole wallet — every notebook's coins — goes to this address in one transaction.";
         }
-        if root.contacts.length > 0: Caption { text: root.pick-mode == "sweep" ? "Other addresses — recently used" : "Recently used"; }
+        if root.contacts.length > 0: Caption { text: "Recently used"; }
         // Recents list. A ListView / stretched Flickable vertically CENTRES a
         // short list, leaving a big gap under the "Recently used" separator.
         // Instead: a content-sized column that sits directly under the
@@ -2609,12 +2574,12 @@ export component AppWindow inherits Window {
             }
         }
         SettingsCard {
-            title: "Funds";
+            title: "Sweep wallet";
             subtitle: root.watch-only
-                ? "Move everything off this notebook's address (minus the fee). Watch-only: you'll sign the transaction on your external wallet."
-                : "Move everything off this notebook's address (minus the fee) — to another notebook, a new one, or any address.";
+                ? "Leaving this wallet: move everything (minus the fee) to an address you choose. Watch-only: you'll sign on your external wallet."
+                : "Leaving this wallet: EVERY notebook's coins go to an address you choose, in one transaction (minus the fee). To move coins between notebooks, use Consolidate instead.";
             GhostButton {
-                text: "Sweep this notebook's funds…";
+                text: "Sweep wallet…";
                 clicked => { root.sweep-open(); }
             }
         }
@@ -2837,6 +2802,7 @@ export component AppWindow inherits Window {
                                 font-weight: 700;
                                 color: Pal.text;
                             }
+                            if a.notebook != "": Badge { label: a.notebook; tint: Pal.muted; }
                             Rectangle { }
                             if a.replaced != "": Badge { label: a.replaced; tint: Pal.faint; }
                             Badge {
@@ -3259,8 +3225,10 @@ export component AppWindow inherits Window {
                     font-weight: 600;
                     color: Pal.accent;
                 }
-                // ---- pay the fee from another wallet ----
-                HorizontalLayout {
+                // ---- pay the fee from another wallet (watch-only: the
+                // external signer's full-value transfer needs it; keyed
+                // sweeps pay their own fee out of the swept amount) ----
+                if root.watch-only: HorizontalLayout {
                     Switch {
                         text: "Pay the fee from another wallet";
                         checked <=> root.sweep-fund-external;
