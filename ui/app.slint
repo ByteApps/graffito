@@ -16,7 +16,9 @@ export struct ContactItem { address: string, name: string }
 // "used" / "notebook" + a sats line); the import/switch picker leaves them
 // empty and the row renders as before.
 export struct AccountItem { index: int, address: string, active: bool, pill: string, balance: string }
-export struct CoinItem { outpoint: string, value: string, status: string }
+// `notebook` = owning notebook's display name (the coins viewer is
+// wallet-wide since 2026-07-11).
+export struct CoinItem { outpoint: string, value: string, status: string, notebook: string }
 export struct SpendCoin { outpoint: string, value: string, confirmed: bool, selected: bool, txid-short: string, explorer: string }
 // One input/output row in the Sparrow-style PSBT confirmation. `kind` drives
 // the accent: note · self · recipient · change · input · other.
@@ -2602,7 +2604,7 @@ export component AppWindow inherits Window {
             title: "Coins";
             subtitle: root.coins-summary;
             GhostButton {
-                text: "View this notebook's coins…";
+                text: "View wallet coins…";
                 clicked => { root.open-coins(); }
             }
         }
@@ -2752,11 +2754,12 @@ export component AppWindow inherits Window {
         Header {
             title: "Coins";
             back => { root.nav-back(); }
+            SvgIconButton { icon: "refresh"; clicked => { root.refresh-coins(); } }
         }
         Caption {
             text: root.watch-only
-                ? "This notebook's unspent outputs — every note tx spends from them. To combine coins, use Settings → Consolidate wallet (signs on your external wallet)."
-                : "This notebook's unspent outputs — every note tx spends from them. To combine coins into one (all notebooks at once), use Settings → Consolidate wallet; to move funds elsewhere, Settings → Funds → Sweep.";
+                ? "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. To combine them, use Settings → Consolidate wallet (signs on your external wallet)."
+                : "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. To combine them into one coin, use Settings → Consolidate wallet; to move one notebook's funds, Settings → Funds → Sweep.";
         }
         // Pure viewer since consolidation moved to Settings ("Consolidate
         // wallet…" — wallet-level, all notebooks at once).
@@ -2776,12 +2779,14 @@ export component AppWindow inherits Window {
                         padding: 12px;
                         spacing: 4px;
                         HorizontalLayout {
+                            spacing: 8px;
                             Text {
                                 text: c.value + " sats";
                                 font-size: 13px;
                                 font-weight: 700;
                                 color: Pal.text;
                             }
+                            if c.notebook != "": Badge { label: c.notebook; tint: Pal.muted; }
                             Rectangle { }
                             Badge {
                                 label: c.status;
