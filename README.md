@@ -9,7 +9,7 @@ Chain Notes writes personal notes into real bitcoin transactions — public ones
   &nbsp;
   <img src="screenshots/compose.png" alt="Compose — live cost preview, fee tiers, coin control" width="290">
   &nbsp;
-  <img src="screenshots/activity.png" alt="Activity — every transaction with rebroadcast and RBF" width="290">
+  <img src="screenshots/activity.png" alt="Activity — every notebook's transactions in one wallet-wide feed" width="290">
 </p>
 
 ## Features
