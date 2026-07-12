@@ -2732,8 +2732,8 @@ export component AppWindow inherits Window {
         }
         Caption {
             text: root.watch-only
-                ? "Each note tx spends these unspent outputs. Consolidating combines them into one coin — watch-only signs the transaction on your external wallet."
-                : "Each note tx spends these unspent outputs. Consolidating combines them into one coin at your address, so future notes need fewer inputs (lower fees).";
+                ? "This notebook's unspent outputs — every note tx spends from them. Consolidating combines them into one coin at this notebook's address; watch-only signs the transaction on your external wallet."
+                : "This notebook's unspent outputs — every note tx spends from them. Consolidating combines them into one coin at this notebook's address, so future notes need fewer inputs (lower fees). To move coins to a DIFFERENT notebook, use Sweep instead (Settings → Funds).";
         }
         // Viewer-first: the list is the point; consolidation is one button
         // that opens its own compose-like screen (16, shared with sweep).

@@ -861,7 +861,7 @@ fn update_activity(w: &AppWindow, st: &State) {
             NoteStatus::Orphaned => "orphaned",
         };
         let title = if t.dest == "self" {
-            format!("Consolidate to your address · {} sats", t.value)
+            format!("Consolidate within this notebook · {} sats", t.value)
         } else {
             format!("To {} · {} sats", t.dest, t.value)
         };
@@ -3264,7 +3264,14 @@ pub fn run() {
         w.set_sweep_kind("consolidate".into());
         w.set_sweep_dest(addr.clone().into());
         w.set_sweep_dest_note("".into());
-        w.set_sweep_to_label(format!("Consolidate to your address · {addr}").into());
+        let nb_name = s
+            .ident
+            .as_ref()
+            .map(|i| s.notebook_display_name(i.account))
+            .unwrap_or_else(|| "this notebook".into());
+        w.set_sweep_to_label(
+            format!("Consolidate within {nb_name} · {}", addr_short(&addr)).into(),
+        );
         w.set_sweep_tier(1);
         let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
         w.set_sweep_rate_text(format!("{rate}").into());
