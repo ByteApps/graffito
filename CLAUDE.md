@@ -271,12 +271,17 @@ the tap-visible paths: open-notebook, home ↻, boot, pick-account,
 set-network, quiz-complete, iCloud restore. Post-broadcast refreshes
 stay synchronous for now (perf-tests task tracks the rest).
 
-**Origin-aware back** (Sal 2026-07-11): settings + activity return to
-the screen they were opened FROM (`return-screen`, set by their open
-callbacks: the notebook list or a notebook's home) — list → settings →
-back lands on the list. The settings Identity card is wallet-level only
-(kind · network · notebook count; the per-notebook account/address
-display is gone).
+**Settings is LIST-only** (Sal 2026-07-11): the gear lives on the
+notebook list header, NOT the notebook (home) header — settings is
+wallet-level, so it hangs off the wallet screen. `return-screen` still
+carries origin for Activity (opened from either screen), but settings
+always returns to the list. The Identity card is wallet-level only (kind
+· network · notebook count). **Consolidate lives on the Coins screen**
+(screen 10) as its ONE viewer-first action button on top (Sal: "I
+thought consolidate was inside and on top of the coins screen") — the
+old Settings "Consolidate wallet" card is gone; the Coins card there
+just opens the (wallet-wide) viewer. Sweep stays a Settings card
+("Sweep wallet…") — it's the wallet-EXIT, not a coins-management op.
 
 **Identity lifecycle:** key material verbatim in the keychain; BIP-86
 account chosen on a paginated picker after hierarchical imports; later
