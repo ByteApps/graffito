@@ -198,18 +198,28 @@ active notebooks is legitimate — archive-all allowed, empty-state
 captions, boot never resurrects archived entries. reset-identity
 deletes notebooks-*.json alongside stores.
 
-**Sweep destinations** (Sal 2026-07-11): the sweep picker (screen 7,
-`pick-mode == "sweep"`) offers, top to bottom: the address input
-(other address), a "My notebooks" section (`sweep-notebooks` — every
-ACTIVE notebook except the current one, name + addr short + balance)
-and "+ New notebook…" (`sweep-new-notebook` → the create picker with
-`State.create_for_sweep`, which adds the notebook WITHOUT switching the
-active account — the sweep spends the CURRENT notebook's coins — and
-routes straight back to screen 16 with the new address as dest), then
-the recents. All destinations funnel through `set_sweep_dest`: notebook
-dests get an "Everything to: <name> · <short>" label, the amber
-on-chain-linkage caveat (`sweep-dest-note`), and NO contacts pollution;
-external dests keep the contact-name label + recents behavior.
+**Sweep is WALLET-level** (Sal 2026-07-11: sweep = leaving the wallet
+altogether, superseding the per-notebook sweep + its my-notebooks/new
+destination sections): Settings → "Sweep wallet…" → the picker (screen
+7, sweep mode: address input + recents ONLY — internal moves are
+Consolidate's job) → screen 16 previews EVERY active notebook's coins
+(`update_sweep_screen` wallet_mode gathers across stores) → ONE
+multi-key tx via `build_sweep_tx_multi`, each input signed by its
+owning account. Bookkeeping: every source's inputs lock; the TxRecord
+lands in the ACTIVE store (kind "sweep", log gains `notebooks=<m>`);
+the flow lands on the notebook list. The "Pay the fee from another
+wallet" toggle on screen 16 is WATCH-ONLY now (a keyed exit pays its
+own fee; watch keeps it for the external-signer full-value transfer —
+watch flows are single-notebook and unchanged). `set_sweep_dest` still
+labels + linkage-warns if the typed dest happens to be one of our own
+addresses. The archive guard's remedy message points at Consolidate.
+
+**Activity is WALLET-WIDE** (Sal 2026-07-11): screen 11 merges every
+ACTIVE notebook's notes + txs (live store for the active account, disk
+stores for the rest), each row tagged with its notebook
+(`ActivityItem.notebook`); Speed-up/Rebroadcast appear ONLY on the
+active notebook's rows (they sign with the live store + key — other
+rows keep the Explorer link).
 
 **Consolidate is WALLET-level** (Sal 2026-07-11, superseding the
 per-notebook framing): Settings → "Consolidate wallet…"
@@ -460,7 +470,7 @@ account=<n>` · `cb: create-notebook picker open[ (sweep dest)]` ·
 excluded=<b> hidden=<n>` · `cb: sweep-pick to=<a>[ (notebook <n>)]` ·
 `cb: wallet-consolidate open coins=<n> notebooks=<m>` ·
 `cb: wallet-consolidate txid=<t> coins=<n> notebooks=<m> value=<v>
-fee=<f>`.
+fee=<f>` · `cb: sweep txid=<t> value=<v> fee=<f> notebooks=<m>`.
 UI e2e:
 `../ui-automation/tests/chain-notes-app.sh` (simtap point offsets from
 the window origin — recalibrate from screenshots when app.slint moves
