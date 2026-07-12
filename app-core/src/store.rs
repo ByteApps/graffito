@@ -111,6 +111,12 @@ pub struct TxRecord {
     /// same spend at a higher rate.
     pub inputs: Vec<TxInput>,
     pub dest_spk_hex: String,
+    /// Owning account per input (parallel to `inputs`) for MULTI-KEY
+    /// records (wallet sweep/consolidate) — a bump must re-sign each
+    /// input with its own account's key. Empty = single-key record
+    /// (every legacy record), bumped with the active identity.
+    #[serde(default)]
+    pub input_accounts: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +168,15 @@ pub struct Store {
     /// dropped on the next save (`skip_serializing_if`).
     #[serde(default, alias = "esplora", skip_serializing_if = "Option::is_none")]
     pub node_url: Option<String>,
+    /// Sender filter: sender keys (addresses) hidden from this notebook's
+    /// view. The EXCLUSION set is what persists — everything not listed is
+    /// visible, so a brand-new sender always shows up by default.
+    #[serde(default)]
+    pub excluded_senders: Vec<String>,
+    /// Unread tracking: `"<note_id>:<sender>"` keys of received notes the
+    /// user has already had on screen (marked when the notebook opens).
+    #[serde(default)]
+    pub seen_received: Vec<String>,
 }
 
 fn default_chunk() -> usize {
@@ -183,6 +198,8 @@ impl Store {
             last_scan_time: 0,
             chunk_size: DEFAULT_CHUNK,
             node_url: None,
+            excluded_senders: Vec::new(),
+            seen_received: Vec::new(),
         }
     }
 
@@ -372,6 +389,7 @@ impl Store {
             dest,
             inputs,
             dest_spk_hex,
+            input_accounts: Vec::new(),
         });
     }
 
@@ -549,6 +567,94 @@ impl Store {
         }
     }
 
+    /// The sender-filter key of a note: the counterparty address for
+    /// received notes, the notebook's own address for everything it
+    /// authored — so "own notes" is one filterable stream like any other.
+    pub fn sender_key(&self, n: &NoteRecord) -> String {
+        if n.received {
+            n.sender.clone().unwrap_or_else(|| "unknown".into())
+        } else {
+            self.address.clone()
+        }
+    }
+
+    /// Distinct sender keys with note counts, newest activity first (the
+    /// order the filter panel lists them in).
+    pub fn senders(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for n in self.notes.iter().rev() {
+            let key = self.sender_key(n);
+            match out.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, count)) => *count += 1,
+                None => out.push((key, 1)),
+            }
+        }
+        out
+    }
+
+    pub fn is_excluded(&self, key: &str) -> bool {
+        self.excluded_senders.iter().any(|s| s == key)
+    }
+
+    pub fn set_excluded(&mut self, key: &str, excluded: bool) {
+        if excluded {
+            if !self.is_excluded(key) {
+                self.excluded_senders.push(key.to_string());
+            }
+        } else {
+            self.excluded_senders.retain(|s| s != key);
+        }
+    }
+
+    /// Notes the sender filter lets through, in store order.
+    pub fn visible_notes(&self) -> impl Iterator<Item = &NoteRecord> {
+        self.notes.iter().filter(|n| !self.is_excluded(&self.sender_key(n)))
+    }
+
+    fn seen_key(n: &NoteRecord) -> String {
+        format!("{}:{}", n.note_id, n.sender.as_deref().unwrap_or(""))
+    }
+
+    /// Received notes not yet marked seen — the notebook row's unread badge.
+    pub fn unread_count(&self) -> usize {
+        self.notes
+            .iter()
+            .filter(|n| n.received && !self.seen_received.contains(&Self::seen_key(n)))
+            .count()
+    }
+
+    /// [`Self::unread_count`] restricted to senders the filter shows — the
+    /// notebook row's badge (the preview must match what opening reveals).
+    pub fn unread_visible_count(&self) -> usize {
+        self.notes
+            .iter()
+            .filter(|n| {
+                n.received
+                    && !self.is_excluded(&self.sender_key(n))
+                    && !self.seen_received.contains(&Self::seen_key(n))
+            })
+            .count()
+    }
+
+    /// Opening the notebook marks every current received note seen.
+    /// Returns how many were newly marked (0 = nothing to persist).
+    pub fn mark_seen(&mut self) -> usize {
+        let mut newly = 0;
+        let keys: Vec<String> = self
+            .notes
+            .iter()
+            .filter(|n| n.received)
+            .map(Self::seen_key)
+            .collect();
+        for k in keys {
+            if !self.seen_received.contains(&k) {
+                self.seen_received.push(k);
+                newly += 1;
+            }
+        }
+        newly
+    }
+
     /// Contacts, Prime rules: front = latest use, dedupe by address,
     /// cap 20; naming does not bump recency.
     pub fn touch_contact(&mut self, address: &str) {
@@ -578,4 +684,81 @@ pub struct ApplyStats {
     pub notes_seen: usize,
     pub notes_new: usize,
     pub orphaned: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(id: &str, received: bool, sender: Option<&str>) -> NoteRecord {
+        NoteRecord {
+            note_id: id.into(),
+            status: NoteStatus::Confirmed,
+            text: Some("t".into()),
+            private: false,
+            directed: received,
+            received,
+            sender: sender.map(String::from),
+            recipient: None,
+            txids: vec![],
+            height: Some(1),
+            blocktime: Some(1),
+            created_at: None,
+            spent: vec![],
+            raw_hex: None,
+            fee: None,
+            vsize: None,
+            change_to: None,
+            gift_amount: None,
+        }
+    }
+
+    fn store_with_notes() -> Store {
+        let mut s = Store::new(&[7u8; 32], Network::Regtest);
+        s.notes.push(note("aa", false, None)); // own
+        s.notes.push(note("bb", true, Some("tb1p-alice")));
+        s.notes.push(note("cc", true, Some("tb1p-alice")));
+        s.notes.push(note("dd", true, Some("tb1p-bob")));
+        s
+    }
+
+    #[test]
+    fn sender_keys_and_ordering() {
+        let s = store_with_notes();
+        // Own notes key by the notebook's own address.
+        assert_eq!(s.sender_key(&s.notes[0]), s.address);
+        // Newest activity first: bob (last note) → alice → self.
+        let senders = s.senders();
+        assert_eq!(
+            senders,
+            vec![("tb1p-bob".into(), 1), ("tb1p-alice".into(), 2), (s.address.clone(), 1)]
+        );
+    }
+
+    #[test]
+    fn exclusion_set_filters_and_persists_only_exclusions() {
+        let mut s = store_with_notes();
+        assert_eq!(s.visible_notes().count(), 4);
+        s.set_excluded("tb1p-alice", true);
+        s.set_excluded("tb1p-alice", true); // no dupes
+        assert_eq!(s.excluded_senders, vec!["tb1p-alice".to_string()]);
+        assert_eq!(s.visible_notes().count(), 2);
+        // A brand-new sender is visible without any state change.
+        s.notes.push(note("ee", true, Some("tb1p-carol")));
+        assert_eq!(s.visible_notes().count(), 3);
+        s.set_excluded("tb1p-alice", false);
+        assert!(s.excluded_senders.is_empty());
+        assert_eq!(s.visible_notes().count(), 5);
+    }
+
+    #[test]
+    fn unread_counts_received_until_marked_seen() {
+        let mut s = store_with_notes();
+        assert_eq!(s.unread_count(), 3); // own note never counts
+        assert_eq!(s.mark_seen(), 3);
+        assert_eq!(s.unread_count(), 0);
+        assert_eq!(s.mark_seen(), 0); // idempotent
+        s.notes.push(note("ee", true, Some("tb1p-carol")));
+        assert_eq!(s.unread_count(), 1);
+    }
 }
