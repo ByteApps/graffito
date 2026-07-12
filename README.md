@@ -1,11 +1,11 @@
 # <img src="assets/icon/icon.svg" alt="" width="42" align="top" /> Chain Notes
 
-**Bitcoin · Notes · Mac / iOS / Android** — your notebook on the bitcoin blockchain, in a native app that goes where you go.
+**Bitcoin · Notes · Mac / iOS / Android** — your notebooks on the bitcoin blockchain, in a native app that goes where you go.
 
-Chain Notes writes personal notes into real bitcoin transactions — public ones anyone can read, private ones only your key can open, and directed notes delivered to any taproot address like unstoppable mail. This is the online, full-featured peer of the [Passport Prime app](https://github.com/ObjSal/prime-chain-notes): the same protocol, byte-identical transactions, but with its own keys, direct broadcasting, and a native interface on Mac, iPhone, and Android. Lose the device, keep the key — the entire notebook rebuilds itself from the chain.
+Chain Notes writes personal notes into real bitcoin transactions — public ones anyone can read, private ones only your key can open, and directed notes delivered to any taproot address like unstoppable mail. This is the online, full-featured peer of the [Passport Prime app](https://github.com/ObjSal/prime-chain-notes): the same protocol, byte-identical transactions, but with its own keys, direct broadcasting, and a native interface on Mac, iPhone, and Android. Keep as many **notebooks** as you like — each its own address from the same seed, with its own notes, balance, and name. Lose the device, keep the key — every notebook rebuilds itself from the chain.
 
 <p align="center">
-  <img src="screenshots/home.png" alt="Home — balance, address QR, and the notebook" width="290">
+  <img src="screenshots/home.png" alt="A notebook — balance, address QR, and its notes" width="290">
   &nbsp;
   <img src="screenshots/compose.png" alt="Compose — live cost preview, fee tiers, coin control" width="290">
   &nbsp;
@@ -14,11 +14,12 @@ Chain Notes writes personal notes into real bitcoin transactions — public ones
 
 ## Features
 
-- **Your key, your way** — create a 12/18/24-word seed in-app with a backup-and-quiz flow, or import what you have: BIP-39 words (12/18/24, with autocomplete), xprv, WIF, or raw hex — typed, scanned from QR (SeedQR included), or loaded from file. Hierarchical keys get a paginated account picker, switchable anytime.
+- **Notebooks** — one seed, many notebooks: the main screen is your list of them, each a separate BIP-86 account with its own address, notes, and balance. Create one and pick a fresh or already-used address, name it, archive it when it's done, and filter a notebook's notes by who sent them.
+- **Your key, your way** — create a 12/18/24-word seed in-app with a backup-and-quiz flow, or import what you have: BIP-39 words (12/18/24, with autocomplete), xprv, WIF, or raw hex — typed, scanned from QR (SeedQR included), or loaded from file. Hierarchical keys open as notebooks you switch between anytime.
 - **Keys live in the platform vault** — the macOS Keychain behind Touch ID, iOS Keychain, Android Keystore. Reveal always re-authenticates.
 - **Watch-only mode** — import just an xpub or descriptor for a key-less notebook: balance and public notes visible, private bodies sealed. Everything that needs a signature — sweep, consolidate, fee bumps, even public-note compose — builds a PSBT your hardware wallet signs (verified against a real signer implementation), with an optional separate fee wallet.
 - **Serious compose tools** — live cost and change preview, fee tiers plus custom rates, full **coin control** with per-coin explorer links, a custom change address, and a **gift amount** to send chosen sats along with a directed note.
-- **Stay on top of your transactions** — an Activity screen with rebroadcast and RBF speed-up for stuck transactions, a Coins screen with one-tap consolidate, and a guided sweep flow.
+- **Stay on top of your transactions** — a wallet-wide Activity feed across every notebook with rebroadcast and RBF speed-up for stuck transactions, a wallet-wide Coins screen, one-tap consolidate that gathers the whole wallet into a single coin, and a guided sweep that empties every notebook to an address you pick.
 - **Your infrastructure or theirs** — pick your Bitcoin node (mempool.space, Blockstream, or your own Esplora-compatible endpoint) and your block explorer, per network, right in Settings.
 - **Every network** — mainnet, testnet4, signet, and regtest. Verified live on testnet4, including a directed private note decrypted by the Passport Prime app's own core.
 - **Text editing that feels native** — right-click menus and every shortcut on the Mac; on iOS/Android an edit bubble with the platform's own trigger rules, and paste that lands exactly at the cursor.
