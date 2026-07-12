@@ -111,6 +111,12 @@ pub struct TxRecord {
     /// same spend at a higher rate.
     pub inputs: Vec<TxInput>,
     pub dest_spk_hex: String,
+    /// Owning account per input (parallel to `inputs`) for MULTI-KEY
+    /// records (wallet sweep/consolidate) — a bump must re-sign each
+    /// input with its own account's key. Empty = single-key record
+    /// (every legacy record), bumped with the active identity.
+    #[serde(default)]
+    pub input_accounts: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,6 +389,7 @@ impl Store {
             dest,
             inputs,
             dest_spk_hex,
+            input_accounts: Vec::new(),
         });
     }
 

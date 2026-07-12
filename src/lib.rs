@@ -3173,9 +3173,52 @@ pub fn run() {
             w.set_bump_error("no identity".into());
             return;
         };
+        // Multi-key records (wallet sweep/consolidate) carry per-input
+        // owners; re-sign each input with its own account's key.
+        let owner_accounts: Vec<u32> = s
+            .store
+            .as_ref()
+            .and_then(|st| st.txs.iter().find(|t| t.txids.iter().any(|x| x == &ref_id)))
+            .map(|t| t.input_accounts.clone())
+            .unwrap_or_default();
         let result: Result<(String, String, u64), app_core::Error> = if is_note {
             app_core::compose::bump_fee(s.store.as_mut().unwrap(), &identity, net, &ref_id, new_rate)
                 .map(|c| (c.tx.raw_hex.clone(), c.tx.txid_hex.clone(), c.tx.fee))
+        } else if !owner_accounts.is_empty() {
+            let mut distinct = owner_accounts.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            let idents: Result<Vec<(u32, app_core::notes_core::bundle::Identity)>, app_core::Error> =
+                s.material
+                    .as_deref()
+                    .ok_or_else(|| app_core::Error::Store("no key material".into()))
+                    .and_then(|m| {
+                        parse_key_material(m, net)
+                            .map_err(|e| app_core::Error::Store(format!("{e}")))
+                    })
+                    .and_then(|material| {
+                        distinct
+                            .iter()
+                            .map(|a| {
+                                realize(&material, net, *a)
+                                    .map_err(|e| app_core::Error::Store(format!("{e}")))
+                                    .and_then(|i| {
+                                        i.full().map(|f| (*a, f.clone_fields())).ok_or_else(|| {
+                                            app_core::Error::Store("watch key can't bump".into())
+                                        })
+                                    })
+                            })
+                            .collect()
+                    });
+            idents.and_then(|idents| {
+                app_core::compose::bump_raw_tx_multi(
+                    s.store.as_mut().unwrap(),
+                    &idents,
+                    &ref_id,
+                    new_rate,
+                )
+                .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee))
+            })
         } else {
             app_core::compose::bump_raw_tx(s.store.as_mut().unwrap(), &identity, &ref_id, new_rate)
                 .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee))
@@ -3376,6 +3419,10 @@ pub fn run() {
                                 }
                             }
                         }
+                        let input_accounts: Vec<u32> = idents
+                            .iter()
+                            .flat_map(|(a, _, coins)| std::iter::repeat(*a).take(coins.len()))
+                            .collect();
                         if let Some(store) = s.store.as_mut() {
                             store.record_tx(
                                 "sweep",
@@ -3389,6 +3436,9 @@ pub fn run() {
                                 dest_spk_hex,
                                 now(),
                             );
+                            if let Some(rec) = store.txs.last_mut() {
+                                rec.input_accounts = input_accounts;
+                            }
                         }
                         s.save_store();
                         println!(
@@ -3586,6 +3636,13 @@ pub fn run() {
                 hex::encode(&dest_spk),
                 now(),
             );
+            if let Some(rec) = dstore.txs.last_mut() {
+                rec.input_accounts = wc
+                    .sources
+                    .iter()
+                    .flat_map(|(a, coins, _)| std::iter::repeat(*a).take(coins.len()))
+                    .collect();
+            }
             // Sources' inputs lock (the dest store handles its own below).
             for (account, coins, _) in &wc.sources {
                 if *account == wc.dest_account {
