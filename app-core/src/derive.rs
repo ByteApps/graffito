@@ -11,12 +11,8 @@
 
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::secp256k1::Secp256k1;
-use hkdf::Hkdf;
 use notes_core::bundle::Identity;
-use notes_core::keys::xonly_pubkey;
-use notes_core::taproot::{taproot_tweak_pubkey, taproot_tweak_seckey};
 use notes_core::Network;
-use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::Error;
@@ -84,25 +80,21 @@ pub fn leaf_from_account(account: &Xpriv, index: u32) -> Result<[u8; 32], Error>
 }
 
 /// The FROZEN note-encryption key rule — identical for all import formats.
+/// The rule LIVES in notes-core now (relocated for the recovery-seeds
+/// feature so device bip86 notebooks share this exact code path); this
+/// delegation is pinned byte-identical by `enc_key_frozen_vector` and the
+/// notes-core-side vector — both implementations were also cross-checked
+/// against an independent HKDF at relocation time.
 pub fn enc_key_from_leaf(leaf_secret: &[u8; 32]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(Some(ENC_SALT), leaf_secret);
-    let mut out = [0u8; 32];
-    hk.expand(ENC_INFO, &mut out).expect("32 bytes is a valid HKDF length");
-    out
+    notes_core::keys::enc_key_from_leaf(leaf_secret)
 }
 
 /// Leaf internal-key secret → full notes-core Identity (internal/output
-/// x-only keys, BIP-341 tweaked signing key, enc key).
+/// x-only keys, BIP-341 tweaked signing key, enc key). Delegates to
+/// notes-core's `Identity::from_leaf_secret` — the same constructor the
+/// Prime app's bip86 notebooks use, byte-identical by construction.
 pub fn identity_from_leaf(leaf_secret: &[u8; 32]) -> Result<Identity, Error> {
-    let (internal_x, _) = xonly_pubkey(leaf_secret)?;
-    let (output_x, _) = taproot_tweak_pubkey(&internal_x, None)?;
-    let tweaked_seckey = taproot_tweak_seckey(leaf_secret, None)?;
-    Ok(Identity {
-        internal_x,
-        output_x,
-        tweaked_seckey,
-        enc_key: enc_key_from_leaf(leaf_secret),
-    })
+    Identity::from_leaf_secret(leaf_secret).map_err(Error::Notes)
 }
 
 /// BIP-39 seed bytes (mnemonic + empty passphrase) → leaf secret.

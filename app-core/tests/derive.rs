@@ -163,3 +163,56 @@ fn watch_xpub_import_matches_full_identity() {
         Err(app_core::Error::XpubNetwork)
     ));
 }
+
+/// Recovery-seeds interop (PLAN-chain-notes-seed-rotation.md): a Prime
+/// device seed's 24 words, imported through OUR normal mnemonic path,
+/// must land on the byte-identical leaf, enc key, and address that the
+/// device derives via notes-core's seeds pipeline. This is the whole
+/// point of the feature — pinned here so neither side can drift.
+#[test]
+fn prime_recovery_seed_words_import_identically() {
+    use app_core::derive::leaf_from_mnemonic;
+    use app_core::notes_core::bundle::Identity as CoreIdentity;
+    use app_core::notes_core::seeds;
+
+    let mut app_seed = [0u8; 32];
+    for (i, b) in app_seed.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+
+    for (seed_index, account, index) in [(0u32, 0u32, 0u32), (0, 1, 2), (1, 0, 0), (7, 3, 5)] {
+        // Device side: app seed → words → BIP-86 leaf (notes-core).
+        let words = seeds::seed_mnemonic(&app_seed, seed_index).unwrap();
+        let device_leaf =
+            seeds::derive_leaf(&app_seed, seed_index, Network::Mainnet, account, index).unwrap();
+        let device_id = CoreIdentity::from_leaf_secret(&device_leaf).unwrap();
+
+        // App side: the SAME words through the normal import pipeline.
+        let mnemonic = bip39::Mnemonic::parse(&*words).unwrap();
+        let app_leaf = leaf_from_mnemonic(&mnemonic, Network::Mainnet, account, index).unwrap();
+        let app_id = identity_from_leaf(&app_leaf).unwrap();
+
+        assert_eq!(app_leaf, device_leaf, "leaf s{seed_index} a{account} i{index}");
+        assert_eq!(app_id.enc_key, device_id.enc_key, "enc key");
+        assert_eq!(app_id.output_x, device_id.output_x, "output key");
+        assert_eq!(app_id.tweaked_seckey, device_id.tweaked_seckey, "signing key");
+    }
+
+    // And the notes-core frozen pipeline vector holds through our path too.
+    let words = seeds::seed_mnemonic(&app_seed, 0).unwrap();
+    let mnemonic = bip39::Mnemonic::parse(&*words).unwrap();
+    let leaf = leaf_from_mnemonic(&mnemonic, Network::Mainnet, 0, 0).unwrap();
+    let ident = identity_from_leaf(&leaf).unwrap();
+    let ident = app_core::identity::realize(
+        &app_core::identity::parse_key_material(&words, Network::Mainnet).unwrap(),
+        Network::Mainnet,
+        0,
+        0,
+    )
+    .map(|i| (i.address.clone(), i.expect_full().enc_key))
+    .map(|(addr, enc)| {
+        assert_eq!(addr, "bc1pjezt70dslyv2pfglhncglc3granc7wmgkz5j4u5eyyx92su5ghsqaqxt88");
+        assert_eq!(enc, ident.enc_key);
+    });
+    ident.unwrap();
+}
