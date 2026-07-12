@@ -251,9 +251,12 @@ DEVICE-LEVEL now (`config.json` "chunk", `State.chunk`): activate()
 stamps it onto every loaded store, so the Settings pill is truly
 wallet-wide (stores of users who never touched it keep their value).
 The "Change account…" row is GONE (the notebook list IS the account
-switcher). Wallet-consolidate RBF caveat: the TxRecord's
-Speed-up would re-sign with only the dest key and fail broadcast
-harmlessly; Rebroadcast works.
+switcher). Multi-key RBF WORKS: wallet
+sweep/consolidate records carry per-input owners
+(`TxRecord.input_accounts`, serde-default — legacy records stay
+single-key), and Speed-up re-signs each input with its own account's
+key (`compose::bump_raw_tx_multi`, host-tested with per-owner
+rust-bitcoin signature verification).
 
 **Identity lifecycle:** key material verbatim in the keychain; BIP-86
 account chosen on a paginated picker after hierarchical imports; later
