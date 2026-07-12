@@ -2669,12 +2669,15 @@ export component AppWindow inherits Window {
             text: root.account-pick-mode == "notebook"
                 ? "Name it, then pick its address. Used addresses already have on-chain history — picking one adopts its notes."
                 : (root.account-pick-mode == "wconsol"
-                    ? "Where should every coin end up? Pick one of your notebooks, or a used/new address (it becomes a notebook)."
+                    ? "Where should every coin end up? Pick one of your notebooks, or a used/new address — it becomes a notebook you can name from the list."
                     : "One seed holds many BIP-86 accounts. Each is a completely separate notebook: its own address, its own encryption key, its own notes.");
         }
-        // Create / consolidate-dest modes: the name lives right here —
-        // tapping an address acts immediately (no second dialog).
-        if root.account-pick-mode != "switch": EditField {
+        // Create mode only: the name lives right here — tapping an
+        // address creates immediately (no second dialog). The consolidate
+        // picker deliberately has NO name field: most picks are existing
+        // notebooks (a typed name would be dead input); a fresh destination
+        // starts as the address short form, renameable from the list.
+        if root.account-pick-mode == "notebook": EditField {
             text <=> root.nb-create-name;
             placeholder-text: "name (optional — empty = address short form)";
         }
