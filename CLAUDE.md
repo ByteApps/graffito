@@ -258,6 +258,26 @@ single-key), and Speed-up re-signs each input with its own account's
 key (`compose::bump_raw_tx_multi`, host-tested with per-owner
 rust-bitcoin signature verification).
 
+**Async refresh** (Sal 2026-07-11: opening a notebook took 3-4 s on the
+phone — the tap handler scanned the chain synchronously and the screen
+never painted until it finished): `refresh_async` snapshots (base,
+address, network, pending txids), paints immediately with "syncing…",
+fetches the bundle + pending-tx statuses on a worker thread, and applies
+on the UI thread via `REFRESH_RESULTS` (Mutex) + the
+`apply-pending-refresh` trampoline callback (invoked with
+`upgrade_in_event_loop`); a stale result (user switched notebooks
+mid-scan) is dropped by address guard (`cb: refresh stale-drop`). Used by
+the tap-visible paths: open-notebook, home ↻, boot, pick-account,
+set-network, quiz-complete, iCloud restore. Post-broadcast refreshes
+stay synchronous for now (perf-tests task tracks the rest).
+
+**Origin-aware back** (Sal 2026-07-11): settings + activity return to
+the screen they were opened FROM (`return-screen`, set by their open
+callbacks: the notebook list or a notebook's home) — list → settings →
+back lands on the list. The settings Identity card is wallet-level only
+(kind · network · notebook count; the per-notebook account/address
+display is gone).
+
 **Identity lifecycle:** key material verbatim in the keychain; BIP-86
 account chosen on a paginated picker after hierarchical imports; later
 switching = the notebook list (each account = its own address AND enc

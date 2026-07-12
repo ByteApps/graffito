@@ -1217,6 +1217,13 @@ export component AppWindow inherits Window {
     callback set-explorer-custom(string);
     callback reveal-backup();
     callback go-home();
+    // Internal: a background scan finished — Rust invokes this from the
+    // event loop to apply the result (never called from UI elements).
+    callback apply-pending-refresh();
+    // Where settings/activity return on back: the screen they were opened
+    // from (the notebook list or a notebook's home). Set by their open
+    // callbacks in Rust.
+    in-out property <int> return-screen: 4;
 
     // ---------- notebooks (screen 17 = the main list; 4 = one notebook) ----------
     in-out property <[NotebookItem]> notebooks;
@@ -1284,7 +1291,12 @@ export component AppWindow inherits Window {
         if (root.screen == 1 || root.screen == 2) { root.screen = 0; return true; }
         if (root.screen == 4) { root.open-notebooks(); return true; }
         if (root.screen == 3) { root.screen = 2; return true; }
-        if (root.screen == 5 || root.screen == 8 || root.screen == 11) { root.go-home(); return true; }
+        if (root.screen == 5) { root.go-home(); return true; }
+        if (root.screen == 8 || root.screen == 11) {
+            // Back to wherever settings/activity was opened from.
+            if (root.return-screen == 17) { root.open-notebooks(); } else { root.go-home(); }
+            return true;
+        }
         if (root.screen == 6) {
             // Clear the typed address on the way back — it's saved in recents
             // now, so leaving it in the field is redundant. Status too: its
@@ -2468,16 +2480,9 @@ export component AppWindow inherits Window {
                 alignment: start;
         SettingsCard {
             title: "Identity";
+            // Wallet-level on purpose: no per-notebook account or address
+            // here (notebooks own those); kind · network · notebook count.
             subtitle: root.settings-identity;
-            Mono {
-                text: root.address;
-                font-size: 10px;
-                color: Pal.muted;
-                wrap: no-wrap;
-                overflow: elide;
-            }
-            // (The old "Change account…" row is gone — the notebook list IS
-            // the account switcher now.)
             GhostButton {
                 text: "Switch identity — new seed or different key…";
                 clicked => { root.show-reset-confirm = true; }

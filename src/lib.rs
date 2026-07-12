@@ -1466,17 +1466,20 @@ fn update_home(w: &AppWindow, st: &State) {
             .unwrap_or(false),
     );
     if let Some(i) = &st.ident {
+        let (active_n, archived_n) = st
+            .notebooks
+            .as_ref()
+            .map(|ix| (ix.active().count(), ix.archived_count()))
+            .unwrap_or((0, 0));
         w.set_settings_identity(
             format!(
-                "{}{}{} · {}",
+                "{}{} · {} · {} notebook{}{}",
                 i.kind,
                 if i.is_watch() { " · watch-only" } else { "" },
-                if matches!(i.kind, "mnemonic" | "xprv") {
-                    format!(" · account {}", i.account)
-                } else {
-                    String::new()
-                },
-                st.network.as_str()
+                st.network.as_str(),
+                active_n,
+                if active_n == 1 { "" } else { "s" },
+                if archived_n > 0 { format!(" ({archived_n} archived)") } else { String::new() }
             )
             .into(),
         );
@@ -1562,6 +1565,123 @@ fn refresh_wallet_stores(st: &State) -> usize {
         }
     }
     scanned
+}
+
+/// One finished background scan, waiting to be applied on the UI thread.
+/// `address` guards staleness: if the user switched notebooks while the
+/// worker ran, the result is dropped (apply_bundle would refuse anyway —
+/// this just keeps the failure silent and correct).
+struct RefreshResult {
+    address: String,
+    bundle: Result<app_core::notes_core::bundle::SyncBundle, String>,
+    /// (txid, confirmed?) for the pending sweep/consolidate records that
+    /// existed at snapshot time — fetched on the worker so
+    /// resolve_spend_statuses never blocks the UI thread.
+    statuses: Vec<(String, Option<bool>)>,
+}
+
+static REFRESH_RESULTS: std::sync::Mutex<Vec<RefreshResult>> = std::sync::Mutex::new(Vec::new());
+
+/// [`refresh`] with the network half on a worker thread (Sal 2026-07-11:
+/// opening a notebook took 3-4 s on the phone because the tap handler
+/// scanned synchronously — the screen never painted until it finished).
+/// The screen paints immediately with "syncing…", the worker fetches the
+/// bundle + pending-tx statuses, and the result comes back through
+/// [`REFRESH_RESULTS`] + the `apply-pending-refresh` trampoline callback
+/// (the UI thread applies it with full State access, exactly like the
+/// synchronous refresh did).
+fn refresh_async(w: &AppWindow, st: &mut State) {
+    if st.ident.is_none() || st.store.is_none() {
+        return;
+    }
+    let Some(base) = st.base_url() else {
+        w.set_status("no Bitcoin node for this network — set one in Settings".into());
+        return;
+    };
+    let address = st.ident.as_ref().unwrap().address.clone();
+    let network = st.network;
+    let pending_txids: Vec<String> = st
+        .store
+        .as_ref()
+        .unwrap()
+        .txs
+        .iter()
+        .filter(|t| t.status == NoteStatus::Pending)
+        .flat_map(|t| t.txids.iter().cloned())
+        .collect();
+    w.set_status("syncing…".into());
+    let weak = w.as_weak();
+    std::thread::spawn(move || {
+        let client = ChainClient::new(HttpTransport::new(base), network);
+        let bundle = client.build_bundle(&address, None).map_err(|e| format!("{e}"));
+        let statuses = pending_txids
+            .iter()
+            .map(|t| (t.clone(), client.fetch_tx_status(t)))
+            .collect();
+        REFRESH_RESULTS
+            .lock()
+            .expect("refresh results mutex")
+            .push(RefreshResult { address, bundle, statuses });
+        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_refresh());
+    });
+}
+
+/// The UI-thread half of [`refresh_async`]: identical bookkeeping to the
+/// synchronous [`refresh`], fed from the worker's results.
+fn apply_refresh_results(w: &AppWindow, st: &mut State) {
+    let results: Vec<RefreshResult> =
+        REFRESH_RESULTS.lock().expect("refresh results mutex").drain(..).collect();
+    for r in results {
+        if st.ident.as_ref().map(|i| i.address.as_str()) != Some(r.address.as_str()) {
+            println!("cb: refresh stale-drop address={}", &r.address[..12.min(r.address.len())]);
+            continue;
+        }
+        match r.bundle {
+            Ok(bundle) => {
+                st.fees = Some(bundle.fee_rates.clone());
+                st.usd = bundle.btc_usd;
+                let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
+                let output_x = st.ident.as_ref().unwrap().output_x();
+                let network = st.network;
+                let applied = match &keyed {
+                    Some(identity) => {
+                        st.store.as_mut().unwrap().apply_bundle(&bundle, identity, network)
+                    }
+                    None => st.store.as_mut().unwrap().apply_bundle_watch(&bundle, &output_x, network),
+                };
+                match applied {
+                    Ok(stats) => {
+                        let n = st
+                            .store
+                            .as_mut()
+                            .unwrap()
+                            .resolve_spend_statuses(|t| {
+                                r.statuses.iter().find(|(x, _)| x == t).and_then(|(_, s)| *s)
+                            });
+                        if n > 0 {
+                            println!("cb: spend-confirmed n={n}");
+                        }
+                        println!(
+                            "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
+                            stats.notes_seen,
+                            stats.notes_new,
+                            stats.orphaned,
+                            st.store.as_ref().unwrap().balance(),
+                            st.store.as_ref().unwrap().tip_height
+                        );
+                        st.save_store();
+                        w.set_status(format!("synced · {} notes", stats.notes_seen).into());
+                    }
+                    Err(e) => w.set_status(format!("apply failed: {e}").into()),
+                }
+            }
+            Err(e) => {
+                println!("cb: refresh err={e}");
+                w.set_status("couldn't reach the network — tap refresh to retry".into());
+            }
+        }
+        update_home(w, st);
+    }
 }
 
 fn refresh(w: &AppWindow, st: &mut State) {
@@ -2604,7 +2724,7 @@ pub fn run() {
                     let st_boot = st.clone();
                     slint::Timer::single_shot(std::time::Duration::from_millis(300), move || {
                         if let Some(win) = w.upgrade() {
-                            refresh(&win, &mut st_boot.borrow_mut());
+                            refresh_async(&win, &mut st_boot.borrow_mut());
                         }
                     });
                 }
@@ -2738,7 +2858,7 @@ pub fn run() {
                         // notebook index yet — land on the (empty) list, not
                         // an unlisted account's home.
                         go_home_or_list(&w, &s);
-                        refresh(&w, &mut s);
+                        refresh_async(&w, &mut s);
                     }
                     Err(e) => w.set_status(format!("restore: {e}").into()),
                 }
@@ -2798,7 +2918,7 @@ pub fn run() {
                 // onboarding must not auto-create one) — land on the empty
                 // list; the first notebook is created deliberately there.
                 go_home_or_list(&w, &s);
-                refresh(&w, &mut s);
+                refresh_async(&w, &mut s);
             }
             Err(e) => w.set_status(format!("{e}").into()),
         }
@@ -2970,7 +3090,13 @@ pub fn run() {
     });
 
     cb!(on_refresh, |w, s| {
-        refresh(&w, &mut s);
+        refresh_async(&w, &mut s);
+    });
+
+    // Trampoline: a finished background scan invokes this from the event
+    // loop; the UI thread applies it with full State access.
+    cb!(on_apply_pending_refresh, |w, s| {
+        apply_refresh_results(&w, &mut s);
     });
 
     cb!(on_open_note, |w, s, id: SharedString| {
@@ -3054,6 +3180,7 @@ pub fn run() {
 
     cb!(on_open_activity, |w, s| {
         println!("cb: open-activity");
+        w.set_return_screen(if w.get_screen() == 17 { 17 } else { 4 });
         update_activity(&w, &s);
         w.set_status("".into());
         w.set_screen(11);
@@ -4778,6 +4905,7 @@ pub fn run() {
     });
 
     cb!(on_settings_open, |w, s| {
+        w.set_return_screen(if w.get_screen() == 17 { 17 } else { 4 });
         println!("cb: settings-open");
         w.set_reveal_text("".into());
         w.set_status("".into());
@@ -4924,7 +5052,7 @@ pub fn run() {
                 w.set_status("".into());
                 w.set_screen(4);
                 update_home(&w, &s);
-                refresh(&w, &mut s);
+                refresh_async(&w, &mut s);
             }
             Err(e) => w.set_status(format!("{e}").into()),
         }
@@ -5010,7 +5138,7 @@ pub fn run() {
             match activate(&mut s, &m, false) {
                 Ok(()) => {
                     update_home(&w, &s);
-                    refresh(&w, &mut s);
+                    refresh_async(&w, &mut s);
                 }
                 Err(e) => w.set_status(format!("network switch: {e}").into()),
             }
@@ -5164,10 +5292,9 @@ pub fn run() {
         println!("cb: open-notebook account={}", s.account);
         match activate(&mut s, &material, false) {
             Ok(()) => {
-                w.set_status("".into());
                 update_home(&w, &s);
-                w.set_screen(4);
-                refresh(&w, &mut s);
+                w.set_screen(4); // paint first — the scan runs in the background
+                refresh_async(&w, &mut s);
             }
             Err(e) => w.set_status(format!("{e}").into()),
         }
