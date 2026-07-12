@@ -121,10 +121,6 @@ struct State {
     notebooks: Option<NotebookIndex>,
     notebooks_fp8: Option<String>,
     nb_addrs: Vec<(u32, String, String)>,
-    /// The create-notebook picker was opened FROM the sweep destination
-    /// picker — the created notebook becomes the sweep dest (and the
-    /// active account must NOT switch: the sweep spends the current one).
-    create_for_sweep: bool,
     /// Wallet-level consolidate in progress: sources snapshotted at open,
     /// destination + fee filled in by the picker, consumed by confirm.
     wconsol: Option<WConsol>,
@@ -689,8 +685,24 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
     let net = st.network;
     let Some(store) = st.store.as_ref() else { return };
     let exb = st.explorer_base();
-    let spendable: Vec<&app_core::store::LedgerUtxo> =
-        store.utxos.iter().filter(|u| !u.pending_spend).collect();
+    // A keyed SWEEP is wallet-level (leaving the wallet): every active
+    // notebook's coins ride. Consolidate (kind) and watch flows stay on
+    // the active store — watch has exactly one notebook anyway.
+    let wallet_mode = w.get_sweep_kind().as_str() == "sweep"
+        && st.ident.as_ref().map(|i| !i.is_watch()).unwrap_or(false);
+    let spendable: Vec<app_core::store::LedgerUtxo> = if wallet_mode {
+        let mut v = Vec::new();
+        if let Some(ix) = &st.notebooks {
+            for m in ix.active() {
+                if let Some(s2) = notebook_store(st, m.account) {
+                    v.extend(s2.utxos.iter().filter(|u| !u.pending_spend).cloned());
+                }
+            }
+        }
+        v
+    } else {
+        store.utxos.iter().filter(|u| !u.pending_spend).cloned().collect()
+    };
     let total: u64 = spendable.iter().map(|u| u.value).sum();
     let n = spendable.len();
     let mut rows: Vec<SpendCoin> = spendable
@@ -831,12 +843,30 @@ fn load_backend_settings(w: &AppWindow, st: &State) {
 /// Build the unified activity list (note txs + sweep/consolidate),
 /// actionable (pending) first, then newest.
 fn update_activity(w: &AppWindow, st: &State) {
-    let Some(store) = &st.store else { return };
     let net = st.network;
     let exb = st.explorer_base();
     let ex = exb.as_deref();
     let mut items: Vec<(u64, bool, ActivityItem)> = Vec::new(); // (created, confirmed, item)
 
+    // Wallet-wide: every ACTIVE notebook's notes + txs, tagged. Only the
+    // active notebook's rows are actionable (bump/rebroadcast sign with
+    // the live store + key); the rest keep the Explorer link.
+    let current = st.ident.as_ref().map(|i| i.account);
+    let mut sources: Vec<(String, bool, Store)> = Vec::new(); // (tag, actionable, store)
+    if let Some(ix) = &st.notebooks {
+        for m in ix.active() {
+            let Some(store) = notebook_store(st, m.account) else { continue };
+            sources.push((
+                st.notebook_display_name(m.account),
+                current == Some(m.account),
+                store,
+            ));
+        }
+    } else if let Some(store) = &st.store {
+        sources.push((String::new(), true, store.clone()));
+    }
+
+    for (tag, actionable, store) in &sources {
     for n in &store.notes {
         let Some(txid) = n.txids.last() else { continue };
         let kind = format!(
@@ -867,8 +897,9 @@ fn update_activity(w: &AppWindow, st: &State) {
                 fee_line: fee_line_str(n.fee, n.vsize).into(),
                 status: status.into(),
                 explorer: explorer_tx_url(ex, net, txid).into(),
-                pending: n.status == NoteStatus::Pending && n.raw_hex.is_some(),
+                pending: *actionable && n.status == NoteStatus::Pending && n.raw_hex.is_some(),
                 replaced: replaced_label(n.txids.len()).into(),
+                notebook: tag.clone().into(),
             },
         ));
     }
@@ -881,7 +912,7 @@ fn update_activity(w: &AppWindow, st: &State) {
             NoteStatus::Orphaned => "orphaned",
         };
         let title = if t.dest == "self" {
-            format!("Consolidate within this notebook · {} sats", t.value)
+            format!("Consolidate · {} sats arrived here", t.value)
         } else {
             format!("To {} · {} sats", t.dest, t.value)
         };
@@ -897,10 +928,12 @@ fn update_activity(w: &AppWindow, st: &State) {
                 fee_line: fee_line_str(Some(t.fee), Some(t.vsize)).into(),
                 status: status.into(),
                 explorer: explorer_tx_url(ex, net, txid).into(),
-                pending: t.status == NoteStatus::Pending && t.raw_hex.is_some(),
+                pending: *actionable && t.status == NoteStatus::Pending && t.raw_hex.is_some(),
                 replaced: replaced_label(t.txids.len()).into(),
+                notebook: tag.clone().into(),
             },
         ));
+    }
     }
 
     // Actionable (unconfirmed) first, then newest created.
@@ -1150,29 +1183,6 @@ fn go_home_or_list(w: &AppWindow, st: &State) {
         update_notebook_list(w, st);
         w.set_screen(17);
     }
-}
-
-/// The sweep destination picker's "My notebooks" rows: every ACTIVE
-/// notebook except the current one (sweep-to-self is consolidate),
-/// name + address short + balance.
-fn sweep_dest_rows(st: &State) -> Vec<NotebookItem> {
-    let Some(ix) = &st.notebooks else { return vec![] };
-    let current = st.ident.as_ref().map(|i| i.account);
-    ix.active()
-        .filter(|m| current != Some(m.account))
-        .filter_map(|m| {
-            let (_, address, _) = st.nb_addrs.iter().find(|(a, ..)| *a == m.account)?;
-            let balance = notebook_store(st, m.account).map(|s| s.balance()).unwrap_or(0);
-            Some(NotebookItem {
-                account: m.account as i32,
-                name: st.notebook_display_name(m.account).into(),
-                snippet: "".into(),
-                meta: format!("{} · {} sats", addr_short(address), commas(balance)).into(),
-                unread: "".into(),
-                active: false,
-            })
-        })
-        .collect()
 }
 
 /// Route a validated sweep destination to the compose-like sweep screen:
@@ -2436,7 +2446,6 @@ pub fn run() {
         notebooks: None,
         notebooks_fp8: None,
         nb_addrs: Vec::new(),
-        create_for_sweep: false,
         wconsol: None,
     }));
     let window = AppWindow::new().expect("window");
@@ -3282,19 +3291,53 @@ pub fn run() {
             watch_spend_build(&w, &mut s, "sweep", dest.clone(), recipient.spk.clone(), rate);
             return;
         }
-        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-            w.set_status("no identity".into());
+        // Wallet-level sweep: gather every active notebook's coins + keys
+        // (sweep = leaving the wallet — one multi-key tx, like consolidate
+        // but with an external destination).
+        let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
             return;
         };
-        let store = s.store.as_mut().unwrap();
-        let inputs = spendable_inputs(store);
+        let Ok(material) = parse_key_material(&material_str, net) else { return };
+        let mut idents: Vec<(u32, app_core::notes_core::bundle::Identity, Vec<app_core::notes_core::tx::Utxo>)> =
+            Vec::new();
+        if let Some(ix) = &s.notebooks {
+            for m in ix.active() {
+                let Some(store) = notebook_store(&s, m.account) else { continue };
+                let coins = store.available_utxos();
+                if coins.is_empty() {
+                    continue;
+                }
+                let Ok(ident) = realize(&material, net, m.account) else { continue };
+                let Some(full) = ident.full().map(|i| i.clone_fields()) else { continue };
+                idents.push((m.account, full, coins));
+            }
+        }
+        if idents.is_empty() {
+            w.set_status("nothing to sweep".into());
+            return;
+        }
+        let all_inputs: Vec<app_core::store::TxInput> = idents
+            .iter()
+            .flat_map(|(_, _, coins)| coins.iter())
+            .map(|u| {
+                let mut t = u.txid;
+                t.reverse();
+                app_core::store::TxInput { txid: hex::encode(t), vout: u.vout, value: u.value }
+            })
+            .collect();
         let dest_spk_hex = hex::encode(&recipient.spk);
-        let sweep = app_core::notes_core::tx::build_sweep_tx(
-            &store.available_utxos(),
-            &identity.output_x,
+        let sources: Vec<app_core::notes_core::tx::SweepSource> = idents
+            .iter()
+            .map(|(_, id, coins)| app_core::notes_core::tx::SweepSource {
+                utxos: coins,
+                output_x: id.output_x,
+                tweaked_seckey: &id.tweaked_seckey,
+            })
+            .collect();
+        let sweep = app_core::notes_core::tx::build_sweep_tx_multi(
+            &sources,
             recipient.spk,
             rate,
-            &identity.tweaked_seckey,
             app_core::notes_core::keys::generate_aux_rand,
         );
         match sweep {
@@ -3302,18 +3345,68 @@ pub fn run() {
                 let client = ChainClient::new(HttpTransport::new(base), net);
                 match client.broadcast(&tx.raw_hex) {
                     Ok(txid) => {
-                        for u in &mut store.utxos {
-                            u.pending_spend = true;
+                        // Lock every source's inputs; the record lives in the
+                        // ACTIVE notebook's store (Activity is wallet-wide).
+                        for (account, _, coins) in &idents {
+                            let active = s.ident.as_ref().map(|i| i.account) == Some(*account);
+                            let mark = |store: &mut Store| {
+                                for u in coins {
+                                    let mut t = u.txid;
+                                    t.reverse();
+                                    let txid_hex = hex::encode(t);
+                                    if let Some(l) = store
+                                        .utxos
+                                        .iter_mut()
+                                        .find(|l| l.txid == txid_hex && l.vout == u.vout)
+                                    {
+                                        l.pending_spend = true;
+                                    }
+                                }
+                            };
+                            if active {
+                                if let Some(store) = s.store.as_mut() {
+                                    mark(store);
+                                }
+                            } else if let Some(mut store) = notebook_store(&s, *account) {
+                                mark(&mut store);
+                                if let Some((_, _, fp8)) =
+                                    s.nb_addrs.iter().find(|(a, ..)| *a == *account)
+                                {
+                                    let _ = store.save(&s.store_path_for(fp8));
+                                }
+                            }
                         }
-                        store.record_tx("sweep", txid.clone(), tx.tx.outputs[0].value, tx.fee, tx.vsize as u64, tx.raw_hex.clone(), dest.clone(), inputs, dest_spk_hex, now());
+                        if let Some(store) = s.store.as_mut() {
+                            store.record_tx(
+                                "sweep",
+                                txid.clone(),
+                                tx.tx.outputs[0].value,
+                                tx.fee,
+                                tx.vsize as u64,
+                                tx.raw_hex.clone(),
+                                dest.clone(),
+                                all_inputs,
+                                dest_spk_hex,
+                                now(),
+                            );
+                        }
                         s.save_store();
                         println!(
-                            "cb: sweep txid={txid} value={} fee={}",
-                            tx.tx.outputs[0].value, tx.fee
+                            "cb: sweep txid={txid} value={} fee={} notebooks={}",
+                            tx.tx.outputs[0].value,
+                            tx.fee,
+                            idents.len()
                         );
-                        w.set_status(format!("swept {} sats to {}…", tx.tx.outputs[0].value, &dest[..14.min(dest.len())]).into());
-                        w.set_screen(4); // done — home, like the PSBT flow
-                        update_home(&w, &s);
+                        w.set_status(
+                            format!(
+                                "swept the wallet — {} sats to {}…",
+                                commas(tx.tx.outputs[0].value),
+                                &dest[..14.min(dest.len())]
+                            )
+                            .into(),
+                        );
+                        update_notebook_list(&w, &s);
+                        w.set_screen(17); // wallet-level flow → the list
                     }
                     Err(e) => w.set_status(format!("sweep broadcast failed: {e}").into()),
                 }
@@ -3345,29 +3438,9 @@ pub fn run() {
         w.set_sweep_kind("sweep".into());
         w.set_pick_mode("sweep".into());
         refresh_contacts(&w, &s);
-        w.set_sweep_notebooks(VecModel::from_slice(&sweep_dest_rows(&s)));
         w.set_contact_input("".into());
         w.set_status("".into());
         w.set_screen(7);
-    });
-
-    cb!(on_pick_notebook_dest, |w, s, account: i32| {
-        let account = account.max(0) as u32;
-        let Some(addr) =
-            s.nb_addrs.iter().find(|(a, ..)| *a == account).map(|(_, ad, _)| ad.clone())
-        else {
-            return;
-        };
-        set_sweep_dest(&w, &mut s, addr);
-    });
-
-    cb!(on_sweep_new_notebook, |w, s| {
-        // Create-and-sweep-into: the picker runs in notebook mode, but the
-        // active account must stay put — the sweep spends ITS coins.
-        println!("cb: create-notebook picker open (sweep dest)");
-        s.create_for_sweep = true;
-        w.set_nb_create_name("".into());
-        show_notebook_picker(&w, &s, 0, "notebook");
     });
 
     cb!(on_consolidate_open, |w, s| {
@@ -4749,29 +4822,6 @@ pub fn run() {
             }
             let name = w.get_nb_create_name().trim().to_string();
             println!("cb: create-notebook account={account}");
-            if s.create_for_sweep {
-                // Sweep-into-new: add the notebook WITHOUT switching to it
-                // (the sweep spends the current notebook's coins), then
-                // route straight to the sweep screen with it as dest.
-                s.create_for_sweep = false;
-                ensure_notebook(&mut s, account);
-                if !name.is_empty() {
-                    if let Some(ix) = s.notebooks.as_mut() {
-                        ix.rename(account, &name);
-                        s.save_notebooks();
-                        println!("cb: rename-notebook account={account}");
-                    }
-                }
-                w.set_account_pick_mode("switch".into());
-                w.set_nb_create_name("".into());
-                let Some(addr) =
-                    s.nb_addrs.iter().find(|(a, ..)| *a == account).map(|(_, ad, _)| ad.clone())
-                else {
-                    return;
-                };
-                set_sweep_dest(&w, &mut s, addr);
-                return;
-            }
             let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
                 return;
             };
@@ -4834,18 +4884,12 @@ pub fn run() {
             return;
         }
         if w.get_account_pick_mode() == "notebook" {
-            // Abandon create → back to wherever it was opened from
-            // (the sweep destination picker, or the notebook list).
+            // Abandon create → back to the notebook list, untouched.
             w.set_account_pick_mode("switch".into());
             w.set_nb_create_name("".into());
             w.set_status("".into());
-            if s.create_for_sweep {
-                s.create_for_sweep = false;
-                w.set_screen(7);
-            } else {
-                update_notebook_list(&w, &s);
-                w.set_screen(17);
-            }
+            update_notebook_list(&w, &s);
+            w.set_screen(17);
             return;
         }
         if s.pending_import.take().is_some() {
@@ -5140,7 +5184,7 @@ pub fn run() {
             if balance > 0 {
                 w.set_status(
                     format!(
-                        "this notebook holds {} sats — sweep it first (Settings → Funds)",
+                        "this notebook holds {} sats — consolidate the wallet first (Settings)",
                         commas(balance)
                     )
                     .into(),
