@@ -116,9 +116,10 @@ struct State {
     notebooks: Option<NotebookIndex>,
     notebooks_fp8: Option<String>,
     nb_addrs: Vec<(u32, String, String)>,
-    /// The account chosen in the create-notebook picker, consumed by the
-    /// naming dialog's Create.
-    create_account: Option<u32>,
+    /// The create-notebook picker was opened FROM the sweep destination
+    /// picker — the created notebook becomes the sweep dest (and the
+    /// active account must NOT switch: the sweep spends the current one).
+    create_for_sweep: bool,
 }
 
 /// Watch-mode compose in progress on the sign screen: everything needed
@@ -1123,6 +1124,84 @@ fn go_home_or_list(w: &AppWindow, st: &State) {
         update_notebook_list(w, st);
         w.set_screen(17);
     }
+}
+
+/// The sweep destination picker's "My notebooks" rows: every ACTIVE
+/// notebook except the current one (sweep-to-self is consolidate),
+/// name + address short + balance.
+fn sweep_dest_rows(st: &State) -> Vec<NotebookItem> {
+    let Some(ix) = &st.notebooks else { return vec![] };
+    let current = st.ident.as_ref().map(|i| i.account);
+    ix.active()
+        .filter(|m| current != Some(m.account))
+        .filter_map(|m| {
+            let (_, address, _) = st.nb_addrs.iter().find(|(a, ..)| *a == m.account)?;
+            let balance = notebook_store(st, m.account).map(|s| s.balance()).unwrap_or(0);
+            Some(NotebookItem {
+                account: m.account as i32,
+                name: st.notebook_display_name(m.account).into(),
+                snippet: "".into(),
+                meta: format!("{} · {} sats", addr_short(address), commas(balance)).into(),
+                unread: "".into(),
+                active: false,
+            })
+        })
+        .collect()
+}
+
+/// Route a validated sweep destination to the compose-like sweep screen:
+/// label (notebook name → contact name → bare address), the on-chain
+/// linkage caveat when the destination is one of OUR notebooks (and no
+/// contacts pollution for those), fee tier defaults, screen 16.
+fn set_sweep_dest(w: &AppWindow, st: &mut State, a: String) {
+    let own_account = st.nb_addrs.iter().find(|(_, ad, _)| *ad == a).map(|(acct, ..)| *acct);
+    match own_account {
+        Some(acct) => {
+            println!("cb: sweep-pick to={a} (notebook {acct})");
+            w.set_sweep_to_label(
+                format!(
+                    "Everything to: {} · {}",
+                    st.notebook_display_name(acct),
+                    addr_short(&a)
+                )
+                .into(),
+            );
+            w.set_sweep_dest_note(
+                "Heads up: sweeping between your own notebooks publicly links their addresses on-chain.".into(),
+            );
+        }
+        None => {
+            println!("cb: sweep-pick to={a}");
+            if let Some(store) = &mut st.store {
+                store.touch_contact(&a);
+            }
+            st.save_store();
+            refresh_contacts(w, st);
+            let name = st
+                .store
+                .as_ref()
+                .and_then(|s| s.contacts.iter().find(|c| c.address == a))
+                .map(|c| c.name.clone())
+                .filter(|n| !n.is_empty());
+            w.set_sweep_to_label(
+                match &name {
+                    Some(n) => format!("Everything to: {n} · {a}"),
+                    None => format!("Everything to: {a}"),
+                }
+                .into(),
+            );
+            w.set_sweep_dest_note("".into());
+        }
+    }
+    w.set_sweep_dest(a.into());
+    w.set_sweep_tier(1);
+    let rate = st.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+    w.set_sweep_rate_text(format!("{rate}").into());
+    w.set_sweep_fund_external(false);
+    w.set_sweep_inputs_expanded(false);
+    w.set_status("".into());
+    update_sweep_screen(w, st);
+    w.set_screen(16);
 }
 
 /// A (possibly inactive) notebook's store, read from its file on disk;
@@ -2237,7 +2316,7 @@ pub fn run() {
         notebooks: None,
         notebooks_fp8: None,
         nb_addrs: Vec::new(),
-        create_account: None,
+        create_for_sweep: false,
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -3145,9 +3224,29 @@ pub fn run() {
         w.set_sweep_kind("sweep".into());
         w.set_pick_mode("sweep".into());
         refresh_contacts(&w, &s);
+        w.set_sweep_notebooks(VecModel::from_slice(&sweep_dest_rows(&s)));
         w.set_contact_input("".into());
         w.set_status("".into());
         w.set_screen(7);
+    });
+
+    cb!(on_pick_notebook_dest, |w, s, account: i32| {
+        let account = account.max(0) as u32;
+        let Some(addr) =
+            s.nb_addrs.iter().find(|(a, ..)| *a == account).map(|(_, ad, _)| ad.clone())
+        else {
+            return;
+        };
+        set_sweep_dest(&w, &mut s, addr);
+    });
+
+    cb!(on_sweep_new_notebook, |w, s| {
+        // Create-and-sweep-into: the picker runs in notebook mode, but the
+        // active account must stay put — the sweep spends ITS coins.
+        println!("cb: create-notebook picker open (sweep dest)");
+        s.create_for_sweep = true;
+        w.set_nb_create_name("".into());
+        show_notebook_picker(&w, &s, 0);
     });
 
     cb!(on_consolidate_open, |w, s| {
@@ -3164,6 +3263,7 @@ pub fn run() {
         println!("cb: consolidate-open coins={spendable}");
         w.set_sweep_kind("consolidate".into());
         w.set_sweep_dest(addr.clone().into());
+        w.set_sweep_dest_note("".into());
         w.set_sweep_to_label(format!("Consolidate to your address · {addr}").into());
         w.set_sweep_tier(1);
         let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
@@ -3345,34 +3445,7 @@ pub fn run() {
                     return;
                 }
             }
-            println!("cb: sweep-pick to={a}");
-            if let Some(store) = &mut s.store {
-                store.touch_contact(&a);
-            }
-            s.save_store();
-            refresh_contacts(&w, &s);
-            let name = s
-                .store
-                .as_ref()
-                .and_then(|st| st.contacts.iter().find(|c| c.address == a))
-                .map(|c| c.name.clone())
-                .filter(|n| !n.is_empty());
-            w.set_sweep_to_label(
-                match &name {
-                    Some(n) => format!("Everything to: {n} · {a}"),
-                    None => format!("Everything to: {a}"),
-                }
-                .into(),
-            );
-            w.set_sweep_dest(a.into());
-            w.set_sweep_tier(1);
-            let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
-            w.set_sweep_rate_text(format!("{rate}").into());
-            w.set_sweep_fund_external(false);
-            w.set_sweep_inputs_expanded(false);
-            w.set_status("".into());
-            update_sweep_screen(&w, &mut s);
-            w.set_screen(16);
+            set_sweep_dest(&w, &mut s, a);
             return;
         }
         if addr.as_str() == "self" {
@@ -4310,18 +4383,59 @@ pub fn run() {
 
     cb!(on_pick_account, |w, s, idx: i32| {
         if w.get_account_pick_mode() == "notebook" {
-            // Create flow: the pick chooses the new notebook's address; the
-            // naming dialog (over the picker) finishes or cancels it.
+            // Create flow: the inline name field is already filled (or
+            // deliberately empty) — tapping an address creates right away.
             let account = idx.max(0) as u32;
             if s.notebooks.as_ref().and_then(|ix| ix.get(account)).is_some() {
-                w.set_status("that address is already a notebook".into());
+                return; // row is disabled in the UI; never re-add
+            }
+            let name = w.get_nb_create_name().trim().to_string();
+            println!("cb: create-notebook account={account}");
+            if s.create_for_sweep {
+                // Sweep-into-new: add the notebook WITHOUT switching to it
+                // (the sweep spends the current notebook's coins), then
+                // route straight to the sweep screen with it as dest.
+                s.create_for_sweep = false;
+                ensure_notebook(&mut s, account);
+                if !name.is_empty() {
+                    if let Some(ix) = s.notebooks.as_mut() {
+                        ix.rename(account, &name);
+                        s.save_notebooks();
+                        println!("cb: rename-notebook account={account}");
+                    }
+                }
+                w.set_account_pick_mode("switch".into());
+                w.set_nb_create_name("".into());
+                let Some(addr) =
+                    s.nb_addrs.iter().find(|(a, ..)| *a == account).map(|(_, ad, _)| ad.clone())
+                else {
+                    return;
+                };
+                set_sweep_dest(&w, &mut s, addr);
                 return;
             }
-            println!("cb: pick-account {account} (new notebook)");
-            s.create_account = Some(account);
-            w.set_status("".into());
-            w.set_nb_rename_input("".into());
-            w.set_nb_rename_account(-2);
+            let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+                return;
+            };
+            s.account = account;
+            match activate(&mut s, &material, false) {
+                Ok(()) => {
+                    ensure_notebook(&mut s, account);
+                    if !name.is_empty() {
+                        if let Some(ix) = s.notebooks.as_mut() {
+                            ix.rename(account, &name);
+                            s.save_notebooks();
+                            println!("cb: rename-notebook account={account}");
+                        }
+                    }
+                    w.set_account_pick_mode("switch".into());
+                    w.set_nb_create_name("".into());
+                    w.set_status("".into());
+                    update_notebook_list(&w, &s);
+                    w.set_screen(17);
+                }
+                Err(e) => w.set_status(format!("{e}").into()),
+            }
             return;
         }
         let first_import = s.pending_import.is_some();
@@ -4353,12 +4467,18 @@ pub fn run() {
 
     cb!(on_account_cancel, |w, s| {
         if w.get_account_pick_mode() == "notebook" {
-            // Abandon create → back to the notebook list, untouched.
+            // Abandon create → back to wherever it was opened from
+            // (the sweep destination picker, or the notebook list).
             w.set_account_pick_mode("switch".into());
-            s.create_account = None;
+            w.set_nb_create_name("".into());
             w.set_status("".into());
-            update_notebook_list(&w, &s);
-            w.set_screen(17);
+            if s.create_for_sweep {
+                s.create_for_sweep = false;
+                w.set_screen(7);
+            } else {
+                update_notebook_list(&w, &s);
+                w.set_screen(17);
+            }
             return;
         }
         if s.pending_import.take().is_some() {
@@ -4595,6 +4715,7 @@ pub fn run() {
             return; // button is hidden; a stray call must not add phantom rows
         }
         println!("cb: create-notebook picker open");
+        w.set_nb_create_name("".into());
         show_notebook_picker(&w, &s, 0);
     });
 
@@ -4614,47 +4735,11 @@ pub fn run() {
 
     cb!(on_nb_rename_save, |w, s, name: SharedString| {
         let sel = w.get_nb_rename_account();
-        if sel == -1 {
+        if sel < 0 {
             return;
         }
         w.set_nb_rename_account(-1);
         w.set_nb_rename_input("".into());
-        if sel == -2 {
-            // CREATE mode: the picker chose the account (fallback: next
-            // unused); derive it, add the index entry, name it, switch.
-            let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
-                return;
-            };
-            if !is_hierarchical(&material, s.network) {
-                return;
-            }
-            let Some(account) = s
-                .create_account
-                .take()
-                .or_else(|| s.notebooks.as_ref().map(|ix| ix.next_account()))
-            else {
-                return;
-            };
-            println!("cb: create-notebook account={account}");
-            s.account = account;
-            match activate(&mut s, &material, false) {
-                Ok(()) => {
-                    ensure_notebook(&mut s, account);
-                    if !name.trim().is_empty() {
-                        if let Some(ix) = s.notebooks.as_mut() {
-                            ix.rename(account, name.as_str());
-                            s.save_notebooks();
-                            println!("cb: rename-notebook account={account}");
-                        }
-                    }
-                    w.set_account_pick_mode("switch".into());
-                    update_notebook_list(&w, &s);
-                    w.set_screen(17);
-                }
-                Err(e) => w.set_status(format!("{e}").into()),
-            }
-            return;
-        }
         let account = sel as u32;
         if let Some(ix) = s.notebooks.as_mut() {
             ix.rename(account, name.as_str());
@@ -4668,9 +4753,7 @@ pub fn run() {
     });
 
     cb!(on_nb_rename_cancel, |w, s| {
-        // In create mode this closes the dialog back onto the picker —
-        // pick another address or back out entirely from there.
-        s.create_account = None;
+        let _ = &mut s;
         w.set_nb_rename_account(-1);
         w.set_nb_rename_input("".into());
     });

@@ -175,16 +175,18 @@ BIP-86 account. `notebooks-<net>-<masterfp8>.json` (app-core
 key (`identity::index_fp8`) is shared across accounts, so one identity
 = one index. Store gains `excluded_senders` + `seen_received` (unread =
 received notes not yet seen; `mark_seen` fires when LEAVING home for
-the list, so the badge only counts what arrived since). Create is
-ADDRESS-FIRST then NAME-FIRST (Sal 2026-07-11): "+ New notebook" opens
-the account picker (screen 9, `account-pick-mode == "notebook"`) whose
-rows carry a pill — grey "notebook" (already in the index), amber
-"used" (on-chain history, balance shown — `ChainClient::address_probe`,
-two cheap requests; offline → plain rows) or green "new" — so
-recovering a used address is a visible choice that adopts its notes;
-the pick opens the naming dialog (`nb-rename-account == -2` = create
-mode; ≥ 0 = rename) and NOTHING is derived or persisted until Create —
-Cancel at either step leaves no phantom row. Notebook creation is
+the list, so the badge only counts what arrived since). Create is ONE
+SCREEN (Sal 2026-07-11): "+ New notebook" opens the account picker
+(screen 9, `account-pick-mode == "notebook"`) with an INLINE name field
+on top (`nb-create-name`; no second dialog — the rename dialog is
+rename-only, `nb-rename-account >= 0`); rows carry a pill — grey
+"notebook" (already in the index, row DISABLED + dimmed), amber "used"
+(on-chain history, balance shown — `ChainClient::address_probe`, two
+cheap requests; offline → plain rows) or green "new" — so recovering a
+used address is a visible choice that adopts its notes. Tapping an
+enabled address creates immediately with the typed name; NOTHING is
+derived or persisted before that tap, so backing out leaves no phantom
+row. Notebook creation is
 DELIBERATE everywhere: activate() only auto-adds for pre-notebooks
 migration (no index file + existing store → "Main") and non-hierarchical
 identities (single intrinsic notebook); explicit `ensure_notebook` runs
@@ -195,6 +197,20 @@ archive guard: a notebook holding sats refuses (sweep first). ZERO
 active notebooks is legitimate — archive-all allowed, empty-state
 captions, boot never resurrects archived entries. reset-identity
 deletes notebooks-*.json alongside stores.
+
+**Sweep destinations** (Sal 2026-07-11; consolidate deliberately stays
+same-address — consolidate IS sweep-to-self): the sweep picker (screen
+7, `pick-mode == "sweep"`) offers, top to bottom: the address input
+(other address), a "My notebooks" section (`sweep-notebooks` — every
+ACTIVE notebook except the current one, name + addr short + balance)
+and "+ New notebook…" (`sweep-new-notebook` → the create picker with
+`State.create_for_sweep`, which adds the notebook WITHOUT switching the
+active account — the sweep spends the CURRENT notebook's coins — and
+routes straight back to screen 16 with the new address as dest), then
+the recents. All destinations funnel through `set_sweep_dest`: notebook
+dests get an "Everything to: <name> · <short>" label, the amber
+on-chain-linkage caveat (`sweep-dest-note`), and NO contacts pollution;
+external dests keep the contact-name label + recents behavior.
 
 **Identity lifecycle:** key material verbatim in the keychain; BIP-86
 account chosen on a paginated picker after hierarchical imports and
@@ -405,10 +421,10 @@ picker` · `cb: pick-account <n>` · `cb: account-picker open` ·
 `cb: sys-back handled=<b> screen=<n>` (Android system back; screen is
 where back landed us) ·
 `cb: notebooks list n=<n> archived=<n>` · `cb: open-notebook
-account=<n>` · `cb: create-notebook picker open` · `cb: pick-account <n>
-(new notebook)` · `cb: create-notebook account=<n>` ·
-`cb: rename-notebook account=<n>` · `cb: archive-notebook account=<n>
-archived=<b>` · `cb: toggle-sender excluded=<b> hidden=<n>`.
+account=<n>` · `cb: create-notebook picker open[ (sweep dest)]` ·
+`cb: create-notebook account=<n>` · `cb: rename-notebook account=<n>` ·
+`cb: archive-notebook account=<n> archived=<b>` · `cb: toggle-sender
+excluded=<b> hidden=<n>` · `cb: sweep-pick to=<a>[ (notebook <n>)]`.
 UI e2e:
 `../ui-automation/tests/chain-notes-app.sh` (simtap point offsets from
 the window origin — recalibrate from screenshots when app.slint moves

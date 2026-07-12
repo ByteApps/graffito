@@ -1220,8 +1220,8 @@ export component AppWindow inherits Window {
     in-out property <string> archived-toggle-label;   // "Archived (2)" — preformatted
     in-out property <bool> can-create-notebook;       // hierarchical identities only
     in-out property <string> notebook-title: "Chain Notes"; // home header = open notebook's name
-    // -1 = naming dialog closed · -2 = CREATE mode (nothing exists until
-    // Save) · >= 0 = renaming that existing account.
+    // -1 = rename dialog closed · >= 0 = renaming that account. (Creation
+    // never dialogs — the picker's inline name field covers it.)
     in-out property <int> nb-rename-account: -1;
     in-out property <string> nb-rename-input;
     // sender filter (home): exclusions persist per notebook, all-on default
@@ -1230,8 +1230,15 @@ export component AppWindow inherits Window {
     in-out property <string> hidden-senders-label;    // "2 senders hidden", empty = none
     // The account picker (screen 9) serves two flows: "switch" = import /
     // settings account change (pick activates), "notebook" = the create-
-    // notebook flow (pick chooses the new notebook's address, then names it).
+    // notebook flow (inline name field on top; tapping an address creates
+    // the notebook right away — rows already added are disabled).
     in-out property <string> account-pick-mode: "switch";
+    in-out property <string> nb-create-name;
+    // sweep destinations: the other notebooks (+ create-and-sweep-into)
+    in-out property <[NotebookItem]> sweep-notebooks;
+    in-out property <string> sweep-dest-note;   // linkage caveat, empty = none
+    callback pick-notebook-dest(int);
+    callback sweep-new-notebook();
     callback open-notebooks();
     callback open-notebook(int);
     callback create-notebook();
@@ -1263,7 +1270,7 @@ export component AppWindow inherits Window {
         if (root.confirm-remove-address != "") { root.cancel-remove(); return true; }
         if (root.rename-address != "") { root.cancel-rename(); return true; }
         if (root.fund-rename-id != "") { root.fund-rename-cancel(); return true; }
-        if (root.nb-rename-account != -1) { root.nb-rename-cancel(); return true; }
+        if (root.nb-rename-account >= 0) { root.nb-rename-cancel(); return true; }
         if (root.scanning) { root.cancel-scan(); return true; }
         // Screens: one branch per header chevron.
         if (root.screen == 1 || root.screen == 2) { root.screen = 0; return true; }
@@ -1317,7 +1324,7 @@ export component AppWindow inherits Window {
     changed screen => { back-scope.focus(); }
     changed rename-address => { if (root.rename-address == "") { back-scope.focus(); } }
     changed fund-rename-id => { if (root.fund-rename-id == "") { back-scope.focus(); } }
-    changed nb-rename-account => { if (root.nb-rename-account == -1) { back-scope.focus(); } }
+    changed nb-rename-account => { if (root.nb-rename-account < 0) { back-scope.focus(); } }
 
     back-scope := FocusScope {
         focus-on-click: false; // never steal a tap's focus from a field
@@ -2377,7 +2384,46 @@ export component AppWindow inherits Window {
             GhostButton { width: 64px; text: "Use"; clicked => { root.pick-contact(root.contact-input); } }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
-        if root.contacts.length > 0: Caption { text: "Recently used"; }
+        // Sweep mode: in-wallet destinations first — the other notebooks,
+        // or a brand-new one created on the spot and swept into.
+        if root.pick-mode == "sweep" && root.sweep-notebooks.length > 0: Caption { text: "My notebooks"; }
+        if root.pick-mode == "sweep": VerticalLayout {
+            spacing: 6px;
+            for nb in root.sweep-notebooks: Rectangle {
+                height: 52px;
+                snb := TouchArea { clicked => { root.pick-notebook-dest(nb.account); } }
+                Rectangle {
+                    y: 2px;
+                    height: parent.height - 6px;
+                    border-radius: 10px;
+                    background: snb.has-hover ? Pal.card-hover : Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        spacing: 8px;
+                        VerticalLayout {
+                            spacing: 3px;
+                            alignment: center;
+                            Text {
+                                text: nb.name;
+                                font-size: 12px;
+                                color: Pal.text;
+                                overflow: elide;
+                            }
+                            Caption { text: nb.meta; overflow: elide; }
+                        }
+                        Rectangle { }
+                    }
+                }
+            }
+            if root.can-create-notebook: GhostButton {
+                text: "+  New notebook…";
+                clicked => { root.sweep-new-notebook(); }
+            }
+        }
+        if root.contacts.length > 0: Caption { text: root.pick-mode == "sweep" ? "Other addresses — recently used" : "Recently used"; }
         // Recents list. A ListView / stretched Flickable vertically CENTRES a
         // short list, leaving a big gap under the "Recently used" separator.
         // Instead: a content-sized column that sits directly under the
@@ -2605,16 +2651,28 @@ export component AppWindow inherits Window {
         }
         Caption {
             text: root.account-pick-mode == "notebook"
-                ? "Pick the address for the new notebook. Used addresses already have on-chain history — picking one adopts its notes."
+                ? "Name it, then pick its address. Used addresses already have on-chain history — picking one adopts its notes."
                 : "One seed holds many BIP-86 accounts. Each is a completely separate notebook: its own address, its own encryption key, its own notes.";
         }
+        // Notebook mode: the name lives right here — tapping an address
+        // creates the notebook immediately (no second dialog).
+        if root.account-pick-mode == "notebook": EditField {
+            text <=> root.nb-create-name;
+            placeholder-text: "name (optional — empty = address short form)";
+        }
         for a in root.accounts: Rectangle {
+            // Rows already added as notebooks are informational only.
+            property <bool> row-disabled: a.pill == "notebook";
             border-radius: 12px;
             border-width: 1px;
             border-color: a.active ? Pal.accent : Pal.line;
-            background: at.has-hover ? Pal.card-hover : Pal.card;
+            background: at.has-hover && !self.row-disabled ? Pal.card-hover : Pal.card;
+            opacity: self.row-disabled ? 0.45 : 1.0;
             height: al.preferred-height;
-            at := TouchArea { clicked => { root.pick-account(a.index); } }
+            at := TouchArea {
+                enabled: !parent.row-disabled;
+                clicked => { root.pick-account(a.index); }
+            }
             al := VerticalLayout {
                 padding: 14px;
                 spacing: 4px;
@@ -3152,6 +3210,7 @@ export component AppWindow inherits Window {
                         overflow: elide;
                     }
                 }
+                if root.sweep-dest-note != "": Caption { text: root.sweep-dest-note; color: Pal.warn; }
                 HorizontalLayout {
                     spacing: 8px;
                     alignment: start;
@@ -3507,8 +3566,8 @@ export component AppWindow inherits Window {
         }
     }
 
-    // ---------- notebook name dialog (create + rename, modal overlay) ----------
-    if root.nb-rename-account != -1: Rectangle {
+    // ---------- notebook rename dialog (modal overlay) ----------
+    if root.nb-rename-account >= 0: Rectangle {
         width: 100%;
         height: 100%;
         background: #000000.with-alpha(0.55);
@@ -3527,7 +3586,7 @@ export component AppWindow inherits Window {
                 padding: 20px;
                 spacing: 12px;
                 Text {
-                    text: root.nb-rename-account == -2 ? "Name your new notebook" : "Name this notebook";
+                    text: "Name this notebook";
                     font-size: 16px;
                     font-weight: 700;
                     color: Pal.text;
@@ -3545,10 +3604,7 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.nb-rename-cancel(); } }
-                    PrimaryButton {
-                        text: root.nb-rename-account == -2 ? "Create" : "Save";
-                        clicked => { root.nb-rename-save(root.nb-rename-input); }
-                    }
+                    PrimaryButton { text: "Save"; clicked => { root.nb-rename-save(root.nb-rename-input); } }
                 }
             }
         }
