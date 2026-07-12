@@ -1605,7 +1605,8 @@ export component AppWindow inherits Window {
             Rectangle { }
             SvgIconButton { icon: "refresh"; clicked => { root.refresh(); } }
             SvgIconButton { icon: "activity"; clicked => { root.open-activity(); } }
-            IconButton { glyph: "⚙"; clicked => { root.settings-open(); } }
+            // No settings gear here (Sal 2026-07-11): settings is
+            // wallet-level, reachable from the notebook list only.
         }
         Card {
             height: 132px;
@@ -2589,16 +2590,6 @@ export component AppWindow inherits Window {
             }
         }
         SettingsCard {
-            title: "Consolidate wallet";
-            subtitle: root.watch-only
-                ? "Combine this wallet's coins into one. Watch-only: signs on your external wallet."
-                : "Gather EVERY notebook's coins into one coin at an address you pick — used or new. One transaction; all source addresses become publicly linked on-chain.";
-            GhostButton {
-                text: "Consolidate wallet…";
-                clicked => { root.consolidate-wallet-open(); }
-            }
-        }
-        SettingsCard {
             title: "Backup";
             subtitle: root.watch-only
                 ? "Shows the watch-only key material (xpub) you imported — stored in your keychain, and in iCloud if enabled, like any key. It can't spend and can't read private notes."
@@ -2728,11 +2719,15 @@ export component AppWindow inherits Window {
         }
         Caption {
             text: root.watch-only
-                ? "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. To combine them, use Settings → Consolidate wallet (signs on your external wallet)."
-                : "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. To combine them into one coin, use Settings → Consolidate wallet; to move one notebook's funds, Settings → Funds → Sweep.";
+                ? "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating signs on your external wallet."
+                : "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating gathers them into ONE coin at an address you pick.";
         }
-        // Pure viewer since consolidation moved to Settings ("Consolidate
-        // wallet…" — wallet-level, all notebooks at once).
+        // Viewer-first: the list is the point; consolidation is the ONE
+        // action button on top (wallet-level — all notebooks at once).
+        GhostButton {
+            text: "Consolidate wallet…";
+            clicked => { root.consolidate-wallet-open(); }
+        }
         Body { text: root.coins-summary; font-size: 12px; }
         Flickable {
             viewport-height: coins-col.preferred-height;
