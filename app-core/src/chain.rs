@@ -396,7 +396,9 @@ impl<T: Transport> ChainClient<T> {
                         .ok_or_else(|| Error::Json("parent vout missing".into()))?
                 }
             };
-            coins.push(crate::psbt_build::WatchCoin { txid: ptxid, vout: pvout, value });
+            // Receive index unknown at fetch time — the caller stamps the
+            // owning notebook index before building a PSBT from these.
+            coins.push(crate::psbt_build::WatchCoin { txid: ptxid, vout: pvout, value, index: 0 });
         }
         let mut outputs = Vec::with_capacity(t.vout.len());
         for o in &t.vout {

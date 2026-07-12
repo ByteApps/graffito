@@ -169,17 +169,33 @@ respect them. Modals (overlays as LAST children of the window root):
 rename, nb-rename, remove-confirm, reset-confirm, sweep-confirm,
 consolidate-confirm.
 
-**Notebooks** (design: `../PLAN-chain-notes-notebooks.md`): notebook =
-BIP-86 account. `notebooks-<net>-<masterfp8>.json` (app-core
-`notebooks.rs`) maps account → {name, archived}; the master fingerprint
-key (`identity::index_fp8`) is shared across accounts, so one identity
-= one index. Store gains `excluded_senders` + `seen_received` (unread =
+**Notebooks** (design: `../PLAN-chain-notes-notebooks.md`, rev 3
+2026-07-12): notebook = **receive-chain address index** of ONE BIP-86
+account (`m/86'/coin'/account'/0/{index}`); the account is a
+Settings-level wallet context ("Change account…" in the Identity card,
+hierarchical identities only, default account 0) and every wallet-level
+feature (sweep/consolidate/Coins/Activity) scopes to the ACTIVE
+account's notebooks. `notebooks-<net>-<fp8>.json` (app-core
+`notebooks.rs`, version 2) maps account → [{index, name, archived}];
+v1 files (accounts-as-notebooks, shipped 2026-07-11) migrate on load —
+each v1 account becomes that account's notebook 0 (same leaf, same
+address, same store file, metadata only). The master fingerprint key
+(`identity::index_fp8`) is shared across accounts, so one identity =
+one index file. Multi-NOTEBOOK capability = mnemonic/xprv (any depth)
+/ranged watch xpub (`KeyMaterial::is_multi_notebook`); multi-ACCOUNT
+capability stays mnemonic/master-xprv (`is_hierarchical`). Watch
+wallet-ops remain single-notebook flows for now, but the watch PSBT
+builders take per-coin receive indexes (`WatchCoin.index`), so
+multi-notebook watch spends are builder-ready. Multi-key records:
+rev-3 wallet sweeps/consolidates stamp `TxRecord.input_indexes`
+(owners = indexes within the record's account); legacy records keep
+`input_accounts` (accounts, index 0 implied) and still RBF correctly. Store gains `excluded_senders` + `seen_received` (unread =
 received notes not yet seen; `mark_seen` fires when LEAVING home for
 the list, so the badge only counts what arrived since). Create is ONE
 SCREEN (Sal 2026-07-11): "+ New notebook" opens the account picker
 (screen 9, `account-pick-mode == "notebook"`) with an INLINE name field
 on top (`nb-create-name`; no second dialog — the rename dialog is
-rename-only, `nb-rename-account >= 0`); rows carry a pill — grey
+rename-only, `nb-rename-index >= 0`); rows carry a pill — grey
 "notebook" (already in the index, row DISABLED + dimmed), amber "used"
 (on-chain history, balance shown — `ChainClient::address_probe`, two
 cheap requests; offline → plain rows) or green "new" — so recovering a
@@ -250,13 +266,16 @@ picker; wallet-level gather = consolidate). The note-size limit is
 DEVICE-LEVEL now (`config.json` "chunk", `State.chunk`): activate()
 stamps it onto every loaded store, so the Settings pill is truly
 wallet-wide (stores of users who never touched it keep their value).
-The "Change account…" row is GONE (the notebook list IS the account
-switcher). Multi-key RBF WORKS: wallet
-sweep/consolidate records carry per-input owners
-(`TxRecord.input_accounts`, serde-default — legacy records stay
-single-key), and Speed-up re-signs each input with its own account's
-key (`compose::bump_raw_tx_multi`, host-tested with per-owner
-rust-bitcoin signature verification).
+The "Change account…" row is BACK (rev 3: accounts are wallets — the
+row sits in the Identity card for hierarchical identities and lands on
+the picked account's notebook list; e2e settings taps below the
+Identity card shifted +48pt for those identities). Multi-key RBF WORKS: wallet
+sweep/consolidate records carry per-input owners (rev 3:
+`TxRecord.input_indexes`, notebook indexes within the record's account;
+legacy records keep `input_accounts` = accounts with index 0 implied —
+both serde-default, single-key records stay bumpable), and Speed-up
+re-signs each input with its owner's key (`compose::bump_raw_tx_multi`,
+host-tested with per-owner rust-bitcoin signature verification).
 
 **Async refresh** (Sal 2026-07-11: opening a notebook took 3-4 s on the
 phone — the tap handler scanned the chain synchronously and the screen
@@ -478,7 +497,7 @@ feeds notes_cli's scan directly.
 
 ## UI log contract additions (src/main.rs `cb:` lines)
 
-`cb: identity kind=<k> account=<n> network=<n> address=<a>` ·
+`cb: identity kind=<k> account=<n> index=<i> network=<n> address=<a>` ·
 `cb: refresh notes=… balance=… tip=…` · `cb: compose … broadcast=ok` ·
 `cb: pick-contact to=<a|self>` · `cb: rename-start/save-contact/
 confirm-remove/remove-contact` · `cb: import hierarchical → account
@@ -492,9 +511,9 @@ picker` · `cb: pick-account <n>` · `cb: account-picker open` ·
 `cb: sys-back handled=<b> screen=<n>` (Android system back; screen is
 where back landed us) ·
 `cb: notebooks list n=<n> archived=<n>` · `cb: open-notebook
-account=<n>` · `cb: create-notebook picker open[ (sweep dest)]` ·
-`cb: create-notebook account=<n>` · `cb: rename-notebook account=<n>` ·
-`cb: archive-notebook account=<n> archived=<b>` · `cb: toggle-sender
+index=<i>` · `cb: create-notebook picker open[ (sweep dest)]` ·
+`cb: create-notebook index=<i>` · `cb: rename-notebook index=<i>` ·
+`cb: archive-notebook index=<i> archived=<b>` · `cb: toggle-sender
 excluded=<b> hidden=<n>` · `cb: sweep-pick to=<a>[ (notebook <n>)]` ·
 `cb: wallet-consolidate open coins=<n> notebooks=<m>` ·
 `cb: wallet-consolidate txid=<t> coins=<n> notebooks=<m> value=<v>
