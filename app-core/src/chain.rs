@@ -371,10 +371,13 @@ impl<T: Transport> ChainClient<T> {
     /// A pending tx's inputs (as spendable outpoints with values) and
     /// outputs (spk bytes + value) — what a watch-mode RBF bump rebuilds
     /// from. Input values come from the vin prevout when the backend sends
-    /// one, else from fetching the parent tx.
+    /// one, else from fetching the parent tx. `index_of` maps a prevout
+    /// address to its owning notebook's receive index (a multi-notebook
+    /// record's inputs span several leaves); unknown addresses stamp 0.
     pub fn fetch_tx_io(
         &self,
         txid: &str,
+        index_of: impl Fn(&str) -> Option<u32>,
     ) -> Result<(Vec<crate::psbt_build::WatchCoin>, Vec<(Vec<u8>, u64)>, bool), Error> {
         let t: EsploraTx = parse_json(&self.transport.get_text(&format!("/tx/{txid}"))?)?;
         let mut coins = Vec::with_capacity(t.vin.len());
@@ -383,22 +386,21 @@ impl<T: Transport> ChainClient<T> {
                 (Some(x), Some(v)) => (x.clone(), v),
                 _ => return Err(Error::Json("vin without outpoint".into())),
             };
-            let value = match vin.prevout.as_ref().map(|p| p.value) {
-                Some(v) if v > 0 => v,
+            let (value, address) = match vin.prevout.as_ref() {
+                Some(p) if p.value > 0 => (p.value, p.scriptpubkey_address.clone()),
                 _ => {
                     // Backend sent no prevout value — read the parent tx.
                     let parent: EsploraTx =
                         parse_json(&self.transport.get_text(&format!("/tx/{ptxid}"))?)?;
-                    parent
+                    let o = parent
                         .vout
                         .get(pvout as usize)
-                        .map(|o| o.value)
-                        .ok_or_else(|| Error::Json("parent vout missing".into()))?
+                        .ok_or_else(|| Error::Json("parent vout missing".into()))?;
+                    (o.value, o.scriptpubkey_address.clone())
                 }
             };
-            // Receive index unknown at fetch time — the caller stamps the
-            // owning notebook index before building a PSBT from these.
-            coins.push(crate::psbt_build::WatchCoin { txid: ptxid, vout: pvout, value, index: 0 });
+            let index = address.as_deref().and_then(&index_of).unwrap_or(0);
+            coins.push(crate::psbt_build::WatchCoin { txid: ptxid, vout: pvout, value, index });
         }
         let mut outputs = Vec::with_capacity(t.vout.len());
         for o in &t.vout {
@@ -450,6 +452,49 @@ impl<T: Transport> ChainClient<T> {
             ..SyncBundle::default()
         })
     }
+}
+
+/// Receive-chain notebook gap discovery (rev-3 follow-up 2): probe the
+/// account's receive indexes in order and return every index with ANY
+/// on-chain history, stopping after `gap` consecutive never-used indexes.
+/// Best-effort by design — a transport error (offline, backend down) stops
+/// the walk and returns what was found so far, so a re-import without a
+/// node simply discovers nothing. The caller `ensure_notebook`s each hit;
+/// this function only reads the chain.
+pub fn discover_indexes<T: Transport>(
+    client: &ChainClient<T>,
+    material: &crate::identity::KeyMaterial,
+    network: Network,
+    account: u32,
+    gap: u32,
+) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut consecutive_unused = 0u32;
+    let mut index = 0u32;
+    while consecutive_unused < gap {
+        // A fixed (non-ranged) watch descriptor only derives index 0 — the
+        // realize error ends the walk cleanly after that one probe.
+        let Ok(ident) = crate::identity::realize(material, network, account, index) else {
+            break;
+        };
+        match client.address_probe(&ident.address) {
+            Ok((used, _)) => {
+                if used {
+                    found.push(index);
+                    consecutive_unused = 0;
+                } else {
+                    consecutive_unused += 1;
+                }
+            }
+            Err(_) => break,
+        }
+        index += 1;
+        // Same runaway backstop as scan_funding: no sane wallet needs more.
+        if index >= 10_000 {
+            break;
+        }
+    }
+    found
 }
 
 /// tx → OnchainTx iff it carries ≥1 OP_RETURN payload. Classification
@@ -523,4 +568,112 @@ pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
         author_candidates,
         recipient: if spends_from_self { recipient } else { None },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::{parse_key_material, realize, KeyMaterial};
+
+    // Official BIP-86 account xpub (m/86'/0'/0') — imports as ranged watch
+    // material, so discovery walks its real receive chain deterministically.
+    const BIP86_ACCT_XPUB: &str = "xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ";
+
+    fn material() -> KeyMaterial {
+        parse_key_material(BIP86_ACCT_XPUB, Network::Mainnet).unwrap()
+    }
+
+    fn addr(i: u32) -> String {
+        realize(&material(), Network::Mainnet, 0, i).unwrap().address
+    }
+
+    /// Canned esplora for address probes: history/utxos only at the listed
+    /// addresses; `fail` simulates an offline backend.
+    struct ProbeTransport {
+        used: Vec<String>,
+        fail: bool,
+    }
+    impl Transport for ProbeTransport {
+        fn get_text(&self, path: &str) -> Result<String, Error> {
+            if self.fail {
+                return Err(Error::Http("offline".into()));
+            }
+            let used = self.used.iter().any(|a| path.contains(a.as_str()));
+            if path.contains("/utxo") {
+                Ok(if used {
+                    r#"[{"txid":"aa","vout":0,"value":700,"status":{"confirmed":true,"block_height":9,"block_time":1}}]"#.into()
+                } else {
+                    "[]".into()
+                })
+            } else if path.contains("/txs") {
+                Ok(if used {
+                    r#"[{"txid":"aa","vin":[],"vout":[],"status":{"confirmed":true,"block_height":9,"block_time":1}}]"#.into()
+                } else {
+                    "[]".into()
+                })
+            } else {
+                Ok(String::new())
+            }
+        }
+        fn post_text(&self, _path: &str, _body: String) -> Result<String, Error> {
+            unreachable!("probes never POST")
+        }
+    }
+
+    #[test]
+    fn discovery_finds_used_indexes_past_holes() {
+        // Indexes 0 and 2 used, 1 is a hole — the gap walk must continue
+        // past it and only stop after `gap` consecutive unused indexes.
+        let client = ChainClient::new(
+            ProbeTransport { used: vec![addr(0), addr(2)], fail: false },
+            Network::Mainnet,
+        );
+        assert_eq!(discover_indexes(&client, &material(), Network::Mainnet, 0, 5), vec![0, 2]);
+    }
+
+    #[test]
+    fn discovery_on_fresh_seed_is_empty() {
+        let client =
+            ChainClient::new(ProbeTransport { used: vec![], fail: false }, Network::Mainnet);
+        assert!(discover_indexes(&client, &material(), Network::Mainnet, 0, 5).is_empty());
+    }
+
+    #[test]
+    fn discovery_offline_is_best_effort_empty() {
+        let client =
+            ChainClient::new(ProbeTransport { used: vec![addr(0)], fail: true }, Network::Mainnet);
+        assert!(discover_indexes(&client, &material(), Network::Mainnet, 0, 5).is_empty());
+    }
+
+    /// Canned /tx/{txid}: two inputs with prevout addresses, one output.
+    struct TxIoTransport;
+    impl Transport for TxIoTransport {
+        fn get_text(&self, path: &str) -> Result<String, Error> {
+            assert!(path.starts_with("/tx/"), "unexpected fetch: {path}");
+            Ok(r#"{"txid":"cc",
+                "vin":[
+                  {"txid":"aa","vout":0,"prevout":{"scriptpubkey_address":"bcrt1p-three","value":1000}},
+                  {"txid":"bb","vout":1,"prevout":{"scriptpubkey_address":"bcrt1p-unknown","value":2000}}],
+                "vout":[{"scriptpubkey":"51","value":2500}],
+                "status":{"confirmed":false}}"#
+                .into())
+        }
+        fn post_text(&self, _path: &str, _body: String) -> Result<String, Error> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn fetch_tx_io_stamps_notebook_indexes_by_address() {
+        let client = ChainClient::new(TxIoTransport, Network::Regtest);
+        let (coins, outputs, confirmed) = client
+            .fetch_tx_io("cc", |a| (a == "bcrt1p-three").then_some(3))
+            .unwrap();
+        assert!(!confirmed);
+        assert_eq!(coins.len(), 2);
+        assert_eq!((coins[0].index, coins[0].value), (3, 1000));
+        // Unknown address (not one of our notebooks) stamps index 0.
+        assert_eq!((coins[1].index, coins[1].value), (0, 2000));
+        assert_eq!(outputs, vec![(vec![0x51], 2500)]);
+    }
 }
