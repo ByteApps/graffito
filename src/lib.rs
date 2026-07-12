@@ -22,8 +22,10 @@ use app_core::chain::{
 use app_core::compose::{compose_and_record, ComposeRequest};
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
 use app_core::identity::{
-    generate_mnemonic, generate_mnemonic_with_salt, parse_key_material, realize, AppIdentity,
+    generate_mnemonic, generate_mnemonic_with_salt, index_fp8, parse_key_material, realize,
+    AppIdentity,
 };
+use app_core::notebooks::NotebookIndex;
 use app_core::psbt_build::{
     build_funded_sweep_psbt, build_funding_psbt, build_watch_bump_psbt, build_watch_note_psbt,
     build_watch_spend_psbt, predict_keyspend_vsize, sign_own_taproot_inputs, BuiltPsbt,
@@ -59,6 +61,11 @@ struct State {
     /// default (mempool.space).
     node_urls: HashMap<String, String>,
     explorers: HashMap<String, String>,
+    /// Device-level note-size limit (config.json). Some = the user chose
+    /// one in Settings; applied to every notebook's store on activate, so
+    /// the wallet-level Settings pill really is wallet-wide. None = each
+    /// store keeps its own (legacy per-store value or the default).
+    chunk: Option<usize>,
     ident: Option<AppIdentity>,
     store: Option<Store>,
     fees: Option<FeeRates>,
@@ -106,6 +113,28 @@ struct State {
     watch_bump: Option<WatchBump>,
     /// Watch-mode compose awaiting external signature (screen 13/14).
     watch_note: Option<WatchNote>,
+    /// Notebook index of the active identity (accounts-as-notebooks:
+    /// names + archive flags, `notebooks-<net>-<fp8>.json`), plus its
+    /// filename key and the derived (account, address, store-fp8) cache
+    /// the list and sender labels read — rebuilt on activate, never per
+    /// frame.
+    notebooks: Option<NotebookIndex>,
+    notebooks_fp8: Option<String>,
+    nb_addrs: Vec<(u32, String, String)>,
+    /// Wallet-level consolidate in progress: sources snapshotted at open,
+    /// destination + fee filled in by the picker, consumed by confirm.
+    wconsol: Option<WConsol>,
+}
+
+/// One wallet-consolidate session (Settings → "Consolidate wallet…").
+struct WConsol {
+    /// (account, spendable coins, their value) per source notebook.
+    sources: Vec<(u32, Vec<app_core::notes_core::tx::Utxo>, u64)>,
+    dest_account: u32,
+    dest_addr: String,
+    rate: f64,
+    fee: u64,
+    vsize: u64,
 }
 
 /// Watch-mode compose in progress on the sign screen: everything needed
@@ -183,6 +212,7 @@ impl State {
                 "account": self.account,
                 "nodes": self.node_urls,
                 "explorers": self.explorers,
+                "chunk": self.chunk,
             })
             .to_string(),
         );
@@ -192,6 +222,54 @@ impl State {
         if let Ok(json) = serde_json::to_string_pretty(&self.funding_wallets) {
             let _ = std::fs::write(self.data_dir.join("funding-wallets.json"), json);
         }
+    }
+
+    /// The notebook index file of the active identity: keyed by the BIP-32
+    /// master fingerprint so every account's notebook shares one index (and
+    /// switching identities can never mix indexes).
+    fn notebooks_path(&self) -> Option<PathBuf> {
+        let fp8 = self.notebooks_fp8.as_ref()?;
+        Some(self.data_dir.join(format!("notebooks-{}-{}.json", self.network.as_str(), fp8)))
+    }
+
+    fn save_notebooks(&self) {
+        if let (Some(ix), Some(p)) = (&self.notebooks, self.notebooks_path()) {
+            let _ = ix.save(&p);
+        }
+    }
+
+    /// A notebook's display name: its local name, else the short form of
+    /// its address (never empty — rows and the home title read this).
+    fn notebook_display_name(&self, account: u32) -> String {
+        let named = self
+            .notebooks
+            .as_ref()
+            .and_then(|ix| ix.get(account))
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        if !named.is_empty() {
+            return named;
+        }
+        self.nb_addrs
+            .iter()
+            .find(|(a, ..)| *a == account)
+            .map(|(_, addr, _)| addr_short(addr))
+            .unwrap_or_else(|| format!("Notebook {account}"))
+    }
+
+    /// The store file of another (not necessarily active) notebook.
+    fn store_path_for(&self, address_output_x_fp8: &str) -> PathBuf {
+        self.data_dir
+            .join(format!("store-{}-{}.json", self.network.as_str(), address_output_x_fp8))
+    }
+}
+
+/// "tb1p2ylq…q7ax" — the row/label short form of an address.
+fn addr_short(a: &str) -> String {
+    if a.len() > 14 {
+        format!("{}…{}", &a[..9], &a[a.len() - 4..])
+    } else {
+        a.to_string()
     }
 }
 
@@ -607,8 +685,24 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
     let net = st.network;
     let Some(store) = st.store.as_ref() else { return };
     let exb = st.explorer_base();
-    let spendable: Vec<&app_core::store::LedgerUtxo> =
-        store.utxos.iter().filter(|u| !u.pending_spend).collect();
+    // A keyed SWEEP is wallet-level (leaving the wallet): every active
+    // notebook's coins ride. Consolidate (kind) and watch flows stay on
+    // the active store — watch has exactly one notebook anyway.
+    let wallet_mode = w.get_sweep_kind().as_str() == "sweep"
+        && st.ident.as_ref().map(|i| !i.is_watch()).unwrap_or(false);
+    let spendable: Vec<app_core::store::LedgerUtxo> = if wallet_mode {
+        let mut v = Vec::new();
+        if let Some(ix) = &st.notebooks {
+            for m in ix.active() {
+                if let Some(s2) = notebook_store(st, m.account) {
+                    v.extend(s2.utxos.iter().filter(|u| !u.pending_spend).cloned());
+                }
+            }
+        }
+        v
+    } else {
+        store.utxos.iter().filter(|u| !u.pending_spend).cloned().collect()
+    };
     let total: u64 = spendable.iter().map(|u| u.value).sum();
     let n = spendable.len();
     let mut rows: Vec<SpendCoin> = spendable
@@ -749,12 +843,30 @@ fn load_backend_settings(w: &AppWindow, st: &State) {
 /// Build the unified activity list (note txs + sweep/consolidate),
 /// actionable (pending) first, then newest.
 fn update_activity(w: &AppWindow, st: &State) {
-    let Some(store) = &st.store else { return };
     let net = st.network;
     let exb = st.explorer_base();
     let ex = exb.as_deref();
     let mut items: Vec<(u64, bool, ActivityItem)> = Vec::new(); // (created, confirmed, item)
 
+    // Wallet-wide: every ACTIVE notebook's notes + txs, tagged. Only the
+    // active notebook's rows are actionable (bump/rebroadcast sign with
+    // the live store + key); the rest keep the Explorer link.
+    let current = st.ident.as_ref().map(|i| i.account);
+    let mut sources: Vec<(String, bool, Store)> = Vec::new(); // (tag, actionable, store)
+    if let Some(ix) = &st.notebooks {
+        for m in ix.active() {
+            let Some(store) = notebook_store(st, m.account) else { continue };
+            sources.push((
+                st.notebook_display_name(m.account),
+                current == Some(m.account),
+                store,
+            ));
+        }
+    } else if let Some(store) = &st.store {
+        sources.push((String::new(), true, store.clone()));
+    }
+
+    for (tag, actionable, store) in &sources {
     for n in &store.notes {
         let Some(txid) = n.txids.last() else { continue };
         let kind = format!(
@@ -785,8 +897,9 @@ fn update_activity(w: &AppWindow, st: &State) {
                 fee_line: fee_line_str(n.fee, n.vsize).into(),
                 status: status.into(),
                 explorer: explorer_tx_url(ex, net, txid).into(),
-                pending: n.status == NoteStatus::Pending && n.raw_hex.is_some(),
+                pending: *actionable && n.status == NoteStatus::Pending && n.raw_hex.is_some(),
                 replaced: replaced_label(n.txids.len()).into(),
+                notebook: tag.clone().into(),
             },
         ));
     }
@@ -799,7 +912,7 @@ fn update_activity(w: &AppWindow, st: &State) {
             NoteStatus::Orphaned => "orphaned",
         };
         let title = if t.dest == "self" {
-            format!("Consolidate to your address · {} sats", t.value)
+            format!("Consolidate · {} sats arrived here", t.value)
         } else {
             format!("To {} · {} sats", t.dest, t.value)
         };
@@ -815,10 +928,12 @@ fn update_activity(w: &AppWindow, st: &State) {
                 fee_line: fee_line_str(Some(t.fee), Some(t.vsize)).into(),
                 status: status.into(),
                 explorer: explorer_tx_url(ex, net, txid).into(),
-                pending: t.status == NoteStatus::Pending && t.raw_hex.is_some(),
+                pending: *actionable && t.status == NoteStatus::Pending && t.raw_hex.is_some(),
                 replaced: replaced_label(t.txids.len()).into(),
+                notebook: tag.clone().into(),
             },
         ));
+    }
     }
 
     // Actionable (unconfirmed) first, then newest created.
@@ -873,12 +988,19 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     let path = st
         .data_dir
         .join(format!("store-{}-{}.json", st.network.as_str(), &fp[..8]));
+    let store_existed = path.exists();
     let mut store = Store::load(&path).unwrap_or_else(|_| Store::new(&ident.output_x(), st.network));
     // Migrate a legacy per-identity node URL (shipped as `esplora`) into the
     // device-level per-network config, then drop it from the store. Only if
     // this network has no node set yet, so a real config choice always wins.
     if let Some(url) = store.node_url.take() {
         st.node_urls.entry(st.network.as_str().to_string()).or_insert(url);
+    }
+    // The note-size limit is a device-level Settings choice: apply it to
+    // whichever notebook is being activated (stores of users who never
+    // touched the pill keep their own value).
+    if let Some(c) = st.chunk {
+        store.chunk_size = c;
     }
     println!(
         "cb: identity kind={} account={} network={} address={}",
@@ -887,6 +1009,45 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
         st.network.as_str(),
         ident.address
     );
+    // Notebook index: load (or start) this identity's account→name/archive
+    // map and rebuild the (account, address) cache the notebook list +
+    // sender labels read. Notebooks are created DELIBERATELY (the
+    // name-first dialog, an import's account pick — via ensure_notebook);
+    // activate() itself adds one only for:
+    //   * migration: a pre-notebooks install (no index file yet, but this
+    //     account already has a store on disk) becomes notebook "Main";
+    //   * non-hierarchical identities (WIF/hex/xpub): exactly one
+    //     intrinsic notebook — nothing to choose, nothing to create.
+    // Saving the (possibly empty) index on first touch marks the identity
+    // as initialized, so later boots respect an emptied list.
+    let fp8 = index_fp8(&material, st.network).map_err(|e| e.to_string())?;
+    let ix_path = st
+        .data_dir
+        .join(format!("notebooks-{}-{}.json", st.network.as_str(), fp8));
+    let index_existed = ix_path.exists();
+    let mut ix = NotebookIndex::load(&ix_path).unwrap_or_default();
+    let migrate = !index_existed && store_existed;
+    let mut dirty = !index_existed;
+    if (migrate || !material.is_hierarchical()) && ix.ensure(ident.account) {
+        if migrate {
+            ix.rename(ident.account, app_core::notebooks::FIRST_NOTEBOOK_NAME);
+        }
+        dirty = true;
+    }
+    if dirty {
+        let _ = ix.save(&ix_path);
+    }
+    st.nb_addrs = ix
+        .notebooks
+        .iter()
+        .filter_map(|m| {
+            realize(&material, st.network, m.account)
+                .ok()
+                .map(|i| (m.account, i.address.clone(), hex::encode(&i.output_x()[..4])))
+        })
+        .collect();
+    st.notebooks_fp8 = Some(fp8);
+    st.notebooks = Some(ix);
     st.ident = Some(ident);
     st.store = Some(store);
     st.save_store();
@@ -919,9 +1080,45 @@ fn account_rows(
                 index: i as i32,
                 address: ident.address.into(),
                 active: active == Some(i),
+                pill: "".into(),
+                balance: "".into(),
             })
         })
         .collect()
+}
+
+/// The create-notebook flavor of the account picker: same 5-per-page rows,
+/// plus a "notebook" pill for accounts already in the index and — when a
+/// node is configured — a used/new pill with the address's current balance,
+/// so recovering an already-used address is a visible, deliberate choice.
+fn show_notebook_picker(w: &AppWindow, st: &State, page: u32, mode: &str) {
+    let Some(material_str) = st.material.as_deref() else { return };
+    let client = st
+        .base_url()
+        .map(|base| ChainClient::new(HttpTransport::new(base), st.network));
+    let mut rows = account_rows(material_str, st.network, page, None);
+    for row in &mut rows {
+        let account = row.index as u32;
+        if st.notebooks.as_ref().and_then(|ix| ix.get(account)).is_some() {
+            row.pill = "notebook".into();
+            continue;
+        }
+        if let Some(client) = &client {
+            match client.address_probe(row.address.as_str()) {
+                Ok((used, balance)) => {
+                    row.pill = if used { "used" } else { "new" }.into();
+                    if used {
+                        row.balance = format!("{} sats", commas(balance)).into();
+                    }
+                }
+                Err(_) => {} // no probe → plain row (offline is fine)
+            }
+        }
+    }
+    w.set_account_page(page as i32);
+    w.set_accounts(VecModel::from_slice(&rows));
+    w.set_account_pick_mode(mode.into());
+    w.set_screen(9);
 }
 
 fn show_account_picker(w: &AppWindow, material: &str, network: Network, page: u32, active: Option<u32>) {
@@ -944,11 +1141,245 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
     w.set_contacts(VecModel::from_slice(&contacts));
 }
 
+/// Deliberate notebook creation for `account`: add it to the index (if
+/// missing), persist, and extend the address cache. The ONLY entry points
+/// are user intent — the create dialog, an import's account pick, and
+/// APP_KEY automation boots (their account choice is explicit config).
+fn ensure_notebook(st: &mut State, account: u32) {
+    let Some(ix) = st.notebooks.as_mut() else { return };
+    if !ix.ensure(account) {
+        return;
+    }
+    st.save_notebooks();
+    if !st.nb_addrs.iter().any(|(a, ..)| *a == account) {
+        if let Some(material_str) = st.material.as_deref() {
+            if let Ok(material) = parse_key_material(material_str, st.network) {
+                if let Ok(i) = realize(&material, st.network, account) {
+                    st.nb_addrs.push((
+                        account,
+                        i.address.clone(),
+                        hex::encode(&i.output_x()[..4]),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// "Home" for flows that end at the active notebook — unless the active
+/// account has no notebook entry (create-seed just finished, an iCloud
+/// restore onto a fresh install), in which case home would be a trap only
+/// reachable by accident: land on the notebook list instead.
+fn go_home_or_list(w: &AppWindow, st: &State) {
+    let listed = st
+        .ident
+        .as_ref()
+        .and_then(|i| st.notebooks.as_ref().map(|ix| ix.get(i.account).is_some()))
+        .unwrap_or(false);
+    if listed {
+        update_home(w, st);
+        w.set_screen(4);
+    } else {
+        update_notebook_list(w, st);
+        w.set_screen(17);
+    }
+}
+
+/// Route a validated sweep destination to the compose-like sweep screen:
+/// label (notebook name → contact name → bare address), the on-chain
+/// linkage caveat when the destination is one of OUR notebooks (and no
+/// contacts pollution for those), fee tier defaults, screen 16.
+fn set_sweep_dest(w: &AppWindow, st: &mut State, a: String) {
+    let own_account = st.nb_addrs.iter().find(|(_, ad, _)| *ad == a).map(|(acct, ..)| *acct);
+    match own_account {
+        Some(acct) => {
+            println!("cb: sweep-pick to={a} (notebook {acct})");
+            w.set_sweep_to_label(
+                format!(
+                    "Everything to: {} · {}",
+                    st.notebook_display_name(acct),
+                    addr_short(&a)
+                )
+                .into(),
+            );
+            w.set_sweep_dest_note(
+                "Heads up: sweeping between your own notebooks publicly links their addresses on-chain.".into(),
+            );
+        }
+        None => {
+            println!("cb: sweep-pick to={a}");
+            if let Some(store) = &mut st.store {
+                store.touch_contact(&a);
+            }
+            st.save_store();
+            refresh_contacts(w, st);
+            let name = st
+                .store
+                .as_ref()
+                .and_then(|s| s.contacts.iter().find(|c| c.address == a))
+                .map(|c| c.name.clone())
+                .filter(|n| !n.is_empty());
+            w.set_sweep_to_label(
+                match &name {
+                    Some(n) => format!("Everything to: {n} · {a}"),
+                    None => format!("Everything to: {a}"),
+                }
+                .into(),
+            );
+            w.set_sweep_dest_note("".into());
+        }
+    }
+    w.set_sweep_dest(a.into());
+    w.set_sweep_tier(1);
+    let rate = st.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+    w.set_sweep_rate_text(format!("{rate}").into());
+    w.set_sweep_fund_external(false);
+    w.set_sweep_inputs_expanded(false);
+    w.set_status("".into());
+    update_sweep_screen(w, st);
+    w.set_screen(16);
+}
+
+/// The per-notebook self-consolidate flow (screen 16, kind
+/// "consolidate") — still the watch-only path, where signing happens on
+/// an external wallet and one notebook is all there is.
+fn open_notebook_consolidate(w: &AppWindow, st: &mut State) {
+    let spendable = st
+        .store
+        .as_ref()
+        .map(|s| s.utxos.iter().filter(|u| !u.pending_spend).count())
+        .unwrap_or(0);
+    if spendable < 2 {
+        w.set_status("nothing to consolidate (need 2+ coins)".into());
+        return;
+    }
+    let Some(addr) = st.ident.as_ref().map(|i| i.address.clone()) else { return };
+    println!("cb: consolidate-open coins={spendable}");
+    w.set_sweep_kind("consolidate".into());
+    w.set_sweep_dest(addr.clone().into());
+    w.set_sweep_dest_note("".into());
+    let nb_name = st
+        .ident
+        .as_ref()
+        .map(|i| st.notebook_display_name(i.account))
+        .unwrap_or_else(|| "this notebook".into());
+    w.set_sweep_to_label(format!("Consolidate within {nb_name} · {}", addr_short(&addr)).into());
+    w.set_sweep_tier(1);
+    let rate = st.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+    w.set_sweep_rate_text(format!("{rate}").into());
+    w.set_sweep_fund_external(false);
+    w.set_sweep_inputs_expanded(false);
+    w.set_status("".into());
+    update_sweep_screen(w, st);
+    w.set_screen(16);
+}
+
+/// A (possibly inactive) notebook's store, read from its file on disk;
+/// the ACTIVE notebook prefers the live in-memory store.
+fn notebook_store(st: &State, account: u32) -> Option<Store> {
+    if st.ident.as_ref().map(|i| i.account) == Some(account) {
+        if let Some(s) = &st.store {
+            return Some(s.clone());
+        }
+    }
+    let (_, _, fp8) = st.nb_addrs.iter().find(|(a, ..)| *a == account)?;
+    Store::load(&st.store_path_for(fp8)).ok()
+}
+
+/// Sender-filter label rules: "Self · <notebook>" when the sender is one
+/// of our own addresses (this notebook's own notes, or directed notes
+/// from a sibling notebook), the contact name when known, else the short
+/// address form.
+fn sender_label(st: &State, store: &Store, key: &str) -> String {
+    if let Some((account, ..)) = st.nb_addrs.iter().find(|(_, a, _)| a == key) {
+        return format!("Self · {}", st.notebook_display_name(*account));
+    }
+    if let Some(c) = store.contacts.iter().find(|c| c.address == key && !c.name.is_empty()) {
+        return c.name.clone();
+    }
+    addr_short(key)
+}
+
+/// Build the notebook-list rows (screen 17) from the index plus each
+/// notebook's store on disk. Snippet and unread respect that notebook's
+/// sender filter, so the row preview matches what opening it reveals.
+fn update_notebook_list(w: &AppWindow, st: &State) {
+    let Some(ix) = &st.notebooks else { return };
+    w.set_can_create_notebook(
+        st.material
+            .as_deref()
+            .map(|m| is_hierarchical(m, st.network))
+            .unwrap_or(false),
+    );
+    let mut active_rows: Vec<NotebookItem> = Vec::new();
+    let mut archived_rows: Vec<NotebookItem> = Vec::new();
+    for meta in &ix.notebooks {
+        let Some((_, address, _)) = st.nb_addrs.iter().find(|(a, ..)| *a == meta.account) else {
+            continue;
+        };
+        let store = notebook_store(st, meta.account);
+        let (snippet, meta_line, unread) = match &store {
+            Some(s) => {
+                let visible: Vec<&app_core::store::NoteRecord> = s.visible_notes().collect();
+                let snippet = visible
+                    .last()
+                    .map(|n| {
+                        n.text
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or("(encrypted)")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "No notes yet".into());
+                let meta_line = format!(
+                    "{} · {} sats · {} note{}",
+                    addr_short(address),
+                    commas(s.balance()),
+                    visible.len(),
+                    if visible.len() == 1 { "" } else { "s" }
+                );
+                (snippet, meta_line, s.unread_visible_count())
+            }
+            None => ("No notes yet".into(), format!("{} · not scanned yet", addr_short(address)), 0),
+        };
+        let row = NotebookItem {
+            account: meta.account as i32,
+            name: st.notebook_display_name(meta.account).into(),
+            snippet: snippet.into(),
+            meta: meta_line.into(),
+            unread: match unread {
+                0 => "".into(),
+                1 => "1 new".into(),
+                n => format!("{n} new").into(),
+            },
+            active: st.ident.as_ref().map(|i| i.account) == Some(meta.account),
+        };
+        if meta.archived {
+            archived_rows.push(row);
+        } else {
+            active_rows.push(row);
+        }
+    }
+    println!("cb: notebooks list n={} archived={}", active_rows.len(), archived_rows.len());
+    w.set_notebooks(VecModel::from_slice(&active_rows));
+    w.set_archived_notebooks(VecModel::from_slice(&archived_rows));
+    w.set_archived_toggle_label(
+        if archived_rows.is_empty() {
+            String::new()
+        } else {
+            format!("Archived ({})", archived_rows.len())
+        }
+        .into(),
+    );
+}
+
 fn update_home(w: &AppWindow, st: &State) {
     let Some(ident) = &st.ident else { return };
     let Some(store) = &st.store else { return };
     let watch = ident.is_watch();
     w.set_watch_only(watch);
+    w.set_notebook_title(st.notebook_display_name(ident.account).into());
     w.set_address(ident.address.as_str().into());
     if let Some(img) = qr::qr_image(&ident.address.to_uppercase()) {
         w.set_address_qr(img);
@@ -957,12 +1388,35 @@ fn update_home(w: &AppWindow, st: &State) {
         format!("{} sats · block {}", commas(store.balance()), commas(store.tip_height as u64))
             .into(),
     );
+    // Sender filter: the checklist model + the "hidden" pill, then the
+    // notes list itself filtered through the persisted exclusion set.
+    let senders: Vec<SenderItem> = store
+        .senders()
+        .into_iter()
+        .map(|(key, count)| SenderItem {
+            label: sender_label(st, store, &key).into(),
+            sub: format!("{count} note{}", if count == 1 { "" } else { "s" }).into(),
+            excluded: store.is_excluded(&key),
+            key: key.into(),
+        })
+        .collect();
+    let hidden = senders.iter().filter(|s| s.excluded).count();
+    w.set_senders(VecModel::from_slice(&senders));
+    w.set_hidden_senders_label(
+        match hidden {
+            0 => String::new(),
+            1 => "1 sender hidden".into(),
+            n => format!("{n} senders hidden"),
+        }
+        .into(),
+    );
     let address = ident.address.clone();
     let net = st.network;
     let mut items: Vec<NoteItem> = store
         .notes
         .iter()
         .rev()
+        .filter(|n| !store.is_excluded(&store.sender_key(n)))
         .map(|n| {
             let badge = match n.status {
                 NoteStatus::Pending => "pending",
@@ -1012,45 +1466,222 @@ fn update_home(w: &AppWindow, st: &State) {
             .unwrap_or(false),
     );
     if let Some(i) = &st.ident {
+        let (active_n, archived_n) = st
+            .notebooks
+            .as_ref()
+            .map(|ix| (ix.active().count(), ix.archived_count()))
+            .unwrap_or((0, 0));
         w.set_settings_identity(
             format!(
-                "{}{}{} · {}",
+                "{}{} · {} · {} notebook{}{}",
                 i.kind,
                 if i.is_watch() { " · watch-only" } else { "" },
-                if matches!(i.kind, "mnemonic" | "xprv") {
-                    format!(" · account {}", i.account)
-                } else {
-                    String::new()
-                },
-                st.network.as_str()
+                st.network.as_str(),
+                active_n,
+                if active_n == 1 { "" } else { "s" },
+                if archived_n > 0 { format!(" ({archived_n} archived)") } else { String::new() }
             )
             .into(),
         );
     }
     w.set_chunk_text(store.chunk_size.to_string().into());
     load_backend_settings(w, st);
-    // Coins (spendable UTXOs) list + summary.
-    let coins: Vec<CoinItem> = store
-        .utxos
-        .iter()
-        .filter(|u| !u.pending_spend)
-        .map(|u| CoinItem {
-            outpoint: format!("{}:{}", u.txid, u.vout).into(),
-            value: u.value.to_string().into(),
-            status: if u.height.is_some() { "confirmed" } else { "unconfirmed" }.into(),
-        })
-        .collect();
-    let spendable: u64 = store.utxos.iter().filter(|u| !u.pending_spend).map(|u| u.value).sum();
+    update_wallet_coins(w, st);
+}
+
+/// The wallet-wide coins viewer (screen 10 + the Settings Coins card):
+/// every ACTIVE notebook's spendable UTXOs, each tagged with its
+/// notebook, plus the cross-wallet summary — data as of each notebook's
+/// last scan (the ↻ on the coins screen rescans them all).
+fn update_wallet_coins(w: &AppWindow, st: &State) {
+    let mut coins: Vec<CoinItem> = Vec::new();
+    let mut spendable: u64 = 0;
+    let mut notebooks = 0usize;
+    if let Some(ix) = &st.notebooks {
+        for m in ix.active() {
+            let Some(store) = notebook_store(st, m.account) else { continue };
+            let name = st.notebook_display_name(m.account);
+            let mut any = false;
+            for u in store.utxos.iter().filter(|u| !u.pending_spend) {
+                coins.push(CoinItem {
+                    outpoint: format!("{}:{}", u.txid, u.vout).into(),
+                    value: u.value.to_string().into(),
+                    status: if u.height.is_some() { "confirmed" } else { "unconfirmed" }.into(),
+                    notebook: name.clone().into(),
+                });
+                spendable += u.value;
+                any = true;
+            }
+            if any {
+                notebooks += 1;
+            }
+        }
+    }
     let n = coins.len();
     w.set_coins(VecModel::from_slice(&coins));
     w.set_coins_summary(
         if n == 0 {
-            "No coins yet — fund your address to add some.".to_string()
+            "No coins anywhere yet — fund a notebook's address to add some.".to_string()
         } else {
-            format!("{n} coin{} · {spendable} sats total", if n == 1 { "" } else { "s" })
+            format!(
+                "{n} coin{} · {} sats across {notebooks} notebook{}",
+                if n == 1 { "" } else { "s" },
+                commas(spendable),
+                if notebooks == 1 { "" } else { "s" }
+            )
         }
         .into(),
     );
+}
+
+/// Rescan every ACTIVE notebook except the current one (the caller runs
+/// the full refresh() for that): bundle per address, apply, save. Used by
+/// the coins screen's ↻ so the wallet-wide view is live, not last-scan.
+fn refresh_wallet_stores(st: &State) -> usize {
+    let Some(base) = st.base_url() else { return 0 };
+    let Some(material_str) = st.material.as_deref() else { return 0 };
+    let Ok(material) = parse_key_material(material_str, st.network) else { return 0 };
+    let Some(ix) = &st.notebooks else { return 0 };
+    let client = ChainClient::new(HttpTransport::new(base), st.network);
+    let current = st.ident.as_ref().map(|i| i.account);
+    let mut scanned = 0;
+    for m in ix.active() {
+        if current == Some(m.account) {
+            continue;
+        }
+        let Ok(ident) = realize(&material, st.network, m.account) else { continue };
+        let mut store = notebook_store(st, m.account)
+            .unwrap_or_else(|| Store::new(&ident.output_x(), st.network));
+        let Ok(bundle) = client.build_bundle(&ident.address, None) else { continue };
+        let applied = match ident.full() {
+            Some(id) => store.apply_bundle(&bundle, id, st.network),
+            None => store.apply_bundle_watch(&bundle, &ident.output_x(), st.network),
+        };
+        if applied.is_ok() {
+            if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == m.account) {
+                let _ = store.save(&st.store_path_for(fp8));
+            }
+            scanned += 1;
+        }
+    }
+    scanned
+}
+
+/// One finished background scan, waiting to be applied on the UI thread.
+/// `address` guards staleness: if the user switched notebooks while the
+/// worker ran, the result is dropped (apply_bundle would refuse anyway —
+/// this just keeps the failure silent and correct).
+struct RefreshResult {
+    address: String,
+    bundle: Result<app_core::notes_core::bundle::SyncBundle, String>,
+    /// (txid, confirmed?) for the pending sweep/consolidate records that
+    /// existed at snapshot time — fetched on the worker so
+    /// resolve_spend_statuses never blocks the UI thread.
+    statuses: Vec<(String, Option<bool>)>,
+}
+
+static REFRESH_RESULTS: std::sync::Mutex<Vec<RefreshResult>> = std::sync::Mutex::new(Vec::new());
+
+/// [`refresh`] with the network half on a worker thread (Sal 2026-07-11:
+/// opening a notebook took 3-4 s on the phone because the tap handler
+/// scanned synchronously — the screen never painted until it finished).
+/// The screen paints immediately with "syncing…", the worker fetches the
+/// bundle + pending-tx statuses, and the result comes back through
+/// [`REFRESH_RESULTS`] + the `apply-pending-refresh` trampoline callback
+/// (the UI thread applies it with full State access, exactly like the
+/// synchronous refresh did).
+fn refresh_async(w: &AppWindow, st: &mut State) {
+    if st.ident.is_none() || st.store.is_none() {
+        return;
+    }
+    let Some(base) = st.base_url() else {
+        w.set_status("no Bitcoin node for this network — set one in Settings".into());
+        return;
+    };
+    let address = st.ident.as_ref().unwrap().address.clone();
+    let network = st.network;
+    let pending_txids: Vec<String> = st
+        .store
+        .as_ref()
+        .unwrap()
+        .txs
+        .iter()
+        .filter(|t| t.status == NoteStatus::Pending)
+        .flat_map(|t| t.txids.iter().cloned())
+        .collect();
+    w.set_status("syncing…".into());
+    let weak = w.as_weak();
+    std::thread::spawn(move || {
+        let client = ChainClient::new(HttpTransport::new(base), network);
+        let bundle = client.build_bundle(&address, None).map_err(|e| format!("{e}"));
+        let statuses = pending_txids
+            .iter()
+            .map(|t| (t.clone(), client.fetch_tx_status(t)))
+            .collect();
+        REFRESH_RESULTS
+            .lock()
+            .expect("refresh results mutex")
+            .push(RefreshResult { address, bundle, statuses });
+        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_refresh());
+    });
+}
+
+/// The UI-thread half of [`refresh_async`]: identical bookkeeping to the
+/// synchronous [`refresh`], fed from the worker's results.
+fn apply_refresh_results(w: &AppWindow, st: &mut State) {
+    let results: Vec<RefreshResult> =
+        REFRESH_RESULTS.lock().expect("refresh results mutex").drain(..).collect();
+    for r in results {
+        if st.ident.as_ref().map(|i| i.address.as_str()) != Some(r.address.as_str()) {
+            println!("cb: refresh stale-drop address={}", &r.address[..12.min(r.address.len())]);
+            continue;
+        }
+        match r.bundle {
+            Ok(bundle) => {
+                st.fees = Some(bundle.fee_rates.clone());
+                st.usd = bundle.btc_usd;
+                let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
+                let output_x = st.ident.as_ref().unwrap().output_x();
+                let network = st.network;
+                let applied = match &keyed {
+                    Some(identity) => {
+                        st.store.as_mut().unwrap().apply_bundle(&bundle, identity, network)
+                    }
+                    None => st.store.as_mut().unwrap().apply_bundle_watch(&bundle, &output_x, network),
+                };
+                match applied {
+                    Ok(stats) => {
+                        let n = st
+                            .store
+                            .as_mut()
+                            .unwrap()
+                            .resolve_spend_statuses(|t| {
+                                r.statuses.iter().find(|(x, _)| x == t).and_then(|(_, s)| *s)
+                            });
+                        if n > 0 {
+                            println!("cb: spend-confirmed n={n}");
+                        }
+                        println!(
+                            "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
+                            stats.notes_seen,
+                            stats.notes_new,
+                            stats.orphaned,
+                            st.store.as_ref().unwrap().balance(),
+                            st.store.as_ref().unwrap().tip_height
+                        );
+                        st.save_store();
+                        w.set_status(format!("synced · {} notes", stats.notes_seen).into());
+                    }
+                    Err(e) => w.set_status(format!("apply failed: {e}").into()),
+                }
+            }
+            Err(e) => {
+                println!("cb: refresh err={e}");
+                w.set_status("couldn't reach the network — tap refresh to retry".into());
+            }
+        }
+        update_home(w, st);
+    }
 }
 
 fn refresh(w: &AppWindow, st: &mut State) {
@@ -1882,6 +2513,8 @@ pub fn run() {
         .and_then(|a| a.parse().ok())
         .or_else(|| config.get("account").and_then(|v| v.as_u64()).map(|v| v as u32))
         .unwrap_or(0);
+    let chunk: Option<usize> =
+        config.get("chunk").and_then(|v| v.as_u64()).map(|v| v as usize);
     // Device-level per-network Settings (Bitcoin node / block explorer URLs).
     let str_map = |key: &str| -> HashMap<String, String> {
         config
@@ -1929,6 +2562,11 @@ pub fn run() {
         watch_spend: None,
         watch_bump: None,
         watch_note: None,
+        chunk,
+        notebooks: None,
+        notebooks_fp8: None,
+        nb_addrs: Vec::new(),
+        wconsol: None,
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -2061,8 +2699,20 @@ pub fn run() {
         if let Some(m) = material {
             match activate(&mut s, &m, false) {
                 Ok(()) => {
-                    window.set_screen(4);
+                    // APP_KEY boots (automation, dev) name their account via
+                    // APP_ACCOUNT/config — that's an explicit choice, so it
+                    // counts as deliberate notebook creation. Keychain boots
+                    // never auto-create: the index is whatever onboarding
+                    // and the user left behind.
+                    if std::env::var("APP_KEY").is_ok() {
+                        let account = s.account;
+                        ensure_notebook(&mut s, account);
+                    }
+                    // The notebook list is the main screen; the active
+                    // notebook's home is one tap in.
                     update_home(&window, &s);
+                    update_notebook_list(&window, &s);
+                    window.set_screen(17);
                     // Initial sync AFTER the first frame. Blocking the launch
                     // path on network I/O gets the app killed by the iOS
                     // launch watchdog (black screen, then 0x8badf00d) when
@@ -2074,7 +2724,7 @@ pub fn run() {
                     let st_boot = st.clone();
                     slint::Timer::single_shot(std::time::Duration::from_millis(300), move || {
                         if let Some(win) = w.upgrade() {
-                            refresh(&win, &mut st_boot.borrow_mut());
+                            refresh_async(&win, &mut st_boot.borrow_mut());
                         }
                     });
                 }
@@ -2204,9 +2854,11 @@ pub fn run() {
                     Ok(()) => {
                         println!("cb: restore-icloud ok");
                         w.set_icloud_backup(true);
-                        w.set_screen(4);
-                        update_home(&w, &s);
-                        refresh(&w, &mut s);
+                        // A fresh install restoring a hierarchical key has no
+                        // notebook index yet — land on the (empty) list, not
+                        // an unlisted account's home.
+                        go_home_or_list(&w, &s);
+                        refresh_async(&w, &mut s);
                     }
                     Err(e) => w.set_status(format!("restore: {e}").into()),
                 }
@@ -2262,9 +2914,11 @@ pub fn run() {
             Ok(()) => {
                 s.pending_mnemonic = None;
                 w.set_status("".into());
-                w.set_screen(4);
-                update_home(&w, &s);
-                refresh(&w, &mut s);
+                // A brand-new seed has NO notebooks (Sal 2026-07-11:
+                // onboarding must not auto-create one) — land on the empty
+                // list; the first notebook is created deliberately there.
+                go_home_or_list(&w, &s);
+                refresh_async(&w, &mut s);
             }
             Err(e) => w.set_status(format!("{e}").into()),
         }
@@ -2436,7 +3090,13 @@ pub fn run() {
     });
 
     cb!(on_refresh, |w, s| {
-        refresh(&w, &mut s);
+        refresh_async(&w, &mut s);
+    });
+
+    // Trampoline: a finished background scan invokes this from the event
+    // loop; the UI thread applies it with full State access.
+    cb!(on_apply_pending_refresh, |w, s| {
+        apply_refresh_results(&w, &mut s);
     });
 
     cb!(on_open_note, |w, s, id: SharedString| {
@@ -2520,6 +3180,7 @@ pub fn run() {
 
     cb!(on_open_activity, |w, s| {
         println!("cb: open-activity");
+        w.set_return_screen(if w.get_screen() == 17 { 17 } else { 4 });
         update_activity(&w, &s);
         w.set_status("".into());
         w.set_screen(11);
@@ -2639,9 +3300,52 @@ pub fn run() {
             w.set_bump_error("no identity".into());
             return;
         };
+        // Multi-key records (wallet sweep/consolidate) carry per-input
+        // owners; re-sign each input with its own account's key.
+        let owner_accounts: Vec<u32> = s
+            .store
+            .as_ref()
+            .and_then(|st| st.txs.iter().find(|t| t.txids.iter().any(|x| x == &ref_id)))
+            .map(|t| t.input_accounts.clone())
+            .unwrap_or_default();
         let result: Result<(String, String, u64), app_core::Error> = if is_note {
             app_core::compose::bump_fee(s.store.as_mut().unwrap(), &identity, net, &ref_id, new_rate)
                 .map(|c| (c.tx.raw_hex.clone(), c.tx.txid_hex.clone(), c.tx.fee))
+        } else if !owner_accounts.is_empty() {
+            let mut distinct = owner_accounts.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            let idents: Result<Vec<(u32, app_core::notes_core::bundle::Identity)>, app_core::Error> =
+                s.material
+                    .as_deref()
+                    .ok_or_else(|| app_core::Error::Store("no key material".into()))
+                    .and_then(|m| {
+                        parse_key_material(m, net)
+                            .map_err(|e| app_core::Error::Store(format!("{e}")))
+                    })
+                    .and_then(|material| {
+                        distinct
+                            .iter()
+                            .map(|a| {
+                                realize(&material, net, *a)
+                                    .map_err(|e| app_core::Error::Store(format!("{e}")))
+                                    .and_then(|i| {
+                                        i.full().map(|f| (*a, f.clone_fields())).ok_or_else(|| {
+                                            app_core::Error::Store("watch key can't bump".into())
+                                        })
+                                    })
+                            })
+                            .collect()
+                    });
+            idents.and_then(|idents| {
+                app_core::compose::bump_raw_tx_multi(
+                    s.store.as_mut().unwrap(),
+                    &idents,
+                    &ref_id,
+                    new_rate,
+                )
+                .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee))
+            })
         } else {
             app_core::compose::bump_raw_tx(s.store.as_mut().unwrap(), &identity, &ref_id, new_rate)
                 .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee))
@@ -2757,19 +3461,53 @@ pub fn run() {
             watch_spend_build(&w, &mut s, "sweep", dest.clone(), recipient.spk.clone(), rate);
             return;
         }
-        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-            w.set_status("no identity".into());
+        // Wallet-level sweep: gather every active notebook's coins + keys
+        // (sweep = leaving the wallet — one multi-key tx, like consolidate
+        // but with an external destination).
+        let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
             return;
         };
-        let store = s.store.as_mut().unwrap();
-        let inputs = spendable_inputs(store);
+        let Ok(material) = parse_key_material(&material_str, net) else { return };
+        let mut idents: Vec<(u32, app_core::notes_core::bundle::Identity, Vec<app_core::notes_core::tx::Utxo>)> =
+            Vec::new();
+        if let Some(ix) = &s.notebooks {
+            for m in ix.active() {
+                let Some(store) = notebook_store(&s, m.account) else { continue };
+                let coins = store.available_utxos();
+                if coins.is_empty() {
+                    continue;
+                }
+                let Ok(ident) = realize(&material, net, m.account) else { continue };
+                let Some(full) = ident.full().map(|i| i.clone_fields()) else { continue };
+                idents.push((m.account, full, coins));
+            }
+        }
+        if idents.is_empty() {
+            w.set_status("nothing to sweep".into());
+            return;
+        }
+        let all_inputs: Vec<app_core::store::TxInput> = idents
+            .iter()
+            .flat_map(|(_, _, coins)| coins.iter())
+            .map(|u| {
+                let mut t = u.txid;
+                t.reverse();
+                app_core::store::TxInput { txid: hex::encode(t), vout: u.vout, value: u.value }
+            })
+            .collect();
         let dest_spk_hex = hex::encode(&recipient.spk);
-        let sweep = app_core::notes_core::tx::build_sweep_tx(
-            &store.available_utxos(),
-            &identity.output_x,
+        let sources: Vec<app_core::notes_core::tx::SweepSource> = idents
+            .iter()
+            .map(|(_, id, coins)| app_core::notes_core::tx::SweepSource {
+                utxos: coins,
+                output_x: id.output_x,
+                tweaked_seckey: &id.tweaked_seckey,
+            })
+            .collect();
+        let sweep = app_core::notes_core::tx::build_sweep_tx_multi(
+            &sources,
             recipient.spk,
             rate,
-            &identity.tweaked_seckey,
             app_core::notes_core::keys::generate_aux_rand,
         );
         match sweep {
@@ -2777,18 +3515,75 @@ pub fn run() {
                 let client = ChainClient::new(HttpTransport::new(base), net);
                 match client.broadcast(&tx.raw_hex) {
                     Ok(txid) => {
-                        for u in &mut store.utxos {
-                            u.pending_spend = true;
+                        // Lock every source's inputs; the record lives in the
+                        // ACTIVE notebook's store (Activity is wallet-wide).
+                        for (account, _, coins) in &idents {
+                            let active = s.ident.as_ref().map(|i| i.account) == Some(*account);
+                            let mark = |store: &mut Store| {
+                                for u in coins {
+                                    let mut t = u.txid;
+                                    t.reverse();
+                                    let txid_hex = hex::encode(t);
+                                    if let Some(l) = store
+                                        .utxos
+                                        .iter_mut()
+                                        .find(|l| l.txid == txid_hex && l.vout == u.vout)
+                                    {
+                                        l.pending_spend = true;
+                                    }
+                                }
+                            };
+                            if active {
+                                if let Some(store) = s.store.as_mut() {
+                                    mark(store);
+                                }
+                            } else if let Some(mut store) = notebook_store(&s, *account) {
+                                mark(&mut store);
+                                if let Some((_, _, fp8)) =
+                                    s.nb_addrs.iter().find(|(a, ..)| *a == *account)
+                                {
+                                    let _ = store.save(&s.store_path_for(fp8));
+                                }
+                            }
                         }
-                        store.record_tx("sweep", txid.clone(), tx.tx.outputs[0].value, tx.fee, tx.vsize as u64, tx.raw_hex.clone(), dest.clone(), inputs, dest_spk_hex, now());
+                        let input_accounts: Vec<u32> = idents
+                            .iter()
+                            .flat_map(|(a, _, coins)| std::iter::repeat(*a).take(coins.len()))
+                            .collect();
+                        if let Some(store) = s.store.as_mut() {
+                            store.record_tx(
+                                "sweep",
+                                txid.clone(),
+                                tx.tx.outputs[0].value,
+                                tx.fee,
+                                tx.vsize as u64,
+                                tx.raw_hex.clone(),
+                                dest.clone(),
+                                all_inputs,
+                                dest_spk_hex,
+                                now(),
+                            );
+                            if let Some(rec) = store.txs.last_mut() {
+                                rec.input_accounts = input_accounts;
+                            }
+                        }
                         s.save_store();
                         println!(
-                            "cb: sweep txid={txid} value={} fee={}",
-                            tx.tx.outputs[0].value, tx.fee
+                            "cb: sweep txid={txid} value={} fee={} notebooks={}",
+                            tx.tx.outputs[0].value,
+                            tx.fee,
+                            idents.len()
                         );
-                        w.set_status(format!("swept {} sats to {}…", tx.tx.outputs[0].value, &dest[..14.min(dest.len())]).into());
-                        w.set_screen(4); // done — home, like the PSBT flow
-                        update_home(&w, &s);
+                        w.set_status(
+                            format!(
+                                "swept the wallet — {} sats to {}…",
+                                commas(tx.tx.outputs[0].value),
+                                &dest[..14.min(dest.len())]
+                            )
+                            .into(),
+                        );
+                        update_notebook_list(&w, &s);
+                        w.set_screen(17); // wallet-level flow → the list
                     }
                     Err(e) => w.set_status(format!("sweep broadcast failed: {e}").into()),
                 }
@@ -2826,28 +3621,212 @@ pub fn run() {
     });
 
     cb!(on_consolidate_open, |w, s| {
-        let spendable = s
-            .store
-            .as_ref()
-            .map(|st| st.utxos.iter().filter(|u| !u.pending_spend).count())
-            .unwrap_or(0);
-        if spendable < 2 {
-            w.set_status("nothing to consolidate (need 2+ coins)".into());
+        open_notebook_consolidate(&w, &mut s);
+    });
+
+    cb!(on_consolidate_wallet_open, |w, s| {
+        // Watch-only identities have exactly one notebook and sign
+        // externally: route through the existing self-consolidate flow.
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            open_notebook_consolidate(&w, &mut s);
             return;
         }
-        let Some(addr) = s.ident.as_ref().map(|i| i.address.clone()) else { return };
-        println!("cb: consolidate-open coins={spendable}");
-        w.set_sweep_kind("consolidate".into());
-        w.set_sweep_dest(addr.clone().into());
-        w.set_sweep_to_label(format!("Consolidate to your address · {addr}").into());
-        w.set_sweep_tier(1);
-        let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
-        w.set_sweep_rate_text(format!("{rate}").into());
-        w.set_sweep_fund_external(false);
-        w.set_sweep_inputs_expanded(false);
-        w.set_status("".into());
-        update_sweep_screen(&w, &mut s);
-        w.set_screen(16);
+        let Some(ix) = &s.notebooks else { return };
+        let mut sources: Vec<(u32, Vec<app_core::notes_core::tx::Utxo>, u64)> = Vec::new();
+        let mut coins_total = 0usize;
+        for m in ix.active() {
+            let Some(store) = notebook_store(&s, m.account) else { continue };
+            let coins = store.available_utxos();
+            if coins.is_empty() {
+                continue;
+            }
+            coins_total += coins.len();
+            let value: u64 = coins.iter().map(|u| u.value).sum();
+            sources.push((m.account, coins, value));
+        }
+        if coins_total < 2 {
+            w.set_status("nothing to consolidate (need 2+ coins across the wallet)".into());
+            return;
+        }
+        println!(
+            "cb: wallet-consolidate open coins={coins_total} notebooks={}",
+            sources.len()
+        );
+        s.wconsol = Some(WConsol {
+            sources,
+            dest_account: 0,
+            dest_addr: String::new(),
+            rate: 0.0,
+            fee: 0,
+            vsize: 0,
+        });
+        w.set_nb_create_name("".into());
+        show_notebook_picker(&w, &s, 0, "wconsol");
+    });
+
+    cb!(on_wallet_consolidate, |w, s| {
+        w.set_show_wconsol_confirm(false);
+        w.set_account_pick_mode("switch".into());
+        let Some(wc) = s.wconsol.take() else { return };
+        let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+            return;
+        };
+        let Ok(material) = parse_key_material(&material_str, s.network) else { return };
+        let Some(base) = s.base_url() else {
+            w.set_status("no Bitcoin node for this network — set one in Settings".into());
+            return;
+        };
+        // Realize every source's full identity; a failure aborts cleanly.
+        let mut idents = Vec::new();
+        for (account, coins, _) in &wc.sources {
+            let ident = match realize(&material, s.network, *account) {
+                Ok(i) => i,
+                Err(e) => {
+                    w.set_status(format!("{e}").into());
+                    return;
+                }
+            };
+            let Some(full) = ident.full().map(|i| i.clone_fields()) else {
+                w.set_status("wallet consolidate needs the full key".into());
+                return;
+            };
+            idents.push((*account, full, coins.clone()));
+        }
+        let dest_spk = match Recipient::parse(s.network, &wc.dest_addr) {
+            Ok(r) => r.spk,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let sources: Vec<app_core::notes_core::tx::SweepSource> = idents
+            .iter()
+            .map(|(_, id, coins)| app_core::notes_core::tx::SweepSource {
+                utxos: coins,
+                output_x: id.output_x,
+                tweaked_seckey: &id.tweaked_seckey,
+            })
+            .collect();
+        let built = match app_core::notes_core::tx::build_sweep_tx_multi(
+            &sources,
+            dest_spk.clone(),
+            wc.rate,
+            app_core::notes_core::keys::generate_aux_rand,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let client = ChainClient::new(HttpTransport::new(base), s.network);
+        let txid = match client.broadcast(&built.raw_hex) {
+            Ok(t) => t,
+            Err(e) => {
+                w.set_status(format!("broadcast failed: {e}").into());
+                return;
+            }
+        };
+        let value = built.tx.outputs[0].value;
+        println!(
+            "cb: wallet-consolidate txid={txid} coins={} notebooks={} value={value} fee={}",
+            built.tx.inputs.len(),
+            wc.sources.len(),
+            built.fee
+        );
+        // Bookkeeping across stores: the destination gets the TxRecord and
+        // the unconfirmed coin; every source's spent inputs lock. The next
+        // scans reconcile everything authoritatively.
+        let all_inputs: Vec<app_core::store::TxInput> = wc
+            .sources
+            .iter()
+            .flat_map(|(_, coins, _)| coins.iter())
+            .map(|u| {
+                let mut t = u.txid;
+                t.reverse();
+                app_core::store::TxInput { txid: hex::encode(t), vout: u.vout, value: u.value }
+            })
+            .collect();
+        let dest_ident_ok = realize(&material, s.network, wc.dest_account).ok();
+        if let Some(dest_ident) = dest_ident_ok {
+            let mut dstore = notebook_store(&s, wc.dest_account)
+                .unwrap_or_else(|| Store::new(&dest_ident.output_x(), s.network));
+            dstore.record_tx(
+                "consolidate",
+                txid.clone(),
+                value,
+                built.fee,
+                built.vsize as u64,
+                built.raw_hex.clone(),
+                "self".into(),
+                all_inputs,
+                hex::encode(&dest_spk),
+                now(),
+            );
+            if let Some(rec) = dstore.txs.last_mut() {
+                rec.input_accounts = wc
+                    .sources
+                    .iter()
+                    .flat_map(|(a, coins, _)| std::iter::repeat(*a).take(coins.len()))
+                    .collect();
+            }
+            // Sources' inputs lock (the dest store handles its own below).
+            for (account, coins, _) in &wc.sources {
+                if *account == wc.dest_account {
+                    for u in coins {
+                        let mut t = u.txid;
+                        t.reverse();
+                        let txid_hex = hex::encode(t);
+                        if let Some(l) = dstore
+                            .utxos
+                            .iter_mut()
+                            .find(|l| l.txid == txid_hex && l.vout == u.vout)
+                        {
+                            l.pending_spend = true;
+                        }
+                    }
+                }
+            }
+            dstore.utxos.push(app_core::store::LedgerUtxo {
+                txid: txid.clone(),
+                vout: 0,
+                value,
+                height: None,
+                pending_spend: false,
+            });
+            if let Some((_, _, fp8)) =
+                s.nb_addrs.iter().find(|(a, ..)| *a == wc.dest_account)
+            {
+                let _ = dstore.save(&s.store_path_for(fp8));
+            }
+        }
+        for (account, coins, _) in &wc.sources {
+            if *account == wc.dest_account {
+                continue; // handled with the destination store above
+            }
+            let Some(mut store) = notebook_store(&s, *account) else { continue };
+            for u in coins {
+                let mut t = u.txid;
+                t.reverse();
+                let txid_hex = hex::encode(t);
+                if let Some(l) =
+                    store.utxos.iter_mut().find(|l| l.txid == txid_hex && l.vout == u.vout)
+                {
+                    l.pending_spend = true;
+                }
+            }
+            if let Some((_, _, fp8)) = s.nb_addrs.iter().find(|(a, ..)| *a == *account) {
+                let _ = store.save(&s.store_path_for(fp8));
+            }
+        }
+        // Reload the active store from disk (it may be source and/or dest),
+        // then land on the list — the wallet-level money flow's home.
+        let _ = activate(&mut s, &material_str, false);
+        update_notebook_list(&w, &s);
+        w.set_status(
+            format!("consolidated — {} sats now at {}", commas(value), s.notebook_display_name(wc.dest_account)).into(),
+        );
+        w.set_screen(17);
     });
 
     cb!(on_set_sweep_tier, |w, s, tier: i32| {
@@ -3020,34 +3999,7 @@ pub fn run() {
                     return;
                 }
             }
-            println!("cb: sweep-pick to={a}");
-            if let Some(store) = &mut s.store {
-                store.touch_contact(&a);
-            }
-            s.save_store();
-            refresh_contacts(&w, &s);
-            let name = s
-                .store
-                .as_ref()
-                .and_then(|st| st.contacts.iter().find(|c| c.address == a))
-                .map(|c| c.name.clone())
-                .filter(|n| !n.is_empty());
-            w.set_sweep_to_label(
-                match &name {
-                    Some(n) => format!("Everything to: {n} · {a}"),
-                    None => format!("Everything to: {a}"),
-                }
-                .into(),
-            );
-            w.set_sweep_dest(a.into());
-            w.set_sweep_tier(1);
-            let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
-            w.set_sweep_rate_text(format!("{rate}").into());
-            w.set_sweep_fund_external(false);
-            w.set_sweep_inputs_expanded(false);
-            w.set_status("".into());
-            update_sweep_screen(&w, &mut s);
-            w.set_screen(16);
+            set_sweep_dest(&w, &mut s, a);
             return;
         }
         if addr.as_str() == "self" {
@@ -3356,8 +4308,9 @@ pub fn run() {
     });
 
     cb!(on_refresh_coins, |w, s| {
-        println!("cb: refresh-coins");
-        refresh(&w, &mut s);
+        let scanned = refresh_wallet_stores(&s);
+        println!("cb: refresh-coins notebooks={}", scanned + 1);
+        refresh(&w, &mut s); // the active notebook + fees; rebuilds the view
         w.set_status("".into());
         refresh_compose(&w, &mut s);
     });
@@ -3952,6 +4905,7 @@ pub fn run() {
     });
 
     cb!(on_settings_open, |w, s| {
+        w.set_return_screen(if w.get_screen() == 17 { 17 } else { 4 });
         println!("cb: settings-open");
         w.set_reveal_text("".into());
         w.set_status("".into());
@@ -3969,6 +4923,11 @@ pub fn run() {
 
     cb!(on_accounts_page, |w, s, delta: i32| {
         let page = (w.get_account_page() + delta).max(0) as u32;
+        let mode = w.get_account_pick_mode();
+        if mode == "notebook" || mode == "wconsol" {
+            show_notebook_picker(&w, &s, page, mode.as_str());
+            return;
+        }
         let material = s
             .pending_import
             .as_ref()
@@ -3980,6 +4939,98 @@ pub fn run() {
     });
 
     cb!(on_pick_account, |w, s, idx: i32| {
+        if w.get_account_pick_mode() == "wconsol" {
+            // Wallet consolidate: the pick is the DESTINATION. A non-
+            // notebook address becomes a notebook (named inline) so the
+            // gathered coin can never land somewhere invisible.
+            let account = idx.max(0) as u32;
+            let Some(mut wc) = s.wconsol.take() else { return };
+            // An archived destination un-archives: the wallet's coin must
+            // never land in a hidden notebook.
+            if s.notebooks.as_ref().and_then(|ix| ix.get(account)).map(|m| m.archived)
+                == Some(true)
+            {
+                if let Some(ix) = s.notebooks.as_mut() {
+                    ix.set_archived(account, false);
+                    s.save_notebooks();
+                    println!("cb: archive-notebook account={account} archived=false");
+                }
+            }
+            if s.notebooks.as_ref().and_then(|ix| ix.get(account)).is_none() {
+                // Unnamed on purpose — the picker has no name field in this
+                // mode; the row shows the address short form until renamed.
+                ensure_notebook(&mut s, account);
+            }
+            let Some(addr) =
+                s.nb_addrs.iter().find(|(a, ..)| *a == account).map(|(_, ad, _)| ad.clone())
+            else {
+                return;
+            };
+            let n: usize = wc.sources.iter().map(|(_, c, _)| c.len()).sum();
+            let total: u64 = wc.sources.iter().map(|(_, _, v)| *v).sum();
+            let vsize = app_core::notes_core::tx::estimate_sweep_vsize(n, 34);
+            let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+            let fee = (vsize as f64 * rate).ceil() as u64;
+            if total <= fee || total - fee < DUST_SATS {
+                w.set_status("not enough across the wallet to cover the fee".into());
+                s.wconsol = None;
+                return;
+            }
+            w.set_wconsol_summary(
+                format!(
+                    "{n} coin{} from {} notebook{} become one coin at {} · {}.\n{} sats arrive after a ~{} sats fee ({rate:.1} sat/vB).",
+                    if n == 1 { "" } else { "s" },
+                    wc.sources.len(),
+                    if wc.sources.len() == 1 { "" } else { "s" },
+                    s.notebook_display_name(account),
+                    addr_short(&addr),
+                    commas(total - fee),
+                    commas(fee)
+                )
+                .into(),
+            );
+            wc.dest_account = account;
+            wc.dest_addr = addr;
+            wc.rate = rate;
+            wc.fee = fee;
+            wc.vsize = vsize as u64;
+            s.wconsol = Some(wc);
+            w.set_show_wconsol_confirm(true);
+            return;
+        }
+        if w.get_account_pick_mode() == "notebook" {
+            // Create flow: the inline name field is already filled (or
+            // deliberately empty) — tapping an address creates right away.
+            let account = idx.max(0) as u32;
+            if s.notebooks.as_ref().and_then(|ix| ix.get(account)).is_some() {
+                return; // row is disabled in the UI; never re-add
+            }
+            let name = w.get_nb_create_name().trim().to_string();
+            println!("cb: create-notebook account={account}");
+            let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+                return;
+            };
+            s.account = account;
+            match activate(&mut s, &material, false) {
+                Ok(()) => {
+                    ensure_notebook(&mut s, account);
+                    if !name.is_empty() {
+                        if let Some(ix) = s.notebooks.as_mut() {
+                            ix.rename(account, &name);
+                            s.save_notebooks();
+                            println!("cb: rename-notebook account={account}");
+                        }
+                    }
+                    w.set_account_pick_mode("switch".into());
+                    w.set_nb_create_name("".into());
+                    w.set_status("".into());
+                    update_notebook_list(&w, &s);
+                    w.set_screen(17);
+                }
+                Err(e) => w.set_status(format!("{e}").into()),
+            }
+            return;
+        }
         let first_import = s.pending_import.is_some();
         let Some(material) = s
             .pending_import
@@ -3993,17 +5044,39 @@ pub fn run() {
         println!("cb: pick-account {}", s.account);
         match activate(&mut s, &material, first_import) {
             Ok(()) => {
+                // Picking an account IS deliberate — it becomes a notebook
+                // (unnamed; renameable from the list).
+                let account = s.account;
+                ensure_notebook(&mut s, account);
                 w.set_import_text("".into());
                 w.set_status("".into());
                 w.set_screen(4);
                 update_home(&w, &s);
-                refresh(&w, &mut s);
+                refresh_async(&w, &mut s);
             }
             Err(e) => w.set_status(format!("{e}").into()),
         }
     });
 
     cb!(on_account_cancel, |w, s| {
+        if w.get_account_pick_mode() == "wconsol" {
+            // Abandon wallet consolidate: back to settings, untouched.
+            w.set_account_pick_mode("switch".into());
+            w.set_nb_create_name("".into());
+            s.wconsol = None;
+            w.set_status("".into());
+            w.set_screen(8);
+            return;
+        }
+        if w.get_account_pick_mode() == "notebook" {
+            // Abandon create → back to the notebook list, untouched.
+            w.set_account_pick_mode("switch".into());
+            w.set_nb_create_name("".into());
+            w.set_status("".into());
+            update_notebook_list(&w, &s);
+            w.set_screen(17);
+            return;
+        }
         if s.pending_import.take().is_some() {
             w.set_screen(1); // abandon import → back to the import form
         } else {
@@ -4019,7 +5092,9 @@ pub fn run() {
         if let Ok(entries) = std::fs::read_dir(&s.data_dir) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if name.starts_with("store-") && name.ends_with(".json") {
+                if (name.starts_with("store-") || name.starts_with("notebooks-"))
+                    && name.ends_with(".json")
+                {
                     let _ = std::fs::remove_file(e.path());
                 }
             }
@@ -4028,6 +5103,9 @@ pub fn run() {
         s.store = None;
         s.material = None;
         s.account = 0;
+        s.notebooks = None;
+        s.notebooks_fp8 = None;
+        s.nb_addrs.clear();
         s.to_address = None;
         s.icloud_backup = false;
         w.set_icloud_backup(false);
@@ -4060,7 +5138,7 @@ pub fn run() {
             match activate(&mut s, &m, false) {
                 Ok(()) => {
                     update_home(&w, &s);
-                    refresh(&w, &mut s);
+                    refresh_async(&w, &mut s);
                 }
                 Err(e) => w.set_status(format!("network switch: {e}").into()),
             }
@@ -4075,6 +5153,8 @@ pub fn run() {
                     store.chunk_size = n;
                 }
                 s.save_store();
+                s.chunk = Some(n); // device-level: every notebook, on activate
+                s.save_config();
                 println!("cb: set-chunk-size {n} ok");
                 w.set_chunk_text(n.to_string().into());
                 if n == 100_000 || n == 80 {
@@ -4186,9 +5266,132 @@ pub fn run() {
     });
 
     cb!(on_go_home, |w, s| {
+        let _ = &mut s;
         w.set_reveal_text("".into());
+        go_home_or_list(&w, &s);
+    });
+
+    cb!(on_open_notebooks, |w, s| {
+        // Leaving the open notebook: everything that was on screen counts
+        // as read, so the list badge only flags what arrived since.
+        if let Some(store) = s.store.as_mut() {
+            if store.mark_seen() > 0 {
+                s.save_store();
+            }
+        }
+        w.set_status("".into());
+        update_notebook_list(&w, &s);
+        w.set_screen(17);
+    });
+
+    cb!(on_open_notebook, |w, s, account: i32| {
+        let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+            return;
+        };
+        s.account = account.max(0) as u32;
+        println!("cb: open-notebook account={}", s.account);
+        match activate(&mut s, &material, false) {
+            Ok(()) => {
+                update_home(&w, &s);
+                w.set_screen(4); // paint first — the scan runs in the background
+                refresh_async(&w, &mut s);
+            }
+            Err(e) => w.set_status(format!("{e}").into()),
+        }
+    });
+
+    cb!(on_create_notebook, |w, s| {
+        // Address-first, then name-first: "+ New notebook" opens the
+        // account picker (used/new pills + balances) so recovering a used
+        // address is a visible choice; the naming dialog follows the pick.
+        // Nothing is derived or persisted until the dialog's Create.
+        let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+            return;
+        };
+        if !is_hierarchical(&material, s.network) {
+            return; // button is hidden; a stray call must not add phantom rows
+        }
+        println!("cb: create-notebook picker open");
+        w.set_nb_create_name("".into());
+        show_notebook_picker(&w, &s, 0, "notebook");
+    });
+
+    cb!(on_nb_rename_start, |w, s, account: i32, _display: SharedString| {
+        let _ = &mut s;
+        // Prefill the RAW local name (the display name may be the address
+        // short form, which must not become a name by accident).
+        let raw = s
+            .notebooks
+            .as_ref()
+            .and_then(|ix| ix.get(account.max(0) as u32))
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        w.set_nb_rename_input(raw.into());
+        w.set_nb_rename_account(account);
+    });
+
+    cb!(on_nb_rename_save, |w, s, name: SharedString| {
+        let sel = w.get_nb_rename_account();
+        if sel < 0 {
+            return;
+        }
+        w.set_nb_rename_account(-1);
+        w.set_nb_rename_input("".into());
+        let account = sel as u32;
+        if let Some(ix) = s.notebooks.as_mut() {
+            ix.rename(account, name.as_str());
+            s.save_notebooks();
+            println!("cb: rename-notebook account={account}");
+        }
+        update_notebook_list(&w, &s);
+        if s.ident.as_ref().map(|i| i.account) == Some(account) {
+            w.set_notebook_title(s.notebook_display_name(account).into());
+        }
+    });
+
+    cb!(on_nb_rename_cancel, |w, s| {
+        let _ = &mut s;
+        w.set_nb_rename_account(-1);
+        w.set_nb_rename_input("".into());
+    });
+
+    cb!(on_nb_archive, |w, s, account: i32, archived: bool| {
+        let account = account.max(0) as u32;
+        if s.notebooks.is_none() {
+            return;
+        }
+        if archived {
+            // One guard only: funds never disappear from view silently —
+            // sweep first. Archiving EVERY notebook is allowed (the list
+            // shows its empty state); Restore brings any of them back.
+            let balance = notebook_store(&s, account).map(|st2| st2.balance()).unwrap_or(0);
+            if balance > 0 {
+                w.set_status(
+                    format!(
+                        "this notebook holds {} sats — consolidate the wallet first (Settings)",
+                        commas(balance)
+                    )
+                    .into(),
+                );
+                return;
+            }
+        }
+        if let Some(ix) = s.notebooks.as_mut() {
+            ix.set_archived(account, archived);
+            s.save_notebooks();
+            println!("cb: archive-notebook account={account} archived={archived}");
+        }
+        w.set_status("".into());
+        update_notebook_list(&w, &s);
+    });
+
+    cb!(on_toggle_sender, |w, s, key: SharedString, excluded: bool| {
+        let Some(store) = s.store.as_mut() else { return };
+        store.set_excluded(key.as_str(), excluded);
+        let hidden = store.excluded_senders.len();
+        println!("cb: toggle-sender excluded={excluded} hidden={hidden}");
+        s.save_store();
         update_home(&w, &s);
-        w.set_screen(4);
     });
 
     let auto_refresh = slint::Timer::default();

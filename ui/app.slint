@@ -5,19 +5,33 @@
 import { ListView, Switch } from "std-widgets.slint";
 
 export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string, private: bool }
+// One notebook row: `unread` is a preformatted badge label ("3 new"), empty =
+// no badge; `meta` is "addr-short · balance · note count".
+export struct NotebookItem { account: int, name: string, snippet: string, meta: string, unread: string, active: bool }
+// One sender-filter row: `key` is the raw sender address (the exclusion-set
+// entry), `label` the resolved display name, `sub` the note count line.
+export struct SenderItem { key: string, label: string, sub: string, excluded: bool }
 export struct ContactItem { address: string, name: string }
-export struct AccountItem { index: int, address: string, active: bool }
-export struct CoinItem { outpoint: string, value: string, status: string }
+// `pill`/`balance` are set only by the notebook-create picker ("new" /
+// "used" / "notebook" + a sats line); the import/switch picker leaves them
+// empty and the row renders as before.
+export struct AccountItem { index: int, address: string, active: bool, pill: string, balance: string }
+// `notebook` = owning notebook's display name (the coins viewer is
+// wallet-wide since 2026-07-11).
+export struct CoinItem { outpoint: string, value: string, status: string, notebook: string }
 export struct SpendCoin { outpoint: string, value: string, confirmed: bool, selected: bool, txid-short: string, explorer: string }
 // One input/output row in the Sparrow-style PSBT confirmation. `kind` drives
 // the accent: note · self · recipient · change · input · other.
 export struct PsbtRow { title: string, subtitle: string, amount: string, kind: string }
 // A saved funding wallet in the manager list.
 export struct FundingWalletRow { id: string, label: string, meta: string, active: bool }
+// `notebook` = owning notebook's display name (Activity is wallet-wide);
+// `pending` also gates the action buttons — only the ACTIVE notebook's
+// rows are actionable (bump/rebroadcast sign with its key).
 export struct ActivityItem {
     ref-id: string, is-note: bool, kind: string, title: string,
     txid: string, fee-line: string, status: string, explorer: string,
-    pending: bool, replaced: string }
+    pending: bool, replaced: string, notebook: string }
 
 // Per-platform optical calibration, set from Rust at startup. The header
 // title Text sits differently inside its line box per platform font (macOS/
@@ -661,6 +675,7 @@ component SvgIconButton inherits Rectangle {
     Image {
         source: root.icon == "activity" ? @image-url("icons/activity.svg")
               : root.icon == "refresh" ? @image-url("icons/refresh.svg")
+              : root.icon == "archive" ? @image-url("icons/archive.svg")
               : @image-url("icons/copy.svg");
         colorize: root.tint;
         width: root.size;
@@ -1202,6 +1217,50 @@ export component AppWindow inherits Window {
     callback set-explorer-custom(string);
     callback reveal-backup();
     callback go-home();
+    // Internal: a background scan finished — Rust invokes this from the
+    // event loop to apply the result (never called from UI elements).
+    callback apply-pending-refresh();
+    // Where settings/activity return on back: the screen they were opened
+    // from (the notebook list or a notebook's home). Set by their open
+    // callbacks in Rust.
+    in-out property <int> return-screen: 4;
+
+    // ---------- notebooks (screen 17 = the main list; 4 = one notebook) ----------
+    in-out property <[NotebookItem]> notebooks;
+    in-out property <[NotebookItem]> archived-notebooks;
+    in-out property <bool> show-archived;
+    in-out property <string> archived-toggle-label;   // "Archived (2)" — preformatted
+    in-out property <bool> can-create-notebook;       // hierarchical identities only
+    in-out property <string> notebook-title: "Chain Notes"; // home header = open notebook's name
+    // -1 = rename dialog closed · >= 0 = renaming that account. (Creation
+    // never dialogs — the picker's inline name field covers it.)
+    in-out property <int> nb-rename-account: -1;
+    in-out property <string> nb-rename-input;
+    // sender filter (home): exclusions persist per notebook, all-on default
+    in-out property <[SenderItem]> senders;
+    in-out property <bool> filter-expanded;
+    in-out property <string> hidden-senders-label;    // "2 senders hidden", empty = none
+    // The account picker (screen 9) serves two flows: "switch" = import /
+    // settings account change (pick activates), "notebook" = the create-
+    // notebook flow (inline name field on top; tapping an address creates
+    // the notebook right away — rows already added are disabled).
+    in-out property <string> account-pick-mode: "switch";
+    in-out property <string> nb-create-name;
+    in-out property <string> sweep-dest-note;   // linkage caveat, empty = none
+    // wallet-level consolidate (Settings): dest picked on screen 9 in
+    // "wconsol" mode, then a confirm modal, then one multi-key tx.
+    in-out property <bool> show-wconsol-confirm;
+    in-out property <string> wconsol-summary;
+    callback consolidate-wallet-open();
+    callback wallet-consolidate();
+    callback open-notebooks();
+    callback open-notebook(int);
+    callback create-notebook();
+    callback nb-rename-start(int, string);
+    callback nb-rename-save(string);
+    callback nb-rename-cancel();
+    callback nb-archive(int, bool);
+    callback toggle-sender(string, bool);
 
     // ---------- system back (Android hardware/gesture back) ----------
     // slint delivers Android's back button/gesture as Key.Back to whatever
@@ -1217,6 +1276,7 @@ export component AppWindow inherits Window {
     function nav-back() -> bool {
         // Overlays first, topmost (= last window child) before the rest —
         // back closes the same thing a tap on Cancel / the dim would.
+        if (root.show-wconsol-confirm) { root.show-wconsol-confirm = false; return true; }
         if (root.show-bump-dialog) { root.show-bump-dialog = false; return true; }
         if (root.show-oversize-modal) { root.show-oversize-modal = false; return true; }
         if (root.show-consolidate-confirm) { root.show-consolidate-confirm = false; return true; }
@@ -1225,11 +1285,18 @@ export component AppWindow inherits Window {
         if (root.confirm-remove-address != "") { root.cancel-remove(); return true; }
         if (root.rename-address != "") { root.cancel-rename(); return true; }
         if (root.fund-rename-id != "") { root.fund-rename-cancel(); return true; }
+        if (root.nb-rename-account >= 0) { root.nb-rename-cancel(); return true; }
         if (root.scanning) { root.cancel-scan(); return true; }
         // Screens: one branch per header chevron.
         if (root.screen == 1 || root.screen == 2) { root.screen = 0; return true; }
+        if (root.screen == 4) { root.open-notebooks(); return true; }
         if (root.screen == 3) { root.screen = 2; return true; }
-        if (root.screen == 5 || root.screen == 8 || root.screen == 11) { root.go-home(); return true; }
+        if (root.screen == 5) { root.go-home(); return true; }
+        if (root.screen == 8 || root.screen == 11) {
+            // Back to wherever settings/activity was opened from.
+            if (root.return-screen == 17) { root.open-notebooks(); } else { root.go-home(); }
+            return true;
+        }
         if (root.screen == 6) {
             // Clear the typed address on the way back — it's saved in recents
             // now, so leaving it in the field is redundant. Status too: its
@@ -1268,7 +1335,7 @@ export component AppWindow inherits Window {
             }
             return true;
         }
-        return false; // 0 onboarding / 4 home: nothing to go back to
+        return false; // 0 onboarding / 17 notebook list: nothing to go back to
     }
     // Focus must never be nobody's, or key events (incl. Back) are dropped
     // before they can bubble anywhere: re-take it whenever the focused
@@ -1277,6 +1344,7 @@ export component AppWindow inherits Window {
     changed screen => { back-scope.focus(); }
     changed rename-address => { if (root.rename-address == "") { back-scope.focus(); } }
     changed fund-rename-id => { if (root.fund-rename-id == "") { back-scope.focus(); } }
+    changed nb-rename-account => { if (root.nb-rename-account < 0) { back-scope.focus(); } }
 
     back-scope := FocusScope {
         focus-on-click: false; // never steal a tap's focus from a field
@@ -1525,17 +1593,20 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             spacing: 8px;
             height: 40px;
+            BackButton { clicked => { root.open-notebooks(); } }
             Text {
-                text: "Chain Notes";
+                text: root.notebook-title;
                 font-size: 19px;
                 font-weight: 700;
                 color: Pal.text;
                 vertical-alignment: center;
+                overflow: elide;
             }
             Rectangle { }
             SvgIconButton { icon: "refresh"; clicked => { root.refresh(); } }
             SvgIconButton { icon: "activity"; clicked => { root.open-activity(); } }
-            IconButton { glyph: "⚙"; clicked => { root.settings-open(); } }
+            // No settings gear here (Sal 2026-07-11): settings is
+            // wallet-level, reachable from the notebook list only.
         }
         Card {
             height: 132px;
@@ -1588,9 +1659,83 @@ export component AppWindow inherits Window {
         }
         PrimaryButton { text: "+  Compose note"; clicked => { root.compose-open(); } }
         if root.watch-only: Caption { text: "Watch-only — public notes only, signed on your external wallet. Private notes need the key."; }
-        Caption { text: root.notes.length == 0
-            ? (root.watch-only ? "No notes on this address yet." : "No notes yet — fund the address above, then compose.")
-            : "Notebook"; }
+        // Sender filter header: tap to expand the per-sender checklist; the
+        // warn pill flags a persisted exclusion so hidden notes are never a
+        // silent mystery.
+        Rectangle {
+            height: 24px;
+            if root.senders.length > 1: TouchArea { clicked => { root.filter-expanded = !root.filter-expanded; } }
+            HorizontalLayout {
+                spacing: 8px;
+                Caption {
+                    text: root.notes.length == 0
+                        ? (root.watch-only ? "No notes on this address yet." : "No notes yet — fund the address above, then compose.")
+                        : "Notes";
+                    vertical-alignment: center;
+                }
+                if root.hidden-senders-label != "": Badge { label: root.hidden-senders-label; tint: Pal.warn; }
+                Rectangle { }
+                if root.senders.length > 1: HorizontalLayout {
+                    spacing: 6px;
+                    Caption { text: "Senders"; vertical-alignment: center; }
+                    VerticalLayout {
+                        alignment: center;
+                        Image {
+                            source: root.filter-expanded
+                                ? @image-url("icons/caret-up.svg")
+                                : @image-url("icons/caret-down.svg");
+                            colorize: Pal.muted;
+                            width: 12px;
+                            height: 12px;
+                        }
+                    }
+                }
+            }
+        }
+        if root.filter-expanded: VerticalLayout {
+            spacing: 4px;
+            for s in root.senders: Rectangle {
+                height: 36px;
+                border-radius: 8px;
+                background: s-ta.has-hover ? Pal.card-hover : Pal.card;
+                border-width: 1px;
+                border-color: Pal.line;
+                s-ta := TouchArea { clicked => { root.toggle-sender(s.key, !s.excluded); } }
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 12px;
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 16px;
+                            height: 16px;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: s.excluded ? Pal.line : Pal.accent;
+                            background: s.excluded ? transparent : Pal.accent.with-alpha(0.18);
+                            if !s.excluded: Image {
+                                source: @image-url("icons/check.svg");
+                                colorize: Pal.accent;
+                                width: 11px;
+                                height: 11px;
+                                x: 2.5px;
+                                y: 2.5px;
+                            }
+                        }
+                    }
+                    Text {
+                        text: s.label;
+                        font-size: 12px;
+                        color: s.excluded ? Pal.muted : Pal.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Rectangle { }
+                    Caption { text: s.sub; vertical-alignment: center; }
+                }
+            }
+        }
         // Notebook list — top-aligned + scrollable (a plain ListView vertically
         // centres a short list). Matches the Settings-screen Flickable pattern.
         Flickable {
@@ -1658,6 +1803,149 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            }
+        }
+    }
+
+    // ---------- 17 · notebooks (the main screen) ----------
+    if screen == 17: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        HorizontalLayout {
+            spacing: 8px;
+            height: 40px;
+            Text {
+                text: "Chain Notes";
+                font-size: 19px;
+                font-weight: 700;
+                color: Pal.text;
+                vertical-alignment: center;
+            }
+            Rectangle { }
+            SvgIconButton { icon: "activity"; clicked => { root.open-activity(); } }
+            IconButton { glyph: "⚙"; clicked => { root.settings-open(); } }
+        }
+        if root.can-create-notebook: PrimaryButton { text: "+  New notebook"; clicked => { root.create-notebook(); } }
+        Caption { text: root.status; }
+        // Zero active notebooks is a legitimate state (fresh start, or
+        // everything archived) — say so instead of showing a blank page.
+        if root.notebooks.length == 0: Caption {
+            text: root.archived-toggle-label != ""
+                ? "All notebooks are archived."
+                : (root.can-create-notebook
+                    ? "No notebooks yet — create one to start writing."
+                    : "No notebooks yet.");
+        }
+        Flickable {
+            viewport-height: nb-col.preferred-height;
+            nb-col := VerticalLayout {
+                alignment: start;
+                spacing: 6px;
+                for nb in root.notebooks: Rectangle {
+                    height: 86px;
+                    nb-ta := TouchArea { clicked => { root.open-notebook(nb.account); } }
+                    Rectangle {
+                        y: 2px;
+                        height: parent.height - 6px;
+                        border-radius: 10px;
+                        background: nb-ta.has-hover ? Pal.card-hover : Pal.card;
+                        border-width: 1px;
+                        border-color: nb.active ? Pal.accent.with-alpha(0.55) : Pal.line;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 4px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 5px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Text {
+                                        text: nb.name;
+                                        font-size: 14px;
+                                        font-weight: 700;
+                                        color: Pal.text;
+                                        overflow: elide;
+                                    }
+                                    if nb.unread != "": Badge { label: nb.unread; tint: Pal.good; }
+                                }
+                                Caption { text: nb.snippet; overflow: elide; }
+                                Caption { text: nb.meta; color: Pal.faint; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                PencilButton { clicked => { root.nb-rename-start(nb.account, nb.name); } }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                SvgIconButton {
+                                    icon: "archive";
+                                    size: 15px;
+                                    width: 32px;
+                                    height: 32px;
+                                    clicked => { root.nb-archive(nb.account, true); }
+                                }
+                            }
+                        }
+                    }
+                }
+                if root.archived-toggle-label != "": Rectangle {
+                    height: 34px;
+                    arch-ta := TouchArea { clicked => { root.show-archived = !root.show-archived; } }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Caption { text: root.archived-toggle-label; vertical-alignment: center; }
+                        VerticalLayout {
+                            alignment: center;
+                            Image {
+                                source: root.show-archived
+                                    ? @image-url("icons/caret-up.svg")
+                                    : @image-url("icons/caret-down.svg");
+                                colorize: Pal.muted;
+                                width: 12px;
+                                height: 12px;
+                            }
+                        }
+                    }
+                }
+                if root.show-archived: VerticalLayout {
+                    spacing: 6px;
+                    for nb in root.archived-notebooks: Rectangle {
+                        height: 56px;
+                        anb-ta := TouchArea { clicked => { root.open-notebook(nb.account); } }
+                        Rectangle {
+                            y: 2px;
+                            height: parent.height - 6px;
+                            border-radius: 10px;
+                            background: anb-ta.has-hover ? Pal.card-hover : Pal.card;
+                            border-width: 1px;
+                            border-color: Pal.line;
+                            HorizontalLayout {
+                                padding-left: 14px;
+                                padding-right: 10px;
+                                spacing: 8px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 4px;
+                                    Text {
+                                        text: nb.name;
+                                        font-size: 13px;
+                                        color: Pal.muted;
+                                        overflow: elide;
+                                    }
+                                    Caption { text: nb.meta; color: Pal.faint; }
+                                }
+                                Rectangle { }
+                                VerticalLayout {
+                                    alignment: center;
+                                    GhostButton { text: "Restore"; clicked => { root.nb-archive(nb.account, false); } }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2117,6 +2405,11 @@ export component AppWindow inherits Window {
             GhostButton { width: 64px; text: "Use"; clicked => { root.pick-contact(root.contact-input); } }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
+        // Sweep = leaving the wallet: destinations are EXTERNAL addresses
+        // (moving coins between notebooks is Consolidate's job).
+        if root.pick-mode == "sweep": Caption {
+            text: "The whole wallet — every notebook's coins — goes to this address in one transaction.";
+        }
         if root.contacts.length > 0: Caption { text: "Recently used"; }
         // Recents list. A ListView / stretched Flickable vertically CENTRES a
         // short list, leaving a big gap under the "Recently used" separator.
@@ -2188,18 +2481,9 @@ export component AppWindow inherits Window {
                 alignment: start;
         SettingsCard {
             title: "Identity";
+            // Wallet-level on purpose: no per-notebook account or address
+            // here (notebooks own those); kind · network · notebook count.
             subtitle: root.settings-identity;
-            Mono {
-                text: root.address;
-                font-size: 10px;
-                color: Pal.muted;
-                wrap: no-wrap;
-                overflow: elide;
-            }
-            if root.settings-hierarchical: GhostButton {
-                text: "Change account…";
-                clicked => { root.open-account-picker(); }
-            }
             GhostButton {
                 text: "Switch identity — new seed or different key…";
                 clicked => { root.show-reset-confirm = true; }
@@ -2291,17 +2575,17 @@ export component AppWindow inherits Window {
             title: "Coins";
             subtitle: root.coins-summary;
             GhostButton {
-                text: "View coins & consolidate…";
+                text: "View wallet coins…";
                 clicked => { root.open-coins(); }
             }
         }
         SettingsCard {
-            title: "Funds";
+            title: "Sweep wallet";
             subtitle: root.watch-only
-                ? "Move everything off the notes address (minus the fee). Watch-only: you'll sign the transaction on your external wallet."
-                : "Move everything off the notes address (minus the fee) — e.g. returning testnet coins.";
+                ? "Leaving this wallet: move everything (minus the fee) to an address you choose. Watch-only: you'll sign on your external wallet."
+                : "Leaving this wallet: EVERY notebook's coins go to an address you choose, in one transaction (minus the fee). To move coins between notebooks, use Consolidate instead.";
             GhostButton {
-                text: "Sweep all funds…";
+                text: "Sweep wallet…";
                 clicked => { root.sweep-open(); }
             }
         }
@@ -2340,19 +2624,41 @@ export component AppWindow inherits Window {
         spacing: 12px;
         alignment: start;
         Header {
-            title: "Choose account";
+            title: root.account-pick-mode == "notebook" ? "New notebook"
+                : (root.account-pick-mode == "wconsol" ? "Consolidate to" : "Choose account");
             back => { root.nav-back(); }
         }
         Caption {
-            text: "One seed holds many BIP-86 accounts. Each is a completely separate notebook: its own address, its own encryption key, its own notes.";
+            text: root.account-pick-mode == "notebook"
+                ? "Name it, then pick its address. Used addresses already have on-chain history — picking one adopts its notes."
+                : (root.account-pick-mode == "wconsol"
+                    ? "Where should every coin end up? Pick one of your notebooks, or a used/new address — it becomes a notebook you can name from the list."
+                    : "One seed holds many BIP-86 accounts. Each is a completely separate notebook: its own address, its own encryption key, its own notes.");
+        }
+        // Create mode only: the name lives right here — tapping an
+        // address creates immediately (no second dialog). The consolidate
+        // picker deliberately has NO name field: most picks are existing
+        // notebooks (a typed name would be dead input); a fresh destination
+        // starts as the address short form, renameable from the list.
+        if root.account-pick-mode == "notebook": EditField {
+            text <=> root.nb-create-name;
+            placeholder-text: "name (optional — empty = address short form)";
         }
         for a in root.accounts: Rectangle {
+            // Rows already added as notebooks are informational-only when
+            // CREATING (can't re-add); as a consolidate DESTINATION they
+            // are first-class choices.
+            property <bool> row-disabled: a.pill == "notebook" && root.account-pick-mode == "notebook";
             border-radius: 12px;
             border-width: 1px;
             border-color: a.active ? Pal.accent : Pal.line;
-            background: at.has-hover ? Pal.card-hover : Pal.card;
+            background: at.has-hover && !self.row-disabled ? Pal.card-hover : Pal.card;
+            opacity: self.row-disabled ? 0.45 : 1.0;
             height: al.preferred-height;
-            at := TouchArea { clicked => { root.pick-account(a.index); } }
+            at := TouchArea {
+                enabled: !parent.row-disabled;
+                clicked => { root.pick-account(a.index); }
+            }
             al := VerticalLayout {
                 padding: 14px;
                 spacing: 4px;
@@ -2364,7 +2670,13 @@ export component AppWindow inherits Window {
                         font-weight: 700;
                         color: a.active ? Pal.accent : Pal.text;
                     }
+                    if a.pill != "": Badge {
+                        label: a.pill;
+                        tint: a.pill == "new" ? Pal.good
+                            : (a.pill == "used" ? Pal.warn : Pal.muted);
+                    }
                     Rectangle { }
+                    if a.balance != "": Caption { text: a.balance; vertical-alignment: center; }
                     if a.active: Badge { label: "current"; tint: Pal.accent; }
                 }
                 Mono {
@@ -2403,17 +2715,18 @@ export component AppWindow inherits Window {
         Header {
             title: "Coins";
             back => { root.nav-back(); }
+            SvgIconButton { icon: "refresh"; clicked => { root.refresh-coins(); } }
         }
         Caption {
             text: root.watch-only
-                ? "Each note tx spends these unspent outputs. Consolidating combines them into one coin — watch-only signs the transaction on your external wallet."
-                : "Each note tx spends these unspent outputs. Consolidating combines them into one coin at your address, so future notes need fewer inputs (lower fees).";
+                ? "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating signs on your external wallet."
+                : "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating gathers them into ONE coin at an address you pick.";
         }
-        // Viewer-first: the list is the point; consolidation is one button
-        // that opens its own compose-like screen (16, shared with sweep).
+        // Viewer-first: the list is the point; consolidation is the ONE
+        // action button on top (wallet-level — all notebooks at once).
         GhostButton {
-            text: "Consolidate into one coin…";
-            clicked => { root.consolidate-open(); }
+            text: "Consolidate wallet…";
+            clicked => { root.consolidate-wallet-open(); }
         }
         Body { text: root.coins-summary; font-size: 12px; }
         Flickable {
@@ -2431,12 +2744,14 @@ export component AppWindow inherits Window {
                         padding: 12px;
                         spacing: 4px;
                         HorizontalLayout {
+                            spacing: 8px;
                             Text {
                                 text: c.value + " sats";
                                 font-size: 13px;
                                 font-weight: 700;
                                 color: Pal.text;
                             }
+                            if c.notebook != "": Badge { label: c.notebook; tint: Pal.muted; }
                             Rectangle { }
                             Badge {
                                 label: c.status;
@@ -2487,6 +2802,7 @@ export component AppWindow inherits Window {
                                 font-weight: 700;
                                 color: Pal.text;
                             }
+                            if a.notebook != "": Badge { label: a.notebook; tint: Pal.muted; }
                             Rectangle { }
                             if a.replaced != "": Badge { label: a.replaced; tint: Pal.faint; }
                             Badge {
@@ -2884,6 +3200,7 @@ export component AppWindow inherits Window {
                         overflow: elide;
                     }
                 }
+                if root.sweep-dest-note != "": Caption { text: root.sweep-dest-note; color: Pal.warn; }
                 HorizontalLayout {
                     spacing: 8px;
                     alignment: start;
@@ -2908,8 +3225,10 @@ export component AppWindow inherits Window {
                     font-weight: 600;
                     color: Pal.accent;
                 }
-                // ---- pay the fee from another wallet ----
-                HorizontalLayout {
+                // ---- pay the fee from another wallet (watch-only: the
+                // external signer's full-value transfer needs it; keyed
+                // sweeps pay their own fee out of the swept amount) ----
+                if root.watch-only: HorizontalLayout {
                     Switch {
                         text: "Pay the fee from another wallet";
                         checked <=> root.sweep-fund-external;
@@ -3239,6 +3558,50 @@ export component AppWindow inherits Window {
         }
     }
 
+    // ---------- notebook rename dialog (modal overlay) ----------
+    if root.nb-rename-account >= 0: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.nb-rename-cancel(); } }
+        Rectangle {
+            width: 400px;
+            height: nbl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { } // swallow clicks on the card body
+            nbl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Name this notebook";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Caption { text: "The name stays on this device — it is never published."; }
+                nb-rename-edit := EditField {
+                    text <=> root.nb-rename-input;
+                    placeholder-text: "name (empty = address short form)";
+                    accepted(t) => { root.nb-rename-save(t); }
+                    init => {
+                        self.focus();
+                        self.select-all();
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.nb-rename-cancel(); } }
+                    PrimaryButton { text: "Save"; clicked => { root.nb-rename-save(root.nb-rename-input); } }
+                }
+            }
+        }
+    }
+
     // ---------- remove-contact confirmation (modal overlay) ----------
     if root.confirm-remove-address != "": Rectangle {
         width: 100%;
@@ -3282,6 +3645,45 @@ export component AppWindow inherits Window {
                         tint-hover: #ff6b62;
                         clicked => { root.remove-contact(root.confirm-remove-address); }
                     }
+                }
+            }
+        }
+    }
+
+    // ---------- wallet-consolidate confirmation (modal overlay) ----------
+    if root.show-wconsol-confirm: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.show-wconsol-confirm = false; } }
+        Rectangle {
+            width: 400px;
+            height: wcl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 200px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { }
+            wcl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Consolidate the whole wallet?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Body { text: root.wconsol-summary; font-size: 12px; }
+                Caption {
+                    text: "One transaction spends every notebook's coins — all their addresses become publicly linked on-chain.";
+                    color: Pal.warn;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.show-wconsol-confirm = false; } }
+                    PrimaryButton { text: "Consolidate"; clicked => { root.wallet-consolidate(); } }
                 }
             }
         }
