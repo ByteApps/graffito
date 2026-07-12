@@ -333,7 +333,14 @@ pub fn build_funded_sweep_psbt(
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         });
-        prevouts.push(TxOut { value: Amount::from_sat(coin.value), script_pubkey: notes_spk.clone() });
+        // Watch identities may sweep several notebooks at once — each coin
+        // sits at its own receive leaf `0/{index}`. Keyed identities pass
+        // identity_source = None and one spk (they sign their own inputs).
+        let spk = match identity_source {
+            Some(src) => ScriptBuf::from_bytes(src.derive(0, coin.index)?.spk),
+            None => notes_spk.clone(),
+        };
+        prevouts.push(TxOut { value: Amount::from_sat(coin.value), script_pubkey: spk });
         weights.push(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH);
     }
     let funding_weight = match plan.source.kind {
@@ -399,8 +406,11 @@ pub fn build_funded_sweep_psbt(
         psbt.inputs[i].witness_utxo = Some(prevout.clone());
     }
     if let Some(src) = identity_source {
-        let def = src.definite(0, 0)?;
-        for i in 0..notes_coins.len() {
+        for (i, coin) in notes_coins.iter().enumerate() {
+            // Per-coin definite descriptor: each input's key origin carries
+            // its own receive index, so the signer recognizes every
+            // notebook's coins (the assemble_watch_psbt rule).
+            let def = src.definite(0, coin.index)?;
             psbt.inputs[i]
                 .update_with_descriptor_unchecked(&def)
                 .map_err(|e| Error::Funding(format!("identity key origins: {e}")))?;
