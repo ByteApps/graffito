@@ -229,10 +229,19 @@ TxRecord + the unconfirmed coin, the active store reloads via
 activate(), and the flow lands on the notebook LIST (the wallet-level
 home). Watch-only routes to the old self-consolidate external-sign flow
 (`open_notebook_consolidate` — one notebook is all watch has). The
-Coins screen (10) is a pure per-notebook viewer now; Settings keeps
-per-notebook "View this notebook's coins…" and "Sweep this notebook's
-funds…" rows, and the "Change account…" row is GONE (the notebook list
-IS the account switcher). Wallet-consolidate RBF caveat: the TxRecord's
+Coins screen (10) is WALLET-WIDE (Sal 2026-07-11): every active
+notebook's spendable coins, each row tagged with its notebook
+(`CoinItem.notebook`, `update_wallet_coins`), summary "N coins · X sats
+across M notebooks", data as of each notebook's last scan; the header ↻
+(`refresh-coins`, log gains `notebooks=<m>`) rescans every active
+notebook via `refresh_wallet_stores`. Sweep stays PER-NOTEBOOK by
+design (the granular mover with the notebook/new/other destination
+picker; wallet-level gather = consolidate). The note-size limit is
+DEVICE-LEVEL now (`config.json` "chunk", `State.chunk`): activate()
+stamps it onto every loaded store, so the Settings pill is truly
+wallet-wide (stores of users who never touched it keep their value).
+The "Change account…" row is GONE (the notebook list IS the account
+switcher). Wallet-consolidate RBF caveat: the TxRecord's
 Speed-up would re-sign with only the dest key and fail broadcast
 harmlessly; Rebroadcast works.
 

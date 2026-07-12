@@ -61,6 +61,11 @@ struct State {
     /// default (mempool.space).
     node_urls: HashMap<String, String>,
     explorers: HashMap<String, String>,
+    /// Device-level note-size limit (config.json). Some = the user chose
+    /// one in Settings; applied to every notebook's store on activate, so
+    /// the wallet-level Settings pill really is wallet-wide. None = each
+    /// store keeps its own (legacy per-store value or the default).
+    chunk: Option<usize>,
     ident: Option<AppIdentity>,
     store: Option<Store>,
     fees: Option<FeeRates>,
@@ -211,6 +216,7 @@ impl State {
                 "account": self.account,
                 "nodes": self.node_urls,
                 "explorers": self.explorers,
+                "chunk": self.chunk,
             })
             .to_string(),
         );
@@ -957,6 +963,12 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     if let Some(url) = store.node_url.take() {
         st.node_urls.entry(st.network.as_str().to_string()).or_insert(url);
     }
+    // The note-size limit is a device-level Settings choice: apply it to
+    // whichever notebook is being activated (stores of users who never
+    // touched the pill keep their own value).
+    if let Some(c) = st.chunk {
+        store.chunk_size = c;
+    }
     println!(
         "cb: identity kind={} account={} network={} address={}",
         ident.kind,
@@ -1461,28 +1473,85 @@ fn update_home(w: &AppWindow, st: &State) {
     }
     w.set_chunk_text(store.chunk_size.to_string().into());
     load_backend_settings(w, st);
-    // Coins (spendable UTXOs) list + summary.
-    let coins: Vec<CoinItem> = store
-        .utxos
-        .iter()
-        .filter(|u| !u.pending_spend)
-        .map(|u| CoinItem {
-            outpoint: format!("{}:{}", u.txid, u.vout).into(),
-            value: u.value.to_string().into(),
-            status: if u.height.is_some() { "confirmed" } else { "unconfirmed" }.into(),
-        })
-        .collect();
-    let spendable: u64 = store.utxos.iter().filter(|u| !u.pending_spend).map(|u| u.value).sum();
+    update_wallet_coins(w, st);
+}
+
+/// The wallet-wide coins viewer (screen 10 + the Settings Coins card):
+/// every ACTIVE notebook's spendable UTXOs, each tagged with its
+/// notebook, plus the cross-wallet summary — data as of each notebook's
+/// last scan (the ↻ on the coins screen rescans them all).
+fn update_wallet_coins(w: &AppWindow, st: &State) {
+    let mut coins: Vec<CoinItem> = Vec::new();
+    let mut spendable: u64 = 0;
+    let mut notebooks = 0usize;
+    if let Some(ix) = &st.notebooks {
+        for m in ix.active() {
+            let Some(store) = notebook_store(st, m.account) else { continue };
+            let name = st.notebook_display_name(m.account);
+            let mut any = false;
+            for u in store.utxos.iter().filter(|u| !u.pending_spend) {
+                coins.push(CoinItem {
+                    outpoint: format!("{}:{}", u.txid, u.vout).into(),
+                    value: u.value.to_string().into(),
+                    status: if u.height.is_some() { "confirmed" } else { "unconfirmed" }.into(),
+                    notebook: name.clone().into(),
+                });
+                spendable += u.value;
+                any = true;
+            }
+            if any {
+                notebooks += 1;
+            }
+        }
+    }
     let n = coins.len();
     w.set_coins(VecModel::from_slice(&coins));
     w.set_coins_summary(
         if n == 0 {
-            "No coins yet — fund your address to add some.".to_string()
+            "No coins anywhere yet — fund a notebook's address to add some.".to_string()
         } else {
-            format!("{n} coin{} · {spendable} sats total", if n == 1 { "" } else { "s" })
+            format!(
+                "{n} coin{} · {} sats across {notebooks} notebook{}",
+                if n == 1 { "" } else { "s" },
+                commas(spendable),
+                if notebooks == 1 { "" } else { "s" }
+            )
         }
         .into(),
     );
+}
+
+/// Rescan every ACTIVE notebook except the current one (the caller runs
+/// the full refresh() for that): bundle per address, apply, save. Used by
+/// the coins screen's ↻ so the wallet-wide view is live, not last-scan.
+fn refresh_wallet_stores(st: &State) -> usize {
+    let Some(base) = st.base_url() else { return 0 };
+    let Some(material_str) = st.material.as_deref() else { return 0 };
+    let Ok(material) = parse_key_material(material_str, st.network) else { return 0 };
+    let Some(ix) = &st.notebooks else { return 0 };
+    let client = ChainClient::new(HttpTransport::new(base), st.network);
+    let current = st.ident.as_ref().map(|i| i.account);
+    let mut scanned = 0;
+    for m in ix.active() {
+        if current == Some(m.account) {
+            continue;
+        }
+        let Ok(ident) = realize(&material, st.network, m.account) else { continue };
+        let mut store = notebook_store(st, m.account)
+            .unwrap_or_else(|| Store::new(&ident.output_x(), st.network));
+        let Ok(bundle) = client.build_bundle(&ident.address, None) else { continue };
+        let applied = match ident.full() {
+            Some(id) => store.apply_bundle(&bundle, id, st.network),
+            None => store.apply_bundle_watch(&bundle, &ident.output_x(), st.network),
+        };
+        if applied.is_ok() {
+            if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == m.account) {
+                let _ = store.save(&st.store_path_for(fp8));
+            }
+            scanned += 1;
+        }
+    }
+    scanned
 }
 
 fn refresh(w: &AppWindow, st: &mut State) {
@@ -2314,6 +2383,8 @@ pub fn run() {
         .and_then(|a| a.parse().ok())
         .or_else(|| config.get("account").and_then(|v| v.as_u64()).map(|v| v as u32))
         .unwrap_or(0);
+    let chunk: Option<usize> =
+        config.get("chunk").and_then(|v| v.as_u64()).map(|v| v as usize);
     // Device-level per-network Settings (Bitcoin node / block explorer URLs).
     let str_map = |key: &str| -> HashMap<String, String> {
         config
@@ -2361,6 +2432,7 @@ pub fn run() {
         watch_spend: None,
         watch_bump: None,
         watch_note: None,
+        chunk,
         notebooks: None,
         notebooks_fp8: None,
         nb_addrs: Vec::new(),
@@ -3979,8 +4051,9 @@ pub fn run() {
     });
 
     cb!(on_refresh_coins, |w, s| {
-        println!("cb: refresh-coins");
-        refresh(&w, &mut s);
+        let scanned = refresh_wallet_stores(&s);
+        println!("cb: refresh-coins notebooks={}", scanned + 1);
+        refresh(&w, &mut s); // the active notebook + fees; rebuilds the view
         w.set_status("".into());
         refresh_compose(&w, &mut s);
     });
@@ -4851,6 +4924,8 @@ pub fn run() {
                     store.chunk_size = n;
                 }
                 s.save_store();
+                s.chunk = Some(n); // device-level: every notebook, on activate
+                s.save_config();
                 println!("cb: set-chunk-size {n} ok");
                 w.set_chunk_text(n.to_string().into());
                 if n == 100_000 || n == 80 {
