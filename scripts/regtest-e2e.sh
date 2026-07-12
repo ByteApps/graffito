@@ -52,6 +52,26 @@ P_ADDR="$("$NOTES" address regtest)"
 [[ "$P_ADDR" == bcrt1p* ]] || fail "prime address not taproot: $P_ADDR"
 pass "prime address $P_ADDR"
 
+echo "== recovery-seeds interop: a Prime bip86 seed's 24 words import identically =="
+# The whole point of PLAN-chain-notes-seed-rotation.md, proven across the
+# two ACTUAL host binaries: the device derives a rotatable BIP-39 phrase
+# from its app seed (notes_cli seed-words) and a bip86 notebook address
+# (seed-address); feeding those SAME words to the app's normal mnemonic
+# import (APP_KEY) must land on the byte-identical address for every
+# (seed, account, index) — funds + notes + ECDH all recover from the
+# words alone. (The in-process key-level proof is app-core's
+# prime_recovery_seed_words_import_identically.)
+R_SEED="d074c6f28bb0d891fd30dd6ff6f5face8ea6d209c7b81684babc34e8446d379a"
+for combo in "0 0 0" "0 1 2" "1 0 0"; do
+    read -r s a i <<<"$combo"
+    R_WORDS="$(NOTES_APP_SEED=$R_SEED "$NOTES" seed-words "$s")"
+    DEV_ADDR="$(NOTES_APP_SEED=$R_SEED "$NOTES" seed-address regtest "$s" "$a" "$i")"
+    APP_ADDR="$(APP_KEY="$R_WORDS" APP_ACCOUNT="$a" APP_INDEX="$i" "$APP" address regtest)"
+    [[ "$DEV_ADDR" == "$APP_ADDR" ]] \
+        || fail "recovery interop s$s a$a i$i: device $DEV_ADDR != app $APP_ADDR"
+done
+pass "device seed words → app import: byte-identical addresses across seed/account/index"
+
 echo "== fund both identities =="
 curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$A_ADDR\",\"amount\":0.001}" >/dev/null
 curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$P_ADDR\",\"amount\":0.001}" >/dev/null

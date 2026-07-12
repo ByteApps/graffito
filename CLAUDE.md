@@ -487,7 +487,19 @@ the Pixel 6 emulator's true status bar is ~48.8dp).
   secret, salt `chain-notes-app/enc/v1`, info `note-enc/v1`) — same rule
   for all four import formats. Derivation: BIP-39/xprv → BIP-86
   `m/86'/{coin}'/0'/0/0` (xprv depth 0 or 3 only); WIF/hex → raw key,
-  BIP-341 tweak, P2TR directly.
+  BIP-341 tweak, P2TR directly. **The rule now LIVES in notes-core**
+  (`keys::enc_key_from_leaf` + `Identity::from_leaf_secret`, relocated
+  for the Prime's recovery-seeds feature so its bip86 notebooks share
+  this exact code path); `app-core/src/derive.rs` delegates. Byte-
+  identical is enforced: `enc_key_frozen_vector` (the shipped pin,
+  untouched) + notes-core's own vector + the interop cross-test
+  `prime_recovery_seed_words_import_identically` (a Prime device seed's
+  24 words through our normal mnemonic import land on the same leaf/enc/
+  output/signing keys notes-core's seeds pipeline derives). This is the
+  recovery-seeds interop contract: any Prime bip86 notebook's phrase
+  imports here as an ordinary BIP-39 mnemonic — funds, private-note
+  decryption, directed-note ECDH, all recover with zero new UI. Design:
+  `../PLAN-chain-notes-seed-rotation.md`.
 - notes-core's `[patch]` getrandom/TRNG override does NOT propagate here
   — correct and intended (host OS randomness).
 - **Key storage is a cross-platform SPEC** (PLAN doc, "Key storage"
