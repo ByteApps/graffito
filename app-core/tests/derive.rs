@@ -19,7 +19,7 @@ const BIP86_ADDR_0: &str = "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwu
 #[test]
 fn bip86_spec_vector_mainnet() {
     let material = parse_key_material(BIP86_MNEMONIC, Network::Mainnet).unwrap();
-    let ident = realize(&material, Network::Mainnet, 0).unwrap();
+    let ident = realize(&material, Network::Mainnet, 0, 0).unwrap();
     assert_eq!(ident.kind, "mnemonic");
     assert_eq!(ident.address, BIP86_ADDR_0);
 }
@@ -29,7 +29,7 @@ fn bip86_spec_vector_mainnet() {
 #[test]
 fn address_cross_checks_with_rust_bitcoin() {
     let material = parse_key_material(BIP86_MNEMONIC, Network::Mainnet).unwrap();
-    let ident = realize(&material, Network::Mainnet, 0).unwrap();
+    let ident = realize(&material, Network::Mainnet, 0, 0).unwrap();
 
     let secp = Secp256k1::new();
     let internal = XOnlyPublicKey::from_slice(&ident.expect_full().internal_x).unwrap();
@@ -53,7 +53,7 @@ fn enc_key_frozen_vector() {
 #[test]
 fn account_xprv_equals_master_derivation() {
     let material = parse_key_material(BIP86_MNEMONIC, Network::Mainnet).unwrap();
-    let from_master = realize(&material, Network::Mainnet, 0).unwrap();
+    let from_master = realize(&material, Network::Mainnet, 0, 0).unwrap();
 
     let KeyMaterial::Mnemonic(m) = &material else { panic!("parsed as mnemonic") };
     let secp = Secp256k1::new();
@@ -71,10 +71,10 @@ fn account_xprv_equals_master_derivation() {
     assert_eq!(account.depth, 3);
 
     let parsed = parse_key_material(&account.to_string(), Network::Mainnet).unwrap();
-    let from_account = realize(&parsed, Network::Mainnet, 0).unwrap();
+    let from_account = realize(&parsed, Network::Mainnet, 0, 0).unwrap();
     assert_eq!(from_account.address, from_master.address);
 
-    let leaf = leaf_from_account(&account).unwrap();
+    let leaf = leaf_from_account(&account, 0).unwrap();
     assert_eq!(from_master.leaf_secret().unwrap(), &leaf);
 }
 
@@ -83,8 +83,8 @@ fn account_xprv_equals_master_derivation() {
 #[test]
 fn accounts_are_separate_identities() {
     let material = parse_key_material(BIP86_MNEMONIC, Network::Mainnet).unwrap();
-    let a0 = realize(&material, Network::Mainnet, 0).unwrap();
-    let a1 = realize(&material, Network::Mainnet, 1).unwrap();
+    let a0 = realize(&material, Network::Mainnet, 0, 0).unwrap();
+    let a1 = realize(&material, Network::Mainnet, 1, 0).unwrap();
     assert_ne!(a0.address, a1.address);
     assert_ne!(a0.expect_full().enc_key, a1.expect_full().enc_key);
     assert_eq!(a1.account, 1);
@@ -106,7 +106,7 @@ fn identity_wiring() {
 #[test]
 fn watch_xpub_import_matches_full_identity() {
     let material = parse_key_material(BIP86_MNEMONIC, Network::Mainnet).unwrap();
-    let full = realize(&material, Network::Mainnet, 0).unwrap();
+    let full = realize(&material, Network::Mainnet, 0, 0).unwrap();
 
     let KeyMaterial::Mnemonic(m) = &material else { panic!("parsed as mnemonic") };
     let secp = Secp256k1::new();
@@ -125,7 +125,7 @@ fn watch_xpub_import_matches_full_identity() {
 
     let parsed = parse_key_material(&xpub.to_string(), Network::Mainnet).unwrap();
     assert!(parsed.is_watch());
-    let watch = realize(&parsed, Network::Mainnet, 0).unwrap();
+    let watch = realize(&parsed, Network::Mainnet, 0, 0).unwrap();
     assert_eq!(watch.kind, "xpub");
     assert!(watch.is_watch());
     assert_eq!(watch.address, BIP86_ADDR_0, "xpub lands on the BIP-86 spec address");
@@ -144,7 +144,7 @@ fn watch_xpub_import_matches_full_identity() {
     ] {
         let m = parse_key_material(&form, Network::Mainnet).unwrap_or_else(|e| panic!("{form}: {e}"));
         assert!(m.is_watch());
-        let w = realize(&m, Network::Mainnet, 0).unwrap();
+        let w = realize(&m, Network::Mainnet, 0, 0).unwrap();
         assert_eq!(w.address, BIP86_ADDR_0, "form {form} must land on the BIP-86 address");
         assert_eq!(w.output_x(), full.output_x());
         assert!(w.watch_source().is_some());

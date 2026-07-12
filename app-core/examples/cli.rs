@@ -27,8 +27,10 @@ use bitcoin::secp256k1::Secp256k1;
 fn identity(network: Network) -> AppIdentity {
     let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | xprv | WIF | hex32");
     let account = std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
+    // Rev 3: APP_INDEX picks the notebook (receive-chain address index).
+    let index = std::env::var("APP_INDEX").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
     let material = parse_key_material(&key, network).expect("APP_KEY parse");
-    realize(&material, network, account).expect("APP_KEY realize")
+    realize(&material, network, account, index).expect("APP_KEY realize")
 }
 
 fn network(s: &str) -> Network {
@@ -143,7 +145,7 @@ fn main() {
                 .utxos
                 .iter()
                 .filter(|u| !u.pending_spend)
-                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: ident.index })
                 .collect();
             let dest_addr = args.get(6).cloned().unwrap_or_else(|| ident.address.clone());
             let dest = Recipient::parse(net, &dest_addr).expect("dest address");
@@ -217,7 +219,7 @@ fn main() {
                 .utxos
                 .iter()
                 .filter(|u| !u.pending_spend)
-                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: ident.index })
                 .collect();
             let dest = Recipient::parse(net, &args[7]).expect("dest address");
             let identity_spk =
@@ -262,7 +264,7 @@ fn main() {
                 .utxos
                 .iter()
                 .filter(|u| !u.pending_spend)
-                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: ident.index })
                 .collect();
             let recipient = args.get(6).map(|a| Recipient::parse(net, a).expect("dest address"));
             let gift: u64 = args.get(7).and_then(|g| g.parse().ok()).unwrap_or(330);
