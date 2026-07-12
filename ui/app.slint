@@ -7,7 +7,7 @@ import { ListView, Switch } from "std-widgets.slint";
 export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string, private: bool }
 // One notebook row: `unread` is a preformatted badge label ("3 new"), empty =
 // no badge; `meta` is "addr-short · balance · note count".
-export struct NotebookItem { account: int, name: string, snippet: string, meta: string, unread: string, active: bool }
+export struct NotebookItem { index: int, name: string, snippet: string, meta: string, unread: string, active: bool }
 // One sender-filter row: `key` is the raw sender address (the exclusion-set
 // entry), `label` the resolved display name, `sub` the note count line.
 export struct SenderItem { key: string, label: string, sub: string, excluded: bool }
@@ -1234,7 +1234,7 @@ export component AppWindow inherits Window {
     in-out property <string> notebook-title: "Chain Notes"; // home header = open notebook's name
     // -1 = rename dialog closed · >= 0 = renaming that account. (Creation
     // never dialogs — the picker's inline name field covers it.)
-    in-out property <int> nb-rename-account: -1;
+    in-out property <int> nb-rename-index: -1;
     in-out property <string> nb-rename-input;
     // sender filter (home): exclusions persist per notebook, all-on default
     in-out property <[SenderItem]> senders;
@@ -1285,7 +1285,7 @@ export component AppWindow inherits Window {
         if (root.confirm-remove-address != "") { root.cancel-remove(); return true; }
         if (root.rename-address != "") { root.cancel-rename(); return true; }
         if (root.fund-rename-id != "") { root.fund-rename-cancel(); return true; }
-        if (root.nb-rename-account >= 0) { root.nb-rename-cancel(); return true; }
+        if (root.nb-rename-index >= 0) { root.nb-rename-cancel(); return true; }
         if (root.scanning) { root.cancel-scan(); return true; }
         // Screens: one branch per header chevron.
         if (root.screen == 1 || root.screen == 2) { root.screen = 0; return true; }
@@ -1344,7 +1344,7 @@ export component AppWindow inherits Window {
     changed screen => { back-scope.focus(); }
     changed rename-address => { if (root.rename-address == "") { back-scope.focus(); } }
     changed fund-rename-id => { if (root.fund-rename-id == "") { back-scope.focus(); } }
-    changed nb-rename-account => { if (root.nb-rename-account < 0) { back-scope.focus(); } }
+    changed nb-rename-index => { if (root.nb-rename-index < 0) { back-scope.focus(); } }
 
     back-scope := FocusScope {
         focus-on-click: false; // never steal a tap's focus from a field
@@ -1843,7 +1843,7 @@ export component AppWindow inherits Window {
                 spacing: 6px;
                 for nb in root.notebooks: Rectangle {
                     height: 86px;
-                    nb-ta := TouchArea { clicked => { root.open-notebook(nb.account); } }
+                    nb-ta := TouchArea { clicked => { root.open-notebook(nb.index); } }
                     Rectangle {
                         y: 2px;
                         height: parent.height - 6px;
@@ -1875,7 +1875,7 @@ export component AppWindow inherits Window {
                             }
                             VerticalLayout {
                                 alignment: center;
-                                PencilButton { clicked => { root.nb-rename-start(nb.account, nb.name); } }
+                                PencilButton { clicked => { root.nb-rename-start(nb.index, nb.name); } }
                             }
                             VerticalLayout {
                                 alignment: center;
@@ -1884,7 +1884,7 @@ export component AppWindow inherits Window {
                                     size: 15px;
                                     width: 32px;
                                     height: 32px;
-                                    clicked => { root.nb-archive(nb.account, true); }
+                                    clicked => { root.nb-archive(nb.index, true); }
                                 }
                             }
                         }
@@ -1914,7 +1914,7 @@ export component AppWindow inherits Window {
                     spacing: 6px;
                     for nb in root.archived-notebooks: Rectangle {
                         height: 56px;
-                        anb-ta := TouchArea { clicked => { root.open-notebook(nb.account); } }
+                        anb-ta := TouchArea { clicked => { root.open-notebook(nb.index); } }
                         Rectangle {
                             y: 2px;
                             height: parent.height - 6px;
@@ -1940,7 +1940,7 @@ export component AppWindow inherits Window {
                                 Rectangle { }
                                 VerticalLayout {
                                     alignment: center;
-                                    GhostButton { text: "Restore"; clicked => { root.nb-archive(nb.account, false); } }
+                                    GhostButton { text: "Restore"; clicked => { root.nb-archive(nb.index, false); } }
                                 }
                             }
                         }
@@ -2484,6 +2484,10 @@ export component AppWindow inherits Window {
             // Wallet-level on purpose: no per-notebook account or address
             // here (notebooks own those); kind · network · notebook count.
             subtitle: root.settings-identity;
+            if root.settings-hierarchical: GhostButton {
+                text: "Change account…";
+                clicked => { root.open-account-picker(); }
+            }
             GhostButton {
                 text: "Switch identity — new seed or different key…";
                 clicked => { root.show-reset-confirm = true; }
@@ -2630,10 +2634,10 @@ export component AppWindow inherits Window {
         }
         Caption {
             text: root.account-pick-mode == "notebook"
-                ? "Name it, then pick its address. Used addresses already have on-chain history — picking one adopts its notes."
+                ? "Name it, then pick its address — the account's next receive addresses. Used addresses already have on-chain history — picking one adopts its notes."
                 : (root.account-pick-mode == "wconsol"
                     ? "Where should every coin end up? Pick one of your notebooks, or a used/new address — it becomes a notebook you can name from the list."
-                    : "One seed holds many BIP-86 accounts. Each is a completely separate notebook: its own address, its own encryption key, its own notes.");
+                    : "One seed holds many BIP-86 accounts — separate wallets with their own notebooks, switchable here. Notebooks live inside an account.");
         }
         // Create mode only: the name lives right here — tapping an
         // address creates immediately (no second dialog). The consolidate
@@ -2665,7 +2669,8 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 8px;
                     Text {
-                        text: "Account " + a.index;
+                        text: (root.account-pick-mode == "notebook" || root.account-pick-mode == "wconsol"
+                            ? "Notebook " : "Account ") + a.index;
                         font-size: 14px;
                         font-weight: 700;
                         color: a.active ? Pal.accent : Pal.text;
@@ -2696,7 +2701,8 @@ export component AppWindow inherits Window {
                 clicked => { root.accounts-page(-1); }
             }
             Caption {
-                text: "accounts " + (root.account-page * 5) + " – " + (root.account-page * 5 + 4);
+                text: (root.account-pick-mode == "notebook" || root.account-pick-mode == "wconsol"
+                    ? "addresses " : "accounts ") + (root.account-page * 5) + " – " + (root.account-page * 5 + 4);
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
@@ -3559,7 +3565,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- notebook rename dialog (modal overlay) ----------
-    if root.nb-rename-account >= 0: Rectangle {
+    if root.nb-rename-index >= 0: Rectangle {
         width: 100%;
         height: 100%;
         background: #000000.with-alpha(0.55);

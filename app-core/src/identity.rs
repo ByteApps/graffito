@@ -49,13 +49,25 @@ impl KeyMaterial {
         matches!(self, KeyMaterial::Xpub(_))
     }
 
-    /// Hierarchical material can derive many BIP-86 accounts — the
-    /// multi-notebook (and account-picker) capability gate.
+    /// Hierarchical material can derive many BIP-86 ACCOUNTS — the
+    /// account-picker / Settings account-switch capability gate.
     pub fn is_hierarchical(&self) -> bool {
         match self {
             KeyMaterial::Mnemonic(_) => true,
             KeyMaterial::Xprv(x) => x.depth == 0,
             _ => false,
+        }
+    }
+
+    /// Material that can derive many NOTEBOOKS (receive indexes 0/i of
+    /// one account): everything except raw single keys. Watch-only
+    /// qualifies when its descriptor has a wildcard (a fixed-address
+    /// descriptor derives exactly one leaf).
+    pub fn is_multi_notebook(&self) -> bool {
+        match self {
+            KeyMaterial::Mnemonic(_) | KeyMaterial::Xprv(_) => true,
+            KeyMaterial::Xpub(src) => src.is_ranged(),
+            KeyMaterial::Wif(_) | KeyMaterial::Hex(_) => false,
         }
     }
 }
@@ -79,7 +91,7 @@ pub fn index_fp8(material: &KeyMaterial, network: Network) -> Result<String, Err
     };
     match master {
         Some(x) => Ok(hex::encode(x.fingerprint(&secp).as_bytes())),
-        None => Ok(hex::encode(&realize(material, network, 0)?.output_x()[..4])),
+        None => Ok(hex::encode(&realize(material, network, 0, 0)?.output_x()[..4])),
     }
 }
 
@@ -99,6 +111,9 @@ pub struct AppIdentity {
     /// BIP-86 account index (meaningful for mnemonic / master-xprv;
     /// 0 and ignored for account-xprv / WIF / hex / xpub).
     pub account: u32,
+    /// Notebook index — the receive-chain address index `0/{index}`
+    /// within the account (rev 3). 0 and ignored for WIF / hex.
+    pub index: u32,
     pub keys: IdentityKeys,
     pub address: String,
 }
@@ -299,27 +314,34 @@ pub fn generate_mnemonic_with_salt(word_count: usize, salt: &str) -> Result<bip3
 }
 
 /// Material → leaf secret → Identity + address on `network`.
-/// `account` = BIP-86 account index for mnemonic / master-xprv imports
-/// (each account is a fully separate identity: its own address AND its
+/// `account` = BIP-86 account index for mnemonic / master-xprv imports;
+/// `index` = the notebook's receive-chain address index within that
+/// account (rev 3: each index is a notebook — its own address AND its
 /// own note-encryption key, since the frozen rule derives from the
-/// leaf). Ignored for account-xprv / WIF / hex.
+/// leaf). Both ignored for WIF / hex; `account` ignored for
+/// account-xprv / xpub (the material IS the account).
 pub fn realize(
     material: &KeyMaterial,
     network: Network,
     account: u32,
+    index: u32,
 ) -> Result<AppIdentity, Error> {
     let leaf: Zeroizing<[u8; 32]> = Zeroizing::new(match material {
-        KeyMaterial::Mnemonic(m) => leaf_from_mnemonic(m, network, account)?,
+        KeyMaterial::Mnemonic(m) => leaf_from_mnemonic(m, network, account, index)?,
         KeyMaterial::Xprv(x) => match x.depth {
-            0 => leaf_from_master(x, network, account)?,
-            3 => leaf_from_account(x)?,
+            0 => leaf_from_master(x, network, account, index)?,
+            3 => leaf_from_account(x, index)?,
             d => return Err(Error::XprvDepth(d)),
         },
         KeyMaterial::Wif(w) => w.inner.secret_bytes(),
         KeyMaterial::Hex(k) => *k,
         KeyMaterial::Xpub(src) => {
-            // The notes address is the descriptor's receive leaf at index 0.
-            let d = src.derive(0, 0)?;
+            // The notebook address is the descriptor's receive leaf at
+            // `index` (a fixed descriptor only has index 0).
+            if index > 0 && !src.is_ranged() {
+                return Err(Error::Xpub("descriptor has no wildcard — only index 0 exists".into()));
+            }
+            let d = src.derive(0, index)?;
             if d.spk.len() != 34 || d.spk[0] != 0x51 {
                 return Err(Error::Xpub("descriptor does not derive a taproot output".into()));
             }
@@ -328,6 +350,7 @@ pub fn realize(
             return Ok(AppIdentity {
                 kind: material.kind(),
                 account: 0,
+                index,
                 keys: IdentityKeys::Watch { output_x, source: src.clone() },
                 address: d.address,
             });
@@ -338,6 +361,7 @@ pub fn realize(
     Ok(AppIdentity {
         kind: material.kind(),
         account,
+        index,
         keys: IdentityKeys::Full { leaf_secret: leaf, identity },
         address,
     })

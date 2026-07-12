@@ -14,7 +14,7 @@ Chain Notes writes personal notes into real bitcoin transactions — public ones
 
 ## Features
 
-- **Notebooks** — one seed, many notebooks: the main screen is your list of them, each a separate BIP-86 account with its own address, notes, and balance. Create one and pick a fresh or already-used address, name it, archive it when it's done, and filter a notebook's notes by who sent them.
+- **Notebooks** — one seed, many notebooks: the main screen is your list of them, each its own address (with its own encryption key) inside one account, with its own notes, name, and balance. Create one and pick a fresh or already-used address, archive it when it's done, and filter a notebook's notes by who sent them. Power users can keep whole separate wallets too — switch BIP-86 accounts from Settings.
 - **Your key, your way** — create a 12/18/24-word seed in-app with a backup-and-quiz flow, or import what you have: BIP-39 words (12/18/24, with autocomplete), xprv, WIF, or raw hex — typed, scanned from QR (SeedQR included), or loaded from file. Hierarchical keys open as notebooks you switch between anytime.
 - **Keys live in the platform vault** — the macOS Keychain behind Touch ID, iOS Keychain, Android Keystore. Reveal always re-authenticates.
 - **Watch-only mode** — import just an xpub or descriptor for a key-less notebook: balance and public notes visible, private bodies sealed. Everything that needs a signature — sweep, consolidate, fee bumps, even public-note compose — builds a PSBT your hardware wallet signs (verified against a real signer implementation), with an optional separate fee wallet.

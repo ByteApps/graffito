@@ -142,5 +142,30 @@ curl -sf -X POST "$BASE/tx" --data-binary "$RAW" >/dev/null || fail "broadcast p
     grep -q "received=true from=$P_ADDR .*text=hello app, from the prime" || fail "app did not decrypt prime's directed note: $(cat "$WORK/notes3")"
 pass "prime → app directed private: received, attributed, decrypted by app-core"
 
+echo "== prime → app NOTEBOOK 1 (rev 3: receive index 0/1, own enc key) =="
+# A second notebook of the SAME app seed/account is receive index 1 — its
+# address AND note-encryption key differ from notebook 0's (frozen rule
+# derives from the leaf). Prime sends it a directed private note; only the
+# index-1 identity can decrypt it.
+NB1_ADDR="$(APP_INDEX=1 "$APP" address regtest)"
+[ "$NB1_ADDR" != "$A_ADDR" ] || fail "notebook 1 address equals notebook 0"
+NB1_STORE="$WORK/app-nb1.json"
+APP_INDEX=1 "$APP" init "$NB1_STORE" regtest >/dev/null
+# Refresh prime's ledger first — its previous send's inputs are gone.
+"$APP" bundle "$P_ADDR" regtest "$BASE" "$WORK/prime.json" >/dev/null
+"$NOTES" scan "$WORK/prime.json" >/dev/null
+"$NOTES" send "$WORK/prime.json" "$NB1_ADDR" private 1.0 100000 "hello notebook one" >"$WORK/prime-send-nb1.json"
+RAW="$(jq -r .raw_hex "$WORK/prime-send-nb1.json")"
+curl -s -X POST "$BASE/tx" --data-binary "$RAW" >"$WORK/nb1-broadcast" || true
+grep -qi error "$WORK/nb1-broadcast" && fail "broadcast prime → nb1: $(cat "$WORK/nb1-broadcast")"
+APP_INDEX=1 "$APP" scan "$NB1_STORE" "$BASE" >/dev/null
+APP_INDEX=1 "$APP" notes "$NB1_STORE" | tee "$WORK/notes-nb1" | \
+    grep -q "received=true from=$P_ADDR .*text=hello notebook one" || fail "notebook 1 did not decrypt its directed note: $(cat "$WORK/notes-nb1")"
+# Notebook 0 must NOT see the body (different leaf, different enc key —
+# and a different address entirely, so it never even scans that tx).
+"$APP" scan "$STORE" "$BASE" >/dev/null
+"$APP" notes "$STORE" | grep -q "text=hello notebook one" && fail "notebook 0 leaked notebook 1's note"
+pass "prime → app notebook 1 (index 0/1): decrypted by its own leaf key only"
+
 echo
 pass "interop matrix + external funding (P2TR + P2WPKH) complete (work dir: $WORK)"

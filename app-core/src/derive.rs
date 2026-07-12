@@ -4,7 +4,9 @@
 //! FROZEN FOREVER once shipped (every private note depends on them):
 //! - enc key = HKDF-SHA256(ikm = leaf internal-key secret,
 //!   salt = "chain-notes-app/enc/v1", info = "note-enc/v1")
-//! - hierarchical path = m/86'/{coin}'/0'/0/0, coin 0 mainnet / 1 otherwise
+//! - hierarchical path = m/86'/{coin}'/{account}'/0/{index}, coin 0
+//!   mainnet / 1 otherwise; notebook `index` on the receive chain
+//!   (rev 3 — index 0 IS the pre-notebooks identity, byte-identical)
 //! - raw keys (WIF/hex) ARE the leaf secret directly (no hierarchy)
 
 use bitcoin::bip32::{ChildNumber, Xpriv};
@@ -51,15 +53,20 @@ fn normal(i: u32) -> ChildNumber {
     ChildNumber::from_normal_idx(i).expect("index < 2^31")
 }
 
-/// m/86'/{coin}'/{account}'/0/0 from a master (depth-0) xprv.
-pub fn leaf_from_master(master: &Xpriv, network: Network, account: u32) -> Result<[u8; 32], Error> {
+/// m/86'/{coin}'/{account}'/0/{index} from a master (depth-0) xprv.
+pub fn leaf_from_master(
+    master: &Xpriv,
+    network: Network,
+    account: u32,
+    index: u32,
+) -> Result<[u8; 32], Error> {
     let secp = Secp256k1::new();
     let path = [
         hardened(86),
         hardened(coin_type(network)),
         hardened(account),
         normal(0),
-        normal(0),
+        normal(index),
     ];
     let leaf = master
         .derive_priv(&secp, &path)
@@ -67,11 +74,11 @@ pub fn leaf_from_master(master: &Xpriv, network: Network, account: u32) -> Resul
     Ok(leaf.private_key.secret_bytes())
 }
 
-/// 0/0 below an account-level (depth-3, e.g. 86'/coin'/n') xprv.
-pub fn leaf_from_account(account: &Xpriv) -> Result<[u8; 32], Error> {
+/// 0/{index} below an account-level (depth-3, e.g. 86'/coin'/n') xprv.
+pub fn leaf_from_account(account: &Xpriv, index: u32) -> Result<[u8; 32], Error> {
     let secp = Secp256k1::new();
     let leaf = account
-        .derive_priv(&secp, &[normal(0), normal(0)])
+        .derive_priv(&secp, &[normal(0), normal(index)])
         .map_err(|e| Error::Xprv(e.to_string()))?;
     Ok(leaf.private_key.secret_bytes())
 }
@@ -103,9 +110,10 @@ pub fn leaf_from_mnemonic(
     mnemonic: &bip39::Mnemonic,
     network: Network,
     account: u32,
+    index: u32,
 ) -> Result<[u8; 32], Error> {
     let seed = Zeroizing::new(mnemonic.to_seed(""));
     let master = Xpriv::new_master(btc_network(network), seed.as_ref())
         .map_err(|e| Error::Xprv(e.to_string()))?;
-    leaf_from_master(&master, network, account)
+    leaf_from_master(&master, network, account, index)
 }
