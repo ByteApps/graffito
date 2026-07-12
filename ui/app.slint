@@ -1239,6 +1239,12 @@ export component AppWindow inherits Window {
     in-out property <string> sweep-dest-note;   // linkage caveat, empty = none
     callback pick-notebook-dest(int);
     callback sweep-new-notebook();
+    // wallet-level consolidate (Settings): dest picked on screen 9 in
+    // "wconsol" mode, then a confirm modal, then one multi-key tx.
+    in-out property <bool> show-wconsol-confirm;
+    in-out property <string> wconsol-summary;
+    callback consolidate-wallet-open();
+    callback wallet-consolidate();
     callback open-notebooks();
     callback open-notebook(int);
     callback create-notebook();
@@ -1262,6 +1268,7 @@ export component AppWindow inherits Window {
     function nav-back() -> bool {
         // Overlays first, topmost (= last window child) before the rest —
         // back closes the same thing a tap on Cancel / the dim would.
+        if (root.show-wconsol-confirm) { root.show-wconsol-confirm = false; return true; }
         if (root.show-bump-dialog) { root.show-bump-dialog = false; return true; }
         if (root.show-oversize-modal) { root.show-oversize-modal = false; return true; }
         if (root.show-consolidate-confirm) { root.show-consolidate-confirm = false; return true; }
@@ -2502,10 +2509,8 @@ export component AppWindow inherits Window {
                 wrap: no-wrap;
                 overflow: elide;
             }
-            if root.settings-hierarchical: GhostButton {
-                text: "Change account…";
-                clicked => { root.open-account-picker(); }
-            }
+            // (The old "Change account…" row is gone — the notebook list IS
+            // the account switcher now.)
             GhostButton {
                 text: "Switch identity — new seed or different key…";
                 clicked => { root.show-reset-confirm = true; }
@@ -2597,18 +2602,28 @@ export component AppWindow inherits Window {
             title: "Coins";
             subtitle: root.coins-summary;
             GhostButton {
-                text: "View coins & consolidate…";
+                text: "View this notebook's coins…";
                 clicked => { root.open-coins(); }
             }
         }
         SettingsCard {
             title: "Funds";
             subtitle: root.watch-only
-                ? "Move everything off the notes address (minus the fee). Watch-only: you'll sign the transaction on your external wallet."
-                : "Move everything off the notes address (minus the fee) — e.g. returning testnet coins.";
+                ? "Move everything off this notebook's address (minus the fee). Watch-only: you'll sign the transaction on your external wallet."
+                : "Move everything off this notebook's address (minus the fee) — to another notebook, a new one, or any address.";
             GhostButton {
-                text: "Sweep all funds…";
+                text: "Sweep this notebook's funds…";
                 clicked => { root.sweep-open(); }
+            }
+        }
+        SettingsCard {
+            title: "Consolidate wallet";
+            subtitle: root.watch-only
+                ? "Combine this wallet's coins into one. Watch-only: signs on your external wallet."
+                : "Gather EVERY notebook's coins into one coin at an address you pick — used or new. One transaction; all source addresses become publicly linked on-chain.";
+            GhostButton {
+                text: "Consolidate wallet…";
+                clicked => { root.consolidate-wallet-open(); }
             }
         }
         SettingsCard {
@@ -2646,23 +2661,28 @@ export component AppWindow inherits Window {
         spacing: 12px;
         alignment: start;
         Header {
-            title: root.account-pick-mode == "notebook" ? "New notebook" : "Choose account";
+            title: root.account-pick-mode == "notebook" ? "New notebook"
+                : (root.account-pick-mode == "wconsol" ? "Consolidate to" : "Choose account");
             back => { root.nav-back(); }
         }
         Caption {
             text: root.account-pick-mode == "notebook"
                 ? "Name it, then pick its address. Used addresses already have on-chain history — picking one adopts its notes."
-                : "One seed holds many BIP-86 accounts. Each is a completely separate notebook: its own address, its own encryption key, its own notes.";
+                : (root.account-pick-mode == "wconsol"
+                    ? "Where should every coin end up? Pick one of your notebooks, or a used/new address (it becomes a notebook)."
+                    : "One seed holds many BIP-86 accounts. Each is a completely separate notebook: its own address, its own encryption key, its own notes.");
         }
-        // Notebook mode: the name lives right here — tapping an address
-        // creates the notebook immediately (no second dialog).
-        if root.account-pick-mode == "notebook": EditField {
+        // Create / consolidate-dest modes: the name lives right here —
+        // tapping an address acts immediately (no second dialog).
+        if root.account-pick-mode != "switch": EditField {
             text <=> root.nb-create-name;
             placeholder-text: "name (optional — empty = address short form)";
         }
         for a in root.accounts: Rectangle {
-            // Rows already added as notebooks are informational only.
-            property <bool> row-disabled: a.pill == "notebook";
+            // Rows already added as notebooks are informational-only when
+            // CREATING (can't re-add); as a consolidate DESTINATION they
+            // are first-class choices.
+            property <bool> row-disabled: a.pill == "notebook" && root.account-pick-mode == "notebook";
             border-radius: 12px;
             border-width: 1px;
             border-color: a.active ? Pal.accent : Pal.line;
@@ -2732,15 +2752,11 @@ export component AppWindow inherits Window {
         }
         Caption {
             text: root.watch-only
-                ? "This notebook's unspent outputs — every note tx spends from them. Consolidating combines them into one coin at this notebook's address; watch-only signs the transaction on your external wallet."
-                : "This notebook's unspent outputs — every note tx spends from them. Consolidating combines them into one coin at this notebook's address, so future notes need fewer inputs (lower fees). To move coins to a DIFFERENT notebook, use Sweep instead (Settings → Funds).";
+                ? "This notebook's unspent outputs — every note tx spends from them. To combine coins, use Settings → Consolidate wallet (signs on your external wallet)."
+                : "This notebook's unspent outputs — every note tx spends from them. To combine coins into one (all notebooks at once), use Settings → Consolidate wallet; to move funds elsewhere, Settings → Funds → Sweep.";
         }
-        // Viewer-first: the list is the point; consolidation is one button
-        // that opens its own compose-like screen (16, shared with sweep).
-        GhostButton {
-            text: "Consolidate into one coin…";
-            clicked => { root.consolidate-open(); }
-        }
+        // Pure viewer since consolidation moved to Settings ("Consolidate
+        // wallet…" — wallet-level, all notebooks at once).
         Body { text: root.coins-summary; font-size: 12px; }
         Flickable {
             viewport-height: coins-col.preferred-height;
@@ -3653,6 +3669,45 @@ export component AppWindow inherits Window {
                         tint-hover: #ff6b62;
                         clicked => { root.remove-contact(root.confirm-remove-address); }
                     }
+                }
+            }
+        }
+    }
+
+    // ---------- wallet-consolidate confirmation (modal overlay) ----------
+    if root.show-wconsol-confirm: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.show-wconsol-confirm = false; } }
+        Rectangle {
+            width: 400px;
+            height: wcl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 200px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { }
+            wcl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Consolidate the whole wallet?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Body { text: root.wconsol-summary; font-size: 12px; }
+                Caption {
+                    text: "One transaction spends every notebook's coins — all their addresses become publicly linked on-chain.";
+                    color: Pal.warn;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.show-wconsol-confirm = false; } }
+                    PrimaryButton { text: "Consolidate"; clicked => { root.wallet-consolidate(); } }
                 }
             }
         }
