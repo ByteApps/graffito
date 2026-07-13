@@ -1613,6 +1613,10 @@ fn update_home(w: &AppWindow, st: &State) {
     let Some(store) = &st.store else { return };
     let watch = ident.is_watch();
     w.set_watch_only(watch);
+    // Single-key imports (wif/hex) have no account-level public material —
+    // no xpub/descriptor to export — so hide the "Public keys" entry rather
+    // than route to a dead-end hint (mirrors hiding Private for watch-only).
+    w.set_reveal_can_public(!matches!(ident.kind, "wif" | "hex"));
     w.set_notebook_title(st.notebook_display_name(ident.index).into());
     w.set_address(ident.address.as_str().into());
     if let Some(img) = qr::qr_image(&ident.address.to_uppercase()) {
