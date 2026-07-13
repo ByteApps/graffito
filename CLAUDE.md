@@ -546,7 +546,13 @@ picker` · `cb: pick-account <n>` · `cb: account-picker open` ·
 `cb: set-network <net>` · `cb: set-chunk-size <n> ok` ·
 `cb: set-node-preset <name|custom>` · `cb: set-node-custom <url|default>` ·
 `cb: set-explorer-preset <name|custom>` · `cb: set-explorer-custom <url|default>` ·
-`cb: reveal-backup ok|cancelled` · `cb: reset-identity` ·
+`cb: reveal-backup ok formats=<n> account=<a> index=<i> | cancelled` (the
+Settings "Backup & export" reveal renders every importable format the
+identity supports — recovery words, account xprv/xpub, tr() descriptor,
+and the active notebook's hex/WIF via `app_core::keyexport::export_formats`;
+values live in UI props only, never logged, wiped on Hide / nav / reset) ·
+`cb: copy-value len=<n>` (a revealed value copied to the clipboard) ·
+`cb: reset-identity` ·
 `cb: open-note-web url=…` · `cb: toggle-coin selected=<n>` ·
 `cb: refresh-coins` · `cb: act-explorer` · `cb: bump-open`/`act-bump` ·
 `cb: sys-back handled=<b> screen=<n>` (Android system back; screen is
