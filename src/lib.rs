@@ -1367,6 +1367,17 @@ fn ensure_notebook(st: &mut State, index: u32) {
 /// account has no notebook entry (create-seed just finished, an iCloud
 /// restore onto a fresh install), in which case home would be a trap only
 /// reachable by accident: land on the notebook list instead.
+/// Wipe any revealed key-export material from the UI (nav away / reset /
+/// hide). Values live only in these props, so clearing them is the wipe.
+fn clear_reveal(w: &AppWindow) {
+    let empty: Vec<RevealRow> = Vec::new();
+    w.set_reveal_public_rows(VecModel::from_slice(&empty));
+    w.set_reveal_private_rows(VecModel::from_slice(&empty));
+    w.set_reveal_fingerprint("".into());
+    w.set_reveal_active(false);
+    w.set_reveal_text("".into());
+}
+
 fn go_home_or_list(w: &AppWindow, st: &State) {
     let listed = st
         .ident
@@ -5317,7 +5328,7 @@ pub fn run() {
     cb!(on_settings_open, |w, s| {
         w.set_return_screen(if w.get_screen() == 17 { 17 } else { 4 });
         println!("cb: settings-open");
-        w.set_reveal_text("".into());
+        clear_reveal(&w);
         w.set_status("".into());
         w.set_chunk_custom(false);
         load_backend_settings(&w, &s);
@@ -5543,7 +5554,7 @@ pub fn run() {
         w.set_icloud_backup(false);
         w.set_icloud_available(false);
         w.set_show_reset_confirm(false);
-        w.set_reveal_text("".into());
+        clear_reveal(&w);
         w.set_status("".into());
         w.set_import_text("".into());
         w.set_screen(0);
@@ -5551,7 +5562,7 @@ pub fn run() {
 
     cb!(on_hide_backup, |w, s| {
         let _ = &mut s;
-        w.set_reveal_text("".into());
+        clear_reveal(&w);
     });
 
     cb!(on_set_network, |w, s, net: SharedString| {
@@ -5682,11 +5693,69 @@ pub fn run() {
     });
 
     cb!(on_reveal_backup, |w, s| {
-        let _ = &mut s;
-        match keychain::reveal_secret(KEYCHAIN_ACCOUNT, "reveal your backup words") {
+        match keychain::reveal_secret(KEYCHAIN_ACCOUNT, "reveal your keys") {
             Ok(Some(secret)) => {
-                println!("cb: reveal-backup ok len={}", secret.len());
-                w.set_reveal_text(secret.into());
+                match app_core::keyexport::export_formats(&secret, s.network, s.account, s.nb_index)
+                {
+                    Ok(f) => {
+                        // Grouped by risk (mirrors the Prime device): public
+                        // (watch-only) vs private (spend + decrypt). Only the
+                        // formats derivable from this identity appear (a WIF
+                        // import has no words/xpub; watch-only has no private
+                        // keys). Values live in UI props only.
+                        let mut pub_rows: Vec<RevealRow> = Vec::new();
+                        let mut priv_rows: Vec<RevealRow> = Vec::new();
+                        if let Some(v) = f.account_xpub.as_deref() {
+                            pub_rows.push(RevealRow { label: "Account xpub".into(), value: v.into() });
+                        }
+                        if let Some(v) = f.descriptor.as_deref() {
+                            pub_rows
+                                .push(RevealRow { label: "Descriptor (tr)".into(), value: v.into() });
+                        }
+                        if let Some(v) = f.mnemonic.as_ref().map(|z| z.as_str()) {
+                            priv_rows
+                                .push(RevealRow { label: "Recovery words".into(), value: v.into() });
+                        }
+                        if let Some(v) = f.account_xprv.as_ref().map(|z| z.as_str()) {
+                            priv_rows.push(RevealRow {
+                                label: "Account xprv · whole account".into(),
+                                value: v.into(),
+                            });
+                        }
+                        if let Some(v) = f.leaf_hex.as_ref().map(|z| z.as_str()) {
+                            priv_rows.push(RevealRow {
+                                label: format!("Notebook {} · hex", s.nb_index).into(),
+                                value: v.into(),
+                            });
+                        }
+                        if let Some(v) = f.leaf_wif.as_ref().map(|z| z.as_str()) {
+                            priv_rows.push(RevealRow {
+                                label: format!("Notebook {} · WIF", s.nb_index).into(),
+                                value: v.into(),
+                            });
+                        }
+                        let fp_line = match f.fingerprint.as_deref() {
+                            Some(fp) => format!("{fp} · account {}", s.account),
+                            None => format!("account {}", s.account),
+                        };
+                        println!(
+                            "cb: reveal-backup ok public={} private={} account={} index={}",
+                            pub_rows.len(),
+                            priv_rows.len(),
+                            s.account,
+                            s.nb_index
+                        );
+                        w.set_reveal_fingerprint(fp_line.into());
+                        w.set_reveal_public_rows(VecModel::from_slice(&pub_rows));
+                        w.set_reveal_private_rows(VecModel::from_slice(&priv_rows));
+                        w.set_reveal_active(true);
+                        w.set_reveal_text("".into());
+                    }
+                    Err(e) => {
+                        w.set_reveal_active(false);
+                        w.set_reveal_text(format!("export: {e}").into());
+                    }
+                }
             }
             Ok(None) => w.set_reveal_text("(no key in keychain — APP_KEY env session?)".into()),
             Err(e) if e == "cancelled" => {
@@ -5696,10 +5765,15 @@ pub fn run() {
             Err(e) => w.set_reveal_text(format!("keychain: {e}").into()),
         }
     });
+    cb!(on_copy_value, |w, s, value: SharedString| {
+        let _ = (&w, &mut s);
+        let _ = platform::set_clipboard_text(value.as_str());
+        println!("cb: copy-value len={}", value.len());
+    });
 
     cb!(on_go_home, |w, s| {
         let _ = &mut s;
-        w.set_reveal_text("".into());
+        clear_reveal(&w);
         go_home_or_list(&w, &s);
     });
 
