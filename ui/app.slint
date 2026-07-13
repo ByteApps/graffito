@@ -1102,6 +1102,7 @@ export component AppWindow inherits Window {
     // fresh biometric. Both rows (xpub + descriptor) shown at once, each
     // with its own QR. `reveal-public-hint` explains an empty list (no
     // cached material, or a derive error) instead of a blank screen.
+    in property <bool> reveal-can-public;   // false for single-key (wif/hex) imports — no xpub/descriptor
     in property <[RevealRow]> reveal-public-rows;
     in property <string> reveal-public-hint;
     // Private keys (19): ALWAYS behind a fresh biometric (triggered from
@@ -2638,7 +2639,7 @@ export component AppWindow inherits Window {
             subtitle: root.watch-only
                 ? "This is a watch-only identity — only public material (xpub / descriptor) can be revealed here. It can't spend and can't read private notes."
                 : "Export this notebook's keys — to back them up, or move them to another wallet. Private material controls the funds and every private note: protect it like cash.";
-            GhostButton { text: "Public keys — safe to share"; clicked => { root.reveal-public(); } }
+            if root.reveal-can-public: GhostButton { text: "Public keys — safe to share"; clicked => { root.reveal-public(); } }
             if !root.watch-only: GhostButton {
                 text: "Private keys  ·  asks for \{root.biometric-name}";
                 clicked => { root.reveal-private(); }
