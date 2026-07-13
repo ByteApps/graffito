@@ -25,7 +25,7 @@ cargo run                     # launch the Mac app
 bash scripts/regtest-e2e.sh   # app↔Prime interop matrix vs real bitcoind
 ```
 
-Mobile: `build_ios.bash` (Xcode project via `project.yml`) and `cargo apk build --lib --target aarch64-linux-android`. See `CLAUDE.md` for the per-platform gotchas (iOS launch watchdog, Android NoActionBar theme, icon/glyph rules).
+Mobile: `build_ios.bash` (Xcode project via `project.yml`) and `cargo apk build --lib --target aarch64-linux-android`. The Android build needs **`ANDROID_NDK_ROOT`** exported, pointing at your installed NDK (e.g. `~/Library/Android/sdk/ndk/<version>`), or `cargo apk` fails with `Error: Android NDK is not found`. See `CLAUDE.md` for the per-platform gotchas (iOS launch watchdog, Android NoActionBar theme, icon/glyph rules).
 
 ## Testing
 
