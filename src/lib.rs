@@ -1371,7 +1371,9 @@ fn ensure_notebook(st: &mut State, index: u32) {
 /// hide). Values live only in these props, so clearing them is the wipe.
 fn clear_reveal(w: &AppWindow) {
     let empty: Vec<RevealRow> = Vec::new();
-    w.set_reveal_rows(VecModel::from_slice(&empty));
+    w.set_reveal_public_rows(VecModel::from_slice(&empty));
+    w.set_reveal_private_rows(VecModel::from_slice(&empty));
+    w.set_reveal_fingerprint("".into());
     w.set_reveal_active(false);
     w.set_reveal_text("".into());
 }
@@ -5696,50 +5698,56 @@ pub fn run() {
                 match app_core::keyexport::export_formats(&secret, s.network, s.account, s.nb_index)
                 {
                     Ok(f) => {
-                        // Only the formats derivable from this identity appear
-                        // (a WIF import has no words/xpub; watch-only has no
-                        // private keys). Values live in UI props only.
-                        let mut rows: Vec<RevealRow> = Vec::new();
-                        if let Some(v) = f.mnemonic.as_ref().map(|z| z.as_str()) {
-                            rows.push(RevealRow { label: "Recovery words".into(), value: v.into() });
-                        }
-                        if let Some(v) = f.account_xprv.as_ref().map(|z| z.as_str()) {
-                            rows.push(RevealRow {
-                                label: "Account xprv · PRIVATE, whole account".into(),
-                                value: v.into(),
-                            });
-                        }
+                        // Grouped by risk (mirrors the Prime device): public
+                        // (watch-only) vs private (spend + decrypt). Only the
+                        // formats derivable from this identity appear (a WIF
+                        // import has no words/xpub; watch-only has no private
+                        // keys). Values live in UI props only.
+                        let mut pub_rows: Vec<RevealRow> = Vec::new();
+                        let mut priv_rows: Vec<RevealRow> = Vec::new();
                         if let Some(v) = f.account_xpub.as_deref() {
-                            rows.push(RevealRow {
-                                label: "Account xpub · watch-only".into(),
-                                value: v.into(),
-                            });
+                            pub_rows.push(RevealRow { label: "Account xpub".into(), value: v.into() });
                         }
                         if let Some(v) = f.descriptor.as_deref() {
-                            rows.push(RevealRow {
-                                label: "Descriptor (tr) · watch-only".into(),
+                            pub_rows
+                                .push(RevealRow { label: "Descriptor (tr)".into(), value: v.into() });
+                        }
+                        if let Some(v) = f.mnemonic.as_ref().map(|z| z.as_str()) {
+                            priv_rows
+                                .push(RevealRow { label: "Recovery words".into(), value: v.into() });
+                        }
+                        if let Some(v) = f.account_xprv.as_ref().map(|z| z.as_str()) {
+                            priv_rows.push(RevealRow {
+                                label: "Account xprv · whole account".into(),
                                 value: v.into(),
                             });
                         }
                         if let Some(v) = f.leaf_hex.as_ref().map(|z| z.as_str()) {
-                            rows.push(RevealRow {
-                                label: format!("Notebook index {} · hex", s.nb_index).into(),
+                            priv_rows.push(RevealRow {
+                                label: format!("Notebook {} · hex", s.nb_index).into(),
                                 value: v.into(),
                             });
                         }
                         if let Some(v) = f.leaf_wif.as_ref().map(|z| z.as_str()) {
-                            rows.push(RevealRow {
-                                label: format!("Notebook index {} · WIF", s.nb_index).into(),
+                            priv_rows.push(RevealRow {
+                                label: format!("Notebook {} · WIF", s.nb_index).into(),
                                 value: v.into(),
                             });
                         }
+                        let fp_line = match f.fingerprint.as_deref() {
+                            Some(fp) => format!("{fp} · account {}", s.account),
+                            None => format!("account {}", s.account),
+                        };
                         println!(
-                            "cb: reveal-backup ok formats={} account={} index={}",
-                            rows.len(),
+                            "cb: reveal-backup ok public={} private={} account={} index={}",
+                            pub_rows.len(),
+                            priv_rows.len(),
                             s.account,
                             s.nb_index
                         );
-                        w.set_reveal_rows(VecModel::from_slice(&rows));
+                        w.set_reveal_fingerprint(fp_line.into());
+                        w.set_reveal_public_rows(VecModel::from_slice(&pub_rows));
+                        w.set_reveal_private_rows(VecModel::from_slice(&priv_rows));
                         w.set_reveal_active(true);
                         w.set_reveal_text("".into());
                     }

@@ -1097,7 +1097,9 @@ export component AppWindow inherits Window {
     // for the active notebook, populated behind Touch ID. Empty until a
     // successful reveal; cleared on Hide.
     in property <bool> reveal-active;
-    in property <[RevealRow]> reveal-rows;
+    in property <string> reveal-fingerprint;         // "<xfp> · account N"
+    in property <[RevealRow]> reveal-public-rows;     // xpub / descriptor
+    in property <[RevealRow]> reveal-private-rows;    // words / xprv / hex / WIF
     in property <[CoinItem]> coins;
     in property <string> coins-summary;
     in property <[ActivityItem]> activity;
@@ -2612,16 +2614,31 @@ export component AppWindow inherits Window {
             GhostButton { text: "Reveal keys  ·  asks for \{root.biometric-name}"; clicked => { root.reveal-backup(); } }
             if root.reveal-active: VerticalLayout {
                 spacing: 12px;
-                for row in root.reveal-rows: VerticalLayout {
+
+                if root.reveal-fingerprint != "": Mono {
+                    text: root.reveal-fingerprint;
+                    color: Pal.muted;
+                }
+                if root.reveal-private-rows.length > 0: Caption {
+                    text: "Make sure no cameras or onlookers — anyone who captures a private key below controls the funds and can read every private note.";
+                    color: Pal.bad;
+                }
+
+                // ---- Public: watch-only, safe to share ----
+                if root.reveal-public-rows.length > 0: Caption {
+                    text: "PUBLIC · watch-only, safe to share";
+                    color: Pal.muted;
+                }
+                for row in root.reveal-public-rows: VerticalLayout {
                     spacing: 4px;
                     Caption { text: row.label; }
                     Rectangle {
                         border-radius: 10px;
-                        background: Pal.warn.with-alpha(0.10);
+                        background: Pal.card;
                         border-width: 1px;
-                        border-color: Pal.warn.with-alpha(0.4);
-                        height: mv.preferred-height + 24px;
-                        mv := Mono {
+                        border-color: Pal.line;
+                        height: pv.preferred-height + 24px;
+                        pv := Mono {
                             x: 12px;
                             y: 12px;
                             width: parent.width - 24px;
@@ -2630,6 +2647,31 @@ export component AppWindow inherits Window {
                     }
                     GhostButton { text: "Copy"; clicked => { root.copy-value(row.value); } }
                 }
+
+                // ---- Private: keep secret ----
+                if root.reveal-private-rows.length > 0: Caption {
+                    text: "PRIVATE · keep secret";
+                    color: Pal.bad;
+                }
+                for row in root.reveal-private-rows: VerticalLayout {
+                    spacing: 4px;
+                    Caption { text: row.label; }
+                    Rectangle {
+                        border-radius: 10px;
+                        background: Pal.warn.with-alpha(0.10);
+                        border-width: 1px;
+                        border-color: Pal.warn.with-alpha(0.4);
+                        height: rv.preferred-height + 24px;
+                        rv := Mono {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            text: row.value;
+                        }
+                    }
+                    GhostButton { text: "Copy"; clicked => { root.copy-value(row.value); } }
+                }
+
                 GhostButton { text: "Hide"; clicked => { root.hide-backup(); } }
             }
             if root.reveal-text != "": Caption { text: root.reveal-text; color: Pal.warn; }
