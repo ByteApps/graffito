@@ -140,6 +140,13 @@ struct State {
     /// Wallet-level consolidate in progress: sources snapshotted at open,
     /// destination + fee filled in by the picker, consumed by confirm.
     wconsol: Option<WConsol>,
+    /// Private-keys reveal session (screen 19): populated by a FRESH
+    /// `keychain::reveal_secret` at the Settings entry point (never from
+    /// the cached `material`), so every distinct format the picker can
+    /// switch to is already derived — `private-select` just reads a
+    /// field, no re-derivation/re-auth. Dropped (zeroized) on hide/back/
+    /// reset. Public keys never touch this — they derive from `material`.
+    reveal_formats: Option<app_core::keyexport::ExportFormats>,
 }
 
 /// One wallet-consolidate session (Coins → "Consolidate into one coin…").
@@ -1368,14 +1375,27 @@ fn ensure_notebook(st: &mut State, index: u32) {
 /// restore onto a fresh install), in which case home would be a trap only
 /// reachable by accident: land on the notebook list instead.
 /// Wipe any revealed key-export material from the UI (nav away / reset /
-/// hide). Values live only in these props, so clearing them is the wipe.
-fn clear_reveal(w: &AppWindow) {
+/// hide) AND drop the cached private-reveal formats (`State.reveal_formats`
+/// — the only place a freshly-authenticated secret is held; dropping it
+/// zeroizes via `Zeroizing`). Values otherwise live only in these props, so
+/// clearing them is the wipe.
+fn clear_reveal(w: &AppWindow, s: &mut State) {
     let empty: Vec<RevealRow> = Vec::new();
     w.set_reveal_public_rows(VecModel::from_slice(&empty));
-    w.set_reveal_private_rows(VecModel::from_slice(&empty));
+    w.set_reveal_public_hint("".into());
     w.set_reveal_fingerprint("".into());
-    w.set_reveal_active(false);
-    w.set_reveal_text("".into());
+    w.set_reveal_has_recovery(false);
+    w.set_reveal_has_xprv(false);
+    w.set_reveal_has_hex(false);
+    w.set_reveal_has_wif(false);
+    w.set_reveal_private_format("".into());
+    w.set_reveal_private_value("".into());
+    w.set_reveal_private_qr(slint::Image::default());
+    w.set_reveal_words_col1("".into());
+    w.set_reveal_words_col2("".into());
+    w.set_reveal_show_seedqr(false);
+    w.set_reveal_seedqr_image(slint::Image::default());
+    s.reveal_formats = None;
 }
 
 fn go_home_or_list(w: &AppWindow, st: &State) {
@@ -2846,6 +2866,7 @@ pub fn run() {
         xacct_addrs: Vec::new(),
         discovery_pending: false,
         wconsol: None,
+        reveal_formats: None,
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -5328,7 +5349,7 @@ pub fn run() {
     cb!(on_settings_open, |w, s| {
         w.set_return_screen(if w.get_screen() == 17 { 17 } else { 4 });
         println!("cb: settings-open");
-        clear_reveal(&w);
+        clear_reveal(&w, &mut s);
         w.set_status("".into());
         w.set_chunk_custom(false);
         load_backend_settings(&w, &s);
@@ -5554,15 +5575,15 @@ pub fn run() {
         w.set_icloud_backup(false);
         w.set_icloud_available(false);
         w.set_show_reset_confirm(false);
-        clear_reveal(&w);
+        clear_reveal(&w, &mut s);
         w.set_status("".into());
         w.set_import_text("".into());
         w.set_screen(0);
     });
 
-    cb!(on_hide_backup, |w, s| {
-        let _ = &mut s;
-        clear_reveal(&w);
+    cb!(on_reveal_hide, |w, s| {
+        clear_reveal(&w, &mut s);
+        println!("cb: hide-reveal");
     });
 
     cb!(on_set_network, |w, s, net: SharedString| {
@@ -5692,79 +5713,180 @@ pub fn run() {
         w.set_status("".into());
     });
 
-    cb!(on_reveal_backup, |w, s| {
+    // ---- Public keys (screen 18): derived from the SESSION-CACHED
+    // material only — never a fresh biometric. Watch-only identities show
+    // whatever public material `export_formats` yields (their `material`
+    // IS the xpub/descriptor string itself, so this works unchanged).
+    cb!(on_reveal_public, |w, s| {
+        let material = std::env::var("APP_KEY")
+            .ok()
+            .or_else(|| s.material.as_ref().map(|z| String::from(z.as_str())));
+        let Some(material) = material else {
+            w.set_reveal_public_rows(VecModel::from_slice(&Vec::<RevealRow>::new()));
+            w.set_reveal_fingerprint("".into());
+            w.set_reveal_public_hint(
+                "No key material cached this session — open Private keys once (it re-authenticates), or restart the app."
+                    .into(),
+            );
+            w.set_screen(18);
+            println!("cb: reveal-public no-material");
+            return;
+        };
+        match app_core::keyexport::export_formats(&material, s.network, s.account, s.nb_index) {
+            Ok(f) => {
+                let mut rows: Vec<RevealRow> = Vec::new();
+                if let Some(v) = f.account_xpub.as_deref() {
+                    rows.push(RevealRow {
+                        label: "Account xpub".into(),
+                        value: v.into(),
+                        qr: qr::qr_image(v).unwrap_or_default(),
+                    });
+                }
+                if let Some(v) = f.descriptor.as_deref() {
+                    rows.push(RevealRow {
+                        label: "Descriptor (tr)".into(),
+                        value: v.into(),
+                        qr: qr::qr_image(v).unwrap_or_default(),
+                    });
+                }
+                let fp_line = match f.fingerprint.as_deref() {
+                    Some(fp) => format!("{fp} · account {}", s.account),
+                    None => format!("account {}", s.account),
+                };
+                println!("cb: reveal-public ok rows={}", rows.len());
+                w.set_reveal_fingerprint(fp_line.into());
+                w.set_reveal_public_rows(VecModel::from_slice(&rows));
+                // A single hex/WIF key import has a leaf key but no account
+                // node — legitimately nothing public to export. Explain the
+                // empty screen instead of leaving it blank.
+                w.set_reveal_public_hint(if rows.is_empty() {
+                    "This key has no account-level public material — a single hex/WIF import can't yield a watch-only xpub or descriptor.".into()
+                } else {
+                    "".into()
+                });
+            }
+            Err(e) => {
+                w.set_reveal_public_rows(VecModel::from_slice(&Vec::<RevealRow>::new()));
+                w.set_reveal_public_hint(format!("Couldn't derive public keys: {e}").into());
+                println!("cb: reveal-public err");
+            }
+        }
+        w.set_screen(18);
+    });
+
+    // ---- Private keys (screen 19): ALWAYS a fresh biometric — never the
+    // session cache. Only on success do we derive + navigate; failures
+    // surface as a status message on Settings (screen stays 8). Every
+    // format this identity supports is derived up front and cached in
+    // `s.reveal_formats` so the picker (`private-select`) never re-prompts
+    // — but nothing is shown until the user taps a pill (progressive
+    // disclosure).
+    cb!(on_reveal_private, |w, s| {
         match keychain::reveal_secret(KEYCHAIN_ACCOUNT, "reveal your keys") {
             Ok(Some(secret)) => {
                 match app_core::keyexport::export_formats(&secret, s.network, s.account, s.nb_index)
                 {
                     Ok(f) => {
-                        // Grouped by risk (mirrors the Prime device): public
-                        // (watch-only) vs private (spend + decrypt). Only the
-                        // formats derivable from this identity appear (a WIF
-                        // import has no words/xpub; watch-only has no private
-                        // keys). Values live in UI props only.
-                        let mut pub_rows: Vec<RevealRow> = Vec::new();
-                        let mut priv_rows: Vec<RevealRow> = Vec::new();
-                        if let Some(v) = f.account_xpub.as_deref() {
-                            pub_rows.push(RevealRow { label: "Account xpub".into(), value: v.into() });
-                        }
-                        if let Some(v) = f.descriptor.as_deref() {
-                            pub_rows
-                                .push(RevealRow { label: "Descriptor (tr)".into(), value: v.into() });
-                        }
-                        if let Some(v) = f.mnemonic.as_ref().map(|z| z.as_str()) {
-                            priv_rows
-                                .push(RevealRow { label: "Recovery words".into(), value: v.into() });
-                        }
-                        if let Some(v) = f.account_xprv.as_ref().map(|z| z.as_str()) {
-                            priv_rows.push(RevealRow {
-                                label: "Account xprv · whole account".into(),
-                                value: v.into(),
-                            });
-                        }
-                        if let Some(v) = f.leaf_hex.as_ref().map(|z| z.as_str()) {
-                            priv_rows.push(RevealRow {
-                                label: format!("Notebook {} · hex", s.nb_index).into(),
-                                value: v.into(),
-                            });
-                        }
-                        if let Some(v) = f.leaf_wif.as_ref().map(|z| z.as_str()) {
-                            priv_rows.push(RevealRow {
-                                label: format!("Notebook {} · WIF", s.nb_index).into(),
-                                value: v.into(),
-                            });
-                        }
                         let fp_line = match f.fingerprint.as_deref() {
                             Some(fp) => format!("{fp} · account {}", s.account),
                             None => format!("account {}", s.account),
                         };
-                        println!(
-                            "cb: reveal-backup ok public={} private={} account={} index={}",
-                            pub_rows.len(),
-                            priv_rows.len(),
-                            s.account,
-                            s.nb_index
-                        );
                         w.set_reveal_fingerprint(fp_line.into());
-                        w.set_reveal_public_rows(VecModel::from_slice(&pub_rows));
-                        w.set_reveal_private_rows(VecModel::from_slice(&priv_rows));
-                        w.set_reveal_active(true);
-                        w.set_reveal_text("".into());
+                        w.set_reveal_has_recovery(f.mnemonic.is_some());
+                        w.set_reveal_has_xprv(f.account_xprv.is_some());
+                        w.set_reveal_has_hex(f.leaf_hex.is_some());
+                        w.set_reveal_has_wif(f.leaf_wif.is_some());
+                        // Nothing selected yet — the screen shows only the
+                        // pills until one is tapped.
+                        w.set_reveal_private_format("".into());
+                        w.set_reveal_private_value("".into());
+                        w.set_reveal_private_qr(slint::Image::default());
+                        w.set_reveal_words_col1("".into());
+                        w.set_reveal_words_col2("".into());
+                        w.set_reveal_show_seedqr(false);
+                        w.set_reveal_seedqr_image(slint::Image::default());
+                        println!("cb: reveal-private ok");
+                        s.reveal_formats = Some(f);
+                        w.set_status("".into());
+                        w.set_screen(19);
                     }
                     Err(e) => {
-                        w.set_reveal_active(false);
-                        w.set_reveal_text(format!("export: {e}").into());
+                        println!("cb: reveal-private err");
+                        w.set_status(format!("export: {e}").into());
                     }
                 }
             }
-            Ok(None) => w.set_reveal_text("(no key in keychain — APP_KEY env session?)".into()),
-            Err(e) if e == "cancelled" => {
-                println!("cb: reveal-backup cancelled");
-                w.set_reveal_text("authentication cancelled".into());
+            Ok(None) => {
+                println!("cb: reveal-private no-key");
+                w.set_status("(no key in keychain — APP_KEY env session?)".into());
             }
-            Err(e) => w.set_reveal_text(format!("keychain: {e}").into()),
+            Err(e) if e == "cancelled" => {
+                println!("cb: reveal-private cancelled");
+                w.set_status("authentication cancelled".into());
+            }
+            Err(e) => {
+                println!("cb: reveal-private err");
+                w.set_status(format!("keychain: {e}").into());
+            }
         }
     });
+
+    // Switch which single format is on screen (progressive disclosure —
+    // only one value visible at a time). Reads the formats derived at
+    // reveal-private time; never re-authenticates.
+    cb!(on_private_select, |w, s, fmt: SharedString| {
+        let fmt = fmt.as_str();
+        let Some(f) = s.reveal_formats.as_ref() else { return };
+        w.set_reveal_show_seedqr(false);
+        match fmt {
+            "recovery" => {
+                let Some(words) = f.mnemonic.as_ref().map(|z| z.as_str().to_string()) else {
+                    return;
+                };
+                let list: Vec<&str> = words.split_whitespace().collect();
+                let half = list.len() / 2;
+                let col = |range: std::ops::Range<usize>| -> String {
+                    range
+                        .map(|i| format!("{:2}. {}", i + 1, list[i]))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                w.set_reveal_words_col1(col(0..half).into());
+                w.set_reveal_words_col2(col(half..list.len()).into());
+                if let Ok(m) = bip39::Mnemonic::parse(&words) {
+                    let digits = app_core::seedqr::encode_standard(&m);
+                    w.set_reveal_seedqr_image(qr::qr_image(&digits).unwrap_or_default());
+                }
+                w.set_reveal_private_value(words.into());
+                w.set_reveal_private_qr(slint::Image::default());
+            }
+            "xprv" => {
+                let Some(v) = f.account_xprv.as_ref().map(|z| z.as_str().to_string()) else {
+                    return;
+                };
+                w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
+                w.set_reveal_private_value(v.into());
+            }
+            "hex" => {
+                let Some(v) = f.leaf_hex.as_ref().map(|z| z.as_str().to_string()) else {
+                    return;
+                };
+                w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
+                w.set_reveal_private_value(v.into());
+            }
+            "wif" => {
+                let Some(v) = f.leaf_wif.as_ref().map(|z| z.as_str().to_string()) else {
+                    return;
+                };
+                w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
+                w.set_reveal_private_value(v.into());
+            }
+            _ => return,
+        }
+        w.set_reveal_private_format(fmt.into());
+        println!("cb: private-select fmt={fmt}");
+    });
+
     cb!(on_copy_value, |w, s, value: SharedString| {
         let _ = (&w, &mut s);
         let _ = platform::set_clipboard_text(value.as_str());
@@ -5772,8 +5894,7 @@ pub fn run() {
     });
 
     cb!(on_go_home, |w, s| {
-        let _ = &mut s;
-        clear_reveal(&w);
+        clear_reveal(&w, &mut s);
         go_home_or_list(&w, &s);
     });
 

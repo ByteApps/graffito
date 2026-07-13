@@ -12,8 +12,10 @@ export struct NotebookItem { index: int, name: string, snippet: string, meta: st
 // entry), `label` the resolved display name, `sub` the note count line.
 export struct SenderItem { key: string, label: string, sub: string, excluded: bool }
 export struct ContactItem { address: string, name: string }
-// One revealed key-export format (Settings "Backup" card): label + value.
-export struct RevealRow { label: string, value: string }
+// One revealed key-export format (Public keys screen — the ONLY reveal
+// surface that shows several rows at once; Private keys is progressive-
+// disclosure, one format at a time, via scalar reveal-private-* props).
+export struct RevealRow { label: string, value: string, qr: image }
 // `pill`/`balance` are set only by the notebook-create picker ("new" /
 // "used" / "notebook" + a sats line); the import/switch picker leaves them
 // empty and the row renders as before.
@@ -1092,14 +1094,32 @@ export component AppWindow inherits Window {
     in property <[string]> explorer-options;
     in-out property <int> explorer-index;
     in-out property <string> explorer-custom-text;
-    in property <string> reveal-text;
-    // Reveal-keys (Settings "Backup"): the available importable formats
-    // for the active notebook, populated behind Touch ID. Empty until a
-    // successful reveal; cleared on Hide.
-    in property <bool> reveal-active;
-    in property <string> reveal-fingerprint;         // "<xfp> · account N"
-    in property <[RevealRow]> reveal-public-rows;     // xpub / descriptor
-    in property <[RevealRow]> reveal-private-rows;    // words / xprv / hex / WIF
+    // ---- Reveal keys (Settings "Dangerous area" -> screens 18/19) ----
+    // Shared header: "<xfp> · account N" (or just "account N" when the
+    // fingerprint isn't known — an account-level xprv import).
+    in property <string> reveal-fingerprint;
+    // Public keys (18): derived from the cached session material, NO
+    // fresh biometric. Both rows (xpub + descriptor) shown at once, each
+    // with its own QR. `reveal-public-hint` explains an empty list (no
+    // cached material, or a derive error) instead of a blank screen.
+    in property <[RevealRow]> reveal-public-rows;
+    in property <string> reveal-public-hint;
+    // Private keys (19): ALWAYS behind a fresh biometric (triggered from
+    // Settings, before navigating here). Adaptive availability — only
+    // formats this identity actually supports get a pill. Progressive
+    // disclosure: `reveal-private-format` is "" until the user taps a
+    // pill, and only that ONE format's value is ever on screen.
+    in property <bool> reveal-has-recovery;
+    in property <bool> reveal-has-xprv;
+    in property <bool> reveal-has-hex;
+    in property <bool> reveal-has-wif;
+    in property <string> reveal-private-format;   // "" | recovery | xprv | hex | wif
+    in property <string> reveal-private-value;    // Mono value / Copy payload
+    in property <image> reveal-private-qr;        // xprv/hex/wif QR
+    in property <string> reveal-words-col1;       // recovery phrase, first half
+    in property <string> reveal-words-col2;       // recovery phrase, second half
+    in-out property <bool> reveal-show-seedqr;    // recovery: words vs SeedQR toggle
+    in property <image> reveal-seedqr-image;
     in property <[CoinItem]> coins;
     in property <string> coins-summary;
     in property <[ActivityItem]> activity;
@@ -1212,7 +1232,6 @@ export component AppWindow inherits Window {
     callback psbt-broadcast();     // finalize + broadcast the signed PSBT
     callback settings-open();
     callback set-network(string);
-    callback hide-backup();
     callback reset-identity();
     callback open-account-picker();
     callback accounts-page(int);
@@ -1224,8 +1243,11 @@ export component AppWindow inherits Window {
     callback set-node-custom(string);
     callback set-explorer-preset(int);
     callback set-explorer-custom(string);
-    callback reveal-backup();
-    callback copy-value(string);   // copy a revealed format to the clipboard
+    callback reveal-public();          // Settings entry: derive from cached material, no auth, -> screen 18
+    callback reveal-private();         // Settings entry: FRESH biometric, only navigates (-> screen 19) on success
+    callback private-select(string);   // pick which single format is shown: recovery | xprv | hex | wif
+    callback reveal-hide();            // back/Done from 18 or 19: wipes every revealed value
+    callback copy-value(string);       // copy a revealed format to the clipboard
     callback go-home();
     // Internal: a background scan finished — Rust invokes this from the
     // event loop to apply the result (never called from UI elements).
@@ -1346,6 +1368,11 @@ export component AppWindow inherits Window {
                 root.pick-mode = "sweep";
                 root.screen = 7;
             }
+            return true;
+        }
+        if (root.screen == 18 || root.screen == 19) {
+            root.reveal-hide();
+            root.screen = 8;
             return true;
         }
         return false; // 0 onboarding / 17 notebook list: nothing to go back to
@@ -2607,74 +2634,15 @@ export component AppWindow inherits Window {
             }
         }
         SettingsCard {
-            title: "Backup & export";
+            title: "Dangerous area";
             subtitle: root.watch-only
-                ? "Reveals the watch-only material (xpub / descriptor) you imported — public, for setting up a watch-only view elsewhere. It can't spend and can't read private notes."
-                : "Reveals this notebook's key in every importable format — recovery words, account xprv/xpub, descriptor, and this notebook's hex/WIF. Anyone who sees a private one controls the funds and every private note.";
-            GhostButton { text: "Reveal keys  ·  asks for \{root.biometric-name}"; clicked => { root.reveal-backup(); } }
-            if root.reveal-active: VerticalLayout {
-                spacing: 12px;
-
-                if root.reveal-fingerprint != "": Mono {
-                    text: root.reveal-fingerprint;
-                    color: Pal.muted;
-                }
-                if root.reveal-private-rows.length > 0: Caption {
-                    text: "Make sure no cameras or onlookers — anyone who captures a private key below controls the funds and can read every private note.";
-                    color: Pal.bad;
-                }
-
-                // ---- Public: watch-only, safe to share ----
-                if root.reveal-public-rows.length > 0: Caption {
-                    text: "PUBLIC · watch-only, safe to share";
-                    color: Pal.muted;
-                }
-                for row in root.reveal-public-rows: VerticalLayout {
-                    spacing: 4px;
-                    Caption { text: row.label; }
-                    Rectangle {
-                        border-radius: 10px;
-                        background: Pal.card;
-                        border-width: 1px;
-                        border-color: Pal.line;
-                        height: pv.preferred-height + 24px;
-                        pv := Mono {
-                            x: 12px;
-                            y: 12px;
-                            width: parent.width - 24px;
-                            text: row.value;
-                        }
-                    }
-                    GhostButton { text: "Copy"; clicked => { root.copy-value(row.value); } }
-                }
-
-                // ---- Private: keep secret ----
-                if root.reveal-private-rows.length > 0: Caption {
-                    text: "PRIVATE · keep secret";
-                    color: Pal.bad;
-                }
-                for row in root.reveal-private-rows: VerticalLayout {
-                    spacing: 4px;
-                    Caption { text: row.label; }
-                    Rectangle {
-                        border-radius: 10px;
-                        background: Pal.warn.with-alpha(0.10);
-                        border-width: 1px;
-                        border-color: Pal.warn.with-alpha(0.4);
-                        height: rv.preferred-height + 24px;
-                        rv := Mono {
-                            x: 12px;
-                            y: 12px;
-                            width: parent.width - 24px;
-                            text: row.value;
-                        }
-                    }
-                    GhostButton { text: "Copy"; clicked => { root.copy-value(row.value); } }
-                }
-
-                GhostButton { text: "Hide"; clicked => { root.hide-backup(); } }
+                ? "This is a watch-only identity — only public material (xpub / descriptor) can be revealed here. It can't spend and can't read private notes."
+                : "Export this notebook's keys — to back them up, or move them to another wallet. Private material controls the funds and every private note: protect it like cash.";
+            GhostButton { text: "Public keys — safe to share"; clicked => { root.reveal-public(); } }
+            if !root.watch-only: GhostButton {
+                text: "Private keys  ·  asks for \{root.biometric-name}";
+                clicked => { root.reveal-private(); }
             }
-            if root.reveal-text != "": Caption { text: root.reveal-text; color: Pal.warn; }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
             }
@@ -3447,6 +3415,174 @@ export component AppWindow inherits Window {
                     }
                 }
                 Caption { text: root.status; color: Pal.bad; }
+            }
+        }
+    }
+
+    // ---------- 18 · public keys (watch-only-safe, no re-auth) ----------
+    if screen == 18: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: "Public keys";
+            back => { root.nav-back(); }
+        }
+        Flickable {
+            viewport-height: pub-col.preferred-height;
+            pub-col := VerticalLayout {
+                spacing: 14px;
+                alignment: start;
+                Caption {
+                    text: "Watch-only — safe to share. Anyone with these can see this notebook's balance and public notes, but can never spend the funds or read a private note.";
+                    color: Pal.muted;
+                }
+                if root.reveal-fingerprint != "": Mono {
+                    text: root.reveal-fingerprint;
+                    color: Pal.muted;
+                }
+                if root.reveal-public-hint != "": Caption { text: root.reveal-public-hint; color: Pal.warn; }
+                for row in root.reveal-public-rows: VerticalLayout {
+                    spacing: 6px;
+                    Caption { text: row.label; }
+                    Rectangle {
+                        border-radius: 10px;
+                        background: Pal.card;
+                        border-width: 1px;
+                        border-color: Pal.line;
+                        height: pkv.preferred-height + 24px;
+                        pkv := Mono {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            text: row.value;
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: center;
+                        Image {
+                            source: row.qr;
+                            width: 176px;
+                            height: 176px;
+                            image-rendering: pixelated;
+                        }
+                    }
+                    GhostButton { text: "Copy"; clicked => { root.copy-value(row.value); } }
+                }
+            }
+        }
+    }
+
+    // ---------- 19 · private keys (fresh Touch ID before entry) ----------
+    if screen == 19: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: "Private keys";
+            back => { root.nav-back(); }
+        }
+        Rectangle {
+            border-radius: 10px;
+            background: Pal.bad.with-alpha(0.12);
+            height: priv-warn.preferred-height + 20px;
+            priv-warn := Caption {
+                x: 12px;
+                y: 10px;
+                width: parent.width - 24px;
+                color: Pal.bad;
+                text: "Make sure no cameras or onlookers — anyone who captures a private key below controls the funds and can read every private note.";
+            }
+        }
+        if root.reveal-fingerprint != "": Mono {
+            text: root.reveal-fingerprint;
+            color: Pal.muted;
+        }
+        Flickable {
+            viewport-height: priv-col.preferred-height;
+            priv-col := VerticalLayout {
+                spacing: 14px;
+                alignment: start;
+                HorizontalLayout {
+                    spacing: 6px;
+                    if root.reveal-has-recovery: SelectPill {
+                        text: "Recovery phrase";
+                        active: root.reveal-private-format == "recovery";
+                        clicked => { root.private-select("recovery"); }
+                    }
+                    if root.reveal-has-xprv: SelectPill {
+                        text: "Account xprv";
+                        active: root.reveal-private-format == "xprv";
+                        clicked => { root.private-select("xprv"); }
+                    }
+                    if root.reveal-has-hex: SelectPill {
+                        text: "Notebook hex";
+                        active: root.reveal-private-format == "hex";
+                        clicked => { root.private-select("hex"); }
+                    }
+                    if root.reveal-has-wif: SelectPill {
+                        text: "Notebook WIF";
+                        active: root.reveal-private-format == "wif";
+                        clicked => { root.private-select("wif"); }
+                    }
+                }
+                if root.reveal-private-format == "": Caption {
+                    text: "Tap a format to reveal it. Only one is ever shown at a time.";
+                    color: Pal.muted;
+                }
+
+                // ---- Recovery phrase: word grid + SeedQR toggle ----
+                if root.reveal-private-format == "recovery": VerticalLayout {
+                    spacing: 10px;
+                    if !root.reveal-show-seedqr: HorizontalLayout {
+                        spacing: 16px;
+                        Mono { text: root.reveal-words-col1; horizontal-stretch: 1; }
+                        Mono { text: root.reveal-words-col2; horizontal-stretch: 1; }
+                    }
+                    if root.reveal-show-seedqr: HorizontalLayout {
+                        alignment: center;
+                        Image {
+                            source: root.reveal-seedqr-image;
+                            width: 200px;
+                            height: 200px;
+                            image-rendering: pixelated;
+                        }
+                    }
+                    GhostButton {
+                        text: root.reveal-show-seedqr ? "Show words" : "Show as SeedQR";
+                        clicked => { root.reveal-show-seedqr = !root.reveal-show-seedqr; }
+                    }
+                }
+
+                // ---- xprv / hex / WIF: a single red-tinted value box ----
+                if root.reveal-private-format == "xprv" || root.reveal-private-format == "hex" || root.reveal-private-format == "wif": VerticalLayout {
+                    spacing: 10px;
+                    Rectangle {
+                        border-radius: 10px;
+                        background: Pal.warn.with-alpha(0.10);
+                        border-width: 1px;
+                        border-color: Pal.warn.with-alpha(0.4);
+                        height: pvv.preferred-height + 24px;
+                        pvv := Mono {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            text: root.reveal-private-value;
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: center;
+                        Image {
+                            source: root.reveal-private-qr;
+                            width: 176px;
+                            height: 176px;
+                            image-rendering: pixelated;
+                        }
+                    }
+                }
+
+                if root.reveal-private-format != "": GhostButton {
+                    text: "Copy";
+                    clicked => { root.copy-value(root.reveal-private-value); }
+                }
             }
         }
     }
