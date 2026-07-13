@@ -37,6 +37,10 @@ pub struct ExportFormats {
     pub leaf_hex: Option<Zeroizing<String>>,
     /// This notebook's leaf key as a compressed WIF. Sensitive.
     pub leaf_wif: Option<Zeroizing<String>>,
+    /// Master key fingerprint (BIP-32 xfp, not a secret) — identifies the
+    /// seed/wallet. None for single-key or account-level-xprv imports where
+    /// the master fingerprint isn't known.
+    pub fingerprint: Option<String>,
 }
 
 fn hardened(i: u32) -> ChildNumber {
@@ -91,6 +95,7 @@ pub fn export_formats(
         _ => None,
     };
     if let Some((node, fp)) = account_node {
+        f.fingerprint = fp.clone();
         f.account_xprv = Some(Zeroizing::new(node.to_string()));
         let xpub = Xpub::from_priv(&secp, &node);
         f.account_xpub = Some(xpub.to_string());
