@@ -546,12 +546,18 @@ picker` · `cb: pick-account <n>` · `cb: account-picker open` ·
 `cb: set-network <net>` · `cb: set-chunk-size <n> ok` ·
 `cb: set-node-preset <name|custom>` · `cb: set-node-custom <url|default>` ·
 `cb: set-explorer-preset <name|custom>` · `cb: set-explorer-custom <url|default>` ·
-`cb: reveal-backup ok formats=<n> account=<a> index=<i> | cancelled` (the
-Settings "Backup & export" reveal renders every importable format the
-identity supports — recovery words, account xprv/xpub, tr() descriptor,
-and the active notebook's hex/WIF via `app_core::keyexport::export_formats`;
-values live in UI props only, never logged, wiped on Hide / nav / reset) ·
-`cb: copy-value len=<n>` (a revealed value copied to the clipboard) ·
+`cb: reveal-public ok rows=<n> | no-material | err` (Settings "Dangerous
+area" → screen 18 Public keys: xpub + descriptor derived from the SESSION-
+CACHED material, no fresh biometric — watch-only identities land here too)
+· `cb: reveal-private ok | no-key | cancelled | err` (→ screen 19 Private
+keys: ALWAYS a fresh `keychain::reveal_secret`; only navigates on success,
+hidden entirely for watch-only) · `cb: private-select fmt=<recovery|xprv|
+hex|wif>` (progressive disclosure — only formats this identity supports get
+a pill via `app_core::keyexport::export_formats`, and only ONE value is ever
+on screen; recovery phrase adds a words/SeedQR toggle) · `cb: hide-reveal`
+(back/Done from either screen wipes every revealed prop AND drops the
+cached `ExportFormats`, zeroizing); values are never logged, only counts/
+names · `cb: copy-value len=<n>` (a revealed value copied to the clipboard) ·
 `cb: reset-identity` ·
 `cb: open-note-web url=…` · `cb: toggle-coin selected=<n>` ·
 `cb: refresh-coins` · `cb: act-explorer` · `cb: bump-open`/`act-bump` ·
