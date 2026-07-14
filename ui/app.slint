@@ -994,6 +994,15 @@ export component AppWindow inherits Window {
     // iCloud is available on this device (signed in) so backup CAN work — gates
     // the "Back up to iCloud" toggle; when false we disable it and say so.
     in property <bool> icloud-enabled: false;
+
+    // Info screens (25) — About / Privacy / Help / Q&A share one screen; Rust
+    // sets the title + body. Terms & disclaimer (24) is its own screen: it's the
+    // first-run accept gate (terms-accept-mode = true → shows Accept, no back)
+    // and, from Settings, a read-only re-view (terms-accept-mode = false).
+    in property <string> info-title;
+    in property <string> info-body;
+    in property <string> disclaimer-body;
+    in property <bool> terms-accept-mode;
     // Apple-only UI (iCloud Keychain sync) — hidden on Android, where the
     // keystore is device-bound and there is no iCloud.
     in property <bool> apple-platform: true;
@@ -1185,6 +1194,10 @@ export component AppWindow inherits Window {
     callback set-icloud-backup(bool);
     callback restore-icloud();
     callback refresh();
+    callback refresh-notebooks();   // notebook-list header: rescan every notebook
+    callback accept-terms();        // first-run disclaimer gate → proceed
+    callback open-info(string);     // "about" | "privacy" | "help" | "faq"
+    callback open-disclaimer();     // re-view Terms & disclaimer from Settings
     callback open-note(string);
     callback open-note-web-url(string);
     callback open-note-web();
@@ -1395,6 +1408,14 @@ export component AppWindow inherits Window {
             root.screen = 8;
             return true;
         }
+        // Terms & disclaimer: the first-run accept gate can't be skipped with
+        // back; the read-only re-view returns to Settings.
+        if (root.screen == 24) {
+            if (root.terms-accept-mode) { return false; }
+            root.screen = 8;
+            return true;
+        }
+        if (root.screen == 25) { root.screen = 8; return true; } // info → Settings
         return false; // 0 onboarding / 17 notebook list: nothing to go back to
     }
     // Focus must never be nobody's, or key events (incl. Back) are dropped
@@ -1890,6 +1911,7 @@ export component AppWindow inherits Window {
                 vertical-alignment: center;
             }
             Rectangle { }
+            SvgIconButton { icon: "refresh"; clicked => { root.refresh-notebooks(); } }
             SvgIconButton { icon: "activity"; clicked => { root.open-activity(); } }
             IconButton { glyph: "⚙"; clicked => { root.settings-open(); } }
         }
@@ -2671,6 +2693,15 @@ export component AppWindow inherits Window {
                 text: "Private keys";
                 clicked => { root.reveal-private(); }
             }
+        }
+        SettingsCard {
+            title: "About & help";
+            subtitle: "What Chain Notes is, how it handles your privacy, how to use it, and the terms you accepted.";
+            GhostButton { text: "About"; clicked => { root.open-info("about"); } }
+            GhostButton { text: "Help"; clicked => { root.open-info("help"); } }
+            GhostButton { text: "Q & A"; clicked => { root.open-info("faq"); } }
+            GhostButton { text: "Privacy"; clicked => { root.open-info("privacy"); } }
+            GhostButton { text: "Terms & disclaimer"; clicked => { root.open-disclaimer(); } }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
             }
@@ -3691,6 +3722,53 @@ export component AppWindow inherits Window {
                     text: "Copy";
                     clicked => { root.copy-value(root.reveal-private-value); }
                 }
+            }
+        }
+    }
+
+    // ---------- 24 · terms & disclaimer (first-run accept gate + re-view) ----------
+    if screen == 24: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 14px;
+        // Accept mode has NO back chevron — it must be accepted to proceed.
+        if root.terms-accept-mode: Text {
+            text: "Before you begin";
+            font-size: 19px;
+            font-weight: 700;
+            color: Pal.text;
+        }
+        if !root.terms-accept-mode: Header {
+            title: "Terms & disclaimer";
+            back => { root.nav-back(); }
+        }
+        Flickable {
+            viewport-width: self.width;
+            viewport-height: dsc-body.preferred-height;
+            dsc-body := Body {
+                width: parent.width;
+                text: root.disclaimer-body;
+            }
+        }
+        if root.terms-accept-mode: PrimaryButton {
+            text: "I understand and accept";
+            clicked => { root.accept-terms(); }
+        }
+    }
+
+    // ---------- 25 · info (About / Privacy / Help / Q&A) ----------
+    if screen == 25: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: root.info-title;
+            back => { root.nav-back(); }
+        }
+        Flickable {
+            viewport-width: self.width;
+            viewport-height: info-body-t.preferred-height;
+            info-body-t := Body {
+                width: parent.width;
+                text: root.info-body;
             }
         }
     }

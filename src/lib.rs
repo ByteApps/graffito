@@ -50,6 +50,22 @@ const KEYCHAIN_ACCOUNT: &str = "identity-key";
 /// Minimum (and default) sats sent to a directed-note recipient.
 const DUST_SATS: u64 = app_core::notes_core::DUST_LIMIT;
 
+// ---- About / Help / Privacy / Q&A / disclaimer copy (info screens 24/25) ----
+
+const DISCLAIMER: &str = "Chain Notes is free software provided \"as is\", without warranty of any kind. You alone control your keys and funds. The authors accept no liability for any loss of funds or data — from lost or leaked keys, fees, failed or malformed transactions, or bugs. Bitcoin transactions are irreversible and on-chain data is public and permanent. This is a hot wallet: keep only small, note-fee amounts here and use it at your own risk.";
+
+const ABOUT: &str = concat!(
+    "Chain Notes writes short, encrypted personal notes onto the Bitcoin blockchain, signed by keys that never leave your device. Read them back on any device from your key alone.\n\n",
+    "Version ", env!("CARGO_PKG_VERSION"), "\n\n",
+    "Companion & viewer:\nobjsal.github.io/chain-notes-companion"
+);
+
+const PRIVACY: &str = "Chain Notes collects no personal data, has no accounts, and runs no servers of its own.\n\nYour keys stay in your device's secure keychain — and in iCloud Keychain only if you turn on iCloud backup.\n\nTo read the chain and broadcast, the app talks to the Bitcoin node / block explorer you choose in Settings. That server sees the addresses you look up and your IP address.\n\nNotes you publish are stored on the public Bitcoin blockchain. Private-note contents are encrypted so only you (or a note's intended recipient) can read them, but the fact that a transaction exists, its timing, and its amounts are public and permanent.";
+
+const HELP: &str = "Getting started\n\n1. Create a new key (12/18/24 words) or import one — a BIP-39 phrase, xprv, WIF, or hex — by typing it, scanning a QR, or loading a file. You can also import an account xpub as a watch-only notebook.\n\n2. Fund your notebook's address with a small amount for fees. This is a hot wallet — keep only note-fee amounts here.\n\n3. Write a note, pick a fee, and broadcast. Notes can be private to you or directed to another address.\n\n4. Read your notes back any time — they live on-chain. Recover everything on a new device from your recovery phrase or iCloud backup.\n\nTip: for real savings, keep your bitcoin on a hardware wallet and import it here as watch-only.";
+
+const FAQ: &str = "Q.  What is Chain Notes?\nA.  A way to write short, encrypted personal notes onto the Bitcoin blockchain, signed by keys that stay on your device.\n\nQ.  Is my money safe here?\nA.  This is a hot wallet — its keys live on an online device. Keep only small, note-fee amounts here; hold savings on a hardware wallet and import it as watch-only.\n\nQ.  Can I recover my notes and funds?\nA.  Yes. Re-import your BIP-39 recovery phrase (or restore from iCloud backup) in Chain Notes or any taproot wallet, and your notes and funds come back from the chain.\n\nQ.  Are my private notes really private?\nA.  Their contents are encrypted so only you or the intended recipient can read them. But the transaction itself — that it happened, when, and for how much — is public and permanent.\n\nQ.  Who can see my activity?\nA.  Anyone who has your address or public keys can see this notebook's balance and full transaction history. The block explorer you pick also sees your IP. Share your public keys only with people you trust.";
+
 struct State {
     data_dir: PathBuf,
     network: Network,
@@ -88,6 +104,9 @@ struct State {
     /// synchronizable Keychain item (syncs across the user's Apple devices and
     /// survives reinstall). Reflects the current stored item's sync state.
     icloud_backup: bool,
+    /// First-run disclaimer accepted (config.json "terms_accepted"). When false
+    /// the app opens on the accept gate (screen 24) before anything else.
+    terms_accepted: bool,
     pending_import: Option<Zeroizing<String>>, // hierarchical import awaiting account pick
     pending_mnemonic: Option<String>,
     quiz_indices: Vec<usize>,
@@ -249,6 +268,7 @@ impl State {
                 "nodes": self.node_urls,
                 "explorers": self.explorers,
                 "chunk": self.chunk,
+                "terms_accepted": self.terms_accepted,
             })
             .to_string(),
         );
@@ -2905,6 +2925,10 @@ pub fn run() {
         .unwrap_or(0);
     let chunk: Option<usize> =
         config.get("chunk").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let terms_accepted = config
+        .get("terms_accepted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // Device-level per-network Settings (Bitcoin node / block explorer URLs).
     let str_map = |key: &str| -> HashMap<String, String> {
         config
@@ -2938,6 +2962,7 @@ pub fn run() {
         consolidate_coins: false,
         material: None,
         icloud_backup: false,
+        terms_accepted,
         pending_import: None,
         pending_mnemonic: None,
         quiz_indices: Vec::new(),
@@ -3141,6 +3166,16 @@ pub fn run() {
         window.set_icloud_backup(s.icloud_backup);
         window.set_icloud_available(synced); // restore door: a synced backup exists
         window.set_icloud_enabled(icloud_avail); // iCloud usable for new backups
+    }
+
+    // First-run disclaimer gate: before anything else, a fresh install (or an
+    // upgrade that predates the gate) must accept the terms. The key/notebook
+    // state was already loaded above, so accepting just reveals the screen the
+    // boot would otherwise have shown (list if a key exists, else onboarding).
+    window.set_disclaimer_body(DISCLAIMER.into());
+    if !st.borrow().terms_accepted {
+        window.set_terms_accept_mode(true);
+        window.set_screen(24);
     }
 
     // System back (Android): the ui-side nav-back() already navigated; this
@@ -4883,6 +4918,51 @@ pub fn run() {
         refresh(&w, &mut s); // the active notebook + fees; rebuilds the view
         w.set_status("".into());
         refresh_compose(&w, &mut s);
+    });
+
+    // Notebook-list (main screen) header ↻: rescan every active notebook and
+    // rebuild the list so balances / note counts / unread badges are current.
+    cb!(on_refresh_notebooks, |w, s| {
+        let scanned = refresh_wallet_stores(&s);
+        refresh(&w, &mut s); // active notebook's live store (+ fees/view)
+        update_notebook_list(&w, &s);
+        println!("cb: refresh-notebooks notebooks={}", scanned + 1);
+        w.set_status("".into());
+    });
+
+    // First-run disclaimer accepted → persist + reveal the real first screen.
+    cb!(on_accept_terms, |w, s| {
+        s.terms_accepted = true;
+        s.save_config();
+        let target = if s.material.is_some() { 17 } else { 0 };
+        w.set_terms_accept_mode(false);
+        w.set_screen(target);
+        println!("cb: accept-terms target={target}");
+    });
+
+    // About / Privacy / Help / Q&A — one info screen, content set per button.
+    cb!(on_open_info, |w, s, kind: slint::SharedString| {
+        let _ = &mut s;
+        let (title, body) = match kind.as_str() {
+            "about" => ("About", ABOUT),
+            "privacy" => ("Privacy", PRIVACY),
+            "help" => ("Help", HELP),
+            "faq" => ("Q & A", FAQ),
+            _ => return,
+        };
+        w.set_info_title(title.into());
+        w.set_info_body(body.into());
+        w.set_screen(25);
+        println!("cb: open-info {kind}");
+    });
+
+    // Re-view Terms & disclaimer (read-only) from Settings.
+    cb!(on_open_disclaimer, |w, s| {
+        let _ = &mut s;
+        w.set_disclaimer_body(DISCLAIMER.into());
+        w.set_terms_accept_mode(false);
+        w.set_screen(24);
+        println!("cb: open-disclaimer");
     });
 
     // ---------- external funding (PSBT) ----------
