@@ -17,6 +17,8 @@ targets:
         PRODUCT_NAME: chain-notes-app
         EXECUTABLE_NAME: chain-notes-app
         CODE_SIGN_STYLE: Automatic
+        # Set via env at `xcodegen generate` time (not committed) — see
+        # ../private/chain-notes-app/signing.env for the local value.
         DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
         GENERATE_INFOPLIST_FILE: NO
         # Single-size 1024px icon in Assets.xcassets/AppIcon.appiconset,

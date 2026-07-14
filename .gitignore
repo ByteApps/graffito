@@ -6,3 +6,16 @@
 /build-ios
 *.xcodeproj/
 /Info.plist
+
+# Internal docs kept in the private workspace companion
+# (prime/private/chain-notes-app) — not published in this (public-ready)
+# repo. Copies live there; these are the working-tree originals a local
+# checkout may still have on disk from before the move.
+/CLAUDE.md
+/DEVELOPMENT.md
+/EXTERNAL-FUNDING-STATUS.md
+/SIGNING-NOTARIZATION.md
+/UPSTREAM-ISSUES.md
+
+# Local signing config symlinked from the private companion (real Team ID) — never publish
+/signing.env
