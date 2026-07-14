@@ -1,0 +1,20 @@
+# Defaults for `fastlane deliver` (upload_to_app_store) — METADATA + SCREENSHOTS
+# only. The binary is uploaded separately by scripts/ios-archive-upload.sh
+# (xcodebuild archive/export via the ASC API key), so deliver never touches it.
+# Text lives in fastlane/metadata/**; screenshots in fastlane/screenshots/en-US/.
+
+app_identifier(ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes")
+
+skip_binary_upload(true)      # binary handled by ios-archive-upload.sh
+overwrite_screenshots(true)   # replace the set on every run
+force(true)                   # skip the HTML preview / confirmation prompt
+run_precheck_before_submit(false)
+
+# Export compliance + content-rights answers. Chain Notes ships no proprietary
+# encryption beyond exempt system crypto (ITSAppUsesNonExemptEncryption=false in
+# Info.plist), holds only the user's own keys, and embeds no third-party content.
+submission_information({
+  export_compliance_uses_encryption: false,
+  content_rights_contains_third_party_content: false,
+  add_id_info_uses_idfa: false
+})

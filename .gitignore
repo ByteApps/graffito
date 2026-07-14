@@ -19,3 +19,18 @@
 
 # Local signing config symlinked from the private companion (real Team ID) — never publish
 /signing.env
+
+# App Store Connect signing + config, symlinked from the private companion
+# (prime/private/chain-notes-app/appstore) — certs, ASC key, provisioning
+# profiles, team/app ids. Never publish.
+/appstore
+
+# App Review contact (real name/email/phone) — symlinked from the private
+# appstore/ companion; never publish.
+/fastlane/metadata/review_information
+
+# fastlane run artifacts
+/fastlane/report.xml
+/fastlane/Preview.html
+/fastlane/test_output
+/fastlane/README.md
