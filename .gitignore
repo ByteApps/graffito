@@ -2,5 +2,7 @@
 /target-mobile
 # XcodeGen-generated (source of truth: project.yml)
 /build
+# xcodebuild -derivedDataPath for on-device iOS builds
+/build-ios
 *.xcodeproj/
 /Info.plist
