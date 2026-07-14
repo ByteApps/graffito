@@ -15,7 +15,7 @@ export struct ContactItem { address: string, name: string }
 // One revealed key-export format (Public keys screen — the ONLY reveal
 // surface that shows several rows at once; Private keys is progressive-
 // disclosure, one format at a time, via scalar reveal-private-* props).
-export struct RevealRow { label: string, value: string, qr: image }
+export struct RevealRow { label: string, value: string, qr: image, expanded: bool }
 // A notebook picker row for the hex/WIF single-key reveal (Private keys
 // screen 19 only — Recovery phrase/Account xprv are seed/account-level and
 // don't need one). `addr` is the short address; `name` falls back to the
@@ -1108,7 +1108,7 @@ export component AppWindow inherits Window {
     // with its own QR. `reveal-public-hint` explains an empty list (no
     // cached material, or a derive error) instead of a blank screen.
     in property <bool> reveal-can-public;   // false for single-key (wif/hex) imports — no xpub/descriptor
-    in property <[RevealRow]> reveal-public-rows;
+    in-out property <[RevealRow]> reveal-public-rows;   // in-out: rows toggle their own `expanded`
     in property <string> reveal-public-hint;
     // Private keys (19): ALWAYS behind a fresh biometric (triggered from
     // Settings, before navigating here). Adaptive availability — only
@@ -1268,6 +1268,9 @@ export component AppWindow inherits Window {
     // Internal: a notebook gap-discovery walk finished (seed re-import) —
     // same trampoline pattern as apply-pending-refresh.
     callback apply-pending-discovery();
+    // Create-notebook picker: used/new address probes finished on a worker
+    // thread; fill in the pills without blocking the tap that opened it.
+    callback apply-pending-picker-probe();
     // Where settings/activity return on back: the screen they were opened
     // from (the notebook list or a notebook's home). Set by their open
     // callbacks in Rust.
@@ -2041,7 +2044,13 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 6 · compose ----------
-    if screen == 6: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == 6: Rectangle {
+        // Background tap layer: a tap on any empty area moves focus to
+        // back-scope, which dismisses the on-screen keyboard. Interactive
+        // children (the note editor, pills, buttons) sit on top in the
+        // VerticalLayout and grab their own taps first — Sal 2026-07-13.
+        TouchArea { clicked => { back-scope.focus(); } }
+        VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -2051,6 +2060,16 @@ export component AppWindow inherits Window {
         }
         Flickable {
             viewport-height: compose-col.preferred-height;
+            // Dismiss layer behind the content: the outer Rectangle's TouchArea
+            // can't reach here (the Flickable intercepts its region), so a second
+            // full-viewport TouchArea sits behind compose-col — taps on any gap
+            // between fields dismiss the keyboard; the fields/editor on top grab
+            // their own taps first — Sal 2026-07-13.
+            TouchArea {
+                width: parent.width;
+                height: compose-col.preferred-height;
+                clicked => { back-scope.focus(); }
+            }
             compose-col := VerticalLayout {
                 spacing: 12px;
         Rectangle {
@@ -2070,31 +2089,10 @@ export component AppWindow inherits Window {
                 overflow: elide;
             }
         }
-        HorizontalLayout {
-            spacing: 16px;
-            Text { text: "Note"; font-size: 12px; color: Pal.muted; vertical-alignment: center; }
-            Rectangle { }
-            Text {
-                text: "Paste";
-                font-size: 13px;
-                color: Pal.accent;
-                vertical-alignment: center;
-                // paste-clip inserts at the cursor (replacing any selection)
-                // via the platform clipboard — the old paste-compose Rust
-                // path appended to the end.
-                TouchArea { clicked => { note-edit.paste-clip(); } }
-            }
-            Text {
-                text: "Done";
-                font-size: 13px;
-                color: Pal.accent;
-                vertical-alignment: center;
-                // Focus moves to back-scope rather than to nobody — same
-                // visible effect (field blurs, keyboard hides), but key
-                // events keep a destination (see back-scope).
-                TouchArea { clicked => { back-scope.focus(); } }
-            }
-        }
+        // Just the label. Paste removed (native paste / the edit bubble
+        // covers it) and Done removed (tapping empty space dismisses the
+        // keyboard now) — Sal 2026-07-13.
+        Text { text: "Note"; font-size: 12px; color: Pal.muted; }
         note-edit := EditArea {
             height: 150px;
             text <=> root.compose-text;
@@ -2427,6 +2425,7 @@ export component AppWindow inherits Window {
         }
         Caption { text: root.status; color: Pal.bad; }
             }
+        }
         }
     }
 
@@ -3441,8 +3440,10 @@ export component AppWindow inherits Window {
             back => { root.nav-back(); }
         }
         Flickable {
+            viewport-width: self.width;
             viewport-height: pub-col.preferred-height;
             pub-col := VerticalLayout {
+                width: parent.width;
                 spacing: 14px;
                 alignment: start;
                 Caption {
@@ -3454,32 +3455,67 @@ export component AppWindow inherits Window {
                     color: Pal.muted;
                 }
                 if root.reveal-public-hint != "": Caption { text: root.reveal-public-hint; color: Pal.warn; }
-                for row in root.reveal-public-rows: VerticalLayout {
+                // Collapsed by default — tap a row header to expand its value +
+                // QR; both can be open at once.
+                for row[idx] in root.reveal-public-rows: VerticalLayout {
                     spacing: 6px;
-                    Caption { text: row.label; }
                     Rectangle {
+                        height: 46px;
                         border-radius: 10px;
                         background: Pal.card;
                         border-width: 1px;
                         border-color: Pal.line;
-                        height: pkv.preferred-height + 24px;
-                        pkv := Mono {
-                            x: 12px;
-                            y: 12px;
-                            width: parent.width - 24px;
-                            text: row.value;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            spacing: 8px;
+                            Text {
+                                text: row.label;
+                                color: Pal.text;
+                                font-size: 14px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Image {
+                                source: row.expanded ? @image-url("icons/caret-up.svg") : @image-url("icons/caret-down.svg");
+                                colorize: Pal.muted;
+                                width: 16px;
+                                height: 16px;
+                            }
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.reveal-public-rows[idx].expanded = !root.reveal-public-rows[idx].expanded;
+                            }
                         }
                     }
-                    HorizontalLayout {
-                        alignment: center;
-                        Image {
-                            source: row.qr;
-                            width: 176px;
-                            height: 176px;
-                            image-rendering: pixelated;
+                    if row.expanded: VerticalLayout {
+                        spacing: 6px;
+                        Rectangle {
+                            border-radius: 10px;
+                            background: Pal.card;
+                            border-width: 1px;
+                            border-color: Pal.line;
+                            height: pkv.preferred-height + 24px;
+                            pkv := Mono {
+                                x: 12px;
+                                y: 12px;
+                                width: parent.width - 24px;
+                                text: row.value;
+                            }
                         }
+                        HorizontalLayout {
+                            alignment: center;
+                            Image {
+                                source: row.qr;
+                                width: 176px;
+                                height: 176px;
+                                image-rendering: pixelated;
+                            }
+                        }
+                        GhostButton { text: "Copy"; clicked => { root.copy-value(row.value); } }
                     }
-                    GhostButton { text: "Copy"; clicked => { root.copy-value(row.value); } }
                 }
             }
         }
@@ -3510,29 +3546,31 @@ export component AppWindow inherits Window {
             color: Pal.muted;
         }
         Flickable {
+            viewport-width: self.width;
             viewport-height: priv-col.preferred-height;
             priv-col := VerticalLayout {
+                width: parent.width;
                 spacing: 14px;
                 alignment: start;
                 HorizontalLayout {
                     spacing: 6px;
                     if root.reveal-has-recovery: SelectPill {
-                        text: "Recovery phrase";
+                        text: "Recovery";
                         active: root.reveal-private-format == "recovery";
                         clicked => { root.private-select("recovery"); }
                     }
                     if root.reveal-has-xprv: SelectPill {
-                        text: "Account xprv";
+                        text: "xprv";
                         active: root.reveal-private-format == "xprv";
                         clicked => { root.private-select("xprv"); }
                     }
                     if root.reveal-has-hex: SelectPill {
-                        text: "Notebook hex";
+                        text: "hex";
                         active: root.reveal-private-format == "hex";
                         clicked => { root.private-select("hex"); }
                     }
                     if root.reveal-has-wif: SelectPill {
-                        text: "Notebook WIF";
+                        text: "WIF";
                         active: root.reveal-private-format == "wif";
                         clicked => { root.private-select("wif"); }
                     }

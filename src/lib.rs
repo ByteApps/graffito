@@ -41,7 +41,7 @@ use app_core::store::{NoteStatus, Store, DEFAULT_CHUNK};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use slint::{ComponentHandle, SharedString, VecModel};
+use slint::{ComponentHandle, Model, SharedString, VecModel};
 use zeroize::Zeroizing;
 
 slint::include_modules!();
@@ -1295,32 +1295,51 @@ fn show_notebook_picker(w: &AppWindow, st: &State, page: u32, mode: &str) {
     if st.material.is_none() {
         return;
     }
-    let client = st
-        .base_url()
-        .map(|base| ChainClient::new(HttpTransport::new(base), st.network));
+    // Paint immediately with local data — the "notebook" pill for indexes
+    // already in the index file, plain rows otherwise. The used/new probe
+    // is network, so it runs OFF the main thread below; before this, tapping
+    // "+ New notebook" hung the UI on up to 5 blocking HTTP calls
+    // (Sal 2026-07-13).
     let mut rows = index_rows(st, page);
+    let mut to_probe: Vec<(u32, String)> = Vec::new(); // (receive index, address)
     for row in &mut rows {
         let index = row.index as u32;
         if st.notebooks.as_ref().and_then(|ix| ix.get(st.account, index)).is_some() {
             row.pill = "notebook".into();
-            continue;
-        }
-        if let Some(client) = &client {
-            match client.address_probe(row.address.as_str()) {
-                Ok((used, balance)) => {
-                    row.pill = if used { "used" } else { "new" }.into();
-                    if used {
-                        row.balance = format!("{} sats", commas(balance)).into();
-                    }
-                }
-                Err(_) => {} // no probe → plain row (offline is fine)
-            }
+        } else {
+            to_probe.push((index, row.address.to_string()));
         }
     }
     w.set_account_page(page as i32);
     w.set_accounts(VecModel::from_slice(&rows));
     w.set_account_pick_mode(mode.into());
     w.set_screen(9);
+
+    // Probe used/new on a worker thread; results fill the pills in via the
+    // apply-pending-picker-probe trampoline (offline / no rows → plain rows).
+    let Some(base) = st.base_url() else { return };
+    if to_probe.is_empty() {
+        return;
+    }
+    let network = st.network;
+    let account = st.account;
+    let weak = w.as_weak();
+    std::thread::spawn(move || {
+        let client = ChainClient::new(HttpTransport::new(base), network);
+        let mut results: Vec<(u32, &'static str, String)> = Vec::new();
+        for (index, addr) in &to_probe {
+            if let Ok((used, balance)) = client.address_probe(addr) {
+                let pill = if used { "used" } else { "new" };
+                let bal = if used { format!("{} sats", commas(balance)) } else { String::new() };
+                results.push((*index, pill, bal));
+            }
+        }
+        PICKER_PROBE_RESULTS
+            .lock()
+            .expect("picker probe mutex")
+            .push(PickerProbeResult { account, page, rows: results });
+        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_picker_probe());
+    });
 }
 
 fn show_account_picker(w: &AppWindow, material: &str, network: Network, page: u32, active: Option<u32>) {
@@ -1891,6 +1910,19 @@ struct DiscoveryResult {
 }
 
 static DISCOVERY_RESULTS: std::sync::Mutex<Vec<DiscoveryResult>> = std::sync::Mutex::new(Vec::new());
+
+/// Finished used/new address probes for the create-notebook picker (worker
+/// thread). Applied to the picker rows on the UI thread; the (account, page)
+/// snapshot guards staleness — paging or switching account/screen drops it.
+struct PickerProbeResult {
+    account: u32,
+    page: u32,
+    /// (receive index, pill "used"|"new", balance string) per probed row.
+    rows: Vec<(u32, &'static str, String)>,
+}
+
+static PICKER_PROBE_RESULTS: std::sync::Mutex<Vec<PickerProbeResult>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Kick off receive-chain notebook gap discovery on a worker thread when
 /// activate() flagged a fresh index file (seed re-import; rev-3
@@ -3453,6 +3485,36 @@ pub fn run() {
     // loop; the UI thread applies it with full State access.
     cb!(on_apply_pending_refresh, |w, s| {
         apply_refresh_results(&w, &mut s);
+    });
+
+    // Trampoline: worker-thread used/new probes for the create-notebook
+    // picker landed — fill in the pills/balances without having blocked the
+    // tap. Guarded by account/page/screen so a stale probe (user paged or
+    // left) is dropped.
+    cb!(on_apply_pending_picker_probe, |w, s| {
+        let results: Vec<PickerProbeResult> =
+            PICKER_PROBE_RESULTS.lock().expect("picker probe mutex").drain(..).collect();
+        for r in results {
+            if s.account != r.account
+                || w.get_account_page() != r.page as i32
+                || w.get_screen() != 9
+            {
+                println!("cb: picker-probe stale-drop");
+                continue;
+            }
+            let model = w.get_accounts();
+            for i in 0..model.row_count() {
+                if let Some(mut row) = model.row_data(i) {
+                    if let Some((_, pill, bal)) =
+                        r.rows.iter().find(|(idx, ..)| *idx == row.index as u32)
+                    {
+                        row.pill = (*pill).into();
+                        row.balance = bal.clone().into();
+                        model.set_row_data(i, row);
+                    }
+                }
+            }
+        }
     });
 
     // Trampoline: a finished notebook gap-discovery walk (seed re-import).
@@ -5794,6 +5856,7 @@ pub fn run() {
                         label: "Account xpub".into(),
                         value: v.into(),
                         qr: qr::qr_image(v).unwrap_or_default(),
+                        expanded: false,
                     });
                 }
                 if let Some(v) = f.descriptor.as_deref() {
@@ -5801,6 +5864,7 @@ pub fn run() {
                         label: "Descriptor (tr)".into(),
                         value: v.into(),
                         qr: qr::qr_image(v).unwrap_or_default(),
+                        expanded: false,
                     });
                 }
                 let fp_line = match f.fingerprint.as_deref() {
