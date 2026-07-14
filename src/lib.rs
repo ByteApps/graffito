@@ -1417,9 +1417,16 @@ fn private_nb_rows(st: &State) -> Vec<NbPickRow> {
                 .find(|(a, ..)| *a == m.index)
                 .map(|(_, a, _)| addr_short(a))
                 .unwrap_or_default();
+            // Named notebooks show their name; unnamed ones read "Notebook N"
+            // (not the address again — the addr already sits in its own column).
+            let name = if m.name.trim().is_empty() {
+                format!("Notebook {}", m.index)
+            } else {
+                m.name.clone()
+            };
             NbPickRow {
                 index: m.index as i32,
-                name: st.notebook_display_name(m.index).into(),
+                name: name.into(),
                 addr: addr.into(),
             }
         })
