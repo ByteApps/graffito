@@ -1,0 +1,1 @@
+bitcoin,notes,taproot,encrypt,sign,wallet,onchain,privacy,seed,offline

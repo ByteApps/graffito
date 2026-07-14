@@ -989,7 +989,11 @@ export component AppWindow inherits Window {
 
     // iCloud Keychain backup opt-in (current stored state) + restore-availability.
     in-out property <bool> icloud-backup: false;
+    // A synced backup EXISTS (offer a restore door in onboarding).
     in property <bool> icloud-available: false;
+    // iCloud is available on this device (signed in) so backup CAN work — gates
+    // the "Back up to iCloud" toggle; when false we disable it and say so.
+    in property <bool> icloud-enabled: false;
     // Apple-only UI (iCloud Keychain sync) — hidden on Android, where the
     // keystore is device-bound and there is no iCloud.
     in property <bool> apple-platform: true;
@@ -1479,10 +1483,6 @@ export component AppWindow inherits Window {
             subtitle: "A key you backed up to iCloud Keychain is available — restore it on this device.";
             clicked => { root.restore-icloud(); }
         }
-        Rectangle { height: 6px; }
-        Caption {
-            text: "This app holds a hot key on an online device — fund it with note-fee money only.";
-        }
         Caption { text: root.status; color: Pal.bad; }
     }
 
@@ -1518,10 +1518,14 @@ export component AppWindow inherits Window {
             GhostButton { text: "Scan QR"; clicked => { root.import-scan(); } }
             if root.desktop-platform: GhostButton { text: "From file…"; clicked => { root.import-file(); } }
         }
-        if root.apple-platform: Switch {
+        if root.apple-platform && root.icloud-enabled: Switch {
             text: "Back up to iCloud";
             checked <=> root.icloud-backup;
             toggled => { root.set-icloud-backup(root.icloud-backup); }
+        }
+        if root.apple-platform && !root.icloud-enabled: Caption {
+            text: "iCloud backup is off — sign into iCloud (with iCloud Keychain) to back up this key automatically.";
+            color: Pal.warn;
         }
         PrimaryButton { text: "Import"; clicked => { root.import-confirm(root.import-text); } }
     }
@@ -1545,7 +1549,7 @@ export component AppWindow inherits Window {
                 y: 10px;
                 width: parent.width - 24px;
                 color: Pal.warn;
-                text: "This is the ONLY backup. Anyone with these words can spend the funds and read every private note. No screenshots — paper.";
+                text: "Anyone with these words can spend your funds and read every private note. Write them on paper — never a screenshot.";
             }
         }
         Card {
@@ -1562,6 +1566,10 @@ export component AppWindow inherits Window {
                 y: parent.height - self.height - 8px;
                 clicked => { root.copy-text("backup-words", root.backup-words); }
             }
+        }
+        Caption {
+            color: Pal.muted;
+            text: "Generated on this online device, so treat it as a hot wallet — keep only note-fee amounts here. For real savings, use a hardware wallet and import it as watch-only. You can also view these words again later in Settings.";
         }
         // Advanced (collapsible, styled like the compose panels so it clearly
         // reads as tappable): optional user-supplied entropy ("salt").
@@ -1614,14 +1622,18 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        if root.apple-platform: Switch {
+        if root.apple-platform && root.icloud-enabled: Switch {
             text: "Back up to iCloud";
             checked <=> root.icloud-backup;
             toggled => { root.set-icloud-backup(root.icloud-backup); }
         }
-        if root.apple-platform: Caption {
+        if root.apple-platform && root.icloud-enabled: Caption {
             text: "Syncs your key to your Apple devices and lets you restore after reinstall. Change anytime in Settings.";
             color: Pal.muted;
+        }
+        if root.apple-platform && !root.icloud-enabled: Caption {
+            text: "iCloud backup is off — you're not signed into iCloud. Turn on iCloud (with iCloud Keychain) in system Settings to back up your key automatically.";
+            color: Pal.warn;
         }
         PrimaryButton { text: "I wrote them down"; clicked => { root.backup-continue(); } }
     }
@@ -2548,10 +2560,14 @@ export component AppWindow inherits Window {
         if root.apple-platform: SettingsCard {
             title: "iCloud backup";
             subtitle: "Sync your key to iCloud Keychain — it's restored automatically after a reinstall or on your other Apple devices. Reveal still needs Face ID.";
-            Switch {
+            if root.icloud-enabled: Switch {
                 text: "Back up to iCloud";
                 checked <=> root.icloud-backup;
                 toggled => { root.set-icloud-backup(root.icloud-backup); }
+            }
+            if !root.icloud-enabled: Caption {
+                text: "iCloud is off on this device — sign into iCloud with iCloud Keychain to enable backup.";
+                color: Pal.warn;
             }
         }
         SettingsCard {

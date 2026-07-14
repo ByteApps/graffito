@@ -3119,14 +3119,20 @@ pub fn run() {
         }
     }
 
-    // Reflect the stored key's iCloud-sync state, and whether a synced backup
-    // exists to offer a restore in onboarding.
+    // iCloud state: (a) whether iCloud is available at all (gates the "Back up
+    // to iCloud" affordance + its default-on), (b) whether a synced backup
+    // already exists (offers a restore door in onboarding). For an EXISTING
+    // stored key the toggle reflects that key's real sync state; for a fresh
+    // install it defaults ON when iCloud is available.
     {
         let mut s = st.borrow_mut();
         let synced = keychain::is_synced(KEYCHAIN_ACCOUNT);
-        s.icloud_backup = synced;
-        window.set_icloud_backup(synced);
-        window.set_icloud_available(synced);
+        let icloud_avail = keychain::icloud_available();
+        let has_key = s.material.is_some();
+        s.icloud_backup = if has_key { synced } else { icloud_avail };
+        window.set_icloud_backup(s.icloud_backup);
+        window.set_icloud_available(synced); // restore door: a synced backup exists
+        window.set_icloud_enabled(icloud_avail); // iCloud usable for new backups
     }
 
     // System back (Android): the ui-side nav-back() already navigated; this
@@ -3151,8 +3157,13 @@ pub fn run() {
 
     cb!(on_door_import, |w, s| {
         println!("cb: door=import");
-        let _ = &mut s;
         w.set_import_feedback("".into());
+        // Default the iCloud backup ON for the imported key when iCloud is
+        // available (parity with create; the toggle stays user-overridable).
+        let avail = keychain::icloud_available();
+        s.icloud_backup = avail;
+        w.set_icloud_backup(avail);
+        w.set_icloud_enabled(avail);
         w.set_screen(1);
     });
 
@@ -3175,6 +3186,12 @@ pub fn run() {
                 }
                 w.set_backup_words(grid.into());
                 s.pending_mnemonic = Some(phrase);
+                // New key on an online device → default the iCloud backup ON
+                // when iCloud is available (the user can still turn it off).
+                let avail = keychain::icloud_available();
+                s.icloud_backup = avail;
+                w.set_icloud_backup(avail);
+                w.set_icloud_enabled(avail);
                 w.set_screen(2);
             }
             Err(e) => w.set_status(format!("{e}").into()),
