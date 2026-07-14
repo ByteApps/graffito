@@ -43,4 +43,4 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # Fixture generator for the flagship import path: the parity tests feed
 # REAL prime-bip85 outputs (mnemonic/WIF/XPRV/hex + SeedQR digits)
 # through our importer — no hand-copied vectors.
-bip85-core = { git = "ssh://git@github.com/ObjSal/prime-bip85.git", rev = "70557655b68354a00b96a6afd36ad0251865a8ae" }
+bip85-core = { git = "ssh://git@github.com/ObjSal/prime-bip85.git", rev = "dbc446534e67314d40c06c3261812fccede3ec29" }
