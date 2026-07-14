@@ -104,10 +104,17 @@ icon = "@mipmap/ic_launcher"
 theme = "@android:style/Theme.DeviceDefault.NoActionBar"
 
 # Dev/emulator release signing uses the standard Android debug keystore
-# (a real Play release would swap in a private upload key).
-[package.metadata.android.signing.release]
-path = "/Users/user/.android/debug.keystore"
-keystore_password = "android"
+# (a real Play release would swap in a private upload key). cargo-apk
+# does not expand `$HOME`/`~` in a manifest `path` (confirmed from its
+# source — the TOML value is used as a literal PathBuf), so rather than
+# hardcode a per-machine home directory here, this block is omitted and
+# cargo-apk's own env-var override is used instead: it checks
+# `CARGO_APK_RELEASE_KEYSTORE(_PASSWORD)` before falling back to this
+# manifest section, and (for the plain, non-`--release` dev profile)
+# auto-locates/creates the debug keystore on its own with no config at
+# all. Set the two env vars locally — see
+# ../private/chain-notes-app/signing.env — before `cargo apk build
+# --release`; plain `cargo apk build` needs nothing.
 
 # Chain sync + broadcast (esplora/mempool.space over HTTPS). cargo-apk
 # does NOT add INTERNET automatically for NativeActivity apps.
