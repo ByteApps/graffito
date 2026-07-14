@@ -16,6 +16,11 @@ export struct ContactItem { address: string, name: string }
 // surface that shows several rows at once; Private keys is progressive-
 // disclosure, one format at a time, via scalar reveal-private-* props).
 export struct RevealRow { label: string, value: string, qr: image }
+// A notebook picker row for the hex/WIF single-key reveal (Private keys
+// screen 19 only — Recovery phrase/Account xprv are seed/account-level and
+// don't need one). `addr` is the short address; `name` falls back to the
+// same short address when the notebook is unnamed.
+export struct NbPickRow { index: int, name: string, addr: string }
 // `pill`/`balance` are set only by the notebook-create picker ("new" /
 // "used" / "notebook" + a sats line); the import/switch picker leaves them
 // empty and the row renders as before.
@@ -1121,6 +1126,12 @@ export component AppWindow inherits Window {
     in property <string> reveal-words-col2;       // recovery phrase, second half
     in-out property <bool> reveal-show-seedqr;    // recovery: words vs SeedQR toggle
     in property <image> reveal-seedqr-image;
+    // Notebook picker for the hex/WIF single-key views only (Recovery
+    // phrase/Account xprv are index-independent — no picker). Populated
+    // whenever Private keys is (re)opened; default selection = the active
+    // notebook. Picking re-derives hex/WIF for THAT notebook, no re-auth.
+    in property <[NbPickRow]> reveal-nb-rows;
+    in-out property <int> reveal-nb-index;
     in property <[CoinItem]> coins;
     in property <string> coins-summary;
     in property <[ActivityItem]> activity;
@@ -1247,6 +1258,7 @@ export component AppWindow inherits Window {
     callback reveal-public();          // Settings entry: derive from cached material, no auth, -> screen 18
     callback reveal-private();         // Settings entry: FRESH biometric, only navigates (-> screen 19) on success
     callback private-select(string);   // pick which single format is shown: recovery | xprv | hex | wif
+    callback private-pick-notebook(int);  // hex/WIF only: re-derive for a different notebook, no re-auth
     callback reveal-hide();            // back/Done from 18 or 19: wipes every revealed value
     callback copy-value(string);       // copy a revealed format to the clipboard
     callback go-home();
@@ -3528,6 +3540,47 @@ export component AppWindow inherits Window {
                 if root.reveal-private-format == "": Caption {
                     text: "Tap a format to reveal it. Only one is ever shown at a time.";
                     color: Pal.muted;
+                }
+
+                // ---- Notebook picker: hex/WIF only (seed/account-level
+                // formats don't vary per notebook) ----
+                if root.reveal-private-format == "hex" || root.reveal-private-format == "wif": VerticalLayout {
+                    spacing: 6px;
+                    Caption { text: "Notebook:"; color: Pal.muted; }
+                    for nb in root.reveal-nb-rows: Rectangle {
+                        height: 44px;
+                        nbp-ta := TouchArea { clicked => { root.private-pick-notebook(nb.index); } }
+                        Rectangle {
+                            border-radius: 10px;
+                            background: nb.index == root.reveal-nb-index
+                                ? Pal.accent.with-alpha(0.18)
+                                : (nbp-ta.has-hover ? Pal.card-hover : Pal.card);
+                            border-width: 1px;
+                            border-color: nb.index == root.reveal-nb-index ? Pal.accent.with-alpha(0.55) : Pal.line;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 8px;
+                                Text {
+                                    text: nb.name;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: Pal.text;
+                                    overflow: elide;
+                                    horizontal-stretch: 2;
+                                    vertical-alignment: center;
+                                }
+                                Mono {
+                                    text: nb.addr;
+                                    color: Pal.muted;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    wrap: no-wrap;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // ---- Recovery phrase: word grid + SeedQR toggle ----
