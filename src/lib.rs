@@ -2884,7 +2884,15 @@ pub fn run() {
         .ok()
         .or_else(|| config.get("network").and_then(|v| v.as_str()).map(String::from))
         .and_then(|s| Network::from_str_opt(&s))
-        .unwrap_or(Network::Testnet4);
+        // First-run default only (APP_NETWORK env + a saved config.json network
+        // both win above): release builds — the ones shipped to iOS / Mac /
+        // Android — start a fresh install on MAINNET; dev/debug builds start on
+        // testnet4 for safe testing.
+        .unwrap_or(if cfg!(debug_assertions) {
+            Network::Testnet4
+        } else {
+            Network::Mainnet
+        });
     let account: u32 = std::env::var("APP_ACCOUNT")
         .ok()
         .and_then(|a| a.parse().ok())

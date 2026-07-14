@@ -2666,9 +2666,9 @@ export component AppWindow inherits Window {
             subtitle: root.watch-only
                 ? "This is a watch-only identity — only public material (xpub / descriptor) can be revealed here. It can't spend and can't read private notes."
                 : "Export this notebook's keys — to back them up, or move them to another wallet. Private material controls the funds and every private note: protect it like cash.";
-            if root.reveal-can-public: GhostButton { text: "Public keys — safe to share"; clicked => { root.reveal-public(); } }
+            if root.reveal-can-public: GhostButton { text: "Public keys"; clicked => { root.reveal-public(); } }
             if !root.watch-only: GhostButton {
-                text: "Private keys  ·  asks for \{root.biometric-name}";
+                text: "Private keys";
                 clicked => { root.reveal-private(); }
             }
         }
@@ -3463,8 +3463,8 @@ export component AppWindow inherits Window {
                 spacing: 14px;
                 alignment: start;
                 Caption {
-                    text: "Watch-only — safe to share. Anyone with these can see this notebook's balance and public notes, but can never spend the funds or read a private note.";
-                    color: Pal.muted;
+                    text: "Watch-only — these can't spend your funds or read a private note. But an xpub or descriptor reveals every address in this notebook, so anyone you share it with can see its full balance and transaction history and track your activity. Share only with people you trust.";
+                    color: Pal.warn;
                 }
                 if root.reveal-fingerprint != "": Mono {
                     text: root.reveal-fingerprint;
@@ -3571,7 +3571,7 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 6px;
                     if root.reveal-has-recovery: SelectPill {
-                        text: "Recovery";
+                        text: "BIP-39";
                         active: root.reveal-private-format == "recovery";
                         clicked => { root.private-select("recovery"); }
                     }
