@@ -1395,7 +1395,57 @@ fn clear_reveal(w: &AppWindow, s: &mut State) {
     w.set_reveal_words_col2("".into());
     w.set_reveal_show_seedqr(false);
     w.set_reveal_seedqr_image(slint::Image::default());
+    w.set_reveal_nb_rows(VecModel::from_slice(&Vec::<NbPickRow>::new()));
+    w.set_reveal_nb_index(0);
     s.reveal_formats = None;
+}
+
+/// The active account's notebook picker rows for the Private-keys hex/WIF
+/// views (archived notebooks excluded — matches the notebook list). `name`
+/// falls back to the short address when unnamed (`notebook_display_name`),
+/// `addr` is always the short address so an unnamed row isn't just a
+/// duplicate string.
+fn private_nb_rows(st: &State) -> Vec<NbPickRow> {
+    let Some(ix) = &st.notebooks else { return Vec::new() };
+    ix.books(st.account)
+        .iter()
+        .filter(|m| !m.archived)
+        .map(|m| {
+            let addr = st
+                .nb_addrs
+                .iter()
+                .find(|(a, ..)| *a == m.index)
+                .map(|(_, a, _)| addr_short(a))
+                .unwrap_or_default();
+            // Named notebooks show their name; unnamed ones read "Notebook N"
+            // (not the address again — the addr already sits in its own column).
+            let name = if m.name.trim().is_empty() {
+                format!("Notebook {}", m.index)
+            } else {
+                m.name.clone()
+            };
+            NbPickRow {
+                index: m.index as i32,
+                name: name.into(),
+                addr: addr.into(),
+            }
+        })
+        .collect()
+}
+
+/// Derive the CURRENTLY-selected picker notebook's hex/WIF leaf key from
+/// the session-cached material (no re-auth) — shared by `private-select`
+/// (switching format pills) and `private-pick-notebook` (switching
+/// notebooks), so whichever changes last always shows the right value.
+fn derive_leaf_value(s: &State, w: &AppWindow, which: &str) -> Option<String> {
+    let material = s.material.as_ref().map(|z| String::from(z.as_str()))?;
+    let index = w.get_reveal_nb_index() as u32;
+    let f = app_core::keyexport::export_formats(&material, s.network, s.account, index).ok()?;
+    match which {
+        "hex" => f.leaf_hex.as_ref().map(|z| z.as_str().to_string()),
+        "wif" => f.leaf_wif.as_ref().map(|z| z.as_str().to_string()),
+        _ => None,
+    }
 }
 
 fn go_home_or_list(w: &AppWindow, st: &State) {
@@ -5809,6 +5859,11 @@ pub fn run() {
                         w.set_reveal_words_col2("".into());
                         w.set_reveal_show_seedqr(false);
                         w.set_reveal_seedqr_image(slint::Image::default());
+                        // Hex/WIF picker: the active account's notebooks,
+                        // defaulting to the active notebook. Hidden in the UI
+                        // for recovery/xprv, but harmless to populate always.
+                        w.set_reveal_nb_rows(VecModel::from_slice(&private_nb_rows(&s)));
+                        w.set_reveal_nb_index(s.nb_index as i32);
                         println!("cb: reveal-private ok");
                         s.reveal_formats = Some(f);
                         w.set_status("".into());
@@ -5837,9 +5892,21 @@ pub fn run() {
 
     // Switch which single format is on screen (progressive disclosure —
     // only one value visible at a time). Reads the formats derived at
-    // reveal-private time; never re-authenticates.
+    // reveal-private time; never re-authenticates. Hex/WIF derive from
+    // whichever notebook the picker currently has selected (not always
+    // the active notebook) so switching back to a pill after picking a
+    // different notebook shows the right value.
     cb!(on_private_select, |w, s, fmt: SharedString| {
         let fmt = fmt.as_str();
+        if fmt == "hex" || fmt == "wif" {
+            let Some(v) = derive_leaf_value(&s, &w, fmt) else { return };
+            w.set_reveal_show_seedqr(false);
+            w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
+            w.set_reveal_private_value(v.into());
+            w.set_reveal_private_format(fmt.into());
+            println!("cb: private-select fmt={fmt}");
+            return;
+        }
         let Some(f) = s.reveal_formats.as_ref() else { return };
         w.set_reveal_show_seedqr(false);
         match fmt {
@@ -5871,24 +5938,27 @@ pub fn run() {
                 w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
                 w.set_reveal_private_value(v.into());
             }
-            "hex" => {
-                let Some(v) = f.leaf_hex.as_ref().map(|z| z.as_str().to_string()) else {
-                    return;
-                };
-                w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
-                w.set_reveal_private_value(v.into());
-            }
-            "wif" => {
-                let Some(v) = f.leaf_wif.as_ref().map(|z| z.as_str().to_string()) else {
-                    return;
-                };
-                w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
-                w.set_reveal_private_value(v.into());
-            }
+            // hex/wif are handled above (picker-aware, returns early).
             _ => return,
         }
         w.set_reveal_private_format(fmt.into());
         println!("cb: private-select fmt={fmt}");
+    });
+
+    // Hex/WIF only: switch the picker's selected notebook and re-derive
+    // its leaf key from the session-cached material — NO re-auth. A no-op
+    // for recovery/xprv (the picker is hidden for those, and the shown
+    // format is index-independent anyway).
+    cb!(on_private_pick_notebook, |w, s, index: i32| {
+        w.set_reveal_nb_index(index);
+        println!("cb: private-pick-notebook index={index}");
+        let fmt = w.get_reveal_private_format().to_string();
+        if fmt != "hex" && fmt != "wif" {
+            return;
+        }
+        let Some(v) = derive_leaf_value(&s, &w, &fmt) else { return };
+        w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
+        w.set_reveal_private_value(v.into());
     });
 
     cb!(on_copy_value, |w, s, value: SharedString| {
