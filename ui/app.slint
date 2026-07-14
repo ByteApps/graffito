@@ -1473,7 +1473,7 @@ export component AppWindow inherits Window {
         }
         H1 { text: "Chain Notes"; horizontal-alignment: center; }
         Caption {
-            text: "Personal notes on the bitcoin blockchain — encrypted, permanent, yours.";
+            text: "Personal notes on the bitcoin blockchain — permanent, and yours.";
             horizontal-alignment: center;
         }
         Rectangle { height: 12px; }
@@ -3727,28 +3727,34 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 24 · terms & disclaimer (first-run accept gate + re-view) ----------
-    if screen == 24: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
-        padding: 20px;
-        spacing: 14px;
+    if screen == 24: VerticalLayout { padding-top: root.safe-top + 20px; padding-bottom: root.safe-bottom + 10px;
+        padding: 24px;
+        spacing: 16px;
+        // View mode (opened from Settings) gets a normal header + back chevron.
         // Accept mode has NO back chevron — it must be accepted to proceed.
-        if root.terms-accept-mode: Text {
-            text: "Before you begin";
-            font-size: 19px;
-            font-weight: 700;
-            color: Pal.text;
-        }
         if !root.terms-accept-mode: Header {
             title: "Terms & disclaimer";
             back => { root.nav-back(); }
         }
-        Flickable {
-            viewport-width: self.width;
-            viewport-height: dsc-body.preferred-height;
-            dsc-body := Body {
-                width: parent.width;
-                text: root.disclaimer-body;
+        Rectangle { }  // stretch — vertically centers the block on tall screens
+        if root.terms-accept-mode: HorizontalLayout {
+            alignment: center;
+            Image {
+                source: @image-url("icons/bitcoin.svg");
+                colorize: Pal.accent;
+                width: 42px;
+                height: 42px;
             }
         }
+        if root.terms-accept-mode: H1 {
+            text: "Before you begin";
+            horizontal-alignment: center;
+        }
+        Body {
+            text: root.disclaimer-body;
+            font-size: 15px;
+        }
+        Rectangle { }  // stretch
         if root.terms-accept-mode: PrimaryButton {
             text: "I understand and accept";
             clicked => { root.accept-terms(); }
@@ -3769,6 +3775,7 @@ export component AppWindow inherits Window {
             info-body-t := Body {
                 width: parent.width;
                 text: root.info-body;
+                font-size: 15px;
             }
         }
     }
