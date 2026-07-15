@@ -989,7 +989,23 @@ export component AppWindow inherits Window {
 
     // iCloud Keychain backup opt-in (current stored state) + restore-availability.
     in-out property <bool> icloud-backup: false;
+    // A synced backup EXISTS (offer a restore door in onboarding).
     in property <bool> icloud-available: false;
+    // iCloud is available on this device (signed in) so backup CAN work — gates
+    // the "Back up to iCloud" toggle; when false we disable it and say so.
+    in property <bool> icloud-enabled: false;
+
+    // Info screens (25) — About / Privacy / Help / Q&A share one screen; Rust
+    // sets the title + body. Terms & disclaimer (24) is its own screen: it's the
+    // first-run accept gate (terms-accept-mode = true → shows Accept, no back)
+    // and, from Settings, a read-only re-view (terms-accept-mode = false).
+    in property <string> info-title;
+    in property <string> info-body;
+    in property <string> disclaimer-body;
+    in property <bool> terms-accept-mode;
+    // Settings scroll position, preserved across sub-screen visits (Rust resets
+    // it to 0 on a fresh open from the list; nav-back keeps it).
+    in-out property <length> settings-scroll-y: 0;
     // Apple-only UI (iCloud Keychain sync) — hidden on Android, where the
     // keystore is device-bound and there is no iCloud.
     in property <bool> apple-platform: true;
@@ -1181,6 +1197,9 @@ export component AppWindow inherits Window {
     callback set-icloud-backup(bool);
     callback restore-icloud();
     callback refresh();
+    callback refresh-notebooks();   // notebook-list header: rescan every notebook
+    callback accept-terms();        // first-run disclaimer gate → proceed
+    callback open-info(string);     // "about" | "privacy" | "help" | "faq" | "terms"
     callback open-note(string);
     callback open-note-web-url(string);
     callback open-note-web();
@@ -1391,6 +1410,14 @@ export component AppWindow inherits Window {
             root.screen = 8;
             return true;
         }
+        // Terms & disclaimer: the first-run accept gate can't be skipped with
+        // back; the read-only re-view returns to Settings.
+        if (root.screen == 24) {
+            if (root.terms-accept-mode) { return false; }
+            root.screen = 8;
+            return true;
+        }
+        if (root.screen == 25) { root.screen = 8; return true; } // info → Settings
         return false; // 0 onboarding / 17 notebook list: nothing to go back to
     }
     // Focus must never be nobody's, or key events (incl. Back) are dropped
@@ -1448,7 +1475,7 @@ export component AppWindow inherits Window {
         }
         H1 { text: "Chain Notes"; horizontal-alignment: center; }
         Caption {
-            text: "Personal notes on the bitcoin blockchain — encrypted, permanent, yours.";
+            text: "Personal notes on the bitcoin blockchain — permanent, and yours.";
             horizontal-alignment: center;
         }
         Rectangle { height: 12px; }
@@ -1478,10 +1505,6 @@ export component AppWindow inherits Window {
             title: "Restore from iCloud";
             subtitle: "A key you backed up to iCloud Keychain is available — restore it on this device.";
             clicked => { root.restore-icloud(); }
-        }
-        Rectangle { height: 6px; }
-        Caption {
-            text: "This app holds a hot key on an online device — fund it with note-fee money only.";
         }
         Caption { text: root.status; color: Pal.bad; }
     }
@@ -1518,10 +1541,14 @@ export component AppWindow inherits Window {
             GhostButton { text: "Scan QR"; clicked => { root.import-scan(); } }
             if root.desktop-platform: GhostButton { text: "From file…"; clicked => { root.import-file(); } }
         }
-        if root.apple-platform: Switch {
+        if root.apple-platform && root.icloud-enabled: Switch {
             text: "Back up to iCloud";
             checked <=> root.icloud-backup;
             toggled => { root.set-icloud-backup(root.icloud-backup); }
+        }
+        if root.apple-platform && !root.icloud-enabled: Caption {
+            text: "iCloud backup is off — sign into iCloud (with iCloud Keychain) to back up this key automatically.";
+            color: Pal.warn;
         }
         PrimaryButton { text: "Import"; clicked => { root.import-confirm(root.import-text); } }
     }
@@ -1545,7 +1572,7 @@ export component AppWindow inherits Window {
                 y: 10px;
                 width: parent.width - 24px;
                 color: Pal.warn;
-                text: "This is the ONLY backup. Anyone with these words can spend the funds and read every private note. No screenshots — paper.";
+                text: "Anyone with these words can spend your funds and read every private note. Write them on paper — never a screenshot.";
             }
         }
         Card {
@@ -1562,6 +1589,10 @@ export component AppWindow inherits Window {
                 y: parent.height - self.height - 8px;
                 clicked => { root.copy-text("backup-words", root.backup-words); }
             }
+        }
+        Caption {
+            color: Pal.muted;
+            text: "Generated on this online device, so treat it as a hot wallet — keep only note-fee amounts here. For real savings, use a hardware wallet and import it as watch-only. You can also view these words again later in Settings.";
         }
         // Advanced (collapsible, styled like the compose panels so it clearly
         // reads as tappable): optional user-supplied entropy ("salt").
@@ -1614,14 +1645,18 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        if root.apple-platform: Switch {
+        if root.apple-platform && root.icloud-enabled: Switch {
             text: "Back up to iCloud";
             checked <=> root.icloud-backup;
             toggled => { root.set-icloud-backup(root.icloud-backup); }
         }
-        if root.apple-platform: Caption {
+        if root.apple-platform && root.icloud-enabled: Caption {
             text: "Syncs your key to your Apple devices and lets you restore after reinstall. Change anytime in Settings.";
             color: Pal.muted;
+        }
+        if root.apple-platform && !root.icloud-enabled: Caption {
+            text: "iCloud backup is off — you're not signed into iCloud. Turn on iCloud (with iCloud Keychain) in system Settings to back up your key automatically.";
+            color: Pal.warn;
         }
         PrimaryButton { text: "I wrote them down"; clicked => { root.backup-continue(); } }
     }
@@ -1878,6 +1913,7 @@ export component AppWindow inherits Window {
                 vertical-alignment: center;
             }
             Rectangle { }
+            SvgIconButton { icon: "refresh"; clicked => { root.refresh-notebooks(); } }
             SvgIconButton { icon: "activity"; clicked => { root.open-activity(); } }
             IconButton { glyph: "⚙"; clicked => { root.settings-open(); } }
         }
@@ -2528,6 +2564,7 @@ export component AppWindow inherits Window {
         }
         Flickable {
             viewport-height: settings-col.preferred-height;
+            viewport-y <=> root.settings-scroll-y;
             settings-col := VerticalLayout {
                 spacing: 12px;
                 alignment: start;
@@ -2548,10 +2585,14 @@ export component AppWindow inherits Window {
         if root.apple-platform: SettingsCard {
             title: "iCloud backup";
             subtitle: "Sync your key to iCloud Keychain — it's restored automatically after a reinstall or on your other Apple devices. Reveal still needs Face ID.";
-            Switch {
+            if root.icloud-enabled: Switch {
                 text: "Back up to iCloud";
                 checked <=> root.icloud-backup;
                 toggled => { root.set-icloud-backup(root.icloud-backup); }
+            }
+            if !root.icloud-enabled: Caption {
+                text: "iCloud is off on this device — sign into iCloud with iCloud Keychain to enable backup.";
+                color: Pal.warn;
             }
         }
         SettingsCard {
@@ -2650,11 +2691,20 @@ export component AppWindow inherits Window {
             subtitle: root.watch-only
                 ? "This is a watch-only identity — only public material (xpub / descriptor) can be revealed here. It can't spend and can't read private notes."
                 : "Export this notebook's keys — to back them up, or move them to another wallet. Private material controls the funds and every private note: protect it like cash.";
-            if root.reveal-can-public: GhostButton { text: "Public keys — safe to share"; clicked => { root.reveal-public(); } }
+            if root.reveal-can-public: GhostButton { text: "Public keys"; clicked => { root.reveal-public(); } }
             if !root.watch-only: GhostButton {
-                text: "Private keys  ·  asks for \{root.biometric-name}";
+                text: "Private keys";
                 clicked => { root.reveal-private(); }
             }
+        }
+        SettingsCard {
+            title: "About & help";
+            subtitle: "What Chain Notes is, how it handles your privacy, how to use it, and the terms you accepted.";
+            GhostButton { text: "About"; clicked => { root.open-info("about"); } }
+            GhostButton { text: "Help"; clicked => { root.open-info("help"); } }
+            GhostButton { text: "Q & A"; clicked => { root.open-info("faq"); } }
+            GhostButton { text: "Privacy"; clicked => { root.open-info("privacy"); } }
+            GhostButton { text: "Terms & disclaimer"; clicked => { root.open-info("terms"); } }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
             }
@@ -3447,8 +3497,8 @@ export component AppWindow inherits Window {
                 spacing: 14px;
                 alignment: start;
                 Caption {
-                    text: "Watch-only — safe to share. Anyone with these can see this notebook's balance and public notes, but can never spend the funds or read a private note.";
-                    color: Pal.muted;
+                    text: "Watch-only — these can't spend your funds or read a private note. But an xpub or descriptor reveals every address in this notebook, so anyone you share it with can see its full balance and transaction history and track your activity. Share only with people you trust.";
+                    color: Pal.warn;
                 }
                 if root.reveal-fingerprint != "": Mono {
                     text: root.reveal-fingerprint;
@@ -3555,7 +3605,7 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 6px;
                     if root.reveal-has-recovery: SelectPill {
-                        text: "Recovery";
+                        text: "BIP-39";
                         active: root.reveal-private-format == "recovery";
                         clicked => { root.private-select("recovery"); }
                     }
@@ -3675,6 +3725,60 @@ export component AppWindow inherits Window {
                     text: "Copy";
                     clicked => { root.copy-value(root.reveal-private-value); }
                 }
+            }
+        }
+    }
+
+    // ---------- 24 · terms & disclaimer (first-run accept gate + re-view) ----------
+    if screen == 24: VerticalLayout { padding-top: root.safe-top + 20px; padding-bottom: root.safe-bottom + 10px;
+        padding: 24px;
+        spacing: 16px;
+        // View mode (opened from Settings) gets a normal header + back chevron.
+        // Accept mode has NO back chevron — it must be accepted to proceed.
+        if !root.terms-accept-mode: Header {
+            title: "Terms & disclaimer";
+            back => { root.nav-back(); }
+        }
+        Rectangle { }  // stretch — vertically centers the block on tall screens
+        if root.terms-accept-mode: HorizontalLayout {
+            alignment: center;
+            Image {
+                source: @image-url("icons/bitcoin.svg");
+                colorize: Pal.accent;
+                width: 42px;
+                height: 42px;
+            }
+        }
+        if root.terms-accept-mode: H1 {
+            text: "Before you begin";
+            horizontal-alignment: center;
+        }
+        Body {
+            text: root.disclaimer-body;
+            font-size: 17px;
+        }
+        Rectangle { }  // stretch
+        if root.terms-accept-mode: PrimaryButton {
+            text: "I understand and accept";
+            clicked => { root.accept-terms(); }
+        }
+    }
+
+    // ---------- 25 · info (About / Privacy / Help / Q&A) ----------
+    if screen == 25: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: root.info-title;
+            back => { root.nav-back(); }
+        }
+        Flickable {
+            viewport-width: self.width;
+            viewport-height: info-body-t.preferred-height;
+            info-body-t := Body {
+                width: parent.width;
+                text: root.info-body;
+                font-size: 17px;
             }
         }
     }

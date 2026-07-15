@@ -250,6 +250,11 @@ pub fn is_synced(_account: &str) -> bool {
     false
 }
 
+/// No iCloud on Android — the "Back up to iCloud" affordance is Apple-only.
+pub fn icloud_available() -> bool {
+    false
+}
+
 pub fn load_secret_protected(account: &str, _prompt: &str) -> Result<Option<String>, String> {
     let path = blob_path(account);
     let blob = match std::fs::read(&path) {

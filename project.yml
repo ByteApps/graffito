@@ -1,6 +1,6 @@
 name: chain-notes-app
 options:
-  bundleIdPrefix: xyz.foundation.chainnotes
+  bundleIdPrefix: com.objsal
   createIntermediateGroups: true
 settings:
   base:
@@ -13,7 +13,7 @@ targets:
     deploymentTarget: "16.0"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: xyz.foundation.chainnotes.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.objsal.chainnotes
         PRODUCT_NAME: chain-notes-app
         EXECUTABLE_NAME: chain-notes-app
         CODE_SIGN_STYLE: Automatic
@@ -37,6 +37,10 @@ targets:
         UILaunchScreen:
           UIColorName: LaunchBackground
         ITSAppUsesNonExemptEncryption: false
+        # Portrait-only, phone-shaped UI. UIRequiresFullScreen opts out of iPad
+        # multitasking so a single-orientation set is allowed (App Store
+        # validation rejects portrait-only universal apps otherwise — code 90474).
+        UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
     sources:

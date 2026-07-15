@@ -34,7 +34,7 @@ extern "C" {
 }
 use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete};
 
-const SERVICE: &str = "com.objsal.chain-notes-app";
+const SERVICE: &str = "com.objsal.chainnotes";
 const ERR_NOT_FOUND: i32 = -25300; // errSecItemNotFound
 const ERR_CANCELED: i32 = -128; // errSecUserCanceled
 
@@ -143,6 +143,25 @@ pub fn store_secret_protected(account: &str, secret: &str, synced: bool) -> Resu
 /// Read the protected item — the OS shows a Touch ID / password prompt
 /// with `prompt` as the reason. Ok(None) = no item; Err carries
 /// "cancelled" when the user dismissed the prompt.
+/// Is iCloud available on this device (so iCloud Keychain sync can work)?
+///
+/// Proxy: the user is signed into iCloud — `NSFileManager.ubiquityIdentityToken`
+/// is non-nil. There is no public API for the iCloud Keychain toggle itself, but
+/// no iCloud account means no keychain sync at all, so this gates the "Back up to
+/// iCloud" affordance and its default-on. Cheap synchronous property read.
+pub fn icloud_available() -> bool {
+    use objc2::runtime::AnyObject;
+    unsafe {
+        let cls = objc2::class!(NSFileManager);
+        let fm: *mut AnyObject = objc2::msg_send![cls, defaultManager];
+        if fm.is_null() {
+            return false;
+        }
+        let token: *mut AnyObject = objc2::msg_send![fm, ubiquityIdentityToken];
+        !token.is_null()
+    }
+}
+
 /// Does an iCloud-synced item exist for this account?
 pub fn is_synced(account: &str) -> bool {
     let mut pairs = base_query(account);

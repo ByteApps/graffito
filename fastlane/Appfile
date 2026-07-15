@@ -1,0 +1,15 @@
+# fastlane app identity for chain-notes-app (iOS + macOS, Universal Purchase).
+#
+# Account-specific ids are read from the environment so nothing personal is
+# committed here. Set them by sourcing the private config first:
+#   source appstore/config.local.env    # TEAM_ID / ASC_TEAM_ID / APPLE_ID / APP_BUNDLE_ID
+# (appstore/ is symlinked from prime/private/chain-notes-app/appstore).
+
+app_identifier(ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes")  # public — ships in the app
+apple_id(ENV["APPLE_ID"].to_s)                                   # Apple account (interactive auth only)
+itc_team_id(ENV["ASC_TEAM_ID"].to_s)                             # App Store Connect provider id
+team_id(ENV["TEAM_ID"].to_s)                                     # Apple Developer Program team id
+
+for_platform :osx do
+  app_identifier(ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes") # same id → Universal Purchase
+end
