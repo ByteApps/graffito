@@ -1,19 +1,98 @@
 #!/usr/bin/env bash
-# Archive the Mac App Store build and upload it to App Store Connect / TestFlight.
+# Archive the Release macOS build and upload it to App Store Connect / Mac
+# TestFlight. Sibling of ios-archive-upload.sh — same App Store Connect API key
+# auth, same "Xcode session signs, key can't cloud-sign" model.
 #
-# STATUS: stub. Mac TestFlight / App Store distribution requires the app to be
-# App-SANDBOXED and signed with an "Apple Distribution" cert + a Mac App Store
-# provisioning profile. chain-notes-app currently ships a NON-sandboxed
-# Developer-ID/ad-hoc Mac build (scripts/bundle-mac.sh), so this path is not
-# wired yet. See the follow-up plan: sandbox entitlements (App Sandbox + camera
-# + user-selected files + network client + keychain), a proper .app target for
-# the Mac App Store, then archive/export/upload here (mirrors ios-archive-upload.sh).
+# The macOS target (chain-notes-app-mac, scheme chain-notes-app-mac) is
+# App-Sandboxed (chain-notes-mac.entitlements) and signed for the Mac App Store
+# (Apple Distribution + a Mac App Store provisioning profile, minted on demand by
+# -allowProvisioningUpdates using the Xcode signed-in session).
+#
+# Prereqs (once): the app RECORD exists in App Store Connect as a Universal
+# Purchase (iOS + macOS under com.objsal.chainnotes — already created), and the
+# paid account is added in Xcode > Settings > Accounts (for distribution signing).
+#
+# Usage (from the repo root):
+#   source signing.env                 # DEVELOPMENT_TEAM
+#   source appstore/config.local.env   # TEAM_ID / ASC_KEY_* / ASC_ISSUER_ID
+#   scripts/mac-archive-upload.sh [--archive-only]
 set -euo pipefail
-cat >&2 <<'MSG'
-mac-archive-upload.sh is not implemented yet.
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO"
 
-Mac App Store / TestFlight needs the app App-Sandboxed and Mac-App-Store-signed.
-That is the follow-up phase (see the workspace CLAUDE.md / task list). Until then
-the Mac app is distributed via Developer-ID + notarization (SIGNING-NOTARIZATION.md).
-MSG
-exit 2
+# --- config: prefer already-exported env, else source the local files -------
+[ -n "${DEVELOPMENT_TEAM:-}" ] || { [ -f signing.env ] && source signing.env; }
+[ -n "${ASC_KEY_ID:-}" ] || { [ -f appstore/config.local.env ] && source appstore/config.local.env; }
+: "${TEAM_ID:=${DEVELOPMENT_TEAM:-}}"
+export PATH="$HOME/.cargo/bin:$PATH"   # standalone rustup builds the Rust bin
+
+for v in TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_PATH; do
+  [ -n "${!v:-}" ] || { echo "!! $v is empty — source signing.env + appstore/config.local.env" >&2; exit 1; }
+done
+[ -s "$ASC_KEY_PATH" ] || { echo "!! ASC key missing at $ASC_KEY_PATH — run appstore/install.sh" >&2; exit 1; }
+
+SCHEME=chain-notes-app-mac
+PROJECT="$REPO/chain-notes-app.xcodeproj"
+BUILD_DIR="$REPO/build/mac-release"
+ARCHIVE="$BUILD_DIR/chain-notes-app-mac.xcarchive"
+EXPORT_DIR="$BUILD_DIR/export"
+EXPORT_OPTS="$BUILD_DIR/ExportOptions.plist"
+LOG="$BUILD_DIR/archive.log"
+UPLOG="$BUILD_DIR/upload.log"
+mkdir -p "$BUILD_DIR"
+rm -rf "$ARCHIVE" "$EXPORT_DIR"
+
+# Signing uses the Xcode signed-in session by default (the paid account is added
+# in Xcode > Settings > Accounts). The ASC API key can NOT do distribution
+# cloud-signing (same gotcha as iOS), so it is NOT passed to xcodebuild unless
+# you opt in with USE_ASC_KEY_SIGNING=1 (only works if the key has Admin).
+AUTH=()
+if [ "${USE_ASC_KEY_SIGNING:-0}" = "1" ]; then
+  AUTH=( -authenticationKeyPath "$ASC_KEY_PATH"
+         -authenticationKeyID "$ASC_KEY_ID"
+         -authenticationKeyIssuerID "$ASC_ISSUER_ID" )
+fi
+
+echo "==> xcodegen generate (DEVELOPMENT_TEAM=$TEAM_ID)"
+DEVELOPMENT_TEAM="$TEAM_ID" xcodegen generate --spec "$REPO/project.yml"
+
+# Reuse the shared export template (method app-store-connect / destination upload /
+# uploadSymbols / manageAppVersionAndBuildNumber) — identical for iOS and macOS.
+sed "s/__TEAM_ID__/${TEAM_ID}/" "$REPO/scripts/ExportOptions.plist.template" > "$EXPORT_OPTS"
+
+echo "==> xcodebuild archive (team $TEAM_ID, generic/platform=macOS)"
+xcodebuild \
+  -project "$PROJECT" \
+  -scheme "$SCHEME" \
+  -configuration Release \
+  -destination 'generic/platform=macOS' \
+  -archivePath "$ARCHIVE" \
+  -allowProvisioningUpdates \
+  ${AUTH[@]+"${AUTH[@]}"} \
+  DEVELOPMENT_TEAM="$TEAM_ID" \
+  archive 2>&1 | tee "$LOG"
+grep -q "ARCHIVE SUCCEEDED" "$LOG" || { echo "ARCHIVE FAILED — see $LOG" >&2; exit 1; }
+
+if [ "${1:-}" = "--archive-only" ]; then
+  echo "✅ Archived at $ARCHIVE (upload skipped: --archive-only)"; exit 0
+fi
+
+echo "==> xcodebuild -exportArchive (destination=upload)"
+xcodebuild -exportArchive \
+  -archivePath "$ARCHIVE" \
+  -exportOptionsPlist "$EXPORT_OPTS" \
+  -exportPath "$EXPORT_DIR" \
+  -allowProvisioningUpdates \
+  ${AUTH[@]+"${AUTH[@]}"} 2>&1 | tee "$UPLOG" || true
+
+if grep -q "EXPORT SUCCEEDED" "$UPLOG" && grep -qi "Upload succeeded\|uploaded successfully" "$UPLOG"; then
+  echo
+  echo "✅ Uploaded to App Store Connect. It shows as 'Processing' for a few"
+  echo "   minutes, then lands in Mac TestFlight."
+else
+  echo
+  echo "❌ Upload did not report success. Likely causes in the log:" >&2
+  grep -iE "error|Invalid|Missing|No suitable|does not|90[0-9]{3}" "$UPLOG" | head -20 >&2 || true
+  echo "   Full log: $UPLOG" >&2
+  exit 1
+fi

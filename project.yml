@@ -51,3 +51,45 @@ targets:
           bash "${SRCROOT}/build_ios.bash" chain-notes-app
         outputFiles:
           - $(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)
+
+  # macOS Mac App Store build. Same bundle id as iOS → Universal Purchase.
+  # App-Sandboxed (chain-notes-mac.entitlements) and Mac-App-Store-signed.
+  # The Rust bin is built (universal, per $ARCHS) and code-signed by Xcode
+  # via the build_mac.bash post-compile step — mirrors build_ios.bash.
+  chain-notes-app-mac:
+    type: application
+    platform: macOS
+    deploymentTarget: "12.0"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.objsal.chainnotes
+        PRODUCT_NAME: chain-notes-app
+        EXECUTABLE_NAME: chain-notes-app
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+        GENERATE_INFOPLIST_FILE: NO
+        # Separate mac-idiom icon set (16–512 @1x/@2x) so the iOS AppIcon
+        # (single 1024, ios platform) is untouched.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon-mac
+        # App Sandbox + camera/files/network/keychain-access-groups.
+        CODE_SIGN_ENTITLEMENTS: chain-notes-mac.entitlements
+    info:
+      path: Info-mac.plist
+      properties:
+        CFBundleDisplayName: Chain Notes
+        CFBundleName: Chain Notes
+        CFBundleExecutable: chain-notes-app
+        CFBundlePackageType: APPL
+        NSCameraUsageDescription: "Scan QR codes (keys, addresses, PSBTs, sync bundles)."
+        NSHighResolutionCapable: true
+        ITSAppUsesNonExemptEncryption: false
+        # Mac App Store requires an app category; mirrors the iOS PRODUCTIVITY listing.
+        LSApplicationCategoryType: public.app-category.productivity
+    sources:
+      - Assets.xcassets
+    postCompileScripts:
+      - name: Build Rust binary with cargo
+        script: |
+          bash "${SRCROOT}/build_mac.bash" chain-notes-app
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)
