@@ -1,0 +1,125 @@
+# fastlane lanes for chain-notes-app (iOS + macOS, Universal Purchase under one
+# bundle id com.objsal.chainnotes).
+#
+# Auth: an App Store Connect API key (.p8). Source the private config first:
+#   source appstore/config.local.env   # ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH + team/app ids
+# The binary build/upload does NOT use deliver — it's scripts/ios-archive-upload.sh
+# (xcodebuild archive/export via the same ASC key). The lanes wrap the pieces.
+
+default_platform(:ios)
+
+def asc_api_key
+  unless ENV["ASC_KEY_ID"] && ENV["ASC_ISSUER_ID"] && ENV["ASC_KEY_PATH"]
+    UI.user_error!("Missing ASC_* env — run: source appstore/config.local.env")
+  end
+  app_store_connect_api_key(
+    key_id: ENV["ASC_KEY_ID"],
+    issuer_id: ENV["ASC_ISSUER_ID"],
+    key_filepath: ENV["ASC_KEY_PATH"],
+    in_house: false
+  )
+end
+
+# Refuse to submit for review while required fields still hold REPLACE_ME.
+def guard_placeholders!
+  files = %w[
+    fastlane/metadata/en-US/support_url.txt
+    fastlane/metadata/en-US/privacy_url.txt
+    fastlane/metadata/review_information/email_address.txt
+    fastlane/metadata/review_information/phone_number.txt
+    fastlane/metadata/review_information/first_name.txt
+    fastlane/metadata/review_information/last_name.txt
+  ]
+  bad = files.select { |f| File.exist?(File.join("..", f)) && File.read(File.join("..", f)).include?("REPLACE_ME") }
+  unless bad.empty?
+    UI.user_error!("Fill these before submitting (still contain REPLACE_ME):\n  - #{bad.join("\n  - ")}")
+  end
+end
+
+desc "Authenticate + list account apps + check the chainnotes bundle id (debug)"
+lane :check do
+  Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(**asc_api_key)
+  apps = Spaceship::ConnectAPI::App.all
+  UI.message("#{apps.size} apps on this account:")
+  apps.each { |a| UI.message("  #{a.bundle_id}   (#{a.name})") }
+  bid = ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes"
+  UI.message(apps.any? { |a| a.bundle_id == bid } ? "EXISTS: #{bid}" : "FREE: #{bid}")
+end
+
+platform :ios do
+  desc "Create the App Store Connect app record (iOS, then add macOS = Universal Purchase)"
+  lane :create_app do
+    # Apple's ASC API does NOT allow creating app records ("apps does not allow
+    # CREATE"), so this uses the Apple ID web session (produce) — it prompts for
+    # your password once (stored in the macOS keychain) and a 2FA code. Run it
+    # INTERACTIVELY from your terminal:  fastlane ios create_app
+    # `platforms: [ios, osx]` creates ONE universal record covering both.
+    produce(
+      username: ENV["APPLE_ID"],
+      app_identifier: ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes",
+      app_name: "Chain Notes",
+      language: "English",
+      app_version: "0.1.0",
+      sku: ENV["ASC_SKU"] || "chainnotes-0001",
+      team_id: ENV["TEAM_ID"],
+      itc_team_id: ENV["ASC_TEAM_ID"],
+      platforms: ["ios", "osx"]
+    )
+    UI.success("App record ready for iOS + macOS under com.objsal.chainnotes")
+  end
+
+  desc "Register the Bundle ID (com.objsal.chainnotes, UNIVERSAL) headlessly via the ASC API key"
+  lane :ensure_bundle_id do
+    Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(**asc_api_key)
+    identifier = ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes"
+    bid = Spaceship::ConnectAPI::BundleId.all.find { |b| b.identifier == identifier }
+    if bid
+      UI.success("Bundle ID already registered: #{identifier} (#{bid.id})")
+    else
+      bid = Spaceship::ConnectAPI::BundleId.create(
+        name: "Chain Notes", identifier: identifier,
+        platform: "UNIVERSAL", seed_id: ENV["TEAM_ID"]
+      )
+      UI.success("Registered Bundle ID: #{identifier} (#{bid.id})")
+    end
+    # The app RECORD can't be created via the API — Apple restricts 'apps' to
+    # GET/UPDATE. Create it with the interactive lane (Apple ID + 2FA):
+    UI.important("Next: run  fastlane ios create_app  in your terminal to create the app record.")
+  end
+
+  desc "Report the numeric ASC app id for the bundle (once the record exists)"
+  lane :app_id do
+    Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(**asc_api_key)
+    app = Spaceship::ConnectAPI::App.find(ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes")
+    UI.user_error!("No app record yet — run `fastlane ios create_app` first.") unless app
+    UI.success("ASC_APP_ID=#{app.id}  (put it in appstore/config.local.env)")
+  end
+
+  desc "Push text metadata only (no screenshots, no binary, no submit)"
+  lane :metadata do
+    deliver(api_key: asc_api_key, skip_screenshots: true, submit_for_review: false)
+  end
+
+  desc "Archive + upload an iOS build to App Store Connect / TestFlight"
+  lane :beta do
+    sh("../scripts/ios-archive-upload.sh")
+  end
+
+  desc "Push everything and submit for App Store review"
+  lane :submit do
+    guard_placeholders!
+    deliver(api_key: asc_api_key, submit_for_review: true, automatic_release: false)
+  end
+end
+
+platform :mac do
+  desc "Archive + upload a Mac build to App Store Connect / TestFlight (needs App Sandbox — follow-up)"
+  lane :beta do
+    sh("../scripts/mac-archive-upload.sh")
+  end
+
+  desc "Push text metadata only for the macOS listing"
+  lane :metadata do
+    deliver(api_key: asc_api_key, platform: "osx", skip_screenshots: true, submit_for_review: false)
+  end
+end

@@ -1,0 +1,10 @@
+Chain Notes turns the Bitcoin blockchain into your personal, tamper-evident notebook.
+
+Compose a short note, encrypt it, sign it with a key that never leaves your device, and anchor it on-chain. Later — on any device — read your notes straight back from the chain. Notes can be private to you, or directed to another Bitcoin address so only its holder can read them.
+
+- Your keys, your device. Create a new 12/24-word key in-app or import an existing one (words, xprv, WIF, hex, or SeedQR). Key material lives only in the device keychain and is revealed only after you authenticate.
+- Private by design. Bodies are encrypted; only you (or your chosen recipient) can read them. No account, no sign-up, no tracking server.
+- Read it anywhere. Your notes are on the most durable ledger there is — recover them on a new device from your key alone.
+- Full control. Choose fees, control which coins you spend, and manage your addresses.
+
+Bitcoin knowledge helps, but Chain Notes handles the cryptography for you.

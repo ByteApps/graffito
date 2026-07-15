@@ -1,0 +1,1 @@
+Write short encrypted notes onto the Bitcoin blockchain, signed by keys that never leave your device. Read them back anywhere. No account, no server.
