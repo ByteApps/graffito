@@ -1,1 +1,1 @@
-REPLACE_ME https://
+https://objsal.github.io/chain-notes-app/legal/privacy.html
