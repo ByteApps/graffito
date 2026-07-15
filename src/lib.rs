@@ -4948,21 +4948,16 @@ pub fn run() {
             "privacy" => ("Privacy", PRIVACY),
             "help" => ("Help", HELP),
             "faq" => ("Q & A", FAQ),
+            // Terms & disclaimer re-views through the SAME info screen (25) as
+            // the others, so Settings sub-screens share one scroll-top UX. The
+            // centered screen 24 is now purely the first-run accept gate.
+            "terms" => ("Terms & disclaimer", DISCLAIMER),
             _ => return,
         };
         w.set_info_title(title.into());
         w.set_info_body(body.into());
         w.set_screen(25);
         println!("cb: open-info {kind}");
-    });
-
-    // Re-view Terms & disclaimer (read-only) from Settings.
-    cb!(on_open_disclaimer, |w, s| {
-        let _ = &mut s;
-        w.set_disclaimer_body(DISCLAIMER.into());
-        w.set_terms_accept_mode(false);
-        w.set_screen(24);
-        println!("cb: open-disclaimer");
     });
 
     // ---------- external funding (PSBT) ----------
@@ -5574,6 +5569,9 @@ pub fn run() {
         w.set_status("".into());
         w.set_chunk_custom(false);
         load_backend_settings(&w, &s);
+        // Fresh entry from the list starts at the top; returning from a Settings
+        // sub-screen (via nav-back, which doesn't call this) keeps its position.
+        w.set_settings_scroll_y(0.0);
         w.set_screen(8);
     });
 
