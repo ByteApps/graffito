@@ -100,6 +100,19 @@ platform :ios do
     deliver(api_key: asc_api_key, skip_screenshots: true, submit_for_review: false)
   end
 
+  desc "Push screenshots only (no metadata text, no binary, no submit)"
+  lane :screenshots do
+    deliver(
+      api_key: asc_api_key,
+      skip_metadata: true,
+      skip_screenshots: false,
+      skip_binary_upload: true,
+      submit_for_review: false,
+      overwrite_screenshots: true,
+      force: true
+    )
+  end
+
   desc "Archive + upload an iOS build to App Store Connect / TestFlight"
   lane :beta do
     sh("../scripts/ios-archive-upload.sh")
