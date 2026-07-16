@@ -1104,6 +1104,10 @@ export component AppWindow inherits Window {
     in property <[AccountItem]> accounts;
     in-out property <int> account-page;
     in-out property <bool> show-reset-confirm;
+    // Tap-to-enlarge QR overlay: any QR sets qr-zoom-image + opens it, so a
+    // small on-card QR can be scanned by another device. One shared overlay.
+    in-out property <bool> qr-zoom-open;
+    in-out property <image> qr-zoom-image;
     in-out property <string> chunk-text;
     in-out property <bool> chunk-custom;
     // Bitcoin node picker (URLs must be Esplora/mempool-compatible): option
@@ -1346,6 +1350,7 @@ export component AppWindow inherits Window {
     function nav-back() -> bool {
         // Overlays first, topmost (= last window child) before the rest —
         // back closes the same thing a tap on Cancel / the dim would.
+        if (root.qr-zoom-open) { root.qr-zoom-open = false; return true; }
         if (root.show-wconsol-confirm) { root.show-wconsol-confirm = false; return true; }
         if (root.show-bump-dialog) { root.show-bump-dialog = false; return true; }
         if (root.show-oversize-modal) { root.show-oversize-modal = false; return true; }
@@ -1716,6 +1721,13 @@ export component AppWindow inherits Window {
                         x: 4px;
                         y: 4px;
                         image-rendering: pixelated;
+                    }
+                    // Tap the QR to enlarge it for scanning by another device.
+                    TouchArea {
+                        clicked => {
+                            root.qr-zoom-image = root.address-qr;
+                            root.qr-zoom-open = true;
+                        }
                     }
                 }
                 VerticalLayout {
@@ -3557,11 +3569,21 @@ export component AppWindow inherits Window {
                         }
                         HorizontalLayout {
                             alignment: center;
-                            Image {
-                                source: row.qr;
+                            Rectangle {
                                 width: 176px;
                                 height: 176px;
-                                image-rendering: pixelated;
+                                Image {
+                                    source: row.qr;
+                                    width: 100%;
+                                    height: 100%;
+                                    image-rendering: pixelated;
+                                }
+                                TouchArea {
+                                    clicked => {
+                                        root.qr-zoom-image = row.qr;
+                                        root.qr-zoom-open = true;
+                                    }
+                                }
                             }
                         }
                         GhostButton { text: "Copy"; clicked => { root.copy-value(row.value); } }
@@ -3681,11 +3703,21 @@ export component AppWindow inherits Window {
                     }
                     if root.reveal-show-seedqr: HorizontalLayout {
                         alignment: center;
-                        Image {
-                            source: root.reveal-seedqr-image;
+                        Rectangle {
                             width: 200px;
                             height: 200px;
-                            image-rendering: pixelated;
+                            Image {
+                                source: root.reveal-seedqr-image;
+                                width: 100%;
+                                height: 100%;
+                                image-rendering: pixelated;
+                            }
+                            TouchArea {
+                                clicked => {
+                                    root.qr-zoom-image = root.reveal-seedqr-image;
+                                    root.qr-zoom-open = true;
+                                }
+                            }
                         }
                     }
                     GhostButton {
@@ -3712,11 +3744,21 @@ export component AppWindow inherits Window {
                     }
                     HorizontalLayout {
                         alignment: center;
-                        Image {
-                            source: root.reveal-private-qr;
+                        Rectangle {
                             width: 176px;
                             height: 176px;
-                            image-rendering: pixelated;
+                            Image {
+                                source: root.reveal-private-qr;
+                                width: 100%;
+                                height: 100%;
+                                image-rendering: pixelated;
+                            }
+                            TouchArea {
+                                clicked => {
+                                    root.qr-zoom-image = root.reveal-private-qr;
+                                    root.qr-zoom-open = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -4323,6 +4365,43 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // ---------- QR zoom overlay (tap any QR to enlarge it for scanning) ----------
+    // Any small on-card QR (address, SeedQR, key export) opens this; a tap
+    // anywhere — the dim OR the enlarged code — closes it. The QR image is
+    // native module resolution + `pixelated`, so blowing it up stays crisp.
+    if root.qr-zoom-open: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.82);
+        qr-zoom-card := Rectangle {
+            width: min(root.width - 48px, min(root.height - 168px, 380px));
+            height: self.width;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: white;
+            border-radius: 16px;
+            Image {
+                source: root.qr-zoom-image;
+                width: parent.width - 36px;
+                height: parent.height - 36px;
+                x: 18px;
+                y: 18px;
+                image-rendering: pixelated;
+            }
+        }
+        Text {
+            text: "Tap to close";
+            x: (parent.width - self.width) / 2;
+            y: qr-zoom-card.y + qr-zoom-card.height + 18px;
+            color: white;
+            font-size: 14px;
+        }
+        // Dismiss layer on TOP so a tap anywhere — including on the enlarged
+        // QR — closes it (non-TouchArea siblings above would otherwise swallow
+        // the click).
+        TouchArea { clicked => { root.qr-zoom-open = false; } }
     }
 
     // Splash cover — the topmost child, so it hides everything until Rust
