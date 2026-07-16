@@ -47,6 +47,9 @@ use zeroize::Zeroizing;
 slint::include_modules!();
 
 const KEYCHAIN_ACCOUNT: &str = "identity-key";
+
+/// Opened by Settings → About & help → "Source code".
+const SOURCE_URL: &str = "https://github.com/ObjSal/chain-notes-app";
 /// Minimum (and default) sats sent to a directed-note recipient.
 const DUST_SATS: u64 = app_core::notes_core::DUST_LIMIT;
 
@@ -3924,6 +3927,12 @@ pub fn run() {
         }
         println!("cb: act-explorer");
         let _ = platform::open_url(url.as_str());
+    });
+
+    cb!(on_open_source, |w, s| {
+        let _ = (&w, &mut s);
+        println!("cb: open-source");
+        let _ = platform::open_url(SOURCE_URL);
     });
 
     // Fee preview for the consolidate dialog: dry-run the SAME builder the

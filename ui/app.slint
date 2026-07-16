@@ -1219,6 +1219,7 @@ export component AppWindow inherits Window {
     callback refresh-notebooks();   // notebook-list header: rescan every notebook
     callback accept-terms();        // first-run disclaimer gate → proceed
     callback open-info(string);     // "about" | "privacy" | "help" | "faq" | "terms"
+    callback open-source();         // Settings → About & help → opens the GitHub repo
     callback open-note(string);
     callback open-note-web-url(string);
     callback open-note-web();
@@ -2733,10 +2734,24 @@ export component AppWindow inherits Window {
             GhostButton { text: "About"; clicked => { root.open-info("about"); } }
             GhostButton { text: "Help"; clicked => { root.open-info("help"); } }
             GhostButton { text: "Q & A"; clicked => { root.open-info("faq"); } }
+            GhostButton { text: "Source code"; clicked => { root.open-source(); } }
             GhostButton { text: "Privacy"; clicked => { root.open-info("privacy"); } }
             GhostButton { text: "Terms & disclaimer"; clicked => { root.open-info("terms"); } }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
+        // Signature tagline — last thing under every settings card, centered
+        // with breathing room above and below.
+        VerticalLayout {
+            padding-top: 20px;
+            padding-bottom: 28px;
+            Text {
+                text: "For bitcoiners by bitcoiners";
+                horizontal-alignment: center;
+                color: Pal.muted;
+                font-size: 12px;
+                font-italic: true;
+            }
+        }
             }
         }
     }
