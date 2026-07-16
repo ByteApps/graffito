@@ -477,6 +477,16 @@ pub fn sign_own_taproot_inputs(
 fn to_notes_tx(psbt: &Psbt) -> Result<notes_core::tx::Transaction, Error> {
     let mut inputs = Vec::with_capacity(psbt.unsigned_tx.input.len());
     for (i, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+        // notes-core's Transaction model has no per-input sequence — its
+        // BIP143 sighash hardcodes the RBF sequence every builder here
+        // uses. A different sequence would make the sighash (and thus the
+        // signature) silently invalid, so refuse loudly instead.
+        if txin.sequence != Sequence::ENABLE_RBF_NO_LOCKTIME {
+            return Err(Error::Funding(format!(
+                "input {i} sequence {:#010x} unsupported (wpkh sighash assumes RBF 0xfffffffd)",
+                txin.sequence.0
+            )));
+        }
         let value = psbt
             .inputs
             .get(i)
