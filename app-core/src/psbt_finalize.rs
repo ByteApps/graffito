@@ -190,6 +190,7 @@ mod tests {
     use crate::funding::{FundingSource, FundingUtxo};
     use crate::psbt_build::{build_funding_psbt, FundingPlan, NoteParams};
     use notes_core::address::Recipient;
+    use notes_core::bundle::Identity;
 
     const BIP86_ACCT_XPUB: &str = "xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ";
     const NET: Network = Network::Mainnet;
