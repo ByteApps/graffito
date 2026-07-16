@@ -14,6 +14,7 @@ use notes_core::tx::Utxo;
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
 
+use crate::notebooks::{SpendingAddr, SpendingSection};
 use crate::Error;
 
 pub const DEFAULT_CHUNK: usize = 100_000;
@@ -152,41 +153,6 @@ pub struct Contact {
     pub name: String,
 }
 
-/// The spending wallet's local bookkeeping (funding-unification M2): next
-/// unused receive/change indexes, plus every address actually handed out —
-/// enough to (a) hand out fresh addresses, (b) build the self-spk SET for
-/// scanning ([`Store::spending_self_spks`]), and (c) survive a restart
-/// without re-deriving. SERDE-DEFAULT and absent on every pre-M2 store
-/// file: an old file loads with `enabled: false` and an empty `used` list,
-/// so its self-spk set is just the notebook's own — byte-identical scan
-/// behavior to before this milestone. Key bytes never live here (key
-/// storage spec) — only indexes and addresses; the spending keys
-/// themselves are re-derived on unlock.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpendingSection {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub next_receive: u32,
-    #[serde(default)]
-    pub next_change: u32,
-    #[serde(default)]
-    pub used: Vec<SpendingAddr>,
-}
-
-/// One address the spending wallet has handed out (receive OR change).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpendingAddr {
-    /// 0 = receive chain, 1 = change chain.
-    pub chain: u32,
-    pub index: u32,
-    pub address: String,
-    /// Raw scriptPubKey, hex — feeds the self-spk SET directly (no address
-    /// re-decoding needed at scan time).
-    #[serde(default)]
-    pub script_pubkey_hex: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Store {
     pub version: u32,
@@ -226,9 +192,19 @@ pub struct Store {
     /// user has already had on screen (marked when the notebook opens).
     #[serde(default)]
     pub seen_received: Vec<String>,
-    /// The internal BIP-84 spending wallet (funding-unification M2).
-    /// Optional/serde-default so pre-M2 store files load unchanged.
-    #[serde(default)]
+    /// RUNTIME cache of the identity's spending wallet (funding-
+    /// unification M2/M3.1). `#[serde(skip)]` — this field never
+    /// round-trips with the store file: the section is per (network,
+    /// identity, ACCOUNT), shared by every notebook of the account, so it
+    /// now persists in the per-identity notebooks index
+    /// (`NotebookIndex.spending`, see `notebooks.rs`) instead. Whatever
+    /// loads a store for the active (account, notebook) must stamp this
+    /// field from `NotebookIndex::spending_for(account)`, and every
+    /// mutation (`spending_mark_used` etc.) must be written back through
+    /// `NotebookIndex::set_spending` + save — the [`Store`] methods below
+    /// only touch the in-memory copy. Defaults empty/disabled until
+    /// stamped.
+    #[serde(skip)]
     pub spending: SpendingSection,
 }
 
@@ -747,45 +723,38 @@ impl Store {
     /// (idempotent by (chain, index)) and bump the matching next-index
     /// past it — fresh-address discipline (funding-unification PLAN): the
     /// NEXT unused index always comes after every address actually handed
-    /// out or discovered.
+    /// out or discovered. Mutates only the in-memory runtime cache — the
+    /// caller must write it back through `NotebookIndex::set_spending` +
+    /// save so the rest of the account's notebooks see the update.
     pub fn spending_mark_used(&mut self, addr: SpendingAddr) {
-        let bump = addr.index + 1;
-        if addr.chain == 0 {
-            self.spending.next_receive = self.spending.next_receive.max(bump);
-        } else {
-            self.spending.next_change = self.spending.next_change.max(bump);
-        }
-        if !self.spending.used.iter().any(|u| u.chain == addr.chain && u.index == addr.index) {
-            self.spending.used.push(addr);
-        }
+        self.spending.mark_used(addr);
     }
 
     /// The spending wallet's self-spk SET: every used address's
     /// scriptPubKey — fed to `extract_notes_multi`/`_watch_multi` alongside
     /// the notebook's own spk so a spending-wallet-funded note scans back
-    /// as OWN. Empty when the section has never been used, which keeps
-    /// scan behavior identical to pre-M2 stores.
+    /// as OWN. Empty when the section has never been used (or the runtime
+    /// cache hasn't been stamped), which keeps scan behavior identical to
+    /// pre-M2 stores.
     pub fn spending_self_spks(&self) -> Vec<Vec<u8>> {
-        self.spending.used.iter().filter_map(|u| hex::decode(&u.script_pubkey_hex).ok()).collect()
+        self.spending.self_spks()
     }
 
     /// Merge a gap-scan's findings (`chain::discover_spending`) into the
     /// section: every discovered used address, plus each chain's next-
     /// unused index raised (never lowered — an unconfirmed local spend the
-    /// scan can't see yet must not un-advance the index).
+    /// scan can't see yet must not un-advance the index). Same write-back
+    /// caveat as [`Self::spending_mark_used`].
     pub fn spending_apply_discovery(
         &mut self,
         used: Vec<SpendingAddr>,
         next_receive: u32,
         next_change: u32,
     ) {
-        for addr in used {
-            self.spending_mark_used(addr);
-        }
-        self.spending.next_receive = self.spending.next_receive.max(next_receive);
-        self.spending.next_change = self.spending.next_change.max(next_change);
+        self.spending.apply_discovery(used, next_receive, next_change);
     }
 
+    /// Same write-back caveat as [`Self::spending_mark_used`].
     pub fn spending_set_enabled(&mut self, on: bool) {
         self.spending.enabled = on;
     }
@@ -939,12 +908,16 @@ mod tests {
     }
 
     #[test]
-    fn spending_section_round_trips_on_disk_and_old_files_load_unchanged() {
+    fn spending_field_is_runtime_only_and_never_round_trips_via_store() {
+        // Funding-unification M3.1: the spending section moved to the
+        // per-identity notebooks index (account-level), so `Store.spending`
+        // is now `#[serde(skip)]` — a populated cache must NOT survive a
+        // plain store save/load cycle, and the saved JSON must carry no
+        // "spending" key at all (requirement: no stale field in per-
+        // notebook store files).
         let dir = std::env::temp_dir().join(format!("cn-store-spending-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // A fresh store with a populated spending section survives a
-        // save/load cycle byte-for-byte.
         let path = dir.join("store-regtest-aabbccdd.json");
         let mut s = Store::new(&[7u8; 32], Network::Regtest);
         s.spending_set_enabled(true);
@@ -956,12 +929,14 @@ mod tests {
         });
         s.save(&path).unwrap();
         let back = Store::load(&path).unwrap();
-        assert_eq!(back.spending, s.spending);
-        assert!(back.spending.enabled);
-        assert_eq!(back.spending.used[0].address, "bc1qreceive0");
+        assert!(!back.spending.enabled);
+        assert!(back.spending.used.is_empty());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"spending\""));
 
-        // An OLD store file with no `spending` key at all (every pre-M2
-        // store) loads with the section defaulted, not an error.
+        // A STALE store file left over from an M2/M3 build (spending key
+        // still in the JSON) loads fine — the field is simply ignored, not
+        // adopted and not an error.
         let legacy_path = dir.join("store-regtest-legacy.json");
         std::fs::write(
             &legacy_path,
@@ -973,15 +948,62 @@ mod tests {
                 "notes": [],
                 "utxos": [],
                 "contacts": [],
-                "txs": []
+                "txs": [],
+                "spending": {"enabled": true, "next_receive": 3, "next_change": 1, "used": []}
             }"#,
         )
         .unwrap();
         let legacy = Store::load(&legacy_path).unwrap();
         assert!(!legacy.spending.enabled);
-        assert!(legacy.spending.used.is_empty());
         assert!(legacy.spending_self_spks().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spending_shared_across_notebooks_via_notebook_index() {
+        use crate::notebooks::NotebookIndex;
+        // Simulates the app's stamp-then-write-back pattern (`activate()` /
+        // `State::save_spending`): load a store for a notebook, stamp its
+        // `spending` runtime cache from the ACCOUNT-level `NotebookIndex`,
+        // mutate, write back — proving two notebooks of the same account
+        // (different leaves, so different store files) never diverge, and
+        // that a mark-used via either one advances the index the other
+        // sees (fresh-address discipline across the whole account).
+        let mut ix = NotebookIndex::new();
+        let mut store_a = Store::new(&[1u8; 32], Network::Regtest); // notebook 0
+        let mut store_b = Store::new(&[2u8; 32], Network::Regtest); // notebook 1, same account
+
+        store_a.spending = ix.spending_for(0);
+        store_a.spending_set_enabled(true);
+        store_a.spending_mark_used(SpendingAddr {
+            chain: 0,
+            index: 0,
+            address: "a0".into(),
+            script_pubkey_hex: "00".into(),
+        });
+        ix.set_spending(0, store_a.spending.clone());
+
+        // Notebook B stamps FRESH from the account-level section and sees
+        // notebook A's enabled flag + index — not independent, empty state.
+        store_b.spending = ix.spending_for(0);
+        assert!(store_b.spending.enabled);
+        assert_eq!(store_b.spending.next_receive, 1);
+
+        // A mark-used via B advances the SAME index A will see next.
+        store_b.spending_mark_used(SpendingAddr {
+            chain: 0,
+            index: 1,
+            address: "a1".into(),
+            script_pubkey_hex: "01".into(),
+        });
+        ix.set_spending(0, store_b.spending.clone());
+        store_a.spending = ix.spending_for(0);
+        assert_eq!(store_a.spending.next_receive, 2);
+        assert_eq!(store_a.spending.used.len(), 2);
+        // Feeds the self-spk SCAN SET identically for every notebook of
+        // the account (requirement: apply_bundle recognizes the account's
+        // spending spks for every notebook).
+        assert_eq!(store_a.spending_self_spks().len(), 2);
     }
 }

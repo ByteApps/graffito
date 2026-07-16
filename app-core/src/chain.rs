@@ -511,7 +511,7 @@ pub fn discover_spending<T: Transport>(
     client: &ChainClient<T>,
     source: &crate::funding::FundingSource,
     gap: u32,
-) -> (Vec<crate::store::SpendingAddr>, u32, u32) {
+) -> (Vec<crate::notebooks::SpendingAddr>, u32, u32) {
     let mut used = Vec::new();
     let mut next_receive = 0u32;
     let mut next_change = 0u32;
@@ -524,7 +524,7 @@ pub fn discover_spending<T: Transport>(
             let Ok(d) = source.derive(chain, index) else { break };
             match client.address_probe(&d.address) {
                 Ok((true, _)) => {
-                    used.push(crate::store::SpendingAddr {
+                    used.push(crate::notebooks::SpendingAddr {
                         chain: chain as u32,
                         index,
                         address: d.address.clone(),

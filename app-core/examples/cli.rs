@@ -12,7 +12,8 @@ use std::str::FromStr;
 use app_core::chain::{ChainClient, HttpTransport};
 use app_core::compose::{compose_and_record, ComposeRequest};
 use app_core::funding::FundingSource;
-use app_core::identity::{parse_key_material, realize, AppIdentity};
+use app_core::identity::{parse_key_material, realize, AppIdentity, KeyMaterial};
+use app_core::notebooks::{NotebookIndex, SpendingAddr};
 use app_core::notes_core::address::Recipient;
 use app_core::notes_core::Network;
 use app_core::psbt_build::{
@@ -43,6 +44,18 @@ fn load(path: &str) -> Store {
 
 fn save(store: &Store, path: &str) {
     store.save(std::path::Path::new(path)).expect("store save");
+}
+
+/// The per-identity notebooks index file NEXT TO `store_path` — the
+/// spending wallet's section (funding-unification M3.1) is ACCOUNT-level
+/// now, shared by every notebook of the account, so it lives here rather
+/// than in the store the caller happened to load. Mirrors the app's own
+/// `notebooks-<net>-<fp8>.json` naming/co-location (`src/lib.rs`
+/// `State::notebooks_path`).
+fn spending_index_path(store_path: &str, network: Network, material: &KeyMaterial) -> std::path::PathBuf {
+    let fp8 = app_core::identity::index_fp8(material, network).expect("index_fp8 (need mnemonic/xprv APP_KEY)");
+    let dir = std::path::Path::new(store_path).parent().filter(|p| !p.as_os_str().is_empty());
+    dir.unwrap_or_else(|| std::path::Path::new(".")).join(format!("notebooks-{}-{}.json", network.as_str(), fp8))
 }
 
 fn status_str(s: NoteStatus) -> &'static str {
@@ -513,38 +526,48 @@ fn main() {
             // spending-address <store.json> <net>
             // Prints the identity's spending wallet's next unused receive
             // address (funding-unification M2) and persists it as handed
-            // out (fresh-address discipline). Needs a BIP-39/master-xprv
+            // out (fresh-address discipline). The section is ACCOUNT-level
+            // (M3.1) — shared by every notebook of the account — so it's
+            // read/written through the notebooks index file next to
+            // store.json, not the store itself. Needs a BIP-39/master-xprv
             // APP_KEY (APP_ACCOUNT selects the account); watch/WIF/hex/
             // account-xprv identities have no spending wallet.
             let net = network(&args[3]);
-            let mut store = load(&args[2]);
             let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | master xprv");
             let account: u32 =
                 std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
             let material = parse_key_material(&key, net).expect("APP_KEY parse");
             let source = app_core::spending::funding_source(&material, net, account)
                 .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
-            let index = store.spending.next_receive;
+            let ix_path = spending_index_path(&args[2], net, &material);
+            let mut ix = NotebookIndex::load(&ix_path).unwrap_or_default();
+            let mut section = ix.spending_for(account);
+            let index = section.next_receive;
             let addr = source.derive(0, index).expect("derive receive address");
-            store.spending_mark_used(app_core::store::SpendingAddr {
+            section.mark_used(SpendingAddr {
                 chain: 0,
                 index,
                 address: addr.address.clone(),
                 script_pubkey_hex: hex::encode(&addr.spk),
             });
-            save(&store, &args[2]);
+            ix.set_spending(account, section);
+            ix.save(&ix_path).expect("save notebooks index");
             println!("cli: spending-address index={index} address={}", addr.address);
             println!("{}", addr.address);
         }
         Some("note-spend-funded") => {
             // note-spend-funded <store.json> <base-url> <public|private> <rate> <text> [to]
             // Fully in-app internal funding kind: scan the identity's OWN
-            // spending wallet, build the SAME funded-note PSBT shape
-            // external funding produces (`build_funding_psbt` — dust-to-
-            // recipient, no configurable gift, same as `fund-build`), sign
-            // every P2WPKH input in-process (no PSBT export/import round
-            // trip), broadcast.
-            let mut store = load(&args[2]);
+            // spending wallet (ACCOUNT-level bookkeeping, funding-
+            // unification M3.1 — shared by every notebook of the account,
+            // so its next-change index and used-address list live in the
+            // notebooks index file next to store.json, not the store),
+            // build the SAME funded-note PSBT shape external funding
+            // produces (`build_funding_psbt` — dust-to-recipient, no
+            // configurable gift, same as `fund-build`), sign every P2WPKH
+            // input in-process (no PSBT export/import round trip),
+            // broadcast.
+            let store = load(&args[2]);
             let net = network(&store.network.clone());
             let ident = identity(net);
             let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | master xprv");
@@ -573,7 +596,10 @@ fn main() {
             let recipient = to.as_deref().map(|a| Recipient::parse(net, a).expect("recipient"));
             let r = app_core::notes_core::keys::generate_aux_rand().expect("rng");
             let note_id = [r[0], r[1], r[2], r[3]];
-            let change_index = store.spending.next_change;
+            let ix_path = spending_index_path(&args[2], net, &material);
+            let mut ix = NotebookIndex::load(&ix_path).unwrap_or_default();
+            let mut section = ix.spending_for(account);
+            let change_index = section.next_change;
             let plan = FundingPlan {
                 source: &source,
                 coins: &scan.utxos,
@@ -604,14 +630,15 @@ fn main() {
 
             if built.change > 0 {
                 let change_addr = source.derive(1, change_index).expect("derive change address");
-                store.spending_mark_used(app_core::store::SpendingAddr {
+                section.mark_used(SpendingAddr {
                     chain: 1,
                     index: change_index,
                     address: change_addr.address,
                     script_pubkey_hex: hex::encode(&change_addr.spk),
                 });
+                ix.set_spending(account, section);
+                ix.save(&ix_path).expect("save notebooks index");
             }
-            save(&store, &args[2]);
             println!(
                 "cli: compose id={} txid={} fee={} vsize={} to={} private={} broadcast=ok",
                 hex::encode(note_id),

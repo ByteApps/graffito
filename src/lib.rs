@@ -25,7 +25,7 @@ use app_core::identity::{
     generate_mnemonic, generate_mnemonic_with_salt, index_fp8, parse_key_material, realize,
     AppIdentity,
 };
-use app_core::notebooks::NotebookIndex;
+use app_core::notebooks::{NotebookIndex, SpendingAddr};
 use app_core::psbt_build::{
     build_funded_sweep_psbt, build_funding_psbt, build_watch_bump_psbt, build_watch_note_psbt,
     build_watch_spend_psbt, predict_keyspend_vsize, sign_own_taproot_inputs, BuiltPsbt,
@@ -319,6 +319,23 @@ impl State {
         if let (Some(ix), Some(p)) = (&self.notebooks, self.notebooks_path()) {
             let _ = ix.save(&p);
         }
+    }
+
+    /// Persist a spending-wallet mutation to its ACCOUNT-level home
+    /// (funding-unification M3.1): copy the active store's runtime
+    /// `spending` cache into the notebooks index entry for the active
+    /// account, then save it — so every OTHER notebook of the account
+    /// picks up the change the next time it activates (they share ONE
+    /// section; see `app_core::notebooks::SpendingSection`). Callers
+    /// mutate `store.spending` via the usual `Store::spending_*` methods
+    /// FIRST, then call this instead of (or beside) `save_store()`.
+    fn save_spending(&mut self) {
+        let Some(section) = self.store.as_ref().map(|s| s.spending.clone()) else { return };
+        let account = self.account;
+        if let Some(ix) = self.notebooks.as_mut() {
+            ix.set_spending(account, section);
+        }
+        self.save_notebooks();
     }
 
     /// A notebook's display name: its local name, else the short form of
@@ -1312,6 +1329,11 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     if !index_existed && material.is_multi_notebook() {
         st.discovery_pending = true;
     }
+    // Funding-unification M3.1: stamp the RUNTIME spending cache from the
+    // ACCOUNT-level section in the notebooks index — every notebook of
+    // this account (this one included) shares it, so re-activating any of
+    // them always reads the same enabled flag / indexes / used list.
+    store.spending = ix.spending_for(st.account);
     st.notebooks_fp8 = Some(fp8);
     st.notebooks = Some(ix);
     st.ident = Some(ident);
@@ -2221,7 +2243,7 @@ struct SpendingRefreshResult {
     fp8: String,
     network: Network,
     account: u32,
-    discovery: Option<(Vec<app_core::store::SpendingAddr>, u32, u32)>,
+    discovery: Option<(Vec<SpendingAddr>, u32, u32)>,
     scan: Result<app_core::funding::FundingScan, String>,
 }
 
@@ -2282,10 +2304,11 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
             println!("cb: spending-refresh stale-drop");
             continue;
         }
-        if let (Some((used, next_receive, next_change)), Some(store)) =
-            (r.discovery, st.store.as_mut())
-        {
-            store.spending_apply_discovery(used, next_receive, next_change);
+        if let Some((used, next_receive, next_change)) = r.discovery {
+            if let Some(store) = st.store.as_mut() {
+                store.spending_apply_discovery(used, next_receive, next_change);
+            }
+            st.save_spending();
         }
         match r.scan {
             Ok(scan) => {
@@ -3688,14 +3711,15 @@ pub fn run() {
     });
 
     // Funding-unification M3: "Separate spending wallet" toggle. Persisted
-    // per-identity (store.spending.enabled) like any other store setting —
-    // survives restarts, resets to off on a fresh identity.
+    // per (identity, account) — M3.1: in the notebooks index, shared by
+    // every notebook of the account — survives restarts, resets to off on
+    // a fresh identity.
     cb!(on_set_spending_enabled, |w, s, on: bool| {
         println!("cb: set-spending enabled={on}");
         if let Some(store) = s.store.as_mut() {
             store.spending_set_enabled(on);
         }
-        s.save_store();
+        s.save_spending();
         update_spending_ui(&w, &s);
         if on && !s.spending_scanned {
             spending_refresh_async(&w, &mut s);
@@ -4549,7 +4573,7 @@ pub fn run() {
                                 (s.spending_source.clone(), s.store.as_mut())
                             {
                                 if let Ok(addr) = src.derive(0, idx) {
-                                    store.spending_mark_used(app_core::store::SpendingAddr {
+                                    store.spending_mark_used(SpendingAddr {
                                         chain: 0,
                                         index: idx,
                                         address: addr.address,
@@ -4557,6 +4581,7 @@ pub fn run() {
                                     });
                                 }
                             }
+                            s.save_spending();
                         }
                         s.save_store();
                         println!(
@@ -6216,13 +6241,14 @@ pub fn run() {
                 if built.change > 0 {
                     if let Ok(change_addr) = source.derive(1, change_index) {
                         if let Some(store) = s.store.as_mut() {
-                            store.spending_mark_used(app_core::store::SpendingAddr {
+                            store.spending_mark_used(SpendingAddr {
                                 chain: 1,
                                 index: change_index,
                                 address: change_addr.address,
                                 script_pubkey_hex: hex::encode(&change_addr.spk),
                             });
                         }
+                        s.save_spending();
                     }
                 }
                 if let Some(store) = s.store.as_mut() {
