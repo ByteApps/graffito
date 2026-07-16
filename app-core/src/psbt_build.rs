@@ -574,6 +574,21 @@ pub fn sign_own_wpkh_inputs(
 /// Build the unsigned funding PSBT. Fails with `Error::Funding` on bad coins,
 /// insufficient funds, or descriptor derivation problems.
 pub fn build_funding_psbt(plan: &FundingPlan, note: &NoteParams) -> Result<BuiltPsbt, Error> {
+    build_funding_psbt_amount(plan, note, DUST_LIMIT)
+}
+
+/// [`build_funding_psbt`] with a configurable recipient amount (the "gift",
+/// funding-unification M3) instead of the hardcoded dust minimum — additive,
+/// mirrors the `recipient_amount` parameter [`build_watch_funded_note_psbt`]
+/// already takes. `build_funding_psbt` delegates here with `DUST_LIMIT` so
+/// every existing caller (external funding wallets, both keyed and watch)
+/// stays byte-identical; the internal spending-wallet compose path is the
+/// first caller that passes a real gift.
+pub fn build_funding_psbt_amount(
+    plan: &FundingPlan,
+    note: &NoteParams,
+    recipient_amount: u64,
+) -> Result<BuiltPsbt, Error> {
     let (payloads, recipient_spk) = sealed_note_payloads(
         note.identity,
         note.text,
@@ -583,7 +598,8 @@ pub fn build_funding_psbt(plan: &FundingPlan, note: &NoteParams) -> Result<Built
         note.max_op_return_bytes,
     )?;
     let self_spk = notes_core::address::p2tr_script_pubkey(&note.identity.output_x);
-    assemble_funded_note_psbt(plan, &payloads, recipient_spk, DUST_LIMIT, self_spk)
+    let amount = if recipient_spk.is_some() { recipient_amount.max(DUST_LIMIT) } else { DUST_LIMIT };
+    assemble_funded_note_psbt(plan, &payloads, recipient_spk, amount, self_spk)
 }
 
 /// A WATCH identity's externally funded PUBLIC note: the funding wallet's
@@ -828,6 +844,51 @@ mod tests {
         assert_eq!(built.sent_to_recipient, 0);
         assert_eq!(built.dust_to_self, 330);
         assert_eq!(100_000, built.fee + built.change + 330);
+    }
+
+    /// `build_funding_psbt` == `build_funding_psbt_amount(.., DUST_LIMIT)`
+    /// byte-for-byte (the delegation this milestone introduced must not
+    /// change the existing external-funding path), and a configurable gift
+    /// (funding-unification M3, the spending-wallet compose path) sizes the
+    /// recipient output instead of the dust default — a self-note's ignores
+    /// the amount entirely (no recipient output to size).
+    #[test]
+    fn funding_psbt_amount_delegates_and_supports_a_gift() {
+        let src = source();
+        let coins = one_coin(&src);
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let to_bob = Recipient::parse(NET, &bob.address(NET)).unwrap();
+        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 1.0, change_override: None };
+        let np = NoteParams {
+            identity: &alice,
+            text: "gift test",
+            private: false,
+            recipient: Some(&to_bob),
+            note_id: [2, 2, 2, 2],
+            max_op_return_bytes: 80,
+            network: NET,
+        };
+        let default_built = build_funding_psbt(&plan, &np).unwrap();
+        let dust_built = build_funding_psbt_amount(&plan, &np, DUST_LIMIT).unwrap();
+        assert_eq!(default_built.sent_to_recipient, dust_built.sent_to_recipient);
+        assert_eq!(default_built.fee, dust_built.fee);
+        assert_eq!(default_built.sent_to_recipient, DUST_LIMIT);
+
+        let gifted = build_funding_psbt_amount(&plan, &np, 5_000).unwrap();
+        assert_eq!(gifted.sent_to_recipient, 5_000);
+        assert!(gifted.psbt.unsigned_tx.output.iter().any(|o| o.script_pubkey.as_bytes() == to_bob.spk && o.value.to_sat() == 5_000));
+
+        // A gift below dust is clamped UP to dust, never dropped.
+        let below_dust = build_funding_psbt_amount(&plan, &np, 10).unwrap();
+        assert_eq!(below_dust.sent_to_recipient, DUST_LIMIT);
+
+        // Self-note: the amount is irrelevant (no recipient output exists).
+        let self_np = NoteParams { recipient: None, ..np };
+        let self_plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 1.0, change_override: None };
+        let self_built = build_funding_psbt_amount(&self_plan, &self_np, 99_999).unwrap();
+        assert_eq!(self_built.sent_to_recipient, 0);
+        assert_eq!(self_built.dust_to_self, DUST_LIMIT);
     }
 
     /// Watch spend (sweep/consolidate) + bump: build from the identity

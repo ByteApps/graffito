@@ -145,6 +145,7 @@ pub fn compose_and_record(
         vsize: Some(tx.vsize as u64),
         change_to: req.change_to.map(str::to_string),
         gift_amount: recipient.as_ref().map(|_| tx.sent),
+        funded_by: None,
     };
     store.record_signed(record, change_utxo);
 

@@ -169,6 +169,26 @@ struct State {
     /// field, no re-derivation/re-auth. Dropped (zeroized) on hide/back/
     /// reset. Public keys never touch this — they derive from `material`.
     reveal_formats: Option<app_core::keyexport::ExportFormats>,
+    /// Funding-unification M3: whether the active identity's key material
+    /// can derive a BIP-84 spending wallet (mnemonic / master xprv) —
+    /// computed once per `activate()`, gates the Settings toggle and the
+    /// compose "Pay from · Spending wallet" option. Watch/WIF/hex/
+    /// account-xprv identities are never capable.
+    spending_capable: bool,
+    /// The identity's spending wallet, once derived + scanned this
+    /// session: the descriptor-backed source (scanning + funded-note
+    /// assembly reuse the exact same `FundingSource` machinery external
+    /// funding wallets use — see app-core `spending.rs`), its spendable
+    /// coins, and whether a scan has completed at least once (gates the
+    /// UI from showing a stale "0 sats" before the first scan finishes).
+    spending_source: Option<FundingSource>,
+    spending_coins: Vec<FundingUtxo>,
+    spending_scanned: bool,
+    /// Settings → "Sweep notebook funds here": the spending-wallet receive
+    /// index the sweep destination was set to, so the broadcast handler
+    /// can mark it used on success (fresh-address discipline). None for
+    /// every other sweep destination.
+    pending_spending_sweep_index: Option<u32>,
 }
 
 /// One wallet-consolidate session (Coins → "Consolidate into one coin…").
@@ -194,6 +214,10 @@ struct WatchNote {
     fee: u64,
     change: u64,
     spent: Vec<app_core::store::OutPointRef>,
+    /// Funding-unification M3: `Some("wallet:<label>")` when an external
+    /// funding wallet paid (Activity's source pill); `None` for a watch
+    /// identity's own-coin self-funded compose.
+    funded: Option<String>,
 }
 
 struct WatchSpend {
@@ -375,6 +399,28 @@ fn replaced_label(txid_count: usize) -> String {
     }
 }
 
+/// The active external funding wallet's Activity pill value
+/// (`"wallet:<label>"`), or `None` if no funding wallet is active — used
+/// when recording a note an external wallet paid for.
+fn active_funding_pill(st: &State) -> Option<String> {
+    let id = st.active_funding_id.as_ref()?;
+    let fw = st.funding_wallets.iter().find(|f| &f.id == id)?;
+    Some(format!("wallet:{}", fw.label))
+}
+
+/// Activity's funding-source pill (funding-unification M3): `NoteRecord.
+/// funded_by` is `Some("spending")` for the internal BIP-84 spending
+/// wallet or `Some("wallet:<label>")` for an external funding wallet;
+/// `None` (every pre-M3 record, and every notebook-funded note) shows no
+/// pill at all — byte-identical to today's Activity row.
+fn funded_pill(funded_by: Option<&str>) -> String {
+    match funded_by {
+        Some("spending") => "spending wallet".to_string(),
+        Some(s) => s.strip_prefix("wallet:").map(str::to_string).unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
 /// "New fee ~N sats (+D)" for a proposed rate over a tx of `vsize`.
 fn new_fee_line(rate: f64, vsize: u64, old_fee: u64) -> String {
     let new_fee = (rate * vsize as f64).ceil() as u64;
@@ -499,6 +545,7 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
             vsize: Some(vsize),
             change_to: None,
             gift_amount: wn.recipient.is_some().then_some(wn.gift),
+            funded_by: wn.funded.clone(),
         },
         change,
     );
@@ -1085,6 +1132,7 @@ fn update_activity(w: &AppWindow, st: &State) {
                 pending: *actionable && n.status == NoteStatus::Pending && n.raw_hex.is_some(),
                 replaced: replaced_label(n.txids.len()).into(),
                 notebook: tag.clone().into(),
+                funded: funded_pill(n.funded_by.as_deref()).into(),
             },
         ));
     }
@@ -1116,6 +1164,7 @@ fn update_activity(w: &AppWindow, st: &State) {
                 pending: *actionable && t.status == NoteStatus::Pending && t.raw_hex.is_some(),
                 replaced: replaced_label(t.txids.len()).into(),
                 notebook: tag.clone().into(),
+                funded: "".into(), // sweeps/consolidates aren't funded-note records
             },
         ));
     }
@@ -1170,6 +1219,14 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
         keychain::store_secret_protected(KEYCHAIN_ACCOUNT, material_str.trim(), st.icloud_backup)?;
     }
     st.material = Some(Zeroizing::new(material_str.trim().to_string()));
+    // Funding-unification M3: the spending wallet is per (identity,
+    // account) — reset session state on every activate() (boot, network/
+    // account switch, identity reset→reimport) and recompute capability
+    // from the fresh material. Cheap: no chain call, just a key-type check.
+    st.spending_capable = app_core::spending::can_derive_spending(&material);
+    st.spending_source = None;
+    st.spending_coins.clear();
+    st.spending_scanned = false;
     let fp = hex::encode(ident.output_x());
     let path = st
         .data_dir
@@ -1836,6 +1893,7 @@ fn update_home(w: &AppWindow, st: &State) {
     w.set_chunk_text(store.chunk_size.to_string().into());
     load_backend_settings(w, st);
     update_wallet_coins(w, st);
+    update_spending_ui(w, st);
 }
 
 /// The wallet-wide coins viewer (screen 10 + the Settings Coins card):
@@ -2150,6 +2208,159 @@ fn refresh(w: &AppWindow, st: &mut State) {
     update_home(w, st);
 }
 
+/// One finished spending-wallet scan (worker thread), waiting to be applied
+/// on the UI thread. (fp8, network, account) guards staleness — switching
+/// identity/network/account mid-scan drops the result, same pattern as
+/// [`RefreshResult`]/[`DiscoveryResult`]. Carries BOTH a `discover_spending`
+/// gap-walk (which addresses have history — merged into `store.spending.
+/// used` so the self-spk SET recognizes a spending-wallet-funded note as
+/// OWN on the next rescan; a plain `scan_funding` alone finds spendable
+/// coins but never marks their addresses "used") and a `scan_funding` call
+/// (the coins themselves, with values — what the funded-note builder needs).
+struct SpendingRefreshResult {
+    fp8: String,
+    network: Network,
+    account: u32,
+    discovery: Option<(Vec<app_core::store::SpendingAddr>, u32, u32)>,
+    scan: Result<app_core::funding::FundingScan, String>,
+}
+
+static SPENDING_REFRESH_RESULTS: std::sync::Mutex<Vec<SpendingRefreshResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Kick off a spending-wallet coin scan on a worker thread (funding-
+/// unification M3) — never block the UI thread with the chain call. A
+/// no-op when the identity can't derive a spending wallet, or none is
+/// configured (no node). Results land through [`SPENDING_REFRESH_RESULTS`]
+/// + the `apply-pending-spending-refresh` trampoline, exactly like
+/// [`refresh_async`].
+fn spending_refresh_async(w: &AppWindow, st: &mut State) {
+    if !st.spending_capable {
+        return;
+    }
+    let Some(material) = st.material.clone() else { return };
+    let Some(base) = st.base_url() else { return };
+    let network = st.network;
+    let account = st.account;
+    let Some(fp8) = st.notebooks_fp8.clone() else { return };
+    w.set_status("scanning spending wallet…".into());
+    let weak = w.as_weak();
+    std::thread::spawn(move || {
+        let material_parsed = parse_key_material(&material, network);
+        let source = material_parsed
+            .as_ref()
+            .map_err(|e| e.to_string())
+            .and_then(|m| app_core::spending::funding_source(m, network, account).map_err(|e| e.to_string()));
+        let client = ChainClient::new(HttpTransport::new(base), network);
+        // Gap-walk first (marks every used address, receive AND change, so
+        // OWN-detection on rescan covers coins this app never explicitly
+        // "handed out" — e.g. an address funded before the app ever showed
+        // it), then the plain coin scan for spendable values.
+        let discovery =
+            source.as_ref().ok().map(|src| app_core::chain::discover_spending(&client, src, 20));
+        let scan = source.and_then(|src| client.scan_funding(&src, 20).map_err(|e| e.to_string()));
+        drop(material); // Zeroizing — wiped as soon as the scan is done
+        SPENDING_REFRESH_RESULTS
+            .lock()
+            .expect("spending refresh mutex")
+            .push(SpendingRefreshResult { fp8, network, account, discovery, scan });
+        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_spending_refresh());
+    });
+}
+
+/// The UI-thread half of [`spending_refresh_async`]: cache the coins +
+/// source, log the result, and repaint every screen that shows the
+/// spending wallet (Settings card, compose picker, Coins segment).
+fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
+    let results: Vec<SpendingRefreshResult> =
+        SPENDING_REFRESH_RESULTS.lock().expect("spending refresh mutex").drain(..).collect();
+    for r in results {
+        if st.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
+            || st.network != r.network
+            || st.account != r.account
+        {
+            println!("cb: spending-refresh stale-drop");
+            continue;
+        }
+        if let (Some((used, next_receive, next_change)), Some(store)) =
+            (r.discovery, st.store.as_mut())
+        {
+            store.spending_apply_discovery(used, next_receive, next_change);
+        }
+        match r.scan {
+            Ok(scan) => {
+                st.spending_coins = scan.utxos;
+                if let Some(material) = st.material.as_ref() {
+                    if let Ok(m) = parse_key_material(material.as_str(), st.network) {
+                        st.spending_source = app_core::spending::funding_source(&m, st.network, st.account).ok();
+                    }
+                }
+                st.save_store();
+                st.spending_scanned = true;
+                let balance: u64 = st.spending_coins.iter().map(|c| c.value).sum();
+                println!("cb: spending-refresh utxos={} balance={balance}", st.spending_coins.len());
+                w.set_status("".into());
+            }
+            Err(e) => {
+                println!("cb: spending-refresh err={e}");
+                w.set_status(format!("spending wallet scan failed: {e}").into());
+            }
+        }
+        update_spending_ui(w, st);
+        if w.get_screen() == 6 && w.get_pay_from() == "spending" {
+            refresh_compose(w, st);
+        }
+    }
+}
+
+/// Populate every spending-wallet-facing property: the Settings card
+/// (capability/enabled/balance/next-receive QR), the compose picker's
+/// subtitle, and the Coins screen's "spending" segment rows. Cheap local
+/// derivation only — no chain call (callers that need fresh data call
+/// [`spending_refresh_async`] first).
+fn update_spending_ui(w: &AppWindow, st: &State) {
+    w.set_spending_capable(st.spending_capable);
+    let enabled = st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false);
+    w.set_spending_enabled(enabled);
+    if !st.spending_capable {
+        w.set_spending_summary("".into());
+        w.set_spending_balance_line("".into());
+        w.set_spending_address("".into());
+        w.set_spending_qr(slint::Image::default());
+        let empty: Vec<SpendingCoinItem> = Vec::new();
+        w.set_spending_coins_list(VecModel::from_slice(&empty));
+        return;
+    }
+    let n = st.spending_coins.len();
+    let total: u64 = st.spending_coins.iter().map(|c| c.value).sum();
+    if !st.spending_scanned {
+        w.set_spending_summary(if enabled { "tap to scan…".to_string() } else { String::new() }.into());
+        w.set_spending_balance_line("not scanned yet — tap refresh".into());
+    } else {
+        let line = format!("{} sats · {n} coin{}", commas(total), if n == 1 { "" } else { "s" });
+        w.set_spending_summary(line.clone().into());
+        w.set_spending_balance_line(line.into());
+    }
+    if let (Some(src), Some(store)) = (st.spending_source.as_ref(), st.store.as_ref()) {
+        if let Ok(d) = src.derive(0, store.spending.next_receive) {
+            w.set_spending_address(d.address.clone().into());
+            w.set_spending_qr(qr::qr_image(&d.address.to_uppercase()).unwrap_or_default());
+        }
+    }
+    let exb = st.explorer_base();
+    let _ = exb; // per-coin explorer link not shown here — status is enough
+    let rows: Vec<SpendingCoinItem> = st
+        .spending_coins
+        .iter()
+        .map(|c| SpendingCoinItem {
+            address: short_addr(&c.address).into(),
+            value: c.value.to_string().into(),
+            status: if c.confirmed { "confirmed" } else { "unconfirmed" }.into(),
+        })
+        .collect();
+    w.set_spending_coins_list(VecModel::from_slice(&rows));
+}
+
 /// Estimated (chunks, vsize) for a note. `estimate_note_cost` assumes a
 /// 34-byte taproot change output; when the change goes to a custom script
 /// of `l` bytes, correct the vsize by `l - 34` (outputs aren't
@@ -2268,6 +2479,32 @@ fn suggested_coins(
 /// Recompute the whole compose screen from state: coin list + selection,
 /// spend total, live cost, change preview, change-address validation, and
 /// the feasibility gate on the Sign button.
+/// Apply a "Pay from" picker selection on compose (funding-unification
+/// M3): "notebook" (today's path, default) or "spending" (the identity's
+/// own BIP-84 wallet). External wallets go through [`activate_funding_wallet`]
+/// instead (it sets `pay-from` to `"wallet:<id>"` itself, since picking one
+/// also has to scan it). Kicks a background scan the first time "spending"
+/// is chosen this session.
+fn apply_pay_from(w: &AppWindow, st: &mut State, kind: &str) {
+    match kind {
+        "spending" => {
+            w.set_pay_from("spending".into());
+            w.set_pay_from_label("Spending wallet".into());
+            w.set_fund_external(false);
+            w.set_spend_from_wallet(true);
+            if !st.spending_scanned {
+                spending_refresh_async(w, st);
+            }
+        }
+        _ => {
+            w.set_pay_from("notebook".into());
+            w.set_pay_from_label("Notebook".into());
+            w.set_fund_external(false);
+            w.set_spend_from_wallet(false);
+        }
+    }
+}
+
 fn refresh_compose(w: &AppWindow, st: &mut State) {
     let net = st.network;
     let text = w.get_compose_text().to_string();
@@ -2277,6 +2514,12 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     // not the self-funded store coins. Handled on its own isolated path.
     if w.get_fund_external() {
         funding_compose_ui(w, st, &text);
+        return;
+    }
+    // Internal spending-wallet mode (funding-unification M3): same idea,
+    // but the source is the identity's OWN BIP-84 wallet, signed in-app.
+    if w.get_spend_from_wallet() {
+        spending_compose_ui(w, st, &text);
         return;
     }
     let spk_len = st
@@ -2492,6 +2735,138 @@ fn funding_compose_ui(w: &AppWindow, st: &State, text: &str) {
     }
 }
 
+/// Internal-spending-wallet variant of the compose coin panel (funding-
+/// unification M3): shows the identity's OWN BIP-84 spending-wallet coins
+/// (all of them — no coin control, matching the external funded path
+/// above) and a LIVE cost/change preview from a dry-run of the exact same
+/// funded-note assembly the broadcast path uses
+/// (`psbt_build::build_funding_psbt_amount`), so the preview and the real
+/// build can never disagree.
+fn spending_compose_ui(w: &AppWindow, st: &State, text: &str) {
+    let net = st.network;
+    let n = st.spending_coins.len();
+    let total: u64 = st.spending_coins.iter().map(|c| c.value).sum();
+    let exb = st.explorer_base();
+    let coins: Vec<SpendCoin> = st
+        .spending_coins
+        .iter()
+        .map(|c| SpendCoin {
+            outpoint: format!("{}:{}", c.txid, c.vout).into(),
+            value: c.value.to_string().into(),
+            confirmed: c.confirmed,
+            selected: true,
+            txid_short: c.txid[..8.min(c.txid.len())].to_string().into(),
+            explorer: explorer_tx_url(exb.as_deref(), net, &c.txid).into(),
+        })
+        .collect();
+    w.set_spend_coins(VecModel::from_slice(&coins));
+    w.set_spend_title(
+        format!("Spending wallet · {n} coin{} · {} sats", if n == 1 { "" } else { "s" }, commas(total)).into(),
+    );
+
+    // Change destination: blank = a fresh spending-wallet address; a valid
+    // custom address overrides it — same pattern as the other two panels.
+    let change_trim = w.get_change_address().trim().to_string();
+    let change_override_spk = if change_trim.is_empty() {
+        w.set_change_error("".into());
+        None
+    } else {
+        match Recipient::parse(net, &normalize_addr(&change_trim)) {
+            Ok(r) => {
+                w.set_change_error("".into());
+                Some(r.spk)
+            }
+            Err(_) => {
+                w.set_change_amount("Change: ⚠ invalid".into());
+                w.set_change_error(format!("Not a valid {} address.", net.as_str()).into());
+                w.set_spend_enough(false);
+                return;
+            }
+        }
+    };
+
+    if n == 0 {
+        w.set_cost_line("".into());
+        w.set_change_amount("Spending wallet has no coins yet — fund its receive address in Settings.".into());
+        w.set_spend_enough(false);
+        return;
+    }
+    if text.is_empty() {
+        w.set_cost_line("".into());
+        w.set_change_amount(
+            if change_override_spk.is_some() {
+                format!("Change to {}…", &change_trim[..14.min(change_trim.len())])
+            } else {
+                "Change to a fresh spending-wallet address".to_string()
+            }
+            .into(),
+        );
+        w.set_spend_enough(true);
+        return;
+    }
+    let (Some(source), Some(store), Some(identity)) = (
+        st.spending_source.as_ref(),
+        st.store.as_ref(),
+        st.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()),
+    ) else {
+        w.set_cost_line("".into());
+        w.set_spend_enough(false);
+        return;
+    };
+    let recipient = st.to_address.as_deref().and_then(|a| Recipient::parse(net, a).ok());
+    let gift = if recipient.is_some() {
+        w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+    } else {
+        0
+    };
+    let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
+    let change_index = store.spending.next_change;
+    let has_custom_change = change_override_spk.is_some();
+    let plan = FundingPlan {
+        source,
+        coins: &st.spending_coins,
+        change_index,
+        fee_rate: rate,
+        change_override: change_override_spk,
+    };
+    let np = NoteParams {
+        identity: &identity,
+        text,
+        private: w.get_compose_private(),
+        recipient: recipient.as_ref(),
+        note_id: [0, 0, 0, 0], // preview only — the real send draws a fresh id
+        max_op_return_bytes: store.chunk_size,
+        network: net,
+    };
+    match app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift) {
+        Ok(built) => {
+            let usd = st.usd.map(|p| format!(" (~${:.2})", built.fee as f64 * p / 1e8)).unwrap_or_default();
+            let gift_line = if recipient.is_some() {
+                format!(" + {} sats to recipient", commas(built.sent_to_recipient))
+            } else {
+                String::new()
+            };
+            w.set_cost_line(
+                format!("~{} sats fee{usd}{gift_line} · +330 sats dust-to-self", built.fee).into(),
+            );
+            w.set_change_amount(
+                if has_custom_change {
+                    format!("Change to {}… · ~{} sats", &change_trim[..14.min(change_trim.len())], built.change)
+                } else {
+                    format!("Change to a fresh spending-wallet address · ~{} sats", built.change)
+                }
+                .into(),
+            );
+            w.set_spend_enough(true);
+        }
+        Err(e) => {
+            w.set_cost_line("".into());
+            w.set_change_amount(format!("{e}").into());
+            w.set_spend_enough(false);
+        }
+    }
+}
+
 /// A per-frame preview closure for [`camera::capture_frames`] — pushes each
 /// downscaled frame to the shared `camera-frame` image so the scan overlay
 /// shows a live view (QR detection, not the preview, is what's throttled).
@@ -2575,6 +2950,11 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
                 update_sweep_screen(w, st);
             } else {
                 w.set_fund_external(true);
+                w.set_spend_from_wallet(false);
+                let label = st.funding_wallets[idx].label.clone();
+                w.set_pay_from(format!("wallet:{id}").into());
+                w.set_pay_from_label(label.clone().into());
+                println!("cb: pay-from wallet:{label}");
                 w.set_spend_expanded(true);
                 w.set_screen(6);
                 refresh_compose(w, st);
@@ -2998,6 +3378,11 @@ pub fn run() {
         discovery_pending: false,
         wconsol: None,
         reveal_formats: None,
+        spending_capable: false,
+        spending_source: None,
+        spending_coins: Vec::new(),
+        spending_scanned: false,
+        pending_spending_sweep_index: None,
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -3302,6 +3687,25 @@ pub fn run() {
         }
     });
 
+    // Funding-unification M3: "Separate spending wallet" toggle. Persisted
+    // per-identity (store.spending.enabled) like any other store setting —
+    // survives restarts, resets to off on a fresh identity.
+    cb!(on_set_spending_enabled, |w, s, on: bool| {
+        println!("cb: set-spending enabled={on}");
+        if let Some(store) = s.store.as_mut() {
+            store.spending_set_enabled(on);
+        }
+        s.save_store();
+        update_spending_ui(&w, &s);
+        if on && !s.spending_scanned {
+            spending_refresh_async(&w, &mut s);
+        }
+    });
+
+    cb!(on_spending_refresh, |w, s| {
+        spending_refresh_async(&w, &mut s);
+    });
+
     // Restore from an existing iCloud-synced key (onboarding, after reinstall
     // or on a new device).
     cb!(on_restore_icloud, |w, s| {
@@ -3559,6 +3963,12 @@ pub fn run() {
         apply_refresh_results(&w, &mut s);
     });
 
+    // Trampoline: a finished spending-wallet scan (funding-unification M3)
+    // landed — same pattern as apply-pending-refresh.
+    cb!(on_apply_pending_spending_refresh, |w, s| {
+        apply_spending_refresh_results(&w, &mut s);
+    });
+
     // Trampoline: worker-thread used/new probes for the create-notebook
     // picker landed — fill in the pills/balances without having blocked the
     // tap. Guarded by account/page/screen so a stale probe (user paged or
@@ -3704,8 +4114,21 @@ pub fn run() {
     cb!(on_open_coins, |w, s| {
         println!("cb: open-coins");
         update_home(&w, &s);
+        update_spending_ui(&w, &s);
+        if w.get_coins_segment() == "spending" && s.spending_capable && !s.spending_scanned {
+            spending_refresh_async(&w, &mut s);
+        }
         w.set_status("".into());
         w.set_screen(10);
+    });
+
+    // Coins screen "spending" segment: scan on first view (data otherwise
+    // stays "as of the last scan", matching the notebook segment's rule).
+    cb!(on_set_coins_segment, |w, s, seg: SharedString| {
+        w.set_coins_segment(seg.clone());
+        if seg.as_str() == "spending" && s.spending_capable && !s.spending_scanned {
+            spending_refresh_async(&w, &mut s);
+        }
     });
 
     cb!(on_open_activity, |w, s| {
@@ -4118,6 +4541,23 @@ pub fn run() {
                                 rec.input_indexes = input_indexes;
                             }
                         }
+                        // Funding-unification M3: this sweep's destination was
+                        // the spending wallet's next receive address — mark it
+                        // used so the NEXT sweep/compose hands out a fresh one.
+                        if let Some(idx) = s.pending_spending_sweep_index.take() {
+                            if let (Some(src), Some(store)) =
+                                (s.spending_source.clone(), s.store.as_mut())
+                            {
+                                if let Ok(addr) = src.derive(0, idx) {
+                                    store.spending_mark_used(app_core::store::SpendingAddr {
+                                        chain: 0,
+                                        index: idx,
+                                        address: addr.address,
+                                        script_pubkey_hex: hex::encode(&addr.spk),
+                                    });
+                                }
+                            }
+                        }
                         s.save_store();
                         println!(
                             "cb: sweep txid={txid} value={} fee={} notebooks={}",
@@ -4163,12 +4603,31 @@ pub fn run() {
 
     cb!(on_sweep_open, |w, s| {
         println!("cb: sweep-open");
+        s.pending_spending_sweep_index = None; // a fresh manual pick, not the spending-wallet shortcut
         w.set_sweep_kind("sweep".into());
         w.set_pick_mode("sweep".into());
         refresh_contacts(&w, &s);
         w.set_contact_input("".into());
         w.set_status("".into());
         w.set_screen(7);
+    });
+
+    // Funding-unification M3: Settings spending-wallet card "Sweep notebook
+    // funds here…" — routes through the EXISTING sweep flow (screen 7 →
+    // 16), just pre-picking the destination = the spending wallet's next
+    // receive address. `pending_spending_sweep_index` tells on_sweep's
+    // success handler to mark that address used (fresh-address discipline).
+    cb!(on_spending_sweep_here, |w, s| {
+        let Some(src) = s.spending_source.clone() else {
+            w.set_status("spending wallet not scanned yet".into());
+            return;
+        };
+        let Some(idx) = s.store.as_ref().map(|st| st.spending.next_receive) else { return };
+        let Ok(d) = src.derive(0, idx) else { return };
+        s.pending_spending_sweep_index = Some(idx);
+        w.set_sweep_kind("sweep".into());
+        w.set_pick_mode("sweep".into());
+        set_sweep_dest(&w, &mut s, d.address);
     });
 
     cb!(on_consolidate_open, |w, s| {
@@ -4633,6 +5092,10 @@ pub fn run() {
                     return;
                 }
             }
+            // A manual pick here always replaces whatever destination was
+            // set before (including the spending-wallet shortcut) — don't
+            // mark a stale index used for an address the user didn't pick.
+            s.pending_spending_sweep_index = None;
             set_sweep_dest(&w, &mut s, a);
             return;
         }
@@ -4681,6 +5144,13 @@ pub fn run() {
         w.set_gift_expanded(false);
         s.selected_coins.clear();
         w.set_status("".into());
+        w.set_payfrom_expanded(false);
+        // Funding-unification M3: default to the spending wallet when the
+        // setting is on (PLAN "UI" section); a watch identity has none.
+        let spending_default = s.spending_capable
+            && !s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false)
+            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false);
+        apply_pay_from(&w, &mut s, if spending_default { "spending" } else { "notebook" });
         w.set_screen(6);
         refresh_compose(&w, &mut s);
     });
@@ -4946,6 +5416,11 @@ pub fn run() {
         println!("cb: refresh-coins notebooks={}", scanned + 1);
         refresh(&w, &mut s); // the active notebook + fees; rebuilds the view
         w.set_status("".into());
+        if s.spending_capable
+            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
+        {
+            spending_refresh_async(&w, &mut s);
+        }
         refresh_compose(&w, &mut s);
     });
 
@@ -5003,6 +5478,15 @@ pub fn run() {
             refresh_funding_list(&w, &s);
             w.set_screen(15);
         }
+    });
+
+    // Funding-unification M3: compose "Pay from" picker — "notebook" or
+    // "spending". External wallets are picked via use-funding-wallet
+    // directly (they need a scan first, same as before this milestone).
+    cb!(on_set_pay_from, |w, s, kind: SharedString| {
+        println!("cb: pay-from {kind}");
+        apply_pay_from(&w, &mut s, kind.as_str());
+        refresh_compose(&w, &mut s);
     });
 
     cb!(on_open_funding, |w, s| {
@@ -5260,6 +5744,7 @@ pub fn run() {
                         fee: built.fee,
                         change: 0, // funding change isn't an own coin
                         spent: Vec::new(),
+                        funded: active_funding_pill(&s),
                     });
                     let n = coins.len();
                     let cost = format!(
@@ -5518,6 +6003,7 @@ pub fn run() {
                             .iter()
                             .map(|c| app_core::store::OutPointRef { txid: c.txid.clone(), vout: c.vout })
                             .collect(),
+                        funded: None, // spends the notebook's own coins
                     });
                     let cost = format!(
                         "public note · fee {} sats{} · sign with your external wallet",
@@ -5594,6 +6080,195 @@ pub fn run() {
         }
     });
 
+    // Funding-unification M3: the internal spending-wallet compose path —
+    // build the SAME funded-note shape the external path uses
+    // (`build_funding_psbt_amount`), sign every P2WPKH input in-process
+    // (`sign_own_wpkh_inputs` — no PSBT export/import round trip), and
+    // broadcast in one tap. Mirrors `examples/cli.rs`'s `note-spend-funded`
+    // recipe exactly.
+    cb!(on_spending_compose_send, |w, s| {
+        let text = w.get_compose_text().to_string();
+        let private = w.get_compose_private();
+        let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(0.0);
+        if text.is_empty() || rate <= 0.0 {
+            w.set_status("empty note or bad fee rate".into());
+            return;
+        }
+        let net = s.network;
+        let Some(base) = s.base_url() else {
+            w.set_status("no Bitcoin node — set one in Settings".into());
+            return;
+        };
+        let to = s.to_address.clone();
+        let recipient = match to.as_deref() {
+            Some(a) => match Recipient::parse(net, a) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    w.set_status(format!("{e}").into());
+                    return;
+                }
+            },
+            None => None,
+        };
+        let change_raw = normalize_addr(w.get_change_address().as_str());
+        let change_override = if change_raw.is_empty() {
+            None
+        } else {
+            match Recipient::parse(net, &change_raw) {
+                Ok(r) => Some(r.spk),
+                Err(_) => {
+                    w.set_status(format!("change address isn't a valid {} address", net.as_str()).into());
+                    return;
+                }
+            }
+        };
+        let Some(source) = s.spending_source.clone() else {
+            w.set_status("spending wallet not scanned yet".into());
+            return;
+        };
+        if s.spending_coins.is_empty() {
+            w.set_status("spending wallet has no coins — fund it from Settings".into());
+            return;
+        }
+        let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+            w.set_status("no identity".into());
+            return;
+        };
+        let Ok(key_material) = parse_key_material(&material_str, net) else {
+            w.set_status("identity parse failed".into());
+            return;
+        };
+        let account = s.account;
+        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+            w.set_status("no identity".into());
+            return;
+        };
+        let Some(change_index) = s.store.as_ref().map(|st| st.spending.next_change) else { return };
+        let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
+        let gift = if recipient.is_some() {
+            w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+        } else {
+            0
+        };
+        let mut note_id = [1u8, 2, 3, 4];
+        for _ in 0..8 {
+            let r = app_core::notes_core::keys::generate_aux_rand()
+                .map(|x| [x[0], x[1], x[2], x[3]])
+                .unwrap_or(note_id);
+            note_id = r;
+            if !s.store.as_ref().map(|st| st.note_id_taken(&note_id)).unwrap_or(false) {
+                break;
+            }
+        }
+        let plan = FundingPlan {
+            source: &source,
+            coins: &s.spending_coins,
+            change_index,
+            fee_rate: rate,
+            change_override,
+        };
+        let np = NoteParams {
+            identity: &identity,
+            text: &text,
+            private,
+            recipient: recipient.as_ref(),
+            note_id,
+            max_op_return_bytes: chunk,
+            network: net,
+        };
+        let built = match app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift) {
+            Ok(b) => b,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let mut psbt = built.psbt.clone();
+        let signed = match app_core::psbt_build::sign_own_wpkh_inputs(
+            &mut psbt,
+            &key_material,
+            net,
+            account,
+            &s.spending_coins,
+        ) {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                w.set_status("no spending-wallet inputs signed".into());
+                return;
+            }
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let (raw, txid, vsize) = match finalize_extract(psbt) {
+            Ok(x) => x,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let client = ChainClient::new(HttpTransport::new(&base), net);
+        match client.broadcast(&raw) {
+            Ok(got_txid) => {
+                if built.change > 0 {
+                    if let Ok(change_addr) = source.derive(1, change_index) {
+                        if let Some(store) = s.store.as_mut() {
+                            store.spending_mark_used(app_core::store::SpendingAddr {
+                                chain: 1,
+                                index: change_index,
+                                address: change_addr.address,
+                                script_pubkey_hex: hex::encode(&change_addr.spk),
+                            });
+                        }
+                    }
+                }
+                if let Some(store) = s.store.as_mut() {
+                    store.record_signed(
+                        app_core::store::NoteRecord {
+                            note_id: hex::encode(note_id),
+                            status: NoteStatus::Pending,
+                            text: Some(text.clone()),
+                            private,
+                            directed: recipient.is_some(),
+                            received: false,
+                            sender: None,
+                            recipient: to.clone(),
+                            txids: vec![got_txid.clone()],
+                            height: None,
+                            blocktime: None,
+                            created_at: Some(now()),
+                            spent: Vec::new(), // spending-wallet inputs only — no notebook coin locked
+                            raw_hex: Some(raw.clone()),
+                            fee: Some(built.fee),
+                            vsize: Some(vsize as u64),
+                            change_to: (!change_raw.is_empty()).then(|| change_raw.clone()),
+                            gift_amount: recipient.as_ref().map(|_| gift),
+                            funded_by: Some("spending".into()),
+                        },
+                        None,
+                    );
+                }
+                s.save_store();
+                println!(
+                    "cb: compose id={} txid={got_txid} fee={} vsize={vsize} to={} private={private} funded=spending broadcast=ok",
+                    hex::encode(note_id),
+                    built.fee,
+                    to.as_deref().unwrap_or("self"),
+                );
+                w.set_status(format!("broadcast {}…", &got_txid[..12.min(got_txid.len())]).into());
+                w.set_compose_text("".into());
+                w.set_change_address("".into());
+                w.set_change_expanded(false);
+                w.set_spend_expanded(false);
+                w.set_payfrom_expanded(false);
+                w.set_screen(4);
+                refresh(&w, &mut s);
+            }
+            Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
+        }
+    });
+
     cb!(on_settings_open, |w, s| {
         w.set_return_screen(if w.get_screen() == 17 { 17 } else { 4 });
         println!("cb: settings-open");
@@ -5601,6 +6276,13 @@ pub fn run() {
         w.set_status("".into());
         w.set_chunk_custom(false);
         load_backend_settings(&w, &s);
+        update_spending_ui(&w, &s);
+        if s.spending_capable
+            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
+            && !s.spending_scanned
+        {
+            spending_refresh_async(&w, &mut s);
+        }
         // Fresh entry from the list starts at the top; returning from a Settings
         // sub-screen (via nav-back, which doesn't call this) keeps its position.
         w.set_settings_scroll_y(0.0);

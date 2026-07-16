@@ -28,6 +28,10 @@ export struct AccountItem { index: int, address: string, active: bool, pill: str
 // `notebook` = owning notebook's display name (the coins viewer is
 // wallet-wide since 2026-07-11).
 export struct CoinItem { outpoint: string, value: string, status: string, notebook: string }
+// A spending-wallet UTXO (funding-unification M3, Coins screen "Spending"
+// segment) — address instead of `notebook` since these coins live on the
+// BIP-84 fresh-address chain, not any one notebook.
+export struct SpendingCoinItem { address: string, value: string, status: string }
 export struct SpendCoin { outpoint: string, value: string, confirmed: bool, selected: bool, txid-short: string, explorer: string }
 // One input/output row in the Sparrow-style PSBT confirmation. `kind` drives
 // the accent: note · self · recipient · change · input · other.
@@ -40,7 +44,9 @@ export struct FundingWalletRow { id: string, label: string, meta: string, active
 export struct ActivityItem {
     ref-id: string, is-note: bool, kind: string, title: string,
     txid: string, fee-line: string, status: string, explorer: string,
-    pending: bool, replaced: string, notebook: string }
+    pending: bool, replaced: string, notebook: string,
+    // Funding-unification M3: "spending" | "wallet:<label>" | "" (notebook-funded).
+    funded: string }
 
 // Per-platform optical calibration, set from Rust at startup. The header
 // title Text sits differently inside its line box per platform font (macOS/
@@ -1097,6 +1103,25 @@ export component AppWindow inherits Window {
     in property <[FundingWalletRow]> funding-wallets;   // saved wallet manager
     in-out property <string> fund-rename-id;            // non-empty = rename modal open
     in-out property <string> fund-rename-input;
+    // ---- internal spending wallet (funding-unification M3, PLAN-chain-notes-funding-unification.md) ----
+    // Same BIP-84 branch of the SAME seed as the notebook's BIP-86 leaf,
+    // signed fully in-app — no PSBT round trip. HD identities only.
+    in property <bool> spending-capable;      // material can derive m/84' (mnemonic / master xprv)
+    in-out property <bool> spending-enabled;  // the persisted Settings toggle
+    in property <string> spending-summary;    // "12,340 sats · 2 coins" or a call to action
+    in property <string> spending-balance-line;
+    in property <string> spending-address;    // next unused receive address
+    in property <image> spending-qr;
+    in property <[SpendingCoinItem]> spending-coins-list;   // Coins screen "Spending" segment
+    in-out property <string> coins-segment: "notebook";      // "notebook" | "spending"
+    // Compose "Pay from" picker: "notebook" (default) | "spending" | "wallet"
+    // (an external funding wallet — `fund-external` still drives its own
+    // panel/flow, unchanged; `pay-from` only decides which pill is lit and
+    // the header label).
+    in-out property <string> pay-from: "notebook";
+    in-out property <bool> payfrom-expanded;
+    in property <string> pay-from-label: "Notebook";
+    in-out property <bool> spend-from-wallet;   // internal spending-wallet compose mode
     // shared camera-scan overlay (every "Scan QR" path uses it)
     in-out property <bool> scanning;
     in-out property <image> camera-frame;
@@ -1274,6 +1299,16 @@ export component AppWindow inherits Window {
     callback funding-use();        // accept the source, scan its coins, back to compose
     callback funding-clear();      // forget the funding wallet
     callback fund-build();         // build the unsigned PSBT → export screen
+    // internal spending wallet (funding-unification M3)
+    callback set-spending-enabled(bool);   // Settings toggle
+    callback spending-refresh();           // manual refresh (Settings card + Coins segment)
+    callback spending-sweep-here();        // Settings card "Sweep notebook funds here"
+    callback set-pay-from(string);         // compose picker: "notebook" | "spending"
+    callback set-coins-segment(string);    // Coins screen: "notebook" | "spending"
+    callback spending-compose-send();      // compose picker "spending" primary action
+    // Internal: a background spending-wallet scan finished — same
+    // trampoline pattern as apply-pending-refresh.
+    callback apply-pending-spending-refresh();
     callback psbt-save();          // export the .psbt file
     callback psbt-copy();          // copy PSBT base64
     callback psbt-goto-import();   // export → import screen
@@ -2244,35 +2279,102 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        // ---- pay from another wallet (external PSBT) ----
-        HorizontalLayout {
-            Switch {
-                text: "Pay from another wallet";
-                checked <=> root.fund-external;
-                toggled => { root.toggle-fund-external(self.checked); }
-            }
-            Rectangle { }
-        }
-        if root.fund-external: Rectangle {
+        // ---- pay from (collapsible: notebook / spending wallet / external wallets) ----
+        Rectangle {
             border-radius: 10px;
-            background: ftap.has-hover ? Pal.card-hover : Pal.card;
+            background: Pal.card;
             border-width: 1px;
-            border-color: root.funding-ready ? Pal.line : Pal.accent.with-alpha(0.5);
-            height: 44px;
-            ftap := TouchArea { clicked => { root.funding-return = 6; root.open-funding(); } }
-            HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 12px;
+            border-color: Pal.line;
+            height: payfrom-col.preferred-height;
+            payfrom-col := VerticalLayout {
+                padding: 10px;
                 spacing: 8px;
-                Text {
-                    text: root.funding-summary;
-                    font-size: 12px;
-                    color: root.funding-ready ? Pal.text : Pal.accent;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                    overflow: elide;
+                Rectangle {
+                    height: 22px;
+                    TouchArea { clicked => { root.payfrom-expanded = !root.payfrom-expanded; } }
+                    HorizontalLayout {
+                        Text {
+                            text: "Pay from · " + root.pay-from-label;
+                            font-size: 12px;
+                            color: Pal.muted;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { }
+                        Image {
+                            source: root.payfrom-expanded
+                                ? @image-url("icons/caret-up.svg")
+                                : @image-url("icons/caret-down.svg");
+                            colorize: Pal.muted;
+                            width: 16px;
+                            height: 16px;
+                        }
+                    }
                 }
-                Text { text: "›"; font-size: 22px; color: Pal.muted; vertical-alignment: center; }
+                if root.payfrom-expanded: VerticalLayout {
+                    spacing: 6px;
+                    Rectangle {
+                        height: 36px;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: root.pay-from == "notebook" ? Pal.accent : Pal.line;
+                        background: root.pay-from == "notebook" ? Pal.accent.with-alpha(0.10) : transparent;
+                        TouchArea { clicked => { root.set-pay-from("notebook"); } }
+                        Text {
+                            x: 10px;
+                            text: "Notebook";
+                            font-size: 12px;
+                            color: root.pay-from == "notebook" ? Pal.accent : Pal.text;
+                            vertical-alignment: center;
+                            height: parent.height;
+                        }
+                    }
+                    if root.spending-capable && root.spending-enabled: Rectangle {
+                        height: 36px;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: root.pay-from == "spending" ? Pal.accent : Pal.line;
+                        background: root.pay-from == "spending" ? Pal.accent.with-alpha(0.10) : transparent;
+                        TouchArea { clicked => { root.set-pay-from("spending"); } }
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            Text {
+                                text: "Spending wallet";
+                                font-size: 12px;
+                                color: root.pay-from == "spending" ? Pal.accent : Pal.text;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Text {
+                                text: root.spending-summary;
+                                font-size: 11px;
+                                color: Pal.muted;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    for fw in root.funding-wallets: Rectangle {
+                        height: 36px;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: (root.fund-external && root.pay-from == "wallet:" + fw.id) ? Pal.accent : Pal.line;
+                        background: (root.fund-external && root.pay-from == "wallet:" + fw.id) ? Pal.accent.with-alpha(0.10) : transparent;
+                        TouchArea { clicked => { root.use-funding-wallet(fw.id); } }
+                        Text {
+                            x: 10px;
+                            text: fw.label;
+                            font-size: 12px;
+                            color: (root.fund-external && root.pay-from == "wallet:" + fw.id) ? Pal.accent : Pal.text;
+                            vertical-alignment: center;
+                            height: parent.height;
+                            overflow: elide;
+                        }
+                    }
+                    GhostButton {
+                        text: "+ External wallet…";
+                        clicked => { root.funding-return = 6; root.open-funding(); }
+                    }
+                }
             }
         }
         // ---- coin control (collapsible) ----
@@ -2453,7 +2555,9 @@ export component AppWindow inherits Window {
                 if root.change-expanded: Caption {
                     text: root.fund-external
                         ? "Change returns to the funding wallet by default. Send it elsewhere:"
-                        : "Change returns to your address by default. Send it somewhere else:";
+                        : (root.pay-from == "spending"
+                            ? "Change returns to a fresh spending-wallet address."
+                            : "Change returns to your address by default. Send it somewhere else:");
                 }
                 if root.change-expanded: HorizontalLayout {
                     spacing: 8px;
@@ -2472,11 +2576,17 @@ export component AppWindow inherits Window {
                 ? "Encrypted forever on-chain — XChaCha20-Poly1305, 256-bit key; only your key (and a directed recipient) can read it."
                 : "⚠  Public notes are world-readable, forever.";
         }
-        if !root.fund-external: PrimaryButton {
+        if root.pay-from == "notebook": PrimaryButton {
             text: root.watch-only ? "Build transaction to sign" : "Sign + broadcast";
             tint: root.spend-enough ? Pal.accent : Pal.faint;
             tint-hover: root.spend-enough ? Pal.accent-hover : Pal.faint;
             clicked => { if (root.spend-enough) { root.compose-send(); } }
+        }
+        if root.pay-from == "spending": PrimaryButton {
+            text: "Sign + broadcast";
+            tint: root.spend-enough ? Pal.accent : Pal.faint;
+            tint-hover: root.spend-enough ? Pal.accent-hover : Pal.faint;
+            clicked => { if (root.spend-enough) { root.spending-compose-send(); } }
         }
         if root.fund-external: PrimaryButton {
             text: root.funding-ready ? "Build transaction to sign" : "Set a funding wallet first";
@@ -2707,6 +2817,82 @@ export component AppWindow inherits Window {
                 clicked => { root.open-coins(); }
             }
         }
+        if root.spending-capable: SettingsCard {
+            title: "Separate spending wallet";
+            subtitle: "Fresh bc1q addresses hold your funds instead of the notebook — protects your balance and pubkey behind the fresh-address discipline (costs slightly more per note). A shared spending pool publicly links the notes it pays for.";
+            HorizontalLayout {
+                Switch {
+                    text: root.spending-enabled ? "On" : "Off";
+                    checked <=> root.spending-enabled;
+                    toggled => { root.set-spending-enabled(root.spending-enabled); }
+                }
+                Rectangle { }
+            }
+            if root.spending-enabled: Rectangle {
+                border-radius: 10px;
+                background: Pal.field;
+                border-width: 1px;
+                border-color: Pal.line;
+                height: spending-card-col.preferred-height;
+                spending-card-col := VerticalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+                    HorizontalLayout {
+                        Text {
+                            text: root.spending-balance-line;
+                            font-size: 13px;
+                            font-weight: 700;
+                            color: Pal.text;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        SvgIconButton { icon: "refresh"; size: 14px; width: 28px; height: 22px; clicked => { root.spending-refresh(); } }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Rectangle {
+                            width: 64px;
+                            height: 64px;
+                            background: white;
+                            border-radius: 6px;
+                            Image {
+                                source: root.spending-qr;
+                                width: 58px;
+                                height: 58px;
+                                x: 3px;
+                                y: 3px;
+                                image-rendering: pixelated;
+                            }
+                            TouchArea {
+                                clicked => {
+                                    root.qr-zoom-image = root.spending-qr;
+                                    root.qr-zoom-open = true;
+                                }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 4px;
+                            Caption { text: "Next receive address"; }
+                            Mono {
+                                text: root.spending-address;
+                                font-size: 10px;
+                                color: Pal.muted;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                    GhostButton {
+                        text: "Sweep notebook funds here…";
+                        clicked => { root.spending-sweep-here(); }
+                    }
+                    GhostButton {
+                        text: "View in Coins…";
+                        clicked => { root.coins-segment = "spending"; root.open-coins(); }
+                    }
+                }
+            }
+        }
         SettingsCard {
             title: "Sweep wallet";
             subtitle: root.watch-only
@@ -2862,14 +3048,23 @@ export component AppWindow inherits Window {
                 ? "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating signs on your external wallet."
                 : "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating gathers them into ONE coin at an address you pick.";
         }
+        if root.spending-capable && root.spending-enabled: HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            SelectPill { text: "notebook"; active: root.coins-segment == "notebook"; clicked => { root.coins-segment = "notebook"; } }
+            SelectPill { text: "spending"; active: root.coins-segment == "spending"; clicked => { root.set-coins-segment("spending"); } }
+        }
         // Viewer-first: the list is the point; consolidation is the ONE
         // action button on top (wallet-level — all notebooks at once).
-        GhostButton {
+        // Notebook-scoped only — the spending wallet has no consolidate
+        // step (fresh addresses are the point).
+        if root.coins-segment == "notebook": GhostButton {
             text: "Consolidate wallet…";
             clicked => { root.consolidate-wallet-open(); }
         }
-        Body { text: root.coins-summary; font-size: 12px; }
-        Flickable {
+        if root.coins-segment == "notebook": Body { text: root.coins-summary; font-size: 12px; }
+        if root.coins-segment == "spending": Body { text: root.spending-balance-line; font-size: 12px; }
+        if root.coins-segment == "notebook": Flickable {
             viewport-height: coins-col.preferred-height;
             coins-col := VerticalLayout {
                 spacing: 8px;
@@ -2900,6 +3095,45 @@ export component AppWindow inherits Window {
                         }
                         Mono {
                             text: c.outpoint;
+                            font-size: 10px;
+                            color: Pal.muted;
+                            wrap: no-wrap;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+        }
+        if root.coins-segment == "spending": Flickable {
+            viewport-height: spending-coins-col.preferred-height;
+            spending-coins-col := VerticalLayout {
+                spacing: 8px;
+                alignment: start;
+                for c in root.spending-coins-list: Rectangle {
+                    height: scil.preferred-height;
+                    border-radius: 10px;
+                    background: Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    scil := VerticalLayout {
+                        padding: 12px;
+                        spacing: 4px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: c.value + " sats";
+                                font-size: 13px;
+                                font-weight: 700;
+                                color: Pal.text;
+                            }
+                            Rectangle { }
+                            Badge {
+                                label: c.status;
+                                tint: c.status == "confirmed" ? Pal.good : Pal.warn;
+                            }
+                        }
+                        Mono {
+                            text: c.address;
                             font-size: 10px;
                             color: Pal.muted;
                             wrap: no-wrap;
@@ -2953,12 +3187,17 @@ export component AppWindow inherits Window {
                         }
                         Body { text: a.title; font-size: 12px; overflow: elide; }
                         Caption { text: a.fee-line; }
-                        Mono {
-                            text: a.txid;
-                            font-size: 10px;
-                            color: Pal.muted;
-                            wrap: no-wrap;
-                            overflow: elide;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Mono {
+                                text: a.txid;
+                                font-size: 10px;
+                                color: Pal.muted;
+                                wrap: no-wrap;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            if a.funded != "": Badge { label: a.funded; tint: Pal.accent; }
                         }
                         HorizontalLayout {
                             spacing: 8px;

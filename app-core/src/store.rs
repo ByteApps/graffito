@@ -77,6 +77,14 @@ pub struct NoteRecord {
     /// self-notes; preserved across RBF so a fee-bump keeps the same gift.
     #[serde(default)]
     pub gift_amount: Option<u64>,
+    /// Funding-unification M3: who paid for this note besides the
+    /// notebook itself — `Some("spending")` for the internal BIP-84
+    /// spending wallet, `Some("wallet:<label>")` for an external funding
+    /// wallet, `None` for the ordinary notebook-funded path (today's
+    /// default — every pre-M3 record loads with `None`, so Activity shows
+    /// no source pill for it, matching current behavior byte-for-byte).
+    #[serde(default)]
+    pub funded_by: Option<String>,
 }
 
 /// One input spent by a sweep/consolidate tx — kept for RBF re-signing.
@@ -501,6 +509,7 @@ impl Store {
                     vsize: None,
                     change_to: None,
                     gift_amount: None,
+                    funded_by: None,
                 });
                 true
             }
@@ -813,6 +822,7 @@ mod tests {
             vsize: None,
             change_to: None,
             gift_amount: None,
+            funded_by: None,
         }
     }
 
