@@ -23,7 +23,6 @@ Chain Notes writes personal notes into real bitcoin transactions — public ones
 - **Stay on top of your transactions** — a wallet-wide Activity feed across every notebook with rebroadcast and RBF speed-up for stuck transactions, a wallet-wide Coins screen, one-tap consolidate that gathers the whole wallet into a single coin, and a guided sweep that empties every notebook to an address you pick.
 - **Your infrastructure or theirs** — pick your Bitcoin node (mempool.space, Blockstream, or your own Esplora-compatible endpoint) and your block explorer, per network, right in Settings.
 - **Every network** — mainnet, testnet4, signet, and regtest. Verified live on testnet4, including a directed private note decrypted by the Passport Prime app's own core.
-- **Text editing that feels native** — right-click menus and every shortcut on the Mac; on iOS/Android an edit bubble with the platform's own trigger rules, and paste that lands exactly at the cursor.
 
 ## Compatible by construction
 
@@ -42,6 +41,20 @@ See **[DEVELOPMENT.md](DEVELOPMENT.md)** for toolchain setup, mobile builds, and
 - [DEVELOPMENT.md](DEVELOPMENT.md) — building (desktop + mobile), testing, architecture pointers
 - [THIRD-PARTY.md](THIRD-PARTY.md) — libraries this app is built on
 - `PLAN-chain-notes-app.md` (workspace repo) — design document and milestones
+
+## Support
+
+If this app is useful to you, a small bitcoin donation is always appreciated — entirely optional.
+
+<div align="center">
+
+<img src="donate-qr.png" alt="Donate bitcoin" width="200">
+
+**`bc1qrfagrsfrm8erdsmrku3fgq5yc573zyp2q3uje8`**
+
+</div>
+
+Donations help cover development costs and keep more open-source bitcoin tools coming. No VC funding, no ads, no tracking.
 
 ## License & disclaimer
 
