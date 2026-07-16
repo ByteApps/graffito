@@ -509,6 +509,119 @@ fn main() {
                 );
             }
         }
+        Some("spending-address") => {
+            // spending-address <store.json> <net>
+            // Prints the identity's spending wallet's next unused receive
+            // address (funding-unification M2) and persists it as handed
+            // out (fresh-address discipline). Needs a BIP-39/master-xprv
+            // APP_KEY (APP_ACCOUNT selects the account); watch/WIF/hex/
+            // account-xprv identities have no spending wallet.
+            let net = network(&args[3]);
+            let mut store = load(&args[2]);
+            let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | master xprv");
+            let account: u32 =
+                std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
+            let material = parse_key_material(&key, net).expect("APP_KEY parse");
+            let source = app_core::spending::funding_source(&material, net, account)
+                .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
+            let index = store.spending.next_receive;
+            let addr = source.derive(0, index).expect("derive receive address");
+            store.spending_mark_used(app_core::store::SpendingAddr {
+                chain: 0,
+                index,
+                address: addr.address.clone(),
+                script_pubkey_hex: hex::encode(&addr.spk),
+            });
+            save(&store, &args[2]);
+            println!("cli: spending-address index={index} address={}", addr.address);
+            println!("{}", addr.address);
+        }
+        Some("note-spend-funded") => {
+            // note-spend-funded <store.json> <base-url> <public|private> <rate> <text> [to]
+            // Fully in-app internal funding kind: scan the identity's OWN
+            // spending wallet, build the SAME funded-note PSBT shape
+            // external funding produces (`build_funding_psbt` — dust-to-
+            // recipient, no configurable gift, same as `fund-build`), sign
+            // every P2WPKH input in-process (no PSBT export/import round
+            // trip), broadcast.
+            let mut store = load(&args[2]);
+            let net = network(&store.network.clone());
+            let ident = identity(net);
+            let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | master xprv");
+            let account: u32 =
+                std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
+            let material = parse_key_material(&key, net).expect("APP_KEY parse");
+            let private = match args[4].as_str() {
+                "private" => true,
+                "public" => false,
+                o => panic!("visibility must be public|private, got {o}"),
+            };
+            let fee_rate: f64 = args[5].parse().expect("fee rate");
+            let text = args[6].clone();
+            let to = args.get(7).cloned();
+
+            let source = app_core::spending::funding_source(&material, net, account)
+                .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
+            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let gap: u32 =
+                std::env::var("CN_FUND_GAP").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+            let scan = client.scan_funding(&source, gap).expect("spending wallet scan");
+            if scan.utxos.is_empty() {
+                panic!("spending wallet has no spendable coins");
+            }
+
+            let recipient = to.as_deref().map(|a| Recipient::parse(net, a).expect("recipient"));
+            let r = app_core::notes_core::keys::generate_aux_rand().expect("rng");
+            let note_id = [r[0], r[1], r[2], r[3]];
+            let change_index = store.spending.next_change;
+            let plan = FundingPlan {
+                source: &source,
+                coins: &scan.utxos,
+                change_index,
+                fee_rate,
+                change_override: None,
+            };
+            let np = NoteParams {
+                identity: ident.expect_full(),
+                text: &text,
+                private,
+                recipient: recipient.as_ref(),
+                note_id,
+                max_op_return_bytes: store.chunk_size,
+                network: net,
+            };
+            let built = build_funding_psbt(&plan, &np).expect("build funded note psbt");
+            let mut psbt = built.psbt.clone();
+            let signed = app_core::psbt_build::sign_own_wpkh_inputs(
+                &mut psbt, &material, net, account, &scan.utxos,
+            )
+            .expect("sign spending-wallet inputs");
+            assert!(signed > 0, "no spending-wallet inputs signed");
+            let (raw, txid, vsize) = finalize_extract(psbt).expect("finalize");
+            assert_eq!(txid, built.txid, "finalize changed the txid");
+            let got = client.broadcast(&raw).expect("broadcast");
+            assert_eq!(got, txid, "endpoint echoed a different txid");
+
+            if built.change > 0 {
+                let change_addr = source.derive(1, change_index).expect("derive change address");
+                store.spending_mark_used(app_core::store::SpendingAddr {
+                    chain: 1,
+                    index: change_index,
+                    address: change_addr.address,
+                    script_pubkey_hex: hex::encode(&change_addr.spk),
+                });
+            }
+            save(&store, &args[2]);
+            println!(
+                "cli: compose id={} txid={} fee={} vsize={} to={} private={} broadcast=ok",
+                hex::encode(note_id),
+                txid,
+                built.fee,
+                vsize,
+                to.as_deref().unwrap_or("self"),
+                private,
+            );
+        }
         // ---- external funding (PSBT) — simulates a hardware/software signer ----
         Some("fund-keygen") => {
             // fund-keygen <network> <seed-hex> [tr|wpkh]
@@ -786,6 +899,8 @@ fn main() {
                 "usage: cli address <net> | init <store> <net> | scan <store> <base> | \
                  notes <store> | compose <store> <base> <public|private> <rate> <text> [to] | \
                  bundle <addr> <net> <base> <out> | \
+                 spending-address <store> <net> | \
+                 note-spend-funded <store> <base> <public|private> <rate> <text> [to] | \
                  fund-keygen <net> <seed-hex> [tr|wpkh] | \
                  fund-build <base> <net> <desc> <public|private> <rate> <text> [to] | \
                  fund-sign <psbt> <xprv> | fund-finalize <base> <net> <psbt>   \

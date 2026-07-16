@@ -8,8 +8,8 @@
 //! plaintext wins over a missing cache, and re-applying the same bundle
 //! is a no-op.
 
-use notes_core::address::taproot_address;
-use notes_core::bundle::{extract_notes, extract_notes_watch, Identity, RecoveredNote, SyncBundle};
+use notes_core::address::{p2tr_script_pubkey, taproot_address};
+use notes_core::bundle::{extract_notes_multi, extract_notes_watch_multi, Identity, RecoveredNote, SyncBundle};
 use notes_core::tx::Utxo;
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
@@ -144,6 +144,41 @@ pub struct Contact {
     pub name: String,
 }
 
+/// The spending wallet's local bookkeeping (funding-unification M2): next
+/// unused receive/change indexes, plus every address actually handed out —
+/// enough to (a) hand out fresh addresses, (b) build the self-spk SET for
+/// scanning ([`Store::spending_self_spks`]), and (c) survive a restart
+/// without re-deriving. SERDE-DEFAULT and absent on every pre-M2 store
+/// file: an old file loads with `enabled: false` and an empty `used` list,
+/// so its self-spk set is just the notebook's own — byte-identical scan
+/// behavior to before this milestone. Key bytes never live here (key
+/// storage spec) — only indexes and addresses; the spending keys
+/// themselves are re-derived on unlock.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendingSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub next_receive: u32,
+    #[serde(default)]
+    pub next_change: u32,
+    #[serde(default)]
+    pub used: Vec<SpendingAddr>,
+}
+
+/// One address the spending wallet has handed out (receive OR change).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendingAddr {
+    /// 0 = receive chain, 1 = change chain.
+    pub chain: u32,
+    pub index: u32,
+    pub address: String,
+    /// Raw scriptPubKey, hex — feeds the self-spk SET directly (no address
+    /// re-decoding needed at scan time).
+    #[serde(default)]
+    pub script_pubkey_hex: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Store {
     pub version: u32,
@@ -183,6 +218,10 @@ pub struct Store {
     /// user has already had on screen (marked when the notebook opens).
     #[serde(default)]
     pub seen_received: Vec<String>,
+    /// The internal BIP-84 spending wallet (funding-unification M2).
+    /// Optional/serde-default so pre-M2 store files load unchanged.
+    #[serde(default)]
+    pub spending: SpendingSection,
 }
 
 fn default_chunk() -> usize {
@@ -206,6 +245,7 @@ impl Store {
             node_url: None,
             excluded_senders: Vec::new(),
             seen_received: Vec::new(),
+            spending: SpendingSection::default(),
         }
     }
 
@@ -265,7 +305,11 @@ impl Store {
 
     /// Merge a scan into the store. `bundle` must be for our address;
     /// full bundles are authoritative for the UTXO set and run orphan
-    /// detection, incrementals only add.
+    /// detection, incrementals only add. The self-spk SET (funding-
+    /// unification M2) is the notebook's own spk plus the spending
+    /// wallet's used addresses — empty `spending.used` (every pre-M2 store,
+    /// or the setting left off) makes this byte-identical to the old
+    /// singleton-spk `extract_notes` call.
     pub fn apply_bundle(
         &mut self,
         bundle: &SyncBundle,
@@ -273,11 +317,16 @@ impl Store {
         network: Network,
     ) -> Result<ApplyStats, Error> {
         self.check_identity(&identity.output_x)?;
-        self.apply_recovered(bundle, extract_notes(bundle, identity, network))
+        let mut self_spks = vec![p2tr_script_pubkey(&identity.output_x)];
+        self_spks.extend(self.spending_self_spks());
+        self.apply_recovered(bundle, extract_notes_multi(bundle, identity, network, &self_spks))
     }
 
     /// Watch-only [`Self::apply_bundle`]: same merge, but notes extract
-    /// without keys — every private body stays sealed (text: None).
+    /// without keys — every private body stays sealed (text: None). Watch
+    /// identities have no spending wallet (PLAN decision 7), so
+    /// `spending_self_spks` is always empty here — this stays byte-
+    /// identical to the old `extract_notes_watch` call.
     pub fn apply_bundle_watch(
         &mut self,
         bundle: &SyncBundle,
@@ -285,7 +334,7 @@ impl Store {
         network: Network,
     ) -> Result<ApplyStats, Error> {
         self.check_identity(output_x)?;
-        self.apply_recovered(bundle, extract_notes_watch(bundle, network))
+        self.apply_recovered(bundle, extract_notes_watch_multi(bundle, network, &self.spending_self_spks()))
     }
 
     fn check_identity(&self, output_x: &[u8; 32]) -> Result<(), Error> {
@@ -684,6 +733,53 @@ impl Store {
     pub fn remove_contact(&mut self, address: &str) {
         self.contacts.retain(|c| c.address != address);
     }
+
+    /// Merge a freshly derived spending address into the used list
+    /// (idempotent by (chain, index)) and bump the matching next-index
+    /// past it — fresh-address discipline (funding-unification PLAN): the
+    /// NEXT unused index always comes after every address actually handed
+    /// out or discovered.
+    pub fn spending_mark_used(&mut self, addr: SpendingAddr) {
+        let bump = addr.index + 1;
+        if addr.chain == 0 {
+            self.spending.next_receive = self.spending.next_receive.max(bump);
+        } else {
+            self.spending.next_change = self.spending.next_change.max(bump);
+        }
+        if !self.spending.used.iter().any(|u| u.chain == addr.chain && u.index == addr.index) {
+            self.spending.used.push(addr);
+        }
+    }
+
+    /// The spending wallet's self-spk SET: every used address's
+    /// scriptPubKey — fed to `extract_notes_multi`/`_watch_multi` alongside
+    /// the notebook's own spk so a spending-wallet-funded note scans back
+    /// as OWN. Empty when the section has never been used, which keeps
+    /// scan behavior identical to pre-M2 stores.
+    pub fn spending_self_spks(&self) -> Vec<Vec<u8>> {
+        self.spending.used.iter().filter_map(|u| hex::decode(&u.script_pubkey_hex).ok()).collect()
+    }
+
+    /// Merge a gap-scan's findings (`chain::discover_spending`) into the
+    /// section: every discovered used address, plus each chain's next-
+    /// unused index raised (never lowered — an unconfirmed local spend the
+    /// scan can't see yet must not un-advance the index).
+    pub fn spending_apply_discovery(
+        &mut self,
+        used: Vec<SpendingAddr>,
+        next_receive: u32,
+        next_change: u32,
+    ) {
+        for addr in used {
+            self.spending_mark_used(addr);
+        }
+        self.spending.next_receive = self.spending.next_receive.max(next_receive);
+        self.spending.next_change = self.spending.next_change.max(next_change);
+    }
+
+    pub fn spending_set_enabled(&mut self, on: bool) {
+        self.spending.enabled = on;
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -767,5 +863,115 @@ mod tests {
         assert_eq!(s.mark_seen(), 0); // idempotent
         s.notes.push(note("ee", true, Some("tb1p-carol")));
         assert_eq!(s.unread_count(), 1);
+    }
+
+    #[test]
+    fn spending_section_defaults_empty_and_disabled() {
+        let s = Store::new(&[7u8; 32], Network::Regtest);
+        assert!(!s.spending.enabled);
+        assert_eq!(s.spending.next_receive, 0);
+        assert_eq!(s.spending.next_change, 0);
+        assert!(s.spending.used.is_empty());
+        assert!(s.spending_self_spks().is_empty());
+    }
+
+    #[test]
+    fn spending_mark_used_advances_indexes_and_dedupes() {
+        let mut s = Store::new(&[7u8; 32], Network::Regtest);
+        s.spending_mark_used(SpendingAddr {
+            chain: 0,
+            index: 0,
+            address: "bc1qreceive0".into(),
+            script_pubkey_hex: "0014aa".into(),
+        });
+        s.spending_mark_used(SpendingAddr {
+            chain: 1,
+            index: 2,
+            address: "bc1qchange2".into(),
+            script_pubkey_hex: "0014bb".into(),
+        });
+        assert_eq!(s.spending.next_receive, 1);
+        assert_eq!(s.spending.next_change, 3);
+        assert_eq!(s.spending.used.len(), 2);
+        assert_eq!(s.spending_self_spks(), vec![hex::decode("0014aa").unwrap(), hex::decode("0014bb").unwrap()]);
+
+        // Re-marking the same (chain, index) is idempotent and never
+        // lowers an index a later observation already advanced past.
+        s.spending_mark_used(SpendingAddr {
+            chain: 0,
+            index: 0,
+            address: "bc1qreceive0".into(),
+            script_pubkey_hex: "0014aa".into(),
+        });
+        assert_eq!(s.spending.used.len(), 2);
+        assert_eq!(s.spending.next_receive, 1);
+    }
+
+    #[test]
+    fn spending_apply_discovery_merges_and_never_lowers_indexes() {
+        let mut s = Store::new(&[7u8; 32], Network::Regtest);
+        // Local state already advanced past index 5 on an unconfirmed
+        // change spend the discovery scan below can't see yet.
+        s.spending.next_change = 5;
+
+        s.spending_apply_discovery(
+            vec![
+                SpendingAddr { chain: 0, index: 0, address: "r0".into(), script_pubkey_hex: "00".into() },
+                SpendingAddr { chain: 0, index: 2, address: "r2".into(), script_pubkey_hex: "01".into() },
+            ],
+            3,
+            1,
+        );
+        assert_eq!(s.spending.used.len(), 2);
+        assert_eq!(s.spending.next_receive, 3);
+        // Discovery's next_change=1 must not un-advance the local 5.
+        assert_eq!(s.spending.next_change, 5);
+    }
+
+    #[test]
+    fn spending_section_round_trips_on_disk_and_old_files_load_unchanged() {
+        let dir = std::env::temp_dir().join(format!("cn-store-spending-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A fresh store with a populated spending section survives a
+        // save/load cycle byte-for-byte.
+        let path = dir.join("store-regtest-aabbccdd.json");
+        let mut s = Store::new(&[7u8; 32], Network::Regtest);
+        s.spending_set_enabled(true);
+        s.spending_mark_used(SpendingAddr {
+            chain: 0,
+            index: 0,
+            address: "bc1qreceive0".into(),
+            script_pubkey_hex: "0014aa".into(),
+        });
+        s.save(&path).unwrap();
+        let back = Store::load(&path).unwrap();
+        assert_eq!(back.spending, s.spending);
+        assert!(back.spending.enabled);
+        assert_eq!(back.spending.used[0].address, "bc1qreceive0");
+
+        // An OLD store file with no `spending` key at all (every pre-M2
+        // store) loads with the section defaulted, not an error.
+        let legacy_path = dir.join("store-regtest-legacy.json");
+        std::fs::write(
+            &legacy_path,
+            r#"{
+                "version": 1,
+                "network": "regtest",
+                "identity_fingerprint": "aa",
+                "address": "bcrt1paaaa",
+                "notes": [],
+                "utxos": [],
+                "contacts": [],
+                "txs": []
+            }"#,
+        )
+        .unwrap();
+        let legacy = Store::load(&legacy_path).unwrap();
+        assert!(!legacy.spending.enabled);
+        assert!(legacy.spending.used.is_empty());
+        assert!(legacy.spending_self_spks().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

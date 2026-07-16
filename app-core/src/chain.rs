@@ -11,6 +11,7 @@
 //!
 //! The `Transport` trait isolates HTTP so tests inject canned JSON.
 
+use notes_core::address::address_to_script_pubkey;
 use notes_core::bundle::{BundleUtxo, FeeRates, OnchainTx, SyncBundle};
 use notes_core::tx::op_return_payload;
 use notes_core::Network;
@@ -433,7 +434,7 @@ impl<T: Transport> ChainClient<T> {
                 Some(h) => !t.status.confirmed || t.status.block_height.unwrap_or(u64::MAX) > h,
                 None => true,
             })
-            .filter_map(|t| classify_tx(t, address))
+            .filter_map(|t| classify_tx_net(t, address, self.network))
             .collect();
 
         Ok(SyncBundle {
@@ -497,9 +498,90 @@ pub fn discover_indexes<T: Transport>(
     found
 }
 
+/// Spending-wallet analog of [`discover_indexes`] (funding-unification
+/// M2): probe BOTH chains of the wallet's BIP-84 branch — receive (0) and
+/// change (1) — for on-chain history, stopping each chain after `gap`
+/// consecutive never-used indexes (the same rule `discover_indexes` and
+/// `scan_funding` use). Returns every address found used (for the store's
+/// persisted list and self-spk set, via `Store::spending_apply_discovery`)
+/// plus each chain's next-unused index. Best-effort like `discover_indexes`:
+/// a transport error stops the walk and returns what was found so far, so a
+/// words-only restore without a node simply discovers nothing yet.
+pub fn discover_spending<T: Transport>(
+    client: &ChainClient<T>,
+    source: &crate::funding::FundingSource,
+    gap: u32,
+) -> (Vec<crate::store::SpendingAddr>, u32, u32) {
+    let mut used = Vec::new();
+    let mut next_receive = 0u32;
+    let mut next_change = 0u32;
+    for chain in [0usize, 1usize] {
+        let mut consecutive_unused = 0u32;
+        let mut index = 0u32;
+        let mut first_unused: Option<u32> = None;
+        let mut transport_error = false;
+        loop {
+            let Ok(d) = source.derive(chain, index) else { break };
+            match client.address_probe(&d.address) {
+                Ok((true, _)) => {
+                    used.push(crate::store::SpendingAddr {
+                        chain: chain as u32,
+                        index,
+                        address: d.address.clone(),
+                        script_pubkey_hex: hex::encode(&d.spk),
+                    });
+                    consecutive_unused = 0;
+                }
+                Ok((false, _)) => {
+                    if first_unused.is_none() {
+                        first_unused = Some(index);
+                    }
+                    consecutive_unused += 1;
+                }
+                Err(_) => {
+                    transport_error = true;
+                    break;
+                }
+            }
+            index += 1;
+            // Same runaway backstop as scan_funding/discover_indexes.
+            if consecutive_unused >= gap || index >= 10_000 {
+                break;
+            }
+        }
+        let next = first_unused.unwrap_or(0);
+        if chain == 0 {
+            next_receive = next;
+        } else {
+            next_change = next;
+        }
+        if transport_error {
+            break;
+        }
+    }
+    (used, next_receive, next_change)
+}
+
 /// tx → OnchainTx iff it carries ≥1 OP_RETURN payload. Classification
 /// rules mirror chain-scan.js; payload parsing is notes-core's own.
+/// Kept exactly as shipped (no `input_prevout_spks`) — additive sibling is
+/// [`classify_tx_net`], which also needs a network to decode addresses
+/// that arrive with no raw script hex (the regtest server.py shape).
 pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
+    classify_tx_inner(tx, address, None)
+}
+
+/// [`classify_tx`] plus `input_prevout_spks` (funding-unification M2's
+/// self-spk-SET ownership rule): every input's raw prevout scriptPubKey,
+/// hex-encoded. Uses the raw `scriptpubkey` hex when the backend sends one
+/// (real esplora); when it sends only `scriptpubkey_address` (the regtest
+/// server.py shape — see the module-level gotcha), the spk is derived from
+/// the address instead of left empty.
+pub fn classify_tx_net(tx: &EsploraTx, address: &str, network: Network) -> Option<OnchainTx> {
+    classify_tx_inner(tx, address, Some(network))
+}
+
+fn classify_tx_inner(tx: &EsploraTx, address: &str, network: Option<Network>) -> Option<OnchainTx> {
     let payloads: Vec<String> = tx
         .vout
         .iter()
@@ -557,6 +639,29 @@ pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
         }
     }
 
+    // Raw prevout spks for the self-spk-SET ownership rule (funding-
+    // unification M2): prefer the raw hex esplora sends; fall back to
+    // decoding `scriptpubkey_address` (the regtest server.py shape, which
+    // carries no script hex at all — the module-level gotcha). `None`
+    // network (the legacy `classify_tx` entry point) leaves this empty,
+    // matching the pre-M2 behavior byte-for-byte.
+    let input_prevout_spks: Vec<String> = match network {
+        Some(net) => tx
+            .vin
+            .iter()
+            .filter_map(|i| {
+                let p = i.prevout.as_ref()?;
+                if let Some(hex) = p.scriptpubkey.as_deref().filter(|h| !h.is_empty()) {
+                    Some(hex.to_string())
+                } else {
+                    let addr = p.scriptpubkey_address.as_deref()?;
+                    address_to_script_pubkey(net, addr).ok().map(|spk| hex::encode(&spk))
+                }
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
     Some(OnchainTx {
         txid: tx.txid.clone(),
         height: tx.status.block_height.filter(|_| tx.status.confirmed),
@@ -567,10 +672,7 @@ pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
         sender: if spends_from_self { None } else { sender },
         author_candidates,
         recipient: if spends_from_self { recipient } else { None },
-        // Raw prevout spks for the self-spk-SET ownership rule land with
-        // the spending wallet (funding-unification M2); empty keeps the
-        // legacy spends_from_self-only behavior via notes-core's OR rule.
-        input_prevout_spks: Vec::new(),
+        input_prevout_spks,
     })
 }
 
@@ -679,5 +781,86 @@ mod tests {
         // Unknown address (not one of our notebooks) stamps index 0.
         assert_eq!((coins[1].index, coins[1].value), (0, 2000));
         assert_eq!(outputs, vec![(vec![0x51], 2500)]);
+    }
+
+    const SPENDING_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon \
+                                      abandon abandon abandon abandon about";
+
+    #[test]
+    fn discover_spending_finds_both_chains_past_holes() {
+        let m = parse_key_material(SPENDING_MNEMONIC, Network::Mainnet).unwrap();
+        let src = crate::spending::funding_source(&m, Network::Mainnet, 0).unwrap();
+        let r0 = src.derive(0, 0).unwrap().address;
+        let r2 = src.derive(0, 2).unwrap().address; // index 1 is a hole
+        let c0 = src.derive(1, 0).unwrap().address;
+        let client = ChainClient::new(
+            ProbeTransport { used: vec![r0.clone(), r2.clone(), c0.clone()], fail: false },
+            Network::Mainnet,
+        );
+        let (used, next_receive, next_change) = discover_spending(&client, &src, 5);
+
+        assert_eq!(used.iter().filter(|a| a.chain == 0).count(), 2);
+        assert!(used.iter().any(|a| a.chain == 0 && a.index == 0 && a.address == r0));
+        assert!(used.iter().any(|a| a.chain == 0 && a.index == 2 && a.address == r2));
+        // First unused receive index is the hole at 1 (same "first unused,
+        // holes don't count as the frontier" rule scan_funding uses).
+        assert_eq!(next_receive, 1);
+        assert_eq!(used.iter().filter(|a| a.chain == 1).count(), 1);
+        assert_eq!(next_change, 1);
+        for a in &used {
+            assert!(hex::decode(&a.script_pubkey_hex).is_ok(), "spk must be valid hex");
+        }
+    }
+
+    #[test]
+    fn discover_spending_on_fresh_wallet_is_empty() {
+        let m = parse_key_material(SPENDING_MNEMONIC, Network::Mainnet).unwrap();
+        let src = crate::spending::funding_source(&m, Network::Mainnet, 0).unwrap();
+        let client = ChainClient::new(ProbeTransport { used: vec![], fail: false }, Network::Mainnet);
+        let (used, next_receive, next_change) = discover_spending(&client, &src, 5);
+        assert!(used.is_empty());
+        assert_eq!(next_receive, 0);
+        assert_eq!(next_change, 0);
+    }
+
+    #[test]
+    fn discover_spending_offline_is_best_effort() {
+        let m = parse_key_material(SPENDING_MNEMONIC, Network::Mainnet).unwrap();
+        let src = crate::spending::funding_source(&m, Network::Mainnet, 0).unwrap();
+        let r0 = src.derive(0, 0).unwrap().address;
+        let client = ChainClient::new(ProbeTransport { used: vec![r0], fail: true }, Network::Mainnet);
+        let (used, next_receive, next_change) = discover_spending(&client, &src, 5);
+        assert!(used.is_empty());
+        assert_eq!((next_receive, next_change), (0, 0));
+    }
+
+    #[test]
+    fn classify_tx_net_populates_input_prevout_spks_from_address_or_hex() {
+        use notes_core::tx::op_return_script;
+        let m = parse_key_material(SPENDING_MNEMONIC, Network::Regtest).unwrap();
+        let key = crate::spending::derive_spending_key(&m, Network::Regtest, 0, 0, 0).unwrap();
+        let payload_hex = hex::encode(op_return_script(b"hi"));
+        let spk_hex = hex::encode(&key.script_pubkey);
+
+        // Regtest server.py shape: only `scriptpubkey_address` on the
+        // prevout, no raw script hex — the spk must be DERIVED from it.
+        let json_addr_only = format!(
+            r#"{{"txid":"t1","vin":[{{"txid":"a","vout":0,"prevout":{{"scriptpubkey_address":"{}","value":1000}}}}],"vout":[{{"scriptpubkey":"{payload_hex}","scriptpubkey_type":"op_return","value":0}}],"status":{{"confirmed":false}}}}"#,
+            key.address
+        );
+        let tx: EsploraTx = serde_json::from_str(&json_addr_only).unwrap();
+        let onchain = classify_tx_net(&tx, "not-our-address", Network::Regtest).unwrap();
+        assert_eq!(onchain.input_prevout_spks, vec![spk_hex.clone()]);
+        // The legacy no-network entry point stays empty — byte-identical
+        // to pre-M2 behavior.
+        assert!(classify_tx(&tx, "not-our-address").unwrap().input_prevout_spks.is_empty());
+
+        // Real esplora shape: raw scriptpubkey hex present — used directly.
+        let json_hex = format!(
+            r#"{{"txid":"t2","vin":[{{"txid":"a","vout":0,"prevout":{{"scriptpubkey":"{spk_hex}","value":1000}}}}],"vout":[{{"scriptpubkey":"{payload_hex}","scriptpubkey_type":"op_return","value":0}}],"status":{{"confirmed":false}}}}"#
+        );
+        let tx2: EsploraTx = serde_json::from_str(&json_hex).unwrap();
+        let onchain2 = classify_tx_net(&tx2, "not-our-address", Network::Regtest).unwrap();
+        assert_eq!(onchain2.input_prevout_spks, vec![spk_hex]);
     }
 }

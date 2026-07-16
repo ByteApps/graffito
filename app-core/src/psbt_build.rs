@@ -15,6 +15,7 @@
 
 use std::str::FromStr;
 
+use bitcoin::hashes::Hash;
 use bitcoin::transaction::{predict_weight, InputWeightPrediction, Version};
 use bitcoin::{
     absolute::LockTime, Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
@@ -27,6 +28,7 @@ use notes_core::tx::op_return_script;
 use notes_core::{Network, DUST_LIMIT};
 
 use crate::funding::{FundingSource, FundingUtxo};
+use crate::identity::KeyMaterial;
 use crate::Error;
 
 /// The funding side of a build request: which source, which coins, where
@@ -462,6 +464,98 @@ pub fn sign_own_taproot_inputs(
                 .map_err(|e| Error::Funding(e.to_string()))?,
             sighash_type: TapSighashType::Default,
         });
+        signed += 1;
+    }
+    Ok(signed)
+}
+
+/// `psbt`'s inputs/outputs recast as a `notes_core::tx::Transaction` — the
+/// shape `notes_core::wpkh`'s BIP143 sighash needs. Pure data marshalling
+/// (outpoints, values from `witness_utxo`, output scripts/values); no
+/// crypto happens here. Every input must already carry a `witness_utxo`
+/// (true of every funding input `assemble_funded_note_psbt` builds).
+fn to_notes_tx(psbt: &Psbt) -> Result<notes_core::tx::Transaction, Error> {
+    let mut inputs = Vec::with_capacity(psbt.unsigned_tx.input.len());
+    for (i, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+        let value = psbt
+            .inputs
+            .get(i)
+            .and_then(|pin| pin.witness_utxo.as_ref())
+            .ok_or_else(|| Error::Funding("input missing witness_utxo".into()))?
+            .value
+            .to_sat();
+        inputs.push(notes_core::tx::Utxo {
+            txid: txin.previous_output.txid.to_byte_array(),
+            vout: txin.previous_output.vout,
+            value,
+        });
+    }
+    let outputs = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .map(|o| notes_core::tx::TxOut {
+            value: o.value.to_sat(),
+            script_pubkey: o.script_pubkey.to_bytes(),
+        })
+        .collect();
+    Ok(notes_core::tx::Transaction {
+        version: psbt.unsigned_tx.version.0,
+        lock_time: psbt.unsigned_tx.lock_time.to_consensus_u32(),
+        inputs,
+        outputs,
+        witnesses: Vec::new(),
+    })
+}
+
+/// Sign every PSBT input that is a P2WPKH output of the identity's OWN
+/// spending wallet — the internal funding kind's own signer (funding-
+/// unification M2). Unlike the external kinds, there is no PSBT export/
+/// import round-trip: this app holds the keys. `coins` (the funding-scan
+/// result that selected these inputs) matches each such input to its
+/// (chain, index) leaf by outpoint, and `crate::spending` re-derives the
+/// raw key on demand — never persisted (key storage spec).
+///
+/// The BIP143 sighash and ECDSA signature come from `notes_core::wpkh` —
+/// never hand-rolled here (FROZEN invariant: notes-core is the only
+/// producer of on-chain-signature bytes). The result is a standard BIP-174
+/// `partial_sigs` entry, so the SAME miniscript finalizer path
+/// (`psbt_finalize::finalize_extract`) picks it up exactly like any signed
+/// `wpkh` descriptor input — no forked finalize path — and composes with
+/// [`sign_own_taproot_inputs`] for a mixed tx (rare: sweeping notebook
+/// dust together with spending-wallet fee inputs). Returns how many
+/// inputs it signed.
+pub fn sign_own_wpkh_inputs(
+    psbt: &mut Psbt,
+    material: &KeyMaterial,
+    network: Network,
+    account: u32,
+    coins: &[FundingUtxo],
+) -> Result<usize, Error> {
+    let notes_tx = to_notes_tx(psbt)?;
+    let mut signed = 0;
+    for i in 0..psbt.inputs.len() {
+        let outpoint = psbt.unsigned_tx.input[i].previous_output;
+        let Some(coin) = coins.iter().find(|c| {
+            c.vout == outpoint.vout
+                && c.txid.parse::<Txid>().map(|t| t == outpoint.txid).unwrap_or(false)
+        }) else {
+            continue; // not a spending-wallet input (e.g. a notebook taproot coin)
+        };
+        let key = crate::spending::derive_spending_key(
+            material,
+            network,
+            account,
+            coin.chain as u32,
+            coin.index,
+        )?;
+        let witness = notes_core::wpkh::sign_p2wpkh_input(&notes_tx, i, &key.seckey)
+            .map_err(Error::Notes)?;
+        let sig = bitcoin::ecdsa::Signature::from_slice(&witness[0])
+            .map_err(|e| Error::Funding(format!("wpkh signature: {e}")))?;
+        let pubkey = bitcoin::PublicKey::from_slice(&witness[1])
+            .map_err(|e| Error::Funding(format!("wpkh pubkey: {e}")))?;
+        psbt.inputs[i].partial_sigs.insert(pubkey, sig);
         signed += 1;
     }
     Ok(signed)
@@ -1119,5 +1213,130 @@ mod tests {
             network: NET,
         };
         assert!(build_funding_psbt(&plan, &np).is_err());
+    }
+
+    /// Fully in-app funded note (funding-unification M2): the internal
+    /// spending-wallet kind reuses `assemble_funded_note_psbt` byte-for-
+    /// byte (via `crate::spending::funding_source`, a `wpkh(...)`
+    /// descriptor over the derived account xpub — same code path the
+    /// external watch-only wallets use) and signs immediately with
+    /// `sign_own_wpkh_inputs` — no PSBT export/import round-trip. Proves:
+    /// the funded output shape is unchanged, the P2WPKH witness verifies
+    /// under rust-bitcoin's own BIP143 sighash, and a bundle carrying
+    /// `input_prevout_spks` scans the note back as OWN even though the tx
+    /// never spends from the notebook address itself.
+    #[test]
+    fn internal_spending_wallet_funds_and_signs_in_app() {
+        use crate::identity::parse_key_material;
+        use notes_core::bundle::{extract_notes_multi, OnchainTx, SyncBundle};
+
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                         abandon abandon abandon about";
+        let material = parse_key_material(mnemonic, NET).unwrap();
+        let source = crate::spending::funding_source(&material, NET, 0).unwrap();
+        let coin_addr = source.derive(0, 0).unwrap();
+        let coins = vec![FundingUtxo {
+            txid: "a".repeat(64),
+            vout: 0,
+            value: 100_000,
+            address: coin_addr.address.clone(),
+            chain: 0,
+            index: 0,
+            confirmed: true,
+        }];
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+
+        let plan =
+            FundingPlan { source: &source, coins: &coins, change_index: 0, fee_rate: 2.0, change_override: None };
+        let np = NoteParams {
+            identity: &alice,
+            text: "funded fully in-app",
+            private: false,
+            recipient: None,
+            note_id: [3, 3, 3, 3],
+            max_op_return_bytes: 80,
+            network: NET,
+        };
+        let built = build_funding_psbt(&plan, &np).unwrap();
+
+        // Output order unchanged: OP_RETURN, dust-to-self (330), change.
+        let outs = &built.psbt.unsigned_tx.output;
+        assert!(outs[0].script_pubkey.is_op_return());
+        let self_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
+        assert_eq!(outs[1].script_pubkey.as_bytes(), self_spk);
+        assert_eq!(outs[1].value.to_sat(), 330);
+        let change_spk = source.derive(1, 0).unwrap().spk;
+        assert_eq!(outs[2].script_pubkey.as_bytes(), change_spk);
+
+        // Sign fully in-app — no PSBT export, no external wallet.
+        let mut psbt = built.psbt.clone();
+        let signed = sign_own_wpkh_inputs(&mut psbt, &material, NET, 0, &coins).unwrap();
+        assert_eq!(signed, 1);
+
+        let (raw, txid, _vsize) = crate::psbt_finalize::finalize_extract(psbt).unwrap();
+        assert_eq!(txid, built.txid, "finalize must not change the txid");
+
+        // rust-bitcoin accepts the P2WPKH witness (sig + pubkey) and its
+        // own BIP143 sighash verifies against the derived spending pubkey.
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(&raw).unwrap()).unwrap();
+        assert_eq!(tx.input[0].witness.len(), 2);
+        let witness = tx.input[0].witness.to_vec();
+        let key = crate::spending::derive_spending_key(&material, NET, 0, 0, 0).unwrap();
+        assert_eq!(witness[1], key.pubkey.to_vec());
+
+        let prevout = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::from_bytes(coin_addr.spk.clone()),
+        };
+        let mut cache = bitcoin::sighash::SighashCache::new(&tx);
+        let sighash = cache
+            .p2wpkh_signature_hash(
+                0,
+                &prevout.script_pubkey,
+                prevout.value,
+                bitcoin::sighash::EcdsaSighashType::All,
+            )
+            .unwrap();
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        let sig = bitcoin::secp256k1::ecdsa::Signature::from_der(&witness[0][..witness[0].len() - 1]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_slice(&witness[1]).unwrap();
+        secp.verify_ecdsa(&bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array()), &sig, &pk)
+            .expect("P2WPKH witness verifies under rust-bitcoin's own sighash");
+
+        // Scan it back: the spending wallet's spk is in the self-spk SET,
+        // so the note extracts as OWN even though the tx spends from a
+        // bc1q address, not the notebook's own bc1p address.
+        let payloads: Vec<String> = tx
+            .output
+            .iter()
+            .filter_map(|o| notes_core::tx::op_return_payload(o.script_pubkey.as_bytes()).map(hex::encode))
+            .collect();
+        let onchain = OnchainTx {
+            txid: txid.clone(),
+            height: Some(1),
+            blocktime: Some(1),
+            spends_from_self: false, // doesn't spend the NOTEBOOK's own spk
+            payloads,
+            pays_self: true, // the dust-to-self output
+            sender: None,
+            author_candidates: vec![],
+            recipient: None,
+            input_prevout_spks: vec![hex::encode(&coin_addr.spk)],
+        };
+        let bundle = SyncBundle { network: "mainnet".into(), notes_onchain: vec![onchain], ..Default::default() };
+        let self_spks = vec![self_spk, coin_addr.spk.clone()];
+        let notes = extract_notes_multi(&bundle, &alice, NET, &self_spks);
+        assert_eq!(notes.len(), 1);
+        assert!(!notes[0].received, "spending-wallet-funded note scans as OWN");
+        assert_eq!(notes[0].text.as_deref(), Some("funded fully in-app"));
+
+        // Without the spending spk in the set, the self-spend rule alone
+        // (spends_from_self=false) correctly leaves it RECEIVED-shaped —
+        // proves the self-spk SET is what's doing the work above, not
+        // some other path.
+        let notes_without = extract_notes_multi(&bundle, &alice, NET, &[notes_core::address::p2tr_script_pubkey(&alice.output_x)]);
+        assert_eq!(notes_without.len(), 1);
+        assert!(notes_without[0].received, "without the spk in the set it looks received");
     }
 }

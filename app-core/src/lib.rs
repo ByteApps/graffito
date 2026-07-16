@@ -17,6 +17,7 @@ pub mod keyexport;
 pub mod notebooks;
 pub mod psbt_build;
 pub mod psbt_finalize;
+pub mod spending;
 pub mod ur;
 pub mod ur_account;
 
