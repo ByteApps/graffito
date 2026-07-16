@@ -336,6 +336,15 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Show the transient "Copied" toast. Bumps toast-nonce so a repeat copy
+/// while a toast is still on screen extends the ~1.5s auto-dismiss window
+/// (the countdown reset lives in app.slint's `changed toast-nonce` handler).
+fn show_toast(w: &AppWindow, text: &str) {
+    w.set_toast_text(text.into());
+    w.set_toast_nonce(w.get_toast_nonce() + 1);
+    w.set_toast_open(true);
+}
+
 fn spendable_inputs(store: &Store) -> Vec<app_core::store::TxInput> {
     store
         .utxos
@@ -3659,9 +3668,20 @@ pub fn run() {
 
     cb!(on_copy_text, |w, s, kind: SharedString, text: SharedString| {
         let _ = &mut s;
-        let _ = &w;
         let ok = platform::set_clipboard_text(text.as_str());
         println!("cb: copy kind={kind} len={} ok={ok}", text.len());
+        let msg = if ok {
+            match kind.as_str() {
+                "address" => "Address copied",
+                "backup-words" => "Recovery phrase copied",
+                "note-text" => "Note copied",
+                "txid" => "Txid copied",
+                _ => "Copied",
+            }
+        } else {
+            "Copy failed"
+        };
+        show_toast(&w, msg);
     });
 
     cb!(on_set_fee_tier, |w, s, tier: i32| {
@@ -5295,7 +5315,10 @@ pub fn run() {
             return;
         }
         let ok = platform::set_clipboard_text(&b64);
-        w.set_status(if ok { "copied PSBT (base64)" } else { "copy failed" }.into());
+        if !ok {
+            w.set_status("copy failed".into());
+        }
+        show_toast(&w, if ok { "PSBT copied" } else { "Copy failed" });
     });
 
     cb!(on_psbt_goto_import, |w, s| {
@@ -6129,9 +6152,10 @@ pub fn run() {
     });
 
     cb!(on_copy_value, |w, s, value: SharedString| {
-        let _ = (&w, &mut s);
-        let _ = platform::set_clipboard_text(value.as_str());
+        let _ = &mut s;
+        let ok = platform::set_clipboard_text(value.as_str());
         println!("cb: copy-value len={}", value.len());
+        show_toast(&w, if ok { "Copied" } else { "Copy failed" });
     });
 
     cb!(on_go_home, |w, s| {

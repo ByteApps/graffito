@@ -978,6 +978,21 @@ export component AppWindow inherits Window {
     in-out property <int> screen: 0;
     in-out property <string> status; // in-out: back buttons clear stale messages
 
+    // Transient "Copied" toast (auto-dismisses ~1.5s after the LAST copy).
+    // Every copy affordance (copy-text/copy-value/psbt-copy) funnels here from
+    // Rust; toast-nonce bumps on each show. toast-ticks is a countdown (in
+    // toast-timer intervals) decremented by the timer and reset by the
+    // toast-nonce changed-handler below — a repeat copy while the toast is
+    // still open just pushes the countdown back out, no timer restart needed
+    // (toggling a running Timer's `running` off/on within one callback does
+    // NOT reset its elapsed time in Slint: the net value is unchanged within
+    // the same evaluation, so the runtime never sees a rising edge to restart
+    // from — confirmed empirically 2026-07-15, don't reintroduce that pattern).
+    in-out property <string> toast-text;
+    in-out property <bool> toast-open;
+    in-out property <int> toast-nonce;
+    in-out property <int> toast-ticks;
+
     // Safe-area insets (set from Rust on iOS: status bar / Dynamic Island /
     // home indicator). 0 on macOS. Applied as padding on each screen root.
     in property <length> safe-top: 0px;
@@ -1433,6 +1448,9 @@ export component AppWindow inherits Window {
     changed rename-address => { if (root.rename-address == "") { back-scope.focus(); } }
     changed fund-rename-id => { if (root.fund-rename-id == "") { back-scope.focus(); } }
     changed nb-rename-index => { if (root.nb-rename-index < 0) { back-scope.focus(); } }
+    // A repeat copy while the toast is still showing resets the countdown
+    // (see toast-ticks above) instead of cutting the dismiss short.
+    changed toast-nonce => { root.toast-ticks = 6; }
 
     back-scope := FocusScope {
         focus-on-click: false; // never steal a tap's focus from a field
@@ -4402,6 +4420,50 @@ export component AppWindow inherits Window {
         // QR — closes it (non-TouchArea siblings above would otherwise swallow
         // the click).
         TouchArea { clicked => { root.qr-zoom-open = false; } }
+    }
+
+    // ---------- Copy toast ("Copied") ----------
+    // Every copy affordance (backup words, address, note text/txid, key-export
+    // rows, PSBT base64) funnels through Rust's on-copy-text/on-copy-value/
+    // on-psbt-copy, which set toast-text + bump toast-nonce + open toast-open.
+    // Non-interactive (no TouchArea) so it never blocks taps underneath. The
+    // timer just ticks a countdown (toast-ticks, reset by the toast-nonce
+    // changed-handler above) while open, so it auto-dismisses ~1.5s after the
+    // LAST copy — see the note on toast-ticks for why this isn't a simple
+    // running-toggle restart.
+    toast-timer := Timer {
+        interval: 250ms;
+        running: root.toast-open;
+        triggered => {
+            root.toast-ticks -= 1;
+            if (root.toast-ticks <= 0) {
+                root.toast-open = false;
+            }
+        }
+    }
+    if root.toast-open: Rectangle {
+        width: 100%;
+        height: 100%;
+        toast-pill := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: parent.height - self.height - 64px;
+            width: toast-label.preferred-width + 32px;
+            height: 36px;
+            border-radius: 18px;
+            background: Pal.card.with-alpha(0.96);
+            border-width: 1px;
+            border-color: Pal.line;
+            toast-label := Text {
+                width: parent.width;
+                height: parent.height;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                text: root.toast-text;
+                color: Pal.text;
+                font-size: 13px;
+                font-weight: 600;
+            }
+        }
     }
 
     // Splash cover — the topmost child, so it hides everything until Rust
