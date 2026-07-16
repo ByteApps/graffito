@@ -124,6 +124,24 @@ fn main() {
             let mut store = load(&args[2]);
             let net = network(&store.network.clone());
             let ident = identity(net);
+            // Funding-unification M3.1: stamp the RUNTIME spending cache
+            // from the account-level notebooks index (mirrors
+            // `State::activate` in src/lib.rs) so `apply_bundle`'s
+            // self-spk SET recognizes spending-wallet-funded notes as
+            // OWN. Best-effort and additive: non-hierarchical APP_KEY
+            // (WIF/hex/account-xprv) has no notebooks index at all, and a
+            // never-enabled spending wallet leaves an empty section
+            // either way — both leave `store.spending` at its byte-
+            // identical pre-M2 default.
+            let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | xprv | WIF | hex32");
+            let account: u32 =
+                std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
+            if let Ok(material) = parse_key_material(&key, net) {
+                let ix_path = spending_index_path(&args[2], net, &material);
+                if let Ok(ix) = NotebookIndex::load(&ix_path) {
+                    store.spending = ix.spending_for(account);
+                }
+            }
             let client = ChainClient::new(HttpTransport::new(&args[3]), net);
             let bundle = client.build_bundle(&store.address, None).expect("build bundle");
             let stats = match ident.full() {
@@ -555,6 +573,39 @@ fn main() {
             println!("cli: spending-address index={index} address={}", addr.address);
             println!("{}", addr.address);
         }
+        Some("spending-discover") => {
+            // spending-discover <store.json> <base-url> [gap]
+            // Words-only recovery leg (funding-unification M4): gap-scan
+            // BOTH chains of the identity's BIP-84 spending branch
+            // (`chain::discover_spending`, the same walk
+            // `spending_refresh_async` runs from the UI) and merge every
+            // discovered address into the account-level notebooks index
+            // — no local state needed beyond the mnemonic/xprv itself, so
+            // a fresh (or missing) index file is created here. Needs a
+            // BIP-39/master-xprv APP_KEY.
+            let store = load(&args[2]);
+            let net = network(&store.network.clone());
+            let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | master xprv");
+            let account: u32 =
+                std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
+            let material = parse_key_material(&key, net).expect("APP_KEY parse");
+            let source = app_core::spending::funding_source(&material, net, account)
+                .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
+            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let gap: u32 = args.get(4).and_then(|g| g.parse().ok()).unwrap_or(20);
+            let (used, next_receive, next_change) =
+                app_core::chain::discover_spending(&client, &source, gap);
+            let ix_path = spending_index_path(&args[2], net, &material);
+            let mut ix = NotebookIndex::load(&ix_path).unwrap_or_default();
+            let mut section = ix.spending_for(account);
+            let found = used.len();
+            section.apply_discovery(used, next_receive, next_change);
+            ix.set_spending(account, section);
+            ix.save(&ix_path).expect("save notebooks index");
+            println!(
+                "cli: spending-discover found={found} next_receive={next_receive} next_change={next_change}"
+            );
+        }
         Some("note-spend-funded") => {
             // note-spend-funded <store.json> <base-url> <public|private> <rate> <text> [to]
             // Fully in-app internal funding kind: scan the identity's OWN
@@ -927,6 +978,7 @@ fn main() {
                  notes <store> | compose <store> <base> <public|private> <rate> <text> [to] | \
                  bundle <addr> <net> <base> <out> | \
                  spending-address <store> <net> | \
+                 spending-discover <store> <base> [gap] | \
                  note-spend-funded <store> <base> <public|private> <rate> <text> [to] | \
                  fund-keygen <net> <seed-hex> [tr|wpkh] | \
                  fund-build <base> <net> <desc> <public|private> <rate> <text> [to] | \
