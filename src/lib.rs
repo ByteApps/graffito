@@ -6184,14 +6184,14 @@ pub fn run() {
             }
         };
         let mut psbt = built.psbt.clone();
-        let signed = match app_core::psbt_build::sign_own_wpkh_inputs(
+        match app_core::psbt_build::sign_own_wpkh_inputs(
             &mut psbt,
             &key_material,
             net,
             account,
             &s.spending_coins,
         ) {
-            Ok(n) if n > 0 => n,
+            Ok(n) if n > 0 => {}
             Ok(_) => {
                 w.set_status("no spending-wallet inputs signed".into());
                 return;
@@ -6210,7 +6210,9 @@ pub fn run() {
         };
         let client = ChainClient::new(HttpTransport::new(&base), net);
         match client.broadcast(&raw) {
-            Ok(got_txid) => {
+            // The locally computed txid is authoritative (same convention as the
+            // keyed compose path); the endpoint echo only confirms acceptance.
+            Ok(_echo) => {
                 if built.change > 0 {
                     if let Ok(change_addr) = source.derive(1, change_index) {
                         if let Some(store) = s.store.as_mut() {
@@ -6234,7 +6236,7 @@ pub fn run() {
                             received: false,
                             sender: None,
                             recipient: to.clone(),
-                            txids: vec![got_txid.clone()],
+                            txids: vec![txid.clone()],
                             height: None,
                             blocktime: None,
                             created_at: Some(now()),
@@ -6251,12 +6253,12 @@ pub fn run() {
                 }
                 s.save_store();
                 println!(
-                    "cb: compose id={} txid={got_txid} fee={} vsize={vsize} to={} private={private} funded=spending broadcast=ok",
+                    "cb: compose id={} txid={txid} fee={} vsize={vsize} to={} private={private} funded=spending broadcast=ok",
                     hex::encode(note_id),
                     built.fee,
                     to.as_deref().unwrap_or("self"),
                 );
-                w.set_status(format!("broadcast {}…", &got_txid[..12.min(got_txid.len())]).into());
+                w.set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
                 w.set_compose_text("".into());
                 w.set_change_address("".into());
                 w.set_change_expanded(false);

@@ -6,7 +6,6 @@ use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Address, Psbt};
 use miniscript::psbt::PsbtExt;
 use notes_core::address::p2tr_script_pubkey;
-use notes_core::bundle::Identity;
 use notes_core::envelope;
 use notes_core::tx::op_return_payload;
 use notes_core::Network;
