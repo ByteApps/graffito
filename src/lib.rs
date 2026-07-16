@@ -1950,7 +1950,7 @@ fn update_wallet_coins(w: &AppWindow, st: &State) {
     w.set_coins(VecModel::from_slice(&coins));
     w.set_coins_summary(
         if n == 0 {
-            "No coins anywhere yet — fund a notebook's address to add some.".to_string()
+            "No notebook coins yet — fund a notebook's address to add some.".to_string()
         } else {
             format!(
                 "{n} coin{} · {} sats across {notebooks} notebook{}",
@@ -2874,9 +2874,13 @@ fn spending_compose_ui(w: &AppWindow, st: &State, text: &str) {
             );
             w.set_change_amount(
                 if has_custom_change {
-                    format!("Change to {}… · ~{} sats", &change_trim[..14.min(change_trim.len())], built.change)
+                    format!(
+                        "Change to {}… · ~{} sats",
+                        &change_trim[..14.min(change_trim.len())],
+                        commas(built.change)
+                    )
                 } else {
-                    format!("Change to a fresh spending-wallet address · ~{} sats", built.change)
+                    format!("Change to a fresh spending-wallet address · ~{} sats", commas(built.change))
                 }
                 .into(),
             );
@@ -6226,6 +6230,16 @@ pub fn run() {
                 return;
             }
         };
+        // Captured before `finalize_extract` consumes the PSBT — used below
+        // to drop the just-spent coins from the runtime cache the moment the
+        // broadcast succeeds (finding 1: a second compose in the same
+        // session must never see an already-spent UTXO).
+        let spent_outpoints: Vec<(String, u32)> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|inp| (inp.previous_output.txid.to_string(), inp.previous_output.vout))
+            .collect();
         let (raw, txid, vsize) = match finalize_extract(psbt) {
             Ok(x) => x,
             Err(e) => {
@@ -6238,6 +6252,15 @@ pub fn run() {
             // The locally computed txid is authoritative (same convention as the
             // keyed compose path); the endpoint echo only confirms acceptance.
             Ok(_echo) => {
+                // Drop the coins this tx just spent so an immediate second
+                // compose (before the refresh below finishes, or without
+                // ever tapping refresh) can't try to spend them again.
+                s.spending_coins
+                    .retain(|c| !spent_outpoints.iter().any(|(t, v)| t == &c.txid && *v == c.vout));
+                update_spending_ui(&w, &s);
+                // Kick a fresh scan so the new change coin shows up once
+                // it's discoverable on-chain.
+                spending_refresh_async(&w, &mut s);
                 if built.change > 0 {
                     if let Ok(change_addr) = source.derive(1, change_index) {
                         if let Some(store) = s.store.as_mut() {

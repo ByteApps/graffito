@@ -3044,9 +3044,11 @@ export component AppWindow inherits Window {
             SvgIconButton { icon: "refresh"; clicked => { root.refresh-coins(); } }
         }
         Caption {
-            text: root.watch-only
-                ? "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating signs on your external wallet."
-                : "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating gathers them into ONE coin at an address you pick.";
+            text: root.coins-segment == "spending"
+                ? "The spending wallet's coins — fresh bc1q addresses that pay for notes, keeping funds off the public notebook."
+                : (root.watch-only
+                    ? "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating signs on your external wallet."
+                    : "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating gathers them into ONE coin at an address you pick.");
         }
         if root.spending-capable && root.spending-enabled: HorizontalLayout {
             spacing: 8px;
