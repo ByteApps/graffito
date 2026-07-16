@@ -58,7 +58,7 @@ Donations help cover development costs and keep more open-source bitcoin tools c
 
 ## License & disclaimer
 
-Licensed under either of the [MIT license](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE), at your option. Both licenses disclaim all warranty and liability; the notes below restate that in plain language.
+Licensed under the [Apache License 2.0](LICENSE-APACHE). It disclaims all warranty and liability; the notes below restate that in plain language.
 
 This is experimental software and it has **not been independently audited**.
 It is provided **"as is", without warranty of any kind**, express or implied,

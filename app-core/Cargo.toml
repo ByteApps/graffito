@@ -13,7 +13,7 @@
 name = "app-core"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [dependencies]
 notes-core = { git = "ssh://git@github.com/ObjSal/prime-chain-notes.git", rev = "4ae1ef0ac39599c29e88a746814064dfb53b9c48" }
