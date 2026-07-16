@@ -63,7 +63,10 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.objsal.chainnotes
-        PRODUCT_NAME: chain-notes-app
+        # Bundle is "Chain Notes.app" (user-visible in Finder/switcher). The
+        # Unix executable stays chain-notes-app so build_mac.bash keeps copying
+        # the Rust binary to Contents/MacOS/chain-notes-app.
+        PRODUCT_NAME: Chain Notes
         EXECUTABLE_NAME: chain-notes-app
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
