@@ -5,7 +5,7 @@ options:
 settings:
   base:
     MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    CURRENT_PROJECT_VERSION: "8"
 targets:
   chain-notes-app:
     type: application
@@ -30,6 +30,13 @@ targets:
       properties:
         CFBundleDisplayName: Chain Notes
         CFBundleExecutable: chain-notes-app
+        # xcodegen regenerates Info.plist from these properties on every
+        # `generate` — without an explicit entry here it defaults
+        # CFBundleVersion to "1" every time, silently discarding
+        # settings.base.CURRENT_PROJECT_VERSION above (which nothing else
+        # references). Point it at that setting so bumping it up top is the
+        # one place that actually takes effect.
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSCameraUsageDescription: "Scan QR codes (keys, addresses, PSBTs, sync bundles)."
         NSFaceIDUsageDescription: "Unlock your notes key to reveal your backup."
         # Dark launch background (matches Pal.bg) so the cold-start flash isn't
