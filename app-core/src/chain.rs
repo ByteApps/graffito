@@ -567,6 +567,10 @@ pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
         sender: if spends_from_self { None } else { sender },
         author_candidates,
         recipient: if spends_from_self { recipient } else { None },
+        // Raw prevout spks for the self-spk-SET ownership rule land with
+        // the spending wallet (funding-unification M2); empty keeps the
+        // legacy spends_from_self-only behavior via notes-core's OR rule.
+        input_prevout_spks: Vec::new(),
     })
 }
 

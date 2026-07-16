@@ -696,6 +696,7 @@ mod tests {
             sender: Some(funder),                       // funder, NOT the author
             author_candidates: vec![alice.address(NET)], // dust-to-self carries the author key
             recipient: None,
+            input_prevout_spks: Vec::new(),
         };
         let bundle = SyncBundle { network: "mainnet".into(), notes_onchain: vec![onchain], ..Default::default() };
         let notes = extract_notes(&bundle, &bob, NET);
@@ -959,6 +960,7 @@ mod tests {
                 sender: None,
                 author_candidates: vec![],
                 recipient: None,
+                input_prevout_spks: Vec::new(),
             }],
             ..Default::default()
         };
@@ -1075,6 +1077,7 @@ mod tests {
                 sender: Some(fund_addr.address.clone()),
                 author_candidates: vec![],
                 recipient: None,
+                input_prevout_spks: Vec::new(),
             }],
             ..Default::default()
         };
