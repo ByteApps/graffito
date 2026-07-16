@@ -16,7 +16,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-notes-core = { git = "ssh://git@github.com/ObjSal/prime-chain-notes.git", rev = "5e5150d1db1e42f292908a814ecf745384da4009" }
+notes-core = { git = "ssh://git@github.com/ObjSal/prime-chain-notes.git", rev = "87eb6978d7f872a060da44196cd0aee0a67b7253" }
 # base64 feature = PSBT <-> base64 string (`.psbt` file / clipboard export).
 bitcoin = { version = "0.32", features = ["base64"] }
 # Output-descriptor parsing + address derivation for external funding wallets

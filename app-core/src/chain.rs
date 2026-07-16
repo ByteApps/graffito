@@ -671,7 +671,13 @@ fn classify_tx_inner(tx: &EsploraTx, address: &str, network: Option<Network>) ->
         pays_self,
         sender: if spends_from_self { None } else { sender },
         author_candidates,
-        recipient: if spends_from_self { recipient } else { None },
+        // Unconditional: ownership is no longer equivalent to
+        // spends_from_self (a spending-wallet- or externally-funded own
+        // note spends other inputs), and the sender needs this field to
+        // re-derive its own directed-private DM key on rescan. notes-core
+        // surfaces it only for directed notes (the envelope flag), so a
+        // self-note's "first non-self output" (its change) stays hidden.
+        recipient,
         input_prevout_spks,
     })
 }
