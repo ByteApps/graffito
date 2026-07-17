@@ -2169,6 +2169,13 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
             }
         }
         update_home(w, st);
+        if w.get_screen() == 20 {
+            update_funding_screen_ui(w, st);
+            log_funding_refresh(st);
+        }
+        if w.get_screen() == 6 {
+            w.set_pay_from_balance(balance_text_for(st, w.get_pay_from().as_str()).into());
+        }
     }
 }
 
@@ -2332,6 +2339,9 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
         update_spending_ui(w, st);
         if w.get_screen() == 6 && w.get_pay_from() == "spending" {
             refresh_compose(w, st);
+        }
+        if w.get_screen() == 20 {
+            log_funding_refresh(st);
         }
     }
 }
@@ -2526,6 +2536,58 @@ fn apply_pay_from(w: &AppWindow, st: &mut State, kind: &str) {
             w.set_spend_from_wallet(false);
         }
     }
+    w.set_pay_from_balance(balance_text_for(st, kind).into());
+}
+
+/// Short "<n> sats" figure for the compose compact "Pay from" row and the
+/// funding screen's Notebook row — deliberately terse (no coin count) so it
+/// always elides cleanly at iPhone width. `kind` is a `pay-from` value:
+/// "notebook" | "spending" | "wallet:<id>".
+fn balance_text_for(st: &State, kind: &str) -> String {
+    if let Some(id) = kind.strip_prefix("wallet:") {
+        return st
+            .funding_wallets
+            .iter()
+            .find(|fw| fw.id == id)
+            .map(|fw| format!("{} sats", commas(fw.balance)))
+            .unwrap_or_else(|| "watch-only".to_string());
+    }
+    if kind == "spending" {
+        return if !st.spending_scanned {
+            "scanning…".to_string()
+        } else {
+            let total: u64 = st.spending_coins.iter().map(|c| c.value).sum();
+            format!("{} sats", commas(total))
+        };
+    }
+    st.store.as_ref().map(|s| format!("{} sats", commas(s.balance()))).unwrap_or_default()
+}
+
+/// Populate the funding screen's Notebook row balance. Cheap local
+/// derivation only — callers that need fresh chain data call
+/// [`refresh_async`]/[`spending_refresh_async`] first (the funding-refresh
+/// callback does both).
+fn update_funding_screen_ui(w: &AppWindow, st: &State) {
+    w.set_funding_notebook_balance(balance_text_for(st, "notebook").into());
+}
+
+/// `cb: funding-refresh` — logged whenever a background scan the funding
+/// screen's ↻ kicked off lands while screen 20 is still open. Notebook and
+/// spending scan on independent worker threads (same pattern as
+/// `on_refresh_coins`), so this may print twice per tap (once per source
+/// landing) — each time with the freshest values known so far.
+fn log_funding_refresh(st: &State) {
+    let notebook = st.store.as_ref().map(|s| s.balance()).unwrap_or(0);
+    let spending = if st.spending_capable && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false) {
+        if st.spending_scanned {
+            st.spending_coins.iter().map(|c| c.value).sum::<u64>().to_string()
+        } else {
+            "?".to_string()
+        }
+    } else {
+        "off".to_string()
+    };
+    println!("cb: funding-refresh notebook={notebook} spending={spending}");
 }
 
 fn refresh_compose(w: &AppWindow, st: &mut State) {
@@ -2533,6 +2595,9 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     let text = w.get_compose_text().to_string();
     let private = w.get_compose_private();
     let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
+    // Keep the compact "Pay from" row's balance current regardless of which
+    // branch below runs (notebook / spending / external).
+    w.set_pay_from_balance(balance_text_for(st, w.get_pay_from().as_str()).into());
     // External-funding mode: the coin panel shows the funding wallet's coins,
     // not the self-funded store coins. Handled on its own isolated path.
     if w.get_fund_external() {
@@ -2759,16 +2824,21 @@ fn funding_compose_ui(w: &AppWindow, st: &State, text: &str) {
 }
 
 /// Internal-spending-wallet variant of the compose coin panel (funding-
-/// unification M3): shows the identity's OWN BIP-84 spending-wallet coins
-/// (all of them — no coin control, matching the external funded path
-/// above) and a LIVE cost/change preview from a dry-run of the exact same
-/// funded-note assembly the broadcast path uses
-/// (`psbt_build::build_funding_psbt_amount`), so the preview and the real
-/// build can never disagree.
-fn spending_compose_ui(w: &AppWindow, st: &State, text: &str) {
+/// unification M3, coin control added funding-unification/M4): shows the
+/// identity's OWN BIP-84 spending-wallet coins with the SAME tap-to-toggle
+/// coin control as the notebook path (`selected_coins`/`coins_overridden`,
+/// shared with [`refresh_compose`]'s notebook branch — default is every
+/// scanned coin until the user overrides it) and a LIVE cost/change preview
+/// from a dry-run of the exact same funded-note assembly the broadcast path
+/// uses (`psbt_build::build_funding_psbt_amount`), spending only the
+/// SELECTED coins, so the preview and the real build can never disagree.
+fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     let net = st.network;
     let n = st.spending_coins.len();
-    let total: u64 = st.spending_coins.iter().map(|c| c.value).sum();
+    if !st.coins_overridden {
+        st.selected_coins = st.spending_coins.iter().map(|c| (c.txid.clone(), c.vout)).collect();
+    }
+    let sel: std::collections::HashSet<(String, u32)> = st.selected_coins.iter().cloned().collect();
     let exb = st.explorer_base();
     let coins: Vec<SpendCoin> = st
         .spending_coins
@@ -2777,14 +2847,26 @@ fn spending_compose_ui(w: &AppWindow, st: &State, text: &str) {
             outpoint: format!("{}:{}", c.txid, c.vout).into(),
             value: c.value.to_string().into(),
             confirmed: c.confirmed,
-            selected: true,
+            selected: sel.contains(&(c.txid.clone(), c.vout)),
             txid_short: c.txid[..8.min(c.txid.len())].to_string().into(),
             explorer: explorer_tx_url(exb.as_deref(), net, &c.txid).into(),
         })
         .collect();
+    let sel_count = coins.iter().filter(|c| c.selected).count();
+    let sel_total: u64 = st
+        .spending_coins
+        .iter()
+        .filter(|c| sel.contains(&(c.txid.clone(), c.vout)))
+        .map(|c| c.value)
+        .sum();
     w.set_spend_coins(VecModel::from_slice(&coins));
     w.set_spend_title(
-        format!("Spending wallet · {n} coin{} · {} sats", if n == 1 { "" } else { "s" }, commas(total)).into(),
+        format!(
+            "Spending wallet · {sel_count}/{n} coin{} · {} sats",
+            if n == 1 { "" } else { "s" },
+            commas(sel_total)
+        )
+        .into(),
     );
 
     // Change destination: blank = a fresh spending-wallet address; a valid
@@ -2811,6 +2893,12 @@ fn spending_compose_ui(w: &AppWindow, st: &State, text: &str) {
     if n == 0 {
         w.set_cost_line("".into());
         w.set_change_amount("Spending wallet has no coins yet — fund its receive address in Settings.".into());
+        w.set_spend_enough(false);
+        return;
+    }
+    if sel_count == 0 {
+        w.set_cost_line("".into());
+        w.set_change_amount("No coins selected — select at least one below.".into());
         w.set_spend_enough(false);
         return;
     }
@@ -2845,9 +2933,17 @@ fn spending_compose_ui(w: &AppWindow, st: &State, text: &str) {
     let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
     let change_index = store.spending.next_change;
     let has_custom_change = change_override_spk.is_some();
+    // Spend exactly the coins selected in the coin-control list below —
+    // mirrors the notebook path's `compose_*_exact`.
+    let selected_coins: Vec<app_core::funding::FundingUtxo> = st
+        .spending_coins
+        .iter()
+        .filter(|c| sel.contains(&(c.txid.clone(), c.vout)))
+        .cloned()
+        .collect();
     let plan = FundingPlan {
         source,
-        coins: &st.spending_coins,
+        coins: &selected_coins,
         change_index,
         fee_rate: rate,
         change_override: change_override_spk,
@@ -2981,6 +3077,7 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
                 let label = st.funding_wallets[idx].label.clone();
                 w.set_pay_from(format!("wallet:{id}").into());
                 w.set_pay_from_label(label.clone().into());
+                w.set_pay_from_balance(format!("{} sats", commas(st.funding_wallets[idx].balance)).into());
                 println!("cb: pay-from wallet:{label}");
                 w.set_spend_expanded(true);
                 w.set_screen(6);
@@ -5174,11 +5271,18 @@ pub fn run() {
         s.selected_coins.clear();
         w.set_status("".into());
         w.set_payfrom_expanded(false);
-        // Funding-unification M3: default to the spending wallet when the
-        // setting is on (PLAN "UI" section); a watch identity has none.
+        // Funding-unification: default to the spending wallet ONLY when the
+        // setting is on AND it actually has spendable balance (Sal
+        // 2026-07-16) — an enabled-but-empty spending wallet still defaults
+        // to Notebook. Balance is whatever's cached this session; an
+        // unscanned wallet reads as 0 and falls through to Notebook too
+        // (never guess a positive balance we haven't confirmed). A watch
+        // identity has no spending wallet at all.
+        let spending_balance: u64 = s.spending_coins.iter().map(|c| c.value).sum();
         let spending_default = s.spending_capable
             && !s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false)
-            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false);
+            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
+            && spending_balance > 0;
         apply_pay_from(&w, &mut s, if spending_default { "spending" } else { "notebook" });
         w.set_screen(6);
         refresh_compose(&w, &mut s);
@@ -5523,6 +5627,28 @@ pub fn run() {
         w.set_status("".into());
         refresh_funding_list(&w, &s);
         w.set_screen(15);
+    });
+
+    // funding-unification: compose's compact "Pay from" row → the dedicated
+    // picker/coin-control/change-address screen (20).
+    cb!(on_open_funding_screen, |w, s| {
+        println!("cb: funding-open");
+        w.set_status("".into());
+        update_funding_screen_ui(&w, &s);
+        refresh_funding_list(&w, &s);
+        w.set_screen(20);
+    });
+
+    // Screen 20's header ↻: re-scan the notebook + (if enabled) the spending
+    // wallet on worker threads, same async/trampoline pattern as
+    // refresh_async/spending_refresh_async — never blocks the UI thread.
+    // Each landing logs its own `cb: funding-refresh …` (see
+    // apply_refresh_results / apply_spending_refresh_results).
+    cb!(on_funding_refresh, |w, s| {
+        refresh_async(&w, &mut s);
+        if s.spending_capable && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false) {
+            spending_refresh_async(&w, &mut s);
+        }
     });
 
     cb!(on_add_funding_wallet, |w, s| {
@@ -6159,6 +6285,25 @@ pub fn run() {
             w.set_status("spending wallet has no coins — fund it from Settings".into());
             return;
         }
+        // Spend exactly the coins selected in the funding screen's coin
+        // control — same `selected_coins`/`coins_overridden` state the
+        // notebook path uses; unselected defaults to every scanned coin
+        // (matches the live preview in `spending_compose_ui`).
+        let spending_sel: std::collections::HashSet<(String, u32)> = if s.coins_overridden {
+            s.selected_coins.iter().cloned().collect()
+        } else {
+            s.spending_coins.iter().map(|c| (c.txid.clone(), c.vout)).collect()
+        };
+        let selected_spending_coins: Vec<app_core::funding::FundingUtxo> = s
+            .spending_coins
+            .iter()
+            .filter(|c| spending_sel.contains(&(c.txid.clone(), c.vout)))
+            .cloned()
+            .collect();
+        if selected_spending_coins.is_empty() {
+            w.set_status("no coins selected".into());
+            return;
+        }
         let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
             w.set_status("no identity".into());
             return;
@@ -6191,7 +6336,7 @@ pub fn run() {
         }
         let plan = FundingPlan {
             source: &source,
-            coins: &s.spending_coins,
+            coins: &selected_spending_coins,
             change_index,
             fee_rate: rate,
             change_override,
@@ -6218,7 +6363,7 @@ pub fn run() {
             &key_material,
             net,
             account,
-            &s.spending_coins,
+            &selected_spending_coins,
         ) {
             Ok(n) if n > 0 => {}
             Ok(_) => {
@@ -6313,6 +6458,8 @@ pub fn run() {
                 w.set_change_expanded(false);
                 w.set_spend_expanded(false);
                 w.set_payfrom_expanded(false);
+                s.coins_overridden = false;
+                s.selected_coins.clear();
                 w.set_screen(4);
                 refresh(&w, &mut s);
             }
