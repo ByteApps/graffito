@@ -46,7 +46,12 @@ export struct ActivityItem {
     txid: string, fee-line: string, status: string, explorer: string,
     pending: bool, replaced: string, notebook: string,
     // Funding-unification M3: "spending" | "wallet:<label>" | "" (notebook-funded).
-    funded: string }
+    funded: string,
+    // Async rebroadcast/speed-up (2026-07-16): true only for the ONE row
+    // whose Rebroadcast/Speed-up is in flight on a worker thread — that
+    // row's buttons show a busy caption and disable; other rows stay
+    // tappable.
+    busy: bool }
 
 // Per-platform optical calibration, set from Rust at startup. The header
 // title Text sits differently inside its line box per platform font (macOS/
@@ -775,6 +780,56 @@ component CopyButton inherits Rectangle {
     }
 }
 
+// Continuously-rotating loading indicator for QR cards (Sal 2026-07-16): QR
+// generation can lag behind an async refresh (e.g. the spending wallet's
+// receive-address QR is cleared to the default image while its worker-
+// thread scan runs) — without this, that gap rendered as a plain white
+// square that looked stuck. A Timer bumps the rotation angle continuously
+// (Slint's `animate` has no infinite-iteration mode, so a timer step gives
+// the same continuous-spin effect — femtovg-safe, no GPU shader needed);
+// the icon is the plain arc SVG (`icons/spinner.svg`) per the tofu rule —
+// no glyph spinners.
+component QrSpinner inherits Rectangle {
+    property <angle> spin-angle: 0deg;
+    Timer {
+        interval: 16ms;
+        running: true;
+        triggered => { spin-angle += 8deg; }
+    }
+    Image {
+        source: @image-url("icons/spinner.svg");
+        colorize: Pal.faint;
+        width: min(parent.width, parent.height) * 0.4;
+        height: self.width;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        rotation-angle: spin-angle;
+        rotation-origin-x: self.width / 2;
+        rotation-origin-y: self.height / 2;
+    }
+}
+
+// A QR image with an automatic loading spinner: whenever `img` is the
+// default/unset image (width == 0 — Rust hasn't produced/refreshed it yet),
+// shows QrSpinner instead of a blank white square. `qr-size` is the square
+// side; callers keep their own tap-to-zoom TouchArea layered on top.
+component QrArea inherits Rectangle {
+    in property <image> img;
+    in property <length> qr-size: 100px;
+    width: root.qr-size;
+    height: root.qr-size;
+    if root.img.width > 0: Image {
+        source: root.img;
+        width: 100%;
+        height: 100%;
+        image-rendering: pixelated;
+    }
+    if root.img.width <= 0: QrSpinner {
+        width: 100%;
+        height: 100%;
+    }
+}
+
 component PencilButton inherits Rectangle {
     callback clicked;
     width: 32px;
@@ -1183,6 +1238,12 @@ export component AppWindow inherits Window {
     in-out property <string> rate-text;
     in-out property <int> fee-tier: 1;
     in property <string> cost-line;
+    // Async sign+broadcast (2026-07-16): true while a compose send
+    // (notebook/spending/mixed) is building or broadcasting — disables the
+    // Sign button and swaps its caption; compose-stage names the phase.
+    in property <bool> compose-sending;
+    in property <string> compose-stage; // "signing" | "broadcasting" | ""
+    out property <string> compose-progress-label: root.compose-stage == "broadcasting" ? "Broadcasting…" : "Signing…";
     // Directed-note gift: is the current note directed, the sats to gift, and
     // whether the collapsible gift section is open.
     in property <bool> directed;
@@ -1496,6 +1557,13 @@ export component AppWindow inherits Window {
     // Create-notebook picker: used/new address probes finished on a worker
     // thread; fill in the pills without blocking the tap that opened it.
     callback apply-pending-picker-probe();
+    // Async sign+broadcast (2026-07-16): a compose send's build+broadcast
+    // finished on a worker thread — same trampoline pattern.
+    callback apply-pending-compose();
+    // A Rebroadcast (act-retry) finished on a worker thread.
+    callback apply-pending-act-retry();
+    // A Speed-up (RBF bump) broadcast finished on a worker thread.
+    callback apply-pending-act-bump();
     // Where settings/activity return on back: the screen they were opened
     // from (the notebook list or a notebook's home). Set by their open
     // callbacks in Rust.
@@ -1927,13 +1995,11 @@ export component AppWindow inherits Window {
                     height: 100px;
                     background: white;
                     border-radius: 8px;
-                    Image {
-                        source: root.address-qr;
-                        width: 92px;
-                        height: 92px;
+                    QrArea {
+                        img: root.address-qr;
+                        qr-size: 92px;
                         x: 4px;
                         y: 4px;
-                        image-rendering: pixelated;
                     }
                     // Tap the QR to enlarge it for scanning by another device.
                     TouchArea {
@@ -2377,17 +2443,24 @@ export component AppWindow inherits Window {
             SelectPill { text: "economy"; active: root.fee-tier == 0; clicked => { root.set-fee-tier(0); } }
             SelectPill { text: "normal"; active: root.fee-tier == 1; clicked => { root.set-fee-tier(1); } }
             SelectPill { text: "fast"; active: root.fee-tier == 2; clicked => { root.set-fee-tier(2); } }
-            SelectPill { text: "custom"; active: root.fee-tier == 3; clicked => { root.fee-tier = 3; } }
+            SelectPill { text: "custom"; active: root.fee-tier == 3; clicked => { root.set-fee-tier(3); } }
         }
-        // Custom sat/vB field — revealed only when the Custom tier is
-        // selected (the pill above is the toggle); hidden for the presets.
-        if root.fee-tier == 3: HorizontalLayout {
+        // Sat/vB rate box — ALWAYS visible (fee-tier redesign, 2026-07-16):
+        // shows the active tier's effective rate and updates live when the
+        // pills change; editing it auto-selects the Custom pill instead of
+        // requiring a tap there first. Rust's on-set-fee-tier never
+        // overwrites rate-text while fee-tier == 3, so this can't fight
+        // the user's typing.
+        HorizontalLayout {
             spacing: 8px;
             alignment: start;
             EditField {
                 width: 84px;
                 text <=> root.rate-text;
-                edited => { root.compose-changed(); }
+                edited => {
+                    root.fee-tier = 3;
+                    root.compose-changed();
+                }
             }
             Caption { text: "sat/vB"; vertical-alignment: center; }
         }
@@ -2507,22 +2580,22 @@ export component AppWindow inherits Window {
                 : "⚠  Public notes are world-readable, forever.";
         }
         if root.mixed-linkage-hint: PrimaryButton {
-            text: "Sign + broadcast";
-            tint: root.spend-enough ? Pal.accent : Pal.faint;
-            tint-hover: root.spend-enough ? Pal.accent-hover : Pal.faint;
-            clicked => { if (root.spend-enough) { root.compose-send-mixed(); } }
+            text: root.compose-sending ? root.compose-progress-label : "Sign + broadcast";
+            tint: (root.spend-enough && !root.compose-sending) ? Pal.accent : Pal.faint;
+            tint-hover: (root.spend-enough && !root.compose-sending) ? Pal.accent-hover : Pal.faint;
+            clicked => { if (root.spend-enough && !root.compose-sending) { root.compose-send-mixed(); } }
         }
         if !root.mixed-linkage-hint && root.pay-from == "notebook": PrimaryButton {
-            text: root.watch-only ? "Build transaction to sign" : "Sign + broadcast";
-            tint: root.spend-enough ? Pal.accent : Pal.faint;
-            tint-hover: root.spend-enough ? Pal.accent-hover : Pal.faint;
-            clicked => { if (root.spend-enough) { root.compose-send(); } }
+            text: root.compose-sending ? root.compose-progress-label : (root.watch-only ? "Build transaction to sign" : "Sign + broadcast");
+            tint: (root.spend-enough && !root.compose-sending) ? Pal.accent : Pal.faint;
+            tint-hover: (root.spend-enough && !root.compose-sending) ? Pal.accent-hover : Pal.faint;
+            clicked => { if (root.spend-enough && !root.compose-sending) { root.compose-send(); } }
         }
         if !root.mixed-linkage-hint && root.pay-from == "spending": PrimaryButton {
-            text: "Sign + broadcast";
-            tint: root.spend-enough ? Pal.accent : Pal.faint;
-            tint-hover: root.spend-enough ? Pal.accent-hover : Pal.faint;
-            clicked => { if (root.spend-enough) { root.spending-compose-send(); } }
+            text: root.compose-sending ? root.compose-progress-label : "Sign + broadcast";
+            tint: (root.spend-enough && !root.compose-sending) ? Pal.accent : Pal.faint;
+            tint-hover: (root.spend-enough && !root.compose-sending) ? Pal.accent-hover : Pal.faint;
+            clicked => { if (root.spend-enough && !root.compose-sending) { root.spending-compose-send(); } }
         }
         if !root.mixed-linkage-hint && root.fund-external: PrimaryButton {
             text: root.funding-ready ? "Build transaction to sign" : "Set a funding wallet first";
@@ -2794,13 +2867,11 @@ export component AppWindow inherits Window {
                             height: 64px;
                             background: white;
                             border-radius: 6px;
-                            Image {
-                                source: root.spending-qr;
-                                width: 58px;
-                                height: 58px;
+                            QrArea {
+                                img: root.spending-qr;
+                                qr-size: 58px;
                                 x: 3px;
                                 y: 3px;
-                                image-rendering: pixelated;
                             }
                             TouchArea {
                                 clicked => {
@@ -2813,11 +2884,19 @@ export component AppWindow inherits Window {
                             alignment: center;
                             spacing: 4px;
                             Caption { text: "Next receive address"; }
-                            Mono {
-                                text: root.spending-address;
-                                font-size: 10px;
-                                color: Pal.muted;
-                                wrap: word-wrap;
+                            HorizontalLayout {
+                                spacing: 4px;
+                                Mono {
+                                    text: root.spending-address;
+                                    font-size: 10px;
+                                    color: Pal.muted;
+                                    wrap: word-wrap;
+                                    horizontal-stretch: 1;
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    CopyButton { clicked => { root.copy-text("address", root.spending-address); } }
+                                }
                             }
                         }
                     }
@@ -3146,14 +3225,16 @@ export component AppWindow inherits Window {
                             if a.pending: GhostButton {
                                 width: 96px;
                                 height: 30px;
-                                text: "Speed up";
-                                clicked => { root.act-bump-open(a.ref-id, a.is-note); }
+                                opacity: a.busy ? 0.5 : 1.0;
+                                text: a.busy ? "…" : "Speed up";
+                                clicked => { if (!a.busy) { root.act-bump-open(a.ref-id, a.is-note); } }
                             }
                             if a.pending: GhostButton {
                                 width: 108px;
                                 height: 30px;
-                                text: "Rebroadcast";
-                                clicked => { root.act-retry(a.ref-id, a.is-note); }
+                                opacity: a.busy ? 0.5 : 1.0;
+                                text: a.busy ? "Sending…" : "Rebroadcast";
+                                clicked => { if (!a.busy) { root.act-retry(a.ref-id, a.is-note); } }
                             }
                             if a.explorer != "": GhostButton {
                                 width: 92px;
@@ -4090,11 +4171,9 @@ export component AppWindow inherits Window {
                             Rectangle {
                                 width: 176px;
                                 height: 176px;
-                                Image {
-                                    source: row.qr;
-                                    width: 100%;
-                                    height: 100%;
-                                    image-rendering: pixelated;
+                                QrArea {
+                                    img: row.qr;
+                                    qr-size: 176px;
                                 }
                                 TouchArea {
                                     clicked => {
@@ -4224,11 +4303,9 @@ export component AppWindow inherits Window {
                         Rectangle {
                             width: 200px;
                             height: 200px;
-                            Image {
-                                source: root.reveal-seedqr-image;
-                                width: 100%;
-                                height: 100%;
-                                image-rendering: pixelated;
+                            QrArea {
+                                img: root.reveal-seedqr-image;
+                                qr-size: 200px;
                             }
                             TouchArea {
                                 clicked => {
@@ -4265,11 +4342,9 @@ export component AppWindow inherits Window {
                         Rectangle {
                             width: 176px;
                             height: 176px;
-                            Image {
-                                source: root.reveal-private-qr;
-                                width: 100%;
-                                height: 100%;
-                                image-rendering: pixelated;
+                            QrArea {
+                                img: root.reveal-private-qr;
+                                qr-size: 176px;
                             }
                             TouchArea {
                                 clicked => {
@@ -4900,13 +4975,11 @@ export component AppWindow inherits Window {
             y: (parent.height - self.height) / 2;
             background: white;
             border-radius: 16px;
-            Image {
-                source: root.qr-zoom-image;
-                width: parent.width - 36px;
-                height: parent.height - 36px;
+            QrArea {
+                img: root.qr-zoom-image;
+                qr-size: parent.width - 36px;
                 x: 18px;
                 y: 18px;
-                image-rendering: pixelated;
             }
         }
         Text {

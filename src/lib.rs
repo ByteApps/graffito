@@ -210,6 +210,17 @@ struct State {
     /// Never overridden by a refresh once chosen; cleared with the rest of
     /// the compose draft on open/broadcast.
     change_choice: String,
+    /// Async sign+broadcast (2026-07-16): true while any of the three
+    /// compose send paths (notebook/spending/mixed) has a build+broadcast
+    /// in flight on a worker thread — re-entrancy guard so a double-tap on
+    /// Sign can't double-broadcast, and drives the button's disabled
+    /// "Signing…"/"Broadcasting…" state.
+    compose_busy: bool,
+    /// Activity screen (2026-07-16): the ref_id of a Rebroadcast/Speed-up
+    /// currently in flight on a worker thread, if any — only that row's
+    /// button shows the busy state and is disabled; other rows stay
+    /// tappable. None when nothing is in flight.
+    act_pending_ref: Option<String>,
 }
 
 /// One wallet-consolidate session (Coins → "Consolidate into one coin…").
@@ -1190,6 +1201,7 @@ fn update_activity(w: &AppWindow, st: &State) {
                 replaced: replaced_label(n.txids.len()).into(),
                 notebook: tag.clone().into(),
                 funded: funded_pill(n.funded_by.as_deref()).into(),
+                busy: st.act_pending_ref.as_deref() == Some(n.note_id.as_str()),
             },
         ));
     }
@@ -1222,6 +1234,7 @@ fn update_activity(w: &AppWindow, st: &State) {
                 replaced: replaced_label(t.txids.len()).into(),
                 notebook: tag.clone().into(),
                 funded: "".into(), // sweeps/consolidates aren't funded-note records
+                busy: st.act_pending_ref.as_deref() == Some(txid.as_str()),
             },
         ));
     }
@@ -2063,6 +2076,373 @@ struct DiscoveryResult {
 
 static DISCOVERY_RESULTS: std::sync::Mutex<Vec<DiscoveryResult>> = std::sync::Mutex::new(Vec::new());
 
+/// A finished Activity Rebroadcast (`on_act_retry`) broadcast POST, waiting
+/// to be applied on the UI thread — clears `State.act_pending_ref` and
+/// shows the toast (2026-07-16: rebroadcast used to give no feedback at
+/// all, "like nothing happened", per Sal).
+struct ActRetryResult {
+    ref_id: String,
+    result: Result<String, String>,
+}
+static ACT_RETRY_RESULTS: std::sync::Mutex<Vec<ActRetryResult>> = std::sync::Mutex::new(Vec::new());
+
+fn apply_act_retry_results(w: &AppWindow, st: &mut State) {
+    let results: Vec<ActRetryResult> =
+        ACT_RETRY_RESULTS.lock().expect("act-retry results mutex").drain(..).collect();
+    for r in results {
+        st.act_pending_ref = None;
+        match r.result {
+            Ok(txid) => {
+                println!("cb: act-retry ref={} txid={txid} ok", r.ref_id);
+                w.set_status(format!("rebroadcast {}…", &txid[..12.min(txid.len())]).into());
+                show_toast(w, &format!("Rebroadcast ok · {}", &txid[..8.min(txid.len())]));
+            }
+            Err(e) => {
+                println!("cb: act-retry ref={} err={e}", r.ref_id);
+                w.set_status(format!("rebroadcast failed: {e}").into());
+                show_toast(w, "Rebroadcast failed");
+            }
+        }
+    }
+    update_activity(w, st);
+}
+
+/// A finished Activity Speed-up (`on_act_bump_confirm`) broadcast POST. The
+/// re-sign (bump_fee/bump_raw_tx[_multi]) already ran synchronously and
+/// saved the store BEFORE this — same "record already saved" shape as the
+/// notebook compose path — so a broadcast failure here needs no navigation
+/// (the bump dialog already closed onto the Activity screen); only status +
+/// toast + a refresh.
+struct ActBumpResult {
+    ref_id: String,
+    txid: String,
+    fee: u64,
+    new_rate: f64,
+    result: Result<String, String>,
+}
+static ACT_BUMP_RESULTS: std::sync::Mutex<Vec<ActBumpResult>> = std::sync::Mutex::new(Vec::new());
+
+fn apply_act_bump_results(w: &AppWindow, st: &mut State) {
+    let results: Vec<ActBumpResult> =
+        ACT_BUMP_RESULTS.lock().expect("act-bump results mutex").drain(..).collect();
+    for r in results {
+        st.act_pending_ref = None;
+        match r.result {
+            Ok(bt) => {
+                println!(
+                    "cb: act-bump ref={} txid={} fee={} rate={:.1} ok",
+                    r.ref_id, r.txid, r.fee, r.new_rate
+                );
+                w.set_status(format!("sped up: {}…", &bt[..12.min(bt.len())]).into());
+                show_toast(w, &format!("Sped up · {}", &bt[..8.min(bt.len())]));
+            }
+            Err(e) => {
+                println!("cb: act-bump ref={} broadcast err={e}", r.ref_id);
+                w.set_status(format!("signed but broadcast failed: {e}").into());
+                show_toast(w, "Speed-up broadcast failed");
+            }
+        }
+    }
+    update_activity(w, st);
+    update_home(w, st);
+}
+
+// ---- Async compose send (2026-07-16) ----
+//
+// Each of the three compose send paths (notebook / spending / mixed) builds
+// + signs synchronously (fast, no network) exactly as before, then hands
+// ONLY the `client.broadcast()` POST to a worker thread — the part that
+// used to visibly freeze the Sign button on a slow connection. The UI-
+// thread `apply_*_compose_result` functions replay each path's EXACT
+// pre-existing Ok/Err bookkeeping, now run once from the worker's result via
+// the shared `apply-pending-compose` trampoline (`apply_compose_results`
+// drains all three). The external/watch/fund-external route is untouched —
+// it already hands off to the sign screen instead of broadcasting itself.
+
+/// Notebook path (`on_compose_send`): `compose_and_record` already wrote the
+/// note Pending + locked its inputs BEFORE broadcast was attempted (existing
+/// invariant), so a broadcast failure is never a build/sign failure —
+/// staying on compose would risk a double-compose. Land on Activity instead
+/// (Rebroadcast is right there for the already-saved record).
+struct NotebookComposeResult {
+    note_id: String,
+    fee: u64,
+    vsize: usize,
+    to: Option<String>,
+    private: bool,
+    result: Result<String, String>,
+}
+static NOTEBOOK_COMPOSE_RESULTS: std::sync::Mutex<Vec<NotebookComposeResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn apply_notebook_compose_result(w: &AppWindow, st: &mut State, r: NotebookComposeResult) {
+    match r.result {
+        Ok(txid) => {
+            println!(
+                "cb: compose id={} txid={txid} fee={} vsize={} to={} private={} broadcast=ok",
+                r.note_id, r.fee, r.vsize, r.to.as_deref().unwrap_or("self"), r.private
+            );
+            w.set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
+            w.set_compose_text("".into());
+            w.set_change_address("".into());
+            w.set_change_expanded(false);
+            w.set_spend_expanded(false);
+            st.coins_overridden = false;
+            st.selected_coins.clear();
+            st.mixed_selected.clear();
+            st.change_choice.clear();
+            w.set_change_choice("".into());
+            w.set_screen(4);
+            refresh_async(w, st);
+        }
+        Err(e) => {
+            println!("cb: compose broadcast err={e}");
+            w.set_return_screen(4);
+            update_activity(w, st);
+            w.set_status(format!("broadcast failed: {e} — note saved, retry from here").into());
+            show_toast(w, "Broadcast failed — note saved. Retry from this list.");
+            w.set_screen(11);
+        }
+    }
+}
+
+/// Spending-wallet path (`on_spending_compose_send`): unlike the notebook
+/// path, nothing is recorded until broadcast actually succeeds — a failure
+/// leaves the draft exactly as it was, so staying on compose to retry is
+/// safe (no double-compose risk, nothing was locked).
+struct SpendingComposeResult {
+    note_id: [u8; 4],
+    text: String,
+    private: bool,
+    to: Option<String>,
+    gift: u64,
+    raw: String,
+    txid: String,
+    vsize: usize,
+    built_fee: u64,
+    built_change: u64,
+    spent_outpoints: Vec<(String, u32)>,
+    change_index: u32,
+    change_raw: String,
+    source: FundingSource,
+    result: Result<String, String>,
+}
+static SPENDING_COMPOSE_RESULTS: std::sync::Mutex<Vec<SpendingComposeResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingComposeResult) {
+    match r.result {
+        Ok(_echo) => {
+            // Drop the coins this tx just spent from the runtime cache
+            // immediately (finding 1: an immediate second compose must
+            // never see an already-spent UTXO).
+            st.spending_coins.retain(|c| {
+                !r.spent_outpoints.iter().any(|(t, v)| t == &c.txid && *v == c.vout)
+            });
+            update_spending_ui(w, st);
+            spending_refresh_async(w, st);
+            if r.built_change > 0 {
+                if let Ok(change_addr) = r.source.derive(1, r.change_index) {
+                    if let Some(store) = st.store.as_mut() {
+                        store.spending_mark_used(SpendingAddr {
+                            chain: 1,
+                            index: r.change_index,
+                            address: change_addr.address,
+                            script_pubkey_hex: hex::encode(&change_addr.spk),
+                        });
+                    }
+                    st.save_spending();
+                }
+            }
+            if let Some(store) = st.store.as_mut() {
+                store.record_signed(
+                    app_core::store::NoteRecord {
+                        note_id: hex::encode(r.note_id),
+                        status: NoteStatus::Pending,
+                        text: Some(r.text.clone()),
+                        private: r.private,
+                        directed: r.to.is_some(),
+                        received: false,
+                        sender: None,
+                        recipient: r.to.clone(),
+                        txids: vec![r.txid.clone()],
+                        height: None,
+                        blocktime: None,
+                        created_at: Some(now()),
+                        spent: Vec::new(), // spending-wallet inputs only — no notebook coin locked
+                        raw_hex: Some(r.raw.clone()),
+                        fee: Some(r.built_fee),
+                        vsize: Some(r.vsize as u64),
+                        change_to: (!r.change_raw.is_empty()).then(|| r.change_raw.clone()),
+                        gift_amount: r.to.as_ref().map(|_| r.gift),
+                        funded_by: Some("spending".into()),
+                    },
+                    None,
+                );
+            }
+            st.save_store();
+            println!(
+                "cb: compose id={} txid={} fee={} vsize={} to={} private={} funded=spending broadcast=ok",
+                hex::encode(r.note_id), r.txid, r.built_fee, r.vsize,
+                r.to.as_deref().unwrap_or("self"), r.private
+            );
+            w.set_status(format!("broadcast {}…", &r.txid[..12.min(r.txid.len())]).into());
+            w.set_compose_text("".into());
+            w.set_change_address("".into());
+            w.set_change_expanded(false);
+            w.set_spend_expanded(false);
+            w.set_payfrom_expanded(false);
+            st.coins_overridden = false;
+            st.selected_coins.clear();
+            st.mixed_selected.clear();
+            st.change_choice.clear();
+            w.set_change_choice("".into());
+            w.set_screen(4);
+            refresh_async(w, st);
+        }
+        Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
+    }
+}
+
+/// Mixed-source path (`on_compose_send_mixed`): same "nothing recorded until
+/// broadcast succeeds" shape as spending — a failure is safe to retry from
+/// compose.
+struct MixedComposeResult {
+    note_id: [u8; 4],
+    text: String,
+    private: bool,
+    to: Option<String>,
+    gift: u64,
+    raw: String,
+    txid: String,
+    vsize: usize,
+    built_fee: u64,
+    built_change: u64,
+    change_default: app_core::mixed::ChangeDefault,
+    notebook_spent: Vec<app_core::store::OutPointRef>,
+    spent_spending: Vec<(String, u32)>,
+    payloads_len: usize,
+    recipient_present: bool,
+    change_index: u32,
+    spending_source: Option<FundingSource>,
+    result: Result<String, String>,
+}
+static MIXED_COMPOSE_RESULTS: std::sync::Mutex<Vec<MixedComposeResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResult) {
+    match r.result {
+        Ok(_echo) => {
+            if let Some(store) = st.store.as_mut() {
+                let change_utxo = (r.built_change > 0
+                    && r.change_default == app_core::mixed::ChangeDefault::Notebook)
+                    .then(|| app_core::store::LedgerUtxo {
+                        txid: r.txid.clone(),
+                        vout: (r.payloads_len + usize::from(r.recipient_present) + 1) as u32,
+                        value: r.built_change,
+                        height: None,
+                        pending_spend: false,
+                    });
+                store.record_signed(
+                    app_core::store::NoteRecord {
+                        note_id: hex::encode(r.note_id),
+                        status: NoteStatus::Pending,
+                        text: Some(r.text.clone()),
+                        private: r.private,
+                        directed: r.to.is_some(),
+                        received: false,
+                        sender: None,
+                        recipient: r.to.clone(),
+                        txids: vec![r.txid.clone()],
+                        height: None,
+                        blocktime: None,
+                        created_at: Some(now()),
+                        spent: r.notebook_spent.clone(),
+                        raw_hex: Some(r.raw.clone()),
+                        fee: Some(r.built_fee),
+                        vsize: Some(r.vsize as u64),
+                        change_to: None,
+                        gift_amount: r.to.as_ref().map(|_| r.gift),
+                        funded_by: Some("mixed".into()),
+                    },
+                    change_utxo,
+                );
+            }
+            st.save_store();
+            if !r.spent_spending.is_empty() {
+                st.spending_coins.retain(|c| {
+                    !r.spent_spending.iter().any(|(t, v)| t == &c.txid && *v == c.vout)
+                });
+                update_spending_ui(w, st);
+            }
+            if r.change_default == app_core::mixed::ChangeDefault::Spending {
+                if let Some(src) = r.spending_source.clone() {
+                    if let Ok(change_addr) = src.derive(1, r.change_index) {
+                        if let Some(store) = st.store.as_mut() {
+                            store.spending_mark_used(SpendingAddr {
+                                chain: 1,
+                                index: r.change_index,
+                                address: change_addr.address,
+                                script_pubkey_hex: hex::encode(&change_addr.spk),
+                            });
+                        }
+                        st.save_spending();
+                    }
+                }
+                spending_refresh_async(w, st);
+            } else if !r.spent_spending.is_empty() {
+                spending_refresh_async(w, st);
+            }
+            println!(
+                "cb: compose id={} txid={} fee={} vsize={} to={} private={} funded=mixed broadcast=ok",
+                hex::encode(r.note_id), r.txid, r.built_fee, r.vsize,
+                r.to.as_deref().unwrap_or("self"), r.private
+            );
+            w.set_status(format!("broadcast {}…", &r.txid[..12.min(r.txid.len())]).into());
+            w.set_compose_text("".into());
+            w.set_change_address("".into());
+            w.set_change_expanded(false);
+            w.set_spend_expanded(false);
+            w.set_payfrom_expanded(false);
+            st.coins_overridden = false;
+            st.selected_coins.clear();
+            st.mixed_selected.clear();
+            st.change_choice.clear();
+            w.set_change_choice("".into());
+            w.set_screen(4);
+            refresh_async(w, st);
+        }
+        Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
+    }
+}
+
+/// Drains all three compose-result queues and applies each on the UI
+/// thread — the shared `apply-pending-compose` trampoline target. Also
+/// clears the busy/progress state common to every path.
+fn apply_compose_results(w: &AppWindow, st: &mut State) {
+    let nb: Vec<NotebookComposeResult> =
+        NOTEBOOK_COMPOSE_RESULTS.lock().expect("notebook compose results mutex").drain(..).collect();
+    let sp: Vec<SpendingComposeResult> =
+        SPENDING_COMPOSE_RESULTS.lock().expect("spending compose results mutex").drain(..).collect();
+    let mx: Vec<MixedComposeResult> =
+        MIXED_COMPOSE_RESULTS.lock().expect("mixed compose results mutex").drain(..).collect();
+    if nb.is_empty() && sp.is_empty() && mx.is_empty() {
+        return;
+    }
+    st.compose_busy = false;
+    w.set_compose_sending(false);
+    w.set_compose_stage("".into());
+    for r in nb {
+        apply_notebook_compose_result(w, st, r);
+    }
+    for r in sp {
+        apply_spending_compose_result(w, st, r);
+    }
+    for r in mx {
+        apply_mixed_compose_result(w, st, r);
+    }
+}
+
 /// Finished used/new address probes for the create-notebook picker (worker
 /// thread). Applied to the picker rows on the UI thread; the (account, page)
 /// snapshot guards staleness — paging or switching account/screen drops it.
@@ -2857,7 +3237,20 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     w.set_spend_title(format!("Spending {sel_count} coin{plural} · {sel_total} sats").into());
 
     if text.is_empty() {
-        w.set_cost_line("".into());
+        // The rate box + cost line are always visible now (fee-tier
+        // redesign, 2026-07-16) — with no text yet, show the minimum
+        // one-chunk estimate (text_len=1, the shortest possible note) so
+        // the line still reads as a real (labeled) estimate instead of
+        // going blank.
+        let n = sel_count.max(1);
+        let min_line = note_est(store, 1, private, n, spk_len, change_spk_len)
+            .ok()
+            .map(|(_, vsize)| {
+                let fee = (vsize as f64 * rate).ceil().max(0.0) as u64;
+                format!("~{} sats fee minimum", commas(fee))
+            })
+            .unwrap_or_default();
+        w.set_cost_line(min_line.into());
         w.set_change_amount(format!("Change to {change_dest}").into());
         w.set_spend_enough(true);
         st.compose_oversize = false;
@@ -3748,6 +4141,8 @@ pub fn run() {
         mixed_selected: Vec::new(),
         payfrom_expanded_source: String::new(),
         change_choice: String::new(),
+        compose_busy: false,
+        act_pending_ref: None,
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -4329,6 +4724,24 @@ pub fn run() {
         apply_refresh_results(&w, &mut s);
     });
 
+    // Trampoline: an async compose send (notebook/spending/mixed) finished
+    // building+broadcasting on a worker thread.
+    cb!(on_apply_pending_compose, |w, s| {
+        apply_compose_results(&w, &mut s);
+    });
+
+    // Trampoline: an Activity Rebroadcast finished on a worker thread.
+    cb!(on_apply_pending_act_retry, |w, s| {
+        apply_act_retry_results(&w, &mut s);
+    });
+
+    // Trampoline: an Activity Speed-up (RBF) broadcast finished on a worker
+    // thread (the re-sign itself stays synchronous — fast, no network; only
+    // the broadcast POST is async).
+    cb!(on_apply_pending_act_bump, |w, s| {
+        apply_act_bump_results(&w, &mut s);
+    });
+
     // Trampoline: a finished spending-wallet scan (funding-unification M3)
     // landed — same pattern as apply-pending-refresh.
     cb!(on_apply_pending_spending_refresh, |w, s| {
@@ -4472,7 +4885,14 @@ pub fn run() {
         }
         .max(1.0);
         w.set_fee_tier(tier);
-        w.set_rate_text(format!("{rate}").into());
+        // Custom (tier 3, also reached by editing the always-visible rate
+        // box) keeps whatever the field already holds — Rust never
+        // overwrites it while tier == 3 (same rule as sweep's
+        // on_set_sweep_tier), so auto-selecting custom on edit can't fight
+        // the user's typing.
+        if tier != 3 {
+            w.set_rate_text(format!("{rate}").into());
+        }
         println!("cb: fee-tier {tier} rate={rate}");
         refresh_compose(&w, &mut s);
     });
@@ -4506,8 +4926,14 @@ pub fn run() {
     });
 
     cb!(on_act_retry, |w, s, ref_id: SharedString, is_note: bool| {
+        // One rebroadcast/speed-up in flight at a time (re-entrancy guard;
+        // also gates on_act_bump_confirm below — both write act_pending_ref).
+        if s.act_pending_ref.is_some() {
+            return;
+        }
         let Some(base) = s.base_url() else { return };
-        let client = ChainClient::new(HttpTransport::new(base), s.network);
+        let net = s.network;
+        let lookup_client = ChainClient::new(HttpTransport::new(base.clone()), net);
         let (raw, last_txid) = if is_note {
             let n = s
                 .store
@@ -4522,24 +4948,29 @@ pub fn run() {
             (t.and_then(|t| t.raw_hex.clone()), t.and_then(|t| t.txids.last().cloned()))
         };
         // Chain-recovered records (watch mode) carry no raw hex — the node
-        // that already knows the tx is the keyless rebroadcast source.
-        let raw = match raw.or_else(|| last_txid.and_then(|t| client.fetch_tx_hex(&t).ok())) {
+        // that already knows the tx is the keyless rebroadcast source. This
+        // lookup stays synchronous (a quick GET, and only the rare keyless
+        // path hits it); only the broadcast POST below moves off-thread.
+        let raw = match raw.or_else(|| last_txid.and_then(|t| lookup_client.fetch_tx_hex(&t).ok())) {
             Some(r) if !r.is_empty() => r,
             _ => {
                 w.set_status("nothing to rebroadcast".into());
                 return;
             }
         };
-        match client.broadcast(&raw) {
-            Ok(txid) => {
-                println!("cb: act-retry ref={ref_id} txid={txid} ok");
-                w.set_status(format!("rebroadcast {}…", &txid[..12.min(txid.len())]).into());
-            }
-            Err(e) => {
-                println!("cb: act-retry ref={ref_id} err={e}");
-                w.set_status(format!("rebroadcast failed: {e}").into());
-            }
-        }
+        let ref_id_s = ref_id.to_string();
+        s.act_pending_ref = Some(ref_id_s.clone());
+        update_activity(&w, &s);
+        let weak = w.as_weak();
+        std::thread::spawn(move || {
+            let client = ChainClient::new(HttpTransport::new(base), net);
+            let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+            ACT_RETRY_RESULTS
+                .lock()
+                .expect("act-retry results mutex")
+                .push(ActRetryResult { ref_id: ref_id_s, result });
+            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_act_retry());
+        });
     });
 
     cb!(on_act_bump_open, |w, s, ref_id: SharedString, is_note: bool| {
@@ -4592,6 +5023,11 @@ pub fn run() {
     });
 
     cb!(on_act_bump_confirm, |w, s| {
+        // Same re-entrancy guard on_act_retry uses — only one Activity
+        // broadcast (rebroadcast or speed-up) in flight at a time.
+        if s.act_pending_ref.is_some() {
+            return;
+        }
         let ref_id = w.get_bump_ref().to_string();
         let is_note = w.get_bump_is_note();
         let Ok(new_rate) = w.get_bump_rate().trim().parse::<f64>() else {
@@ -4686,21 +5122,24 @@ pub fn run() {
         };
         match result {
             Ok((raw, txid, fee)) => {
+                // The re-signed replacement is already saved (same shape as
+                // the notebook compose path) — a broadcast failure from here
+                // needs no navigation, just status/toast on the Activity
+                // screen the dialog closes onto.
                 s.save_store();
                 w.set_show_bump_dialog(false);
-                let client = ChainClient::new(HttpTransport::new(base), net);
-                match client.broadcast(&raw) {
-                    Ok(bt) => {
-                        println!("cb: act-bump ref={ref_id} txid={txid} fee={fee} rate={new_rate:.1} ok");
-                        w.set_status(format!("sped up: {}…", &bt[..12.min(bt.len())]).into());
-                    }
-                    Err(e) => {
-                        println!("cb: act-bump ref={ref_id} broadcast err={e}");
-                        w.set_status(format!("signed but broadcast failed: {e}").into());
-                    }
-                }
+                s.act_pending_ref = Some(ref_id.clone());
                 update_activity(&w, &s);
-                update_home(&w, &s);
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    ACT_BUMP_RESULTS
+                        .lock()
+                        .expect("act-bump results mutex")
+                        .push(ActBumpResult { ref_id, txid, fee, new_rate, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_act_bump());
+                });
             }
             Err(e) => {
                 println!("cb: act-bump ref={ref_id} err={e}");
@@ -6392,6 +6831,11 @@ pub fn run() {
     });
 
     cb!(on_compose_send, |w, s| {
+        // Async sign+broadcast (2026-07-16): re-entrancy guard so a
+        // double-tap on Sign can't double-broadcast.
+        if s.compose_busy {
+            return;
+        }
         let text = w.get_compose_text().to_string();
         let private = w.get_compose_private();
         let rate: f64 = w.get_rate_text().parse().unwrap_or(0.0);
@@ -6540,35 +6984,29 @@ pub fn run() {
         );
         match result {
             Ok(c) => {
+                // compose_and_record already wrote the note Pending + locked
+                // its inputs (existing invariant — a failed POST leaves a
+                // retryable record with the tx hex in hand), so from here a
+                // broadcast failure is NOT a build/sign failure: staying on
+                // compose would risk a double-compose on retry.
                 s.save_store();
-                let client = ChainClient::new(HttpTransport::new(base), net);
-                match client.broadcast(&c.tx.raw_hex) {
-                    Ok(txid) => {
-                        println!(
-                            "cb: compose id={} txid={txid} fee={} vsize={} to={} private={} broadcast=ok",
-                            c.note_id, c.tx.fee, c.tx.vsize,
-                            to.as_deref().unwrap_or("self"), private
-                        );
-                        w.set_status(format!("broadcast {}…", &txid[..12]).into());
-                        w.set_compose_text("".into());
-                        w.set_change_address("".into());
-                        w.set_change_expanded(false);
-                        w.set_spend_expanded(false);
-                        s.coins_overridden = false;
-                        s.selected_coins.clear();
-                        s.mixed_selected.clear();
-                        s.change_choice.clear();
-                        w.set_change_choice("".into());
-                        w.set_screen(4);
-                        refresh(&w, &mut s);
-                    }
-                    Err(e) => {
-                        println!("cb: compose broadcast err={e}");
-                        w.set_status(format!("signed but broadcast failed ({e}) — note is pending, Refresh to retry visibility. If relay-policy, lower chunk bytes in Settings and recompose.").into());
-                        update_home(&w, &s);
-                        w.set_screen(4);
-                    }
-                }
+                s.compose_busy = true;
+                w.set_compose_sending(true);
+                w.set_compose_stage("broadcasting".into());
+                let note_id = c.note_id.clone();
+                let fee = c.tx.fee;
+                let vsize = c.tx.vsize;
+                let raw = c.tx.raw_hex.clone();
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    NOTEBOOK_COMPOSE_RESULTS
+                        .lock()
+                        .expect("notebook compose results mutex")
+                        .push(NotebookComposeResult { note_id, fee, vsize, to, private, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+                });
             }
             Err(e) => {
                 println!("cb: compose err={e}");
@@ -6584,6 +7022,9 @@ pub fn run() {
     // broadcast in one tap. Mirrors `examples/cli.rs`'s `note-spend-funded`
     // recipe exactly.
     cb!(on_spending_compose_send, |w, s| {
+        if s.compose_busy {
+            return;
+        }
         let text = w.get_compose_text().to_string();
         let private = w.get_compose_private();
         let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(0.0);
@@ -6734,82 +7175,39 @@ pub fn run() {
                 return;
             }
         };
-        let client = ChainClient::new(HttpTransport::new(&base), net);
-        match client.broadcast(&raw) {
-            // The locally computed txid is authoritative (same convention as the
-            // keyed compose path); the endpoint echo only confirms acceptance.
-            Ok(_echo) => {
-                // Drop the coins this tx just spent so an immediate second
-                // compose (before the refresh below finishes, or without
-                // ever tapping refresh) can't try to spend them again.
-                s.spending_coins
-                    .retain(|c| !spent_outpoints.iter().any(|(t, v)| t == &c.txid && *v == c.vout));
-                update_spending_ui(&w, &s);
-                // Kick a fresh scan so the new change coin shows up once
-                // it's discoverable on-chain.
-                spending_refresh_async(&w, &mut s);
-                if built.change > 0 {
-                    if let Ok(change_addr) = source.derive(1, change_index) {
-                        if let Some(store) = s.store.as_mut() {
-                            store.spending_mark_used(SpendingAddr {
-                                chain: 1,
-                                index: change_index,
-                                address: change_addr.address,
-                                script_pubkey_hex: hex::encode(&change_addr.spk),
-                            });
-                        }
-                        s.save_spending();
-                    }
-                }
-                if let Some(store) = s.store.as_mut() {
-                    store.record_signed(
-                        app_core::store::NoteRecord {
-                            note_id: hex::encode(note_id),
-                            status: NoteStatus::Pending,
-                            text: Some(text.clone()),
-                            private,
-                            directed: recipient.is_some(),
-                            received: false,
-                            sender: None,
-                            recipient: to.clone(),
-                            txids: vec![txid.clone()],
-                            height: None,
-                            blocktime: None,
-                            created_at: Some(now()),
-                            spent: Vec::new(), // spending-wallet inputs only — no notebook coin locked
-                            raw_hex: Some(raw.clone()),
-                            fee: Some(built.fee),
-                            vsize: Some(vsize as u64),
-                            change_to: (!change_raw.is_empty()).then(|| change_raw.clone()),
-                            gift_amount: recipient.as_ref().map(|_| gift),
-                            funded_by: Some("spending".into()),
-                        },
-                        None,
-                    );
-                }
-                s.save_store();
-                println!(
-                    "cb: compose id={} txid={txid} fee={} vsize={vsize} to={} private={private} funded=spending broadcast=ok",
-                    hex::encode(note_id),
-                    built.fee,
-                    to.as_deref().unwrap_or("self"),
-                );
-                w.set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
-                w.set_compose_text("".into());
-                w.set_change_address("".into());
-                w.set_change_expanded(false);
-                w.set_spend_expanded(false);
-                w.set_payfrom_expanded(false);
-                s.coins_overridden = false;
-                s.selected_coins.clear();
-                s.mixed_selected.clear();
-                s.change_choice.clear();
-                w.set_change_choice("".into());
-                w.set_screen(4);
-                refresh(&w, &mut s);
-            }
-            Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
-        }
+        // Nothing is recorded until broadcast actually succeeds (unlike the
+        // notebook path) — a failure leaves the draft untouched, so the
+        // apply step can safely leave the user on compose to retry.
+        s.compose_busy = true;
+        w.set_compose_sending(true);
+        w.set_compose_stage("broadcasting".into());
+        let built_fee = built.fee;
+        let built_change = built.change;
+        let weak = w.as_weak();
+        std::thread::spawn(move || {
+            let client = ChainClient::new(HttpTransport::new(base), net);
+            let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+            SPENDING_COMPOSE_RESULTS.lock().expect("spending compose results mutex").push(
+                SpendingComposeResult {
+                    note_id,
+                    text,
+                    private,
+                    to,
+                    gift,
+                    raw,
+                    txid,
+                    vsize,
+                    built_fee,
+                    built_change,
+                    spent_outpoints,
+                    change_index,
+                    change_raw,
+                    source,
+                    result,
+                },
+            );
+            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+        });
     });
 
     // Funding-unification UI rework (2026-07-16): the selection on the
@@ -6821,6 +7219,9 @@ pub fn run() {
     // app-core's psbt_build already proves that pattern: our own
     // signatures plus an external signer's, on one PSBT).
     cb!(on_compose_send_mixed, |w, s| {
+        if s.compose_busy {
+            return;
+        }
         let text = w.get_compose_text().to_string();
         let private = w.get_compose_private();
         let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(0.0);
@@ -7075,101 +7476,50 @@ pub fn run() {
                 return;
             }
         };
-        let client = ChainClient::new(HttpTransport::new(&base), net);
-        match client.broadcast(&raw) {
-            Ok(_echo) => {
-                if let Some(store) = s.store.as_mut() {
-                    let change_utxo = (built.change > 0 && change_default == app_core::mixed::ChangeDefault::Notebook)
-                        .then(|| app_core::store::LedgerUtxo {
-                            txid: txid.clone(),
-                            vout: (payloads.len() + usize::from(recipient.is_some()) + 1) as u32,
-                            value: built.change,
-                            height: None,
-                            pending_spend: false,
-                        });
-                    store.record_signed(
-                        app_core::store::NoteRecord {
-                            note_id: hex::encode(note_id),
-                            status: NoteStatus::Pending,
-                            text: Some(text.clone()),
-                            private,
-                            directed: recipient.is_some(),
-                            received: false,
-                            sender: None,
-                            recipient: to.clone(),
-                            txids: vec![txid.clone()],
-                            height: None,
-                            blocktime: None,
-                            created_at: Some(now()),
-                            spent: notebook_spent,
-                            raw_hex: Some(raw.clone()),
-                            fee: Some(built.fee),
-                            vsize: Some(vsize as u64),
-                            change_to: None,
-                            gift_amount: recipient.as_ref().map(|_| gift),
-                            funded_by: Some("mixed".into()),
-                        },
-                        change_utxo,
-                    );
-                }
-                s.save_store();
-                // Drop any spending-wallet coins this tx just spent from the
-                // runtime cache immediately (the same "finding 1" fix
-                // `on_spending_compose_send` already applies) — otherwise an
-                // immediate second compose, before the background rescan
-                // below lands, could try to reuse an already-spent UTXO.
-                let spent_spending: Vec<(String, u32)> = coins
-                    .iter()
-                    .filter(|c| matches!(c.source, app_core::mixed::CoinSource::Spending))
-                    .map(|c| (c.txid.clone(), c.vout))
-                    .collect();
-                if !spent_spending.is_empty() {
-                    s.spending_coins
-                        .retain(|c| !spent_spending.iter().any(|(t, v)| t == &c.txid && *v == c.vout));
-                    update_spending_ui(&w, &s);
-                }
-                if change_default == app_core::mixed::ChangeDefault::Spending {
-                    if let Some(src) = s.spending_source.clone() {
-                        if let Ok(change_addr) = src.derive(1, change_index) {
-                            if let Some(store) = s.store.as_mut() {
-                                store.spending_mark_used(SpendingAddr {
-                                    chain: 1,
-                                    index: change_index,
-                                    address: change_addr.address,
-                                    script_pubkey_hex: hex::encode(&change_addr.spk),
-                                });
-                            }
-                            s.save_spending();
-                        }
-                    }
-                    spending_refresh_async(&w, &mut s);
-                } else if !spent_spending.is_empty() {
-                    // Spending coins were spent but change went elsewhere
-                    // (an explicit override) — still worth a fresh scan.
-                    spending_refresh_async(&w, &mut s);
-                }
-                println!(
-                    "cb: compose id={} txid={txid} fee={} vsize={vsize} to={} private={private} funded=mixed broadcast=ok",
-                    hex::encode(note_id),
-                    built.fee,
-                    to.as_deref().unwrap_or("self"),
-                );
-                w.set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
-                w.set_compose_text("".into());
-                w.set_change_address("".into());
-                w.set_change_expanded(false);
-                w.set_spend_expanded(false);
-                w.set_payfrom_expanded(false);
-                s.coins_overridden = false;
-                s.selected_coins.clear();
-                s.mixed_selected.clear();
-                s.change_choice.clear();
-                w.set_change_choice("".into());
-                w.set_screen(4);
-                refresh(&w, &mut s);
-            }
-            Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
-        }
+        // Nothing is recorded until broadcast actually succeeds — same
+        // "safe to retry from compose on failure" shape as the spending
+        // path.
+        let spent_spending: Vec<(String, u32)> = coins
+            .iter()
+            .filter(|c| matches!(c.source, app_core::mixed::CoinSource::Spending))
+            .map(|c| (c.txid.clone(), c.vout))
+            .collect();
+        let spending_source = s.spending_source.clone();
+        s.compose_busy = true;
+        w.set_compose_sending(true);
+        w.set_compose_stage("broadcasting".into());
+        let built_fee = built.fee;
+        let built_change = built.change;
+        let payloads_len = payloads.len();
+        let recipient_present = recipient.is_some();
+        let weak = w.as_weak();
+        std::thread::spawn(move || {
+            let client = ChainClient::new(HttpTransport::new(base), net);
+            let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+            MIXED_COMPOSE_RESULTS.lock().expect("mixed compose results mutex").push(
+                MixedComposeResult {
+                    note_id,
+                    text,
+                    private,
+                    to,
+                    gift,
+                    raw,
+                    txid,
+                    vsize,
+                    built_fee,
+                    built_change,
+                    change_default,
+                    notebook_spent,
+                    spent_spending,
+                    payloads_len,
+                    recipient_present,
+                    change_index,
+                    spending_source,
+                    result,
+                },
+            );
+            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+        });
     });
 
     cb!(on_settings_open, |w, s| {
