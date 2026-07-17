@@ -2720,6 +2720,117 @@ fn apply_psbt_broadcast_result(w: &AppWindow, st: &mut State, r: PsbtBroadcastRe
     }
 }
 
+/// Non-`result` half of a spending-wallet consolidate broadcast (CHANGE 3,
+/// Coins screen spending segment "Consolidate spending coins…") — merges
+/// EVERY spending coin into one, at the next fresh spending receive
+/// address, signed in-app (no external wallet). Staleness anchor is the
+/// identity/network/account triple, like [`WConsolSnapshot`] (the spending
+/// section lives at the account level, not a single notebook).
+struct SpendingConsolidateSnapshot {
+    fp8: String,
+    network: Network,
+    account: u32,
+    /// The receive index consolidated INTO — marked used on success.
+    dest_index: u32,
+    dest_addr: String,
+    dest_spk_hex: String,
+    value: u64,
+    fee: u64,
+    vsize: u64,
+    raw_hex: String,
+    /// Every spending coin that rode as an input (outpoint + value) —
+    /// pruned from the runtime cache on success.
+    spent: Vec<(String, u32, u64)>,
+}
+struct SpendingConsolidateResult {
+    snap: SpendingConsolidateSnapshot,
+    result: Result<String, String>,
+}
+static SPENDING_CONSOLIDATE_RESULTS: std::sync::Mutex<Vec<SpendingConsolidateResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn apply_spending_consolidate_result(w: &AppWindow, st: &mut State, r: SpendingConsolidateResult) {
+    let snap = r.snap;
+    if st.notebooks_fp8.as_deref() != Some(snap.fp8.as_str())
+        || st.network != snap.network
+        || st.account != snap.account
+    {
+        println!("cb: spending-consolidate stale-drop");
+        return;
+    }
+    match r.result {
+        Ok(txid) => {
+            // Fresh-address discipline: the destination is now used.
+            if let Some(store) = st.store.as_mut() {
+                store.spending_mark_used(SpendingAddr {
+                    chain: 0,
+                    index: snap.dest_index,
+                    address: snap.dest_addr.clone(),
+                    script_pubkey_hex: snap.dest_spk_hex.clone(),
+                });
+            }
+            st.save_spending();
+            // Prune every spent coin, then immediately track the new one so
+            // the segment shows it without waiting for the rescan below.
+            st.spending_coins.retain(|c| {
+                !snap.spent.iter().any(|(t, v, _)| t == &c.txid && *v == c.vout)
+            });
+            st.spending_coins.push(FundingUtxo {
+                txid: txid.clone(),
+                vout: 0,
+                value: snap.value,
+                address: snap.dest_addr.clone(),
+                chain: 0,
+                index: snap.dest_index,
+                confirmed: false,
+            });
+            if let Some(store) = st.store.as_mut() {
+                let inputs: Vec<app_core::store::TxInput> = snap
+                    .spent
+                    .iter()
+                    .map(|(t, v, val)| app_core::store::TxInput { txid: t.clone(), vout: *v, value: *val })
+                    .collect();
+                store.record_tx(
+                    "consolidate",
+                    txid.clone(),
+                    snap.value,
+                    snap.fee,
+                    snap.vsize,
+                    snap.raw_hex.clone(),
+                    snap.dest_addr.clone(),
+                    inputs,
+                    snap.dest_spk_hex.clone(),
+                    now(),
+                );
+                // All-P2WPKH inputs — same non-bumpable marker as a mixed
+                // notebook+spending sweep (CHANGE 2 / TxRecord.mixed_inputs):
+                // the taproot bump path can't re-sign these either.
+                if let Some(rec) = store.txs.last_mut() {
+                    rec.mixed_inputs = true;
+                }
+            }
+            st.save_store();
+            update_spending_ui(w, st);
+            spending_refresh_async(w, st); // authoritative reconciliation
+            println!(
+                "cb: spending-consolidate txid={txid} coins={} value={} fee={}",
+                snap.spent.len(),
+                snap.value,
+                snap.fee
+            );
+            // Coins-management op, like notebook consolidate — stays on the
+            // Coins screen (spending segment), not a money-flow "go home".
+            show_toast(w, &format!("Consolidated · {}…", &txid[..8.min(txid.len())]));
+            update_wallet_coins(w, st);
+        }
+        Err(e) => {
+            println!("cb: spending-consolidate broadcast err={e}");
+            w.set_status(format!("consolidate failed: {e}").into());
+            show_toast(w, "Broadcast failed");
+        }
+    }
+}
+
 /// Drains the CHANGE-4 wallet-tx result queues and applies each on the UI
 /// thread — the shared `apply-pending-wallet-tx` trampoline target. Also
 /// clears the shared busy flag.
@@ -2735,7 +2846,17 @@ fn apply_pending_wallet_tx_results(w: &AppWindow, st: &mut State) {
         WCONSOL_BROADCAST_RESULTS.lock().expect("wconsol broadcast results mutex").drain(..).collect();
     let psbt: Vec<PsbtBroadcastResult> =
         PSBT_BROADCAST_RESULTS.lock().expect("psbt broadcast results mutex").drain(..).collect();
-    if sweep.is_empty() && consolidate.is_empty() && wconsol.is_empty() && psbt.is_empty() {
+    let spending_consolidate: Vec<SpendingConsolidateResult> = SPENDING_CONSOLIDATE_RESULTS
+        .lock()
+        .expect("spending consolidate results mutex")
+        .drain(..)
+        .collect();
+    if sweep.is_empty()
+        && consolidate.is_empty()
+        && wconsol.is_empty()
+        && psbt.is_empty()
+        && spending_consolidate.is_empty()
+    {
         return;
     }
     st.wallet_tx_busy = false;
@@ -2751,6 +2872,9 @@ fn apply_pending_wallet_tx_results(w: &AppWindow, st: &mut State) {
     }
     for r in psbt {
         apply_psbt_broadcast_result(w, st, r);
+    }
+    for r in spending_consolidate {
+        apply_spending_consolidate_result(w, st, r);
     }
 }
 
@@ -6134,6 +6258,108 @@ pub fn run() {
         w.set_sweep_kind("sweep".into());
         w.set_pick_mode("sweep".into());
         set_sweep_dest(&w, &mut s, d.address);
+    });
+
+    // CHANGE 3 (2026-07-17): the Coins screen's spending segment gets its
+    // own consolidate — dry-run the fee via notes-core's byte-exact mixed
+    // estimator (all-P2WPKH inputs, one P2WPKH output), then open the
+    // confirm modal.
+    cb!(on_spending_consolidate_open, |w, s| {
+        let Some(src) = s.spending_source.clone() else {
+            w.set_status("spending wallet not scanned yet".into());
+            return;
+        };
+        let n = s.spending_coins.len();
+        if n < 2 {
+            w.set_status("nothing to consolidate (need 2+ spending coins)".into());
+            return;
+        }
+        let Some(next_receive) = s.store.as_ref().map(|st| st.spending.next_receive) else { return };
+        let Ok(dest) = src.derive(0, next_receive) else { return };
+        let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+        let total: u64 = s.spending_coins.iter().map(|c| c.value).sum();
+        use app_core::notes_core::tx::{estimate_vsize_mixed, InputKind};
+        let kinds: Vec<InputKind> = std::iter::repeat(InputKind::P2wpkh).take(n).collect();
+        let vsize = estimate_vsize_mixed(&kinds, &[], &[dest.spk.len()]) as u64;
+        let fee = (vsize as f64 * rate).ceil() as u64;
+        println!("cb: spending-consolidate open coins={n}");
+        w.set_spending_consolidate_fee_line(
+            if total <= fee {
+                format!("balance {} sats can't cover the ~{} sat fee", commas(total), commas(fee))
+            } else {
+                format!("combines {n} coins → 1 · fee ~{} sats · keeps {}", commas(fee), commas(total - fee))
+            }
+            .into(),
+        );
+        w.set_show_spending_consolidate_confirm(true);
+    });
+
+    cb!(on_spending_consolidate, |w, s| {
+        w.set_show_spending_consolidate_confirm(false);
+        if s.wallet_tx_busy {
+            return;
+        }
+        let Some(src) = s.spending_source.clone() else { return };
+        let Some(base) = s.base_url() else {
+            w.set_status("no Bitcoin node for this network — set one in Settings".into());
+            return;
+        };
+        let coins = s.spending_coins.clone();
+        if coins.len() < 2 {
+            w.set_status("nothing to consolidate (need 2+ spending coins)".into());
+            return;
+        }
+        let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+            return;
+        };
+        let net = s.network;
+        let Ok(material) = parse_key_material(&material_str, net) else { return };
+        let Some(next_receive) = s.store.as_ref().map(|st| st.spending.next_receive) else { return };
+        let Ok(dest) = src.derive(0, next_receive) else {
+            w.set_status("couldn't derive the destination address".into());
+            return;
+        };
+        let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+        let account = s.account;
+        let built = app_core::mixed::build_wallet_sweep_mixed(
+            &[],
+            Some((&material, net, account, &coins)),
+            dest.spk.clone(),
+            rate,
+        );
+        match built {
+            Ok(tx) => {
+                let spent: Vec<(String, u32, u64)> =
+                    coins.iter().map(|c| (c.txid.clone(), c.vout, c.value)).collect();
+                let snap = SpendingConsolidateSnapshot {
+                    fp8: s.notebooks_fp8.clone().unwrap_or_default(),
+                    network: net,
+                    account,
+                    dest_index: next_receive,
+                    dest_addr: dest.address.clone(),
+                    dest_spk_hex: hex::encode(&dest.spk),
+                    value: tx.tx.outputs[0].value,
+                    fee: tx.fee,
+                    vsize: tx.vsize as u64,
+                    raw_hex: tx.raw_hex.clone(),
+                    spent,
+                };
+                s.wallet_tx_busy = true;
+                w.set_wallet_tx_busy(true);
+                let raw = tx.raw_hex.clone();
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    SPENDING_CONSOLIDATE_RESULTS
+                        .lock()
+                        .expect("spending consolidate results mutex")
+                        .push(SpendingConsolidateResult { snap, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+                });
+            }
+            Err(e) => w.set_status(format!("{e}").into()),
+        }
     });
 
     cb!(on_consolidate_open, |w, s| {

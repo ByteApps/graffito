@@ -1631,6 +1631,13 @@ export component AppWindow inherits Window {
     in-out property <string> wconsol-summary;
     callback consolidate-wallet-open();
     callback wallet-consolidate();
+    // CHANGE 3 (2026-07-17): the Coins screen's spending segment gets its
+    // own consolidate — merges every spending coin into ONE at the next
+    // fresh spending receive address (signs in-app, no external wallet).
+    in-out property <bool> show-spending-consolidate-confirm;
+    in property <string> spending-consolidate-fee-line;
+    callback spending-consolidate-open();
+    callback spending-consolidate();
     callback open-notebooks();
     callback open-notebook(int);
     callback create-notebook();
@@ -1656,6 +1663,7 @@ export component AppWindow inherits Window {
         // back closes the same thing a tap on Cancel / the dim would.
         if (root.qr-zoom-open) { root.qr-zoom-open = false; return true; }
         if (root.show-wconsol-confirm) { root.show-wconsol-confirm = false; return true; }
+        if (root.show-spending-consolidate-confirm) { root.show-spending-consolidate-confirm = false; return true; }
         if (root.show-bump-dialog) { root.show-bump-dialog = false; return true; }
         if (root.show-oversize-modal) { root.show-oversize-modal = false; return true; }
         if (root.show-consolidate-confirm) { root.show-consolidate-confirm = false; return true; }
@@ -3114,11 +3122,17 @@ export component AppWindow inherits Window {
         }
         // Viewer-first: the list is the point; consolidation is the ONE
         // action button on top (wallet-level — all notebooks at once).
-        // Notebook-scoped only — the spending wallet has no consolidate
-        // step (fresh addresses are the point).
         if root.coins-segment == "notebook": GhostButton {
             text: "Consolidate wallet…";
             clicked => { root.consolidate-wallet-open(); }
+        }
+        // CHANGE 3 (2026-07-17): the spending segment gets its own ONE
+        // consolidate button (merges every spending coin into one, at the
+        // NEXT FRESH spending receive address) — disabled below 2 coins.
+        if root.coins-segment == "spending": GhostButton {
+            text: "Consolidate spending coins…";
+            opacity: root.spending-coins-list.length >= 2 ? 1.0 : 0.4;
+            clicked => { if (root.spending-coins-list.length >= 2) { root.spending-consolidate-open(); } }
         }
         if root.coins-segment == "notebook": Body { text: root.coins-summary; font-size: 12px; }
         if root.coins-segment == "spending": Body { text: root.spending-balance-line; font-size: 12px; }
@@ -4786,6 +4800,62 @@ export component AppWindow inherits Window {
                         text: root.wallet-tx-busy ? "Consolidating…" : "Consolidate";
                         tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
                         clicked => { if (!root.wallet-tx-busy) { root.wallet-consolidate(); } }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- spending-wallet consolidate confirmation (modal overlay) ----------
+    // CHANGE 3 (2026-07-17): merges every spending coin into ONE, at the
+    // NEXT FRESH spending receive address — signs in-app immediately (no
+    // external wallet, unlike the notebook wconsol flow above).
+    if root.show-spending-consolidate-confirm: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.show-spending-consolidate-confirm = false; } }
+        Rectangle {
+            width: 400px;
+            height: scl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { }
+            scl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Consolidate spending coins?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Body {
+                    text: "Merges every spending-wallet coin into a single coin at the next fresh spending receive address.";
+                    font-size: 12px;
+                }
+                if root.spending-consolidate-fee-line != "": Text {
+                    text: root.spending-consolidate-fee-line;
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: Pal.accent;
+                    wrap: word-wrap;
+                }
+                Caption {
+                    text: "Consolidating links these fresh addresses on-chain.";
+                    color: Pal.warn;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.show-spending-consolidate-confirm = false; } }
+                    PrimaryButton {
+                        text: root.wallet-tx-busy ? "Consolidating…" : "Consolidate";
+                        tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
+                        clicked => { if (!root.wallet-tx-busy) { root.spending-consolidate(); } }
                     }
                 }
             }
