@@ -189,6 +189,27 @@ struct State {
     /// can mark it used on success (fresh-address discipline). None for
     /// every other sweep destination.
     pending_spending_sweep_index: Option<u32>,
+    /// Cross-wallet coin selection for the Pay-from screen (funding-
+    /// unification UI rework, 2026-07-16): (source key, txid, vout). Source
+    /// key uses the convention `pay_from`/`use-funding-wallet` already use:
+    /// "notebook" | "spending" | "wallet:<id>". A note may spend coins
+    /// tagged with different source keys in ONE tx. This is a per-source
+    /// MEMORY the existing single-source scratch state (`selected_coins`/
+    /// `coins_overridden`) mirrors into/out of whenever the active source
+    /// (`payfrom_expanded_source`) changes — so every existing single-
+    /// source compute/send path keeps working on `selected_coins`
+    /// unmodified, and re-expanding a previously-touched wallet row
+    /// restores exactly what was selected there.
+    mixed_selected: Vec<(String, String, u32)>,
+    /// Which wallet row is expanded on the Pay-from screen (nested coins
+    /// visible) — "" = none. Tapping a row sets this AND makes it the
+    /// active `pay_from` source (Sal's rule: tap = select AND expand).
+    payfrom_expanded_source: String,
+    /// Explicit change destination pick made this compose session (screen
+    /// 21) — "" = unset, `app_core::mixed::resolve_change_default` applies.
+    /// Never overridden by a refresh once chosen; cleared with the rest of
+    /// the compose draft on open/broadcast.
+    change_choice: String,
 }
 
 /// One wallet-consolidate session (Coins → "Consolidate into one coin…").
@@ -216,8 +237,23 @@ struct WatchNote {
     spent: Vec<app_core::store::OutPointRef>,
     /// Funding-unification M3: `Some("wallet:<label>")` when an external
     /// funding wallet paid (Activity's source pill); `None` for a watch
-    /// identity's own-coin self-funded compose.
+    /// identity's own-coin self-funded compose. Funding-unification UI
+    /// rework: `Some("mixed")` for a keyed mixed-source compose whose
+    /// selection included an external wallet.
     funded: Option<String>,
+    /// True for a genuine watch identity's compose (drives the broadcast
+    /// log's `private=false`/`watch=1`, both hardcoded before this field
+    /// existed). False for a keyed mixed-source compose routed through the
+    /// same sign screen — those keep their real `private` flag.
+    is_watch: bool,
+    /// The real private/public flag — only meaningful when `is_watch` is
+    /// false (a genuine watch compose is always public, unconditionally).
+    private: bool,
+    /// Whether the built tx carries a separate dust-to-self output BEFORE
+    /// change (funding-unification UI rework's mixed builder always adds
+    /// one; a watch identity's self-funded compose never does — it already
+    /// spends from self) — shifts the change output's vout by one.
+    dust_to_self: bool,
 }
 
 struct WatchSpend {
@@ -535,9 +571,13 @@ fn refresh_consolidate_preview(w: &AppWindow, s: &mut State) {
 /// for rebroadcast until confirmation.
 fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsize: u64) {
     let Some(store) = st.store.as_mut() else { return };
+    // A mixed-source compose (funding-unification UI rework) always carries
+    // a dust-to-self output BEFORE change; a genuine watch compose never
+    // does (it already spends from self) — shifts the change vout by one.
+    let change_vout = wn.chunks + usize::from(wn.recipient.is_some()) + usize::from(wn.dust_to_self);
     let change = (wn.change > 0).then(|| app_core::store::LedgerUtxo {
         txid: txid.to_string(),
-        vout: (wn.chunks + usize::from(wn.recipient.is_some())) as u32,
+        vout: change_vout as u32,
         value: wn.change,
         height: None,
         pending_spend: false,
@@ -547,7 +587,7 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
             note_id: hex::encode(wn.note_id),
             status: NoteStatus::Pending,
             text: Some(wn.text.clone()),
-            private: false,
+            private: wn.private,
             directed: wn.recipient.is_some(),
             received: false,
             sender: None,
@@ -2342,6 +2382,13 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
         }
         if w.get_screen() == 20 {
             log_funding_refresh(st);
+            // funding-unification UI rework: the nested coin panel under
+            // the spending row (if expanded) reads `spend-coins`/
+            // `spend-title`, populated by `refresh_compose`'s branches —
+            // a landed scan must repaint them, not just the row's summary
+            // balance (`update_spending_ui`), or the panel shows stale
+            // "0/0 coins" under a since-scanned wallet.
+            refresh_compose(w, st);
         }
     }
 }
@@ -2539,6 +2586,135 @@ fn apply_pay_from(w: &AppWindow, st: &mut State, kind: &str) {
     w.set_pay_from_balance(balance_text_for(st, kind).into());
 }
 
+/// Coins remembered under `source` in the cross-wallet selection memory
+/// (funding-unification UI rework) — source key convention: "notebook" |
+/// "spending" | "wallet:<id>".
+fn mixed_coins_for(st: &State, source: &str) -> Vec<(String, u32)> {
+    st.mixed_selected
+        .iter()
+        .filter(|(s, _, _)| s == source)
+        .map(|(_, t, v)| (t.clone(), *v))
+        .collect()
+}
+
+/// Replace `source`'s entries in the cross-wallet selection memory with
+/// `coins` — keeps it in sync with the legacy single-source scratch state
+/// (`selected_coins`) whenever the active source's selection changes.
+fn mixed_sync_source(st: &mut State, source: &str, coins: &[(String, u32)]) {
+    st.mixed_selected.retain(|(s, _, _)| s != source);
+    for (t, v) in coins {
+        st.mixed_selected.push((source.to_string(), t.clone(), *v));
+    }
+}
+
+/// Total value of every coin currently remembered across ALL sources — used
+/// for the mixed-compose "enough" heuristic and the mixed broadcast. Looks
+/// each coin up in whichever per-source list holds its value; `funding_coins`
+/// only ever caches ONE external wallet's scan at a time (the currently
+/// active one — matches the rest of the external-funding architecture), so a
+/// selection spanning two DIFFERENT external wallets simultaneously isn't
+/// representable yet — an accepted scope boundary for this milestone (a
+/// note may mix notebook + spending + ONE external wallet).
+fn mixed_selected_total(st: &State) -> u64 {
+    st.mixed_selected
+        .iter()
+        .filter_map(|(source, txid, vout)| {
+            if source == "notebook" {
+                st.store.as_ref()?.utxos.iter().find(|u| &u.txid == txid && u.vout == *vout).map(|u| u.value)
+            } else if source == "spending" {
+                st.spending_coins.iter().find(|c| &c.txid == txid && c.vout == *vout).map(|c| c.value)
+            } else if source.starts_with("wallet:") {
+                st.funding_coins.iter().find(|c| &c.txid == txid && c.vout == *vout).map(|c| c.value)
+            } else {
+                None
+            }
+        })
+        .sum()
+}
+
+/// Recompute the mixed-source bookkeeping after `refresh_compose`'s active-
+/// source branch runs: mirror its (possibly just auto-suggested) selection
+/// into the cross-wallet memory, flag the linkage hint when the total
+/// selection spans more than one wallet, and resolve the Change screen's
+/// current destination label. A loose sufficiency check stands in for the
+/// mixed case's "enough" gate — `on_compose_send_mixed`'s real PSBT build is
+/// the actual arbiter and reports a precise error via `status` if it fails.
+fn sync_and_finalize_payfrom(w: &AppWindow, st: &mut State) {
+    let active = st.payfrom_expanded_source.clone();
+    if !active.is_empty() {
+        let coins = st.selected_coins.clone();
+        mixed_sync_source(st, &active, &coins);
+    }
+    let sources: std::collections::HashSet<&str> =
+        st.mixed_selected.iter().map(|(s, _, _)| s.as_str()).collect();
+    let mixed = sources.len() > 1;
+    w.set_mixed_linkage_hint(mixed);
+    if mixed {
+        w.set_spend_enough(mixed_selected_total(st) > 0);
+    }
+    update_change_label(w, st);
+}
+
+/// Recompute the Change screen/nav-row's resolved destination — respects an
+/// explicit `change_choice` pick made this session; otherwise applies
+/// `app_core::mixed::resolve_change_default` (Sal's rule: spending wallet
+/// enabled + participating wins, else a single participating external
+/// wallet, else the notebook).
+fn update_change_label(w: &AppWindow, st: &mut State) {
+    let sources: std::collections::HashSet<&str> =
+        st.mixed_selected.iter().map(|(s, _, _)| s.as_str()).collect();
+    let spending_enabled =
+        st.spending_capable && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false);
+    let spending_participates = sources.contains("spending") || st.payfrom_expanded_source == "spending";
+    let non_notebook_spending: Vec<&str> =
+        sources.iter().filter(|s| **s != "notebook" && **s != "spending").copied().collect();
+    let only_external: Option<String> = if !sources.contains("notebook")
+        && !sources.contains("spending")
+        && non_notebook_spending.len() == 1
+    {
+        non_notebook_spending[0].strip_prefix("wallet:").map(String::from)
+    } else {
+        None
+    };
+    let default = app_core::mixed::resolve_change_default(
+        spending_enabled,
+        spending_participates,
+        only_external.as_deref(),
+    );
+
+    let default_str = match &default {
+        app_core::mixed::ChangeDefault::Spending => "spending".to_string(),
+        app_core::mixed::ChangeDefault::Notebook => "notebook".to_string(),
+        app_core::mixed::ChangeDefault::Wallet(id) => format!("wallet:{id}"),
+    };
+    // An explicit pick this session (including "custom") always wins; the
+    // default only applies while `change_choice` is unset.
+    let choice = if st.change_choice.is_empty() { default_str } else { st.change_choice.clone() };
+    w.set_change_choice(choice.clone().into());
+
+    let label = if choice == "spending" {
+        "a fresh spending address".to_string()
+    } else if choice == "notebook" {
+        "your notebook address".to_string()
+    } else if choice == "custom" {
+        let addr = w.get_change_address().to_string();
+        if addr.trim().is_empty() {
+            "custom address".to_string()
+        } else {
+            format!("{}…", &addr[..14.min(addr.len())])
+        }
+    } else if let Some(id) = choice.strip_prefix("wallet:") {
+        st.funding_wallets
+            .iter()
+            .find(|fw| fw.id == id)
+            .map(|fw| format!("{} change", fw.label))
+            .unwrap_or_else(|| "external wallet".to_string())
+    } else {
+        "your address".to_string()
+    };
+    w.set_change_dest_label(label.into());
+}
+
 /// Short "<n> sats" figure for the compose compact "Pay from" row and the
 /// funding screen's Notebook row — deliberately terse (no coin count) so it
 /// always elides cleanly at iPhone width. `kind` is a `pay-from` value:
@@ -2602,12 +2778,14 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     // not the self-funded store coins. Handled on its own isolated path.
     if w.get_fund_external() {
         funding_compose_ui(w, st, &text);
+        sync_and_finalize_payfrom(w, st);
         return;
     }
     // Internal spending-wallet mode (funding-unification M3): same idea,
     // but the source is the identity's OWN BIP-84 wallet, signed in-app.
     if w.get_spend_from_wallet() {
         spending_compose_ui(w, st, &text);
+        sync_and_finalize_payfrom(w, st);
         return;
     }
     let spk_len = st
@@ -2683,6 +2861,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         w.set_change_amount(format!("Change to {change_dest}").into());
         w.set_spend_enough(true);
         st.compose_oversize = false;
+        sync_and_finalize_payfrom(w, st);
         return;
     }
     let n = sel_count.max(1);
@@ -2752,6 +2931,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         }
     }
     st.compose_oversize = over;
+    sync_and_finalize_payfrom(w, st);
 }
 
 trait CloneFields {
@@ -2769,9 +2949,13 @@ impl CloneFields for app_core::notes_core::bundle::Identity {
 }
 
 /// External-funding variant of the compose coin panel: show the funding
-/// wallet's scanned coins (all spent) and a source summary, instead of the
-/// self-funded store coins. Keeps the intricate self-funded path untouched.
-fn funding_compose_ui(w: &AppWindow, st: &State, text: &str) {
+/// wallet's scanned coins and a source summary, instead of the self-funded
+/// store coins. Coin selection (funding-unification UI rework) defaults to
+/// every scanned coin until the user overrides it — same tap-to-toggle
+/// pattern the notebook/spending panels use, tracked in the cross-wallet
+/// selection memory keyed "wallet:<id>" so a mixed compose can spend only
+/// SOME of an external wallet's coins.
+fn funding_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     let net = st.network;
     let total: u64 = st.funding_coins.iter().map(|c| c.value).sum();
     let n = st.funding_coins.len();
@@ -2790,6 +2974,25 @@ fn funding_compose_ui(w: &AppWindow, st: &State, text: &str) {
         None => w.set_funding_summary("Set a funding wallet".into()),
     }
 
+    let source_key = st
+        .active_funding_id
+        .as_deref()
+        .map(|id| format!("wallet:{id}"))
+        .unwrap_or_default();
+    let remembered = mixed_coins_for(st, &source_key);
+    let sel: std::collections::HashSet<(String, u32)> = if remembered.is_empty() {
+        // First time this wallet is shown this session: default to every
+        // scanned coin (matches the pre-rework behavior byte-for-byte) and
+        // remember that as the baseline.
+        let all: Vec<(String, u32)> = st.funding_coins.iter().map(|c| (c.txid.clone(), c.vout)).collect();
+        if !all.is_empty() && !source_key.is_empty() {
+            mixed_sync_source(st, &source_key, &all);
+        }
+        all.into_iter().collect()
+    } else {
+        remembered.into_iter().collect()
+    };
+
     let exb = st.explorer_base();
     let coins: Vec<SpendCoin> = st
         .funding_coins
@@ -2798,15 +3001,24 @@ fn funding_compose_ui(w: &AppWindow, st: &State, text: &str) {
             outpoint: format!("{}:{}", c.txid, c.vout).into(),
             value: c.value.to_string().into(),
             confirmed: c.confirmed,
-            selected: true,
+            selected: sel.contains(&(c.txid.clone(), c.vout)),
             txid_short: c.txid[..8.min(c.txid.len())].to_string().into(),
             explorer: explorer_tx_url(exb.as_deref(), net, &c.txid).into(),
         })
         .collect();
+    let sel_count = coins.iter().filter(|c| c.selected).count();
+    let sel_total: u64 = st
+        .funding_coins
+        .iter()
+        .filter(|c| sel.contains(&(c.txid.clone(), c.vout)))
+        .map(|c| c.value)
+        .sum();
     w.set_spend_coins(VecModel::from_slice(&coins));
-    w.set_spend_title(format!("Funding {n} coin{} · {total} sats", if n == 1 { "" } else { "s" }).into());
+    w.set_spend_title(
+        format!("Funding {sel_count}/{n} coin{} · {} sats", if n == 1 { "" } else { "s" }, commas(sel_total)).into(),
+    );
     w.set_cost_line(if text.is_empty() { String::new() } else { "funded from the external wallet".into() }.into());
-    w.set_spend_enough(ready && !text.is_empty());
+    w.set_spend_enough(ready && sel_count > 0 && !text.is_empty());
 
     // Change: blank = the funding wallet's own change; a valid custom address
     // overrides it. Same validation/label pattern as the self-funded path.
@@ -3038,6 +3250,10 @@ fn refresh_funding_list(w: &AppWindow, st: &State) {
 /// Make a saved wallet the active funding source: scan it, cache its balance,
 /// and return to compose in external-funding mode.
 fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
+    // funding-unification UI rework: tapping a wallet row on the Pay-from
+    // screen (20) selects + expands it IN PLACE — it must not navigate away
+    // like the screen-15/16 entry points do.
+    let stay_on_payfrom = w.get_screen() == 20;
     let net = st.network;
     let Some(idx) = st.funding_wallets.iter().position(|fw| fw.id == id) else { return };
     let descriptor = st.funding_wallets[idx].descriptor.clone();
@@ -3066,7 +3282,16 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
             st.funding = Some(src);
             st.active_funding_id = Some(id.to_string());
             w.set_status(if empty { "wallet has no spendable coins yet".to_string() } else { String::new() }.into());
-            if w.get_funding_return() == 16 {
+            if stay_on_payfrom {
+                w.set_fund_external(true);
+                w.set_spend_from_wallet(false);
+                let label = st.funding_wallets[idx].label.clone();
+                w.set_pay_from(format!("wallet:{id}").into());
+                w.set_pay_from_label(label.clone().into());
+                w.set_pay_from_balance(format!("{} sats", commas(st.funding_wallets[idx].balance)).into());
+                println!("cb: pay-from wallet:{label}");
+                refresh_compose(w, st);
+            } else if w.get_funding_return() == 16 {
                 // Came from the sweep screen — return there, funding armed.
                 w.set_sweep_fund_external(true);
                 w.set_screen(16);
@@ -3507,6 +3732,9 @@ pub fn run() {
         spending_coins: Vec::new(),
         spending_scanned: false,
         pending_spending_sweep_index: None,
+        mixed_selected: Vec::new(),
+        payfrom_expanded_source: String::new(),
+        change_choice: String::new(),
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -5271,6 +5499,12 @@ pub fn run() {
         s.selected_coins.clear();
         w.set_status("".into());
         w.set_payfrom_expanded(false);
+        // Funding-unification UI rework: fresh compose session, fresh
+        // cross-wallet coin memory + change pick (an explicit change choice
+        // from a PRIOR note must never leak into this one).
+        s.mixed_selected.clear();
+        s.change_choice.clear();
+        w.set_change_choice("".into());
         // Funding-unification: default to the spending wallet ONLY when the
         // setting is on AND it actually has spendable balance (Sal
         // 2026-07-16) — an enabled-but-empty spending wallet still defaults
@@ -5283,7 +5517,10 @@ pub fn run() {
             && !s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false)
             && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
             && spending_balance > 0;
-        apply_pay_from(&w, &mut s, if spending_default { "spending" } else { "notebook" });
+        let default_source = if spending_default { "spending" } else { "notebook" };
+        s.payfrom_expanded_source = default_source.to_string();
+        w.set_payfrom_expanded_source(default_source.into());
+        apply_pay_from(&w, &mut s, default_source);
         w.set_screen(6);
         refresh_compose(&w, &mut s);
     });
@@ -5517,18 +5754,28 @@ pub fn run() {
     });
 
     cb!(on_toggle_coin, |w, s, outpoint: SharedString| {
-        // "txid:vout" → (txid, vout)
+        // "txid:vout" → (txid, vout). Operates on whichever wallet row is
+        // expanded (funding-unification UI rework) — the cross-wallet
+        // selection memory is authoritative; notebook/spending also mirror
+        // into the legacy `selected_coins` scratch so their existing fee/
+        // change-preview math keeps reading it directly.
         let op = outpoint.as_str();
         if let Some((txid, vout)) = op.rsplit_once(':') {
             if let Ok(vout) = vout.parse::<u32>() {
+                let source = s.payfrom_expanded_source.clone();
+                let mut coins = mixed_coins_for(&s, &source);
                 let key = (txid.to_string(), vout);
-                if let Some(i) = s.selected_coins.iter().position(|c| c == &key) {
-                    s.selected_coins.remove(i);
+                if let Some(i) = coins.iter().position(|c| c == &key) {
+                    coins.remove(i);
                 } else {
-                    s.selected_coins.push(key);
+                    coins.push(key);
                 }
-                s.coins_overridden = true;
-                println!("cb: toggle-coin selected={}", s.selected_coins.len());
+                mixed_sync_source(&mut s, &source, &coins);
+                if source == "notebook" || source == "spending" {
+                    s.selected_coins = coins.clone();
+                    s.coins_overridden = true;
+                }
+                println!("cb: toggle-coin selected={}", coins.len());
                 refresh_compose(&w, &mut s);
             }
         }
@@ -5636,7 +5883,75 @@ pub fn run() {
         w.set_status("".into());
         update_funding_screen_ui(&w, &s);
         refresh_funding_list(&w, &s);
+        w.set_payfrom_expanded_source(s.payfrom_expanded_source.clone().into());
         w.set_screen(20);
+    });
+
+    // Multi-wallet coin selection (funding-unification UI rework,
+    // 2026-07-16): tapping a wallet row on the Pay-from screen selects it
+    // AND expands its coins nested beneath it — an accordion (collapse when
+    // another expands is fine), but the cross-wallet selection persists
+    // regardless of which row is currently open. Re-expanding a
+    // previously-touched row restores exactly what was selected there.
+    cb!(on_payfrom_expand, |w, s, source: SharedString| {
+        let key = source.to_string();
+        let collapsing = s.payfrom_expanded_source == key;
+        s.payfrom_expanded_source = if collapsing { String::new() } else { key.clone() };
+        w.set_payfrom_expanded_source(s.payfrom_expanded_source.clone().into());
+        let logged = if s.payfrom_expanded_source.is_empty() { "-".to_string() } else { s.payfrom_expanded_source.clone() };
+        println!("cb: funding-expand wallet={logged}");
+        if !collapsing {
+            // Seed the legacy single-source scratch state from this
+            // source's remembered selection (if any) BEFORE the branch's
+            // own auto-suggest runs, so a previously-touched wallet's
+            // selection is restored rather than re-suggested.
+            let remembered = mixed_coins_for(&s, &key);
+            if key == "notebook" || key == "spending" {
+                if remembered.is_empty() {
+                    s.coins_overridden = false;
+                } else {
+                    s.selected_coins = remembered;
+                    s.coins_overridden = true;
+                }
+            }
+            if key == "notebook" {
+                apply_pay_from(&w, &mut s, "notebook");
+            } else if key == "spending" {
+                apply_pay_from(&w, &mut s, "spending");
+            } else if let Some(id) = key.strip_prefix("wallet:") {
+                activate_funding_wallet(&w, &mut s, id);
+            }
+        }
+        refresh_compose(&w, &mut s);
+    });
+
+    // Change now lives on its own screen (21), reached from a second
+    // compose nav row below "Pay from" (funding-unification UI rework).
+    cb!(on_change_open, |w, s| {
+        w.set_status("".into());
+        refresh_funding_list(&w, &s);
+        update_change_label(&w, &mut s);
+        // Logged AFTER resolution so `default=<choice>` reflects the
+        // effective destination (an explicit pick if one was made this
+        // session, else app-core's resolved default) — a screenshot-
+        // independent way to assert change-default behavior in e2e.
+        println!("cb: change-open default={}", w.get_change_choice());
+        w.set_screen(21);
+    });
+
+    cb!(on_change_pick, |w, s, choice: SharedString| {
+        println!("cb: change-pick {choice}");
+        s.change_choice = choice.to_string();
+        w.set_change_choice(choice.clone());
+        if choice.as_str() != "custom" {
+            w.set_change_address("".into());
+            w.set_change_error("".into());
+        }
+        update_change_label(&w, &mut s);
+        refresh_compose(&w, &mut s);
+        if choice.as_str() != "custom" {
+            w.set_screen(6);
+        }
     });
 
     // Screen 20's header ↻: re-scan the notebook + (if enabled) the spending
@@ -5900,6 +6215,9 @@ pub fn run() {
                         change: 0, // funding change isn't an own coin
                         spent: Vec::new(),
                         funded: active_funding_pill(&s),
+                        is_watch: true,
+                        private: false,
+                        dust_to_self: false,
                     });
                     let n = coins.len();
                     let cost = format!(
@@ -6013,16 +6331,21 @@ pub fn run() {
                 // twins; notes and bumps keep landing on the active notebook.
                 let mut wallet_flow = false;
                 if let Some(wn) = s.watch_note.take() {
-                    // Watch-mode compose: the note enters the store as
-                    // Pending exactly like a keyed compose (inputs locked,
-                    // change spendable, raw hex kept for rebroadcast).
+                    // Watch-mode compose (or a keyed mixed-source compose
+                    // that included an external wallet — funding-
+                    // unification UI rework, `wn.is_watch == false`): the
+                    // note enters the store as Pending exactly like a keyed
+                    // compose (inputs locked, change spendable, raw hex
+                    // kept for rebroadcast).
                     record_watch_note(&mut s, &wn, &txid, &raw, vsize as u64);
                     println!(
-                        "cb: compose id={} txid={txid} fee={} vsize={vsize} to={} private=false gift={} watch=1 broadcast=ok",
+                        "cb: compose id={} txid={txid} fee={} vsize={vsize} to={} private={} gift={} watch={} broadcast=ok",
                         hex::encode(wn.note_id),
                         wn.fee,
                         wn.recipient.as_deref().unwrap_or("self"),
-                        wn.gift
+                        wn.private,
+                        wn.gift,
+                        if wn.is_watch { 1 } else { 0 }
                     );
                 } else if let Some(ws) = s.watch_spend.take() {
                     // Watch-mode spend: record it so Activity gets the
@@ -6159,6 +6482,9 @@ pub fn run() {
                             .map(|c| app_core::store::OutPointRef { txid: c.txid.clone(), vout: c.vout })
                             .collect(),
                         funded: None, // spends the notebook's own coins
+                        is_watch: true,
+                        private: false,
+                        dust_to_self: false,
                     });
                     let cost = format!(
                         "public note · fee {} sats{} · sign with your external wallet",
@@ -6217,6 +6543,9 @@ pub fn run() {
                         w.set_spend_expanded(false);
                         s.coins_overridden = false;
                         s.selected_coins.clear();
+                        s.mixed_selected.clear();
+                        s.change_choice.clear();
+                        w.set_change_choice("".into());
                         w.set_screen(4);
                         refresh(&w, &mut s);
                     }
@@ -6460,6 +6789,369 @@ pub fn run() {
                 w.set_payfrom_expanded(false);
                 s.coins_overridden = false;
                 s.selected_coins.clear();
+                s.mixed_selected.clear();
+                s.change_choice.clear();
+                w.set_change_choice("".into());
+                w.set_screen(4);
+                refresh(&w, &mut s);
+            }
+            Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
+        }
+    });
+
+    // Funding-unification UI rework (2026-07-16): the selection on the
+    // Pay-from screen spans more than one wallet — assemble ONE mixed-
+    // source PSBT (notebook + spending + at most one external wallet),
+    // sign our own inputs in-app, and either broadcast directly (no
+    // external coin involved) or route the partially-signed PSBT through
+    // the existing external-sign screens 13/14 (the funded-sweep test in
+    // app-core's psbt_build already proves that pattern: our own
+    // signatures plus an external signer's, on one PSBT).
+    cb!(on_compose_send_mixed, |w, s| {
+        let text = w.get_compose_text().to_string();
+        let private = w.get_compose_private();
+        let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(0.0);
+        if text.is_empty() || rate <= 0.0 {
+            w.set_status("empty note or bad fee rate".into());
+            return;
+        }
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            w.set_status("watch-only identities can't mix sources".into());
+            return;
+        }
+        let net = s.network;
+        let Some(base) = s.base_url() else {
+            w.set_status("no Bitcoin node — set one in Settings".into());
+            return;
+        };
+        let to = s.to_address.clone();
+        let recipient = match to.as_deref() {
+            Some(a) => match Recipient::parse(net, a) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    w.set_status(format!("{e}").into());
+                    return;
+                }
+            },
+            None => None,
+        };
+        let gift = if recipient.is_some() {
+            w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+        } else {
+            0
+        };
+        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+            w.set_status("no identity".into());
+            return;
+        };
+        let notebook_spk = p2tr_script_pubkey(&identity.output_x);
+
+        // Partition the cross-wallet selection into per-source coins.
+        let notebook_sel = mixed_coins_for(&s, "notebook");
+        let spending_sel = mixed_coins_for(&s, "spending");
+        let wallet_key = s.mixed_selected.iter().find_map(|(src, _, _)| {
+            src.strip_prefix("wallet:").map(|_| src.clone())
+        });
+        let wallet_sel = wallet_key.as_deref().map(|k| mixed_coins_for(&s, k)).unwrap_or_default();
+
+        let mut coins: Vec<app_core::mixed::MixedCoin> = Vec::new();
+        if let Some(store) = s.store.as_ref() {
+            for (txid, vout) in &notebook_sel {
+                if let Some(u) =
+                    store.utxos.iter().find(|u| &u.txid == txid && u.vout == *vout && !u.pending_spend)
+                {
+                    coins.push(app_core::mixed::MixedCoin {
+                        source: app_core::mixed::CoinSource::Notebook,
+                        txid: u.txid.clone(),
+                        vout: u.vout,
+                        value: u.value,
+                        chain: 0,
+                        index: 0,
+                    });
+                }
+            }
+        }
+        for (txid, vout) in &spending_sel {
+            if let Some(c) = s.spending_coins.iter().find(|c| &c.txid == txid && c.vout == *vout) {
+                coins.push(app_core::mixed::MixedCoin {
+                    source: app_core::mixed::CoinSource::Spending,
+                    txid: c.txid.clone(),
+                    vout: c.vout,
+                    value: c.value,
+                    chain: c.chain,
+                    index: c.index,
+                });
+            }
+        }
+        let mut wallets_map: std::collections::HashMap<String, FundingSource> = std::collections::HashMap::new();
+        if let Some(wk) = wallet_key.as_deref() {
+            if let (Some(id), Some(src)) = (wk.strip_prefix("wallet:"), s.funding.clone()) {
+                for (txid, vout) in &wallet_sel {
+                    if let Some(c) = s.funding_coins.iter().find(|c| &c.txid == txid && c.vout == *vout) {
+                        coins.push(app_core::mixed::MixedCoin {
+                            source: app_core::mixed::CoinSource::Wallet(id.to_string()),
+                            txid: c.txid.clone(),
+                            vout: c.vout,
+                            value: c.value,
+                            chain: c.chain,
+                            index: c.index,
+                        });
+                    }
+                }
+                wallets_map.insert(id.to_string(), src);
+            }
+        }
+
+        if coins.is_empty() {
+            w.set_status("no coins selected".into());
+            return;
+        }
+        if !app_core::mixed::spans_multiple_wallets(&coins) {
+            w.set_status("selection is single-source — use the Sign button on that source instead".into());
+            return;
+        }
+
+        // Change: an explicit "custom" pick overrides; otherwise the
+        // resolved default already reflected in `change-choice`.
+        let choice = w.get_change_choice().to_string();
+        let change_override = if choice == "custom" {
+            let addr = normalize_addr(w.get_change_address().as_str());
+            if addr.is_empty() {
+                None
+            } else {
+                match Recipient::parse(net, &addr) {
+                    Ok(r) => Some(r.spk),
+                    Err(_) => {
+                        w.set_status(format!("change address isn't a valid {} address", net.as_str()).into());
+                        return;
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let change_default = match choice.as_str() {
+            "spending" => app_core::mixed::ChangeDefault::Spending,
+            c if c.starts_with("wallet:") => {
+                app_core::mixed::ChangeDefault::Wallet(c.trim_start_matches("wallet:").to_string())
+            }
+            _ => app_core::mixed::ChangeDefault::Notebook,
+        };
+        let change_index = s.store.as_ref().map(|st| st.spending.next_change).unwrap_or(0);
+        let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
+
+        let mut note_id = [2u8, 0, 1, 6];
+        for _ in 0..8 {
+            let r = app_core::notes_core::keys::generate_aux_rand()
+                .map(|x| [x[0], x[1], x[2], x[3]])
+                .unwrap_or(note_id);
+            note_id = r;
+            if !s.store.as_ref().map(|st| st.note_id_taken(&note_id)).unwrap_or(false) {
+                break;
+            }
+        }
+
+        let sealed = app_core::notes_core::bundle::sealed_note_payloads(
+            &identity, &text, private, recipient.as_ref(), note_id, chunk,
+        )
+        .map_err(app_core::Error::from);
+        let (payloads, recipient_spk) = match sealed {
+            Ok(p) => p,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let recipient_amount = if recipient.is_some() { gift } else { 0 };
+
+        let mut built = match app_core::mixed::assemble_mixed_note_psbt(
+            &coins,
+            notebook_spk,
+            s.spending_source.as_ref(),
+            &wallets_map,
+            &payloads,
+            recipient_spk,
+            recipient_amount,
+            &change_default,
+            change_override,
+            change_index,
+            rate,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+
+        // Sign our own inputs regardless of kind — a no-op (Ok(0)) for
+        // whichever kind isn't present in this selection.
+        if let Err(e) =
+            app_core::psbt_build::sign_own_taproot_inputs(&mut built.psbt, &identity.output_x, &identity.tweaked_seckey)
+        {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+        let spending_funding_utxos = app_core::mixed::spending_funding_utxos(&coins);
+        if !spending_funding_utxos.is_empty() {
+            let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+                w.set_status("no identity".into());
+                return;
+            };
+            let Ok(key_material) = parse_key_material(&material_str, net) else {
+                w.set_status("identity parse failed".into());
+                return;
+            };
+            if let Err(e) = app_core::psbt_build::sign_own_wpkh_inputs(
+                &mut built.psbt, &key_material, net, s.account, &spending_funding_utxos,
+            ) {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        }
+
+        let notebook_spent: Vec<app_core::store::OutPointRef> = coins
+            .iter()
+            .filter(|c| matches!(c.source, app_core::mixed::CoinSource::Notebook))
+            .map(|c| app_core::store::OutPointRef { txid: c.txid.clone(), vout: c.vout })
+            .collect();
+        let has_external = coins.iter().any(|c| matches!(c.source, app_core::mixed::CoinSource::Wallet(_)));
+
+        if has_external {
+            // Our own inputs are already signed above; export for the
+            // external wallet to complete its own via screens 13/14.
+            s.watch_spend = None;
+            s.watch_note = Some(WatchNote {
+                note_id,
+                text: text.clone(),
+                recipient: to.clone(),
+                gift,
+                chunks: payloads.len(),
+                fee: built.fee,
+                change: built.change,
+                spent: notebook_spent,
+                funded: Some("mixed".to_string()),
+                is_watch: false,
+                private,
+                dust_to_self: true,
+            });
+            let n = coins.len();
+            let sources: std::collections::HashSet<&str> =
+                s.mixed_selected.iter().map(|(src, _, _)| src.as_str()).collect();
+            println!(
+                "cb: compose-mixed build txid={} fee={} inputs={n} sources={} external=1",
+                built.txid,
+                built.fee,
+                sources.len()
+            );
+            let cost = format!(
+                "mixed source · fee {} sats · {n} input{} · sign with your external wallet",
+                built.fee,
+                if n == 1 { "" } else { "s" }
+            );
+            show_psbt_sign_screen(&w, &mut s, built, cost);
+            return;
+        }
+
+        // No external coin: finalize + broadcast directly.
+        let psbt = built.psbt.clone();
+        let (raw, txid, vsize) = match finalize_extract(psbt) {
+            Ok(x) => x,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let client = ChainClient::new(HttpTransport::new(&base), net);
+        match client.broadcast(&raw) {
+            Ok(_echo) => {
+                if let Some(store) = s.store.as_mut() {
+                    let change_utxo = (built.change > 0 && change_default == app_core::mixed::ChangeDefault::Notebook)
+                        .then(|| app_core::store::LedgerUtxo {
+                            txid: txid.clone(),
+                            vout: (payloads.len() + usize::from(recipient.is_some()) + 1) as u32,
+                            value: built.change,
+                            height: None,
+                            pending_spend: false,
+                        });
+                    store.record_signed(
+                        app_core::store::NoteRecord {
+                            note_id: hex::encode(note_id),
+                            status: NoteStatus::Pending,
+                            text: Some(text.clone()),
+                            private,
+                            directed: recipient.is_some(),
+                            received: false,
+                            sender: None,
+                            recipient: to.clone(),
+                            txids: vec![txid.clone()],
+                            height: None,
+                            blocktime: None,
+                            created_at: Some(now()),
+                            spent: notebook_spent,
+                            raw_hex: Some(raw.clone()),
+                            fee: Some(built.fee),
+                            vsize: Some(vsize as u64),
+                            change_to: None,
+                            gift_amount: recipient.as_ref().map(|_| gift),
+                            funded_by: Some("mixed".into()),
+                        },
+                        change_utxo,
+                    );
+                }
+                s.save_store();
+                // Drop any spending-wallet coins this tx just spent from the
+                // runtime cache immediately (the same "finding 1" fix
+                // `on_spending_compose_send` already applies) — otherwise an
+                // immediate second compose, before the background rescan
+                // below lands, could try to reuse an already-spent UTXO.
+                let spent_spending: Vec<(String, u32)> = coins
+                    .iter()
+                    .filter(|c| matches!(c.source, app_core::mixed::CoinSource::Spending))
+                    .map(|c| (c.txid.clone(), c.vout))
+                    .collect();
+                if !spent_spending.is_empty() {
+                    s.spending_coins
+                        .retain(|c| !spent_spending.iter().any(|(t, v)| t == &c.txid && *v == c.vout));
+                    update_spending_ui(&w, &s);
+                }
+                if change_default == app_core::mixed::ChangeDefault::Spending {
+                    if let Some(src) = s.spending_source.clone() {
+                        if let Ok(change_addr) = src.derive(1, change_index) {
+                            if let Some(store) = s.store.as_mut() {
+                                store.spending_mark_used(SpendingAddr {
+                                    chain: 1,
+                                    index: change_index,
+                                    address: change_addr.address,
+                                    script_pubkey_hex: hex::encode(&change_addr.spk),
+                                });
+                            }
+                            s.save_spending();
+                        }
+                    }
+                    spending_refresh_async(&w, &mut s);
+                } else if !spent_spending.is_empty() {
+                    // Spending coins were spent but change went elsewhere
+                    // (an explicit override) — still worth a fresh scan.
+                    spending_refresh_async(&w, &mut s);
+                }
+                println!(
+                    "cb: compose id={} txid={txid} fee={} vsize={vsize} to={} private={private} funded=mixed broadcast=ok",
+                    hex::encode(note_id),
+                    built.fee,
+                    to.as_deref().unwrap_or("self"),
+                );
+                w.set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
+                w.set_compose_text("".into());
+                w.set_change_address("".into());
+                w.set_change_expanded(false);
+                w.set_spend_expanded(false);
+                w.set_payfrom_expanded(false);
+                s.coins_overridden = false;
+                s.selected_coins.clear();
+                s.mixed_selected.clear();
+                s.change_choice.clear();
+                w.set_change_choice("".into());
                 w.set_screen(4);
                 refresh(&w, &mut s);
             }

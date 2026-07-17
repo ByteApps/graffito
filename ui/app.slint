@@ -969,6 +969,122 @@ component DoorCard inherits Rectangle {
     }
 }
 
+// Nested coin-control list under a wallet row on the Pay-from screen
+// (funding-unification UI rework, 2026-07-16): checkbox-style coin rows,
+// content driven entirely by `in` properties so the SAME AppWindow-level
+// `spend-coins`/`spend-title` state (recomputed in Rust for whichever
+// source is expanded) renders under whichever wallet row is currently
+// expanded — the "Coins" section is no longer a page-level block.
+component CoinListPanel inherits VerticalLayout {
+    in property <[SpendCoin]> coins;
+    in property <string> title;
+    in property <bool> enough: true;
+    in property <int> strategy;
+    callback pick-strategy(int);
+    callback toggle(string);
+    callback refresh();
+    callback explorer(string);
+    padding: 10px;
+    spacing: 8px;
+    HorizontalLayout {
+        Text {
+            text: root.title;
+            font-size: 12px;
+            color: root.enough ? Pal.muted : Pal.bad;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        SvgIconButton {
+            icon: "refresh";
+            size: 14px;
+            width: 28px;
+            height: 22px;
+            clicked => { root.refresh(); }
+        }
+    }
+    Caption { text: "Tap coins to include or exclude. The note spends exactly what's selected."; }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        SelectPill { text: "fewest coins"; active: root.strategy == 0; clicked => { root.pick-strategy(0); } }
+        SelectPill { text: "consolidate"; active: root.strategy == 1; clicked => { root.pick-strategy(1); } }
+    }
+    if !root.enough: Caption {
+        text: "Selected coins don't cover the note + fee — select more.";
+        color: Pal.bad;
+    }
+    for c in root.coins: Rectangle {
+        height: 42px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: c.selected ? Pal.accent : Pal.line;
+        background: c.selected ? Pal.accent.with-alpha(0.10) : transparent;
+        TouchArea { clicked => { root.toggle(c.outpoint); } }
+        HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            spacing: 10px;
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                y: (parent.height - 18px) / 2;
+                border-radius: 4px;
+                border-width: 2px;
+                border-color: c.selected ? Pal.accent : Pal.muted;
+                background: c.selected ? Pal.accent : transparent;
+                if c.selected: Rectangle {
+                    width: 8px; height: 8px;
+                    x: (parent.width - 8px) / 2;
+                    y: (parent.height - 8px) / 2;
+                    background: Pal.on-accent;
+                    border-radius: 2px;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Text { text: c.value + " sats"; font-size: 12px; color: Pal.text; }
+            }
+            Rectangle { }
+            VerticalLayout {
+                alignment: center;
+                Badge { label: c.confirmed ? "confirmed" : "unconfirmed"; tint: c.confirmed ? Pal.good : Pal.warn; }
+            }
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    height: 22px;
+                    width: cplpill.preferred-width + 14px;
+                    border-radius: 11px;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    background: cplta.has-hover && c.explorer != "" ? Pal.card-hover : transparent;
+                    cplta := TouchArea { clicked => { if (c.explorer != "") { root.explorer(c.explorer); } } }
+                    cplpill := HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 7px;
+                        spacing: 4px;
+                        Text {
+                            text: c.txid-short;
+                            font-family: "Menlo";
+                            font-size: 10px;
+                            color: Pal.muted;
+                            vertical-alignment: center;
+                        }
+                        if c.explorer != "": Image {
+                            source: @image-url("icons/external.svg");
+                            colorize: Pal.accent;
+                            width: 11px;
+                            height: 11px;
+                            y: (parent.height - 11px) / 2;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     preferred-width: 480px;
     preferred-height: 780px;
@@ -1127,6 +1243,22 @@ export component AppWindow inherits Window {
     in property <string> pay-from-balance;
     in property <string> funding-notebook-balance;
     in-out property <bool> spend-from-wallet;   // internal spending-wallet compose mode
+    // ---- multi-wallet coin selection (funding-unification UI rework) ----
+    // Coins nest under each wallet row on screen 20; tapping a row selects
+    // it AND expands its coins beneath it (accordion — only one row's list
+    // is visibly expanded at a time, but selections persist across every
+    // source). "" = nothing expanded; "notebook" | "spending" | "wallet:<id>"
+    // otherwise — same key convention `pay-from` already uses.
+    in-out property <string> payfrom-expanded-source: "";
+    // Selected coins span more than one wallet — shows the linkage-hint line.
+    in property <bool> mixed-linkage-hint: false;
+    // Resolved change destination (default or explicit pick), for the
+    // compose nav row and the Change screen header — always elided.
+    in property <string> change-dest-label: "Notebook";
+    // Explicit change pick made this compose session; "" = default resolution
+    // applies (see app-core's resolve_change_default). Never reset by a
+    // refresh once the user has chosen — only a fresh compose clears it.
+    in-out property <string> change-choice: "";
     // shared camera-scan overlay (every "Scan QR" path uses it)
     in-out property <bool> scanning;
     in-out property <image> camera-frame;
@@ -1316,6 +1448,15 @@ export component AppWindow inherits Window {
     // a single compact row on compose.
     callback open-funding-screen();        // compose row → screen 20
     callback funding-refresh();            // screen 20 header ↻ — async re-scan
+    // Multi-wallet coin selection (funding-unification UI rework): tapping a
+    // wallet row on screen 20 selects it AND expands its nested coin list.
+    callback payfrom-expand(string);
+    // Change now lives on its own screen (21), reached from a second compose
+    // nav row below "Pay from".
+    callback change-open();                // compose → screen 21
+    callback change-pick(string);          // screen 21 row tap: an explicit choice
+    // Sign when the selection spans more than one wallet in one tx.
+    callback compose-send-mixed();
     // Internal: a background spending-wallet scan finished — same
     // trampoline pattern as apply-pending-refresh.
     callback apply-pending-spending-refresh();
@@ -1475,6 +1616,10 @@ export component AppWindow inherits Window {
         // back always returns to compose, draft untouched (no field wipes,
         // unlike screen 6's own back-to-picker branch above).
         if (root.screen == 20) { root.screen = 6; return true; }
+        // Change (screen 21): reached only from compose's second nav row —
+        // back returns to compose too (a sibling of the Pay-from row, not
+        // nested under screen 20).
+        if (root.screen == 21) { root.screen = 6; return true; }
         if (root.screen == 18 || root.screen == 19) {
             root.reveal-hide();
             root.screen = 8;
@@ -2328,24 +2473,58 @@ export component AppWindow inherits Window {
                 Text { text: "›"; font-size: 20px; color: Pal.muted; vertical-alignment: center; }
             }
         }
+        // ---- change: ONE compact navigation row → screen 21, directly
+        // below Pay-from (funding-unification UI rework, 2026-07-16). ----
+        Rectangle {
+            border-radius: 10px;
+            background: chtap.has-hover ? Pal.card-hover : Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: 44px;
+            chtap := TouchArea { clicked => { root.change-open(); } }
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 6px;
+                Text {
+                    text: "Change · " + root.change-dest-label;
+                    font-size: 12px;
+                    color: Pal.text;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Text { text: "›"; font-size: 20px; color: Pal.muted; vertical-alignment: center; }
+            }
+        }
+        if root.mixed-linkage-hint: Caption {
+            text: "This note spends coins from more than one wallet — their addresses become publicly linked on-chain.";
+            color: Pal.warn;
+        }
         Caption {
             text: root.compose-private
                 ? "Encrypted forever on-chain — XChaCha20-Poly1305, 256-bit key; only your key (and a directed recipient) can read it."
                 : "⚠  Public notes are world-readable, forever.";
         }
-        if root.pay-from == "notebook": PrimaryButton {
+        if root.mixed-linkage-hint: PrimaryButton {
+            text: "Sign + broadcast";
+            tint: root.spend-enough ? Pal.accent : Pal.faint;
+            tint-hover: root.spend-enough ? Pal.accent-hover : Pal.faint;
+            clicked => { if (root.spend-enough) { root.compose-send-mixed(); } }
+        }
+        if !root.mixed-linkage-hint && root.pay-from == "notebook": PrimaryButton {
             text: root.watch-only ? "Build transaction to sign" : "Sign + broadcast";
             tint: root.spend-enough ? Pal.accent : Pal.faint;
             tint-hover: root.spend-enough ? Pal.accent-hover : Pal.faint;
             clicked => { if (root.spend-enough) { root.compose-send(); } }
         }
-        if root.pay-from == "spending": PrimaryButton {
+        if !root.mixed-linkage-hint && root.pay-from == "spending": PrimaryButton {
             text: "Sign + broadcast";
             tint: root.spend-enough ? Pal.accent : Pal.faint;
             tint-hover: root.spend-enough ? Pal.accent-hover : Pal.faint;
             clicked => { if (root.spend-enough) { root.spending-compose-send(); } }
         }
-        if root.fund-external: PrimaryButton {
+        if !root.mixed-linkage-hint && root.fund-external: PrimaryButton {
             text: root.funding-ready ? "Build transaction to sign" : "Set a funding wallet first";
             tint: (root.funding-ready && root.spend-enough) ? Pal.accent : Pal.faint;
             tint-hover: (root.funding-ready && root.spend-enough) ? Pal.accent-hover : Pal.faint;
@@ -3546,281 +3725,288 @@ export component AppWindow inherits Window {
             payfrom-scr-col := VerticalLayout {
                 spacing: 10px;
                 alignment: start;
-                // ---- source rows (radio-select, same style as the old compose picker) ----
-                Rectangle {
-                    height: 36px;
-                    border-radius: 8px;
-                    border-width: 1px;
-                    border-color: root.pay-from == "notebook" ? Pal.accent : Pal.line;
-                    background: root.pay-from == "notebook" ? Pal.accent.with-alpha(0.10) : Pal.card;
-                    TouchArea { clicked => { root.set-pay-from("notebook"); } }
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        Text {
-                            text: "Notebook";
-                            font-size: 12px;
-                            color: root.pay-from == "notebook" ? Pal.accent : Pal.text;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                            overflow: elide;
+                // ---- source rows: tap selects AND expands its coins nested
+                // directly beneath it (accordion — only one row's coin list
+                // is visibly open at a time; selections persist across every
+                // source regardless of which is currently expanded). ----
+                VerticalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        height: 36px;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: root.pay-from == "notebook" ? Pal.accent : Pal.line;
+                        background: root.pay-from == "notebook" ? Pal.accent.with-alpha(0.10) : Pal.card;
+                        TouchArea { clicked => { root.payfrom-expand("notebook"); } }
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 6px;
+                            Text {
+                                text: "Notebook";
+                                font-size: 12px;
+                                color: root.pay-from == "notebook" ? Pal.accent : Pal.text;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: root.funding-notebook-balance;
+                                font-size: 11px;
+                                color: Pal.muted;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Image {
+                                source: root.payfrom-expanded-source == "notebook"
+                                    ? @image-url("icons/caret-up.svg")
+                                    : @image-url("icons/caret-down.svg");
+                                colorize: Pal.muted;
+                                width: 14px;
+                                height: 14px;
+                                y: (parent.height - 14px) / 2;
+                            }
                         }
-                        Text {
-                            text: root.funding-notebook-balance;
-                            font-size: 11px;
-                            color: Pal.muted;
-                            vertical-alignment: center;
-                            overflow: elide;
+                    }
+                    if root.payfrom-expanded-source == "notebook": Rectangle {
+                        border-radius: 10px;
+                        background: Pal.card;
+                        border-width: 1px;
+                        border-color: root.spend-enough ? Pal.line : Pal.bad;
+                        height: nb20panel.preferred-height;
+                        nb20panel := CoinListPanel {
+                            coins: root.spend-coins;
+                            title: root.spend-title;
+                            enough: root.spend-enough;
+                            strategy: root.coin-strategy;
+                            pick-strategy(i) => { root.set-coin-strategy(i); }
+                            toggle(op) => { root.toggle-coin(op); }
+                            refresh() => { root.refresh-coins(); }
+                            explorer(u) => { root.act-explorer(u); }
                         }
                     }
                 }
-                if root.spending-capable && root.spending-enabled: Rectangle {
-                    height: 36px;
-                    border-radius: 8px;
-                    border-width: 1px;
-                    border-color: root.pay-from == "spending" ? Pal.accent : Pal.line;
-                    background: root.pay-from == "spending" ? Pal.accent.with-alpha(0.10) : Pal.card;
-                    TouchArea { clicked => { root.set-pay-from("spending"); } }
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        Text {
-                            text: "Spending wallet";
-                            font-size: 12px;
-                            color: root.pay-from == "spending" ? Pal.accent : Pal.text;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                            overflow: elide;
+                if root.spending-capable && root.spending-enabled: VerticalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        height: 36px;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: root.pay-from == "spending" ? Pal.accent : Pal.line;
+                        background: root.pay-from == "spending" ? Pal.accent.with-alpha(0.10) : Pal.card;
+                        TouchArea { clicked => { root.payfrom-expand("spending"); } }
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 6px;
+                            Text {
+                                text: "Spending wallet";
+                                font-size: 12px;
+                                color: root.pay-from == "spending" ? Pal.accent : Pal.text;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: root.spending-summary;
+                                font-size: 11px;
+                                color: Pal.muted;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Image {
+                                source: root.payfrom-expanded-source == "spending"
+                                    ? @image-url("icons/caret-up.svg")
+                                    : @image-url("icons/caret-down.svg");
+                                colorize: Pal.muted;
+                                width: 14px;
+                                height: 14px;
+                                y: (parent.height - 14px) / 2;
+                            }
                         }
-                        Text {
-                            text: root.spending-summary;
-                            font-size: 11px;
-                            color: Pal.muted;
-                            vertical-alignment: center;
-                            overflow: elide;
+                    }
+                    if root.payfrom-expanded-source == "spending": Rectangle {
+                        border-radius: 10px;
+                        background: Pal.card;
+                        border-width: 1px;
+                        border-color: root.spend-enough ? Pal.line : Pal.bad;
+                        height: sp20panel.preferred-height;
+                        sp20panel := CoinListPanel {
+                            coins: root.spend-coins;
+                            title: root.spend-title;
+                            enough: root.spend-enough;
+                            strategy: root.coin-strategy;
+                            pick-strategy(i) => { root.set-coin-strategy(i); }
+                            toggle(op) => { root.toggle-coin(op); }
+                            refresh() => { root.refresh-coins(); }
+                            explorer(u) => { root.act-explorer(u); }
                         }
                     }
                 }
-                for fw in root.funding-wallets: Rectangle {
-                    height: fw20-row.preferred-height;
-                    border-radius: 8px;
-                    border-width: 1px;
-                    border-color: (root.fund-external && root.pay-from == "wallet:" + fw.id) ? Pal.accent : Pal.line;
-                    background: (root.fund-external && root.pay-from == "wallet:" + fw.id) ? Pal.accent.with-alpha(0.10) : Pal.card;
-                    TouchArea { clicked => { root.use-funding-wallet(fw.id); } }
-                    fw20-row := VerticalLayout {
-                        padding: 8px;
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        spacing: 2px;
-                        Text {
-                            text: fw.label;
-                            font-size: 12px;
-                            color: (root.fund-external && root.pay-from == "wallet:" + fw.id) ? Pal.accent : Pal.text;
-                            overflow: elide;
+                for fw in root.funding-wallets: VerticalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        height: fw20-row.preferred-height;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: root.payfrom-expanded-source == "wallet:" + fw.id ? Pal.accent : Pal.line;
+                        background: root.payfrom-expanded-source == "wallet:" + fw.id ? Pal.accent.with-alpha(0.10) : Pal.card;
+                        TouchArea { clicked => { root.payfrom-expand("wallet:" + fw.id); } }
+                        fw20-row := VerticalLayout {
+                            padding: 8px;
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 2px;
+                            Text {
+                                text: fw.label;
+                                font-size: 12px;
+                                color: root.payfrom-expanded-source == "wallet:" + fw.id ? Pal.accent : Pal.text;
+                                overflow: elide;
+                            }
+                            Caption { text: "watch-only"; }
                         }
-                        Caption { text: "watch-only"; }
+                    }
+                    if root.payfrom-expanded-source == "wallet:" + fw.id: Rectangle {
+                        border-radius: 10px;
+                        background: Pal.card;
+                        border-width: 1px;
+                        border-color: root.spend-enough ? Pal.line : Pal.bad;
+                        height: fwpanel.preferred-height;
+                        fwpanel := CoinListPanel {
+                            coins: root.spend-coins;
+                            title: root.spend-title;
+                            enough: root.spend-enough;
+                            strategy: root.coin-strategy;
+                            pick-strategy(i) => { root.set-coin-strategy(i); }
+                            toggle(op) => { root.toggle-coin(op); }
+                            refresh() => { root.refresh-coins(); }
+                            explorer(u) => { root.act-explorer(u); }
+                        }
                     }
                 }
                 GhostButton {
                     text: "+ External wallet…";
                     clicked => { root.funding-return = 20; root.open-funding(); }
                 }
-                // ---- coin control for the selected source (moved wholesale from compose) ----
-                Rectangle {
-                    border-radius: 10px;
-                    background: Pal.card;
-                    border-width: 1px;
-                    border-color: root.spend-enough ? Pal.line : Pal.bad;
-                    height: spend-col.preferred-height;
-                    spend-col := VerticalLayout {
-                        padding: 10px;
-                        spacing: 8px;
-                        Rectangle {
-                            height: 22px;
-                            TouchArea { clicked => { root.spend-expanded = !root.spend-expanded; } }
-                            HorizontalLayout {
-                                Text {
-                                    text: root.spend-title;
-                                    font-size: 12px;
-                                    color: root.spend-enough ? Pal.muted : Pal.bad;
-                                    vertical-alignment: center;
-                                }
-                                Rectangle { }
-                                SvgIconButton {
-                                    icon: "refresh";
-                                    size: 14px;
-                                    width: 28px;
-                                    height: 22px;
-                                    clicked => { root.refresh-coins(); }
-                                }
-                                Image {
-                                    source: root.spend-expanded
-                                        ? @image-url("icons/caret-up.svg")
-                                        : @image-url("icons/caret-down.svg");
-                                    colorize: Pal.muted;
-                                    width: 16px;
-                                    height: 16px;
-                                    y: (parent.height - 16px) / 2;
-                                }
-                            }
-                        }
-                        if root.spend-expanded: Caption {
-                            text: "Tap coins to include or exclude. The note spends exactly what's selected.";
-                        }
-                        if root.spend-expanded: HorizontalLayout {
-                            spacing: 8px;
-                            alignment: start;
-                            SelectPill {
-                                text: "fewest coins";
-                                active: root.coin-strategy == 0;
-                                clicked => { root.set-coin-strategy(0); }
-                            }
-                            SelectPill {
-                                text: "consolidate";
-                                active: root.coin-strategy == 1;
-                                clicked => { root.set-coin-strategy(1); }
-                            }
-                        }
-                        if root.spend-expanded && !root.spend-enough: Caption {
-                            text: "Selected coins don't cover the note + fee — select more.";
-                            color: Pal.bad;
-                        }
-                        if root.spend-expanded: VerticalLayout {
-                            spacing: 6px;
-                            for c in root.spend-coins: Rectangle {
-                                height: 42px;
-                                border-radius: 8px;
-                                border-width: 1px;
-                                border-color: c.selected ? Pal.accent : Pal.line;
-                                background: c.selected ? Pal.accent.with-alpha(0.10) : transparent;
-                                cta := TouchArea { clicked => { root.toggle-coin(c.outpoint); } }
-                                HorizontalLayout {
-                                    padding-left: 10px;
-                                    padding-right: 10px;
-                                    spacing: 10px;
-                                    Rectangle {
-                                        width: 18px;
-                                        height: 18px;
-                                        y: (parent.height - 18px) / 2;
-                                        border-radius: 4px;
-                                        border-width: 2px;
-                                        border-color: c.selected ? Pal.accent : Pal.muted;
-                                        background: c.selected ? Pal.accent : transparent;
-                                        if c.selected: Rectangle {
-                                            width: 8px; height: 8px;
-                                            x: (parent.width - 8px) / 2;
-                                            y: (parent.height - 8px) / 2;
-                                            background: Pal.on-accent;
-                                            border-radius: 2px;
-                                        }
-                                    }
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Text {
-                                            text: c.value + " sats";
-                                            font-size: 12px;
-                                            color: Pal.text;
-                                        }
-                                    }
-                                    Rectangle { }
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Badge {
-                                            label: c.confirmed ? "confirmed" : "unconfirmed";
-                                            tint: c.confirmed ? Pal.good : Pal.warn;
-                                        }
-                                    }
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Rectangle {
-                                            height: 22px;
-                                            width: pillrow20.preferred-width + 14px;
-                                            border-radius: 11px;
-                                            border-width: 1px;
-                                            border-color: Pal.line;
-                                            background: pta20.has-hover && c.explorer != "" ? Pal.card-hover : transparent;
-                                            pta20 := TouchArea {
-                                                clicked => { if (c.explorer != "") { root.act-explorer(c.explorer); } }
-                                            }
-                                            pillrow20 := HorizontalLayout {
-                                                padding-left: 8px;
-                                                padding-right: 7px;
-                                                spacing: 4px;
-                                                Text {
-                                                    text: c.txid-short;
-                                                    font-family: "Menlo";
-                                                    font-size: 10px;
-                                                    color: Pal.muted;
-                                                    vertical-alignment: center;
-                                                }
-                                                if c.explorer != "": Image {
-                                                    source: @image-url("icons/external.svg");
-                                                    colorize: Pal.accent;
-                                                    width: 11px;
-                                                    height: 11px;
-                                                    y: (parent.height - 11px) / 2;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // ---- custom change address (moved wholesale from compose) ----
-                Rectangle {
-                    border-radius: 10px;
-                    background: Pal.card;
-                    border-width: 1px;
-                    border-color: root.change-error != "" ? Pal.bad : Pal.line;
-                    height: change-col.preferred-height;
-                    change-col := VerticalLayout {
-                        padding: 10px;
-                        spacing: 8px;
-                        Rectangle {
-                            height: 22px;
-                            TouchArea { clicked => { root.change-expanded = !root.change-expanded; } }
-                            HorizontalLayout {
-                                Text {
-                                    text: root.change-amount;
-                                    font-size: 12px;
-                                    color: Pal.muted;
-                                    vertical-alignment: center;
-                                }
-                                Rectangle { }
-                                Image {
-                                    source: root.change-expanded
-                                        ? @image-url("icons/caret-up.svg")
-                                        : @image-url("icons/caret-down.svg");
-                                    colorize: Pal.muted;
-                                    width: 16px;
-                                    height: 16px;
-                                    y: (parent.height - 16px) / 2;
-                                }
-                            }
-                        }
-                        if root.change-expanded: Caption {
-                            text: root.fund-external
-                                ? "Change returns to the funding wallet by default. Send it elsewhere:"
-                                : (root.pay-from == "spending"
-                                    ? "Change returns to a fresh spending-wallet address."
-                                    : "Change returns to your address by default. Send it somewhere else:");
-                        }
-                        if root.change-expanded: HorizontalLayout {
-                            spacing: 8px;
-                            EditField {
-                                text <=> root.change-address;
-                                placeholder-text: "change address (blank = back to you)";
-                                edited => { root.compose-changed(); }
-                            }
-                            ScanButton { clicked => { root.change-scan(); } }
-                        }
-                        if root.change-error != "": Caption { text: root.change-error; color: Pal.bad; }
-                    }
+                if root.mixed-linkage-hint: Caption {
+                    text: "This note spends coins from more than one wallet — their addresses become publicly linked on-chain.";
+                    color: Pal.warn;
                 }
                 if root.status != "": Caption { text: root.status; color: Pal.bad; }
+            }
+        }
+    }
+
+    // ---------- 21 · change destination (funding-unification UI rework) ----------
+    // Moved off the Pay-from screen onto its own screen, reached from a
+    // second compose nav row. Single-select rows; "Custom address…" reveals
+    // the existing validated text input. Defaults (never overridden once an
+    // explicit pick is made this session) come from app-core's
+    // `mixed::resolve_change_default`.
+    if screen == 21: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Change";
+            back => { root.nav-back(); }
+        }
+        Flickable {
+            viewport-height: change-scr-col.preferred-height;
+            change-scr-col := VerticalLayout {
+                spacing: 10px;
+                alignment: start;
+                if root.spending-capable && root.spending-enabled: Rectangle {
+                    height: 36px;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: root.change-choice == "spending" ? Pal.accent : Pal.line;
+                    background: root.change-choice == "spending" ? Pal.accent.with-alpha(0.10) : Pal.card;
+                    TouchArea { clicked => { root.change-pick("spending"); } }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: "Fresh spending-wallet address";
+                            font-size: 12px;
+                            color: root.change-choice == "spending" ? Pal.accent : Pal.text;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 36px;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: root.change-choice == "notebook" ? Pal.accent : Pal.line;
+                    background: root.change-choice == "notebook" ? Pal.accent.with-alpha(0.10) : Pal.card;
+                    TouchArea { clicked => { root.change-pick("notebook"); } }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: "Notebook address";
+                            font-size: 12px;
+                            color: root.change-choice == "notebook" ? Pal.accent : Pal.text;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                    }
+                }
+                for fw in root.funding-wallets: Rectangle {
+                    height: 36px;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: root.change-choice == "wallet:" + fw.id ? Pal.accent : Pal.line;
+                    background: root.change-choice == "wallet:" + fw.id ? Pal.accent.with-alpha(0.10) : Pal.card;
+                    TouchArea { clicked => { root.change-pick("wallet:" + fw.id); } }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: fw.label + " change";
+                            font-size: 12px;
+                            color: root.change-choice == "wallet:" + fw.id ? Pal.accent : Pal.text;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 36px;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: root.change-choice == "custom" ? Pal.accent : Pal.line;
+                    background: root.change-choice == "custom" ? Pal.accent.with-alpha(0.10) : Pal.card;
+                    TouchArea { clicked => { root.change-pick("custom"); } }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: "Custom address…";
+                            font-size: 12px;
+                            color: root.change-choice == "custom" ? Pal.accent : Pal.text;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                    }
+                }
+                if root.change-choice == "custom": HorizontalLayout {
+                    spacing: 8px;
+                    EditField {
+                        text <=> root.change-address;
+                        placeholder-text: "change address";
+                        edited => { root.compose-changed(); }
+                    }
+                    ScanButton { clicked => { root.change-scan(); } }
+                }
+                if root.change-error != "": Caption { text: root.change-error; color: Pal.bad; }
+                Caption { text: "Current: " + root.change-dest-label; }
             }
         }
     }

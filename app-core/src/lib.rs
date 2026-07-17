@@ -14,6 +14,7 @@ pub mod derive;
 pub mod funding;
 pub mod identity;
 pub mod keyexport;
+pub mod mixed;
 pub mod notebooks;
 pub mod psbt_build;
 pub mod psbt_finalize;
