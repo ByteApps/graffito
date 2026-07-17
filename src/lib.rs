@@ -3281,6 +3281,19 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
             st.funding_change_index = scan.next_change_index;
             st.funding = Some(src);
             st.active_funding_id = Some(id.to_string());
+            // Seed the single-source scratch selection from this wallet's
+            // coins (or its remembered cross-wallet selection), so
+            // `sync_and_finalize_payfrom` mirrors the wallet into
+            // `mixed_selected` — without this the change-default resolver
+            // never saw an external wallet participating and kept
+            // defaulting to the notebook (Sal's rule: external funding
+            // defaults change to THAT wallet's change address).
+            let remembered = mixed_coins_for(st, &format!("wallet:{id}"));
+            st.selected_coins = if remembered.is_empty() {
+                st.funding_coins.iter().map(|c| (c.txid.clone(), c.vout)).collect()
+            } else {
+                remembered
+            };
             w.set_status(if empty { "wallet has no spendable coins yet".to_string() } else { String::new() }.into());
             if stay_on_payfrom {
                 w.set_fund_external(true);
