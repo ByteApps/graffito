@@ -132,6 +132,20 @@ pub struct TxRecord {
     /// Empty on legacy records (see `input_accounts`).
     #[serde(default)]
     pub input_indexes: Vec<u32>,
+    /// CHANGE 2 (funding-unification wallet-level flows, 2026-07-17): true
+    /// when this record's inputs mix notebook (taproot) coins with
+    /// spending-wallet (P2WPKH) coins — `build_wallet_sweep_mixed`'s
+    /// output. `input_accounts`/`input_indexes` are left EMPTY on a mixed
+    /// record (no single per-input owner scheme covers both kinds), so the
+    /// existing multi-key bump path (`bump_raw_tx_multi`, taproot-only)
+    /// must never be reached for one — the UI hides Speed-up
+    /// (`ActivityItem.bumpable`) and `on_act_bump_open`/`_confirm` refuse
+    /// defensively too. Rebroadcast still works (`raw_hex` is kept exactly
+    /// like any other pending record) — only RBF re-signing is unavailable.
+    /// Default false: every pre-existing record (single-key or
+    /// taproot-only multi-key) is unaffected and stays bumpable.
+    #[serde(default)]
+    pub mixed_inputs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,6 +444,7 @@ impl Store {
             dest_spk_hex,
             input_accounts: Vec::new(),
             input_indexes: Vec::new(),
+            mixed_inputs: false,
         });
     }
 

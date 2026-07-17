@@ -51,7 +51,13 @@ export struct ActivityItem {
     // whose Rebroadcast/Speed-up is in flight on a worker thread — that
     // row's buttons show a busy caption and disable; other rows stay
     // tappable.
-    busy: bool }
+    busy: bool,
+    // CHANGE 2 (2026-07-17): false for a mixed notebook+spending-wallet
+    // sweep record (`TxRecord.mixed_inputs`) — no per-input owner scheme
+    // covers both input kinds, so Speed-up (RBF) is unavailable; gates
+    // ONLY the Speed-up button — `pending` alone still shows Rebroadcast.
+    // true for every other record (unaffected, matches today).
+    bumpable: bool }
 
 // Per-platform optical calibration, set from Rust at startup. The header
 // title Text sits differently inside its line box per platform font (macOS/
@@ -1420,6 +1426,12 @@ export component AppWindow inherits Window {
     in-out property <string> consolidate-rate: "1";
     in-out property <bool> show-consolidate-confirm;
     in property <string> consolidate-fee-line;
+    // CHANGE 4 (async wallet-tx broadcast, 2026-07-17): true while any of
+    // on-consolidate / on-sweep / on-wallet-consolidate / on-psbt-broadcast
+    // has a broadcast in flight on a worker thread (build+sign stays
+    // synchronous) — the confirm modals' primary buttons show a busy
+    // caption and disable, and every entry point re-enters early.
+    in-out property <bool> wallet-tx-busy;
     in-out property <string> sweep-dest;
     in-out property <string> sweep-rate: "1";
     in-out property <bool> show-sweep-confirm;
@@ -1582,6 +1594,10 @@ export component AppWindow inherits Window {
     callback apply-pending-act-retry();
     // A Speed-up (RBF bump) broadcast finished on a worker thread.
     callback apply-pending-act-bump();
+    // CHANGE 4: a consolidate/sweep/wallet-consolidate/psbt broadcast
+    // finished on a worker thread — same trampoline pattern, one callback
+    // draining all four result queues (mirrors apply-pending-compose).
+    callback apply-pending-wallet-tx();
     // Where settings/activity return on back: the screen they were opened
     // from (the notebook list or a notebook's home). Set by their open
     // callbacks in Rust.
@@ -3244,7 +3260,7 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 8px;
                             alignment: start;
-                            if a.pending: GhostButton {
+                            if a.pending && a.bumpable: GhostButton {
                                 width: 96px;
                                 height: 30px;
                                 opacity: a.busy ? 0.5 : 1.0;
@@ -3501,8 +3517,9 @@ export component AppWindow inherits Window {
             }
         }
         if root.psbt-signed: PrimaryButton {
-            text: "Broadcast";
-            clicked => { root.psbt-broadcast(); }
+            text: root.wallet-tx-busy ? "Broadcasting…" : "Broadcast";
+            tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
+            clicked => { if (!root.wallet-tx-busy) { root.psbt-broadcast(); } }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
     }
@@ -4765,7 +4782,11 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.show-wconsol-confirm = false; } }
-                    PrimaryButton { text: "Consolidate"; clicked => { root.wallet-consolidate(); } }
+                    PrimaryButton {
+                        text: root.wallet-tx-busy ? "Consolidating…" : "Consolidate";
+                        tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
+                        clicked => { if (!root.wallet-tx-busy) { root.wallet-consolidate(); } }
+                    }
                 }
             }
         }
@@ -4860,10 +4881,10 @@ export component AppWindow inherits Window {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.show-sweep-confirm = false; } }
                     PrimaryButton {
-                        text: "Sweep";
-                        tint: Pal.bad;
-                        tint-hover: #ff6b62;
-                        clicked => { root.sweep(); }
+                        text: root.wallet-tx-busy ? "Sweeping…" : "Sweep";
+                        tint: root.wallet-tx-busy ? Pal.faint : Pal.bad;
+                        tint-hover: root.wallet-tx-busy ? Pal.faint : #ff6b62;
+                        clicked => { if (!root.wallet-tx-busy) { root.sweep(); } }
                     }
                 }
             }
@@ -4912,7 +4933,11 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.show-consolidate-confirm = false; } }
-                    PrimaryButton { text: "Consolidate"; clicked => { root.consolidate(); } }
+                    PrimaryButton {
+                        text: root.wallet-tx-busy ? "Consolidating…" : "Consolidate";
+                        tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
+                        clicked => { if (!root.wallet-tx-busy) { root.consolidate(); } }
+                    }
                 }
             }
         }

@@ -411,6 +411,7 @@ mod bump_tests {
             // resolved by the caller).
             input_accounts: vec![0, 3],
             input_indexes: Vec::new(),
+            mixed_inputs: false,
         });
 
         fn dup(i: &Identity) -> Identity {

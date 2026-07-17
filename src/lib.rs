@@ -228,6 +228,13 @@ struct State {
     /// to "spending" out from under a deliberate "notebook" pick. Reset to
     /// false at the start of every fresh compose session (`pick_contact_core`).
     payfrom_manual: bool,
+    /// CHANGE 4 (async wallet-tx broadcast, 2026-07-17): true while a
+    /// consolidate / sweep / wallet-consolidate / psbt-broadcast has a
+    /// `client.broadcast()` in flight on a worker thread — re-entrancy
+    /// guard so a double-tap can't double-broadcast (mirrors
+    /// `compose_busy`, kept separate since the two never overlap but
+    /// represent different flows).
+    wallet_tx_busy: bool,
 }
 
 /// One wallet-consolidate session (Coins → "Consolidate into one coin…").
@@ -1010,8 +1017,24 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
     } else {
         store.utxos.iter().filter(|u| !u.pending_spend).cloned().collect()
     };
-    let total: u64 = spendable.iter().map(|u| u.value).sum();
+    // CHANGE 2: a WALLET sweep also gathers the spending wallet's coins —
+    // UNLESS the destination IS the spending wallet's own next receive
+    // address (`on_spending_sweep_here`; `pending_spending_sweep_index`),
+    // where including them would sweep the spending wallet into itself.
+    let spending_rows: Vec<FundingUtxo> = if wallet_mode
+        && st.pending_spending_sweep_index.is_none()
+        && st.spending_capable
+        && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false)
+    {
+        st.spending_coins.clone()
+    } else {
+        Vec::new()
+    };
+    let nb_total: u64 = spendable.iter().map(|u| u.value).sum();
+    let sp_total: u64 = spending_rows.iter().map(|c| c.value).sum();
+    let total = nb_total + sp_total;
     let n = spendable.len();
+    let sp_n = spending_rows.len();
     let mut rows: Vec<SpendCoin> = spendable
         .iter()
         .map(|u| SpendCoin {
@@ -1023,12 +1046,30 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
             explorer: explorer_tx_url(exb.as_deref(), net, &u.txid).into(),
         })
         .collect();
+    rows.extend(spending_rows.iter().map(|c| SpendCoin {
+        outpoint: format!("{}:{}", c.txid, c.vout).into(),
+        value: c.value.to_string().into(),
+        confirmed: c.confirmed,
+        selected: true,
+        txid_short: c.txid[..8.min(c.txid.len())].to_string().into(),
+        explorer: explorer_tx_url(exb.as_deref(), net, &c.txid).into(),
+    }));
     rows.sort_by_key(|r| r.value.parse::<u64>().unwrap_or(0));
     w.set_sweep_coins(VecModel::from_slice(&rows));
     let plural = if n == 1 { "" } else { "s" };
-    w.set_sweep_inputs_title(format!("Inputs · {n} coin{plural} · {total} sats (all)").into());
+    w.set_sweep_inputs_title(
+        if sp_n > 0 {
+            format!(
+                "Inputs · {n} notebook coin{plural} + {sp_n} spending coin{} · {total} sats (all)",
+                if sp_n == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("Inputs · {n} coin{plural} · {total} sats (all)")
+        }
+        .into(),
+    );
 
-    if n == 0 {
+    if n == 0 && sp_n == 0 {
         w.set_sweep_cost_line("nothing to sweep — no spendable coins".into());
         return;
     }
@@ -1074,7 +1115,20 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
             .into(),
         );
     } else {
-        let vsize = predict_keyspend_vsize(n, std::iter::once(dest_spk_len));
+        // CHANGE 2: with spending coins riding along, size via
+        // notes-core's mixed estimator (byte-exact — the same function
+        // `build_wallet_sweep_mixed`/`build_sweep_tx_mixed` actually use
+        // to build the tx); the all-taproot path is untouched.
+        let vsize = if sp_n > 0 {
+            use app_core::notes_core::tx::{estimate_vsize_mixed, InputKind};
+            let kinds: Vec<InputKind> = std::iter::repeat(InputKind::Taproot)
+                .take(n)
+                .chain(std::iter::repeat(InputKind::P2wpkh).take(sp_n))
+                .collect();
+            estimate_vsize_mixed(&kinds, &[], &[dest_spk_len]) as u64
+        } else {
+            predict_keyspend_vsize(n, std::iter::once(dest_spk_len))
+        };
         let fee = (vsize as f64 * rate).ceil() as u64;
         if total <= fee {
             w.set_sweep_cost_line(format!("balance {total} sats can't cover the ~{fee} sat fee").into());
@@ -1209,6 +1263,7 @@ fn update_activity(w: &AppWindow, st: &State) {
                 notebook: tag.clone().into(),
                 funded: funded_pill(n.funded_by.as_deref()).into(),
                 busy: st.act_pending_ref.as_deref() == Some(n.note_id.as_str()),
+                bumpable: true, // notes bump via bump_fee — never a mixed record
             },
         ));
     }
@@ -1242,6 +1297,7 @@ fn update_activity(w: &AppWindow, st: &State) {
                 notebook: tag.clone().into(),
                 funded: "".into(), // sweeps/consolidates aren't funded-note records
                 busy: st.act_pending_ref.as_deref() == Some(txid.as_str()),
+                bumpable: !t.mixed_inputs, // CHANGE 2: a mixed sweep can't RBF (see TxRecord.mixed_inputs)
             },
         ));
     }
@@ -2242,6 +2298,170 @@ fn apply_act_bump_results(w: &AppWindow, st: &mut State) {
     }
     update_activity(w, st);
     update_home(w, st);
+}
+
+// ---- CHANGE 4: async wallet-tx broadcast (2026-07-17) ----
+//
+// consolidate / sweep / wallet-consolidate / psbt-broadcast all build+sign
+// synchronously (fast, no network) exactly as before; only the
+// `client.broadcast()` POST moves to a worker thread — the part that used
+// to visibly freeze the confirm button on a slow connection. Each flow's
+// `apply_*_result` replays its EXACT pre-existing Ok/Err bookkeeping, once,
+// from the worker's result, via the shared `apply-pending-wallet-tx`
+// trampoline (`apply_pending_wallet_tx_results` drains every queue) — same
+// shape as `apply_compose_results`. `State.wallet_tx_busy` is the shared
+// re-entrancy guard; every entry point returns early when it's set.
+
+/// Non-`result` half of [`SweepBroadcastResult`] — built on the UI thread
+/// before spawning (owns everything the apply side needs), moved into the
+/// worker, then wrapped with the real broadcast result and pushed.
+struct SweepSnapshot {
+    /// The active notebook's address at spawn time — if it no longer
+    /// matches on the apply side (identity/account/notebook switched
+    /// mid-flight), the tx is already on-chain but its bookkeeping is
+    /// dropped (logged `stale-drop`) rather than misapplied to the WRONG
+    /// store; the next refresh's UTXO scan still reconciles balances.
+    identity_addr: String,
+    dest: String,
+    dest_spk_hex: String,
+    value: u64,
+    fee: u64,
+    vsize: u64,
+    raw_hex: String,
+    /// Per-notebook lock list: (notebook index, [(txid display-hex, vout)]).
+    notebook_locks: Vec<(u32, Vec<(String, u32)>)>,
+    all_inputs: Vec<app_core::store::TxInput>,
+    /// Empty for a MIXED sweep (`TxRecord.mixed_inputs` — CHANGE 2): no
+    /// per-input owner scheme covers both input kinds, so a mixed record
+    /// can't be bumped either.
+    input_indexes: Vec<u32>,
+    mixed: bool,
+    /// CHANGE 2: spending-wallet coins that rode as inputs — pruned from
+    /// the runtime cache and re-scanned on success.
+    spending_spent: Vec<(String, u32)>,
+    /// Sweeping notebook funds INTO the spending wallet's next receive
+    /// address (`on_spending_sweep_here`) — marked used on success.
+    pending_spending_sweep_index: Option<u32>,
+    notebooks_n: usize,
+}
+
+struct SweepBroadcastResult {
+    snap: SweepSnapshot,
+    result: Result<String, String>,
+}
+static SWEEP_BROADCAST_RESULTS: std::sync::Mutex<Vec<SweepBroadcastResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn apply_sweep_broadcast_result(w: &AppWindow, st: &mut State, r: SweepBroadcastResult) {
+    let snap = r.snap;
+    if st.ident.as_ref().map(|i| i.address.as_str()) != Some(snap.identity_addr.as_str()) {
+        println!("cb: sweep stale-drop");
+        return;
+    }
+    match r.result {
+        Ok(txid) => {
+            for (index, coins) in &snap.notebook_locks {
+                let active = st.ident.as_ref().map(|i| i.index) == Some(*index);
+                let mark = |store: &mut Store| {
+                    for (txid_hex, vout) in coins {
+                        if let Some(l) =
+                            store.utxos.iter_mut().find(|l| &l.txid == txid_hex && l.vout == *vout)
+                        {
+                            l.pending_spend = true;
+                        }
+                    }
+                };
+                if active {
+                    if let Some(store) = st.store.as_mut() {
+                        mark(store);
+                    }
+                } else if let Some(mut store) = notebook_store(st, *index) {
+                    mark(&mut store);
+                    if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == *index) {
+                        let _ = store.save(&st.store_path_for(fp8));
+                    }
+                }
+            }
+            if let Some(store) = st.store.as_mut() {
+                store.record_tx(
+                    "sweep",
+                    txid.clone(),
+                    snap.value,
+                    snap.fee,
+                    snap.vsize,
+                    snap.raw_hex.clone(),
+                    snap.dest.clone(),
+                    snap.all_inputs.clone(),
+                    snap.dest_spk_hex.clone(),
+                    now(),
+                );
+                if let Some(rec) = store.txs.last_mut() {
+                    rec.input_indexes = snap.input_indexes.clone();
+                    rec.mixed_inputs = snap.mixed;
+                }
+            }
+            if let Some(idx) = snap.pending_spending_sweep_index {
+                st.pending_spending_sweep_index = None;
+                if let (Some(src), Some(store)) = (st.spending_source.clone(), st.store.as_mut()) {
+                    if let Ok(addr) = src.derive(0, idx) {
+                        store.spending_mark_used(SpendingAddr {
+                            chain: 0,
+                            index: idx,
+                            address: addr.address,
+                            script_pubkey_hex: hex::encode(&addr.spk),
+                        });
+                    }
+                }
+                st.save_spending();
+            }
+            let spending_n = snap.spending_spent.len();
+            if spending_n > 0 {
+                st.spending_coins.retain(|c| {
+                    !snap.spending_spent.iter().any(|(t, v)| t == &c.txid && *v == c.vout)
+                });
+                update_spending_ui(w, st);
+                spending_refresh_async(w, st);
+            }
+            st.save_store();
+            println!(
+                "cb: sweep txid={txid} value={} fee={} notebooks={}{}",
+                snap.value,
+                snap.fee,
+                snap.notebooks_n,
+                if spending_n > 0 { format!(" spending={spending_n}") } else { String::new() }
+            );
+            w.set_status(
+                format!(
+                    "swept the wallet — {} sats to {}…",
+                    commas(snap.value),
+                    &snap.dest[..14.min(snap.dest.len())]
+                )
+                .into(),
+            );
+            update_notebook_list(w, st);
+            w.set_screen(17); // wallet-level flow → the list
+        }
+        Err(e) => {
+            println!("cb: sweep broadcast err={e}");
+            w.set_status(format!("sweep broadcast failed: {e}").into());
+        }
+    }
+}
+
+/// Drains the CHANGE-4 wallet-tx result queues and applies each on the UI
+/// thread — the shared `apply-pending-wallet-tx` trampoline target. Also
+/// clears the shared busy flag.
+fn apply_pending_wallet_tx_results(w: &AppWindow, st: &mut State) {
+    let sweep: Vec<SweepBroadcastResult> =
+        SWEEP_BROADCAST_RESULTS.lock().expect("sweep broadcast results mutex").drain(..).collect();
+    if sweep.is_empty() {
+        return;
+    }
+    st.wallet_tx_busy = false;
+    w.set_wallet_tx_busy(false);
+    for r in sweep {
+        apply_sweep_broadcast_result(w, st, r);
+    }
 }
 
 // ---- Async compose send (2026-07-16) ----
@@ -4287,6 +4507,7 @@ pub fn run() {
         compose_busy: false,
         act_pending_ref: None,
         payfrom_manual: false,
+        wallet_tx_busy: false,
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -4894,6 +5115,12 @@ pub fn run() {
         apply_act_bump_results(&w, &mut s);
     });
 
+    // Trampoline: an async consolidate/sweep/wallet-consolidate/psbt
+    // broadcast (CHANGE 4) finished on a worker thread.
+    cb!(on_apply_pending_wallet_tx, |w, s| {
+        apply_pending_wallet_tx_results(&w, &mut s);
+    });
+
     // Trampoline: a finished spending-wallet scan (funding-unification M3)
     // landed — same pattern as apply-pending-refresh.
     cb!(on_apply_pending_spending_refresh, |w, s| {
@@ -5133,6 +5360,13 @@ pub fn run() {
             return;
         }
         let Some(store) = &s.store else { return };
+        // CHANGE 2 defense-in-depth: the UI already hides Speed-up for a
+        // mixed record (`ActivityItem.bumpable`), but refuse here too
+        // rather than trust the tap origin.
+        if !is_note && store.txs.iter().any(|t| t.txids.iter().any(|x| x == ref_id.as_str()) && t.mixed_inputs) {
+            w.set_status("this sweep mixed notebook + spending coins — it can't be sped up (rebroadcast still works)".into());
+            return;
+        }
         let Some((old_rate, fee, vsize)) = tx_rate(store, ref_id.as_str(), is_note) else {
             w.set_status("can't determine current fee rate".into());
             return;
@@ -5192,6 +5426,13 @@ pub fn run() {
         let Some(base) = s.base_url() else { return };
         if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
             watch_bump_confirm(&w, &mut s, new_rate);
+            return;
+        }
+        // CHANGE 2 defense-in-depth (see on_act_bump_open).
+        if !is_note
+            && s.store.as_ref().map(|st| st.txs.iter().any(|t| t.txids.iter().any(|x| x == &ref_id) && t.mixed_inputs)).unwrap_or(false)
+        {
+            w.set_bump_error("this sweep mixed notebook + spending coins — it can't be sped up".into());
             return;
         }
         let min_rate = match s.store.as_ref().and_then(|st| tx_rate(st, &ref_id, is_note)) {
@@ -5382,6 +5623,9 @@ pub fn run() {
 
     cb!(on_sweep, |w, s| {
         w.set_show_sweep_confirm(false);
+        if s.wallet_tx_busy {
+            return;
+        }
         let dest = w.get_sweep_dest().to_string();
         let rate: f64 = w.get_sweep_rate().trim().parse().unwrap_or(1.0);
         let net = s.network;
@@ -5415,11 +5659,23 @@ pub fn run() {
                 idents.push((m.index, full, coins));
             }
         }
-        if idents.is_empty() {
+        // CHANGE 2: gather the spending wallet's coins too — UNLESS this
+        // sweep's destination IS the spending wallet's own next receive
+        // address (`on_spending_sweep_here`), where including them would
+        // sweep the spending wallet into itself.
+        let spending_coins_for_sweep: Vec<FundingUtxo> = if s.pending_spending_sweep_index.is_none()
+            && s.spending_capable
+            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
+        {
+            s.spending_coins.clone()
+        } else {
+            Vec::new()
+        };
+        if idents.is_empty() && spending_coins_for_sweep.is_empty() {
             w.set_status("nothing to sweep".into());
             return;
         }
-        let all_inputs: Vec<app_core::store::TxInput> = idents
+        let mut all_inputs: Vec<app_core::store::TxInput> = idents
             .iter()
             .flat_map(|(_, _, coins)| coins.iter())
             .map(|u| {
@@ -5428,116 +5684,106 @@ pub fn run() {
                 app_core::store::TxInput { txid: hex::encode(t), vout: u.vout, value: u.value }
             })
             .collect();
-        let dest_spk_hex = hex::encode(&recipient.spk);
-        let sources: Vec<app_core::notes_core::tx::SweepSource> = idents
+        let notebook_locks: Vec<(u32, Vec<(String, u32)>)> = idents
             .iter()
-            .map(|(_, id, coins)| app_core::notes_core::tx::SweepSource {
-                utxos: coins,
-                output_x: id.output_x,
-                tweaked_seckey: &id.tweaked_seckey,
+            .map(|(index, _, coins)| {
+                (
+                    *index,
+                    coins
+                        .iter()
+                        .map(|u| {
+                            let mut t = u.txid;
+                            t.reverse();
+                            (hex::encode(t), u.vout)
+                        })
+                        .collect(),
+                )
             })
             .collect();
-        let sweep = app_core::notes_core::tx::build_sweep_tx_multi(
-            &sources,
-            recipient.spk,
-            rate,
-            app_core::notes_core::keys::generate_aux_rand,
-        );
+        let dest_spk_hex = hex::encode(&recipient.spk);
+        let mixed = !spending_coins_for_sweep.is_empty();
+        // Mixed record: no per-input owner scheme covers both notebook and
+        // spending-wallet inputs, so it can't be RBF-bumped — see CHANGE 2
+        // / TxRecord.mixed_inputs. A pure-notebook sweep keeps its owners
+        // (bumpable, unchanged).
+        let input_indexes: Vec<u32> = if mixed {
+            Vec::new()
+        } else {
+            idents.iter().flat_map(|(a, _, coins)| std::iter::repeat(*a).take(coins.len())).collect()
+        };
+        let spending_spent: Vec<(String, u32)> =
+            spending_coins_for_sweep.iter().map(|c| (c.txid.clone(), c.vout)).collect();
+        if mixed {
+            all_inputs.extend(
+                spending_coins_for_sweep
+                    .iter()
+                    .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value }),
+            );
+        }
+        let sweep: Result<app_core::notes_core::tx::NoteTx, String> = if mixed {
+            let notebook_sources: Vec<app_core::mixed::NotebookSweepSource> = idents
+                .iter()
+                .map(|(_, id, coins)| app_core::mixed::NotebookSweepSource {
+                    output_x: id.output_x,
+                    tweaked_seckey: &id.tweaked_seckey,
+                    utxos: coins,
+                })
+                .collect();
+            app_core::mixed::build_wallet_sweep_mixed(
+                &notebook_sources,
+                Some((&material, net, s.account, &spending_coins_for_sweep)),
+                recipient.spk.clone(),
+                rate,
+            )
+            .map_err(|e| format!("{e}"))
+        } else {
+            let sources: Vec<app_core::notes_core::tx::SweepSource> = idents
+                .iter()
+                .map(|(_, id, coins)| app_core::notes_core::tx::SweepSource {
+                    utxos: coins,
+                    output_x: id.output_x,
+                    tweaked_seckey: &id.tweaked_seckey,
+                })
+                .collect();
+            app_core::notes_core::tx::build_sweep_tx_multi(
+                &sources,
+                recipient.spk.clone(),
+                rate,
+                app_core::notes_core::keys::generate_aux_rand,
+            )
+            .map_err(|e| format!("{e}"))
+        };
         match sweep {
             Ok(tx) => {
-                let client = ChainClient::new(HttpTransport::new(base), net);
-                match client.broadcast(&tx.raw_hex) {
-                    Ok(txid) => {
-                        // Lock every source's inputs; the record lives in the
-                        // ACTIVE notebook's store (Activity is wallet-wide).
-                        for (index, _, coins) in &idents {
-                            let active = s.ident.as_ref().map(|i| i.index) == Some(*index);
-                            let mark = |store: &mut Store| {
-                                for u in coins {
-                                    let mut t = u.txid;
-                                    t.reverse();
-                                    let txid_hex = hex::encode(t);
-                                    if let Some(l) = store
-                                        .utxos
-                                        .iter_mut()
-                                        .find(|l| l.txid == txid_hex && l.vout == u.vout)
-                                    {
-                                        l.pending_spend = true;
-                                    }
-                                }
-                            };
-                            if active {
-                                if let Some(store) = s.store.as_mut() {
-                                    mark(store);
-                                }
-                            } else if let Some(mut store) = notebook_store(&s, *index) {
-                                mark(&mut store);
-                                if let Some((_, _, fp8)) =
-                                    s.nb_addrs.iter().find(|(a, ..)| *a == *index)
-                                {
-                                    let _ = store.save(&s.store_path_for(fp8));
-                                }
-                            }
-                        }
-                        let input_indexes: Vec<u32> = idents
-                            .iter()
-                            .flat_map(|(a, _, coins)| std::iter::repeat(*a).take(coins.len()))
-                            .collect();
-                        if let Some(store) = s.store.as_mut() {
-                            store.record_tx(
-                                "sweep",
-                                txid.clone(),
-                                tx.tx.outputs[0].value,
-                                tx.fee,
-                                tx.vsize as u64,
-                                tx.raw_hex.clone(),
-                                dest.clone(),
-                                all_inputs,
-                                dest_spk_hex,
-                                now(),
-                            );
-                            if let Some(rec) = store.txs.last_mut() {
-                                rec.input_indexes = input_indexes;
-                            }
-                        }
-                        // Funding-unification M3: this sweep's destination was
-                        // the spending wallet's next receive address — mark it
-                        // used so the NEXT sweep/compose hands out a fresh one.
-                        if let Some(idx) = s.pending_spending_sweep_index.take() {
-                            if let (Some(src), Some(store)) =
-                                (s.spending_source.clone(), s.store.as_mut())
-                            {
-                                if let Ok(addr) = src.derive(0, idx) {
-                                    store.spending_mark_used(SpendingAddr {
-                                        chain: 0,
-                                        index: idx,
-                                        address: addr.address,
-                                        script_pubkey_hex: hex::encode(&addr.spk),
-                                    });
-                                }
-                            }
-                            s.save_spending();
-                        }
-                        s.save_store();
-                        println!(
-                            "cb: sweep txid={txid} value={} fee={} notebooks={}",
-                            tx.tx.outputs[0].value,
-                            tx.fee,
-                            idents.len()
-                        );
-                        w.set_status(
-                            format!(
-                                "swept the wallet — {} sats to {}…",
-                                commas(tx.tx.outputs[0].value),
-                                &dest[..14.min(dest.len())]
-                            )
-                            .into(),
-                        );
-                        update_notebook_list(&w, &s);
-                        w.set_screen(17); // wallet-level flow → the list
-                    }
-                    Err(e) => w.set_status(format!("sweep broadcast failed: {e}").into()),
-                }
+                let snap = SweepSnapshot {
+                    identity_addr: s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default(),
+                    dest: dest.clone(),
+                    dest_spk_hex,
+                    value: tx.tx.outputs[0].value,
+                    fee: tx.fee,
+                    vsize: tx.vsize as u64,
+                    raw_hex: tx.raw_hex.clone(),
+                    notebook_locks,
+                    all_inputs,
+                    input_indexes,
+                    mixed,
+                    spending_spent,
+                    pending_spending_sweep_index: s.pending_spending_sweep_index,
+                    notebooks_n: idents.len(),
+                };
+                s.wallet_tx_busy = true;
+                w.set_wallet_tx_busy(true);
+                let raw = tx.raw_hex.clone();
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    SWEEP_BROADCAST_RESULTS
+                        .lock()
+                        .expect("sweep broadcast results mutex")
+                        .push(SweepBroadcastResult { snap, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+                });
             }
             Err(e) => w.set_status(format!("sweep: {e}").into()),
         }
