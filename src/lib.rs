@@ -1526,6 +1526,86 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
     w.set_contacts(VecModel::from_slice(&contacts));
 }
 
+/// The ONE sanctioned recipient-setting path for normal (non-sweep) compose:
+/// validates/normalizes `addr`, saves it to contacts (creates-if-absent +
+/// bumps recency), refreshes recents, sets `to-label`/`to-address`/
+/// `directed`, resets every compose-session field (fee tier, coin
+/// selection, change choice, gift amount, pay-from default), and lands on
+/// screen 6. Shared by the normal contact picker (`on_pick_contact`) and
+/// Reply (`on_reply_to_note`) so both go through identical logic.
+fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
+    if addr == "self" {
+        st.to_address = None;
+        w.set_to_label("To: Self (my notebook)".into());
+        w.set_directed(false);
+        println!("cb: pick-contact to=self");
+    } else {
+        let mut a = normalize_addr(addr);
+        if Recipient::parse(st.network, &a).is_err() {
+            let lower = a.to_lowercase();
+            if Recipient::parse(st.network, &lower).is_ok() {
+                a = lower;
+            } else {
+                println!("cb: pick-contact err=bad-address");
+                w.set_status(format!("not a valid {} address", st.network.as_str()).into());
+                return;
+            }
+        }
+        println!("cb: pick-contact to={a}");
+        if let Some(store) = &mut st.store {
+            store.touch_contact(&a);
+        }
+        st.save_store();
+        // Rebuild the recents now so the address is in the list when the
+        // user presses Back from compose.
+        refresh_contacts(w, st);
+        w.set_to_label(format!("To: {a}").into());
+        st.to_address = Some(a);
+        w.set_directed(true);
+    }
+    let rate = st.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+    if st.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+        w.set_compose_private(false); // no sealing key on this device
+    }
+    w.set_fee_tier(1);
+    w.set_rate_text(format!("{rate}").into());
+    w.set_change_address("".into());
+    w.set_change_expanded(false);
+    w.set_spend_expanded(false);
+    st.coins_overridden = false;
+    st.consolidate_coins = false;
+    w.set_coin_strategy(0);
+    w.set_gift_sats(format!("{DUST_SATS}").into());
+    w.set_gift_expanded(false);
+    st.selected_coins.clear();
+    w.set_status("".into());
+    w.set_payfrom_expanded(false);
+    // Funding-unification UI rework: fresh compose session, fresh
+    // cross-wallet coin memory + change pick (an explicit change choice
+    // from a PRIOR note must never leak into this one).
+    st.mixed_selected.clear();
+    st.change_choice.clear();
+    w.set_change_choice("".into());
+    // Funding-unification: default to the spending wallet ONLY when the
+    // setting is on AND it actually has spendable balance (Sal
+    // 2026-07-16) — an enabled-but-empty spending wallet still defaults
+    // to Notebook. Balance is whatever's cached this session; an
+    // unscanned wallet reads as 0 and falls through to Notebook too
+    // (never guess a positive balance we haven't confirmed). A watch
+    // identity has no spending wallet at all.
+    let spending_balance: u64 = st.spending_coins.iter().map(|c| c.value).sum();
+    let spending_default = st.spending_capable
+        && !st.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false)
+        && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false)
+        && spending_balance > 0;
+    let default_source = if spending_default { "spending" } else { "notebook" };
+    st.payfrom_expanded_source = default_source.to_string();
+    w.set_payfrom_expanded_source(default_source.into());
+    apply_pay_from(w, st, default_source);
+    w.set_screen(6);
+    refresh_compose(w, st);
+}
+
 /// Deliberate notebook creation for receive `index` of the ACTIVE
 /// account: add it to the index file (if missing), persist, and extend
 /// the address cache. The ONLY entry points are user intent — the create
@@ -4832,6 +4912,8 @@ pub fn run() {
             w.set_note_view_id(n.note_id.clone().into());
             w.set_note_pending(n.status == NoteStatus::Pending && n.raw_hex.is_some());
             w.set_note_txid(n.txids.last().cloned().unwrap_or_default().into());
+            let reply_addr = if n.received { n.sender.clone().unwrap_or_default() } else { String::new() };
+            w.set_note_reply_address(reply_addr.into());
             let web = match s.network {
                 Network::Regtest => String::new(),
                 net => {
@@ -5905,76 +5987,18 @@ pub fn run() {
             set_sweep_dest(&w, &mut s, a);
             return;
         }
-        if addr.as_str() == "self" {
-            s.to_address = None;
-            w.set_to_label("To: Self (my notebook)".into());
-            w.set_directed(false);
-            println!("cb: pick-contact to=self");
-        } else {
-            let mut a = normalize_addr(addr.as_str());
-            if Recipient::parse(s.network, &a).is_err() {
-                let lower = a.to_lowercase();
-                if Recipient::parse(s.network, &lower).is_ok() {
-                    a = lower;
-                } else {
-                    println!("cb: pick-contact err=bad-address");
-                    w.set_status(format!("not a valid {} address", s.network.as_str()).into());
-                    return;
-                }
-            }
-            println!("cb: pick-contact to={a}");
-            if let Some(store) = &mut s.store {
-                store.touch_contact(&a);
-            }
-            s.save_store();
-            // Rebuild the recents now so the address is in the list when the
-            // user presses Back from compose.
-            refresh_contacts(&w, &s);
-            w.set_to_label(format!("To: {a}").into());
-            s.to_address = Some(a);
-            w.set_directed(true);
+        w.set_compose_return(7);
+        pick_contact_core(&w, &mut s, addr.as_str());
+    });
+
+    cb!(on_reply_to_note, |w, s| {
+        let addr = w.get_note_reply_address().to_string();
+        if addr.is_empty() {
+            return;
         }
-        let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
-        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
-            w.set_compose_private(false); // no sealing key on this device
-        }
-        w.set_fee_tier(1);
-        w.set_rate_text(format!("{rate}").into());
-        w.set_change_address("".into());
-        w.set_change_expanded(false);
-        w.set_spend_expanded(false);
-        s.coins_overridden = false;
-        s.consolidate_coins = false;
-        w.set_coin_strategy(0);
-        w.set_gift_sats(format!("{DUST_SATS}").into());
-        w.set_gift_expanded(false);
-        s.selected_coins.clear();
-        w.set_status("".into());
-        w.set_payfrom_expanded(false);
-        // Funding-unification UI rework: fresh compose session, fresh
-        // cross-wallet coin memory + change pick (an explicit change choice
-        // from a PRIOR note must never leak into this one).
-        s.mixed_selected.clear();
-        s.change_choice.clear();
-        w.set_change_choice("".into());
-        // Funding-unification: default to the spending wallet ONLY when the
-        // setting is on AND it actually has spendable balance (Sal
-        // 2026-07-16) — an enabled-but-empty spending wallet still defaults
-        // to Notebook. Balance is whatever's cached this session; an
-        // unscanned wallet reads as 0 and falls through to Notebook too
-        // (never guess a positive balance we haven't confirmed). A watch
-        // identity has no spending wallet at all.
-        let spending_balance: u64 = s.spending_coins.iter().map(|c| c.value).sum();
-        let spending_default = s.spending_capable
-            && !s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false)
-            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
-            && spending_balance > 0;
-        let default_source = if spending_default { "spending" } else { "notebook" };
-        s.payfrom_expanded_source = default_source.to_string();
-        w.set_payfrom_expanded_source(default_source.into());
-        apply_pay_from(&w, &mut s, default_source);
-        w.set_screen(6);
-        refresh_compose(&w, &mut s);
+        println!("cb: reply to={addr}");
+        w.set_compose_return(5);
+        pick_contact_core(&w, &mut s, &addr);
     });
 
     {

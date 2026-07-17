@@ -1231,6 +1231,7 @@ export component AppWindow inherits Window {
     in-out property <string> note-view-id;
     in property <bool> note-pending;
     in property <string> note-txid;
+    in property <string> note-reply-address;   // sender address, only when this note is RECEIVED with a known sender; "" hides Reply
 
     in property <string> to-label;
     in-out property <string> compose-text;
@@ -1425,6 +1426,9 @@ export component AppWindow inherits Window {
     in-out property <string> sweep-kind: "sweep";
     // Which screen the funding-wallet manager returns to (6 compose, 16 sweep).
     in-out property <int> funding-return: 6;
+    // Where compose (screen 6) returns on back: 7 = picker (default/normal
+    // flow), 5 = note view (opened via Reply).
+    in-out property <int> compose-return: 7;
 
     callback door-import();
     callback door-create(int);
@@ -1446,6 +1450,7 @@ export component AppWindow inherits Window {
     callback open-note(string);
     callback open-note-web-url(string);
     callback open-note-web();
+    callback reply-to-note();
     callback copy-text(string, string);
     callback set-fee-tier(int);
     callback sweep();
@@ -1648,7 +1653,7 @@ export component AppWindow inherits Window {
             // message belonged to this screen.
             root.contact-input = "";
             root.status = "";
-            root.screen = 7;
+            root.screen = root.compose-return;
             return true;
         }
         if (root.screen == 7) {
@@ -2363,6 +2368,10 @@ export component AppWindow inherits Window {
         if root.note-web-url != "": GhostButton {
             text: "Open in web viewer";
             clicked => { root.open-note-web(); }
+        }
+        if root.note-reply-address != "": GhostButton {
+            text: "Reply";
+            clicked => { root.reply-to-note(); }
         }
         Caption { text: root.status; }
         if root.note-web-url == "": Caption {
