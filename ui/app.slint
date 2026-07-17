@@ -2814,7 +2814,10 @@ export component AppWindow inherits Window {
             subtitle: root.coins-summary;
             GhostButton {
                 text: "View wallet coins…";
-                clicked => { root.open-coins(); }
+                // This card summarizes NOTEBOOK coins, so always land on that
+                // segment — without the reset, arriving after the spending
+                // card's "View in Coins…" kept the spending segment active.
+                clicked => { root.coins-segment = "notebook"; root.open-coins(); }
             }
         }
         if root.spending-capable: SettingsCard {
