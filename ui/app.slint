@@ -3253,11 +3253,16 @@ export component AppWindow inherits Window {
                             if a.replaced != "": Badge { label: a.replaced; tint: Pal.faint; }
                             Badge {
                                 label: a.status;
+                                // Task #14: "dropped" reads as amber, same
+                                // warn tint "pending" uses (it's still a
+                                // pending record — the tx just genuinely
+                                // evaporated; Bump/Rebroadcast still work).
                                 tint: a.status == "confirmed" ? Pal.good
-                                    : (a.status == "pending" ? Pal.warn : Pal.bad);
+                                    : ((a.status == "pending" || a.status == "dropped") ? Pal.warn : Pal.bad);
                             }
                         }
                         Body { text: a.title; font-size: 12px; overflow: elide; }
+                        if a.status == "dropped": Caption { text: "dropped — bump fee to retry"; color: Pal.warn; }
                         Caption { text: a.fee-line; }
                         HorizontalLayout {
                             spacing: 6px;

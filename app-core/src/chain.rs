@@ -24,6 +24,20 @@ pub trait Transport {
     fn post_text(&self, path: &str, body: String) -> Result<String, Error>;
 }
 
+/// Task #14 (dropped-pending detection): the outcome of a `/tx/:txid`
+/// lookup, kept distinct from a plain `Option` so a definitive "no such
+/// tx" (esplora 404) can never be confused with "couldn't tell" (network
+/// error, non-404 status, bad body) — see [`ChainClient::tx_lookup_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxLookupStatus {
+    /// The node has it — Some(confirmed-in-a-block?).
+    Found(bool),
+    /// The node definitively has no record of this txid.
+    NotFound,
+    /// Anything else — never grounds for a dropped verdict.
+    Unknown,
+}
+
 /// mempool.space bases per network. Regtest has no public instance —
 /// callers supply a custom base (companion/server.py shape) instead.
 pub fn default_base(network: Network) -> Option<&'static str> {
@@ -363,6 +377,43 @@ impl<T: Transport> ChainClient<T> {
     /// Raw hex of an on-chain/mempool tx — the keyless rebroadcast source.
     pub fn fetch_tx_hex(&self, txid: &str) -> Result<String, Error> {
         Ok(self.transport.get_text(&format!("/tx/{txid}/hex"))?.trim().to_string())
+    }
+
+    /// Task #14 (dropped-pending detection): unlike [`Self::fetch_tx_status`]
+    /// — which collapses "definitely doesn't exist" and "transient network
+    /// error" into the same `None` — this distinguishes them, since a
+    /// dropped-tx verdict must NEVER be based on a mere hiccup. `NotFound`
+    /// requires a definitive esplora 404 (what real mempool.space/esplora
+    /// returns for an unknown txid); anything else — a non-404 error status,
+    /// a connection failure, an unparseable body — is `Unknown` and must
+    /// leave the caller's state untouched. (companion/server.py's regtest
+    /// shim currently answers an unknown txid with a 400 carrying the raw
+    /// bitcoind RPC error, not a 404 — so `NotFound` is reachable against
+    /// real esplora/mempool.space but not through the local shim; see the
+    /// e2e suite's dropped-tx leg, which therefore stays host-unit-test-only.)
+    pub fn tx_lookup_status(&self, txid: &str) -> TxLookupStatus {
+        match self.transport.get_text(&format!("/tx/{txid}")) {
+            Ok(text) => match parse_json::<EsploraTx>(&text) {
+                Ok(t) => TxLookupStatus::Found(t.status.confirmed),
+                Err(_) => TxLookupStatus::Unknown,
+            },
+            Err(Error::Http(msg)) if msg.trim_start().starts_with("404") => TxLookupStatus::NotFound,
+            Err(_) => TxLookupStatus::Unknown,
+        }
+    }
+
+    /// Task #14: is this specific outpoint still sitting spendable at
+    /// `address`? Backs the dropped-tx detector's second condition — a
+    /// `NotFound` tx whose funding coin is STILL unspent means the
+    /// broadcast never really took (as opposed to Orphaned, where the coin
+    /// was spent by something else). Uses the same `/address/:a/utxo`
+    /// endpoint `Self::utxos` already calls (esplora-shape already
+    /// supported by both real esplora and companion/server.py — no new
+    /// endpoint needed). `None` on a transport/parse failure — the caller
+    /// must treat that as "don't know", not "unspent".
+    pub fn outpoint_unspent(&self, address: &str, txid: &str, vout: u32) -> Option<bool> {
+        let utxos = self.utxos(address).ok()?;
+        Some(utxos.iter().any(|u| u.txid == txid && u.vout == vout))
     }
 
     /// Real confirmation status of a txid: Some(true) = in a block,
@@ -872,5 +923,90 @@ mod tests {
         let tx2: EsploraTx = serde_json::from_str(&json_hex).unwrap();
         let onchain2 = classify_tx_net(&tx2, "not-our-address", Network::Regtest).unwrap();
         assert_eq!(onchain2.input_prevout_spks, vec![spk_hex]);
+    }
+
+    // ---- task #14: dropped-pending detection — tx_lookup_status /
+    // outpoint_unspent (the ChainClient half; the pure state machine that
+    // consumes them, `store::resolve_dropped`, is tested in store.rs). ----
+
+    /// Canned `/tx/:txid` transport: a 404 (real-esplora "definitely no
+    /// such tx"), a non-404 error (transient), and a found tx, keyed by
+    /// txid. `/address/:a/utxo` answers from a fixed outpoint list.
+    struct TxLookupTransport {
+        found_confirmed: Option<bool>, // Some(confirmed) for txid "found"
+        utxos: Vec<(&'static str, u32)>, // (txid, vout) pairs deemed unspent
+    }
+
+    impl Transport for TxLookupTransport {
+        fn get_text(&self, path: &str) -> Result<String, Error> {
+            if path == "/tx/found" {
+                let confirmed = self.found_confirmed.expect("found_confirmed must be set");
+                return Ok(format!(
+                    r#"{{"txid":"found","vin":[],"vout":[],"status":{{"confirmed":{confirmed}}}}}"#
+                ));
+            }
+            if path == "/tx/missing" {
+                return Err(Error::Http("404 Not Found: Transaction not found".into()));
+            }
+            if path == "/tx/flaky" {
+                return Err(Error::Http("connection reset".into()));
+            }
+            if path == "/tx/bad-status" {
+                // A non-404 HTTP error must NOT read as NotFound.
+                return Err(Error::Http("500 Internal Server Error: oops".into()));
+            }
+            if path.starts_with("/address/") && path.ends_with("/utxo") {
+                let items: Vec<String> = self
+                    .utxos
+                    .iter()
+                    .map(|(t, v)| {
+                        format!(
+                            r#"{{"txid":"{t}","vout":{v},"value":1000,"status":{{"confirmed":true,"block_height":1}}}}"#
+                        )
+                    })
+                    .collect();
+                return Ok(format!("[{}]", items.join(",")));
+            }
+            Err(Error::Http(format!("unexpected path: {path}")))
+        }
+        fn post_text(&self, _path: &str, _body: String) -> Result<String, Error> {
+            unreachable!("dropped-detection never POSTs")
+        }
+    }
+
+    #[test]
+    fn tx_lookup_status_distinguishes_found_notfound_unknown() {
+        let client = ChainClient::new(
+            TxLookupTransport { found_confirmed: Some(true), utxos: vec![] },
+            Network::Regtest,
+        );
+        assert_eq!(client.tx_lookup_status("found"), TxLookupStatus::Found(true));
+        assert_eq!(client.tx_lookup_status("missing"), TxLookupStatus::NotFound);
+        // A transport-level failure (no HTTP status at all) is Unknown, not
+        // NotFound — a dropped verdict must never come from a network blip.
+        assert_eq!(client.tx_lookup_status("flaky"), TxLookupStatus::Unknown);
+        // A definite HTTP error that ISN'T a 404 is also Unknown, never
+        // NotFound — only a real esplora 404 counts as definitive.
+        assert_eq!(client.tx_lookup_status("bad-status"), TxLookupStatus::Unknown);
+    }
+
+    #[test]
+    fn tx_lookup_status_found_reports_mempool_vs_confirmed() {
+        let client = ChainClient::new(
+            TxLookupTransport { found_confirmed: Some(false), utxos: vec![] },
+            Network::Regtest,
+        );
+        assert_eq!(client.tx_lookup_status("found"), TxLookupStatus::Found(false));
+    }
+
+    #[test]
+    fn outpoint_unspent_checks_the_address_utxo_set() {
+        let client = ChainClient::new(
+            TxLookupTransport { found_confirmed: None, utxos: vec![("aa", 0), ("bb", 1)] },
+            Network::Regtest,
+        );
+        assert_eq!(client.outpoint_unspent("addr1", "aa", 0), Some(true));
+        assert_eq!(client.outpoint_unspent("addr1", "aa", 1), Some(false));
+        assert_eq!(client.outpoint_unspent("addr1", "cc", 0), Some(false));
     }
 }

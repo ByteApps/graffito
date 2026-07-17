@@ -18,6 +18,7 @@ use std::rc::Rc;
 use app_core::bitcoin;
 use app_core::chain::{
     default_base, explorer_presets, explorer_tx_url, node_presets, ChainClient, HttpTransport,
+    TxLookupStatus,
 };
 use app_core::compose::{compose_and_record, ComposeRequest};
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
@@ -628,6 +629,7 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
             change_to: None,
             gift_amount: wn.recipient.is_some().then_some(wn.gift),
             funded_by: wn.funded.clone(),
+            dropped: false,
         },
         change,
     );
@@ -1242,6 +1244,11 @@ fn update_activity(w: &AppWindow, st: &State) {
             }
         );
         let status = match n.status {
+            // Task #14: a dropped PENDING note renders distinctly (amber
+            // "dropped — bump fee to retry" in the UI) — Bump/Rebroadcast
+            // stay available exactly like an ordinary pending row (`pending`
+            // below is unaffected by `dropped`).
+            NoteStatus::Pending if n.dropped => "dropped",
             NoteStatus::Pending => "pending",
             NoteStatus::Confirmed => "confirmed",
             NoteStatus::Orphaned => "orphaned",
@@ -1271,6 +1278,8 @@ fn update_activity(w: &AppWindow, st: &State) {
     for t in &store.txs {
         let Some(txid) = t.txids.last() else { continue };
         let status = match t.status {
+            // Task #14 — see the identical note-row rule above.
+            NoteStatus::Pending if t.dropped => "dropped",
             NoteStatus::Pending => "pending",
             NoteStatus::Confirmed => "confirmed",
             NoteStatus::Orphaned => "orphaned",
@@ -2213,9 +2222,94 @@ struct RefreshResult {
     /// existed at snapshot time — fetched on the worker so
     /// resolve_spend_statuses never blocks the UI thread.
     statuses: Vec<(String, Option<bool>)>,
+    /// Task #14 (dropped-pending detection): every PENDING record's
+    /// (notes AND sweep/consolidate) CURRENT-txid lookup result, gathered
+    /// on the worker thread alongside `statuses` — see
+    /// [`gather_dropped_checks`] / [`fetch_dropped_checks`].
+    dropped_lookup: HashMap<String, TxLookupStatus>,
+    /// Populated only for entries whose lookup came back `NotFound` —
+    /// keyed by the record's first spent input (txid, vout).
+    dropped_unspent: HashMap<(String, u32), bool>,
 }
 
 static REFRESH_RESULTS: std::sync::Mutex<Vec<RefreshResult>> = std::sync::Mutex::new(Vec::new());
+
+/// Task #14: one PENDING record's dropped-check inputs, snapshotted on the
+/// UI thread (cheap field reads) before handing off to a worker that does
+/// the actual HTTP round trips. `current_txid` is the record's LATEST txid
+/// (an RBF bump supersedes the original — only the current attempt going
+/// missing counts as "dropped"); `first_input` is what
+/// `ChainClient::outpoint_unspent` checks.
+struct DroppedCheck {
+    current_txid: String,
+    first_input: (String, u32),
+}
+
+/// Snapshot every PENDING record (sweep/consolidate txs AND notes) in
+/// `store` into the (current-txid, first-input) pairs a worker thread needs
+/// — shared by both the async and synchronous refresh paths so they exhibit
+/// identical dropped-detection behavior.
+fn gather_dropped_checks(store: &Store) -> Vec<DroppedCheck> {
+    let tx_checks = store.txs.iter().filter(|t| t.status == NoteStatus::Pending).filter_map(|t| {
+        let current_txid = t.txids.last()?.clone();
+        let first = t.inputs.first()?;
+        Some(DroppedCheck { current_txid, first_input: (first.txid.clone(), first.vout) })
+    });
+    let note_checks = store.notes.iter().filter(|n| n.status == NoteStatus::Pending).filter_map(|n| {
+        let current_txid = n.txids.last()?.clone();
+        let first = n.spent.first()?;
+        Some(DroppedCheck { current_txid, first_input: (first.txid.clone(), first.vout) })
+    });
+    tx_checks.chain(note_checks).collect()
+}
+
+/// The worker-thread half of task #14: run `checks` (see
+/// [`gather_dropped_checks`]) against a live `client`, returning the two
+/// maps `RefreshResult` carries — `tx_lookup_status` once per DISTINCT
+/// current txid, `outpoint_unspent` only for the ones that came back
+/// `NotFound` (the common "still pending"/"confirmed" cases never pay for
+/// the extra round trip).
+fn fetch_dropped_checks(
+    client: &ChainClient<HttpTransport>,
+    address: &str,
+    checks: &[DroppedCheck],
+) -> (HashMap<String, TxLookupStatus>, HashMap<(String, u32), bool>) {
+    let mut lookup = HashMap::new();
+    let mut unspent = HashMap::new();
+    for c in checks {
+        let status = *lookup
+            .entry(c.current_txid.clone())
+            .or_insert_with(|| client.tx_lookup_status(&c.current_txid));
+        if status == TxLookupStatus::NotFound {
+            unspent.entry(c.first_input.clone()).or_insert_with(|| {
+                client
+                    .outpoint_unspent(address, &c.first_input.0, c.first_input.1)
+                    .unwrap_or(false)
+            });
+        }
+    }
+    (lookup, unspent)
+}
+
+/// The UI-thread half: apply the two maps `fetch_dropped_checks` gathered
+/// against `store`'s pending txs AND notes, logging `cb: tx-dropped
+/// txid=<t>` once per NEW transition into dropped (task #14's log
+/// contract).
+fn apply_dropped_checks(
+    store: &mut Store,
+    lookup: &HashMap<String, TxLookupStatus>,
+    unspent: &HashMap<(String, u32), bool>,
+) {
+    let lookup_fn = |txid: &str| lookup.get(txid).copied().unwrap_or(TxLookupStatus::Unknown);
+    let unspent_fn = |_addr: &str, txid: &str, vout: u32| {
+        unspent.get(&(txid.to_string(), vout)).copied()
+    };
+    let mut newly = store.resolve_dropped_tx(lookup_fn, unspent_fn);
+    newly.extend(store.resolve_dropped_notes(lookup_fn, unspent_fn));
+    for txid in newly {
+        println!("cb: tx-dropped txid={txid}");
+    }
+}
 
 /// One finished notebook gap-discovery walk (worker thread), waiting to be
 /// applied on the UI thread. The identity/network/account snapshot guards
@@ -3007,6 +3101,7 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
                         change_to: (!r.change_raw.is_empty()).then(|| r.change_raw.clone()),
                         gift_amount: r.to.as_ref().map(|_| r.gift),
                         funded_by: Some("spending".into()),
+                        dropped: false,
                     },
                     None,
                 );
@@ -3095,6 +3190,7 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                         change_to: None,
                         gift_amount: r.to.as_ref().map(|_| r.gift),
                         funded_by: Some("mixed".into()),
+                        dropped: false,
                     },
                     change_utxo,
                 );
@@ -3248,6 +3344,7 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
         .filter(|t| t.status == NoteStatus::Pending)
         .flat_map(|t| t.txids.iter().cloned())
         .collect();
+    let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
     w.set_status("syncing…".into());
     let weak = w.as_weak();
     std::thread::spawn(move || {
@@ -3257,10 +3354,11 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
             .iter()
             .map(|t| (t.clone(), client.fetch_tx_status(t)))
             .collect();
+        let (dropped_lookup, dropped_unspent) = fetch_dropped_checks(&client, &address, &dropped_checks);
         REFRESH_RESULTS
             .lock()
             .expect("refresh results mutex")
-            .push(RefreshResult { address, bundle, statuses });
+            .push(RefreshResult { address, bundle, statuses, dropped_lookup, dropped_unspent });
         let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_refresh());
     });
 }
@@ -3300,6 +3398,11 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
                         if n > 0 {
                             println!("cb: spend-confirmed n={n}");
                         }
+                        apply_dropped_checks(
+                            st.store.as_mut().unwrap(),
+                            &r.dropped_lookup,
+                            &r.dropped_unspent,
+                        );
                         println!(
                             "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
                             stats.notes_seen,
@@ -3341,6 +3444,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
     };
     let client = ChainClient::new(HttpTransport::new(base), st.network);
     let address = st.ident.as_ref().unwrap().address.clone();
+    let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
     match client.build_bundle(&address, None) {
         Ok(bundle) => {
             st.fees = Some(bundle.fee_rates.clone());
@@ -3366,6 +3470,9 @@ fn refresh(w: &AppWindow, st: &mut State) {
                     if n > 0 {
                         println!("cb: spend-confirmed n={n}");
                     }
+                    let (dropped_lookup, dropped_unspent) =
+                        fetch_dropped_checks(&client, &address, &dropped_checks);
+                    apply_dropped_checks(st.store.as_mut().unwrap(), &dropped_lookup, &dropped_unspent);
                     println!(
                         "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
                         stats.notes_seen,

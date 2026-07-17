@@ -146,6 +146,7 @@ pub fn compose_and_record(
         change_to: req.change_to.map(str::to_string),
         gift_amount: recipient.as_ref().map(|_| tx.sent),
         funded_by: None,
+        dropped: false,
     };
     store.record_signed(record, change_utxo);
 
@@ -412,6 +413,7 @@ mod bump_tests {
             input_accounts: vec![0, 3],
             input_indexes: Vec::new(),
             mixed_inputs: false,
+            dropped: false,
         });
 
         fn dup(i: &Identity) -> Identity {

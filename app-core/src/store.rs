@@ -86,6 +86,14 @@ pub struct NoteRecord {
     /// no source pill for it, matching current behavior byte-for-byte).
     #[serde(default)]
     pub funded_by: Option<String>,
+    /// Task #14 (dropped-pending detection): true once a PENDING record's
+    /// tx lookup came back a definitive not-found AND its first spent
+    /// input was verifiably still unspent — the mempool genuinely lost the
+    /// broadcast (as opposed to Orphaned, where a DIFFERENT tx spent the
+    /// inputs). Cleared the moment the tx is seen again. Never true for a
+    /// Confirmed/Orphaned record. See [`resolve_dropped`].
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 /// One input spent by a sweep/consolidate tx — kept for RBF re-signing.
@@ -146,6 +154,11 @@ pub struct TxRecord {
     /// taproot-only multi-key) is unaffected and stays bumpable.
     #[serde(default)]
     pub mixed_inputs: bool,
+    /// Task #14 (dropped-pending detection): see `NoteRecord::dropped` —
+    /// same meaning, same [`resolve_dropped`] state machine, applied to
+    /// sweep/consolidate records via [`Store::resolve_dropped_tx`].
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +237,41 @@ pub struct Store {
 
 fn default_chunk() -> usize {
     DEFAULT_CHUNK
+}
+
+/// Task #14 (dropped-pending detection): the pure state-machine core —
+/// no I/O, so it's host-testable with canned inputs. Decides the NEXT
+/// `dropped` flag for one PENDING record from its tx-lookup result and
+/// (lazily — only evaluated when the lookup is `NotFound`) whether its
+/// first spent input is still sitting unspent.
+///
+/// - `Found(_)`            → false. The tx is back (still there, or newly
+///   seen) — clears a stale `dropped` from an earlier flaky lookup.
+/// - `Unknown`              → unchanged. A transient error (offline,
+///   non-404 HTTP failure, bad body) must NEVER move the flag either way.
+/// - `NotFound` + unspent   → true. The node has no record of the tx AND
+///   the coin it was supposed to spend never left — the broadcast
+///   genuinely evaporated (as opposed to Orphaned, where something ELSE
+///   spent the input).
+/// - `NotFound` + spent, or unspent-check itself inconclusive → unchanged
+///   (never guess a positive from a `NotFound` alone — the coin may have
+///   been consumed by an RBF replacement or a different owner entirely;
+///   the caller's own orphan-detection pass handles the "spent by
+///   something else" case separately).
+pub fn resolve_dropped(
+    was_dropped: bool,
+    lookup: crate::chain::TxLookupStatus,
+    first_input_unspent: impl FnOnce() -> Option<bool>,
+) -> bool {
+    use crate::chain::TxLookupStatus;
+    match lookup {
+        TxLookupStatus::Found(_) => false,
+        TxLookupStatus::Unknown => was_dropped,
+        TxLookupStatus::NotFound => match first_input_unspent() {
+            Some(true) => true,
+            _ => was_dropped,
+        },
+    }
 }
 
 impl Store {
@@ -372,6 +420,7 @@ impl Store {
                     n.height = *h;
                     n.blocktime = *bt;
                     n.raw_hex = None; // on-chain now — no rebroadcast needed
+                    n.dropped = false; // it reappeared — task #14
                 }
             }
         }
@@ -409,10 +458,78 @@ impl Store {
             if t.txids.iter().any(|x| lookup(x) == Some(true)) {
                 t.status = NoteStatus::Confirmed;
                 t.raw_hex = None; // on-chain now — no rebroadcast needed
+                t.dropped = false; // it reappeared — task #14
                 confirmed += 1;
             }
         }
         confirmed
+    }
+
+    /// Task #14 (dropped-pending detection): resolve `dropped` for every
+    /// PENDING sweep/consolidate record, same pass as
+    /// [`Self::resolve_spend_statuses`] (both run from the async refresh's
+    /// pending-status sweep, fed by the same node round trip). `lookup`
+    /// gives the CURRENT (latest RBF bump) txid's definitive-vs-transient
+    /// status; `unspent(address, txid, vout)` is called ONLY when `lookup`
+    /// says `NotFound`, checking whether the record's first spent input is
+    /// still sitting unspent at the store's own address (the common case —
+    /// see [`resolve_dropped`]'s doc for the mixed/spending-wallet-funded
+    /// caveat). Returns the CURRENT txid of every record that just
+    /// transitioned INTO dropped (for the caller's one-line-per-transition
+    /// log) — a record clearing back to not-dropped isn't included (no log
+    /// line asked for that direction).
+    pub fn resolve_dropped_tx(
+        &mut self,
+        lookup: impl Fn(&str) -> crate::chain::TxLookupStatus,
+        unspent: impl Fn(&str, &str, u32) -> Option<bool>,
+    ) -> Vec<String> {
+        let address = self.address.clone();
+        let mut newly_dropped = Vec::new();
+        for t in &mut self.txs {
+            if t.status != NoteStatus::Pending {
+                continue;
+            }
+            let Some(current) = t.txids.last() else { continue };
+            let Some(first) = t.inputs.first() else { continue };
+            let status = lookup(current);
+            let next = resolve_dropped(t.dropped, status, || {
+                unspent(&address, &first.txid, first.vout)
+            });
+            if next && !t.dropped {
+                newly_dropped.push(current.clone());
+            }
+            t.dropped = next;
+        }
+        newly_dropped
+    }
+
+    /// Task #14: the note-record twin of [`Self::resolve_dropped_tx`] — a
+    /// note's own broadcast can go missing exactly the same way a sweep's
+    /// can. Same signature/semantics; `t.spent` (the note's locked inputs)
+    /// stands in for `TxRecord.inputs`.
+    pub fn resolve_dropped_notes(
+        &mut self,
+        lookup: impl Fn(&str) -> crate::chain::TxLookupStatus,
+        unspent: impl Fn(&str, &str, u32) -> Option<bool>,
+    ) -> Vec<String> {
+        let address = self.address.clone();
+        let mut newly_dropped = Vec::new();
+        for n in &mut self.notes {
+            if n.status != NoteStatus::Pending {
+                continue;
+            }
+            let Some(current) = n.txids.last() else { continue };
+            let Some(first) = n.spent.first() else { continue };
+            let status = lookup(current);
+            let next = resolve_dropped(n.dropped, status, || {
+                unspent(&address, &first.txid, first.vout)
+            });
+            if next && !n.dropped {
+                newly_dropped.push(current.clone());
+            }
+            n.dropped = next;
+        }
+        newly_dropped
     }
 
     /// Record a broadcast sweep/consolidate for the activity view + RBF.
@@ -445,6 +562,7 @@ impl Store {
             input_accounts: Vec::new(),
             input_indexes: Vec::new(),
             mixed_inputs: false,
+            dropped: false,
         });
     }
 
@@ -501,6 +619,7 @@ impl Store {
                     change_to: None,
                     gift_amount: None,
                     funded_by: None,
+                    dropped: false,
                 });
                 true
             }
@@ -807,6 +926,7 @@ mod tests {
             change_to: None,
             gift_amount: None,
             funded_by: None,
+            dropped: false,
         }
     }
 
@@ -1020,5 +1140,146 @@ mod tests {
         // the account (requirement: apply_bundle recognizes the account's
         // spending spks for every notebook).
         assert_eq!(store_a.spending_self_spks().len(), 2);
+    }
+
+    // ---- task #14: dropped-pending detection — the pure state machine
+    // (`resolve_dropped`) plus its two Store-level wirings. ----
+
+    use crate::chain::TxLookupStatus;
+
+    #[test]
+    fn resolve_dropped_marks_notfound_plus_unspent_as_dropped() {
+        assert!(resolve_dropped(false, TxLookupStatus::NotFound, || Some(true)));
+    }
+
+    #[test]
+    fn resolve_dropped_transient_error_never_changes_state() {
+        // Not-yet-dropped stays not-dropped...
+        assert!(!resolve_dropped(false, TxLookupStatus::Unknown, || {
+            panic!("must not evaluate the unspent check on a transient error")
+        }));
+        // ...and an already-dropped record STAYS dropped through a blip
+        // (a transient error must never clear it either — that would need
+        // a real reappearance).
+        assert!(resolve_dropped(true, TxLookupStatus::Unknown, || {
+            panic!("must not evaluate the unspent check on a transient error")
+        }));
+    }
+
+    #[test]
+    fn resolve_dropped_reappearing_tx_clears_the_flag() {
+        assert!(!resolve_dropped(true, TxLookupStatus::Found(false), || {
+            panic!("Found must never consult the unspent check")
+        }));
+        assert!(!resolve_dropped(true, TxLookupStatus::Found(true), || {
+            panic!("Found must never consult the unspent check")
+        }));
+    }
+
+    #[test]
+    fn resolve_dropped_notfound_but_input_spent_stays_unchanged() {
+        // NotFound alone is not enough — the coin being gone too (spent by
+        // something else, or just an inconclusive check) must never flip
+        // an un-dropped record to dropped.
+        assert!(!resolve_dropped(false, TxLookupStatus::NotFound, || Some(false)));
+        assert!(!resolve_dropped(false, TxLookupStatus::NotFound, || None));
+    }
+
+    fn tx_input(txid: &str, vout: u32, value: u64) -> TxInput {
+        TxInput { txid: txid.into(), vout, value }
+    }
+
+    fn pending_tx(txid: &str, first_input: &str) -> TxRecord {
+        TxRecord {
+            kind: "sweep".into(),
+            txids: vec![txid.into()],
+            status: NoteStatus::Pending,
+            value: 1000,
+            fee: 100,
+            vsize: 150,
+            created_at: Some(1),
+            raw_hex: Some("00".into()),
+            dest: "ext".into(),
+            inputs: vec![tx_input(first_input, 0, 2000)],
+            dest_spk_hex: "51".into(),
+            input_accounts: vec![0],
+            input_indexes: vec![0],
+            mixed_inputs: false,
+            dropped: false,
+        }
+    }
+
+    #[test]
+    fn resolve_dropped_tx_marks_and_logs_the_transition() {
+        let mut store = Store::new(&[3u8; 32], Network::Regtest);
+        store.txs.push(pending_tx("deadbeef", "coin1"));
+
+        let newly = store.resolve_dropped_tx(
+            |txid| if txid == "deadbeef" { TxLookupStatus::NotFound } else { TxLookupStatus::Unknown },
+            |_addr, txid, _vout| if txid == "coin1" { Some(true) } else { None },
+        );
+        assert_eq!(newly, vec!["deadbeef".to_string()]);
+        assert!(store.txs[0].dropped);
+
+        // A second pass with the SAME inputs is not a new transition (the
+        // record is already dropped) — the caller must not re-log it.
+        let newly2 = store.resolve_dropped_tx(
+            |_| TxLookupStatus::NotFound,
+            |_addr, txid, _vout| if txid == "coin1" { Some(true) } else { None },
+        );
+        assert!(newly2.is_empty());
+        assert!(store.txs[0].dropped);
+
+        // The tx reappears (found in the mempool again) — cleared.
+        let newly3 = store.resolve_dropped_tx(|_| TxLookupStatus::Found(false), |_, _, _| None);
+        assert!(newly3.is_empty()); // "cleared" isn't a "newly dropped" transition
+        assert!(!store.txs[0].dropped);
+    }
+
+    #[test]
+    fn resolve_dropped_tx_transient_error_never_marks_dropped() {
+        let mut store = Store::new(&[4u8; 32], Network::Regtest);
+        store.txs.push(pending_tx("cafef00d", "coin2"));
+        let newly = store.resolve_dropped_tx(
+            |_| TxLookupStatus::Unknown,
+            |_, _, _| panic!("must not be called on a non-NotFound lookup"),
+        );
+        assert!(newly.is_empty());
+        assert!(!store.txs[0].dropped);
+    }
+
+    #[test]
+    fn resolve_dropped_tx_ignores_confirmed_and_orphaned_records() {
+        let mut store = Store::new(&[5u8; 32], Network::Regtest);
+        let mut t = pending_tx("11111111", "coin3");
+        t.status = NoteStatus::Confirmed;
+        store.txs.push(t);
+        let newly = store.resolve_dropped_tx(
+            |_| TxLookupStatus::NotFound,
+            |_, _, _| panic!("a Confirmed record must never reach the unspent check"),
+        );
+        assert!(newly.is_empty());
+        assert!(!store.txs[0].dropped);
+    }
+
+    #[test]
+    fn resolve_dropped_notes_mirrors_the_tx_state_machine() {
+        let mut store = Store::new(&[6u8; 32], Network::Regtest);
+        let mut n = note("aa", false, None);
+        n.status = NoteStatus::Pending;
+        n.txids = vec!["notetxid".into()];
+        n.spent = vec![OutPointRef { txid: "notecoin".into(), vout: 0 }];
+        store.notes.push(n);
+
+        let newly = store.resolve_dropped_notes(
+            |txid| if txid == "notetxid" { TxLookupStatus::NotFound } else { TxLookupStatus::Unknown },
+            |_addr, txid, _vout| if txid == "notecoin" { Some(true) } else { None },
+        );
+        assert_eq!(newly, vec!["notetxid".to_string()]);
+        assert!(store.notes[0].dropped);
+
+        // Reappears — cleared.
+        store.resolve_dropped_notes(|_| TxLookupStatus::Found(true), |_, _, _| None);
+        assert!(!store.notes[0].dropped);
     }
 }
