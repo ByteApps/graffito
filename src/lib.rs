@@ -2448,19 +2448,309 @@ fn apply_sweep_broadcast_result(w: &AppWindow, st: &mut State, r: SweepBroadcast
     }
 }
 
+/// Non-`result` half of a single-notebook consolidate broadcast (screen 16,
+/// kind "consolidate", classic confirm modal) — same shape as
+/// [`SweepSnapshot`], one store instead of many.
+struct ConsolidateSnapshot {
+    identity_addr: String,
+    value: u64,
+    fee: u64,
+    vsize: u64,
+    raw_hex: String,
+    dest_spk_hex: String,
+    inputs: Vec<app_core::store::TxInput>,
+}
+struct ConsolidateBroadcastResult {
+    snap: ConsolidateSnapshot,
+    result: Result<String, String>,
+}
+static CONSOLIDATE_BROADCAST_RESULTS: std::sync::Mutex<Vec<ConsolidateBroadcastResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn apply_consolidate_broadcast_result(w: &AppWindow, st: &mut State, r: ConsolidateBroadcastResult) {
+    let snap = r.snap;
+    if st.ident.as_ref().map(|i| i.address.as_str()) != Some(snap.identity_addr.as_str()) {
+        println!("cb: consolidate stale-drop");
+        return;
+    }
+    match r.result {
+        Ok(txid) => {
+            if let Some(store) = st.store.as_mut() {
+                for u in &mut store.utxos {
+                    u.pending_spend = true;
+                }
+                store.record_tx(
+                    "consolidate",
+                    txid.clone(),
+                    snap.value,
+                    snap.fee,
+                    snap.vsize,
+                    snap.raw_hex.clone(),
+                    "self".into(),
+                    snap.inputs.clone(),
+                    snap.dest_spk_hex.clone(),
+                    now(),
+                );
+            }
+            st.save_store();
+            println!("cb: consolidate txid={txid} value={} fee={}", snap.value, snap.fee);
+            w.set_status(format!("consolidating: {}…", &txid[..12.min(txid.len())]).into());
+            w.set_screen(4); // done — home, like the PSBT flow
+            update_home(w, st);
+        }
+        Err(e) => {
+            println!("cb: consolidate broadcast err={e}");
+            w.set_status(format!("consolidate broadcast failed: {e}").into());
+        }
+    }
+}
+
+/// Non-`result` half of a wallet-consolidate broadcast (Settings/Coins →
+/// "Consolidate wallet…", keyed non-watch path) — spans potentially several
+/// SOURCE notebook stores plus a DESTINATION store, so its staleness anchor
+/// is the identity/network/account triple (`fp8`), same guard shape as
+/// [`SpendingRefreshResult`], not a single notebook address.
+struct WConsolSnapshot {
+    fp8: String,
+    network: Network,
+    account: u32,
+    dest_index: u32,
+    dest_spk_hex: String,
+    value: u64,
+    fee: u64,
+    vsize: u64,
+    raw_hex: String,
+    /// (source notebook index, [(txid display-hex, vout)]) — mirrors
+    /// `SweepSnapshot.notebook_locks`.
+    source_locks: Vec<(u32, Vec<(String, u32)>)>,
+    all_inputs: Vec<app_core::store::TxInput>,
+    input_indexes: Vec<u32>,
+    sources_n: usize,
+}
+struct WConsolBroadcastResult {
+    snap: WConsolSnapshot,
+    result: Result<String, String>,
+}
+static WCONSOL_BROADCAST_RESULTS: std::sync::Mutex<Vec<WConsolBroadcastResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn apply_wconsol_broadcast_result(w: &AppWindow, st: &mut State, r: WConsolBroadcastResult) {
+    let snap = r.snap;
+    if st.notebooks_fp8.as_deref() != Some(snap.fp8.as_str())
+        || st.network != snap.network
+        || st.account != snap.account
+    {
+        println!("cb: wallet-consolidate stale-drop");
+        return;
+    }
+    match r.result {
+        Ok(txid) => {
+            let material_str = st.material.as_ref().map(|z| String::from(z.as_str()));
+            let dest_ident_ok = material_str
+                .as_deref()
+                .and_then(|m| parse_key_material(m, snap.network).ok())
+                .and_then(|material| realize(&material, snap.network, snap.account, snap.dest_index).ok());
+            if let Some(dest_ident) = dest_ident_ok {
+                let mut dstore = notebook_store(st, snap.dest_index)
+                    .unwrap_or_else(|| Store::new(&dest_ident.output_x(), snap.network));
+                dstore.record_tx(
+                    "consolidate",
+                    txid.clone(),
+                    snap.value,
+                    snap.fee,
+                    snap.vsize,
+                    snap.raw_hex.clone(),
+                    "self".into(),
+                    snap.all_inputs.clone(),
+                    snap.dest_spk_hex.clone(),
+                    now(),
+                );
+                if let Some(rec) = dstore.txs.last_mut() {
+                    rec.input_indexes = snap.input_indexes.clone();
+                }
+                // Sources' inputs lock (the dest store handles its own below).
+                for (index, coins) in &snap.source_locks {
+                    if *index == snap.dest_index {
+                        for (txid_hex, vout) in coins {
+                            if let Some(l) =
+                                dstore.utxos.iter_mut().find(|l| &l.txid == txid_hex && l.vout == *vout)
+                            {
+                                l.pending_spend = true;
+                            }
+                        }
+                    }
+                }
+                dstore.utxos.push(app_core::store::LedgerUtxo {
+                    txid: txid.clone(),
+                    vout: 0,
+                    value: snap.value,
+                    height: None,
+                    pending_spend: false,
+                });
+                if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == snap.dest_index) {
+                    let _ = dstore.save(&st.store_path_for(fp8));
+                }
+            }
+            for (index, coins) in &snap.source_locks {
+                if *index == snap.dest_index {
+                    continue; // handled with the destination store above
+                }
+                let Some(mut store) = notebook_store(st, *index) else { continue };
+                for (txid_hex, vout) in coins {
+                    if let Some(l) = store.utxos.iter_mut().find(|l| &l.txid == txid_hex && l.vout == *vout) {
+                        l.pending_spend = true;
+                    }
+                }
+                if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == *index) {
+                    let _ = store.save(&st.store_path_for(fp8));
+                }
+            }
+            // Reload the active store from disk (it may be source and/or
+            // dest), then land on the list — the wallet-level money flow's
+            // home.
+            if let Some(m) = material_str {
+                let _ = activate(st, &m, false);
+            }
+            update_notebook_list(w, st);
+            println!(
+                "cb: wallet-consolidate txid={txid} coins={} notebooks={} value={} fee={}",
+                snap.all_inputs.len(),
+                snap.sources_n,
+                snap.value,
+                snap.fee
+            );
+            w.set_status(
+                format!(
+                    "consolidated — {} sats now at {}",
+                    commas(snap.value),
+                    st.notebook_display_name(snap.dest_index)
+                )
+                .into(),
+            );
+            w.set_screen(17);
+        }
+        Err(e) => {
+            println!("cb: wallet-consolidate broadcast err={e}");
+            w.set_status(format!("broadcast failed: {e}").into());
+        }
+    }
+}
+
+/// Non-`result` half of a psbt-broadcast (screen 14 "Broadcast" — the
+/// watch/external-sign flow's finalize+broadcast button, also used by
+/// plain external-funding compose with no watch bookkeeping at all).
+/// `finalize_extract` runs synchronously (local, fast) BEFORE spawning, so
+/// `txid`/`raw`/`vsize` are already final — only the broadcast POST itself
+/// is async. `identity_addr` is the staleness anchor; on a mismatch the
+/// pending `watch_note`/`watch_spend` bookkeeping is dropped too (cleared,
+/// not left to misapply against a switched-to identity next time).
+struct PsbtBroadcastSnapshot {
+    identity_addr: String,
+    txid: String,
+    raw: String,
+    vsize: usize,
+}
+struct PsbtBroadcastResult {
+    snap: PsbtBroadcastSnapshot,
+    result: Result<String, String>,
+}
+static PSBT_BROADCAST_RESULTS: std::sync::Mutex<Vec<PsbtBroadcastResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn apply_psbt_broadcast_result(w: &AppWindow, st: &mut State, r: PsbtBroadcastResult) {
+    let snap = r.snap;
+    if st.ident.as_ref().map(|i| i.address.as_str()) != Some(snap.identity_addr.as_str()) {
+        println!("cb: fund-broadcast stale-drop");
+        st.watch_note = None;
+        st.watch_spend = None;
+        return;
+    }
+    match r.result {
+        Ok(_got) => {
+            let raw = snap.raw.as_str();
+            let txid = snap.txid.as_str();
+            let vsize = snap.vsize;
+            // Wallet-level money flows (watch sweep/consolidate) land on
+            // the notebook LIST — the wallet's home — like their keyed
+            // twins; notes and bumps keep landing on the active notebook.
+            let mut wallet_flow = false;
+            if let Some(wn) = st.watch_note.take() {
+                // Watch-mode compose (or a keyed mixed-source compose that
+                // included an external wallet — funding-unification UI
+                // rework, `wn.is_watch == false`): the note enters the
+                // store as Pending exactly like a keyed compose (inputs
+                // locked, change spendable, raw hex kept for rebroadcast).
+                record_watch_note(st, &wn, txid, raw, vsize as u64);
+                println!(
+                    "cb: compose id={} txid={txid} fee={} vsize={vsize} to={} private={} gift={} watch={} broadcast=ok",
+                    hex::encode(wn.note_id),
+                    wn.fee,
+                    wn.recipient.as_deref().unwrap_or("self"),
+                    wn.private,
+                    wn.gift,
+                    if wn.is_watch { 1 } else { 0 }
+                );
+            } else if let Some(ws) = st.watch_spend.take() {
+                // Watch-mode spend: record it so Activity gets the
+                // pending→confirmed lifecycle, and lock the coins.
+                record_watch_spend(st, &ws, txid, raw, vsize as u64);
+                println!("cb: watch-{} txid={txid} fee={} ok", ws.kind, ws.fee);
+                wallet_flow = ws.bump_ref.is_none() && (ws.kind == "sweep" || ws.kind == "consolidate");
+            } else {
+                println!("cb: fund-broadcast txid={txid} ok");
+            }
+            w.set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
+            st.funding_coins.clear();
+            st.built_psbt = None;
+            st.signed_psbt = None;
+            st.ur_frames.clear();
+            w.set_compose_text("".into());
+            w.set_fund_external(false);
+            w.set_psbt_signed(false);
+            if wallet_flow {
+                refresh(w, st); // active store first — the list rows read disk + memory
+                update_notebook_list(w, st);
+                w.set_screen(17);
+            } else {
+                w.set_screen(4);
+                refresh(w, st);
+            }
+        }
+        Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
+    }
+}
+
 /// Drains the CHANGE-4 wallet-tx result queues and applies each on the UI
 /// thread — the shared `apply-pending-wallet-tx` trampoline target. Also
 /// clears the shared busy flag.
 fn apply_pending_wallet_tx_results(w: &AppWindow, st: &mut State) {
     let sweep: Vec<SweepBroadcastResult> =
         SWEEP_BROADCAST_RESULTS.lock().expect("sweep broadcast results mutex").drain(..).collect();
-    if sweep.is_empty() {
+    let consolidate: Vec<ConsolidateBroadcastResult> = CONSOLIDATE_BROADCAST_RESULTS
+        .lock()
+        .expect("consolidate broadcast results mutex")
+        .drain(..)
+        .collect();
+    let wconsol: Vec<WConsolBroadcastResult> =
+        WCONSOL_BROADCAST_RESULTS.lock().expect("wconsol broadcast results mutex").drain(..).collect();
+    let psbt: Vec<PsbtBroadcastResult> =
+        PSBT_BROADCAST_RESULTS.lock().expect("psbt broadcast results mutex").drain(..).collect();
+    if sweep.is_empty() && consolidate.is_empty() && wconsol.is_empty() && psbt.is_empty() {
         return;
     }
     st.wallet_tx_busy = false;
     w.set_wallet_tx_busy(false);
     for r in sweep {
         apply_sweep_broadcast_result(w, st, r);
+    }
+    for r in consolidate {
+        apply_consolidate_broadcast_result(w, st, r);
+    }
+    for r in wconsol {
+        apply_wconsol_broadcast_result(w, st, r);
+    }
+    for r in psbt {
+        apply_psbt_broadcast_result(w, st, r);
     }
 }
 
@@ -5567,6 +5857,9 @@ pub fn run() {
 
     cb!(on_consolidate, |w, s| {
         w.set_show_consolidate_confirm(false);
+        if s.wallet_tx_busy {
+            return;
+        }
         let rate: f64 = w.get_consolidate_rate().trim().parse().unwrap_or(1.0);
         let net = s.network;
         let Some(base) = s.base_url() else { return };
@@ -5601,21 +5894,28 @@ pub fn run() {
         );
         match tx {
             Ok(tx) => {
-                let client = ChainClient::new(HttpTransport::new(base), net);
-                match client.broadcast(&tx.raw_hex) {
-                    Ok(txid) => {
-                        for u in &mut store.utxos {
-                            u.pending_spend = true;
-                        }
-                        store.record_tx("consolidate", txid.clone(), tx.tx.outputs[0].value, tx.fee, tx.vsize as u64, tx.raw_hex.clone(), "self".into(), inputs, dest_spk_hex, now());
-                        s.save_store();
-                        println!("cb: consolidate txid={txid} value={} fee={}", tx.tx.outputs[0].value, tx.fee);
-                        w.set_status(format!("consolidating: {}…", &txid[..12.min(txid.len())]).into());
-                        w.set_screen(4); // done — home, like the PSBT flow
-                        update_home(&w, &s);
-                    }
-                    Err(e) => w.set_status(format!("consolidate broadcast failed: {e}").into()),
-                }
+                let snap = ConsolidateSnapshot {
+                    identity_addr: s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default(),
+                    value: tx.tx.outputs[0].value,
+                    fee: tx.fee,
+                    vsize: tx.vsize as u64,
+                    raw_hex: tx.raw_hex.clone(),
+                    dest_spk_hex,
+                    inputs,
+                };
+                s.wallet_tx_busy = true;
+                w.set_wallet_tx_busy(true);
+                let raw = tx.raw_hex.clone();
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    CONSOLIDATE_BROADCAST_RESULTS
+                        .lock()
+                        .expect("consolidate broadcast results mutex")
+                        .push(ConsolidateBroadcastResult { snap, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+                });
             }
             Err(e) => w.set_status(format!("consolidate: {e}").into()),
         }
@@ -5881,6 +6181,9 @@ pub fn run() {
     cb!(on_wallet_consolidate, |w, s| {
         w.set_show_wconsol_confirm(false);
         w.set_account_pick_mode("switch".into());
+        if s.wallet_tx_busy {
+            return;
+        }
         let Some(wc) = s.wconsol.take() else { return };
         if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
             // Watch: ONE external-sign PSBT over every source notebook's
@@ -6006,24 +6309,11 @@ pub fn run() {
                 return;
             }
         };
-        let client = ChainClient::new(HttpTransport::new(base), s.network);
-        let txid = match client.broadcast(&built.raw_hex) {
-            Ok(t) => t,
-            Err(e) => {
-                w.set_status(format!("broadcast failed: {e}").into());
-                return;
-            }
-        };
-        let value = built.tx.outputs[0].value;
-        println!(
-            "cb: wallet-consolidate txid={txid} coins={} notebooks={} value={value} fee={}",
-            built.tx.inputs.len(),
-            wc.sources.len(),
-            built.fee
-        );
-        // Bookkeeping across stores: the destination gets the TxRecord and
-        // the unconfirmed coin; every source's spent inputs lock. The next
-        // scans reconcile everything authoritatively.
+        // Bookkeeping snapshot: the destination gets the TxRecord and the
+        // unconfirmed coin; every source's spent inputs lock. The next
+        // scans reconcile everything authoritatively — moved into
+        // ConsolidateBroadcastResult's apply fn (CHANGE 4), which runs once
+        // the broadcast POST (below, on a worker thread) succeeds.
         let all_inputs: Vec<app_core::store::TxInput> = wc
             .sources
             .iter()
@@ -6034,86 +6324,56 @@ pub fn run() {
                 app_core::store::TxInput { txid: hex::encode(t), vout: u.vout, value: u.value }
             })
             .collect();
-        let dest_ident_ok = realize(&material, s.network, s.account, wc.dest_index).ok();
-        if let Some(dest_ident) = dest_ident_ok {
-            let mut dstore = notebook_store(&s, wc.dest_index)
-                .unwrap_or_else(|| Store::new(&dest_ident.output_x(), s.network));
-            dstore.record_tx(
-                "consolidate",
-                txid.clone(),
-                value,
-                built.fee,
-                built.vsize as u64,
-                built.raw_hex.clone(),
-                "self".into(),
-                all_inputs,
-                hex::encode(&dest_spk),
-                now(),
-            );
-            if let Some(rec) = dstore.txs.last_mut() {
-                rec.input_indexes = wc
-                    .sources
-                    .iter()
-                    .flat_map(|(a, coins, _)| std::iter::repeat(*a).take(coins.len()))
-                    .collect();
-            }
-            // Sources' inputs lock (the dest store handles its own below).
-            for (index, coins, _) in &wc.sources {
-                if *index == wc.dest_index {
-                    for u in coins {
-                        let mut t = u.txid;
-                        t.reverse();
-                        let txid_hex = hex::encode(t);
-                        if let Some(l) = dstore
-                            .utxos
-                            .iter_mut()
-                            .find(|l| l.txid == txid_hex && l.vout == u.vout)
-                        {
-                            l.pending_spend = true;
-                        }
-                    }
-                }
-            }
-            dstore.utxos.push(app_core::store::LedgerUtxo {
-                txid: txid.clone(),
-                vout: 0,
-                value,
-                height: None,
-                pending_spend: false,
-            });
-            if let Some((_, _, fp8)) =
-                s.nb_addrs.iter().find(|(a, ..)| *a == wc.dest_index)
-            {
-                let _ = dstore.save(&s.store_path_for(fp8));
-            }
-        }
-        for (index, coins, _) in &wc.sources {
-            if *index == wc.dest_index {
-                continue; // handled with the destination store above
-            }
-            let Some(mut store) = notebook_store(&s, *index) else { continue };
-            for u in coins {
-                let mut t = u.txid;
-                t.reverse();
-                let txid_hex = hex::encode(t);
-                if let Some(l) =
-                    store.utxos.iter_mut().find(|l| l.txid == txid_hex && l.vout == u.vout)
-                {
-                    l.pending_spend = true;
-                }
-            }
-            if let Some((_, _, fp8)) = s.nb_addrs.iter().find(|(a, ..)| *a == *index) {
-                let _ = store.save(&s.store_path_for(fp8));
-            }
-        }
-        // Reload the active store from disk (it may be source and/or dest),
-        // then land on the list — the wallet-level money flow's home.
-        let _ = activate(&mut s, &material_str, false);
-        update_notebook_list(&w, &s);
-        w.set_status(
-            format!("consolidated — {} sats now at {}", commas(value), s.notebook_display_name(wc.dest_index)).into(),
-        );
-        w.set_screen(17);
+        let input_indexes: Vec<u32> = wc
+            .sources
+            .iter()
+            .flat_map(|(a, coins, _)| std::iter::repeat(*a).take(coins.len()))
+            .collect();
+        let source_locks: Vec<(u32, Vec<(String, u32)>)> = wc
+            .sources
+            .iter()
+            .map(|(index, coins, _)| {
+                (
+                    *index,
+                    coins
+                        .iter()
+                        .map(|u| {
+                            let mut t = u.txid;
+                            t.reverse();
+                            (hex::encode(t), u.vout)
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let snap = WConsolSnapshot {
+            fp8: s.notebooks_fp8.clone().unwrap_or_default(),
+            network: s.network,
+            account: s.account,
+            dest_index: wc.dest_index,
+            dest_spk_hex: hex::encode(&dest_spk),
+            value: built.tx.outputs[0].value,
+            fee: built.fee,
+            vsize: built.vsize as u64,
+            raw_hex: built.raw_hex.clone(),
+            source_locks,
+            all_inputs,
+            input_indexes,
+            sources_n: wc.sources.len(),
+        };
+        s.wallet_tx_busy = true;
+        w.set_wallet_tx_busy(true);
+        let raw = built.raw_hex.clone();
+        let weak = w.as_weak();
+        std::thread::spawn(move || {
+            let client = ChainClient::new(HttpTransport::new(base), snap.network);
+            let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+            WCONSOL_BROADCAST_RESULTS
+                .lock()
+                .expect("wconsol broadcast results mutex")
+                .push(WConsolBroadcastResult { snap, result });
+            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+        });
     });
 
     cb!(on_set_sweep_tier, |w, s, tier: i32| {
@@ -7105,6 +7365,9 @@ pub fn run() {
     });
 
     cb!(on_psbt_broadcast, |w, s| {
+        if s.wallet_tx_busy {
+            return;
+        }
         let Some(psbt) = s.signed_psbt.clone() else {
             w.set_status("no signed PSBT".into());
             return;
@@ -7120,59 +7383,25 @@ pub fn run() {
                 return;
             }
         };
-        let client = ChainClient::new(HttpTransport::new(&base), s.network);
-        match client.broadcast(&raw) {
-            Ok(_got) => {
-                // Wallet-level money flows (watch sweep/consolidate) land on
-                // the notebook LIST — the wallet's home — like their keyed
-                // twins; notes and bumps keep landing on the active notebook.
-                let mut wallet_flow = false;
-                if let Some(wn) = s.watch_note.take() {
-                    // Watch-mode compose (or a keyed mixed-source compose
-                    // that included an external wallet — funding-
-                    // unification UI rework, `wn.is_watch == false`): the
-                    // note enters the store as Pending exactly like a keyed
-                    // compose (inputs locked, change spendable, raw hex
-                    // kept for rebroadcast).
-                    record_watch_note(&mut s, &wn, &txid, &raw, vsize as u64);
-                    println!(
-                        "cb: compose id={} txid={txid} fee={} vsize={vsize} to={} private={} gift={} watch={} broadcast=ok",
-                        hex::encode(wn.note_id),
-                        wn.fee,
-                        wn.recipient.as_deref().unwrap_or("self"),
-                        wn.private,
-                        wn.gift,
-                        if wn.is_watch { 1 } else { 0 }
-                    );
-                } else if let Some(ws) = s.watch_spend.take() {
-                    // Watch-mode spend: record it so Activity gets the
-                    // pending→confirmed lifecycle, and lock the coins.
-                    record_watch_spend(&mut s, &ws, &txid, &raw, vsize as u64);
-                    println!("cb: watch-{} txid={txid} fee={} ok", ws.kind, ws.fee);
-                    wallet_flow = ws.bump_ref.is_none()
-                        && (ws.kind == "sweep" || ws.kind == "consolidate");
-                } else {
-                    println!("cb: fund-broadcast txid={txid} ok");
-                }
-                w.set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
-                s.funding_coins.clear();
-                s.built_psbt = None;
-                s.signed_psbt = None;
-                s.ur_frames.clear();
-                w.set_compose_text("".into());
-                w.set_fund_external(false);
-                w.set_psbt_signed(false);
-                if wallet_flow {
-                    refresh(&w, &mut s); // active store first — the list rows read disk + memory
-                    update_notebook_list(&w, &s);
-                    w.set_screen(17);
-                } else {
-                    w.set_screen(4);
-                    refresh(&w, &mut s);
-                }
-            }
-            Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
-        }
+        let net = s.network;
+        let snap = PsbtBroadcastSnapshot {
+            identity_addr: s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default(),
+            txid,
+            raw: raw.clone(),
+            vsize,
+        };
+        s.wallet_tx_busy = true;
+        w.set_wallet_tx_busy(true);
+        let weak = w.as_weak();
+        std::thread::spawn(move || {
+            let client = ChainClient::new(HttpTransport::new(&base), net);
+            let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+            PSBT_BROADCAST_RESULTS
+                .lock()
+                .expect("psbt broadcast results mutex")
+                .push(PsbtBroadcastResult { snap, result });
+            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+        });
     });
 
     cb!(on_compose_send, |w, s| {
