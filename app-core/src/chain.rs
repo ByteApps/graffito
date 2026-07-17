@@ -238,6 +238,10 @@ impl<T: Transport> ChainClient<T> {
                 vout: u.vout,
                 value: u.value,
                 height: u.status.block_height.filter(|_| u.status.confirmed),
+                // None = "the bundle's scanned address" (this call scans
+                // exactly one address's own UTXOs) — notes-core's documented
+                // default, byte-identical to pre-bump behavior.
+                owner_address: None,
             })
             .collect())
     }

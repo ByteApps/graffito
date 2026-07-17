@@ -74,6 +74,7 @@ fn change_utxo(tx: &NoteTx, height: Option<u64>) -> BundleUtxo {
         vout: (tx.tx.outputs.len() - 1) as u32,
         value: tx.change,
         height,
+        owner_address: None,
     }
 }
 
@@ -182,7 +183,7 @@ fn directed_private_note_both_sides() {
     // decrypted via reciprocal ECDH (open_received).
     let bob_bundle = bundle(
         vec![onchain(&sent.tx, 105, false, Some(&alice_addr), None)],
-        vec![BundleUtxo { txid: sent.tx.txid_hex.clone(), vout: 1, value: 330, height: Some(105) }],
+        vec![BundleUtxo { txid: sent.tx.txid_hex.clone(), vout: 1, value: 330, height: Some(105), owner_address: None }],
         105,
     );
     let mut bob_store = Store::new(&b.output_x, NET);
@@ -200,7 +201,7 @@ fn unconfirmed_scanned_utxo_is_spendable() {
     // A scan that returns one UNCONFIRMED utxo (height None) paying us.
     let b = bundle(
         vec![],
-        vec![BundleUtxo { txid: "ab".repeat(32), vout: 0, value: 50_000, height: None }],
+        vec![BundleUtxo { txid: "ab".repeat(32), vout: 0, value: 50_000, height: None, owner_address: None }],
         100,
     );
     store.apply_bundle(&b, &a, NET).unwrap();
