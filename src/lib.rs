@@ -221,6 +221,13 @@ struct State {
     /// button shows the busy state and is disabled; other rows stay
     /// tappable. None when nothing is in flight.
     act_pending_ref: Option<String>,
+    /// CHANGE 5 (activate()-spending-cache fix, 2026-07-17): true once the
+    /// user has EXPLICITLY picked a "Pay from" source this compose session
+    /// (the compact picker or the Pay-from screen's row tap) — guards a
+    /// landed `spending_refresh_async` scan from yanking the default back
+    /// to "spending" out from under a deliberate "notebook" pick. Reset to
+    /// false at the start of every fresh compose session (`pick_contact_core`).
+    payfrom_manual: bool,
 }
 
 /// One wallet-consolidate session (Coins → "Consolidate into one coin…").
@@ -1586,13 +1593,23 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
     st.mixed_selected.clear();
     st.change_choice.clear();
     w.set_change_choice("".into());
-    // Funding-unification: default to the spending wallet ONLY when the
-    // setting is on AND it actually has spendable balance (Sal
-    // 2026-07-16) — an enabled-but-empty spending wallet still defaults
-    // to Notebook. Balance is whatever's cached this session; an
-    // unscanned wallet reads as 0 and falls through to Notebook too
-    // (never guess a positive balance we haven't confirmed). A watch
-    // identity has no spending wallet at all.
+    st.payfrom_manual = false; // a fresh compose session — see resolve_payfrom_default
+    resolve_payfrom_default(w, st);
+    w.set_screen(6);
+    refresh_compose(w, st);
+}
+
+/// Funding-unification: default "Pay from" to the spending wallet ONLY when
+/// the setting is on AND it actually has spendable balance (Sal
+/// 2026-07-16) — an enabled-but-empty spending wallet still defaults to
+/// Notebook. Balance is whatever's cached this session; an unscanned wallet
+/// reads as 0 and falls through to Notebook too (never guess a positive
+/// balance we haven't confirmed). A watch identity has no spending wallet
+/// at all. Shared by `pick_contact_core` (fresh compose session) and
+/// `apply_spending_refresh_results` (CHANGE 5: a landed scan re-resolves
+/// the default for a user already sitting on compose, as long as they
+/// haven't made an explicit pick yet this session — `payfrom_manual`).
+fn resolve_payfrom_default(w: &AppWindow, st: &mut State) {
     let spending_balance: u64 = st.spending_coins.iter().map(|c| c.value).sum();
     let spending_default = st.spending_capable
         && !st.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false)
@@ -1602,8 +1619,6 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
     st.payfrom_expanded_source = default_source.to_string();
     w.set_payfrom_expanded_source(default_source.into());
     apply_pay_from(w, st, default_source);
-    w.set_screen(6);
-    refresh_compose(w, st);
 }
 
 /// Deliberate notebook creation for receive `index` of the ACTIVE
@@ -2081,19 +2096,21 @@ fn update_wallet_coins(w: &AppWindow, st: &State) {
     }
     let n = coins.len();
     w.set_coins(VecModel::from_slice(&coins));
-    w.set_coins_summary(
-        if n == 0 {
-            "No notebook coins yet — fund a notebook's address to add some.".to_string()
+    // CHANGE 1 (2026-07-17): when the spending wallet is enabled+capable,
+    // this line (Settings Coins card + the Coins screen's notebook segment,
+    // which reads the same property) aggregates both pools; otherwise it's
+    // the original notebook-only line, byte-for-byte.
+    let spending_state = if st.spending_capable && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false) {
+        if !st.spending_scanned {
+            Some(app_core::mixed::SpendingSummaryState::NotScanned)
         } else {
-            format!(
-                "{n} coin{} · {} sats across {notebooks} notebook{}",
-                if n == 1 { "" } else { "s" },
-                commas(spendable),
-                if notebooks == 1 { "" } else { "s" }
-            )
+            let sats: u64 = st.spending_coins.iter().map(|c| c.value).sum();
+            Some(app_core::mixed::SpendingSummaryState::Scanned { n: st.spending_coins.len(), sats })
         }
-        .into(),
-    );
+    } else {
+        None
+    };
+    w.set_coins_summary(app_core::mixed::coins_summary_line(n, spendable, notebooks, spending_state).into());
 }
 
 /// Rescan every ACTIVE notebook except the current one (the caller runs
@@ -2837,8 +2854,16 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
             }
         }
         update_spending_ui(w, st);
-        if w.get_screen() == 6 && w.get_pay_from() == "spending" {
-            refresh_compose(w, st);
+        if w.get_screen() == 6 {
+            // CHANGE 5: a user already sitting on compose when the scan
+            // lands sees the default upgrade to "spending" too — but only
+            // absent an explicit pick this session (payfrom_manual).
+            if !st.payfrom_manual && w.get_pay_from() != "spending" {
+                resolve_payfrom_default(w, st);
+            }
+            if w.get_pay_from() == "spending" {
+                refresh_compose(w, st);
+            }
         }
         if w.get_screen() == 20 {
             log_funding_refresh(st);
@@ -4261,6 +4286,7 @@ pub fn run() {
         change_choice: String::new(),
         compose_busy: false,
         act_pending_ref: None,
+        payfrom_manual: false,
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -4418,7 +4444,13 @@ pub fn run() {
                     let st_boot = st.clone();
                     slint::Timer::single_shot(std::time::Duration::from_millis(300), move || {
                         if let Some(win) = w.upgrade() {
-                            refresh_async(&win, &mut st_boot.borrow_mut());
+                            let mut s = st_boot.borrow_mut();
+                            refresh_async(&win, &mut s);
+                            // CHANGE 5: boot is an activate()-then-refresh
+                            // site too — without this, the spending cache
+                            // stays empty until something else triggers a
+                            // scan (Settings, or opening compose).
+                            spending_refresh_async(&win, &mut s);
                         }
                     });
                 }
@@ -4600,6 +4632,7 @@ pub fn run() {
                         // an unlisted account's home.
                         go_home_or_list(&w, &s);
                         refresh_async(&w, &mut s);
+                        spending_refresh_async(&w, &mut s); // CHANGE 5
                     }
                     Err(e) => w.set_status(format!("restore: {e}").into()),
                 }
@@ -4660,6 +4693,7 @@ pub fn run() {
                 // list; the first notebook is created deliberately there.
                 go_home_or_list(&w, &s);
                 refresh_async(&w, &mut s);
+                spending_refresh_async(&w, &mut s); // CHANGE 5
             }
             Err(e) => w.set_status(format!("{e}").into()),
         }
@@ -6379,6 +6413,7 @@ pub fn run() {
     // directly (they need a scan first, same as before this milestone).
     cb!(on_set_pay_from, |w, s, kind: SharedString| {
         println!("cb: pay-from {kind}");
+        s.payfrom_manual = true; // explicit pick — CHANGE 5 stops re-defaulting it
         apply_pay_from(&w, &mut s, kind.as_str());
         refresh_compose(&w, &mut s);
     });
@@ -6419,6 +6454,7 @@ pub fn run() {
             // source's remembered selection (if any) BEFORE the branch's
             // own auto-suggest runs, so a previously-touched wallet's
             // selection is restored rather than re-suggested.
+            s.payfrom_manual = true; // explicit pick — CHANGE 5 stops re-defaulting it
             let remembered = mixed_coins_for(&s, &key);
             if key == "notebook" || key == "spending" {
                 if remembered.is_empty() {
@@ -7755,6 +7791,7 @@ pub fn run() {
                     w.set_screen(4);
                     update_home(&w, &s);
                     refresh_async(&w, &mut s);
+                    spending_refresh_async(&w, &mut s); // CHANGE 5
                 } else {
                     // Settings account switch: the account is a wallet —
                     // land on ITS notebook list (possibly empty; creation
@@ -7852,6 +7889,7 @@ pub fn run() {
                 Ok(()) => {
                     update_home(&w, &s);
                     refresh_async(&w, &mut s);
+                    spending_refresh_async(&w, &mut s); // CHANGE 5
                 }
                 Err(e) => w.set_status(format!("network switch: {e}").into()),
             }
@@ -8194,6 +8232,7 @@ pub fn run() {
                 update_home(&w, &s);
                 w.set_screen(4); // paint first — the scan runs in the background
                 refresh_async(&w, &mut s);
+                spending_refresh_async(&w, &mut s); // CHANGE 5: was missing — Sal's finding
             }
             Err(e) => w.set_status(format!("{e}").into()),
         }

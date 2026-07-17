@@ -96,6 +96,76 @@ pub fn spans_multiple_wallets(coins: &[MixedCoin]) -> bool {
     sources.len() > 1
 }
 
+/// The spending wallet's contribution to [`coins_summary_line`] — distinct
+/// from "off" (no spending wallet at all, which isn't representable here;
+/// the caller passes `None` for that case instead of this enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpendingSummaryState {
+    /// Enabled, but the first scan hasn't landed yet this session.
+    NotScanned,
+    /// Scanned: `n` spendable coins totalling `sats`.
+    Scanned { n: usize, sats: u64 },
+}
+
+/// The Settings "Coins" card subtitle (and the Coins screen's notebook
+/// segment caption, which reuses the same property) — CHANGE 1 of the
+/// wallet-level-flows-learn-the-spending-wallet rework (2026-07-17): when
+/// the spending wallet is enabled+capable, the notebook-side count
+/// aggregates BOTH pools; disabled/incapable identities (`spending: None`)
+/// get the ORIGINAL line, byte-for-byte, so nothing changes for them.
+/// `nb_notebooks` is how many distinct notebooks contributed a coin — only
+/// shown in the non-aggregate line (the aggregate line drops it for
+/// brevity, matching Sal's examples: "3 notebook coins · 100,660 sats —
+/// spending: 1 coin · 49,423 sats").
+pub fn coins_summary_line(
+    nb_n: usize,
+    nb_sats: u64,
+    nb_notebooks: usize,
+    spending: Option<SpendingSummaryState>,
+) -> String {
+    let Some(spending) = spending else {
+        return if nb_n == 0 {
+            "No notebook coins yet — fund a notebook's address to add some.".to_string()
+        } else {
+            format!(
+                "{nb_n} coin{} · {} sats across {nb_notebooks} notebook{}",
+                if nb_n == 1 { "" } else { "s" },
+                commas(nb_sats),
+                if nb_notebooks == 1 { "" } else { "s" }
+            )
+        };
+    };
+    let nb_part = if nb_n == 0 {
+        "No notebook coins".to_string()
+    } else {
+        format!("{nb_n} notebook coin{} · {} sats", if nb_n == 1 { "" } else { "s" }, commas(nb_sats))
+    };
+    let spending_part = match spending {
+        SpendingSummaryState::NotScanned => "spending: not scanned yet".to_string(),
+        SpendingSummaryState::Scanned { n: 0, .. } => "spending: no coins".to_string(),
+        SpendingSummaryState::Scanned { n, sats } => {
+            format!("spending: {n} coin{} · {} sats", if n == 1 { "" } else { "s" }, commas(sats))
+        }
+    };
+    format!("{nb_part} — {spending_part}")
+}
+
+/// Group digits with thousands separators — local copy of the same helper
+/// `src/lib.rs` has (kept tiny and dependency-free rather than plumbing a
+/// shared crate for one function).
+fn commas(n: u64) -> String {
+    let s = n.to_string();
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in b.iter().enumerate() {
+        if i > 0 && (b.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*c as char);
+    }
+    out
+}
+
 /// Coerce this mixed selection's Spending-source coins into the
 /// `FundingUtxo` shape [`crate::psbt_build::sign_own_wpkh_inputs`] expects.
 pub fn spending_funding_utxos(coins: &[MixedCoin]) -> Vec<crate::funding::FundingUtxo> {
@@ -431,6 +501,38 @@ mod tests {
         );
         // (d) notebook-only (nothing else participating) -> Notebook.
         assert_eq!(resolve_change_default(true, false, None), ChangeDefault::Notebook);
+    }
+
+    /// CHANGE 1 (funding-unification wallet-level flows, 2026-07-17): the
+    /// Settings Coins card aggregates both pools once spending is enabled,
+    /// but is BYTE-IDENTICAL to the pre-feature line when it isn't.
+    #[test]
+    fn coins_summary_line_covers_every_state() {
+        // Spending off/incapable: original line, unchanged.
+        assert_eq!(
+            coins_summary_line(0, 0, 0, None),
+            "No notebook coins yet — fund a notebook's address to add some."
+        );
+        assert_eq!(coins_summary_line(3, 100_660, 2, None), "3 coins · 100,660 sats across 2 notebooks");
+        assert_eq!(coins_summary_line(1, 500, 1, None), "1 coin · 500 sats across 1 notebook");
+
+        // Spending on: aggregate, per Sal's examples.
+        assert_eq!(
+            coins_summary_line(3, 100_660, 2, Some(SpendingSummaryState::Scanned { n: 1, sats: 49_423 })),
+            "3 notebook coins · 100,660 sats — spending: 1 coin · 49,423 sats"
+        );
+        assert_eq!(
+            coins_summary_line(0, 0, 0, Some(SpendingSummaryState::Scanned { n: 1, sats: 49_423 })),
+            "No notebook coins — spending: 1 coin · 49,423 sats"
+        );
+        assert_eq!(
+            coins_summary_line(0, 0, 0, Some(SpendingSummaryState::NotScanned)),
+            "No notebook coins — spending: not scanned yet"
+        );
+        assert_eq!(
+            coins_summary_line(2, 5_000, 1, Some(SpendingSummaryState::Scanned { n: 0, sats: 0 })),
+            "2 notebook coins · 5,000 sats — spending: no coins"
+        );
     }
 
     #[test]
