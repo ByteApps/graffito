@@ -270,6 +270,80 @@ pub fn assemble_mixed_note_psbt(
     Ok(BuiltPsbt { psbt, fee, change, sent_to_recipient, dust_to_self, txid })
 }
 
+/// One notebook's contribution to a mixed wallet sweep — same shape
+/// `on_sweep`'s all-taproot path already gathers via `SweepSource`, but
+/// per-coin here because `MixedInput` is flat (no source grouping).
+pub struct NotebookSweepSource<'a> {
+    pub output_x: [u8; 32],
+    pub tweaked_seckey: &'a [u8; 32],
+    pub utxos: &'a [notes_core::tx::Utxo],
+}
+
+/// Wallet-level sweep across every active notebook's taproot coins AND the
+/// spending wallet's P2WPKH coins, in ONE mixed tx — the sweep analog of
+/// [`assemble_mixed_note_psbt`]'s input-side generalization, but for
+/// sweeping (single destination output, no change, no note payload):
+/// flattens `notebook_sources` (each entry's `utxos` signed with that
+/// notebook's own tweaked key) plus, if present, the spending wallet's
+/// coins (each re-derived and signed via `crate::spending::derive_spending_key`)
+/// into a single `Vec<MixedInput>` and hands it to
+/// `notes_core::tx::build_sweep_tx_mixed`. `spending` is `None` when the
+/// spending wallet isn't participating in this sweep (not enabled, or no
+/// spending coins selected) — notebook-only sweeps still route through
+/// here so callers don't need two code paths.
+pub fn build_wallet_sweep_mixed(
+    notebook_sources: &[NotebookSweepSource],
+    spending: Option<(&crate::identity::KeyMaterial, notes_core::Network, u32, &[crate::funding::FundingUtxo])>,
+    dest_spk: Vec<u8>,
+    fee_rate: f64,
+) -> Result<notes_core::tx::NoteTx, Error> {
+    let mut inputs: Vec<notes_core::tx::MixedInput> = Vec::new();
+
+    for src in notebook_sources {
+        let prevout_spk = notes_core::address::p2tr_script_pubkey(&src.output_x);
+        for u in src.utxos {
+            inputs.push(notes_core::tx::MixedInput {
+                utxo: u.clone(),
+                prevout_spk: prevout_spk.clone(),
+                kind: notes_core::tx::InputKind::Taproot,
+                seckey: *src.tweaked_seckey,
+            });
+        }
+    }
+
+    if let Some((material, network, account, coins)) = spending {
+        for coin in coins {
+            let key = crate::spending::derive_spending_key(
+                material,
+                network,
+                account,
+                coin.chain as u32,
+                coin.index,
+            )?;
+            // FundingUtxo.txid is display-order hex (like MixedCoin.txid
+            // above); notes_core::tx::Utxo wants internal byte order — same
+            // decode+reverse `Store::available_utxos` already does.
+            let mut txid = [0u8; 32];
+            hex::decode_to_slice(&coin.txid, &mut txid)
+                .map_err(|e| Error::Funding(format!("bad txid: {e}")))?;
+            txid.reverse();
+            inputs.push(notes_core::tx::MixedInput {
+                utxo: notes_core::tx::Utxo { txid, vout: coin.vout, value: coin.value },
+                prevout_spk: key.script_pubkey,
+                kind: notes_core::tx::InputKind::P2wpkh,
+                seckey: *key.seckey,
+            });
+        }
+    }
+
+    if inputs.is_empty() {
+        return Err(Error::Funding("no coins to sweep".into()));
+    }
+
+    notes_core::tx::build_sweep_tx_mixed(&inputs, dest_spk, fee_rate, notes_core::keys::generate_aux_rand)
+        .map_err(Error::Notes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +445,254 @@ mod tests {
             MixedCoin { source: CoinSource::Wallet("w1".into()), txid: "c".repeat(64), vout: 0, value: 1000, chain: 0, index: 0 },
         ];
         assert!(spans_multiple_wallets(&mixed));
+    }
+
+    /// One notebook (one taproot coin) + one spending-wallet coin, swept
+    /// into a single external output — the mixed-source wallet-sweep
+    /// analog of `mixed_notebook_and_spending_psbt_signs_both_kinds` above,
+    /// but through `build_wallet_sweep_mixed`/`build_sweep_tx_mixed`
+    /// (raw signed tx, not a PSBT). Verification recipe mirrors notes-core's
+    /// own `sweep_mixed_taproot_and_wpkh_cross_check` test one layer down
+    /// (`prime-chain-notes/notes-core/tests/mixed_tx.rs`): re-derive both
+    /// sighashes independently via rust-bitcoin and check each witness
+    /// verifies under its own BIP against the actual signing key.
+    #[test]
+    fn wallet_sweep_mixed_one_notebook_and_spending_verifies_both_kinds() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::secp256k1::ecdsa::Signature as SecpEcdsaSignature;
+        use bitcoin::secp256k1::{
+            schnorr::Signature as SecpSchnorrSignature, Message, PublicKey as SecpPublicKey, Secp256k1,
+            XOnlyPublicKey,
+        };
+        use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
+        use bitcoin::{Amount, ScriptBuf, TxOut as BtcTxOut};
+
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let taproot_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
+        let taproot_utxo = notes_core::tx::Utxo { txid: [31u8; 32], vout: 0, value: 60_000 };
+        let notebook_sources = [NotebookSweepSource {
+            output_x: alice.output_x,
+            tweaked_seckey: &alice.tweaked_seckey,
+            utxos: std::slice::from_ref(&taproot_utxo),
+        }];
+
+        let spending_key0 = crate::spending::derive_spending_key(&material, net, 0, 0, 0).unwrap();
+        let coins = vec![crate::funding::FundingUtxo {
+            txid: "b".repeat(64),
+            vout: 1,
+            value: 40_000,
+            address: spending_key0.address.clone(),
+            chain: 0,
+            index: 0,
+            confirmed: true,
+        }];
+
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let dest_spk = notes_core::address::p2tr_script_pubkey(&bob.output_x);
+
+        let sweep = build_wallet_sweep_mixed(
+            &notebook_sources,
+            Some((&material, net, 0, &coins)),
+            dest_spk.clone(),
+            2.0,
+        )
+        .unwrap();
+
+        // Single destination output, everything minus fee — no change, no
+        // recipient, no OP_RETURN.
+        assert_eq!(sweep.tx.outputs.len(), 1);
+        assert_eq!(sweep.tx.outputs[0].script_pubkey, dest_spk);
+        assert_eq!(sweep.sent, 0);
+        assert_eq!(sweep.change, 0);
+
+        // Value conservation.
+        let in_value = 60_000 + 40_000u64;
+        assert_eq!(in_value, sweep.fee + sweep.tx.outputs[0].value);
+
+        // txid/vsize agreement with rust-bitcoin.
+        let raw = hex::decode(&sweep.raw_hex).unwrap();
+        let btx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&raw).unwrap();
+        assert_eq!(btx.compute_txid().to_string(), sweep.txid_hex);
+        assert_eq!(btx.vsize(), sweep.vsize);
+
+        // Both witness kinds verify under their own BIP.
+        let wpkh_input_spk = spending_key0.script_pubkey.clone();
+        let prevouts: Vec<BtcTxOut> = vec![
+            BtcTxOut { value: Amount::from_sat(60_000), script_pubkey: ScriptBuf::from_bytes(taproot_spk.clone()) },
+            BtcTxOut { value: Amount::from_sat(40_000), script_pubkey: ScriptBuf::from_bytes(wpkh_input_spk.clone()) },
+        ];
+        let secp = Secp256k1::verification_only();
+        let mut cache = SighashCache::new(&btx);
+
+        // Input 0: notebook taproot key-path (BIP340/341).
+        let output_key = XOnlyPublicKey::from_slice(&alice.output_x).unwrap();
+        let tap_sighash = cache
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), TapSighashType::Default)
+            .unwrap();
+        secp.verify_schnorr(
+            &SecpSchnorrSignature::from_slice(&sweep.tx.witnesses[0][0]).unwrap(),
+            &Message::from_digest(tap_sighash.to_byte_array()),
+            &output_key,
+        )
+        .expect("notebook sweep input must verify under BIP340/341");
+
+        // Input 1: spending-wallet P2WPKH (BIP143).
+        let wpkh_script_spk = ScriptBuf::from_bytes(wpkh_input_spk);
+        let wpkh_sighash = cache
+            .p2wpkh_signature_hash(1, &wpkh_script_spk, Amount::from_sat(40_000), EcdsaSighashType::All)
+            .unwrap();
+        let witness1 = &sweep.tx.witnesses[1];
+        let sig_bytes = &witness1[0];
+        assert_eq!(*sig_bytes.last().unwrap(), 0x01, "SIGHASH_ALL byte");
+        let der = &sig_bytes[..sig_bytes.len() - 1];
+        let pubkey_bytes = &witness1[1];
+        let secp_sig = SecpEcdsaSignature::from_der(der).unwrap();
+        let secp_pubkey = SecpPublicKey::from_slice(pubkey_bytes).unwrap();
+        secp.verify_ecdsa(&Message::from_digest(wpkh_sighash.to_byte_array()), &secp_sig, &secp_pubkey)
+            .expect("spending-wallet sweep input must verify under BIP143");
+    }
+
+    /// Two notebooks + the spending wallet flattened into ONE mixed sweep
+    /// tx — proves `build_wallet_sweep_mixed` correctly flattens several
+    /// `NotebookSweepSource` entries and that each notebook's coin is
+    /// signed with ITS OWN key (not a shared/wrong one): each witness
+    /// verifies against its own notebook's `output_x` and explicitly does
+    /// NOT verify against the other notebook's.
+    #[test]
+    fn wallet_sweep_mixed_multiple_notebooks_each_sign_their_own_coin() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::secp256k1::{schnorr::Signature as SecpSchnorrSignature, Message, Secp256k1, XOnlyPublicKey};
+        use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+        use bitcoin::{Amount, ScriptBuf, TxOut as BtcTxOut};
+
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let carol = Identity::from_app_seed(&[11u8; 32]).unwrap();
+        let alice_utxo = notes_core::tx::Utxo { txid: [31u8; 32], vout: 0, value: 30_000 };
+        let carol_utxo = notes_core::tx::Utxo { txid: [32u8; 32], vout: 2, value: 20_000 };
+        let notebook_sources = [
+            NotebookSweepSource {
+                output_x: alice.output_x,
+                tweaked_seckey: &alice.tweaked_seckey,
+                utxos: std::slice::from_ref(&alice_utxo),
+            },
+            NotebookSweepSource {
+                output_x: carol.output_x,
+                tweaked_seckey: &carol.tweaked_seckey,
+                utxos: std::slice::from_ref(&carol_utxo),
+            },
+        ];
+
+        let spending_key0 = crate::spending::derive_spending_key(&material, net, 0, 0, 0).unwrap();
+        let coins = vec![crate::funding::FundingUtxo {
+            txid: "c".repeat(64),
+            vout: 1,
+            value: 50_000,
+            address: spending_key0.address.clone(),
+            chain: 0,
+            index: 0,
+            confirmed: true,
+        }];
+
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let dest_spk = notes_core::address::p2tr_script_pubkey(&bob.output_x);
+
+        let sweep = build_wallet_sweep_mixed(
+            &notebook_sources,
+            Some((&material, net, 0, &coins)),
+            dest_spk.clone(),
+            2.0,
+        )
+        .unwrap();
+
+        assert_eq!(sweep.tx.outputs.len(), 1);
+        assert_eq!(sweep.tx.outputs[0].script_pubkey, dest_spk);
+        let in_value = 30_000 + 20_000 + 50_000u64;
+        assert_eq!(in_value, sweep.fee + sweep.tx.outputs[0].value);
+
+        let raw = hex::decode(&sweep.raw_hex).unwrap();
+        let btx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&raw).unwrap();
+        assert_eq!(btx.compute_txid().to_string(), sweep.txid_hex);
+
+        let alice_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
+        let carol_spk = notes_core::address::p2tr_script_pubkey(&carol.output_x);
+        let prevouts: Vec<BtcTxOut> = vec![
+            BtcTxOut { value: Amount::from_sat(30_000), script_pubkey: ScriptBuf::from_bytes(alice_spk) },
+            BtcTxOut { value: Amount::from_sat(20_000), script_pubkey: ScriptBuf::from_bytes(carol_spk) },
+            BtcTxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(spending_key0.script_pubkey.clone()),
+            },
+        ];
+        let secp = Secp256k1::verification_only();
+        let mut cache = SighashCache::new(&btx);
+
+        for (id, i) in [(&alice, 0usize), (&carol, 1usize)] {
+            let output_key = XOnlyPublicKey::from_slice(&id.output_x).unwrap();
+            let sighash = cache
+                .taproot_key_spend_signature_hash(i, &Prevouts::All(&prevouts), TapSighashType::Default)
+                .unwrap();
+            secp.verify_schnorr(
+                &SecpSchnorrSignature::from_slice(&sweep.tx.witnesses[i][0]).unwrap(),
+                &Message::from_digest(sighash.to_byte_array()),
+                &output_key,
+            )
+            .unwrap_or_else(|_| panic!("notebook at input {i} must verify with its own key"));
+        }
+
+        // Cross-check: alice's signature must NOT verify against carol's
+        // key — proves each notebook signs with its OWN key, not a shared
+        // or swapped one.
+        let carol_key = XOnlyPublicKey::from_slice(&carol.output_x).unwrap();
+        let alice_sighash = cache
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), TapSighashType::Default)
+            .unwrap();
+        assert!(secp
+            .verify_schnorr(
+                &SecpSchnorrSignature::from_slice(&sweep.tx.witnesses[0][0]).unwrap(),
+                &Message::from_digest(alice_sighash.to_byte_array()),
+                &carol_key,
+            )
+            .is_err());
+    }
+
+    /// `spending: None` — the all-taproot degenerate case still routes
+    /// through the mixed path cleanly (notebook-only wallet sweeps don't
+    /// need a separate code path from mixed ones).
+    #[test]
+    fn wallet_sweep_mixed_notebook_only_with_no_spending_participant() {
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let utxo = notes_core::tx::Utxo { txid: [41u8; 32], vout: 0, value: 50_000 };
+        let notebook_sources = [NotebookSweepSource {
+            output_x: alice.output_x,
+            tweaked_seckey: &alice.tweaked_seckey,
+            utxos: std::slice::from_ref(&utxo),
+        }];
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let dest_spk = notes_core::address::p2tr_script_pubkey(&bob.output_x);
+
+        let sweep = build_wallet_sweep_mixed(&notebook_sources, None, dest_spk.clone(), 2.0).unwrap();
+        assert_eq!(sweep.tx.outputs.len(), 1);
+        assert_eq!(sweep.tx.outputs[0].script_pubkey, dest_spk);
+        assert_eq!(sweep.fee + sweep.tx.outputs[0].value, 50_000);
+    }
+
+    /// Empty combined inputs (no notebook coins, no spending participant)
+    /// returns a clean "nothing to sweep" error rather than panicking or
+    /// falling through to notes-core's generic `InsufficientFunds`.
+    #[test]
+    fn wallet_sweep_mixed_empty_inputs_errors_cleanly() {
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let dest_spk = notes_core::address::p2tr_script_pubkey(&bob.output_x);
+        let err = build_wallet_sweep_mixed(&[], None, dest_spk, 2.0).unwrap_err();
+        match err {
+            Error::Funding(msg) => assert!(msg.contains("no coins to sweep"), "unexpected message: {msg}"),
+            other => panic!("expected Error::Funding, got {other:?}"),
+        }
     }
 }
