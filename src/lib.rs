@@ -3147,6 +3147,36 @@ fn update_change_label(w: &AppWindow, st: &mut State) {
         app_core::mixed::ChangeDefault::Notebook => "notebook".to_string(),
         app_core::mixed::ChangeDefault::Wallet(id) => format!("wallet:{id}"),
     };
+    w.set_change_default_choice(default_str.clone().into());
+    let default_reason = match &default {
+        app_core::mixed::ChangeDefault::Spending => "the spending wallet is paying".to_string(),
+        app_core::mixed::ChangeDefault::Notebook => "no spending wallet enabled".to_string(),
+        app_core::mixed::ChangeDefault::Wallet(id) => {
+            let label = st
+                .funding_wallets
+                .iter()
+                .find(|fw| &fw.id == id)
+                .map(|fw| fw.label.clone())
+                .unwrap_or_else(|| id.clone());
+            format!("{label} is paying")
+        }
+    };
+    w.set_change_default_reason(default_reason.into());
+    let notebook_line = addr_short(&st.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default());
+    w.set_change_notebook_line(notebook_line.into());
+    let spending_line = if st.spending_capable && spending_enabled {
+        if let (Some(src), Some(store)) = (st.spending_source.as_ref(), st.store.as_ref()) {
+            src.derive(1, store.spending.next_change)
+                .ok()
+                .map(|d| format!("{} · change #{}", addr_short(&d.address), store.spending.next_change))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    w.set_change_spending_line(spending_line.into());
     // An explicit pick this session (including "custom") always wins; the
     // default only applies while `change_choice` is unset.
     let choice = if st.change_choice.is_empty() { default_str } else { st.change_choice.clone() };
@@ -3709,11 +3739,18 @@ fn refresh_funding_list(w: &AppWindow, st: &State) {
             } else {
                 format!("{} · tap to scan for funds", fw.kind)
             };
+            let change_addr = fw
+                .source(st.network)
+                .ok()
+                .and_then(|src| src.derive(1, fw.next_change_index).ok())
+                .map(|d| addr_short(&d.address))
+                .unwrap_or_default();
             FundingWalletRow {
                 id: fw.id.clone().into(),
                 label: fw.label.clone().into(),
                 meta: meta.into(),
                 active: active.as_deref() == Some(fw.id.as_str()),
+                change_addr: change_addr.into(),
             }
         })
         .collect();
@@ -3748,6 +3785,7 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
             st.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
             st.funding_wallets[idx].coins = scan.utxos.len();
             st.funding_wallets[idx].scanned = true;
+            st.funding_wallets[idx].next_change_index = scan.next_change_index;
             st.save_funding_wallets();
             let empty = scan.utxos.is_empty();
             st.funding_coins = scan.utxos;
@@ -6482,6 +6520,7 @@ pub fn run() {
             s.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
             s.funding_wallets[idx].coins = scan.utxos.len();
             s.funding_wallets[idx].scanned = true;
+            s.funding_wallets[idx].next_change_index = scan.next_change_index;
             s.save_funding_wallets();
         }
         w.set_status("".into());
@@ -8384,9 +8423,9 @@ fn preview_mock(w: &AppWindow) {
     w.set_confirm_outputs(VecModel::from_slice(&outs));
 
     let wallets = [
-        FundingWalletRow { id: "aa".into(), label: "Signer · bc1p5cyxnux…".into(), meta: "taproot · 220,000 sats · 2 coins".into(), active: true },
-        FundingWalletRow { id: "bb".into(), label: "Sparrow hot wallet".into(), meta: "segwit · 45,000 sats · 1 coin".into(), active: false },
-        FundingWalletRow { id: "cc".into(), label: "segwit · tb1qr8k2p9…".into(), meta: "segwit · tap to scan for funds".into(), active: false },
+        FundingWalletRow { id: "aa".into(), label: "Signer · bc1p5cyxnux…".into(), meta: "taproot · 220,000 sats · 2 coins".into(), active: true, change_addr: "bc1p3qkhfe…uhk7".into() },
+        FundingWalletRow { id: "bb".into(), label: "Sparrow hot wallet".into(), meta: "segwit · 45,000 sats · 1 coin".into(), active: false, change_addr: "bc1qm34ls…dqfw".into() },
+        FundingWalletRow { id: "cc".into(), label: "segwit · tb1qr8k2p9…".into(), meta: "segwit · tap to scan for funds".into(), active: false, change_addr: "".into() },
     ];
     w.set_funding_wallets(VecModel::from_slice(&wallets));
 }

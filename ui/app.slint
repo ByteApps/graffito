@@ -37,7 +37,7 @@ export struct SpendCoin { outpoint: string, value: string, confirmed: bool, sele
 // the accent: note · self · recipient · change · input · other.
 export struct PsbtRow { title: string, subtitle: string, amount: string, kind: string }
 // A saved funding wallet in the manager list.
-export struct FundingWalletRow { id: string, label: string, meta: string, active: bool }
+export struct FundingWalletRow { id: string, label: string, meta: string, active: bool, change-addr: string }
 // `notebook` = owning notebook's display name (Activity is wallet-wide);
 // `pending` also gates the action buttons — only the ACTIVE notebook's
 // rows are actionable (bump/rebroadcast sign with its key).
@@ -1321,6 +1321,19 @@ export component AppWindow inherits Window {
     // applies (see app-core's resolve_change_default). Never reset by a
     // refresh once the user has chosen — only a fresh compose clears it.
     in-out property <string> change-choice: "";
+    // The ACTUAL default resolution (see app-core's resolve_change_default) —
+    // "spending" | "notebook" | "wallet:<id>" — independent of `change-choice`,
+    // which may be a user override; drives which row gets the "default" pill.
+    in property <string> change-default-choice: "";
+    // Human-readable reason the default row is the default, e.g. "the
+    // spending wallet is paying" / "no spending wallet enabled" / "<label>
+    // is paying".
+    in property <string> change-default-reason: "";
+    // Truncated notebook (identity) address, for the Notebook row's subtitle.
+    in property <string> change-notebook-line: "";
+    // Truncated fresh spending-wallet change address + index, e.g.
+    // "tb1p2ylq…q7ax · change #3" — "" when not derivable.
+    in property <string> change-spending-line: "";
     // shared camera-scan overlay (every "Scan QR" path uses it)
     in-out property <bool> scanning;
     in-out property <image> camera-frame;
@@ -4007,80 +4020,104 @@ export component AppWindow inherits Window {
                 spacing: 10px;
                 alignment: start;
                 if root.spending-capable && root.spending-enabled: Rectangle {
-                    height: 36px;
+                    height: chg-sp-row.preferred-height;
                     border-radius: 8px;
                     border-width: 1px;
                     border-color: root.change-choice == "spending" ? Pal.accent : Pal.line;
                     background: root.change-choice == "spending" ? Pal.accent.with-alpha(0.10) : Pal.card;
                     TouchArea { clicked => { root.change-pick("spending"); } }
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        Text {
-                            text: "Fresh spending-wallet address";
-                            font-size: 12px;
-                            color: root.change-choice == "spending" ? Pal.accent : Pal.text;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                            overflow: elide;
+                    chg-sp-row := VerticalLayout {
+                        padding: 10px;
+                        spacing: 3px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            Text {
+                                text: "Spending wallet · fresh change";
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: root.change-choice == "spending" ? Pal.accent : Pal.text;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            if root.change-default-choice == "spending": Badge { label: "default"; tint: Pal.accent; }
                         }
+                        if root.change-spending-line != "": Caption { text: root.change-spending-line; }
+                        if root.change-default-choice == "spending": Caption { text: root.change-default-reason; }
+                        Caption { text: "Never used before — keeps your funds unlinked."; }
                     }
                 }
                 Rectangle {
-                    height: 36px;
+                    height: chg-nb-row.preferred-height;
                     border-radius: 8px;
                     border-width: 1px;
                     border-color: root.change-choice == "notebook" ? Pal.accent : Pal.line;
                     background: root.change-choice == "notebook" ? Pal.accent.with-alpha(0.10) : Pal.card;
                     TouchArea { clicked => { root.change-pick("notebook"); } }
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        Text {
-                            text: "Notebook address";
-                            font-size: 12px;
-                            color: root.change-choice == "notebook" ? Pal.accent : Pal.text;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                            overflow: elide;
+                    chg-nb-row := VerticalLayout {
+                        padding: 10px;
+                        spacing: 3px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            Text {
+                                text: "Notebook";
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: root.change-choice == "notebook" ? Pal.accent : Pal.text;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            if root.change-default-choice == "notebook": Badge { label: "default"; tint: Pal.accent; }
                         }
+                        if root.change-notebook-line != "": Caption { text: root.change-notebook-line; }
+                        if root.change-default-choice == "notebook": Caption { text: root.change-default-reason; }
+                        Caption { text: "Reuses your public notebook address."; }
                     }
                 }
                 for fw in root.funding-wallets: Rectangle {
-                    height: 36px;
+                    height: chg-fw-row.preferred-height;
                     border-radius: 8px;
                     border-width: 1px;
                     border-color: root.change-choice == "wallet:" + fw.id ? Pal.accent : Pal.line;
                     background: root.change-choice == "wallet:" + fw.id ? Pal.accent.with-alpha(0.10) : Pal.card;
                     TouchArea { clicked => { root.change-pick("wallet:" + fw.id); } }
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        Text {
-                            text: fw.label + " change";
-                            font-size: 12px;
-                            color: root.change-choice == "wallet:" + fw.id ? Pal.accent : Pal.text;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                            overflow: elide;
+                    chg-fw-row := VerticalLayout {
+                        padding: 10px;
+                        spacing: 3px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            Text {
+                                text: fw.label + " change";
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: root.change-choice == "wallet:" + fw.id ? Pal.accent : Pal.text;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            if root.change-default-choice == "wallet:" + fw.id: Badge { label: "default"; tint: Pal.accent; }
                         }
+                        if fw.change-addr != "": Caption { text: fw.change-addr; }
+                        if root.change-default-choice == "wallet:" + fw.id: Caption { text: root.change-default-reason; }
+                        Caption { text: fw.label + "'s change chain."; }
                     }
                 }
                 Rectangle {
-                    height: 36px;
+                    height: chg-custom-row.preferred-height;
                     border-radius: 8px;
                     border-width: 1px;
                     border-color: root.change-choice == "custom" ? Pal.accent : Pal.line;
                     background: root.change-choice == "custom" ? Pal.accent.with-alpha(0.10) : Pal.card;
                     TouchArea { clicked => { root.change-pick("custom"); } }
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
+                    chg-custom-row := VerticalLayout {
+                        padding: 10px;
+                        spacing: 3px;
                         Text {
                             text: "Custom address…";
                             font-size: 12px;
+                            font-weight: 600;
                             color: root.change-choice == "custom" ? Pal.accent : Pal.text;
-                            vertical-alignment: center;
                             horizontal-stretch: 1;
                             overflow: elide;
                         }
@@ -4094,6 +4131,10 @@ export component AppWindow inherits Window {
                         edited => { root.compose-changed(); }
                     }
                     ScanButton { clicked => { root.change-scan(); } }
+                }
+                if root.change-choice == "custom": Caption {
+                    text: "Leaves this wallet — the coin won't be tracked here.";
+                    color: Pal.warn;
                 }
                 if root.change-error != "": Caption { text: root.change-error; color: Pal.bad; }
                 Caption { text: "Current: " + root.change-dest-label; }
