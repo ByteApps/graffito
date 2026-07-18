@@ -229,7 +229,11 @@ component EditField inherits Rectangle {
         }
     }
     function toolbar-action(a: string) {
-        if (a == "select-all") { ti.select-all(); }
+        // select-all re-fires cursor-position-changed (anchor jumps to 0);
+        // guard with internal-sel so handle-tap()'s reentrant call doesn't
+        // see a non-empty selection, fall through to its reset branch, and
+        // clear root.bubble out from under the "keep it open" logic below.
+        if (a == "select-all") { root.internal-sel = true; ti.select-all(); root.internal-sel = false; }
         if (a == "copy" && EditOps.ios) { do-copy(); }
         if (a == "copy" && !EditOps.ios) { ti.copy(); }
         if (a == "paste") { self.paste-clip(); }
@@ -265,7 +269,19 @@ component EditField inherits Rectangle {
                     EditOps.word-start(ti.text, ti.cursor-position-byte-offset),
                     EditOps.word-end(ti.text, ti.cursor-position-byte-offset));
                 root.internal-sel = false;
-                root.bubble = true;
+                // Bubble reveal is DEFERRED to dbl's `triggered` handler
+                // below, NOT shown here: the bubble floats just above the
+                // word we just selected, only ~8px from the text row, which
+                // is exactly where a real 3rd tap (finishing a triple-tap)
+                // tends to land. A plain Rectangle — even one with no
+                // TouchArea of its own — still swallows taps inside its
+                // bounds (see the QR-zoom overlay gotcha), so an immediately
+                // -shown bubble silently eats the 3rd tap before it reaches
+                // the TextInput, breaking triple-tap-select-all on-device
+                // (confirmed: a tap landing in the bubble's padding does
+                // nothing and never reaches handle-tap). Deferring keeps the
+                // bubble off-screen for the whole window a 3rd tap could
+                // still arrive in.
                 dbl.running = false;
                 dbl.running = true;   // keep the window open for a 3rd tap
             } else {
@@ -294,7 +310,15 @@ component EditField inherits Rectangle {
     dbl := Timer {
         interval: 350ms;
         running: false;
-        triggered => { self.running = false; }
+        triggered => {
+            self.running = false;
+            // Window closed with no 3rd tap: reveal the bubble the
+            // tap-count==2 branch above deferred. `has-focus` re-check
+            // avoids popping it up over a field the user already left.
+            if (root.tap-count == 2 && ti.has-focus) {
+                root.bubble = true;
+            }
+        }
     }
 
     // placeholder — declared BELOW the input stack: a Text element laid
@@ -458,7 +482,11 @@ component EditArea inherits Rectangle {
         }
     }
     function toolbar-action(a: string) {
-        if (a == "select-all") { ti.select-all(); }
+        // select-all re-fires cursor-position-changed (anchor jumps to 0);
+        // guard with internal-sel so handle-tap()'s reentrant call doesn't
+        // see a non-empty selection, fall through to its reset branch, and
+        // clear root.bubble out from under the "keep it open" logic below.
+        if (a == "select-all") { root.internal-sel = true; ti.select-all(); root.internal-sel = false; }
         if (a == "copy" && EditOps.ios) { do-copy(); }
         if (a == "copy" && !EditOps.ios) { ti.copy(); }
         if (a == "paste") { self.paste-clip(); }
@@ -489,7 +517,19 @@ component EditArea inherits Rectangle {
                     EditOps.word-start(ti.text, ti.cursor-position-byte-offset),
                     EditOps.word-end(ti.text, ti.cursor-position-byte-offset));
                 root.internal-sel = false;
-                root.bubble = true;
+                // Bubble reveal is DEFERRED to dbl's `triggered` handler
+                // below, NOT shown here: the bubble floats just above the
+                // word we just selected, only ~8px from the text row, which
+                // is exactly where a real 3rd tap (finishing a triple-tap)
+                // tends to land. A plain Rectangle — even one with no
+                // TouchArea of its own — still swallows taps inside its
+                // bounds (see the QR-zoom overlay gotcha), so an immediately
+                // -shown bubble silently eats the 3rd tap before it reaches
+                // the TextInput, breaking triple-tap-select-all on-device
+                // (confirmed: a tap landing in the bubble's padding does
+                // nothing and never reaches handle-tap). Deferring keeps the
+                // bubble off-screen for the whole window a 3rd tap could
+                // still arrive in.
                 dbl.running = false;
                 dbl.running = true;   // keep the window open for a 3rd tap
             } else {
@@ -518,7 +558,15 @@ component EditArea inherits Rectangle {
     dbl := Timer {
         interval: 350ms;
         running: false;
-        triggered => { self.running = false; }
+        triggered => {
+            self.running = false;
+            // Window closed with no 3rd tap: reveal the bubble the
+            // tap-count==2 branch above deferred. `has-focus` re-check
+            // avoids popping it up over a field the user already left.
+            if (root.tap-count == 2 && ti.has-focus) {
+                root.bubble = true;
+            }
+        }
     }
 
     Text {
