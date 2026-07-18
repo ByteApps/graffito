@@ -10,6 +10,7 @@
 
 pub mod chain;
 pub mod compose;
+pub mod confirm;
 pub mod derive;
 pub mod funding;
 pub mod identity;

@@ -152,8 +152,10 @@ pub fn coins_summary_line(
 
 /// Group digits with thousands separators — local copy of the same helper
 /// `src/lib.rs` has (kept tiny and dependency-free rather than plumbing a
-/// shared crate for one function).
-fn commas(n: u64) -> String {
+/// shared crate for one function). `pub(crate)` so `confirm.rs` (the
+/// universal confirm-screen summarizer) reuses it instead of writing a
+/// third copy.
+pub(crate) fn commas(n: u64) -> String {
     let s = n.to_string();
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
