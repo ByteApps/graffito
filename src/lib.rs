@@ -263,7 +263,8 @@ struct State {
 /// rebuild rather than re-POST possibly-stale signed bytes.
 #[derive(Clone)]
 struct PendingBroadcast {
-    kind: &'static str, // "compose" | "compose-spending" | "compose-mixed" | "psbt"
+    kind: &'static str, // "compose" | "compose-spending" | "compose-mixed" | "psbt" |
+    // "sweep" | "consolidate" | "wconsol" | "spending-consolidate" | "bump" | "rebroadcast"
     raw_hex: String,
     txid: String,
     vsize: usize,
@@ -337,6 +338,32 @@ enum PendingPayload {
     /// screen's navigation, so stage B is the pre-existing
     /// `on_psbt_broadcast` body verbatim — this variant carries nothing.
     Psbt,
+    /// Wallet-level sweep (`on_sweep_send`'s keyed self-paid tail → the
+    /// (removed) sweep-confirm modal used to trigger `on_sweep`, kind
+    /// "sweep"): build+sign already ran in stage A; stage B is the
+    /// pre-existing `SWEEP_BROADCAST_RESULTS` thread-spawn, moved
+    /// verbatim.
+    Sweep { snap: SweepSnapshot },
+    /// Single-notebook consolidate (`on_sweep_send`'s keyed self-paid
+    /// tail, kind "consolidate") — same shape as `Sweep`.
+    Consolidate { snap: ConsolidateSnapshot },
+    /// Wallet-level consolidate (account picker "wconsol" mode — picking
+    /// the destination row IS the trigger now, kind "wconsol").
+    WConsol { snap: WConsolSnapshot },
+    /// Spending-wallet consolidate ("Consolidate spending coins…", kind
+    /// "spending-consolidate").
+    SpendingConsolidate { snap: SpendingConsolidateSnapshot },
+    /// Activity Speed-up (`on_act_bump_confirm`, kind "bump") — the
+    /// re-sign already ran + saved in stage A; stage B re-arms
+    /// `act_pending_ref` (moved here from the old pre-broadcast point,
+    /// mirroring `wallet_tx_busy` elsewhere) and spawns the SAME
+    /// broadcast worker pushing `ActBumpResult`.
+    Bump { ref_id: String, fee: u64, new_rate: f64 },
+    /// Activity Rebroadcast (`on_act_retry`, kind "rebroadcast") — stage A
+    /// already resolved the raw hex (locally cached, or via a worker
+    /// fetch for chain-recovered/watch records with none cached); stage B
+    /// is the pre-existing broadcast thread-spawn pushing `ActRetryResult`.
+    Rebroadcast { ref_id: String },
 }
 
 /// One wallet-consolidate session (Coins → "Consolidate into one coin…").
@@ -618,77 +645,6 @@ fn tx_rate(store: &Store, ref_id: &str, is_note: bool) -> Option<(f64, u64, u64)
     } else {
         let t = store.txs.iter().find(|t| t.txids.iter().any(|x| x == ref_id))?;
         (t.vsize > 0).then(|| (t.fee as f64 / t.vsize as f64, t.fee, t.vsize))
-    }
-}
-
-/// Refresh the consolidate confirm-dialog fee line. Free function (not
-/// just the callback) so on_sweep_send can call it WITHOUT re-invoking
-/// the slint callback — that re-borrows the State RefCell and panics.
-fn refresh_consolidate_preview(w: &AppWindow, s: &mut State) {
-    let _ = &s;
-    w.set_consolidate_fee_line("".into());
-    let rate: f64 = w.get_consolidate_rate().trim().parse().unwrap_or(1.0);
-    let net = s.network;
-    let Some(ident) = s.ident.as_ref() else { return };
-    let Ok(me) = Recipient::parse(net, &ident.address) else { return };
-    if ident.is_watch() {
-        // Dry-run the same builder the watch consolidate signs externally.
-        let Some(src) = ident.watch_source() else { return };
-        let Some(store) = s.store.as_ref() else { return };
-        let nb = ident.index;
-        let coins: Vec<WatchCoin> = store
-            .utxos
-            .iter()
-            .filter(|u| !u.pending_spend)
-            .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: nb })
-            .collect();
-        if coins.len() < 2 {
-            w.set_consolidate_fee_line("nothing to consolidate — need 2+ spendable coins".into());
-            return;
-        }
-        match build_watch_spend_psbt(src, &coins, me.spk.clone(), rate) {
-            Ok(b) => w.set_consolidate_fee_line(
-                format!(
-                    "fee {} sats · combines {} coins @ {} sat/vB · signs on your external wallet",
-                    b.fee,
-                    coins.len(),
-                    rate
-                )
-                .into(),
-            ),
-            Err(e) => w.set_consolidate_fee_line(format!("{e}").into()),
-        }
-        return;
-    }
-    let Some(identity) = ident.full().map(|i| i.clone_fields()) else { return };
-    let Some(store) = s.store.as_ref() else { return };
-    let coins = store.available_utxos();
-    if coins.len() < 2 {
-        w.set_consolidate_fee_line("nothing to consolidate — need 2+ spendable coins".into());
-        return;
-    }
-    match app_core::notes_core::tx::build_sweep_tx(
-        &coins,
-        &identity.output_x,
-        me.spk,
-        rate,
-        &identity.tweaked_seckey,
-        app_core::notes_core::keys::generate_aux_rand,
-    ) {
-        Ok(tx) => {
-            println!("cb: consolidate-preview coins={} fee={} vsize={}", coins.len(), tx.fee, tx.vsize);
-            w.set_consolidate_fee_line(
-                format!(
-                    "fee {} sats · combines {} coins · {} vB @ {} sat/vB",
-                    tx.fee,
-                    coins.len(),
-                    tx.vsize,
-                    rate
-                )
-                .into(),
-            );
-        }
-        Err(e) => w.set_consolidate_fee_line(format!("estimate failed: {e}").into()),
     }
 }
 
@@ -2428,6 +2384,49 @@ struct DiscoveryResult {
 
 static DISCOVERY_RESULTS: std::sync::Mutex<Vec<DiscoveryResult>> = std::sync::Mutex::new(Vec::new());
 
+/// A finished rebroadcast raw-hex fetch (`on_act_retry`'s sub-case (b): a
+/// chain-recovered/watch record with no locally cached hex) — waiting to
+/// enter the universal confirm screen on the UI thread. Mirrors
+/// `SpendingRefreshResult`'s staleness pattern, anchored on the identity
+/// address (switching identity mid-fetch drops the result rather than
+/// misapplying it).
+struct RebroadcastFetchResult {
+    ref_id: String,
+    is_note: bool,
+    identity_addr: String,
+    result: Result<String, String>,
+}
+static REBROADCAST_FETCH_RESULTS: std::sync::Mutex<Vec<RebroadcastFetchResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The UI-thread half of `on_act_retry`'s sub-case (b): clear the transient
+/// fetch guard, drop a stale result, and either enter the confirm screen
+/// (fetch succeeded) or report the failure — same shape as
+/// `apply_spending_refresh_results`.
+fn apply_pending_rebroadcast_fetch_results(w: &AppWindow, st: &mut State) {
+    let results: Vec<RebroadcastFetchResult> =
+        REBROADCAST_FETCH_RESULTS.lock().expect("rebroadcast fetch results mutex").drain(..).collect();
+    for r in results {
+        st.act_pending_ref = None;
+        if st.ident.as_ref().map(|i| i.address.as_str()) != Some(r.identity_addr.as_str()) {
+            println!("cb: rebroadcast-fetch stale-drop");
+            continue;
+        }
+        match r.result {
+            Ok(raw) if !raw.is_empty() => enter_rebroadcast_confirm(w, st, r.ref_id, r.is_note, raw),
+            Ok(_) => {
+                println!("cb: act-retry ref={} err=nothing-to-rebroadcast", r.ref_id);
+                w.set_status("nothing to rebroadcast".into());
+            }
+            Err(e) => {
+                println!("cb: act-retry ref={} err={e}", r.ref_id);
+                w.set_status(format!("couldn't rebroadcast: {e}").into());
+            }
+        }
+    }
+    update_activity(w, st);
+}
+
 /// A finished Activity Rebroadcast (`on_act_retry`) broadcast POST, waiting
 /// to be applied on the UI thread — clears `State.act_pending_ref` and
 /// shows the toast (2026-07-16: rebroadcast used to give no feedback at
@@ -2513,7 +2512,10 @@ fn apply_act_bump_results(w: &AppWindow, st: &mut State) {
 
 /// Non-`result` half of [`SweepBroadcastResult`] — built on the UI thread
 /// before spawning (owns everything the apply side needs), moved into the
-/// worker, then wrapped with the real broadcast result and pushed.
+/// worker, then wrapped with the real broadcast result and pushed. `Clone`
+/// so it can also ride in `PendingPayload::Sweep` (universal confirm
+/// screen, funding-unification follow-up 2026-07-17).
+#[derive(Clone)]
 struct SweepSnapshot {
     /// The active notebook's address at spawn time — if it no longer
     /// matches on the apply side (identity/account/notebook switched
@@ -2648,8 +2650,9 @@ fn apply_sweep_broadcast_result(w: &AppWindow, st: &mut State, r: SweepBroadcast
 }
 
 /// Non-`result` half of a single-notebook consolidate broadcast (screen 16,
-/// kind "consolidate", classic confirm modal) — same shape as
-/// [`SweepSnapshot`], one store instead of many.
+/// kind "consolidate") — same shape as [`SweepSnapshot`], one store instead
+/// of many. `Clone` for `PendingPayload::Consolidate`.
+#[derive(Clone)]
 struct ConsolidateSnapshot {
     identity_addr: String,
     value: u64,
@@ -2708,7 +2711,9 @@ fn apply_consolidate_broadcast_result(w: &AppWindow, st: &mut State, r: Consolid
 /// "Consolidate wallet…", keyed non-watch path) — spans potentially several
 /// SOURCE notebook stores plus a DESTINATION store, so its staleness anchor
 /// is the identity/network/account triple (`fp8`), same guard shape as
-/// [`SpendingRefreshResult`], not a single notebook address.
+/// [`SpendingRefreshResult`], not a single notebook address. `Clone` for
+/// `PendingPayload::WConsol`.
+#[derive(Clone)]
 struct WConsolSnapshot {
     fp8: String,
     network: Network,
@@ -2924,7 +2929,9 @@ fn apply_psbt_broadcast_result(w: &AppWindow, st: &mut State, r: PsbtBroadcastRe
 /// EVERY spending coin into one, at the next fresh spending receive
 /// address, signed in-app (no external wallet). Staleness anchor is the
 /// identity/network/account triple, like [`WConsolSnapshot`] (the spending
-/// section lives at the account level, not a single notebook).
+/// section lives at the account level, not a single notebook). `Clone` for
+/// `PendingPayload::SpendingConsolidate`.
+#[derive(Clone)]
 struct SpendingConsolidateSnapshot {
     fp8: String,
     network: Network,
@@ -4971,6 +4978,137 @@ fn notebook_prevouts(
         .collect()
 }
 
+/// `ConfirmCtx.prevouts` from already-known inputs whose value is already
+/// in hand (gathered while building a sweep/consolidate tx, unlike
+/// `notebook_prevouts`'s compose-path shape which must look values up) —
+/// every entry gets the SAME address + source label. Multi-source flows
+/// (wallet sweep, wconsol) build the map entry-by-entry themselves instead
+/// (each input needs its OWN owning notebook's label).
+fn labeled_prevouts(
+    inputs: &[app_core::store::TxInput],
+    address: Option<&str>,
+    source: &str,
+) -> HashMap<String, app_core::confirm::PrevoutInfo> {
+    inputs
+        .iter()
+        .map(|inp| {
+            (
+                format!("{}:{}", inp.txid, inp.vout),
+                app_core::confirm::PrevoutInfo {
+                    value: inp.value,
+                    address: address.map(str::to_string),
+                    source: source.to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// `ConfirmCtx.prevouts` for a STORED pending record's inputs — used by
+/// Speed-up and Rebroadcast, where the tx was already built earlier (not
+/// freshly composed this session, so there's no fresh coin list in hand).
+/// A note spend is always this notebook's own single address (coin
+/// control only ever spends one notebook's own UTXOs). A sweep/consolidate
+/// record resolves each input's owning notebook from
+/// `TxRecord.input_indexes`/`input_accounts` where available (multi-key
+/// wallet ops); an input with no resolvable owner (a mixed notebook+
+/// spending-wallet record has none at all — see `TxRecord.mixed_inputs`)
+/// gets an empty source/no address — honest partial disclosure, never a
+/// fabricated one; the confirm module renders that as "source unknown".
+fn stored_record_prevouts(
+    st: &State,
+    ref_id: &str,
+    is_note: bool,
+) -> HashMap<String, app_core::confirm::PrevoutInfo> {
+    let Some(store) = st.store.as_ref() else { return HashMap::new() };
+    if is_note {
+        let Some(rec) = store.notes.iter().find(|n| n.note_id == ref_id) else { return HashMap::new() };
+        let name = st.notebook_display_name(st.ident.as_ref().map(|i| i.index).unwrap_or(0));
+        let addr = st.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
+        return rec
+            .spent
+            .iter()
+            .map(|op| {
+                let value = store
+                    .utxos
+                    .iter()
+                    .find(|u| u.txid == op.txid && u.vout == op.vout)
+                    .map(|u| u.value)
+                    .unwrap_or(0);
+                (
+                    format!("{}:{}", op.txid, op.vout),
+                    app_core::confirm::PrevoutInfo {
+                        value,
+                        address: Some(addr.clone()),
+                        source: format!("Notebook · {name}"),
+                    },
+                )
+            })
+            .collect();
+    }
+    let Some(rec) = store.txs.iter().find(|t| t.txids.iter().any(|x| x == ref_id)) else {
+        return HashMap::new();
+    };
+    let material = st.material.as_deref().and_then(|m| parse_key_material(m, st.network).ok());
+    rec.inputs
+        .iter()
+        .enumerate()
+        .map(|(i, inp)| {
+            let owner = if !rec.input_indexes.is_empty() {
+                rec.input_indexes.get(i).map(|idx| (st.account, *idx))
+            } else if !rec.input_accounts.is_empty() {
+                rec.input_accounts.get(i).map(|acct| (*acct, 0u32))
+            } else {
+                None
+            };
+            let info = match (owner, material.as_ref()) {
+                (Some((acct, idx)), Some(m)) => match realize(m, st.network, acct, idx) {
+                    Ok(ident) => app_core::confirm::PrevoutInfo {
+                        value: inp.value,
+                        address: Some(ident.address.clone()),
+                        source: if acct == st.account {
+                            format!("Notebook · {}", st.notebook_display_name(idx))
+                        } else {
+                            format!("Notebook · account {acct}")
+                        },
+                    },
+                    Err(_) => {
+                        app_core::confirm::PrevoutInfo { value: inp.value, address: None, source: String::new() }
+                    }
+                },
+                _ => app_core::confirm::PrevoutInfo { value: inp.value, address: None, source: String::new() },
+            };
+            (format!("{}:{}", inp.txid, inp.vout), info)
+        })
+        .collect()
+}
+
+/// `ConfirmCtx.expected_change` for a note's Speed-up/Rebroadcast: a note
+/// composed with a custom (non-self) change address persists it on the
+/// record (`NoteRecord.change_to`) specifically so RBF/rebroadcast keep
+/// classifying it correctly — without this, a bumped/rebroadcast note's
+/// custom-change output would wrongly read "other" (foreign) and trip the
+/// paranoid warning on every legitimate replacement. Sweep/consolidate
+/// records have no custom-change concept, so `None` for those.
+fn stored_record_expected_change(st: &State, ref_id: &str, is_note: bool) -> Option<String> {
+    if !is_note {
+        return None;
+    }
+    st.store.as_ref()?.notes.iter().find(|n| n.note_id == ref_id)?.change_to.clone()
+}
+
+/// Decode a raw signed tx's txid + vsize directly (no `ConfirmCtx` needed)
+/// — used by the rebroadcast path, which has the raw hex in hand (cached
+/// or freshly fetched) but no build-time `NoteTx`/`finalize_extract`
+/// result to read them from. `None` on malformed hex; the caller falls
+/// back to empty/zero, and `show_confirm`'s own decode will independently
+/// (and honestly) fail too.
+fn decode_txid_vsize(raw_hex: &str) -> Option<(String, usize)> {
+    let bytes = hex::decode(raw_hex.trim()).ok()?;
+    let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&bytes).ok()?;
+    Some((tx.compute_txid().to_string(), tx.vsize()))
+}
+
 /// Populate the universal confirm screen (26) from a signed raw tx +
 /// [`app_core::confirm::ConfirmCtx`], and stash `pending` for the
 /// Broadcast/Cancel taps. `summarize_signed_tx` decodes `pending.raw_hex`
@@ -5017,6 +5155,535 @@ fn show_confirm(w: &AppWindow, st: &mut State, pending: PendingBroadcast, ctx: a
     w.set_status("".into());
     st.pending_broadcast = Some(PendingBroadcast { return_screen, ..pending });
     w.set_screen(26);
+}
+
+/// Stage A for a wallet-level sweep (screen 16, `sweep-kind == "sweep"`,
+/// keyed self-paid — `on_sweep_send`'s tail): gathers every active
+/// notebook's coins (+ the spending wallet's, mixed-sweep style) exactly
+/// as the old `on_sweep` modal handler did, builds + signs the multi-key
+/// tx, then hands off to the universal confirm screen instead of
+/// broadcasting immediately. The sweep destination is passed as
+/// `ConfirmCtx.recipient` (no name) so it classifies "recipient" even
+/// when it happens to be a foreign address — the paranoid "other"
+/// tripwire is reserved for an address NOBODY chose, so a legitimate
+/// sweep doesn't cry wolf on every tap. Stage B
+/// (`on_confirm_broadcast`/`PendingPayload::Sweep`) is the pre-existing
+/// `SWEEP_BROADCAST_RESULTS` thread-spawn, moved verbatim.
+fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
+    let net = s.network;
+    if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+        return; // caller already routes watch identities to watch_spend_build
+    }
+    if s.base_url().is_none() {
+        w.set_status("no Bitcoin node — set one in Settings".into());
+        return;
+    }
+    let Ok(recipient) = Recipient::parse(net, &dest) else {
+        w.set_status(format!("not a valid {} address", net.as_str()).into());
+        return;
+    };
+    let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+        return;
+    };
+    let Ok(material) = parse_key_material(&material_str, net) else { return };
+    let mut idents: Vec<(
+        u32,
+        app_core::notes_core::bundle::Identity,
+        Vec<app_core::notes_core::tx::Utxo>,
+        String,
+    )> = Vec::new();
+    if let Some(ix) = &s.notebooks {
+        for m in ix.active(s.account) {
+            let Some(store) = notebook_store(s, m.index) else { continue };
+            let coins = store.available_utxos();
+            if coins.is_empty() {
+                continue;
+            }
+            let Ok(ident) = realize(&material, net, s.account, m.index) else { continue };
+            let addr = ident.address.clone();
+            let Some(full) = ident.full().map(|i| i.clone_fields()) else { continue };
+            idents.push((m.index, full, coins, addr));
+        }
+    }
+    // CHANGE 2: gather the spending wallet's coins too — UNLESS this
+    // sweep's destination IS the spending wallet's own next receive
+    // address (`on_spending_sweep_here`), where including them would
+    // sweep the spending wallet into itself.
+    let spending_coins_for_sweep: Vec<FundingUtxo> = if s.pending_spending_sweep_index.is_none()
+        && s.spending_capable
+        && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
+    {
+        s.spending_coins.clone()
+    } else {
+        Vec::new()
+    };
+    if idents.is_empty() && spending_coins_for_sweep.is_empty() {
+        w.set_status("nothing to sweep".into());
+        return;
+    }
+    let mut all_inputs: Vec<app_core::store::TxInput> = Vec::new();
+    let mut prevouts: HashMap<String, app_core::confirm::PrevoutInfo> = HashMap::new();
+    let notebook_locks: Vec<(u32, Vec<(String, u32)>)> = idents
+        .iter()
+        .map(|(index, _, coins, addr)| {
+            let name = s.notebook_display_name(*index);
+            let source = format!("Notebook · {name}");
+            let locks: Vec<(String, u32)> = coins
+                .iter()
+                .map(|u| {
+                    let mut t = u.txid;
+                    t.reverse();
+                    let txid_hex = hex::encode(t);
+                    all_inputs.push(app_core::store::TxInput {
+                        txid: txid_hex.clone(),
+                        vout: u.vout,
+                        value: u.value,
+                    });
+                    prevouts.insert(
+                        format!("{txid_hex}:{}", u.vout),
+                        app_core::confirm::PrevoutInfo {
+                            value: u.value,
+                            address: Some(addr.clone()),
+                            source: source.clone(),
+                        },
+                    );
+                    (txid_hex, u.vout)
+                })
+                .collect();
+            (*index, locks)
+        })
+        .collect();
+    let dest_spk_hex = hex::encode(&recipient.spk);
+    let mixed = !spending_coins_for_sweep.is_empty();
+    // Mixed record: no per-input owner scheme covers both notebook and
+    // spending-wallet inputs, so it can't be RBF-bumped — see CHANGE 2 /
+    // TxRecord.mixed_inputs. A pure-notebook sweep keeps its owners
+    // (bumpable, unchanged).
+    let input_indexes: Vec<u32> = if mixed {
+        Vec::new()
+    } else {
+        idents.iter().flat_map(|(a, _, coins, _)| std::iter::repeat(*a).take(coins.len())).collect()
+    };
+    let spending_spent: Vec<(String, u32)> =
+        spending_coins_for_sweep.iter().map(|c| (c.txid.clone(), c.vout)).collect();
+    if mixed {
+        for c in &spending_coins_for_sweep {
+            all_inputs.push(app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value });
+            prevouts.insert(
+                format!("{}:{}", c.txid, c.vout),
+                app_core::confirm::PrevoutInfo {
+                    value: c.value,
+                    address: Some(c.address.clone()),
+                    source: "Spending wallet".to_string(),
+                },
+            );
+        }
+    }
+    let sweep: Result<app_core::notes_core::tx::NoteTx, String> = if mixed {
+        let notebook_sources: Vec<app_core::mixed::NotebookSweepSource> = idents
+            .iter()
+            .map(|(_, id, coins, _)| app_core::mixed::NotebookSweepSource {
+                output_x: id.output_x,
+                tweaked_seckey: &id.tweaked_seckey,
+                utxos: coins,
+            })
+            .collect();
+        app_core::mixed::build_wallet_sweep_mixed(
+            &notebook_sources,
+            Some((&material, net, s.account, &spending_coins_for_sweep)),
+            recipient.spk.clone(),
+            rate,
+        )
+        .map_err(|e| format!("{e}"))
+    } else {
+        let sources: Vec<app_core::notes_core::tx::SweepSource> = idents
+            .iter()
+            .map(|(_, id, coins, _)| app_core::notes_core::tx::SweepSource {
+                utxos: coins,
+                output_x: id.output_x,
+                tweaked_seckey: &id.tweaked_seckey,
+            })
+            .collect();
+        app_core::notes_core::tx::build_sweep_tx_multi(
+            &sources,
+            recipient.spk.clone(),
+            rate,
+            app_core::notes_core::keys::generate_aux_rand,
+        )
+        .map_err(|e| format!("{e}"))
+    };
+    match sweep {
+        Ok(tx) => {
+            let snap = SweepSnapshot {
+                identity_addr: s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default(),
+                dest: dest.clone(),
+                dest_spk_hex,
+                value: tx.tx.outputs[0].value,
+                fee: tx.fee,
+                vsize: tx.vsize as u64,
+                raw_hex: tx.raw_hex.clone(),
+                notebook_locks,
+                all_inputs,
+                input_indexes,
+                mixed,
+                spending_spent,
+                pending_spending_sweep_index: s.pending_spending_sweep_index,
+                notebooks_n: idents.len(),
+            };
+            let (self_spks, spending_spks) = confirm_self_spks(s);
+            let ctx = app_core::confirm::ConfirmCtx {
+                network: app_core::derive::btc_network(net),
+                prevouts,
+                self_spks,
+                spending_spks,
+                expected_change: None,
+                recipient: Some(dest.clone()),
+                recipient_name: None,
+                note_preview: None,
+            };
+            let pending = PendingBroadcast {
+                kind: "sweep",
+                raw_hex: tx.raw_hex.clone(),
+                txid: tx.txid_hex.clone(),
+                vsize: tx.vsize,
+                context: format!("Sweep to {}… · {}", &dest[..14.min(dest.len())], net.as_str()),
+                return_screen: 16, // overwritten by show_confirm
+                payload: PendingPayload::Sweep { snap },
+            };
+            show_confirm(w, s, pending, ctx);
+        }
+        Err(e) => w.set_status(format!("sweep: {e}").into()),
+    }
+}
+
+/// Stage A for a single-notebook consolidate (screen 16, `sweep-kind ==
+/// "consolidate"`, keyed self-paid — `on_sweep_send`'s tail): build + sign
+/// exactly as the old `on_consolidate` modal handler did, then hand off to
+/// the universal confirm screen instead of broadcasting. The destination
+/// is our own address (already in `confirm_self_spks`'s set), so no
+/// `ConfirmCtx.recipient` is needed. Stage B
+/// (`on_confirm_broadcast`/`PendingPayload::Consolidate`) is the
+/// pre-existing thread-spawn, moved verbatim.
+fn build_consolidate_confirm(w: &AppWindow, s: &mut State, rate: f64) {
+    let net = s.network;
+    if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+        return; // caller already routes watch identities to watch_spend_build
+    }
+    if s.base_url().is_none() {
+        w.set_status("no Bitcoin node — set one in Settings".into());
+        return;
+    }
+    let Some(self_addr) = s.ident.as_ref().map(|i| i.address.clone()) else { return };
+    let Ok(me) = Recipient::parse(net, &self_addr) else { return };
+    let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+        w.set_status("no identity".into());
+        return;
+    };
+    let nb_index = s.ident.as_ref().map(|i| i.index).unwrap_or(0);
+    let name = s.notebook_display_name(nb_index);
+    let Some(store) = s.store.as_mut() else { return };
+    if store.available_utxos().len() < 2 {
+        w.set_status("nothing to consolidate (need 2+ coins)".into());
+        return;
+    }
+    let inputs = spendable_inputs(store);
+    let dest_spk_hex = hex::encode(&me.spk);
+    let tx = app_core::notes_core::tx::build_sweep_tx(
+        &store.available_utxos(),
+        &identity.output_x,
+        me.spk.clone(),
+        rate,
+        &identity.tweaked_seckey,
+        app_core::notes_core::keys::generate_aux_rand,
+    );
+    match tx {
+        Ok(tx) => {
+            let snap = ConsolidateSnapshot {
+                identity_addr: self_addr.clone(),
+                value: tx.tx.outputs[0].value,
+                fee: tx.fee,
+                vsize: tx.vsize as u64,
+                raw_hex: tx.raw_hex.clone(),
+                dest_spk_hex,
+                inputs: inputs.clone(),
+            };
+            let prevouts = labeled_prevouts(&inputs, Some(&self_addr), &format!("Notebook · {name}"));
+            let (self_spks, spending_spks) = confirm_self_spks(s);
+            let ctx = app_core::confirm::ConfirmCtx {
+                network: app_core::derive::btc_network(net),
+                prevouts,
+                self_spks,
+                spending_spks,
+                expected_change: None,
+                recipient: None,
+                recipient_name: None,
+                note_preview: None,
+            };
+            let pending = PendingBroadcast {
+                kind: "consolidate",
+                raw_hex: tx.raw_hex.clone(),
+                txid: tx.txid_hex.clone(),
+                vsize: tx.vsize,
+                context: format!("Consolidate · {}", net.as_str()),
+                return_screen: 16, // overwritten by show_confirm
+                payload: PendingPayload::Consolidate { snap },
+            };
+            show_confirm(w, s, pending, ctx);
+        }
+        Err(e) => w.set_status(format!("consolidate: {e}").into()),
+    }
+}
+
+/// Stage A for wallet-level consolidate (account picker "wconsol" mode —
+/// picking a destination row IS the trigger now, no separate confirm
+/// tap): keyed identities build + sign here and hand off to the universal
+/// confirm screen; watch identities are UNCHANGED (external-sign PSBT,
+/// screens 13/14, copied verbatim from the old `on_wallet_consolidate`).
+/// The linkage-warning caption the old confirm modal carried
+/// ("One transaction spends every notebook's coins…") moves onto
+/// `PendingBroadcast.context`, appended after the base context. Stage B
+/// (`on_confirm_broadcast`/`PendingPayload::WConsol`) is the pre-existing
+/// thread-spawn, moved verbatim.
+fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
+    // The picker's own job is done the moment a destination is picked —
+    // reset its mode now (regardless of watch/keyed outcome below), same
+    // as the old `on_wallet_consolidate` modal handler did unconditionally
+    // at its top, so a later "Change account…" open isn't left in
+    // "wconsol" mode.
+    w.set_account_pick_mode("switch".into());
+    if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+        // Watch: ONE external-sign PSBT over every source notebook's
+        // coins — each input's key origin carries its own receive index,
+        // so the signer recognizes them all in one pass. The cross-store
+        // bookkeeping runs post-broadcast (record_watch_spend, dest_index
+        // = the picked notebook). Unchanged from the old handler.
+        let Some(src) = s.ident.as_ref().and_then(|i| i.watch_source()).cloned() else {
+            return;
+        };
+        let dest_spk = match Recipient::parse(s.network, &wc.dest_addr) {
+            Ok(r) => r.spk,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let coins: Vec<WatchCoin> = wc
+            .sources
+            .iter()
+            .flat_map(|(index, coins, _)| {
+                coins.iter().map(move |u| {
+                    let mut t = u.txid;
+                    t.reverse();
+                    WatchCoin { txid: hex::encode(t), vout: u.vout, value: u.value, index: *index }
+                })
+            })
+            .collect();
+        let inputs: Vec<app_core::store::TxInput> = coins
+            .iter()
+            .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
+            .collect();
+        let input_indexes: Vec<u32> = coins.iter().map(|c| c.index).collect();
+        match build_watch_spend_psbt(&src, &coins, dest_spk.clone(), wc.rate) {
+            Ok(built) => {
+                let cost = format!(
+                    "consolidate · {} sats · fee {} sats · {} input{} from {} notebook{} · sign with your external wallet",
+                    built.sent_to_recipient,
+                    built.fee,
+                    coins.len(),
+                    if coins.len() == 1 { "" } else { "s" },
+                    wc.sources.len(),
+                    if wc.sources.len() == 1 { "" } else { "s" }
+                );
+                s.watch_note = None;
+                s.watch_spend = Some(WatchSpend {
+                    kind: "consolidate",
+                    dest: wc.dest_addr.clone(),
+                    dest_spk_hex: hex::encode(&dest_spk),
+                    value: built.sent_to_recipient,
+                    fee: built.fee,
+                    inputs,
+                    input_indexes,
+                    dest_index: Some(wc.dest_index),
+                    bump_ref: None,
+                });
+                println!(
+                    "cb: wallet-consolidate build txid={} coins={} notebooks={} fee={}",
+                    built.txid,
+                    coins.len(),
+                    wc.sources.len(),
+                    built.fee
+                );
+                show_psbt_sign_screen(w, s, built, cost);
+            }
+            Err(e) => w.set_status(format!("{e}").into()),
+        }
+        return;
+    }
+    let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+        return;
+    };
+    let Ok(material) = parse_key_material(&material_str, s.network) else { return };
+    if s.base_url().is_none() {
+        w.set_status("no Bitcoin node for this network — set one in Settings".into());
+        return;
+    }
+    // Realize every source's full identity; a failure aborts cleanly.
+    let mut idents = Vec::new();
+    for (index, coins, _) in &wc.sources {
+        let ident = match realize(&material, s.network, s.account, *index) {
+            Ok(i) => i,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let addr = ident.address.clone();
+        let Some(full) = ident.full().map(|i| i.clone_fields()) else {
+            w.set_status("wallet consolidate needs the full key".into());
+            return;
+        };
+        idents.push((*index, full, coins.clone(), addr));
+    }
+    let dest_spk = match Recipient::parse(s.network, &wc.dest_addr) {
+        Ok(r) => r.spk,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
+    let sources: Vec<app_core::notes_core::tx::SweepSource> = idents
+        .iter()
+        .map(|(_, id, coins, _)| app_core::notes_core::tx::SweepSource {
+            utxos: coins,
+            output_x: id.output_x,
+            tweaked_seckey: &id.tweaked_seckey,
+        })
+        .collect();
+    let built = match app_core::notes_core::tx::build_sweep_tx_multi(
+        &sources,
+        dest_spk.clone(),
+        wc.rate,
+        app_core::notes_core::keys::generate_aux_rand,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
+    let mut all_inputs: Vec<app_core::store::TxInput> = Vec::new();
+    let mut prevouts: HashMap<String, app_core::confirm::PrevoutInfo> = HashMap::new();
+    let source_locks: Vec<(u32, Vec<(String, u32)>)> = idents
+        .iter()
+        .map(|(index, _, coins, addr)| {
+            let name = s.notebook_display_name(*index);
+            let source = format!("Notebook · {name}");
+            let locks: Vec<(String, u32)> = coins
+                .iter()
+                .map(|u| {
+                    let mut t = u.txid;
+                    t.reverse();
+                    let txid_hex = hex::encode(t);
+                    all_inputs.push(app_core::store::TxInput {
+                        txid: txid_hex.clone(),
+                        vout: u.vout,
+                        value: u.value,
+                    });
+                    prevouts.insert(
+                        format!("{txid_hex}:{}", u.vout),
+                        app_core::confirm::PrevoutInfo {
+                            value: u.value,
+                            address: Some(addr.clone()),
+                            source: source.clone(),
+                        },
+                    );
+                    (txid_hex, u.vout)
+                })
+                .collect();
+            (*index, locks)
+        })
+        .collect();
+    let input_indexes: Vec<u32> =
+        wc.sources.iter().flat_map(|(a, coins, _)| std::iter::repeat(*a).take(coins.len())).collect();
+    let net = s.network;
+    let snap = WConsolSnapshot {
+        fp8: s.notebooks_fp8.clone().unwrap_or_default(),
+        network: net,
+        account: s.account,
+        dest_index: wc.dest_index,
+        dest_spk_hex: hex::encode(&dest_spk),
+        value: built.tx.outputs[0].value,
+        fee: built.fee,
+        vsize: built.vsize as u64,
+        raw_hex: built.raw_hex.clone(),
+        source_locks,
+        all_inputs,
+        input_indexes,
+        sources_n: wc.sources.len(),
+    };
+    let (mut self_spks, spending_spks) = confirm_self_spks(s);
+    // The destination notebook may be freshly created (not yet an
+    // "active" notebook `realize()` would find via `confirm_self_spks`)
+    // — push its spk on top so it classifies "self", same rule a
+    // compose's fresh change address follows.
+    self_spks.push(dest_spk.clone());
+    let ctx = app_core::confirm::ConfirmCtx {
+        network: app_core::derive::btc_network(net),
+        prevouts,
+        self_spks,
+        spending_spks,
+        expected_change: None,
+        recipient: None,
+        recipient_name: None,
+        note_preview: None,
+    };
+    let pending = PendingBroadcast {
+        kind: "wconsol",
+        raw_hex: built.raw_hex.clone(),
+        txid: built.txid_hex.clone(),
+        vsize: built.vsize,
+        context: format!(
+            "Consolidate wallet · {} — One transaction spends every notebook's coins — all their addresses become publicly linked on-chain.",
+            net.as_str()
+        ),
+        return_screen: 9, // overwritten by show_confirm
+        payload: PendingPayload::WConsol { snap },
+    };
+    show_confirm(w, s, pending, ctx);
+}
+
+/// Stage A for a Rebroadcast (`on_act_retry`), once the raw hex is in hand
+/// (cached locally, or freshly fetched for a chain-recovered/watch record
+/// with none cached — both sub-cases converge here): summarize + hand off
+/// to the universal confirm screen. Stage B
+/// (`on_confirm_broadcast`/`PendingPayload::Rebroadcast`) is the
+/// pre-existing broadcast thread-spawn, moved verbatim.
+fn enter_rebroadcast_confirm(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool, raw_hex: String) {
+    let net = st.network;
+    let (txid, vsize) = decode_txid_vsize(&raw_hex).unwrap_or_default();
+    let prevouts = stored_record_prevouts(st, &ref_id, is_note);
+    let expected_change = stored_record_expected_change(st, &ref_id, is_note);
+    let (self_spks, spending_spks) = confirm_self_spks(st);
+    let ctx = app_core::confirm::ConfirmCtx {
+        network: app_core::derive::btc_network(net),
+        prevouts,
+        self_spks,
+        spending_spks,
+        expected_change,
+        recipient: None,
+        recipient_name: None,
+        note_preview: None,
+    };
+    let pending = PendingBroadcast {
+        kind: "rebroadcast",
+        raw_hex,
+        txid,
+        vsize,
+        context: format!("Rebroadcast · {}", net.as_str()),
+        return_screen: 11, // overwritten by show_confirm
+        payload: PendingPayload::Rebroadcast { ref_id },
+    };
+    show_confirm(w, st, pending, ctx);
 }
 
 /// Put a freshly built unsigned PSBT on the sign screen (13): animated-UR
@@ -5938,6 +6605,12 @@ pub fn run() {
         apply_act_retry_results(&w, &mut s);
     });
 
+    // Trampoline: `on_act_retry`'s sub-case (b) raw-hex fetch (chain-
+    // recovered/watch record, no local hex) landed on a worker thread.
+    cb!(on_apply_pending_rebroadcast_fetch, |w, s| {
+        apply_pending_rebroadcast_fetch_results(&w, &mut s);
+    });
+
     // Trampoline: an Activity Speed-up (RBF) broadcast finished on a worker
     // thread (the re-sign itself stays synchronous — fast, no network; only
     // the broadcast POST is async).
@@ -6136,15 +6809,17 @@ pub fn run() {
         w.set_screen(11);
     });
 
+    // Universal confirm screen (2026-07-17): stage A resolves the raw hex
+    // (locally cached, or fetched) and hands off to screen 26 —
+    // `act_pending_ref` is no longer set here for the broadcast itself
+    // (moved to stage B, `on_confirm_broadcast`/`PendingPayload::
+    // Rebroadcast`, mirroring `on_act_bump_confirm` below); it's only
+    // touched transiently to guard sub-case (b)'s own network fetch
+    // against a double-tap, cleared the moment the fetch result lands.
     cb!(on_act_retry, |w, s, ref_id: SharedString, is_note: bool| {
-        // One rebroadcast/speed-up in flight at a time (re-entrancy guard;
-        // also gates on_act_bump_confirm below — both write act_pending_ref).
-        if s.act_pending_ref.is_some() {
+        if s.act_pending_ref.is_some() || s.wallet_tx_busy || s.pending_broadcast.is_some() {
             return;
         }
-        let Some(base) = s.base_url() else { return };
-        let net = s.network;
-        let lookup_client = ChainClient::new(HttpTransport::new(base.clone()), net);
         let (raw, last_txid) = if is_note {
             let n = s
                 .store
@@ -6158,29 +6833,36 @@ pub fn run() {
                 .and_then(|st| st.txs.iter().find(|t| t.txids.iter().any(|x| x == ref_id.as_str())));
             (t.and_then(|t| t.raw_hex.clone()), t.and_then(|t| t.txids.last().cloned()))
         };
-        // Chain-recovered records (watch mode) carry no raw hex — the node
-        // that already knows the tx is the keyless rebroadcast source. This
-        // lookup stays synchronous (a quick GET, and only the rare keyless
-        // path hits it); only the broadcast POST below moves off-thread.
-        let raw = match raw.or_else(|| last_txid.and_then(|t| lookup_client.fetch_tx_hex(&t).ok())) {
-            Some(r) if !r.is_empty() => r,
-            _ => {
-                w.set_status("nothing to rebroadcast".into());
-                return;
-            }
-        };
         let ref_id_s = ref_id.to_string();
+        if let Some(r) = raw.filter(|r| !r.is_empty()) {
+            // Case (a): raw hex cached locally — summarize + show_confirm
+            // right now, no network round trip needed.
+            enter_rebroadcast_confirm(&w, &mut s, ref_id_s, is_note, r);
+            return;
+        }
+        // Case (b): chain-recovered record (watch mode, or any record with
+        // no cached hex) — the node that already knows the tx is the
+        // keyless rebroadcast source. Never block the UI thread on the
+        // fetch; land on the confirm screen from the fetch-result
+        // trampoline (mirrors `spending_refresh_async`).
+        let Some(base) = s.base_url() else {
+            w.set_status("no Bitcoin node — set one in Settings".into());
+            return;
+        };
+        let net = s.network;
+        let identity_addr = s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
         s.act_pending_ref = Some(ref_id_s.clone());
         update_activity(&w, &s);
         let weak = w.as_weak();
         std::thread::spawn(move || {
             let client = ChainClient::new(HttpTransport::new(base), net);
-            let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
-            ACT_RETRY_RESULTS
-                .lock()
-                .expect("act-retry results mutex")
-                .push(ActRetryResult { ref_id: ref_id_s, result });
-            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_act_retry());
+            let result = last_txid
+                .ok_or_else(|| "nothing to rebroadcast".to_string())
+                .and_then(|t| client.fetch_tx_hex(&t).map_err(|e| format!("{e}")));
+            REBROADCAST_FETCH_RESULTS.lock().expect("rebroadcast fetch results mutex").push(
+                RebroadcastFetchResult { ref_id: ref_id_s, is_note, identity_addr, result },
+            );
+            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_rebroadcast_fetch());
         });
     });
 
@@ -6240,10 +6922,16 @@ pub fn run() {
         }
     });
 
+    // Universal confirm screen (2026-07-17): the dialog stays for rate
+    // entry only — its primary button ("Sign…") now BUILDS + SIGNS the
+    // replacement (stage A) and hands off to screen 26 instead of
+    // broadcasting directly. `act_pending_ref` moves to stage B
+    // (`on_confirm_broadcast`/`PendingPayload::Bump`, the actual
+    // broadcast POST) — NOT set here, so it must never gate stage A;
+    // `pending_broadcast`/`wallet_tx_busy` are the re-entrancy guard for
+    // the build+navigate step instead.
     cb!(on_act_bump_confirm, |w, s| {
-        // Same re-entrancy guard on_act_retry uses — only one Activity
-        // broadcast (rebroadcast or speed-up) in flight at a time.
-        if s.act_pending_ref.is_some() {
+        if s.act_pending_ref.is_some() || s.wallet_tx_busy || s.pending_broadcast.is_some() {
             return;
         }
         let ref_id = w.get_bump_ref().to_string();
@@ -6253,7 +6941,10 @@ pub fn run() {
             return;
         };
         let net = s.network;
-        let Some(base) = s.base_url() else { return };
+        if s.base_url().is_none() {
+            w.set_bump_error("no Bitcoin node — set one in Settings".into());
+            return;
+        }
         if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
             watch_bump_confirm(&w, &mut s, new_rate);
             return;
@@ -6298,9 +6989,9 @@ pub fn run() {
             })
             .unwrap_or_default();
         let active_account = s.account;
-        let result: Result<(String, String, u64), app_core::Error> = if is_note {
+        let result: Result<(String, String, u64, usize), app_core::Error> = if is_note {
             app_core::compose::bump_fee(s.store.as_mut().unwrap(), &identity, net, &ref_id, new_rate)
-                .map(|c| (c.tx.raw_hex.clone(), c.tx.txid_hex.clone(), c.tx.fee))
+                .map(|c| (c.tx.raw_hex.clone(), c.tx.txid_hex.clone(), c.tx.fee, c.tx.vsize))
         } else if !owner_ids.is_empty() {
             let mut distinct = owner_ids.clone();
             distinct.sort_unstable();
@@ -6339,32 +7030,45 @@ pub fn run() {
                     &ref_id,
                     new_rate,
                 )
-                .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee))
+                .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee, tx.vsize))
             })
         } else {
             app_core::compose::bump_raw_tx(s.store.as_mut().unwrap(), &identity, &ref_id, new_rate)
-                .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee))
+                .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee, tx.vsize))
         };
         match result {
-            Ok((raw, txid, fee)) => {
+            Ok((raw, txid, fee, vsize)) => {
                 // The re-signed replacement is already saved (same shape as
-                // the notebook compose path) — a broadcast failure from here
-                // needs no navigation, just status/toast on the Activity
-                // screen the dialog closes onto.
+                // the notebook compose path). Hand off to the universal
+                // confirm screen instead of broadcasting immediately —
+                // stage B (`on_confirm_broadcast`) re-arms `act_pending_ref`
+                // right before the POST and spawns the SAME worker pushing
+                // `ActBumpResult`.
                 s.save_store();
                 w.set_show_bump_dialog(false);
-                s.act_pending_ref = Some(ref_id.clone());
-                update_activity(&w, &s);
-                let weak = w.as_weak();
-                std::thread::spawn(move || {
-                    let client = ChainClient::new(HttpTransport::new(base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
-                    ACT_BUMP_RESULTS
-                        .lock()
-                        .expect("act-bump results mutex")
-                        .push(ActBumpResult { ref_id, txid, fee, new_rate, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_act_bump());
-                });
+                let prevouts = stored_record_prevouts(&s, &ref_id, is_note);
+                let expected_change = stored_record_expected_change(&s, &ref_id, is_note);
+                let (self_spks, spending_spks) = confirm_self_spks(&s);
+                let ctx = app_core::confirm::ConfirmCtx {
+                    network: app_core::derive::btc_network(net),
+                    prevouts,
+                    self_spks,
+                    spending_spks,
+                    expected_change,
+                    recipient: None,
+                    recipient_name: None,
+                    note_preview: None,
+                };
+                let pending = PendingBroadcast {
+                    kind: "bump",
+                    raw_hex: raw,
+                    txid,
+                    vsize,
+                    context: format!("Speed-up · {}", net.as_str()),
+                    return_screen: 11, // overwritten by show_confirm
+                    payload: PendingPayload::Bump { ref_id: ref_id.clone(), fee, new_rate },
+                };
+                show_confirm(&w, &mut s, pending, ctx);
             }
             Err(e) => {
                 println!("cb: act-bump ref={ref_id} err={e}");
@@ -6386,247 +7090,6 @@ pub fn run() {
         let _ = (&w, &mut s);
         println!("cb: open-source");
         let _ = platform::open_url(SOURCE_URL);
-    });
-
-    // Fee preview for the consolidate dialog: dry-run the SAME builder the
-    // Consolidate button broadcasts. Key-spend signatures are constant-size,
-    // so the previewed fee/vsize match the broadcast tx exactly.
-    cb!(on_consolidate_preview, |w, s| {
-        refresh_consolidate_preview(&w, &mut s);
-    });
-
-    cb!(on_consolidate, |w, s| {
-        w.set_show_consolidate_confirm(false);
-        if s.wallet_tx_busy {
-            return;
-        }
-        let rate: f64 = w.get_consolidate_rate().trim().parse().unwrap_or(1.0);
-        let net = s.network;
-        let Some(base) = s.base_url() else { return };
-        // Self-send: consolidate all spendable coins into one output at
-        // our own address.
-        let Some(self_addr) = s.ident.as_ref().map(|i| i.address.clone()) else { return };
-        let Ok(me) = Recipient::parse(net, &self_addr) else { return };
-        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
-            let spk = me.spk.clone();
-            watch_spend_build(&w, &mut s, "consolidate", self_addr, spk, rate);
-            return;
-        }
-        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields())
-        else {
-            w.set_status("no identity".into());
-            return;
-        };
-        let store = s.store.as_mut().unwrap();
-        if store.available_utxos().len() < 2 {
-            w.set_status("nothing to consolidate (need 2+ coins)".into());
-            return;
-        }
-        let inputs = spendable_inputs(store);
-        let dest_spk_hex = hex::encode(&me.spk);
-        let tx = app_core::notes_core::tx::build_sweep_tx(
-            &store.available_utxos(),
-            &identity.output_x,
-            me.spk,
-            rate,
-            &identity.tweaked_seckey,
-            app_core::notes_core::keys::generate_aux_rand,
-        );
-        match tx {
-            Ok(tx) => {
-                let snap = ConsolidateSnapshot {
-                    identity_addr: s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default(),
-                    value: tx.tx.outputs[0].value,
-                    fee: tx.fee,
-                    vsize: tx.vsize as u64,
-                    raw_hex: tx.raw_hex.clone(),
-                    dest_spk_hex,
-                    inputs,
-                };
-                s.wallet_tx_busy = true;
-                w.set_wallet_tx_busy(true);
-                let raw = tx.raw_hex.clone();
-                let weak = w.as_weak();
-                std::thread::spawn(move || {
-                    let client = ChainClient::new(HttpTransport::new(base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
-                    CONSOLIDATE_BROADCAST_RESULTS
-                        .lock()
-                        .expect("consolidate broadcast results mutex")
-                        .push(ConsolidateBroadcastResult { snap, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
-                });
-            }
-            Err(e) => w.set_status(format!("consolidate: {e}").into()),
-        }
-    });
-
-    cb!(on_sweep, |w, s| {
-        w.set_show_sweep_confirm(false);
-        if s.wallet_tx_busy {
-            return;
-        }
-        let dest = w.get_sweep_dest().to_string();
-        let rate: f64 = w.get_sweep_rate().trim().parse().unwrap_or(1.0);
-        let net = s.network;
-        let Some(base) = s.base_url() else { return };
-        let Ok(recipient) = Recipient::parse(net, &dest) else {
-            w.set_status(format!("not a valid {} address", net.as_str()).into());
-            return;
-        };
-        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
-            watch_spend_build(&w, &mut s, "sweep", dest.clone(), recipient.spk.clone(), rate);
-            return;
-        }
-        // Wallet-level sweep: gather every active notebook's coins + keys
-        // (sweep = leaving the wallet — one multi-key tx, like consolidate
-        // but with an external destination).
-        let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
-            return;
-        };
-        let Ok(material) = parse_key_material(&material_str, net) else { return };
-        let mut idents: Vec<(u32, app_core::notes_core::bundle::Identity, Vec<app_core::notes_core::tx::Utxo>)> =
-            Vec::new();
-        if let Some(ix) = &s.notebooks {
-            for m in ix.active(s.account) {
-                let Some(store) = notebook_store(&s, m.index) else { continue };
-                let coins = store.available_utxos();
-                if coins.is_empty() {
-                    continue;
-                }
-                let Ok(ident) = realize(&material, net, s.account, m.index) else { continue };
-                let Some(full) = ident.full().map(|i| i.clone_fields()) else { continue };
-                idents.push((m.index, full, coins));
-            }
-        }
-        // CHANGE 2: gather the spending wallet's coins too — UNLESS this
-        // sweep's destination IS the spending wallet's own next receive
-        // address (`on_spending_sweep_here`), where including them would
-        // sweep the spending wallet into itself.
-        let spending_coins_for_sweep: Vec<FundingUtxo> = if s.pending_spending_sweep_index.is_none()
-            && s.spending_capable
-            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
-        {
-            s.spending_coins.clone()
-        } else {
-            Vec::new()
-        };
-        if idents.is_empty() && spending_coins_for_sweep.is_empty() {
-            w.set_status("nothing to sweep".into());
-            return;
-        }
-        let mut all_inputs: Vec<app_core::store::TxInput> = idents
-            .iter()
-            .flat_map(|(_, _, coins)| coins.iter())
-            .map(|u| {
-                let mut t = u.txid;
-                t.reverse();
-                app_core::store::TxInput { txid: hex::encode(t), vout: u.vout, value: u.value }
-            })
-            .collect();
-        let notebook_locks: Vec<(u32, Vec<(String, u32)>)> = idents
-            .iter()
-            .map(|(index, _, coins)| {
-                (
-                    *index,
-                    coins
-                        .iter()
-                        .map(|u| {
-                            let mut t = u.txid;
-                            t.reverse();
-                            (hex::encode(t), u.vout)
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
-        let dest_spk_hex = hex::encode(&recipient.spk);
-        let mixed = !spending_coins_for_sweep.is_empty();
-        // Mixed record: no per-input owner scheme covers both notebook and
-        // spending-wallet inputs, so it can't be RBF-bumped — see CHANGE 2
-        // / TxRecord.mixed_inputs. A pure-notebook sweep keeps its owners
-        // (bumpable, unchanged).
-        let input_indexes: Vec<u32> = if mixed {
-            Vec::new()
-        } else {
-            idents.iter().flat_map(|(a, _, coins)| std::iter::repeat(*a).take(coins.len())).collect()
-        };
-        let spending_spent: Vec<(String, u32)> =
-            spending_coins_for_sweep.iter().map(|c| (c.txid.clone(), c.vout)).collect();
-        if mixed {
-            all_inputs.extend(
-                spending_coins_for_sweep
-                    .iter()
-                    .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value }),
-            );
-        }
-        let sweep: Result<app_core::notes_core::tx::NoteTx, String> = if mixed {
-            let notebook_sources: Vec<app_core::mixed::NotebookSweepSource> = idents
-                .iter()
-                .map(|(_, id, coins)| app_core::mixed::NotebookSweepSource {
-                    output_x: id.output_x,
-                    tweaked_seckey: &id.tweaked_seckey,
-                    utxos: coins,
-                })
-                .collect();
-            app_core::mixed::build_wallet_sweep_mixed(
-                &notebook_sources,
-                Some((&material, net, s.account, &spending_coins_for_sweep)),
-                recipient.spk.clone(),
-                rate,
-            )
-            .map_err(|e| format!("{e}"))
-        } else {
-            let sources: Vec<app_core::notes_core::tx::SweepSource> = idents
-                .iter()
-                .map(|(_, id, coins)| app_core::notes_core::tx::SweepSource {
-                    utxos: coins,
-                    output_x: id.output_x,
-                    tweaked_seckey: &id.tweaked_seckey,
-                })
-                .collect();
-            app_core::notes_core::tx::build_sweep_tx_multi(
-                &sources,
-                recipient.spk.clone(),
-                rate,
-                app_core::notes_core::keys::generate_aux_rand,
-            )
-            .map_err(|e| format!("{e}"))
-        };
-        match sweep {
-            Ok(tx) => {
-                let snap = SweepSnapshot {
-                    identity_addr: s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default(),
-                    dest: dest.clone(),
-                    dest_spk_hex,
-                    value: tx.tx.outputs[0].value,
-                    fee: tx.fee,
-                    vsize: tx.vsize as u64,
-                    raw_hex: tx.raw_hex.clone(),
-                    notebook_locks,
-                    all_inputs,
-                    input_indexes,
-                    mixed,
-                    spending_spent,
-                    pending_spending_sweep_index: s.pending_spending_sweep_index,
-                    notebooks_n: idents.len(),
-                };
-                s.wallet_tx_busy = true;
-                w.set_wallet_tx_busy(true);
-                let raw = tx.raw_hex.clone();
-                let weak = w.as_weak();
-                std::thread::spawn(move || {
-                    let client = ChainClient::new(HttpTransport::new(base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
-                    SWEEP_BROADCAST_RESULTS
-                        .lock()
-                        .expect("sweep broadcast results mutex")
-                        .push(SweepBroadcastResult { snap, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
-                });
-            }
-            Err(e) => w.set_status(format!("sweep: {e}").into()),
-        }
     });
 
     cb!(on_open_note_web_url, |w, s, url: SharedString| {
@@ -6687,54 +7150,30 @@ pub fn run() {
         set_sweep_dest(&w, &mut s, d.address);
     });
 
-    // CHANGE 3 (2026-07-17): the Coins screen's spending segment gets its
-    // own consolidate — dry-run the fee via notes-core's byte-exact mixed
-    // estimator (all-P2WPKH inputs, one P2WPKH output), then open the
-    // confirm modal.
+    // CHANGE 3 (2026-07-17) / universal confirm screen follow-up: the
+    // Coins screen's spending segment "Consolidate spending coins…"
+    // button IS the trigger now (the confirm modal is gone) — build +
+    // sign the all-P2WPKH merge directly (byte-exact mixed estimator, one
+    // P2WPKH output at the next fresh spending receive address) and hand
+    // off to the universal confirm screen. Stage B
+    // (`on_confirm_broadcast`/`PendingPayload::SpendingConsolidate`) is
+    // the pre-existing thread-spawn, moved verbatim.
     cb!(on_spending_consolidate_open, |w, s| {
+        if s.wallet_tx_busy || s.pending_broadcast.is_some() {
+            return;
+        }
         ensure_spending_source(&mut s);
         let Some(src) = s.spending_source.clone() else {
             w.set_status("spending wallet unavailable for this identity".into());
             return;
         };
-        let n = s.spending_coins.len();
-        if n < 2 {
-            w.set_status("nothing to consolidate (need 2+ spending coins)".into());
-            return;
-        }
-        let Some(next_receive) = s.store.as_ref().map(|st| st.spending.next_receive) else { return };
-        let Ok(dest) = src.derive(0, next_receive) else { return };
-        let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
-        let total: u64 = s.spending_coins.iter().map(|c| c.value).sum();
-        use app_core::notes_core::tx::{estimate_vsize_mixed, InputKind};
-        let kinds: Vec<InputKind> = std::iter::repeat(InputKind::P2wpkh).take(n).collect();
-        let vsize = estimate_vsize_mixed(&kinds, &[], &[dest.spk.len()]) as u64;
-        let fee = (vsize as f64 * rate).ceil() as u64;
-        println!("cb: spending-consolidate open coins={n}");
-        w.set_spending_consolidate_fee_line(
-            if total <= fee {
-                format!("balance {} sats can't cover the ~{} sat fee", commas(total), commas(fee))
-            } else {
-                format!("combines {n} coins → 1 · fee ~{} sats · keeps {}", commas(fee), commas(total - fee))
-            }
-            .into(),
-        );
-        w.set_show_spending_consolidate_confirm(true);
-    });
-
-    cb!(on_spending_consolidate, |w, s| {
-        w.set_show_spending_consolidate_confirm(false);
-        if s.wallet_tx_busy {
-            return;
-        }
-        let Some(src) = s.spending_source.clone() else { return };
-        let Some(base) = s.base_url() else {
-            w.set_status("no Bitcoin node for this network — set one in Settings".into());
-            return;
-        };
         let coins = s.spending_coins.clone();
         if coins.len() < 2 {
             w.set_status("nothing to consolidate (need 2+ spending coins)".into());
+            return;
+        }
+        if s.base_url().is_none() {
+            w.set_status("no Bitcoin node for this network — set one in Settings".into());
             return;
         }
         let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
@@ -6772,19 +7211,42 @@ pub fn run() {
                     raw_hex: tx.raw_hex.clone(),
                     spent,
                 };
-                s.wallet_tx_busy = true;
-                w.set_wallet_tx_busy(true);
-                let raw = tx.raw_hex.clone();
-                let weak = w.as_weak();
-                std::thread::spawn(move || {
-                    let client = ChainClient::new(HttpTransport::new(base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
-                    SPENDING_CONSOLIDATE_RESULTS
-                        .lock()
-                        .expect("spending consolidate results mutex")
-                        .push(SpendingConsolidateResult { snap, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
-                });
+                let mut prevouts: HashMap<String, app_core::confirm::PrevoutInfo> = HashMap::new();
+                for c in &coins {
+                    prevouts.insert(
+                        format!("{}:{}", c.txid, c.vout),
+                        app_core::confirm::PrevoutInfo {
+                            value: c.value,
+                            address: Some(c.address.clone()),
+                            source: "Spending wallet".to_string(),
+                        },
+                    );
+                }
+                let (mut self_spks, mut spending_spks) = confirm_self_spks(&s);
+                // Fresh spending receive address, not yet "used" bookkeeping
+                // — push its spk on top so it classifies "self".
+                self_spks.push(dest.spk.clone());
+                spending_spks.push(dest.spk.clone());
+                let ctx = app_core::confirm::ConfirmCtx {
+                    network: app_core::derive::btc_network(net),
+                    prevouts,
+                    self_spks,
+                    spending_spks,
+                    expected_change: None,
+                    recipient: None,
+                    recipient_name: None,
+                    note_preview: None,
+                };
+                let pending = PendingBroadcast {
+                    kind: "spending-consolidate",
+                    raw_hex: tx.raw_hex.clone(),
+                    txid: tx.txid_hex.clone(),
+                    vsize: tx.vsize,
+                    context: format!("Consolidate spending coins · {}", net.as_str()),
+                    return_screen: 10, // overwritten by show_confirm
+                    payload: PendingPayload::SpendingConsolidate { snap },
+                };
+                show_confirm(&w, &mut s, pending, ctx);
             }
             Err(e) => w.set_status(format!("{e}").into()),
         }
@@ -6830,204 +7292,6 @@ pub fn run() {
         });
         w.set_nb_create_name("".into());
         show_notebook_picker(&w, &s, 0, "wconsol");
-    });
-
-    cb!(on_wallet_consolidate, |w, s| {
-        w.set_show_wconsol_confirm(false);
-        w.set_account_pick_mode("switch".into());
-        if s.wallet_tx_busy {
-            return;
-        }
-        let Some(wc) = s.wconsol.take() else { return };
-        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
-            // Watch: ONE external-sign PSBT over every source notebook's
-            // coins — each input's key origin carries its own receive
-            // index, so the signer recognizes them all in one pass. The
-            // cross-store bookkeeping runs post-broadcast
-            // (record_watch_spend, dest_index = the picked notebook).
-            let Some(src) = s.ident.as_ref().and_then(|i| i.watch_source()).cloned() else {
-                return;
-            };
-            let dest_spk = match Recipient::parse(s.network, &wc.dest_addr) {
-                Ok(r) => r.spk,
-                Err(e) => {
-                    w.set_status(format!("{e}").into());
-                    return;
-                }
-            };
-            let coins: Vec<WatchCoin> = wc
-                .sources
-                .iter()
-                .flat_map(|(index, coins, _)| {
-                    coins.iter().map(move |u| {
-                        let mut t = u.txid;
-                        t.reverse();
-                        WatchCoin {
-                            txid: hex::encode(t),
-                            vout: u.vout,
-                            value: u.value,
-                            index: *index,
-                        }
-                    })
-                })
-                .collect();
-            let inputs: Vec<app_core::store::TxInput> = coins
-                .iter()
-                .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
-                .collect();
-            let input_indexes: Vec<u32> = coins.iter().map(|c| c.index).collect();
-            match build_watch_spend_psbt(&src, &coins, dest_spk.clone(), wc.rate) {
-                Ok(built) => {
-                    let cost = format!(
-                        "consolidate · {} sats · fee {} sats · {} input{} from {} notebook{} · sign with your external wallet",
-                        built.sent_to_recipient,
-                        built.fee,
-                        coins.len(),
-                        if coins.len() == 1 { "" } else { "s" },
-                        wc.sources.len(),
-                        if wc.sources.len() == 1 { "" } else { "s" }
-                    );
-                    s.watch_note = None;
-                    s.watch_spend = Some(WatchSpend {
-                        kind: "consolidate",
-                        dest: wc.dest_addr.clone(),
-                        dest_spk_hex: hex::encode(&dest_spk),
-                        value: built.sent_to_recipient,
-                        fee: built.fee,
-                        inputs,
-                        input_indexes,
-                        dest_index: Some(wc.dest_index),
-                        bump_ref: None,
-                    });
-                    println!(
-                        "cb: wallet-consolidate build txid={} coins={} notebooks={} fee={}",
-                        built.txid,
-                        coins.len(),
-                        wc.sources.len(),
-                        built.fee
-                    );
-                    show_psbt_sign_screen(&w, &mut s, built, cost);
-                }
-                Err(e) => w.set_status(format!("{e}").into()),
-            }
-            return;
-        }
-        let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
-            return;
-        };
-        let Ok(material) = parse_key_material(&material_str, s.network) else { return };
-        let Some(base) = s.base_url() else {
-            w.set_status("no Bitcoin node for this network — set one in Settings".into());
-            return;
-        };
-        // Realize every source's full identity; a failure aborts cleanly.
-        let mut idents = Vec::new();
-        for (index, coins, _) in &wc.sources {
-            let ident = match realize(&material, s.network, s.account, *index) {
-                Ok(i) => i,
-                Err(e) => {
-                    w.set_status(format!("{e}").into());
-                    return;
-                }
-            };
-            let Some(full) = ident.full().map(|i| i.clone_fields()) else {
-                w.set_status("wallet consolidate needs the full key".into());
-                return;
-            };
-            idents.push((*index, full, coins.clone()));
-        }
-        let dest_spk = match Recipient::parse(s.network, &wc.dest_addr) {
-            Ok(r) => r.spk,
-            Err(e) => {
-                w.set_status(format!("{e}").into());
-                return;
-            }
-        };
-        let sources: Vec<app_core::notes_core::tx::SweepSource> = idents
-            .iter()
-            .map(|(_, id, coins)| app_core::notes_core::tx::SweepSource {
-                utxos: coins,
-                output_x: id.output_x,
-                tweaked_seckey: &id.tweaked_seckey,
-            })
-            .collect();
-        let built = match app_core::notes_core::tx::build_sweep_tx_multi(
-            &sources,
-            dest_spk.clone(),
-            wc.rate,
-            app_core::notes_core::keys::generate_aux_rand,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                w.set_status(format!("{e}").into());
-                return;
-            }
-        };
-        // Bookkeeping snapshot: the destination gets the TxRecord and the
-        // unconfirmed coin; every source's spent inputs lock. The next
-        // scans reconcile everything authoritatively — moved into
-        // ConsolidateBroadcastResult's apply fn (CHANGE 4), which runs once
-        // the broadcast POST (below, on a worker thread) succeeds.
-        let all_inputs: Vec<app_core::store::TxInput> = wc
-            .sources
-            .iter()
-            .flat_map(|(_, coins, _)| coins.iter())
-            .map(|u| {
-                let mut t = u.txid;
-                t.reverse();
-                app_core::store::TxInput { txid: hex::encode(t), vout: u.vout, value: u.value }
-            })
-            .collect();
-        let input_indexes: Vec<u32> = wc
-            .sources
-            .iter()
-            .flat_map(|(a, coins, _)| std::iter::repeat(*a).take(coins.len()))
-            .collect();
-        let source_locks: Vec<(u32, Vec<(String, u32)>)> = wc
-            .sources
-            .iter()
-            .map(|(index, coins, _)| {
-                (
-                    *index,
-                    coins
-                        .iter()
-                        .map(|u| {
-                            let mut t = u.txid;
-                            t.reverse();
-                            (hex::encode(t), u.vout)
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
-        let snap = WConsolSnapshot {
-            fp8: s.notebooks_fp8.clone().unwrap_or_default(),
-            network: s.network,
-            account: s.account,
-            dest_index: wc.dest_index,
-            dest_spk_hex: hex::encode(&dest_spk),
-            value: built.tx.outputs[0].value,
-            fee: built.fee,
-            vsize: built.vsize as u64,
-            raw_hex: built.raw_hex.clone(),
-            source_locks,
-            all_inputs,
-            input_indexes,
-            sources_n: wc.sources.len(),
-        };
-        s.wallet_tx_busy = true;
-        w.set_wallet_tx_busy(true);
-        let raw = built.raw_hex.clone();
-        let weak = w.as_weak();
-        std::thread::spawn(move || {
-            let client = ChainClient::new(HttpTransport::new(base), snap.network);
-            let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
-            WCONSOL_BROADCAST_RESULTS
-                .lock()
-                .expect("wconsol broadcast results mutex")
-                .push(WConsolBroadcastResult { snap, result });
-            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
-        });
     });
 
     cb!(on_set_sweep_tier, |w, s, tier: i32| {
@@ -7181,15 +7445,18 @@ pub fn run() {
             watch_spend_build(&w, &mut s, kind, dest, recipient.spk.clone(), rate);
             return;
         }
-        // Keyed, self-paid: resolved rate feeds the classic confirm modal —
-        // on_sweep / on_consolidate sign + broadcast in-app.
+        // Keyed, self-paid: build + sign now (stage A) and hand off to the
+        // universal confirm screen — the (removed) sweep/consolidate
+        // confirm modals used to gate this; Broadcast on screen 26 is the
+        // only way out now (`on_confirm_broadcast`, kind "sweep"/
+        // "consolidate").
+        if s.wallet_tx_busy || s.pending_broadcast.is_some() {
+            return;
+        }
         if consolidate {
-            w.set_consolidate_rate(format!("{rate}").into());
-            refresh_consolidate_preview(&w, &mut s);
-            w.set_show_consolidate_confirm(true);
+            build_consolidate_confirm(&w, &mut s, rate);
         } else {
-            w.set_sweep_rate(format!("{rate}").into());
-            w.set_show_sweep_confirm(true);
+            build_sweep_confirm(&w, &mut s, dest, rate);
         }
     });
 
@@ -8234,6 +8501,153 @@ pub fn run() {
                     let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
                 });
             }
+            // ---- sweep / consolidate / wconsol / spending-consolidate:
+            // stage A already built + signed (see `build_sweep_confirm`
+            // et al.); stage B synchronously returns to the ORIGIN screen
+            // (`pending.return_screen`) — mirroring the removed confirm
+            // modals, which closed in place while the broadcast ran in the
+            // background — then spawns the pre-existing thread-spawn
+            // verbatim, pushing into the SAME result queue their (UNTOUCHED)
+            // `apply_*_broadcast_result` already drains via the shared
+            // `apply-pending-wallet-tx` trampoline.
+            PendingPayload::Sweep { snap } => {
+                let Some(base) = s.base_url() else {
+                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                w.set_screen(pending.return_screen);
+                s.wallet_tx_busy = true;
+                w.set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(&base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    SWEEP_BROADCAST_RESULTS
+                        .lock()
+                        .expect("sweep broadcast results mutex")
+                        .push(SweepBroadcastResult { snap, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+                });
+            }
+            PendingPayload::Consolidate { snap } => {
+                let Some(base) = s.base_url() else {
+                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                w.set_screen(pending.return_screen);
+                s.wallet_tx_busy = true;
+                w.set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(&base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    CONSOLIDATE_BROADCAST_RESULTS
+                        .lock()
+                        .expect("consolidate broadcast results mutex")
+                        .push(ConsolidateBroadcastResult { snap, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+                });
+            }
+            PendingPayload::WConsol { snap } => {
+                let Some(base) = s.base_url() else {
+                    w.set_status("no Bitcoin node for this network — set one in Settings".into());
+                    return;
+                };
+                let net = snap.network;
+                s.pending_broadcast = None;
+                w.set_screen(pending.return_screen);
+                s.wallet_tx_busy = true;
+                w.set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(&base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    WCONSOL_BROADCAST_RESULTS
+                        .lock()
+                        .expect("wconsol broadcast results mutex")
+                        .push(WConsolBroadcastResult { snap, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+                });
+            }
+            PendingPayload::SpendingConsolidate { snap } => {
+                let Some(base) = s.base_url() else {
+                    w.set_status("no Bitcoin node for this network — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                w.set_screen(pending.return_screen);
+                s.wallet_tx_busy = true;
+                w.set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(&base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    SPENDING_CONSOLIDATE_RESULTS
+                        .lock()
+                        .expect("spending consolidate results mutex")
+                        .push(SpendingConsolidateResult { snap, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+                });
+            }
+            // ---- bump / rebroadcast: stage B re-arms `act_pending_ref`
+            // (the Activity row's own busy guard — screen 26 briefly, then
+            // back on the Activity screen while the POST runs) and spawns
+            // the SAME broadcast worker their (UNTOUCHED) apply_act_*
+            // functions already drain.
+            PendingPayload::Bump { ref_id, fee, new_rate } => {
+                let Some(base) = s.base_url() else {
+                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                w.set_screen(pending.return_screen);
+                s.act_pending_ref = Some(ref_id.clone());
+                update_activity(&w, &s);
+                let raw = pending.raw_hex.clone();
+                let txid = pending.txid.clone();
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(&base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    ACT_BUMP_RESULTS
+                        .lock()
+                        .expect("act-bump results mutex")
+                        .push(ActBumpResult { ref_id, txid, fee, new_rate, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_act_bump());
+                });
+            }
+            PendingPayload::Rebroadcast { ref_id } => {
+                let Some(base) = s.base_url() else {
+                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                w.set_screen(pending.return_screen);
+                s.act_pending_ref = Some(ref_id.clone());
+                update_activity(&w, &s);
+                let raw = pending.raw_hex.clone();
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(&base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    ACT_RETRY_RESULTS
+                        .lock()
+                        .expect("act-retry results mutex")
+                        .push(ActRetryResult { ref_id, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_act_retry());
+                });
+            }
         }
     });
 
@@ -9137,10 +9551,15 @@ pub fn run() {
 
     cb!(on_pick_account, |w, s, idx: i32| {
         if w.get_account_pick_mode() == "wconsol" {
+            if s.wallet_tx_busy || s.pending_broadcast.is_some() {
+                return;
+            }
             // Wallet consolidate: the pick is the DESTINATION — a notebook
             // address (receive index) of the active account. A non-
             // notebook address becomes a notebook (named inline) so the
-            // gathered coin can never land somewhere invisible.
+            // gathered coin can never land somewhere invisible. Picking IS
+            // the trigger now (the confirm modal is gone) — build + sign
+            // (or, watch, build the external-sign PSBT) right here.
             let index = idx.max(0) as u32;
             let Some(mut wc) = s.wconsol.take() else { return };
             // An archived destination un-archives: the wallet's coin must
@@ -9175,31 +9594,12 @@ pub fn run() {
                 s.wconsol = None;
                 return;
             }
-            let watch_note = if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
-                "\nSigns on your external wallet."
-            } else {
-                ""
-            };
-            w.set_wconsol_summary(
-                format!(
-                    "{n} coin{} from {} notebook{} become one coin at {} · {}.\n{} sats arrive after a ~{} sats fee ({rate:.1} sat/vB).{watch_note}",
-                    if n == 1 { "" } else { "s" },
-                    wc.sources.len(),
-                    if wc.sources.len() == 1 { "" } else { "s" },
-                    s.notebook_display_name(index),
-                    addr_short(&addr),
-                    commas(total - fee),
-                    commas(fee)
-                )
-                .into(),
-            );
             wc.dest_index = index;
             wc.dest_addr = addr;
             wc.rate = rate;
             wc.fee = fee;
             wc.vsize = vsize as u64;
-            s.wconsol = Some(wc);
-            w.set_show_wconsol_confirm(true);
+            build_wconsol_confirm(&w, &mut s, wc);
             return;
         }
         if w.get_account_pick_mode() == "notebook" {

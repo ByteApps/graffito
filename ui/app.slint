@@ -1568,18 +1568,14 @@ export component AppWindow inherits Window {
     in property <string> bump-error;
     in property <string> bump-new-fee;
     in-out property <string> bump-rate;
-    in-out property <string> consolidate-rate: "1";
-    in-out property <bool> show-consolidate-confirm;
-    in property <string> consolidate-fee-line;
-    // CHANGE 4 (async wallet-tx broadcast, 2026-07-17): true while any of
-    // on-consolidate / on-sweep / on-wallet-consolidate / on-psbt-broadcast
-    // has a broadcast in flight on a worker thread (build+sign stays
-    // synchronous) — the confirm modals' primary buttons show a busy
-    // caption and disable, and every entry point re-enters early.
+    // CHANGE 4 (async wallet-tx broadcast, 2026-07-17): true while a
+    // sweep/consolidate/wallet-consolidate/spending-consolidate/psbt-
+    // broadcast has a POST in flight on a worker thread (build+sign stays
+    // synchronous) — the universal confirm screen's Broadcast button shows
+    // a busy caption and disables, and every entry point re-enters early.
     in-out property <bool> wallet-tx-busy;
     in-out property <string> sweep-dest;
     in-out property <string> sweep-rate: "1";
-    in-out property <bool> show-sweep-confirm;
     // Sweep flow (picker → dedicated screen 15, compose-like): the send-to
     // picker doubles as the sweep destination picker via pick-mode.
     in-out property <string> pick-mode: "compose";   // "compose" | "sweep"
@@ -1623,7 +1619,6 @@ export component AppWindow inherits Window {
     callback reply-to-note();
     callback copy-text(string, string);
     callback set-fee-tier(int);
-    callback sweep();
     callback sweep-open();                 // settings → destination picker
     callback consolidate-open();           // coins → consolidate screen (16)
     callback set-sweep-tier(int);
@@ -1631,8 +1626,6 @@ export component AppWindow inherits Window {
     callback toggle-sweep-fund-external(bool);
     callback sweep-send();                 // screen 15 primary action
     callback open-coins();
-    callback consolidate();
-    callback consolidate-preview();
     callback open-activity();
     callback act-retry(string, bool);
     callback act-bump-open(string, bool);
@@ -1739,6 +1732,10 @@ export component AppWindow inherits Window {
     callback apply-pending-compose();
     // A Rebroadcast (act-retry) finished on a worker thread.
     callback apply-pending-act-retry();
+    // A Rebroadcast's own raw-hex fetch (sub-case (b): chain-recovered/
+    // watch record, no locally cached hex) finished on a worker thread —
+    // enters the universal confirm screen on success.
+    callback apply-pending-rebroadcast-fetch();
     // A Speed-up (RBF bump) broadcast finished on a worker thread.
     callback apply-pending-act-bump();
     // CHANGE 4: a consolidate/sweep/wallet-consolidate/psbt broadcast
@@ -1773,18 +1770,15 @@ export component AppWindow inherits Window {
     in-out property <string> nb-create-name;
     in-out property <string> sweep-dest-note;   // linkage caveat, empty = none
     // wallet-level consolidate (Settings): dest picked on screen 9 in
-    // "wconsol" mode, then a confirm modal, then one multi-key tx.
-    in-out property <bool> show-wconsol-confirm;
-    in-out property <string> wconsol-summary;
+    // "wconsol" mode — picking a destination row IS the trigger (build +
+    // sign + universal confirm screen), no separate confirm tap.
     callback consolidate-wallet-open();
-    callback wallet-consolidate();
     // CHANGE 3 (2026-07-17): the Coins screen's spending segment gets its
     // own consolidate — merges every spending coin into ONE at the next
     // fresh spending receive address (signs in-app, no external wallet).
-    in-out property <bool> show-spending-consolidate-confirm;
-    in property <string> spending-consolidate-fee-line;
+    // The button tap IS the trigger (build + sign + universal confirm
+    // screen), no separate confirm tap.
     callback spending-consolidate-open();
-    callback spending-consolidate();
     callback open-notebooks();
     callback open-notebook(int);
     callback create-notebook();
@@ -1809,12 +1803,8 @@ export component AppWindow inherits Window {
         // Overlays first, topmost (= last window child) before the rest —
         // back closes the same thing a tap on Cancel / the dim would.
         if (root.qr-zoom-open) { root.qr-zoom-open = false; return true; }
-        if (root.show-wconsol-confirm) { root.show-wconsol-confirm = false; return true; }
-        if (root.show-spending-consolidate-confirm) { root.show-spending-consolidate-confirm = false; return true; }
         if (root.show-bump-dialog) { root.show-bump-dialog = false; return true; }
         if (root.show-oversize-modal) { root.show-oversize-modal = false; return true; }
-        if (root.show-consolidate-confirm) { root.show-consolidate-confirm = false; return true; }
-        if (root.show-sweep-confirm) { root.show-sweep-confirm = false; return true; }
         if (root.show-reset-confirm) { root.show-reset-confirm = false; return true; }
         if (root.confirm-remove-address != "") { root.cancel-remove(); return true; }
         if (root.rename-address != "") { root.cancel-rename(); return true; }
@@ -4852,105 +4842,6 @@ export component AppWindow inherits Window {
         }
     }
 
-    // ---------- wallet-consolidate confirmation (modal overlay) ----------
-    if root.show-wconsol-confirm: Rectangle {
-        width: 100%;
-        height: 100%;
-        background: #000000.with-alpha(0.55);
-        TouchArea { clicked => { root.show-wconsol-confirm = false; } }
-        Rectangle {
-            width: 400px;
-            height: wcl.preferred-height;
-            x: (parent.width - self.width) / 2;
-            y: 200px;
-            border-radius: 14px;
-            background: Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            TouchArea { }
-            wcl := VerticalLayout {
-                padding: 20px;
-                spacing: 12px;
-                Text {
-                    text: "Consolidate the whole wallet?";
-                    font-size: 16px;
-                    font-weight: 700;
-                    color: Pal.text;
-                }
-                Body { text: root.wconsol-summary; font-size: 12px; }
-                Caption {
-                    text: "One transaction spends every notebook's coins — all their addresses become publicly linked on-chain.";
-                    color: Pal.warn;
-                }
-                HorizontalLayout {
-                    spacing: 10px;
-                    GhostButton { text: "Cancel"; clicked => { root.show-wconsol-confirm = false; } }
-                    PrimaryButton {
-                        text: root.wallet-tx-busy ? "Consolidating…" : "Consolidate";
-                        tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
-                        clicked => { if (!root.wallet-tx-busy) { root.wallet-consolidate(); } }
-                    }
-                }
-            }
-        }
-    }
-
-    // ---------- spending-wallet consolidate confirmation (modal overlay) ----------
-    // CHANGE 3 (2026-07-17): merges every spending coin into ONE, at the
-    // NEXT FRESH spending receive address — signs in-app immediately (no
-    // external wallet, unlike the notebook wconsol flow above).
-    if root.show-spending-consolidate-confirm: Rectangle {
-        width: 100%;
-        height: 100%;
-        background: #000000.with-alpha(0.55);
-        TouchArea { clicked => { root.show-spending-consolidate-confirm = false; } }
-        Rectangle {
-            width: 400px;
-            height: scl.preferred-height;
-            x: (parent.width - self.width) / 2;
-            y: 220px;
-            border-radius: 14px;
-            background: Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            TouchArea { }
-            scl := VerticalLayout {
-                padding: 20px;
-                spacing: 12px;
-                Text {
-                    text: "Consolidate spending coins?";
-                    font-size: 16px;
-                    font-weight: 700;
-                    color: Pal.text;
-                }
-                Body {
-                    text: "Merges every spending-wallet coin into a single coin at the next fresh spending receive address.";
-                    font-size: 12px;
-                }
-                if root.spending-consolidate-fee-line != "": Text {
-                    text: root.spending-consolidate-fee-line;
-                    font-size: 13px;
-                    font-weight: 600;
-                    color: Pal.accent;
-                    wrap: word-wrap;
-                }
-                Caption {
-                    text: "Consolidating links these fresh addresses on-chain.";
-                    color: Pal.warn;
-                }
-                HorizontalLayout {
-                    spacing: 10px;
-                    GhostButton { text: "Cancel"; clicked => { root.show-spending-consolidate-confirm = false; } }
-                    PrimaryButton {
-                        text: root.wallet-tx-busy ? "Consolidating…" : "Consolidate";
-                        tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
-                        clicked => { if (!root.wallet-tx-busy) { root.spending-consolidate(); } }
-                    }
-                }
-            }
-        }
-    }
-
     // ---------- reset-identity confirmation (modal overlay) ----------
     if root.show-reset-confirm: Rectangle {
         width: 100%;
@@ -4996,106 +4887,6 @@ export component AppWindow inherits Window {
                         tint: Pal.bad;
                         tint-hover: #ff6b62;
                         clicked => { root.reset-identity(); }
-                    }
-                }
-            }
-        }
-    }
-
-    // ---------- sweep confirmation (modal overlay) ----------
-    if root.show-sweep-confirm: Rectangle {
-        width: 100%;
-        height: 100%;
-        background: #000000.with-alpha(0.55);
-        TouchArea { clicked => { root.show-sweep-confirm = false; } }
-        Rectangle {
-            width: 400px;
-            height: sl.preferred-height;
-            x: (parent.width - self.width) / 2;
-            y: 220px;
-            border-radius: 14px;
-            background: Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            TouchArea { }
-            sl := VerticalLayout {
-                padding: 20px;
-                spacing: 12px;
-                Text {
-                    text: "Sweep all funds?";
-                    font-size: 16px;
-                    font-weight: 700;
-                    color: Pal.text;
-                }
-                Body { text: root.balance-line; font-size: 12px; }
-                Mono {
-                    text: "To " + root.sweep-dest;
-                    font-size: 10px;
-                    color: Pal.muted;
-                    wrap: no-wrap;
-                    overflow: elide;
-                }
-                Caption { text: "Sends the entire balance (minus the fee). Pending notes' locked inputs are not touched."; }
-                HorizontalLayout {
-                    spacing: 10px;
-                    GhostButton { text: "Cancel"; clicked => { root.show-sweep-confirm = false; } }
-                    PrimaryButton {
-                        text: root.wallet-tx-busy ? "Sweeping…" : "Sweep";
-                        tint: root.wallet-tx-busy ? Pal.faint : Pal.bad;
-                        tint-hover: root.wallet-tx-busy ? Pal.faint : #ff6b62;
-                        clicked => { if (!root.wallet-tx-busy) { root.sweep(); } }
-                    }
-                }
-            }
-        }
-    }
-
-    // ---------- consolidate confirmation (modal overlay) ----------
-    if root.show-consolidate-confirm: Rectangle {
-        width: 100%;
-        height: 100%;
-        background: #000000.with-alpha(0.55);
-        TouchArea { clicked => { root.show-consolidate-confirm = false; } }
-        Rectangle {
-            width: 400px;
-            height: kl.preferred-height;
-            x: (parent.width - self.width) / 2;
-            y: 220px;
-            border-radius: 14px;
-            background: Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            TouchArea { }
-            kl := VerticalLayout {
-                padding: 20px;
-                spacing: 12px;
-                Text {
-                    text: "Consolidate coins?";
-                    font-size: 16px;
-                    font-weight: 700;
-                    color: Pal.text;
-                }
-                Body {
-                    text: "Combines all spendable coins into a single output back to your own address. Costs a fee now; saves on every future note.";
-                    font-size: 12px;
-                }
-                Caption { text: root.coins-summary; }
-                // Exact fee preview: a dry-run of the same tx builder the
-                // Consolidate button broadcasts (same inputs → same vsize).
-                if root.consolidate-fee-line != "": Text {
-                    text: root.consolidate-fee-line;
-                    font-size: 13px;
-                    font-weight: 600;
-                    color: Pal.accent;
-                    wrap: word-wrap;
-                }
-                HorizontalLayout {
-                    spacing: 10px;
-                    GhostButton { text: "Cancel"; clicked => { root.show-consolidate-confirm = false; } }
-                    PrimaryButton {
-                        text: root.wallet-tx-busy ? "Consolidating…" : "Consolidate";
-                        tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
-                        clicked => { if (!root.wallet-tx-busy) { root.consolidate(); } }
                     }
                 }
             }
@@ -5188,7 +4979,7 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.show-bump-dialog = false; } }
-                    PrimaryButton { text: "Replace & broadcast"; clicked => { root.act-bump-confirm(); } }
+                    PrimaryButton { text: "Sign…"; clicked => { root.act-bump-confirm(); } }
                 }
             }
         }
