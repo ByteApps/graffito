@@ -126,14 +126,23 @@ impl HttpTransport {
 }
 
 impl Transport for HttpTransport {
+    // `.send()` failing means the request never reached a server at all
+    // (DNS, connection refused/reset, timeout) — `Error::Transport`, the
+    // class `ChainClient::broadcast` retries once. A `.text()` failure
+    // happens after a response header/status DID arrive, but a body that
+    // never fully lands (connection dropped mid-transfer) is the same
+    // "no usable server response" shape, so it's tagged `Transport` too.
+    // Only a cleanly-received non-2xx status (a real response, just an
+    // error one) is `Error::Http` — never retried, since retrying a
+    // rejected request can't help.
     fn get_text(&self, path: &str) -> Result<String, Error> {
         let resp = self
             .client
             .get(format!("{}{}", self.base, path))
             .send()
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(|e| Error::Transport(e.to_string()))?;
         let status = resp.status();
-        let text = resp.text().map_err(|e| Error::Http(e.to_string()))?;
+        let text = resp.text().map_err(|e| Error::Transport(e.to_string()))?;
         if !status.is_success() {
             return Err(Error::Http(format!("{status}: {text}")));
         }
@@ -146,9 +155,9 @@ impl Transport for HttpTransport {
             .post(format!("{}{}", self.base, path))
             .body(body)
             .send()
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(|e| Error::Transport(e.to_string()))?;
         let status = resp.status();
-        let text = resp.text().map_err(|e| Error::Http(e.to_string()))?;
+        let text = resp.text().map_err(|e| Error::Transport(e.to_string()))?;
         if !status.is_success() {
             return Err(Error::Http(format!("{status}: {text}")));
         }
@@ -370,8 +379,31 @@ impl<T: Transport> ChainClient<T> {
     }
 
     /// Broadcast raw tx hex; returns the txid mempool.space echoes back.
+    ///
+    /// One automatic retry, TRANSPORT-class failures only (`Error::Transport`
+    /// — the request never reached a server: connection reset, timeout, a
+    /// dying cellular link; the exact shape a weak-connection broadcast hits,
+    /// see the "note saved, retry from here" Activity path). A real server
+    /// RESPONSE with an error status (`Error::Http` — 400 bad tx, 409, ...)
+    /// is reported immediately, no retry: retrying a rejected tx can't help,
+    /// and could even mask the real reason for a caller that only sees the
+    /// final error. Sleeping ~2s between attempts is fine to block on: this
+    /// always runs on a worker `std::thread` (every call site here spawns
+    /// one for exactly this reason), never the UI/event-loop thread. A
+    /// retried broadcast re-POSTs the SAME raw bytes, so it's idempotent —
+    /// same tx, same computed txid — a duplicate submission after a timeout
+    /// is a harmless no-op server-side, not a double-spend.
     pub fn broadcast(&self, raw_hex: &str) -> Result<String, Error> {
-        Ok(self.transport.post_text("/tx", raw_hex.to_string())?.trim().to_string())
+        match self.transport.post_text("/tx", raw_hex.to_string()) {
+            Ok(txid) => Ok(txid.trim().to_string()),
+            Err(Error::Transport(_)) => {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                self.transport
+                    .post_text("/tx", raw_hex.to_string())
+                    .map(|txid| txid.trim().to_string())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Raw hex of an on-chain/mempool tx — the keyless rebroadcast source.
@@ -1008,5 +1040,78 @@ mod tests {
         assert_eq!(client.outpoint_unspent("addr1", "aa", 0), Some(true));
         assert_eq!(client.outpoint_unspent("addr1", "aa", 1), Some(false));
         assert_eq!(client.outpoint_unspent("addr1", "cc", 0), Some(false));
+    }
+
+    // ---- broadcast: one retry, transport-class failures only ----
+
+    /// Canned `/tx` POST transport whose first N attempts fail with a fixed
+    /// error (transport- or response-shaped, caller's choice), then succeed
+    /// — `attempts` counts every `post_text` call so tests can assert the
+    /// retry fired exactly once (never more).
+    struct BroadcastTransport {
+        fail_first: std::cell::Cell<u32>,
+        fail_err: Error,
+        attempts: std::cell::Cell<u32>,
+    }
+    impl Transport for BroadcastTransport {
+        fn get_text(&self, _path: &str) -> Result<String, Error> {
+            unreachable!("broadcast never GETs")
+        }
+        fn post_text(&self, path: &str, _body: String) -> Result<String, Error> {
+            assert_eq!(path, "/tx");
+            self.attempts.set(self.attempts.get() + 1);
+            let remaining = self.fail_first.get();
+            if remaining > 0 {
+                self.fail_first.set(remaining - 1);
+                return Err(self.fail_err.clone());
+            }
+            Ok("deadbeef".into())
+        }
+    }
+
+    #[test]
+    fn broadcast_retries_once_after_a_transport_failure_then_succeeds() {
+        let transport = BroadcastTransport {
+            fail_first: std::cell::Cell::new(1),
+            fail_err: Error::Transport("error sending request for url (...)".into()),
+            attempts: std::cell::Cell::new(0),
+        };
+        let client = ChainClient::new(transport, Network::Testnet4);
+        assert_eq!(client.broadcast("aabbcc").unwrap(), "deadbeef");
+        assert_eq!(client.transport.attempts.get(), 2, "one retry after the transport failure");
+    }
+
+    #[test]
+    fn broadcast_gives_up_after_two_transport_failures() {
+        let transport = BroadcastTransport {
+            fail_first: std::cell::Cell::new(99), // every attempt fails
+            fail_err: Error::Transport("connection reset".into()),
+            attempts: std::cell::Cell::new(0),
+        };
+        let client = ChainClient::new(transport, Network::Testnet4);
+        let err = client.broadcast("aabbcc").unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
+        assert_eq!(
+            client.transport.attempts.get(),
+            2,
+            "exactly one retry, not an unbounded loop"
+        );
+    }
+
+    #[test]
+    fn broadcast_never_retries_a_server_rejection() {
+        let transport = BroadcastTransport {
+            fail_first: std::cell::Cell::new(99),
+            fail_err: Error::Http("400 Bad Request: bad-txns-in-belowout".into()),
+            attempts: std::cell::Cell::new(0),
+        };
+        let client = ChainClient::new(transport, Network::Testnet4);
+        let err = client.broadcast("aabbcc").unwrap_err();
+        assert!(matches!(err, Error::Http(_)));
+        assert_eq!(
+            client.transport.attempts.get(),
+            1,
+            "a real server response (even an error one) is reported immediately"
+        );
     }
 }

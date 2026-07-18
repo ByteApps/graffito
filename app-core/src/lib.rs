@@ -65,6 +65,13 @@ pub enum Error {
     Entropy,
     /// HTTP transport failure (network, status, body).
     Http(String),
+    /// The request never reached a server at all — connection refused/reset,
+    /// DNS failure, timeout, dropped mid-transfer (see
+    /// `HttpTransport::get_text`/`post_text`'s `.send()`/body-read steps in
+    /// chain.rs). Kept distinct from [`Error::Http`] (a response DID come
+    /// back, just with an error status) so callers can retry only the
+    /// transport case — a rejected tx must never be silently retried.
+    Transport(String),
     /// Response body did not parse as expected.
     Json(String),
     /// Store I/O, (de)serialization, or identity-mismatch failure.
@@ -104,6 +111,7 @@ impl core::fmt::Display for Error {
             Error::SeedQr(m) => write!(f, "SeedQR: {m}"),
             Error::Entropy => write!(f, "entropy source failure"),
             Error::Http(m) => write!(f, "http: {m}"),
+            Error::Transport(m) => write!(f, "transport: {m}"),
             Error::Json(m) => write!(f, "response: {m}"),
             Error::Store(m) => write!(f, "store: {m}"),
             Error::Funding(m) => write!(f, "funding: {m}"),

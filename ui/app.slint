@@ -4723,10 +4723,29 @@ export component AppWindow inherits Window {
             warn: root.confirm-warn;
             txid: root.confirm-txid;
         }
-        PrimaryButton {
-            text: root.wallet-tx-busy ? "Broadcasting…" : "Broadcast";
-            tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
-            clicked => { if (!root.wallet-tx-busy) { root.confirm-broadcast(); } }
+        Rectangle {
+            height: 46px;
+            PrimaryButton {
+                width: 100%;
+                height: 100%;
+                text: root.wallet-tx-busy ? "Broadcasting…" : "Broadcast";
+                tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
+                clicked => { if (!root.wallet-tx-busy) { root.confirm-broadcast(); } }
+            }
+            // A label swap alone was too subtle on a slow/dying connection
+            // (Sal 2026-07-18: the button "did nothing" for several seconds
+            // on weak cellular before the error landed) — pair it with the
+            // same rotating spinner.svg QrSpinner already used elsewhere for
+            // in-flight work, plus the reassurance caption below.
+            if root.wallet-tx-busy: QrSpinner {
+                width: 22px;
+                height: 22px;
+                x: parent.width - self.width - 14px;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+        if root.wallet-tx-busy: Caption {
+            text: "Sending to your node — a weak connection can take up to 30 seconds.";
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
     }

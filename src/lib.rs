@@ -1463,6 +1463,76 @@ fn commas(n: u64) -> String {
     out
 }
 
+/// The bare host from a Bitcoin-node base URL, e.g.
+/// `https://mempool.space/testnet4/api` → `mempool.space`. Falls back to
+/// "your node" when `base_url` is empty/unparseable (no node configured, or
+/// the setting changed between the broadcast attempt and this being shown).
+fn host_of(base_url: &str) -> String {
+    let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
+    match rest.split('/').next().filter(|h| !h.is_empty()) {
+        Some(h) => h.to_string(),
+        None => "your node".to_string(),
+    }
+}
+
+/// Broadcast-failure sites see a stringified `app_core::Error` (workers
+/// already `.map_err(|e| format!("{e}"))` before crossing the thread
+/// boundary — see the `client.broadcast()` call sites). A TRANSPORT-class
+/// failure (`app_core::Error::Transport`, tagged by its Display impl with a
+/// "transport: " prefix — chain.rs already retried it once and it still
+/// didn't reach a server) reads as raw reqwest text like `error sending
+/// request for url (...)`, which is Greek to a user on a weak connection;
+/// swap it for a plain-language message naming the node host instead.
+/// Anything else — a real server rejection (`Error::Http`, e.g. "400 Bad
+/// Request: ..."), a local build/sign error, ... — passes through untouched:
+/// those messages are already meaningful (or at least not a networking red
+/// herring) and mapping them further risks hiding the actual cause.
+///
+/// Applied ONLY at user-facing `set_status`/toast broadcast-failure sites;
+/// every `cb:`/println! log line keeps the raw error verbatim (the
+/// debugging contract — see the workspace CLAUDE.md's log-contract note).
+fn friendly_broadcast_err(e: &str, base_url: &str) -> String {
+    match e.strip_prefix("transport: ") {
+        Some(_raw) => format!("network error reaching {} — check your connection", host_of(base_url)),
+        None => e.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod broadcast_err_tests {
+    use super::*;
+
+    #[test]
+    fn transport_errors_become_a_friendly_host_message() {
+        let e = "transport: error sending request for url (https://mempool.space/testnet4/api/tx)";
+        assert_eq!(
+            friendly_broadcast_err(e, "https://mempool.space/testnet4/api"),
+            "network error reaching mempool.space — check your connection"
+        );
+    }
+
+    #[test]
+    fn transport_errors_fall_back_when_base_url_is_unknown() {
+        let e = "transport: connection reset";
+        assert_eq!(
+            friendly_broadcast_err(e, ""),
+            "network error reaching your node — check your connection"
+        );
+    }
+
+    #[test]
+    fn server_rejections_pass_through_untouched() {
+        let e = "http: 400 Bad Request: bad-txns-in-belowout";
+        assert_eq!(friendly_broadcast_err(e, "https://mempool.space/testnet4/api"), e);
+    }
+
+    #[test]
+    fn non_broadcast_errors_pass_through_untouched() {
+        let e = "no signed PSBT";
+        assert_eq!(friendly_broadcast_err(e, "https://mempool.space/api"), e);
+    }
+}
+
 fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), String> {
     let material =
         parse_key_material(material_str, st.network).map_err(|e| e.to_string())?;
@@ -2510,7 +2580,10 @@ fn apply_act_retry_results(w: &AppWindow, st: &mut State) {
             }
             Err(e) => {
                 println!("cb: act-retry ref={} err={e}", r.ref_id);
-                w.set_status(format!("rebroadcast failed: {e}").into());
+                let base = st.base_url().unwrap_or_default();
+                w.set_status(
+                    format!("rebroadcast failed: {}", friendly_broadcast_err(&e, &base)).into(),
+                );
                 show_toast(w, "Rebroadcast failed");
             }
         }
@@ -2550,7 +2623,11 @@ fn apply_act_bump_results(w: &AppWindow, st: &mut State) {
             }
             Err(e) => {
                 println!("cb: act-bump ref={} broadcast err={e}", r.ref_id);
-                w.set_status(format!("signed but broadcast failed: {e}").into());
+                let base = st.base_url().unwrap_or_default();
+                w.set_status(
+                    format!("signed but broadcast failed: {}", friendly_broadcast_err(&e, &base))
+                        .into(),
+                );
                 show_toast(w, "Speed-up broadcast failed");
             }
         }
@@ -2705,7 +2782,10 @@ fn apply_sweep_broadcast_result(w: &AppWindow, st: &mut State, r: SweepBroadcast
         }
         Err(e) => {
             println!("cb: sweep broadcast err={e}");
-            w.set_status(format!("sweep broadcast failed: {e}").into());
+            let base = st.base_url().unwrap_or_default();
+            w.set_status(
+                format!("sweep broadcast failed: {}", friendly_broadcast_err(&e, &base)).into(),
+            );
         }
     }
 }
@@ -2763,7 +2843,11 @@ fn apply_consolidate_broadcast_result(w: &AppWindow, st: &mut State, r: Consolid
         }
         Err(e) => {
             println!("cb: consolidate broadcast err={e}");
-            w.set_status(format!("consolidate broadcast failed: {e}").into());
+            let base = st.base_url().unwrap_or_default();
+            w.set_status(
+                format!("consolidate broadcast failed: {}", friendly_broadcast_err(&e, &base))
+                    .into(),
+            );
         }
     }
 }
@@ -2896,7 +2980,8 @@ fn apply_wconsol_broadcast_result(w: &AppWindow, st: &mut State, r: WConsolBroad
         }
         Err(e) => {
             println!("cb: wallet-consolidate broadcast err={e}");
-            w.set_status(format!("broadcast failed: {e}").into());
+            let base = st.base_url().unwrap_or_default();
+            w.set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
         }
     }
 }
@@ -2981,7 +3066,10 @@ fn apply_psbt_broadcast_result(w: &AppWindow, st: &mut State, r: PsbtBroadcastRe
                 refresh(w, st);
             }
         }
-        Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
+        Err(e) => {
+            let base = st.base_url().unwrap_or_default();
+            w.set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
+        }
     }
 }
 
@@ -3092,7 +3180,10 @@ fn apply_spending_consolidate_result(w: &AppWindow, st: &mut State, r: SpendingC
         }
         Err(e) => {
             println!("cb: spending-consolidate broadcast err={e}");
-            w.set_status(format!("consolidate failed: {e}").into());
+            let base = st.base_url().unwrap_or_default();
+            w.set_status(
+                format!("consolidate failed: {}", friendly_broadcast_err(&e, &base)).into(),
+            );
             show_toast(w, "Broadcast failed");
         }
     }
@@ -3197,7 +3288,14 @@ fn apply_notebook_compose_result(w: &AppWindow, st: &mut State, r: NotebookCompo
             println!("cb: compose broadcast err={e}");
             w.set_return_screen(4);
             update_activity(w, st);
-            w.set_status(format!("broadcast failed: {e} — note saved, retry from here").into());
+            let base = st.base_url().unwrap_or_default();
+            w.set_status(
+                format!(
+                    "broadcast failed: {} — note saved, retry from here",
+                    friendly_broadcast_err(&e, &base)
+                )
+                .into(),
+            );
             show_toast(w, "Broadcast failed — note saved. Retry from this list.");
             w.set_screen(11);
         }
@@ -3305,7 +3403,8 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
         // currently on (its Broadcast button is now inert: stage B already
         // dropped `pending_broadcast` for every non-psbt kind once it fired).
         Err(e) => {
-            w.set_status(format!("broadcast failed: {e}").into());
+            let base = st.base_url().unwrap_or_default();
+            w.set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
             w.set_screen(6);
         }
     }
@@ -3420,7 +3519,10 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
             w.set_screen(4);
             refresh_async(w, st);
         }
-        Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
+        Err(e) => {
+            let base = st.base_url().unwrap_or_default();
+            w.set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
+        }
     }
 }
 
