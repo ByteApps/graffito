@@ -3599,6 +3599,12 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
             }
         }
         update_spending_ui(w, st);
+        if w.get_screen() == 16 && w.get_sweep_kind() == "sweep" {
+            // A wallet-sweep preview computed before the scan landed shows
+            // notebook coins only (Sal 2026-07-17) — recompute it so the
+            // spending coins join the inputs summary and fee preview.
+            update_sweep_screen(w, st);
+        }
         if w.get_screen() == 6 {
             // CHANGE 5: a user already sitting on compose when the scan
             // lands sees the default upgrade to "spending" too — but only
@@ -6345,6 +6351,16 @@ pub fn run() {
     cb!(on_sweep_open, |w, s| {
         println!("cb: sweep-open");
         s.pending_spending_sweep_index = None; // a fresh manual pick, not the spending-wallet shortcut
+        // A wallet sweep's inputs include spending-wallet coins, but on a
+        // fresh session (list → Settings → Sweep, no notebook opened) the
+        // runtime spending cache is empty — kick the scan now so the
+        // preview on screen 16 includes them (the apply repaints it there).
+        if s.spending_capable
+            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
+            && !s.spending_scanned
+        {
+            spending_refresh_async(&w, &mut s);
+        }
         w.set_sweep_kind("sweep".into());
         w.set_pick_mode("sweep".into());
         refresh_contacts(&w, &s);
