@@ -118,6 +118,12 @@ struct State {
     /// ceiling, so the "too large" dialog pops once on crossing — not on
     /// every keystroke while the draft stays too big.
     compose_oversize: bool,
+    /// Last-logged sub-dust fold amount (0 sats) for the compose cost-line
+    /// prediction — a last-value guard so `cb: compose-est fold=<S>` prints
+    /// once per distinct value instead of on every keystroke while a fold
+    /// keeps holding at the same figure (honest-fee-label feature,
+    /// 2026-07-18).
+    compose_fold_shown: u64,
     /// External-funding session (screens 12–14). The parsed funding source,
     /// its scanned spendable coins + next change index, the built unsigned
     /// PSBT, its animated-UR export frames, and the imported signed PSBT.
@@ -4370,6 +4376,21 @@ enum PayfromShape {
 /// and `build_funding_psbt_amount` use internally, minus their insufficiency
 /// gate (which would otherwise swallow the very fee figure a "you're short"
 /// UI needs to show).
+/// The Pay-from summary card's "Required" line, honest about a predicted
+/// sub-dust fold (2026-07-18): `required` is always the NOMINAL figure
+/// (what the shape actually needs at the chosen rate — never the eventual
+/// byte-true fee, which includes the folded leftover on top), and a
+/// `fold` prediction appends the leftover so the line never reads as an
+/// inflated/expensive requirement. `"~0 sats"` when nothing is known yet
+/// (unchanged from every branch's previous fallback).
+fn fold_required_line(required: Option<u64>, fold: Option<(u64, u64)>) -> String {
+    match (required, fold) {
+        (Some(r), Some((_, folded))) => format!("~{} sats (+{} leftover, dust rule)", commas(r), commas(folded)),
+        (Some(r), None) => format!("~{} sats", commas(r)),
+        (None, _) => "~0 sats".to_string(),
+    }
+}
+
 fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
     let net = st.network;
 
@@ -4440,9 +4461,13 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
     // Fee estimate for a "funded" shape (spending / mixed): reuses the real
     // sealer (`sealed_note_payloads`, the same primitive `build_funding_psbt_amount`/
     // `assemble_mixed_note_psbt` call internally) for accurate payload sizes,
-    // then `estimate_funded_fee` for the weight/fee math — WITHOUT their
-    // insufficiency gate, so a number always comes back.
-    let funded_fee = |input_weights: &[bitcoin::transaction::InputWeightPrediction], change_spk_len: usize| -> Option<u64> {
+    // then `estimate_funded_fee`/`estimate_funded_fee_no_change` for the
+    // weight/fee math — WITHOUT their insufficiency gate, so a number
+    // always comes back. Returns (fee_with_change, fee_no_change): the pair
+    // `app_core::mixed::predict_fold` needs to tell whether THIS selection
+    // would fold a sub-dust leftover into the fee (honest-fee-label,
+    // 2026-07-18).
+    let funded_fee_pair = |input_weights: &[bitcoin::transaction::InputWeightPrediction], change_spk_len: usize| -> Option<(u64, u64)> {
         let identity = st.ident.as_ref().and_then(|i| i.full())?.clone_fields();
         let chunk = st.store.as_ref().map(|s| s.chunk_size).unwrap_or(DEFAULT_CHUNK);
         let (payloads, recipient_spk) = app_core::notes_core::bundle::sealed_note_payloads(
@@ -4455,7 +4480,9 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         )
         .ok()?;
         let recipient_spk_len = recipient_spk.map(|s| s.len()).or_else(|| recipient.as_ref().map(|r| r.spk.len()));
-        Some(app_core::mixed::estimate_funded_fee(input_weights, &payloads, recipient_spk_len, change_spk_len, rate))
+        let fee_wc = app_core::mixed::estimate_funded_fee(input_weights, &payloads, recipient_spk_len, change_spk_len, rate);
+        let fee_nc = app_core::mixed::estimate_funded_fee_no_change(input_weights, &payloads, recipient_spk_len, rate);
+        Some((fee_wc, fee_nc))
     };
 
     let (required, required_line, source_label): (Option<u64>, String, String);
@@ -4464,6 +4491,8 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         // Nothing selected in ANY source — estimate the minimal 1-input
         // self-funded shape (what auto-suggest will land on): never leave
         // the line blank just because the user hasn't picked a coin yet.
+        // No fold prediction here — there's no real selection yet to fold
+        // FROM (`in_value` would be 0), so this stays the plain estimate.
         let spk_len = recipient.as_ref().map(|r| r.spk.len());
         let change_len = custom_change_spk_len.or(Some(34));
         let fee = st
@@ -4478,29 +4507,41 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
     } else if nb_total > 0 && groups == 1 {
         // Notebook-only — same self-funded estimator the plain compose path
         // already uses (no dust-to-self: change naturally returns to the
-        // notebook, which already keeps the note discoverable).
+        // notebook, which already keeps the note discoverable). Sub-dust
+        // fold prediction (honest-fee-label, 2026-07-18): `required` stays
+        // the NOMINAL fee (what the no-change shape actually needs), and
+        // the line notes the folded leftover separately so it never reads
+        // as an inflated/expensive fee.
         let spk_len = recipient.as_ref().map(|r| r.spk.len());
-        let change_len = custom_change_spk_len.or(Some(34));
-        let fee = st
+        let change_len = custom_change_spk_len.unwrap_or(34);
+        let vsize = st
             .store
             .as_ref()
-            .and_then(|store| note_est(store, text_for_est.len(), private, nb_sel.len().max(1), spk_len, change_len).ok())
-            .map(|(_, vsize)| (vsize as f64 * rate).ceil().max(0.0) as u64);
-        required = fee.map(|f| f + gift);
+            .and_then(|store| note_est(store, text_for_est.len(), private, nb_sel.len().max(1), spk_len, Some(change_len)).ok())
+            .map(|(_, vsize)| vsize);
+        let fee_wc = vsize.map(|v| (v as f64 * rate).ceil().max(0.0) as u64);
+        let fold = vsize.and_then(|v| app_core::mixed::predict_notebook_fold(nb_total, gift, v, change_len, rate));
+        let nominal = fold.map(|(n, _)| n).or(fee_wc);
+        required = nominal.map(|f| f + gift);
         source_label = "Notebook".to_string();
-        required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
+        required_line = fold_required_line(required, fold);
         shape = PayfromShape::Notebook;
     } else if sp_total > 0 && groups == 1 {
         // Spending-only — same funded shape `spending_compose_ui` builds for
         // real (dust-to-self ALWAYS), just never gated on affordability.
+        // Same fold treatment as the notebook branch above, via the funded
+        // (with-change/no-change) estimator pair.
         let weights: Vec<_> = std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX)
             .take(sp_sel.len().max(1))
             .collect();
         let change_len = custom_change_spk_len.unwrap_or(22); // BIP84 p2wpkh spk is always 22 bytes
-        let fee = funded_fee(&weights, change_len);
-        required = fee.map(|f| f + gift + DUST_SATS);
+        let fees = funded_fee_pair(&weights, change_len);
+        let fixed_out = gift + DUST_SATS; // recipient (if any) + the ALWAYS dust-to-self output
+        let fold = fees.and_then(|(fee_wc, fee_nc)| app_core::mixed::predict_fold(sp_total, fixed_out, fee_wc, fee_nc, false));
+        let nominal = fold.map(|(n, _)| n).or_else(|| fees.map(|(wc, _)| wc));
+        required = nominal.map(|f| f + gift + DUST_SATS);
         source_label = "Spending wallet".to_string();
-        required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
+        required_line = fold_required_line(required, fold);
         shape = PayfromShape::Spending;
     } else if groups == 1 {
         // External-only — cost is "whatever the wallet pays"; never invent a
@@ -4554,10 +4595,13 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
                 .map(|fw| if fw.kind == "taproot" { 34 } else { 22 })
                 .unwrap_or(34),
         });
-        let fee = funded_fee(&weights, change_len);
-        required = fee.map(|f| f + gift + DUST_SATS);
+        let fees = funded_fee_pair(&weights, change_len);
+        let fixed_out = gift + DUST_SATS; // recipient (if any) + the ALWAYS dust-to-self output
+        let fold = fees.and_then(|(fee_wc, fee_nc)| app_core::mixed::predict_fold(selected, fixed_out, fee_wc, fee_nc, false));
+        let nominal = fold.map(|(n, _)| n).or_else(|| fees.map(|(wc, _)| wc));
+        required = nominal.map(|f| f + gift + DUST_SATS);
         source_label = format!("{groups} wallets");
-        required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
+        required_line = fold_required_line(required, fold);
         shape = PayfromShape::Mixed;
     }
 
@@ -4934,8 +4978,23 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     let over = !matches!(fit, FitCheck::Ok);
     match est {
         Ok((chunks, vsize)) if !over => {
-            let fee = (vsize as f64 * rate).ceil() as u64;
-            let change = sel_total.saturating_sub(fee + sent);
+            let change_len = change_spk_len.unwrap_or(34);
+            // Sub-dust fold prediction (honest-fee-label, 2026-07-18): when
+            // the leftover after this selection's fee can't clear the dust
+            // minimum, the real builder folds it into the fee instead of a
+            // change output — mirror that HERE so the preview shows the
+            // vsize/fee the tx will ACTUALLY have (the no-change shape), not
+            // the with-change one that won't be built.
+            let fold = app_core::mixed::predict_notebook_fold(sel_total, sent, vsize, change_len, rate);
+            let (vsize, fee, change) = match fold {
+                Some((nominal, _)) => {
+                    (app_core::mixed::notebook_vsize_no_change(vsize, change_len), nominal, 0)
+                }
+                None => {
+                    let fee = (vsize as f64 * rate).ceil() as u64;
+                    (vsize, fee, sel_total.saturating_sub(fee + sent))
+                }
+            };
             let usd = st
                 .usd
                 .map(|p| format!(" (~${:.2})", fee as f64 * p / 1e8))
@@ -4945,8 +5004,19 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             } else {
                 String::new()
             };
+            let fold_line = match fold {
+                Some((_, folded)) => format!(" + {} sats leftover (dust rule)", commas(folded)),
+                None => String::new(),
+            };
+            let fold_amount = fold.map(|(_, folded)| folded).unwrap_or(0);
+            if fold_amount != st.compose_fold_shown {
+                if fold_amount > 0 {
+                    println!("cb: compose-est fold={fold_amount}");
+                }
+                st.compose_fold_shown = fold_amount;
+            }
             w.set_cost_line(
-                format!("{chunks} chunk(s) · ~{vsize} vB · ~{fee} sats{usd}{gift_line}").into(),
+                format!("{chunks} chunk(s) · ~{vsize} vB · ~{fee} sats{usd}{gift_line}{fold_line}").into(),
             );
             w.set_change_amount(format!("Change to {change_dest} · ~{change} sats").into());
         }
@@ -5235,14 +5305,55 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     };
     match app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift) {
         Ok(built) => {
-            let usd = st.usd.map(|p| format!(" (~${:.2})", built.fee as f64 * p / 1e8)).unwrap_or_default();
+            // Sub-dust fold prediction (honest-fee-label, 2026-07-18):
+            // `built.change == 0` means the REAL build already chose the
+            // no-change shape — split its fee into the nominal figure
+            // (what that shape actually costs at the chosen rate) and the
+            // sub-dust leftover folded in on top, so the line never reads
+            // as an inflated/expensive fee.
+            let fold = if built.change == 0 {
+                let weights: Vec<_> = std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX)
+                    .take(selected_coins.len().max(1))
+                    .collect();
+                app_core::notes_core::bundle::sealed_note_payloads(
+                    &identity,
+                    text,
+                    w.get_compose_private(),
+                    recipient.as_ref(),
+                    [0u8, 0, 0, 0],
+                    store.chunk_size,
+                )
+                .ok()
+                .map(|(payloads, recipient_spk)| {
+                    let recipient_spk_len =
+                        recipient_spk.map(|s| s.len()).or_else(|| recipient.as_ref().map(|r| r.spk.len()));
+                    let nominal =
+                        app_core::mixed::estimate_funded_fee_no_change(&weights, &payloads, recipient_spk_len, rate);
+                    (nominal, built.fee.saturating_sub(nominal))
+                })
+                .filter(|(_, folded)| *folded > 0)
+            } else {
+                None
+            };
+            let fold_amount = fold.map(|(_, f)| f).unwrap_or(0);
+            if fold_amount != st.compose_fold_shown {
+                if fold_amount > 0 {
+                    println!("cb: compose-est fold={fold_amount}");
+                }
+                st.compose_fold_shown = fold_amount;
+            }
+            let fee_shown = fold.map(|(nominal, _)| nominal).unwrap_or(built.fee);
+            let usd = st.usd.map(|p| format!(" (~${:.2})", fee_shown as f64 * p / 1e8)).unwrap_or_default();
             let gift_line = if recipient.is_some() {
                 format!(" + {} sats to recipient", commas(built.sent_to_recipient))
             } else {
                 String::new()
             };
+            let fold_line = fold
+                .map(|(_, folded)| format!(" + {} sats leftover (dust rule)", commas(folded)))
+                .unwrap_or_default();
             w.set_cost_line(
-                format!("~{} sats fee{usd}{gift_line} · +330 sats dust-to-self", built.fee).into(),
+                format!("~{} sats fee{usd}{gift_line} · +330 sats dust-to-self{fold_line}", fee_shown).into(),
             );
             w.set_change_amount(
                 if has_custom_change {
@@ -5614,8 +5725,15 @@ fn note_context(directed: bool, private: bool, network: Network) -> String {
 /// output). Without this note the confirm screen shows a fee visibly above
 /// rate×vsize with no explanation — Sal hit exactly that on testnet4
 /// (single 330-sat coin → whole coin to fee) and asked if dust was
-/// forgotten. Appends to the warn banner AFTER show_confirm populated it;
-/// only when the confirm screen actually navigated.
+/// forgotten. The byte-truth fee row (e.g. "330 sats · 3.2 sat/vB") stays
+/// untouched elsewhere on the screen — this banner is what keeps that
+/// figure from reading as an inflated/expensive fee: it splits it into the
+/// real network fee at the user's chosen rate (`nominal = ceil(vsize×rate)`)
+/// and the sub-dust leftover riding along on top (Sal 2026-07-18: "every
+/// fee label must split honestly ... so it's not misleading as being
+/// expensive to use this app"). Appends to the warn banner AFTER
+/// show_confirm populated it; only when the confirm screen actually
+/// navigated.
 fn note_subdust_fold_warn(w: &AppWindow, change: u64, fee: u64, vsize: u64, rate: f64) {
     if change != 0 || w.get_screen() != 26 {
         return;
@@ -5627,7 +5745,8 @@ fn note_subdust_fold_warn(w: &AppWindow, change: u64, fee: u64, vsize: u64, rate
     }
     println!("cb: confirm subdust-fold folded={folded}");
     let msg = format!(
-        "no change output: the {} sat leftover is below the {} sat dust minimum, so it goes to the network fee",
+        "network fee ~{} sats at your rate · +{} sats leftover below the {} sat dust minimum (too small to form a change output)",
+        commas(nominal),
         commas(folded),
         DUST_SATS
     );
@@ -6661,6 +6780,7 @@ pub fn run() {
         pending_mnemonic: None,
         quiz_indices: Vec::new(),
         compose_oversize: false,
+        compose_fold_shown: 0,
         funding: None,
         funding_coins: Vec::new(),
         funding_change_index: 0,

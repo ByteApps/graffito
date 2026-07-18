@@ -198,6 +198,138 @@ pub fn estimate_funded_fee(
     (vsize as f64 * fee_rate).ceil().max(0.0) as u64
 }
 
+/// The other half of [`estimate_funded_fee`]'s output-shape list: the SAME
+/// funded shape (OP_RETURNs + optional recipient + the ALWAYS-present
+/// dust-to-self) but WITHOUT a discretionary change output — the "no
+/// change" branch of the with-change/no-change decision
+/// [`assemble_mixed_note_psbt`] / [`crate::psbt_build::assemble_funded_note_psbt`]
+/// make for real. Paired with `estimate_funded_fee` by [`predict_fold`] to
+/// tell whether the CURRENT selection would fold a sub-dust leftover into
+/// the fee.
+pub fn estimate_funded_fee_no_change(
+    input_weights: &[InputWeightPrediction],
+    payloads: &[Vec<u8>],
+    recipient_spk_len: Option<usize>,
+    fee_rate: f64,
+) -> u64 {
+    let mut lens: Vec<usize> =
+        payloads.iter().map(|p| notes_core::tx::op_return_script(p).len()).collect();
+    if let Some(l) = recipient_spk_len {
+        lens.push(l);
+    }
+    lens.push(34); // dust-to-self: always present, with or without change
+    let vsize = predict_weight(input_weights.iter().copied(), lens.into_iter()).to_vbytes_ceil();
+    (vsize as f64 * fee_rate).ceil().max(0.0) as u64
+}
+
+/// Honest-fee-label prediction (2026-07-18): every note-tx builder in this
+/// app picks between a WITH-CHANGE shape and a NO-CHANGE shape — when a
+/// discretionary change output would be sub-dust, its value is folded into
+/// the fee instead (`build_note_tx_with_change`/`_exact` in notes-core for
+/// the notebook shape; [`assemble_mixed_note_psbt`] /
+/// [`crate::psbt_build::assemble_funded_note_psbt`] for spending/external/
+/// mixed). Without a UI split, the fee figure shown looks unexplainably
+/// high for tiny coins. `predict_fold` is the shared decision, applied to a
+/// FIXED selection (no coin-set growing, matching how the "current
+/// selection" is already fully known once coins are chosen): given the
+/// with-change and no-change fee figures for that exact selection, returns
+/// `Some((nominal, folded))` when the shape actually needed is no-change —
+/// `nominal` is the real fee at the given rate for that shape, `folded` is
+/// the sub-dust leftover swept into it on top (so `nominal + folded` is the
+/// byte-true fee the tx will pay). `None` when a change output is
+/// affordable, or nothing folds.
+///
+/// `cap_at_dust`: the plain notebook builder's no-change branch ALSO
+/// refuses a leftover ABOVE dust (`if !change && change_value > DUST_LIMIT
+/// { continue }` in `build_note_tx_with_change`/`_exact`) — for a fixed
+/// selection that means the real build would simply fail rather than fold
+/// an oversized leftover, so callers predicting the notebook shape must
+/// pass `true` (see [`predict_notebook_fold`]). The funded/mixed builders'
+/// no-change fallback has no such ceiling — it always folds whatever's
+/// left once a change output is ruled out — so [`predict_funded_fold`]
+/// passes `false`.
+pub fn predict_fold(
+    in_value: u64,
+    fixed_out: u64,
+    fee_with_change: u64,
+    fee_no_change: u64,
+    cap_at_dust: bool,
+) -> Option<(u64, u64)> {
+    if in_value >= fixed_out.saturating_add(fee_with_change) {
+        let change_wc = in_value - fixed_out - fee_with_change;
+        if change_wc >= DUST_LIMIT {
+            return None; // a change output is affordable — no fold
+        }
+    }
+    if in_value < fixed_out.saturating_add(fee_no_change) {
+        return None; // can't even afford the no-change shape
+    }
+    let leftover = in_value - fixed_out - fee_no_change;
+    if leftover == 0 {
+        return None; // nothing folds
+    }
+    if cap_at_dust && leftover > DUST_LIMIT {
+        return None; // the real (fixed-selection) build would refuse this shape
+    }
+    Some((fee_no_change, leftover))
+}
+
+/// [`predict_fold`] for the notebook (pure self-funded taproot) shape.
+/// `vsize_with_change` is the WITH-CHANGE vsize already sized for
+/// `change_len` — e.g. the app's own `note_est`, which mirrors notes-core's
+/// `estimate_vsize(…, true)` byte for byte. The no-change vsize is derived
+/// from it by subtracting the change output's own serialized byte cost
+/// (8-byte value + a 1-byte length varint + the script itself — every
+/// change script in this app is well under the 253-byte varint threshold,
+/// same assumption `note_est`'s own custom-change correction already
+/// makes): weight is exactly linear in whether the change output is
+/// present, and subtracting an integer before or after `ceil(weight/4)`
+/// gives the same vsize, so this is an EXACT match for calling
+/// `estimate_vsize(…, false)` directly — not an approximation. Verified
+/// against a real notebook build by `predict_notebook_fold_matches_real_build`.
+pub fn predict_notebook_fold(
+    in_value: u64,
+    sent: u64,
+    vsize_with_change: usize,
+    change_len: usize,
+    fee_rate: f64,
+) -> Option<(u64, u64)> {
+    let vsize_no_change = notebook_vsize_no_change(vsize_with_change, change_len);
+    let fee_wc = (vsize_with_change as f64 * fee_rate).ceil().max(0.0) as u64;
+    let fee_nc = (vsize_no_change as f64 * fee_rate).ceil().max(0.0) as u64;
+    predict_fold(in_value, sent, fee_wc, fee_nc, true)
+}
+
+/// The exact vsize a notebook note tx would have WITHOUT its discretionary
+/// change output, derived algebraically from the WITH-CHANGE vsize (e.g.
+/// `note_est`'s result) — see [`predict_notebook_fold`]'s doc for why
+/// subtracting the change output's own serialized byte cost this way is
+/// EXACT, not an approximation. Exposed separately from
+/// `predict_notebook_fold` so callers that already know a fold happened
+/// (its `Some`) can also show the real no-change vsize (the compose cost
+/// line's "~<N> vB").
+pub fn notebook_vsize_no_change(vsize_with_change: usize, change_len: usize) -> usize {
+    vsize_with_change.saturating_sub(9 + change_len) // 8 (value) + 1 (length varint) + script bytes
+}
+
+/// [`predict_fold`] for the funded shape (spending-only / external-only /
+/// mixed compose) — the `estimate_funded_fee` / `estimate_funded_fee_no_change`
+/// pair IS the with-change/no-change comparison, so this just runs both and
+/// hands them to `predict_fold` with `cap_at_dust = false` (see its doc).
+pub fn predict_funded_fold(
+    input_weights: &[InputWeightPrediction],
+    payloads: &[Vec<u8>],
+    recipient_spk_len: Option<usize>,
+    change_spk_len: usize,
+    in_value: u64,
+    fixed_out: u64,
+    fee_rate: f64,
+) -> Option<(u64, u64)> {
+    let fee_wc = estimate_funded_fee(input_weights, payloads, recipient_spk_len, change_spk_len, fee_rate);
+    let fee_nc = estimate_funded_fee_no_change(input_weights, payloads, recipient_spk_len, fee_rate);
+    predict_fold(in_value, fixed_out, fee_wc, fee_nc, false)
+}
+
 /// Coerce this mixed selection's Spending-source coins into the
 /// `FundingUtxo` shape [`crate::psbt_build::sign_own_wpkh_inputs`] expects.
 pub fn spending_funding_utxos(coins: &[MixedCoin]) -> Vec<crate::funding::FundingUtxo> {
@@ -567,6 +699,104 @@ mod tests {
             2.0,
         );
         assert_eq!(est, built.fee, "estimate drifted from the real builder's fee");
+    }
+
+    /// The honest-fee-label pin (2026-07-18) for the notebook shape: a
+    /// selection that folds must predict the SAME (nominal, folded) split
+    /// notes-core's own `compose_note_exact` actually pays. Uses Sal's
+    /// concrete example (330-sat coin, 1 sat/vB, a note whose single
+    /// OP_RETURN chunk sizes to a 103-vB no-change tx) so the numbers in
+    /// the UI copy are provably real, not illustrative.
+    #[test]
+    fn predict_notebook_fold_matches_real_build() {
+        let identity = Identity::from_app_seed(&[3u8; 32]).unwrap();
+        let utxo = notes_core::tx::Utxo { txid: [0x11; 32], vout: 0, value: 330 };
+        let text = "x".repeat(12);
+        let rate = 1.0;
+        let chunk = 100_000usize;
+        let built = notes_core::bundle::compose_note_exact(
+            &identity,
+            std::slice::from_ref(&utxo),
+            &text,
+            false,
+            [9, 9, 9, 9],
+            None,
+            chunk,
+            rate,
+            || Ok([7u8; 32]),
+        )
+        .unwrap();
+        assert_eq!(built.change, 0, "the 330-sat coin must force the no-change fold shape");
+        assert_eq!(built.fee, 330, "the whole coin goes to the fee — no room for anything else");
+
+        // Independent oracle: real payload lengths for the same body/flags,
+        // vsize computed directly (change=true/false) rather than through
+        // the predictor's Δ-shortcut, so this also proves the shortcut
+        // matches calling `estimate_vsize(.., false)` outright.
+        let payloads = notes_core::envelope::encode_chunks([9, 9, 9, 9], 0, text.as_bytes(), chunk).unwrap();
+        let payload_lens: Vec<usize> = payloads.iter().map(Vec::len).collect();
+        let vsize_wc = notes_core::tx::estimate_vsize(1, &payload_lens, None, true);
+        let vsize_nc_direct = notes_core::tx::estimate_vsize(1, &payload_lens, None, false);
+        let fee_nc_direct = (vsize_nc_direct as f64 * rate).ceil() as u64;
+
+        let (nominal, folded) =
+            predict_notebook_fold(330, 0, vsize_wc, 34, rate).expect("fold predicted");
+        assert_eq!(nominal, fee_nc_direct, "Δ-shortcut must match direct no-change vsize math");
+        assert_eq!(nominal, 103, "matches Sal's concrete example exactly");
+        assert_eq!(folded, 227);
+        assert_eq!(nominal + folded, built.fee, "predicted split must equal the real built tx's fee");
+    }
+
+    /// The honest-fee-label pin for the funded shape (spending/external/
+    /// mixed compose): a spending-wallet-only selection too small to leave
+    /// a P2WPKH change output must fold, and `predict_funded_fold`'s split
+    /// must equal `assemble_mixed_note_psbt`'s real fee — the same drift
+    /// guard `estimate_funded_fee_matches_real_mixed_build` gives the
+    /// with-change case, for the no-change one.
+    #[test]
+    fn predict_funded_fold_matches_real_build() {
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let spending_src = crate::spending::funding_source(&material, net, 0).unwrap();
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let notebook_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
+
+        let value = 700u64; // deliberately small — leaves no room for spending-wallet change
+        let rate = 2.0;
+        let coins = vec![MixedCoin {
+            source: CoinSource::Spending,
+            txid: "c".repeat(64),
+            vout: 0,
+            value,
+            chain: 0,
+            index: 0,
+        }];
+        let payloads = notes_core::envelope::encode_chunks([1, 2, 3, 4], 0, b"fold pin test", 80).unwrap();
+        let built = assemble_mixed_note_psbt(
+            &coins,
+            notebook_spk,
+            Some(&spending_src),
+            &HashMap::new(),
+            &payloads,
+            None,
+            0,
+            &ChangeDefault::Spending,
+            None,
+            0,
+            rate,
+        )
+        .unwrap();
+        assert_eq!(built.change, 0, "the 700-sat coin must force the no-change fold shape");
+
+        let weights = [InputWeightPrediction::P2WPKH_MAX];
+        let (nominal, folded) = predict_funded_fold(&weights, &payloads, None, 22, value, DUST_LIMIT, rate)
+            .expect("fold predicted");
+        assert_eq!(nominal + folded, built.fee, "predicted split must equal the real builder's fee");
+        assert_eq!(
+            built.fee + built.dust_to_self,
+            value,
+            "no discretionary change: the whole coin covers dust-to-self + fee"
+        );
     }
 
     /// The four change-default scenarios Sal's rule distinguishes.
