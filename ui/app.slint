@@ -37,7 +37,14 @@ export struct SpendCoin { outpoint: string, value: string, confirmed: bool, sele
 // the accent: note · self · recipient · change · input · other.
 export struct PsbtRow { title: string, subtitle: string, amount: string, kind: string }
 // A saved funding wallet in the manager list.
-export struct FundingWalletRow { id: string, label: string, meta: string, active: bool, change-addr: string }
+// `coins`/`coin-title` + `expanded` (independent-expand rework, 2026-07-18):
+// each row carries its OWN Pay-from screen (20) coin panel data — external
+// wallets stay an accordion among themselves (`expanded` is true for at
+// most one row at a time), but that no longer affects Notebook/Spending.
+export struct FundingWalletRow {
+    id: string, label: string, meta: string, active: bool, change-addr: string,
+    coins: [SpendCoin], coin-title: string, expanded: bool,
+}
 // `notebook` = owning notebook's display name (Activity is wallet-wide);
 // `pending` also gates the action buttons — only the ACTIVE notebook's
 // rows are actionable (bump/rebroadcast sign with its key).
@@ -1453,12 +1460,33 @@ export component AppWindow inherits Window {
     in property <string> funding-notebook-balance;
     in-out property <bool> spend-from-wallet;   // internal spending-wallet compose mode
     // ---- multi-wallet coin selection (funding-unification UI rework) ----
-    // Coins nest under each wallet row on screen 20; tapping a row selects
-    // it AND expands its coins beneath it (accordion — only one row's list
-    // is visibly expanded at a time, but selections persist across every
-    // source). "" = nothing expanded; "notebook" | "spending" | "wallet:<id>"
-    // otherwise — same key convention `pay-from` already uses.
+    // Coins nest under each wallet row on screen 20. Independent-expand
+    // rework (2026-07-18, Sal's iPhone feedback): Notebook and Spending
+    // expand/collapse independently via their own booleans below — opening
+    // one never hides another's selection, and a header tap ONLY toggles
+    // visibility (never selection). External wallets stay an accordion
+    // AMONG THEMSELVES (this app only ever keeps one external wallet's
+    // coins scanned/cached live at a time) — `payfrom-expanded-source` now
+    // tracks ONLY that slot: "" = none, "wallet:<id>" otherwise.
+    in-out property <bool> nb-expanded;
+    in-out property <bool> sp-expanded;
     in-out property <string> payfrom-expanded-source: "";
+    // Each section's OWN coin list + caption (independent-expand rework) —
+    // NOT the legacy singular `spend-coins`/`spend-title` below (those stay
+    // driven by whichever source is the compose engine's active pay-from,
+    // feeding the live fee/change preview; external wallets carry their own
+    // `coins`/`coin-title` directly on `FundingWalletRow` since they're a
+    // dynamic list).
+    in property <[SpendCoin]> nb-panel-coins;
+    in property <string> nb-panel-title;
+    in property <[SpendCoin]> sp-panel-coins;
+    in property <string> sp-panel-title;
+    // Pay-from screen summary card: reuses the exact cost/sufficiency
+    // figures `refresh_compose`'s active branch already computes — never a
+    // separately invented estimate. "Selected" spans every source
+    // regardless of which is active/expanded; tint by `spend-enough`.
+    in property <string> payfrom-required-line;
+    in property <string> payfrom-selected-line;
     // Selected coins span more than one wallet — shows the linkage-hint line.
     in property <bool> mixed-linkage-hint: false;
     // Resolved change destination (default or explicit pick), for the
@@ -1645,7 +1673,11 @@ export component AppWindow inherits Window {
     callback paste-compose();
     callback compose-send();
     callback change-scan();
-    callback toggle-coin(string);
+    // (source, "txid:vout") — `source` is now passed explicitly by the
+    // tapped panel itself (independent-expand rework, 2026-07-18): multiple
+    // Pay-from sections can be expanded at once, so there's no longer a
+    // single "currently expanded" source to infer it from.
+    callback toggle-coin(string, string);
     callback refresh-coins();
     callback set-coin-strategy(int);
     // external funding (PSBT)
@@ -3893,33 +3925,79 @@ export component AppWindow inherits Window {
     // custom change, moved off compose wholesale — Sal 2026-07-16 iPhone
     // build-8 review). Reached only from compose's compact "Pay from" row;
     // back (nav-back, screen == 20) always returns to compose with the
-    // draft untouched. ----------
+    // draft untouched. Independent-expand rework (2026-07-18, Sal's iPhone
+    // feedback): Notebook/Spending/each external wallet expand and collapse
+    // on their own — a header tap ONLY shows/hides a section, it never
+    // selects coins (that needs an actual coin tap, or the on-open
+    // auto-selection); a pinned summary card up top shows required vs.
+    // selected sats (reusing the exact figures the compose flow already
+    // computes) so the totals stay visible while the wallet list scrolls
+    // beneath it (no `alignment: start` + the Flickable gets
+    // `vertical-stretch: 1`, same pattern as the universal confirm screen,
+    // commit c3ec2d5). ----------
     if screen == 20: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
-        alignment: start;
         Header {
             title: "Pay from";
             back => { root.nav-back(); }
             SvgIconButton { icon: "refresh"; clicked => { root.funding-refresh(); } }
         }
+        Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: root.spend-enough ? Pal.line : Pal.warn;
+            height: pf-summary.preferred-height;
+            pf-summary := VerticalLayout {
+                padding: 12px;
+                spacing: 4px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text { text: "Required"; font-size: 11px; color: Pal.muted; vertical-alignment: center; }
+                    Text {
+                        text: root.payfrom-required-line;
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: root.spend-enough ? Pal.text : Pal.warn;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        horizontal-alignment: right;
+                        overflow: elide;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text { text: "Selected"; font-size: 11px; color: Pal.muted; vertical-alignment: center; }
+                    Text {
+                        text: root.payfrom-selected-line;
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: root.spend-enough ? Pal.good : Pal.warn;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        horizontal-alignment: right;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
         Flickable {
+            vertical-stretch: 1;
             viewport-height: payfrom-scr-col.preferred-height;
             payfrom-scr-col := VerticalLayout {
                 spacing: 10px;
                 alignment: start;
-                // ---- source rows: tap selects AND expands its coins nested
-                // directly beneath it (accordion — only one row's coin list
-                // is visibly open at a time; selections persist across every
-                // source regardless of which is currently expanded). ----
+                // ---- Notebook: expands/collapses independently of every
+                // other section — a header tap ONLY toggles visibility. ----
                 VerticalLayout {
                     spacing: 8px;
                     Rectangle {
                         height: 36px;
                         border-radius: 8px;
                         border-width: 1px;
-                        border-color: root.pay-from == "notebook" ? Pal.accent : Pal.line;
-                        background: root.pay-from == "notebook" ? Pal.accent.with-alpha(0.10) : Pal.card;
+                        border-color: root.nb-expanded ? Pal.accent : Pal.line;
+                        background: root.nb-expanded ? Pal.accent.with-alpha(0.10) : Pal.card;
                         TouchArea { clicked => { root.payfrom-expand("notebook"); } }
                         HorizontalLayout {
                             padding-left: 10px;
@@ -3928,7 +4006,7 @@ export component AppWindow inherits Window {
                             Text {
                                 text: "Notebook";
                                 font-size: 12px;
-                                color: root.pay-from == "notebook" ? Pal.accent : Pal.text;
+                                color: root.nb-expanded ? Pal.accent : Pal.text;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
                                 overflow: elide;
@@ -3941,7 +4019,7 @@ export component AppWindow inherits Window {
                                 overflow: elide;
                             }
                             Image {
-                                source: root.payfrom-expanded-source == "notebook"
+                                source: root.nb-expanded
                                     ? @image-url("icons/caret-up.svg")
                                     : @image-url("icons/caret-down.svg");
                                 colorize: Pal.muted;
@@ -3951,32 +4029,33 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    if root.payfrom-expanded-source == "notebook": Rectangle {
+                    if root.nb-expanded: Rectangle {
                         border-radius: 10px;
                         background: Pal.card;
                         border-width: 1px;
                         border-color: root.spend-enough ? Pal.line : Pal.bad;
                         height: nb20panel.preferred-height;
                         nb20panel := CoinListPanel {
-                            coins: root.spend-coins;
-                            title: root.spend-title;
+                            coins: root.nb-panel-coins;
+                            title: root.nb-panel-title;
                             enough: root.spend-enough;
                             strategy: root.coin-strategy;
                             pick-strategy(i) => { root.set-coin-strategy(i); }
-                            toggle(op) => { root.toggle-coin(op); }
+                            toggle(op) => { root.toggle-coin("notebook", op); }
                             refresh() => { root.refresh-coins(); }
                             explorer(u) => { root.act-explorer(u); }
                         }
                     }
                 }
+                // ---- Spending wallet: independent of Notebook + wallets. ----
                 if root.spending-capable && root.spending-enabled: VerticalLayout {
                     spacing: 8px;
                     Rectangle {
                         height: 36px;
                         border-radius: 8px;
                         border-width: 1px;
-                        border-color: root.pay-from == "spending" ? Pal.accent : Pal.line;
-                        background: root.pay-from == "spending" ? Pal.accent.with-alpha(0.10) : Pal.card;
+                        border-color: root.sp-expanded ? Pal.accent : Pal.line;
+                        background: root.sp-expanded ? Pal.accent.with-alpha(0.10) : Pal.card;
                         TouchArea { clicked => { root.payfrom-expand("spending"); } }
                         HorizontalLayout {
                             padding-left: 10px;
@@ -3985,7 +4064,7 @@ export component AppWindow inherits Window {
                             Text {
                                 text: "Spending wallet";
                                 font-size: 12px;
-                                color: root.pay-from == "spending" ? Pal.accent : Pal.text;
+                                color: root.sp-expanded ? Pal.accent : Pal.text;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
                                 overflow: elide;
@@ -3998,7 +4077,7 @@ export component AppWindow inherits Window {
                                 overflow: elide;
                             }
                             Image {
-                                source: root.payfrom-expanded-source == "spending"
+                                source: root.sp-expanded
                                     ? @image-url("icons/caret-up.svg")
                                     : @image-url("icons/caret-down.svg");
                                 colorize: Pal.muted;
@@ -4008,32 +4087,35 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    if root.payfrom-expanded-source == "spending": Rectangle {
+                    if root.sp-expanded: Rectangle {
                         border-radius: 10px;
                         background: Pal.card;
                         border-width: 1px;
                         border-color: root.spend-enough ? Pal.line : Pal.bad;
                         height: sp20panel.preferred-height;
                         sp20panel := CoinListPanel {
-                            coins: root.spend-coins;
-                            title: root.spend-title;
+                            coins: root.sp-panel-coins;
+                            title: root.sp-panel-title;
                             enough: root.spend-enough;
                             strategy: root.coin-strategy;
                             pick-strategy(i) => { root.set-coin-strategy(i); }
-                            toggle(op) => { root.toggle-coin(op); }
+                            toggle(op) => { root.toggle-coin("spending", op); }
                             refresh() => { root.refresh-coins(); }
                             explorer(u) => { root.act-explorer(u); }
                         }
                     }
                 }
+                // ---- External wallets: an accordion among THEMSELVES only
+                // (this app keeps one external wallet's coins scanned/cached
+                // live at a time) — independent of Notebook/Spending. ----
                 for fw in root.funding-wallets: VerticalLayout {
                     spacing: 8px;
                     Rectangle {
                         height: fw20-row.preferred-height;
                         border-radius: 8px;
                         border-width: 1px;
-                        border-color: root.payfrom-expanded-source == "wallet:" + fw.id ? Pal.accent : Pal.line;
-                        background: root.payfrom-expanded-source == "wallet:" + fw.id ? Pal.accent.with-alpha(0.10) : Pal.card;
+                        border-color: fw.expanded ? Pal.accent : Pal.line;
+                        background: fw.expanded ? Pal.accent.with-alpha(0.10) : Pal.card;
                         TouchArea { clicked => { root.payfrom-expand("wallet:" + fw.id); } }
                         fw20-row := VerticalLayout {
                             padding: 8px;
@@ -4043,25 +4125,25 @@ export component AppWindow inherits Window {
                             Text {
                                 text: fw.label;
                                 font-size: 12px;
-                                color: root.payfrom-expanded-source == "wallet:" + fw.id ? Pal.accent : Pal.text;
+                                color: fw.expanded ? Pal.accent : Pal.text;
                                 overflow: elide;
                             }
                             Caption { text: "watch-only"; }
                         }
                     }
-                    if root.payfrom-expanded-source == "wallet:" + fw.id: Rectangle {
+                    if fw.expanded: Rectangle {
                         border-radius: 10px;
                         background: Pal.card;
                         border-width: 1px;
                         border-color: root.spend-enough ? Pal.line : Pal.bad;
                         height: fwpanel.preferred-height;
                         fwpanel := CoinListPanel {
-                            coins: root.spend-coins;
-                            title: root.spend-title;
+                            coins: fw.coins;
+                            title: fw.coin-title;
                             enough: root.spend-enough;
                             strategy: root.coin-strategy;
                             pick-strategy(i) => { root.set-coin-strategy(i); }
-                            toggle(op) => { root.toggle-coin(op); }
+                            toggle(op) => { root.toggle-coin("wallet:" + fw.id, op); }
                             refresh() => { root.refresh-coins(); }
                             explorer(u) => { root.act-explorer(u); }
                         }

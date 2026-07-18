@@ -197,15 +197,50 @@ struct State {
     /// tagged with different source keys in ONE tx. This is a per-source
     /// MEMORY the existing single-source scratch state (`selected_coins`/
     /// `coins_overridden`) mirrors into/out of whenever the active source
-    /// (`payfrom_expanded_source`) changes — so every existing single-
+    /// (`payfrom_active_source`) changes — so every existing single-
     /// source compute/send path keeps working on `selected_coins`
     /// unmodified, and re-expanding a previously-touched wallet row
     /// restores exactly what was selected there.
     mixed_selected: Vec<(String, String, u32)>,
-    /// Which wallet row is expanded on the Pay-from screen (nested coins
-    /// visible) — "" = none. Tapping a row sets this AND makes it the
-    /// active `pay_from` source (Sal's rule: tap = select AND expand).
+    /// Which EXTERNAL WALLET row is expanded on the Pay-from screen — ""
+    /// = none. Independent-expand rework (2026-07-18, Sal's iPhone
+    /// feedback): Notebook/Spending got their own booleans below
+    /// (`nb_expanded`/`sp_expanded`) that toggle without touching this or
+    /// each other; external wallets stay an accordion AMONG THEMSELVES
+    /// only (a pre-existing scope boundary — this app only ever keeps ONE
+    /// external wallet's coins scanned/cached at a time, see
+    /// `payfrom_wallet_coins`). A header tap here ONLY flips this string —
+    /// it never selects/deselects coins or changes which source is the
+    /// compose engine's active pay-from (`payfrom_active_source` below);
+    /// that's `on_toggle_coin`'s job now, triggered by an actual coin tap.
     payfrom_expanded_source: String,
+    /// Pay-from screen: is the Notebook section visually expanded?
+    /// Independent of `sp_expanded`/`payfrom_expanded_source` — see the
+    /// doc comment above. Re-derived (never persisted) every time the
+    /// screen opens: every source holding a selected coin starts expanded.
+    nb_expanded: bool,
+    /// Pay-from screen: is the Spending-wallet section visually expanded?
+    /// See `nb_expanded`.
+    sp_expanded: bool,
+    /// The compose engine's ACTIVE pay-from source — drives `pay_from`/
+    /// `fund_external`/`spend_from_wallet` and which of `refresh_compose`'s
+    /// three branches computes the live fee/change preview
+    /// (`spend_coins`/`spend_title`/`spend_enough`/`cost_line`) that feeds
+    /// the compose screen's compact row and the Pay-from screen's summary
+    /// card. Renamed off `payfrom_expanded_source` in the independent-
+    /// expand rework (2026-07-18): visibility and "active" are now two
+    /// separate concerns — this only ever changes via `resolve_payfrom_default`
+    /// (fresh compose session) or an explicit coin tap (`on_toggle_coin`),
+    /// NEVER a mere header tap that only shows/hides a section.
+    payfrom_active_source: String,
+    /// Per-wallet coin cache for the Pay-from screen's independently-
+    /// expandable external-wallet rows (2026-07-18 rework) — separate from
+    /// `funding_coins`/`active_funding_id` (the SINGLE "real" active
+    /// external source the compose/broadcast plumbing reads) so merely
+    /// expanding a row to LOOK at a wallet can never clobber a DIFFERENT
+    /// wallet's live selection. Populated by `payfrom_scan_wallet_for_display`
+    /// on first expand; cleared at the start of every fresh compose session.
+    payfrom_wallet_coins: std::collections::HashMap<String, Vec<FundingUtxo>>,
     /// Explicit change destination pick made this compose session (screen
     /// 21) — "" = unset, `app_core::mixed::resolve_change_default` applies.
     /// Never overridden by a refresh once chosen; cleared with the rest of
@@ -1730,6 +1765,13 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
     st.change_choice.clear();
     w.set_change_choice("".into());
     st.payfrom_manual = false; // a fresh compose session — see resolve_payfrom_default
+    // Independent-expand rework (2026-07-18): visual expansion + the
+    // external-wallet peek cache are per-compose-session UI state, never
+    // carried over from a prior note.
+    st.nb_expanded = false;
+    st.sp_expanded = false;
+    st.payfrom_expanded_source.clear();
+    st.payfrom_wallet_coins.clear();
     resolve_payfrom_default(w, st);
     w.set_screen(6);
     refresh_compose(w, st);
@@ -1752,8 +1794,7 @@ fn resolve_payfrom_default(w: &AppWindow, st: &mut State) {
         && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false)
         && spending_balance > 0;
     let default_source = if spending_default { "spending" } else { "notebook" };
-    st.payfrom_expanded_source = default_source.to_string();
-    w.set_payfrom_expanded_source(default_source.into());
+    st.payfrom_active_source = default_source.to_string();
     apply_pay_from(w, st, default_source);
 }
 
@@ -3568,6 +3609,10 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
         if w.get_screen() == 20 {
             update_funding_screen_ui(w, st);
             log_funding_refresh(st);
+            // A landed notebook rescan must repaint the (now possibly
+            // independently expanded) Notebook panel, not just the row's
+            // summary balance — independent-expand rework, 2026-07-18.
+            update_payfrom_panels(w, st);
         }
         if w.get_screen() == 6 {
             w.set_pay_from_balance(balance_text_for(st, w.get_pay_from().as_str()).into());
@@ -3773,13 +3818,14 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
         }
         if w.get_screen() == 20 {
             log_funding_refresh(st);
-            // funding-unification UI rework: the nested coin panel under
-            // the spending row (if expanded) reads `spend-coins`/
-            // `spend-title`, populated by `refresh_compose`'s branches —
-            // a landed scan must repaint them, not just the row's summary
-            // balance (`update_spending_ui`), or the panel shows stale
-            // "0/0 coins" under a since-scanned wallet.
+            // funding-unification UI rework: a landed scan must repaint the
+            // Spending panel (independent-expand rework, 2026-07-18: it now
+            // reads its own `sp-panel-coins`/`sp-panel-title`, not the
+            // legacy singular `spend-coins`/`spend-title` — those stay
+            // driven by whichever source is `payfrom_active_source`), or the
+            // panel shows stale "0 coins" under a since-scanned wallet.
             refresh_compose(w, st);
+            update_payfrom_panels(w, st);
         }
     }
 }
@@ -4023,6 +4069,168 @@ fn mixed_selected_total(st: &State) -> u64 {
         .sum()
 }
 
+/// Build a source's OWN coin list + "N coins selected · X sats" caption for
+/// the Pay-from screen's independently-expandable sections (2026-07-18
+/// rework: every expanded section now renders its own data, so opening one
+/// wallet never hides another's — see `nb_expanded`/`sp_expanded`/
+/// `payfrom_expanded_source`). Deliberately separate from the legacy
+/// singular `spend-coins`/`spend-title` (untouched — still driven by
+/// whichever source is `payfrom_active_source` and feeds the live fee/
+/// change preview via `refresh_compose`'s three branches). Selection
+/// membership is read from the cross-wallet memory (`mixed_selected`) —
+/// read-only, never mutates it. An external wallet's coins come from
+/// `funding_coins` when it's the currently-active one, else the display-
+/// only peek cache (`payfrom_wallet_coins`) populated by
+/// `payfrom_scan_wallet_for_display` — empty (not yet scanned) shows as a
+/// zero-coin panel, never a stale/wrong wallet's coins.
+fn payfrom_panel_coins(st: &State, source: &str) -> (Vec<SpendCoin>, String) {
+    let net = st.network;
+    let exb = st.explorer_base();
+    let sel: std::collections::HashSet<(String, u32)> = mixed_coins_for(st, source).into_iter().collect();
+    let row = |txid: &str, vout: u32, value: u64, confirmed: bool| SpendCoin {
+        outpoint: format!("{txid}:{vout}").into(),
+        value: value.to_string().into(),
+        confirmed,
+        selected: sel.contains(&(txid.to_string(), vout)),
+        txid_short: txid[..8.min(txid.len())].to_string().into(),
+        explorer: explorer_tx_url(exb.as_deref(), net, txid).into(),
+    };
+    let mut coins: Vec<SpendCoin> = Vec::new();
+    match source {
+        "notebook" => {
+            if let Some(store) = st.store.as_ref() {
+                let mut spendable: Vec<&app_core::store::LedgerUtxo> =
+                    store.utxos.iter().filter(|u| !u.pending_spend).collect();
+                spendable.sort_by(|a, b| a.value.cmp(&b.value));
+                for u in spendable {
+                    coins.push(row(&u.txid, u.vout, u.value, u.height.is_some()));
+                }
+            }
+        }
+        "spending" => {
+            for c in &st.spending_coins {
+                coins.push(row(&c.txid, c.vout, c.value, c.confirmed));
+            }
+        }
+        _ => {
+            if let Some(id) = source.strip_prefix("wallet:") {
+                let cached: Vec<FundingUtxo> = if st.active_funding_id.as_deref() == Some(id) {
+                    st.funding_coins.clone()
+                } else {
+                    st.payfrom_wallet_coins.get(id).cloned().unwrap_or_default()
+                };
+                for c in &cached {
+                    coins.push(row(&c.txid, c.vout, c.value, c.confirmed));
+                }
+            }
+        }
+    }
+    let sel_count = coins.iter().filter(|c| c.selected).count();
+    let sel_total: u64 =
+        coins.iter().filter(|c| c.selected).filter_map(|c| c.value.parse::<u64>().ok()).sum();
+    let plural = if sel_count == 1 { "" } else { "s" };
+    let title = format!("{sel_count} coin{plural} selected · {} sats", commas(sel_total));
+    (coins, title)
+}
+
+/// Refresh the Pay-from screen's per-section coin lists — Notebook and
+/// Spending only (external wallets are handled per-row inside
+/// `refresh_funding_list`, since they're a dynamic list). Pure read +
+/// render, called after every state change that could affect what an
+/// expanded section shows (open, header-tap expand, a coin toggle, a
+/// landed scan) — cheap (bounded by UTXO count), never touches selection.
+fn update_payfrom_panels(w: &AppWindow, st: &mut State) {
+    let (nb_coins, nb_title) = payfrom_panel_coins(st, "notebook");
+    w.set_nb_panel_coins(VecModel::from_slice(&nb_coins));
+    w.set_nb_panel_title(nb_title.into());
+    let (sp_coins, sp_title) = payfrom_panel_coins(st, "spending");
+    w.set_sp_panel_coins(VecModel::from_slice(&sp_coins));
+    w.set_sp_panel_title(sp_title.into());
+}
+
+/// Scan a saved wallet PURELY to populate its Pay-from screen coin list
+/// (independent-expand rework, 2026-07-18) — the header-tap counterpart to
+/// `activate_funding_wallet` that never makes the wallet the active/primary
+/// funding source and never defaults its selection to "every coin" (that
+/// default-to-all-on-expand was Sal's iPhone complaint #3). Only an actual
+/// coin tap (`on_toggle_coin`, via `promote_wallet_active`) or a remembered
+/// selection from earlier this session puts anything in `mixed_selected`.
+/// A no-op once this wallet is either the live active one or already
+/// peek-cached — re-expanding just shows what's already there.
+fn payfrom_scan_wallet_for_display(w: &AppWindow, st: &mut State, id: &str) {
+    if st.active_funding_id.as_deref() == Some(id) || st.payfrom_wallet_coins.contains_key(id) {
+        return;
+    }
+    let net = st.network;
+    let Some(idx) = st.funding_wallets.iter().position(|fw| fw.id == id) else { return };
+    let descriptor = st.funding_wallets[idx].descriptor.clone();
+    let src = match FundingSource::parse(&descriptor, net) {
+        Ok(src) => src,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
+    let Some(base) = st.base_url() else {
+        w.set_status("no Bitcoin node — set one in Settings".into());
+        return;
+    };
+    w.set_status("scanning funding wallet…".into());
+    let client = ChainClient::new(HttpTransport::new(&base), net);
+    match client.scan_funding(&src, 20) {
+        Ok(scan) => {
+            st.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
+            st.funding_wallets[idx].coins = scan.utxos.len();
+            st.funding_wallets[idx].scanned = true;
+            st.funding_wallets[idx].next_change_index = scan.next_change_index;
+            st.save_funding_wallets();
+            let empty = scan.utxos.is_empty();
+            st.payfrom_wallet_coins.insert(id.to_string(), scan.utxos);
+            w.set_status(if empty { "wallet has no spendable coins yet".to_string() } else { String::new() }.into());
+        }
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+        }
+    }
+}
+
+/// Make a wallet the compose engine's active/primary pay-from source —
+/// counterpart to `apply_pay_from`'s notebook/spending cases, called from
+/// `on_toggle_coin` right after a coin tap (never from a mere expand).
+/// Promotes the display-only peek cache (`payfrom_wallet_coins`) into the
+/// SINGLE live `funding_coins`/`funding`/`active_funding_id` the rest of
+/// the external-funding plumbing reads, unless this wallet is already the
+/// live one (then its current scan is left untouched — never reverted to a
+/// possibly-stale peek snapshot). Never auto-selects coins: by the time
+/// this runs, the caller has already synced the just-toggled selection into
+/// `mixed_selected`.
+fn promote_wallet_active(w: &AppWindow, st: &mut State, id: &str) {
+    let net = st.network;
+    let Some(idx) = st.funding_wallets.iter().position(|fw| fw.id == id) else { return };
+    if st.active_funding_id.as_deref() != Some(id) {
+        let descriptor = st.funding_wallets[idx].descriptor.clone();
+        let src = match FundingSource::parse(&descriptor, net) {
+            Ok(src) => src,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        st.funding_coins = st.payfrom_wallet_coins.get(id).cloned().unwrap_or_default();
+        st.funding_change_index = st.funding_wallets[idx].next_change_index;
+        st.funding = Some(src);
+        st.active_funding_id = Some(id.to_string());
+    }
+    let label = st.funding_wallets[idx].label.clone();
+    let balance = st.funding_wallets[idx].balance;
+    w.set_fund_external(true);
+    w.set_spend_from_wallet(false);
+    w.set_pay_from(format!("wallet:{id}").into());
+    w.set_pay_from_label(label.clone().into());
+    w.set_pay_from_balance(format!("{} sats", commas(balance)).into());
+    println!("cb: pay-from wallet:{label}");
+}
+
 /// Recompute the mixed-source bookkeeping after `refresh_compose`'s active-
 /// source branch runs: mirror its (possibly just auto-suggested) selection
 /// into the cross-wallet memory, flag the linkage hint when the total
@@ -4031,7 +4239,7 @@ fn mixed_selected_total(st: &State) -> u64 {
 /// mixed case's "enough" gate — `on_compose_send_mixed`'s real PSBT build is
 /// the actual arbiter and reports a precise error via `status` if it fails.
 fn sync_and_finalize_payfrom(w: &AppWindow, st: &mut State) {
-    let active = st.payfrom_expanded_source.clone();
+    let active = st.payfrom_active_source.clone();
     if !active.is_empty() {
         let coins = st.selected_coins.clone();
         mixed_sync_source(st, &active, &coins);
@@ -4043,6 +4251,12 @@ fn sync_and_finalize_payfrom(w: &AppWindow, st: &mut State) {
     if mixed {
         w.set_spend_enough(mixed_selected_total(st) > 0);
     }
+    // Pay-from screen summary card (independent-expand rework, 2026-07-18):
+    // "Selected" is the true cross-wallet total regardless of which source
+    // is active or expanded; "Required" is set directly by whichever of
+    // `refresh_compose`'s three branches just ran (the same fee figure it
+    // already shows in `cost_line` — never a separately invented estimate).
+    w.set_payfrom_selected_line(format!("{} sats", commas(mixed_selected_total(st))).into());
     update_change_label(w, st);
 }
 
@@ -4056,7 +4270,7 @@ fn update_change_label(w: &AppWindow, st: &mut State) {
         st.mixed_selected.iter().map(|(s, _, _)| s.as_str()).collect();
     let spending_enabled =
         st.spending_capable && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false);
-    let spending_participates = sources.contains("spending") || st.payfrom_expanded_source == "spending";
+    let spending_participates = sources.contains("spending") || st.payfrom_active_source == "spending";
     let non_notebook_spending: Vec<&str> =
         sources.iter().filter(|s| **s != "notebook" && **s != "spending").copied().collect();
     let only_external: Option<String> = if !sources.contains("notebook")
@@ -4241,6 +4455,11 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     };
     w.set_change_error(change_err.clone().into());
 
+    // Pay-from screen summary card (independent-expand rework, 2026-07-18):
+    // cleared up front so a stale figure from a PRIOR keystroke/branch never
+    // lingers on screen; filled in below wherever a real fee number exists —
+    // never a separately invented estimate.
+    w.set_payfrom_required_line("".into());
     let consolidate = st.consolidate_coins;
     let Some(store) = &st.store else { return };
     // Auto-suggest a selection until the user overrides it.
@@ -4284,16 +4503,18 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         // the line still reads as a real (labeled) estimate instead of
         // going blank.
         let n = sel_count.max(1);
-        let min_line = note_est(store, 1, private, n, spk_len, change_spk_len)
+        let est_fee = note_est(store, 1, private, n, spk_len, change_spk_len)
             .ok()
-            .map(|(_, vsize)| {
-                let fee = (vsize as f64 * rate).ceil().max(0.0) as u64;
-                format!("~{} sats fee minimum", commas(fee))
-            })
+            .map(|(_, vsize)| (vsize as f64 * rate).ceil().max(0.0) as u64);
+        let min_line = est_fee
+            .map(|fee| format!("~{} sats fee minimum", commas(fee)))
             .unwrap_or_default();
         w.set_cost_line(min_line.into());
         w.set_change_amount(format!("Change to {change_dest}").into());
         w.set_spend_enough(true);
+        if let Some(fee) = est_fee {
+            w.set_payfrom_required_line(format!("~{} sats", commas(fee + sent)).into());
+        }
         st.compose_oversize = false;
         sync_and_finalize_payfrom(w, st);
         return;
@@ -4321,6 +4542,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             );
             w.set_change_amount(format!("Change to {change_dest} · ~{change} sats").into());
             w.set_spend_enough(enough);
+            w.set_payfrom_required_line(format!("~{} sats", commas(fee + sent)).into());
         }
         // Over the per-tx broadcast ceiling: vsize > 100 kB (Ok arm) or the
         // body needs > 255 chunks (Err arm). Sign is gated off; the dialog
@@ -4452,7 +4674,14 @@ fn funding_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         format!("Funding {sel_count}/{n} coin{} · {} sats", if n == 1 { "" } else { "s" }, commas(sel_total)).into(),
     );
     w.set_cost_line(if text.is_empty() { String::new() } else { "funded from the external wallet".into() }.into());
-    w.set_spend_enough(ready && sel_count > 0 && !text.is_empty());
+    let enough = ready && sel_count > 0 && !text.is_empty();
+    w.set_spend_enough(enough);
+    // No numeric fee is ever computed for external funding (the wallet pays
+    // whatever it pays) — the Pay-from screen's summary card gets a
+    // descriptive line instead of an invented sats figure.
+    w.set_payfrom_required_line(
+        if enough { format!("funded by {}", w.get_pay_from_label()) } else { String::new() }.into(),
+    );
 
     // Change: blank = the funding wallet's own change; a valid custom address
     // overrides it. Same validation/label pattern as the self-funded path.
@@ -4480,6 +4709,10 @@ fn funding_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
 /// SELECTED coins, so the preview and the real build can never disagree.
 fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     let net = st.network;
+    // Cleared up front (independent-expand rework, 2026-07-18) — filled in
+    // below only where a real dry-run fee exists; every early return here
+    // leaves it blank rather than showing a stale figure.
+    w.set_payfrom_required_line("".into());
     let n = st.spending_coins.len();
     if !st.coins_overridden {
         st.selected_coins = st.spending_coins.iter().map(|c| (c.txid.clone(), c.vout)).collect();
@@ -4614,6 +4847,9 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
             w.set_cost_line(
                 format!("~{} sats fee{usd}{gift_line} · +330 sats dust-to-self", built.fee).into(),
             );
+            w.set_payfrom_required_line(
+                format!("~{} sats", commas(built.fee + built.sent_to_recipient + DUST_SATS)).into(),
+            );
             w.set_change_amount(
                 if has_custom_change {
                     format!(
@@ -4661,6 +4897,12 @@ fn begin_scan(weak: &slint::Weak<AppWindow>, cancel: &Arc<AtomicBool>, hint: &st
 /// Populate the saved-wallet manager list (screen 15).
 fn refresh_funding_list(w: &AppWindow, st: &State) {
     let active = st.active_funding_id.clone();
+    // Independent-expand rework (2026-07-18): each row carries its OWN
+    // coins/title (from the shared `payfrom_panel_coins` helper — screen
+    // 20's per-row panels bind directly to `fw.coins`, no more singular
+    // `spend-coins`) and whether IT is the one open in the external-wallet
+    // accordion slot (`payfrom_expanded_source`; Notebook/Spending have
+    // their own independent booleans and never touch this).
     let rows: Vec<FundingWalletRow> = st
         .funding_wallets
         .iter()
@@ -4676,12 +4918,17 @@ fn refresh_funding_list(w: &AppWindow, st: &State) {
                 .and_then(|src| src.derive(1, fw.next_change_index).ok())
                 .map(|d| addr_short(&d.address))
                 .unwrap_or_default();
+            let source_key = format!("wallet:{}", fw.id);
+            let (coins, coin_title) = payfrom_panel_coins(st, &source_key);
             FundingWalletRow {
                 id: fw.id.clone().into(),
                 label: fw.label.clone().into(),
                 meta: meta.into(),
                 active: active.as_deref() == Some(fw.id.as_str()),
                 change_addr: change_addr.into(),
+                coins: VecModel::from_slice(&coins),
+                coin_title: coin_title.into(),
+                expanded: st.payfrom_expanded_source == source_key,
             }
         })
         .collect();
@@ -4689,7 +4936,14 @@ fn refresh_funding_list(w: &AppWindow, st: &State) {
 }
 
 /// Make a saved wallet the active funding source: scan it, cache its balance,
-/// and return to compose in external-funding mode.
+/// and return to compose in external-funding mode. Used by the screen-15
+/// wallet list, the add-descriptor flow (12), and the sweep screen (16) —
+/// NOT the Pay-from screen (20) anymore: independent-expand rework
+/// (2026-07-18) split that header tap into `payfrom_scan_wallet_for_display`
+/// (view only) + `promote_wallet_active` (on an actual coin tap), so
+/// `stay_on_payfrom` below is effectively always false now — kept rather
+/// than removed since this function's other callers still rely on the rest
+/// of its behavior unchanged.
 fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
     // funding-unification UI rework: tapping a wallet row on the Pay-from
     // screen (20) selects + expands it IN PLACE — it must not navigate away
@@ -6014,6 +6268,10 @@ pub fn run() {
         pending_spending_sweep_index: None,
         mixed_selected: Vec::new(),
         payfrom_expanded_source: String::new(),
+        nb_expanded: false,
+        sp_expanded: false,
+        payfrom_active_source: String::new(),
+        payfrom_wallet_coins: std::collections::HashMap::new(),
         change_choice: String::new(),
         compose_busy: false,
         act_pending_ref: None,
@@ -7766,16 +8024,23 @@ pub fn run() {
         refresh_compose(&w, &mut s);
     });
 
-    cb!(on_toggle_coin, |w, s, outpoint: SharedString| {
-        // "txid:vout" → (txid, vout). Operates on whichever wallet row is
-        // expanded (funding-unification UI rework) — the cross-wallet
-        // selection memory is authoritative; notebook/spending also mirror
-        // into the legacy `selected_coins` scratch so their existing fee/
-        // change-preview math keeps reading it directly.
+    // Independent-expand rework (2026-07-18): `source` is now passed
+    // explicitly by the tapped panel itself (each of the 3 CoinListPanel
+    // instances on screen 20 forwards its OWN "notebook"/"spending"/
+    // "wallet:<id>" — see app.slint) rather than read from a single
+    // "currently expanded" variable, since multiple sections can be
+    // expanded at once now. The cross-wallet selection memory
+    // (`mixed_selected`) is authoritative; notebook/spending also mirror
+    // into the legacy `selected_coins` scratch so their existing fee/
+    // change-preview math keeps reading it directly. A coin tap — and ONLY
+    // a coin tap, never a header tap — also makes its wallet the compose
+    // engine's active/primary pay-from source (Sal's rule: only an
+    // explicit pick may do that).
+    cb!(on_toggle_coin, |w, s, source: SharedString, outpoint: SharedString| {
+        let source = source.to_string();
         let op = outpoint.as_str();
         if let Some((txid, vout)) = op.rsplit_once(':') {
             if let Ok(vout) = vout.parse::<u32>() {
-                let source = s.payfrom_expanded_source.clone();
                 let mut coins = mixed_coins_for(&s, &source);
                 let key = (txid.to_string(), vout);
                 if let Some(i) = coins.iter().position(|c| c == &key) {
@@ -7784,12 +8049,19 @@ pub fn run() {
                     coins.push(key);
                 }
                 mixed_sync_source(&mut s, &source, &coins);
+                s.payfrom_manual = true; // explicit pick — CHANGE 5 stops re-defaulting it
+                s.payfrom_active_source = source.clone();
                 if source == "notebook" || source == "spending" {
                     s.selected_coins = coins.clone();
                     s.coins_overridden = true;
+                    apply_pay_from(&w, &mut s, source.as_str());
+                } else if let Some(id) = source.strip_prefix("wallet:") {
+                    promote_wallet_active(&w, &mut s, id);
                 }
                 println!("cb: toggle-coin selected={}", coins.len());
                 refresh_compose(&w, &mut s);
+                update_payfrom_panels(&w, &mut s);
+                refresh_funding_list(&w, &s);
             }
         }
     });
@@ -7891,53 +8163,80 @@ pub fn run() {
     });
 
     // funding-unification: compose's compact "Pay from" row → the dedicated
-    // picker/coin-control/change-address screen (20).
+    // picker/coin-control/change-address screen (20). Independent-expand
+    // rework (2026-07-18, Sal's iPhone feedback #3): on EVERY open, re-derive
+    // which sections start expanded from what's actually selected right now
+    // (never persisted across visits) — every source holding at least one
+    // selected coin starts open so the user sees it, the rest start
+    // collapsed. This is the ONLY place auto-selection-driven expansion
+    // happens; a header tap thereafter only shows/hides (`on_payfrom_expand`).
     cb!(on_open_funding_screen, |w, s| {
         println!("cb: funding-open");
         w.set_status("".into());
-        update_funding_screen_ui(&w, &s);
-        refresh_funding_list(&w, &s);
+        s.nb_expanded = !mixed_coins_for(&s, "notebook").is_empty();
+        s.sp_expanded = !mixed_coins_for(&s, "spending").is_empty();
+        w.set_nb_expanded(s.nb_expanded);
+        w.set_sp_expanded(s.sp_expanded);
+        println!("cb: payfrom expand wallet=notebook expanded={}", s.nb_expanded);
+        println!("cb: payfrom expand wallet=spending expanded={}", s.sp_expanded);
+        let wallet_open = s
+            .funding_wallets
+            .iter()
+            .find(|fw| !mixed_coins_for(&s, &format!("wallet:{}", fw.id)).is_empty())
+            .map(|fw| format!("wallet:{}", fw.id))
+            .unwrap_or_default();
+        s.payfrom_expanded_source = wallet_open;
         w.set_payfrom_expanded_source(s.payfrom_expanded_source.clone().into());
+        if !s.payfrom_expanded_source.is_empty() {
+            println!("cb: payfrom expand wallet={} expanded=true", s.payfrom_expanded_source);
+        }
+        update_funding_screen_ui(&w, &s);
+        update_payfrom_panels(&w, &mut s);
+        refresh_funding_list(&w, &s);
         w.set_screen(20);
     });
 
-    // Multi-wallet coin selection (funding-unification UI rework,
-    // 2026-07-16): tapping a wallet row on the Pay-from screen selects it
-    // AND expands its coins nested beneath it — an accordion (collapse when
-    // another expands is fine), but the cross-wallet selection persists
-    // regardless of which row is currently open. Re-expanding a
-    // previously-touched row restores exactly what was selected there.
+    // Independent-expand rework (2026-07-18, Sal's iPhone feedback #1/#3): a
+    // wallet-row tap ONLY toggles that section's visibility — it never
+    // selects/deselects coins or changes which source is the compose
+    // engine's active pay-from (that's `on_toggle_coin`'s job, triggered by
+    // an actual coin tap, or the on-open auto-selection above). Notebook and
+    // Spending expand/collapse fully independently of each other and of the
+    // external-wallet row(s): opening one never hides another's selection.
+    // External wallets stay an accordion AMONG THEMSELVES only — this app
+    // only ever keeps ONE external wallet's coins scanned/cached live at a
+    // time (`payfrom_wallet_coins`/`funding_coins`, a pre-existing scope
+    // boundary) — but expanding one never touches Notebook/Spending.
     cb!(on_payfrom_expand, |w, s, source: SharedString| {
         let key = source.to_string();
-        let collapsing = s.payfrom_expanded_source == key;
-        s.payfrom_expanded_source = if collapsing { String::new() } else { key.clone() };
-        w.set_payfrom_expanded_source(s.payfrom_expanded_source.clone().into());
-        let logged = if s.payfrom_expanded_source.is_empty() { "-".to_string() } else { s.payfrom_expanded_source.clone() };
-        println!("cb: funding-expand wallet={logged}");
-        if !collapsing {
-            // Seed the legacy single-source scratch state from this
-            // source's remembered selection (if any) BEFORE the branch's
-            // own auto-suggest runs, so a previously-touched wallet's
-            // selection is restored rather than re-suggested.
-            s.payfrom_manual = true; // explicit pick — CHANGE 5 stops re-defaulting it
-            let remembered = mixed_coins_for(&s, &key);
-            if key == "notebook" || key == "spending" {
-                if remembered.is_empty() {
-                    s.coins_overridden = false;
-                } else {
-                    s.selected_coins = remembered;
-                    s.coins_overridden = true;
+        match key.as_str() {
+            "notebook" => {
+                s.nb_expanded = !s.nb_expanded;
+                w.set_nb_expanded(s.nb_expanded);
+                println!("cb: payfrom expand wallet=notebook expanded={}", s.nb_expanded);
+            }
+            "spending" => {
+                s.sp_expanded = !s.sp_expanded;
+                w.set_sp_expanded(s.sp_expanded);
+                println!("cb: payfrom expand wallet=spending expanded={}", s.sp_expanded);
+                if s.sp_expanded && !s.spending_scanned {
+                    spending_refresh_async(&w, &mut s);
                 }
             }
-            if key == "notebook" {
-                apply_pay_from(&w, &mut s, "notebook");
-            } else if key == "spending" {
-                apply_pay_from(&w, &mut s, "spending");
-            } else if let Some(id) = key.strip_prefix("wallet:") {
-                activate_funding_wallet(&w, &mut s, id);
+            _ => {
+                let collapsing = s.payfrom_expanded_source == key;
+                s.payfrom_expanded_source = if collapsing { String::new() } else { key.clone() };
+                w.set_payfrom_expanded_source(s.payfrom_expanded_source.clone().into());
+                println!("cb: payfrom expand wallet={key} expanded={}", !collapsing);
+                if !collapsing {
+                    if let Some(id) = key.strip_prefix("wallet:") {
+                        payfrom_scan_wallet_for_display(&w, &mut s, id);
+                    }
+                }
             }
         }
-        refresh_compose(&w, &mut s);
+        update_payfrom_panels(&w, &mut s);
+        refresh_funding_list(&w, &s);
     });
 
     // Change now lives on its own screen (21), reached from a second
@@ -10388,9 +10687,9 @@ fn preview_mock(w: &AppWindow) {
     w.set_confirm_outputs(VecModel::from_slice(&outs));
 
     let wallets = [
-        FundingWalletRow { id: "aa".into(), label: "Signer · bc1p5cyxnux…".into(), meta: "taproot · 220,000 sats · 2 coins".into(), active: true, change_addr: "bc1p3qkhfe…uhk7".into() },
-        FundingWalletRow { id: "bb".into(), label: "Sparrow hot wallet".into(), meta: "segwit · 45,000 sats · 1 coin".into(), active: false, change_addr: "bc1qm34ls…dqfw".into() },
-        FundingWalletRow { id: "cc".into(), label: "segwit · tb1qr8k2p9…".into(), meta: "segwit · tap to scan for funds".into(), active: false, change_addr: "".into() },
+        FundingWalletRow { id: "aa".into(), label: "Signer · bc1p5cyxnux…".into(), meta: "taproot · 220,000 sats · 2 coins".into(), active: true, change_addr: "bc1p3qkhfe…uhk7".into(), coins: VecModel::from_slice(&[] as &[SpendCoin]), coin_title: "".into(), expanded: false },
+        FundingWalletRow { id: "bb".into(), label: "Sparrow hot wallet".into(), meta: "segwit · 45,000 sats · 1 coin".into(), active: false, change_addr: "bc1qm34ls…dqfw".into(), coins: VecModel::from_slice(&[] as &[SpendCoin]), coin_title: "".into(), expanded: false },
+        FundingWalletRow { id: "cc".into(), label: "segwit · tb1qr8k2p9…".into(), meta: "segwit · tap to scan for funds".into(), active: false, change_addr: "".into(), coins: VecModel::from_slice(&[] as &[SpendCoin]), coin_title: "".into(), expanded: false },
     ];
     w.set_funding_wallets(VecModel::from_slice(&wallets));
 }
