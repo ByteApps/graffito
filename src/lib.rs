@@ -2161,10 +2161,11 @@ fn update_wallet_coins(w: &AppWindow, st: &State) {
     }
     let n = coins.len();
     w.set_coins(VecModel::from_slice(&coins));
-    // CHANGE 1 (2026-07-17): when the spending wallet is enabled+capable,
-    // this line (Settings Coins card + the Coins screen's notebook segment,
-    // which reads the same property) aggregates both pools; otherwise it's
-    // the original notebook-only line, byte-for-byte.
+    // The aggregate (both pools) belongs ONLY on the Settings Coins card,
+    // which has no segments of its own. The Coins SCREEN's notebook segment
+    // and the notebook-consolidate confirm keep the notebook-only line —
+    // Sal 2026-07-17: "spending: 2 coins" on a segment that shows no
+    // spending coins is misleading (the spending segment is one tap away).
     let spending_state = if st.spending_capable && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false) {
         if !st.spending_scanned {
             Some(app_core::mixed::SpendingSummaryState::NotScanned)
@@ -2175,7 +2176,10 @@ fn update_wallet_coins(w: &AppWindow, st: &State) {
     } else {
         None
     };
-    w.set_coins_summary(app_core::mixed::coins_summary_line(n, spendable, notebooks, spending_state).into());
+    w.set_coins_summary(app_core::mixed::coins_summary_line(n, spendable, notebooks, None).into());
+    w.set_coins_summary_settings(
+        app_core::mixed::coins_summary_line(n, spendable, notebooks, spending_state).into(),
+    );
 }
 
 /// Rescan every ACTIVE notebook except the current one (the caller runs

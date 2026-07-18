@@ -1412,6 +1412,10 @@ export component AppWindow inherits Window {
     in-out property <int> reveal-nb-index;
     in property <[CoinItem]> coins;
     in property <string> coins-summary;
+    // Settings Coins card only: aggregates notebook + spending pools (the
+    // card has no segments); the Coins screen's segmented views keep the
+    // per-pool `coins-summary` above.
+    in property <string> coins-summary-settings;
     in property <[ActivityItem]> activity;
     in property <string> activity-summary;
     in-out property <bool> show-bump-dialog;
@@ -2866,7 +2870,7 @@ export component AppWindow inherits Window {
         }
         SettingsCard {
             title: "Coins";
-            subtitle: root.coins-summary;
+            subtitle: root.coins-summary-settings;
             GhostButton {
                 text: "View wallet coins…";
                 // This card summarizes NOTEBOOK coins, so always land on that
