@@ -4556,13 +4556,18 @@ export component AppWindow inherits Window {
     if screen == 26: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
-        alignment: start;
+        // No `alignment: start` here: the detail view stretches to fill so
+        // the Broadcast button stays PINNED at the bottom — a long tx
+        // (mixed sweep, many inputs) scrolls inside TxConfirmView instead
+        // of pushing Broadcast off-screen (and the e2e tap point is one
+        // constant, not per-tx-shape).
         Header {
             title: "Confirm & broadcast";
             back => { root.confirm-cancel(); }
         }
         if root.confirm-context != "": Caption { text: root.confirm-context; }
         TxConfirmView {
+            vertical-stretch: 1;
             note: root.confirm-note;
             inputs: root.confirm-inputs;
             outputs: root.confirm-outputs;
