@@ -2767,19 +2767,19 @@ export component AppWindow inherits Window {
                 : "⚠  Public notes are world-readable, forever.";
         }
         if root.mixed-linkage-hint: PrimaryButton {
-            text: root.compose-sending ? root.compose-progress-label : "Sign + broadcast";
+            text: root.compose-sending ? root.compose-progress-label : "Sign + review…";
             tint: (root.spend-enough && !root.compose-sending) ? Pal.accent : Pal.faint;
             tint-hover: (root.spend-enough && !root.compose-sending) ? Pal.accent-hover : Pal.faint;
             clicked => { if (root.spend-enough && !root.compose-sending) { root.compose-send-mixed(); } }
         }
         if !root.mixed-linkage-hint && root.pay-from == "notebook": PrimaryButton {
-            text: root.compose-sending ? root.compose-progress-label : (root.watch-only ? "Build transaction to sign" : "Sign + broadcast");
+            text: root.compose-sending ? root.compose-progress-label : (root.watch-only ? "Build transaction to sign" : "Sign + review…");
             tint: (root.spend-enough && !root.compose-sending) ? Pal.accent : Pal.faint;
             tint-hover: (root.spend-enough && !root.compose-sending) ? Pal.accent-hover : Pal.faint;
             clicked => { if (root.spend-enough && !root.compose-sending) { root.compose-send(); } }
         }
         if !root.mixed-linkage-hint && root.pay-from == "spending": PrimaryButton {
-            text: root.compose-sending ? root.compose-progress-label : "Sign + broadcast";
+            text: root.compose-sending ? root.compose-progress-label : "Sign + review…";
             tint: (root.spend-enough && !root.compose-sending) ? Pal.accent : Pal.faint;
             tint-hover: (root.spend-enough && !root.compose-sending) ? Pal.accent-hover : Pal.faint;
             clicked => { if (root.spend-enough && !root.compose-sending) { root.spending-compose-send(); } }
@@ -3866,7 +3866,7 @@ export component AppWindow inherits Window {
                     }
                 }
                 if !root.sweep-fund-external && !root.watch-only: PrimaryButton {
-                    text: root.sweep-kind == "consolidate" ? "Consolidate — sign + broadcast" : "Sweep — sign + broadcast";
+                    text: root.sweep-kind == "consolidate" ? "Consolidate — sign + review…" : "Sweep — sign + review…";
                     clicked => { root.sweep-send(); }
                 }
                 if !root.sweep-fund-external && root.watch-only: PrimaryButton {
