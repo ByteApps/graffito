@@ -1091,10 +1091,14 @@ component DoorCard inherits Rectangle {
 // `spend-coins`/`spend-title` state (recomputed in Rust for whichever
 // source is expanded) renders under whichever wallet row is currently
 // expanded — the "Coins" section is no longer a page-level block.
+// Deliberately NEUTRAL always (Sal's iPhone bug cluster, 2026-07-18,
+// defect #3): a panel with 0 selected coins is a normal state, not an
+// error, and the insufficiency verdict is now a WHOLE-SCREEN concern shown
+// once under the summary card — so this component no longer takes an
+// `enough` input or renders its own copy of the warning.
 component CoinListPanel inherits VerticalLayout {
     in property <[SpendCoin]> coins;
     in property <string> title;
-    in property <bool> enough: true;
     in property <int> strategy;
     callback pick-strategy(int);
     callback toggle(string);
@@ -1106,7 +1110,7 @@ component CoinListPanel inherits VerticalLayout {
         Text {
             text: root.title;
             font-size: 12px;
-            color: root.enough ? Pal.muted : Pal.bad;
+            color: Pal.muted;
             vertical-alignment: center;
             horizontal-stretch: 1;
             overflow: elide;
@@ -1125,10 +1129,6 @@ component CoinListPanel inherits VerticalLayout {
         alignment: start;
         SelectPill { text: "fewest coins"; active: root.strategy == 0; clicked => { root.pick-strategy(0); } }
         SelectPill { text: "consolidate"; active: root.strategy == 1; clicked => { root.pick-strategy(1); } }
-    }
-    if !root.enough: Caption {
-        text: "Selected coins don't cover the note + fee — select more.";
-        color: Pal.bad;
     }
     for c in root.coins: Rectangle {
         height: 42px;
@@ -1529,12 +1529,18 @@ export component AppWindow inherits Window {
     in property <string> nb-panel-title;
     in property <[SpendCoin]> sp-panel-coins;
     in property <string> sp-panel-title;
-    // Pay-from screen summary card: reuses the exact cost/sufficiency
-    // figures `refresh_compose`'s active branch already computes — never a
-    // separately invented estimate. "Selected" spans every source
-    // regardless of which is active/expanded; tint by `spend-enough`.
+    // Pay-from screen summary card + compose row (Sal's iPhone bug cluster,
+    // 2026-07-18): ONE global verdict computed by Rust's `payfrom_state` from
+    // the TRUE cross-wallet selection — never a separately invented estimate,
+    // and never dependent on which panel is `payfrom-active-source`/expanded.
+    // "Selected" spans every source; "Required" is that selection's exact
+    // shape-appropriate fee estimate (always non-empty); "source-label" is
+    // the truthful "Notebook" / "Spending wallet" / <wallet label> / "N
+    // wallets" the compose row and summary card both render; tint by
+    // `spend-enough` everywhere (the SAME verdict gates Sign).
     in property <string> payfrom-required-line;
     in property <string> payfrom-selected-line;
+    in property <string> payfrom-source-label: "Notebook";
     // Selected coins span more than one wallet — shows the linkage-hint line.
     in property <bool> mixed-linkage-hint: false;
     // Resolved change destination (default or explicit pick), for the
@@ -2782,7 +2788,11 @@ export component AppWindow inherits Window {
         // Picker, coin control, and custom change all live on the "Pay from"
         // screen now (Sal 2026-07-16 iPhone-build-8 review — the old inline
         // rows widened past the right edge on iPhone). Every text elides so
-        // this row can never do that again.
+        // this row can never do that again. Label + amount come from
+        // `payfrom-source-label`/`payfrom-selected-line` (Sal's iPhone bug
+        // cluster, 2026-07-18) — the TRUE cross-wallet selection, not the
+        // last-tapped `pay-from`/`pay-from-label`, which could disagree with
+        // what's actually selected (defect #4: the row used to lie).
         Rectangle {
             border-radius: 10px;
             background: pftap.has-hover ? Pal.card-hover : Pal.card;
@@ -2795,7 +2805,7 @@ export component AppWindow inherits Window {
                 padding-right: 12px;
                 spacing: 6px;
                 Text {
-                    text: "Pay from · " + root.pay-from-label;
+                    text: "Pay from · " + root.payfrom-source-label;
                     font-size: 12px;
                     color: root.spend-enough ? Pal.text : Pal.bad;
                     vertical-alignment: center;
@@ -2803,7 +2813,7 @@ export component AppWindow inherits Window {
                     horizontal-stretch: 1;
                 }
                 Text {
-                    text: root.pay-from-balance;
+                    text: root.payfrom-selected-line;
                     font-size: 12px;
                     color: Pal.muted;
                     vertical-alignment: center;
@@ -4028,6 +4038,15 @@ export component AppWindow inherits Window {
                         overflow: elide;
                     }
                 }
+                // ONE insufficiency message for the whole screen (Sal's
+                // iPhone bug cluster, 2026-07-18: this used to render inside
+                // EVERY expanded wallet panel — now it lives here, under the
+                // summary card that carries the global verdict; panel
+                // captions/borders stay neutral always, see `CoinListPanel`).
+                if !root.spend-enough: Caption {
+                    text: "Selected coins don't cover the note + fee — select more.";
+                    color: Pal.warn;
+                }
             }
         }
         Flickable {
@@ -4081,12 +4100,11 @@ export component AppWindow inherits Window {
                         border-radius: 10px;
                         background: Pal.card;
                         border-width: 1px;
-                        border-color: root.spend-enough ? Pal.line : Pal.bad;
+                        border-color: Pal.line;
                         height: nb20panel.preferred-height;
                         nb20panel := CoinListPanel {
                             coins: root.nb-panel-coins;
                             title: root.nb-panel-title;
-                            enough: root.spend-enough;
                             strategy: root.coin-strategy;
                             pick-strategy(i) => { root.set-coin-strategy(i); }
                             toggle(op) => { root.toggle-coin("notebook", op); }
@@ -4139,12 +4157,11 @@ export component AppWindow inherits Window {
                         border-radius: 10px;
                         background: Pal.card;
                         border-width: 1px;
-                        border-color: root.spend-enough ? Pal.line : Pal.bad;
+                        border-color: Pal.line;
                         height: sp20panel.preferred-height;
                         sp20panel := CoinListPanel {
                             coins: root.sp-panel-coins;
                             title: root.sp-panel-title;
-                            enough: root.spend-enough;
                             strategy: root.coin-strategy;
                             pick-strategy(i) => { root.set-coin-strategy(i); }
                             toggle(op) => { root.toggle-coin("spending", op); }
@@ -4183,12 +4200,11 @@ export component AppWindow inherits Window {
                         border-radius: 10px;
                         background: Pal.card;
                         border-width: 1px;
-                        border-color: root.spend-enough ? Pal.line : Pal.bad;
+                        border-color: Pal.line;
                         height: fwpanel.preferred-height;
                         fwpanel := CoinListPanel {
                             coins: fw.coins;
                             title: fw.coin-title;
-                            enough: root.spend-enough;
                             strategy: root.coin-strategy;
                             pick-strategy(i) => { root.set-coin-strategy(i); }
                             toggle(op) => { root.toggle-coin("wallet:" + fw.id, op); }

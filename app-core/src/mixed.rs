@@ -168,6 +168,36 @@ pub(crate) fn commas(n: u64) -> String {
     out
 }
 
+/// Fee-only estimate for the FUNDED output shape (OP_RETURNs + optional
+/// recipient dust/gift + an ALWAYS dust-to-self output + change) —
+/// [`crate::psbt_build::assemble_funded_note_psbt`] / [`assemble_mixed_note_psbt`]'s
+/// exact output order, but WITHOUT their insufficiency gate: both builders
+/// intentionally `Err` rather than report a fee once the selected coins
+/// can't cover it (correct for the real build) — which is exactly the case
+/// the Pay-from screen's summary card most needs a number for, to explain a
+/// red state (Sal's iPhone bug cluster, 2026-07-18: the summary/"Required"
+/// line was going blank right when it mattered most). `payloads` come from
+/// the SAME `sealed_note_payloads` call those builders make internally —
+/// this function only does the weight/fee arithmetic, via the same
+/// `predict_weight` call they use, never a separately invented formula.
+pub fn estimate_funded_fee(
+    input_weights: &[InputWeightPrediction],
+    payloads: &[Vec<u8>],
+    recipient_spk_len: Option<usize>,
+    change_spk_len: usize,
+    fee_rate: f64,
+) -> u64 {
+    let mut lens: Vec<usize> =
+        payloads.iter().map(|p| notes_core::tx::op_return_script(p).len()).collect();
+    if let Some(l) = recipient_spk_len {
+        lens.push(l);
+    }
+    lens.push(34); // dust-to-self: always our own P2TR notebook address
+    lens.push(change_spk_len);
+    let vsize = predict_weight(input_weights.iter().copied(), lens.into_iter()).to_vbytes_ceil();
+    (vsize as f64 * fee_rate).ceil().max(0.0) as u64
+}
+
 /// Coerce this mixed selection's Spending-source coins into the
 /// `FundingUtxo` shape [`crate::psbt_build::sign_own_wpkh_inputs`] expects.
 pub fn spending_funding_utxos(coins: &[MixedCoin]) -> Vec<crate::funding::FundingUtxo> {

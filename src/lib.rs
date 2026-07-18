@@ -4044,31 +4044,6 @@ fn mixed_sync_source(st: &mut State, source: &str, coins: &[(String, u32)]) {
     }
 }
 
-/// Total value of every coin currently remembered across ALL sources — used
-/// for the mixed-compose "enough" heuristic and the mixed broadcast. Looks
-/// each coin up in whichever per-source list holds its value; `funding_coins`
-/// only ever caches ONE external wallet's scan at a time (the currently
-/// active one — matches the rest of the external-funding architecture), so a
-/// selection spanning two DIFFERENT external wallets simultaneously isn't
-/// representable yet — an accepted scope boundary for this milestone (a
-/// note may mix notebook + spending + ONE external wallet).
-fn mixed_selected_total(st: &State) -> u64 {
-    st.mixed_selected
-        .iter()
-        .filter_map(|(source, txid, vout)| {
-            if source == "notebook" {
-                st.store.as_ref()?.utxos.iter().find(|u| &u.txid == txid && u.vout == *vout).map(|u| u.value)
-            } else if source == "spending" {
-                st.spending_coins.iter().find(|c| &c.txid == txid && c.vout == *vout).map(|c| c.value)
-            } else if source.starts_with("wallet:") {
-                st.funding_coins.iter().find(|c| &c.txid == txid && c.vout == *vout).map(|c| c.value)
-            } else {
-                None
-            }
-        })
-        .sum()
-}
-
 /// Build a source's OWN coin list + "N coins selected · X sats" caption for
 /// the Pay-from screen's independently-expandable sections (2026-07-18
 /// rework: every expanded section now renders its own data, so opening one
@@ -4231,13 +4206,254 @@ fn promote_wallet_active(w: &AppWindow, st: &mut State, id: &str) {
     println!("cb: pay-from wallet:{label}");
 }
 
+/// The ONE authoritative Pay-from verdict (Sal's iPhone bug cluster,
+/// 2026-07-18: sufficiency was being evaluated per-wallet-PANEL — whichever
+/// of `refresh_compose`'s three branches happened to be `payfrom_active_source`
+/// at the time — instead of on the TRUE cross-wallet selection, so a
+/// well-funded selection could render red, or the "Required" figure could go
+/// blank, depending purely on which section was last tapped). Computed fresh
+/// from `mixed_selected` (the cross-wallet memory — what actually gets
+/// spent), NEVER from `payfrom_active_source` (a last-touched/visibility
+/// concern, orthogonal to what's selected). Every consumer renders from
+/// this: the summary card, the single insufficiency message, the compose
+/// "Pay from" row (label + amount + tint), and the Sign gate
+/// (`spend_enough`). Panel captions stay neutral always — see
+/// `payfrom_panel_coins`, unchanged.
+struct PayfromState {
+    /// The exact fee-plus-outputs figure this selection's SHAPE needs, when
+    /// one can be estimated numerically. `None` only for a lone external
+    /// wallet, whose real cost is "whatever the wallet pays" — never an
+    /// invented sats figure (unchanged design intent).
+    required: Option<u64>,
+    /// Always non-empty — "~N sats" for numeric shapes, a descriptive line
+    /// ("funded by <wallet>") for the external-only shape.
+    required_line: String,
+    /// True cross-wallet total, regardless of which source is active/expanded.
+    selected: u64,
+    /// The single sufficiency verdict every consumer renders from.
+    enough: bool,
+    /// "Notebook" | "Spending wallet" | the external wallet's label | "N wallets".
+    source_label: String,
+}
+
+/// Compute [`PayfromState`] for the CURRENT cross-wallet selection, using
+/// whichever of the three real compose branches' math matches this
+/// selection's shape (notebook-only / spending-only / external-only /
+/// mixed) — the branches already compute the exact fee for their own shape;
+/// this never invents a new estimator, it just stops letting the ANSWER
+/// depend on which panel happens to be `payfrom_active_source`. The two
+/// "funded" shapes (spending, mixed) reuse [`app_core::mixed::estimate_funded_fee`]
+/// — the same weight/output math [`app_core::mixed::assemble_mixed_note_psbt`]
+/// and `build_funding_psbt_amount` use internally, minus their insufficiency
+/// gate (which would otherwise swallow the very fee figure a "you're short"
+/// UI needs to show).
+fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
+    let net = st.network;
+
+    // ---- partition the TRUE cross-wallet selection — never the legacy
+    // single-source `selected_coins` scratch, which only ever mirrors
+    // whichever source is `payfrom_active_source`. ----
+    let nb_sel = mixed_coins_for(st, "notebook");
+    let nb_total: u64 = st
+        .store
+        .as_ref()
+        .map(|store| {
+            nb_sel
+                .iter()
+                .filter_map(|(t, v)| store.utxos.iter().find(|u| &u.txid == t && u.vout == *v).map(|u| u.value))
+                .sum()
+        })
+        .unwrap_or(0);
+    let sp_sel = mixed_coins_for(st, "spending");
+    let sp_total: u64 = sp_sel
+        .iter()
+        .filter_map(|(t, v)| st.spending_coins.iter().find(|c| &c.txid == t && c.vout == *v).map(|c| c.value))
+        .sum();
+    let mut wallet_sources: Vec<String> = st
+        .mixed_selected
+        .iter()
+        .filter(|(s, _, _)| s.starts_with("wallet:"))
+        .map(|(s, _, _)| s.clone())
+        .collect();
+    wallet_sources.sort();
+    wallet_sources.dedup();
+    let ext_total: u64 = wallet_sources
+        .iter()
+        .map(|src| {
+            let coins = mixed_coins_for(st, src);
+            let id = src.strip_prefix("wallet:").unwrap_or("");
+            let pool: Vec<FundingUtxo> = if st.active_funding_id.as_deref() == Some(id) {
+                st.funding_coins.clone()
+            } else {
+                st.payfrom_wallet_coins.get(id).cloned().unwrap_or_default()
+            };
+            coins.iter().filter_map(|(t, v)| pool.iter().find(|c| &c.txid == t && c.vout == *v).map(|c| c.value)).sum::<u64>()
+        })
+        .sum();
+
+    let selected = nb_total + sp_total + ext_total;
+    let groups = [nb_total > 0, sp_total > 0, ext_total > 0].into_iter().filter(|b| *b).count();
+
+    // ---- shared compose context ----
+    let text = w.get_compose_text().to_string();
+    let text_for_est: String = if text.is_empty() { "x".to_string() } else { text.clone() };
+    let private = w.get_compose_private();
+    let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
+    let recipient = st.to_address.as_deref().and_then(|a| Recipient::parse(net, a).ok());
+    let gift = if recipient.is_some() {
+        w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+    } else {
+        0
+    };
+    let change_raw = w.get_change_address().to_string();
+    let change_trim = change_raw.trim();
+    let custom_change = if change_trim.is_empty() { None } else { Recipient::parse(net, change_trim).ok() };
+    // An explicitly-typed change address that DOESN'T parse is invalid —
+    // gate Sign on it same as before (each branch used to bail out on this
+    // independently; now it's one check).
+    let change_valid = change_trim.is_empty() || custom_change.is_some();
+    let custom_change_spk_len = custom_change.map(|r| r.spk.len());
+
+    // Fee estimate for a "funded" shape (spending / mixed): reuses the real
+    // sealer (`sealed_note_payloads`, the same primitive `build_funding_psbt_amount`/
+    // `assemble_mixed_note_psbt` call internally) for accurate payload sizes,
+    // then `estimate_funded_fee` for the weight/fee math — WITHOUT their
+    // insufficiency gate, so a number always comes back.
+    let funded_fee = |input_weights: &[bitcoin::transaction::InputWeightPrediction], change_spk_len: usize| -> Option<u64> {
+        let identity = st.ident.as_ref().and_then(|i| i.full())?.clone_fields();
+        let chunk = st.store.as_ref().map(|s| s.chunk_size).unwrap_or(DEFAULT_CHUNK);
+        let (payloads, recipient_spk) = app_core::notes_core::bundle::sealed_note_payloads(
+            &identity,
+            &text_for_est,
+            private,
+            recipient.as_ref(),
+            [0u8, 0, 0, 0],
+            chunk,
+        )
+        .ok()?;
+        let recipient_spk_len = recipient_spk.map(|s| s.len()).or_else(|| recipient.as_ref().map(|r| r.spk.len()));
+        Some(app_core::mixed::estimate_funded_fee(input_weights, &payloads, recipient_spk_len, change_spk_len, rate))
+    };
+
+    let (required, required_line, source_label): (Option<u64>, String, String);
+    if groups == 0 {
+        // Nothing selected in ANY source — estimate the minimal 1-input
+        // self-funded shape (what auto-suggest will land on): never leave
+        // the line blank just because the user hasn't picked a coin yet.
+        let spk_len = recipient.as_ref().map(|r| r.spk.len());
+        let change_len = custom_change_spk_len.or(Some(34));
+        let fee = st
+            .store
+            .as_ref()
+            .and_then(|store| note_est(store, text_for_est.len(), private, 1, spk_len, change_len).ok())
+            .map(|(_, vsize)| (vsize as f64 * rate).ceil().max(0.0) as u64);
+        required = fee.map(|f| f + gift);
+        source_label = if st.payfrom_active_source == "spending" { "Spending wallet".to_string() } else { "Notebook".to_string() };
+        required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
+    } else if nb_total > 0 && groups == 1 {
+        // Notebook-only — same self-funded estimator the plain compose path
+        // already uses (no dust-to-self: change naturally returns to the
+        // notebook, which already keeps the note discoverable).
+        let spk_len = recipient.as_ref().map(|r| r.spk.len());
+        let change_len = custom_change_spk_len.or(Some(34));
+        let fee = st
+            .store
+            .as_ref()
+            .and_then(|store| note_est(store, text_for_est.len(), private, nb_sel.len().max(1), spk_len, change_len).ok())
+            .map(|(_, vsize)| (vsize as f64 * rate).ceil().max(0.0) as u64);
+        required = fee.map(|f| f + gift);
+        source_label = "Notebook".to_string();
+        required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
+    } else if sp_total > 0 && groups == 1 {
+        // Spending-only — same funded shape `spending_compose_ui` builds for
+        // real (dust-to-self ALWAYS), just never gated on affordability.
+        let weights: Vec<_> = std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX)
+            .take(sp_sel.len().max(1))
+            .collect();
+        let change_len = custom_change_spk_len.unwrap_or(22); // BIP84 p2wpkh spk is always 22 bytes
+        let fee = funded_fee(&weights, change_len);
+        required = fee.map(|f| f + gift + DUST_SATS);
+        source_label = "Spending wallet".to_string();
+        required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
+    } else if groups == 1 {
+        // External-only — cost is "whatever the wallet pays"; never invent a
+        // numeric fee for it (unchanged design intent).
+        let id = wallet_sources.first().and_then(|s| s.strip_prefix("wallet:"));
+        let label = id
+            .and_then(|id| st.funding_wallets.iter().find(|fw| fw.id == id))
+            .map(|fw| fw.label.clone())
+            .unwrap_or_else(|| "External wallet".to_string());
+        required = None;
+        // Always non-empty (never blank just because no note text is typed
+        // yet) — a funding wallet's role doesn't depend on that; "enough"
+        // below still gates Sign on text being present.
+        required_line = format!("funded by {label}");
+        source_label = label;
+    } else {
+        // Mixed: 2+ source groups in ONE tx — the real mixed builder
+        // (`assemble_mixed_note_psbt`) is the only correct sizer for this
+        // shape (per-source input weights + the funded output shape), reused
+        // here via `estimate_funded_fee` (same weights/outputs, no
+        // insufficiency gate).
+        let mut weights: Vec<bitcoin::transaction::InputWeightPrediction> = Vec::new();
+        weights.extend(std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH).take(nb_sel.len()));
+        weights.extend(std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX).take(sp_sel.len()));
+        for src in &wallet_sources {
+            let id = src.strip_prefix("wallet:").unwrap_or("");
+            let taproot = st.funding_wallets.iter().find(|fw| fw.id == id).map(|fw| fw.kind == "taproot").unwrap_or(true);
+            let iw = if taproot {
+                bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH
+            } else {
+                bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX
+            };
+            weights.extend(std::iter::repeat(iw).take(mixed_coins_for(st, src).len()));
+        }
+        let spending_enabled = st.spending_capable && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false);
+        let single_external = if wallet_sources.len() == 1 && nb_total == 0 && sp_total == 0 {
+            wallet_sources.first().and_then(|s| s.strip_prefix("wallet:"))
+        } else {
+            None
+        };
+        let default_change =
+            app_core::mixed::resolve_change_default(spending_enabled, sp_total > 0, single_external);
+        let change_len = custom_change_spk_len.unwrap_or(match &default_change {
+            app_core::mixed::ChangeDefault::Spending => 22,
+            app_core::mixed::ChangeDefault::Notebook => 34,
+            app_core::mixed::ChangeDefault::Wallet(id) => st
+                .funding_wallets
+                .iter()
+                .find(|fw| &fw.id == id)
+                .map(|fw| if fw.kind == "taproot" { 34 } else { 22 })
+                .unwrap_or(34),
+        });
+        let fee = funded_fee(&weights, change_len);
+        required = fee.map(|f| f + gift + DUST_SATS);
+        source_label = format!("{groups} wallets");
+        required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
+    }
+
+    let enough = match required {
+        Some(r) => change_valid && selected >= r,
+        None => {
+            // External-only: readiness, not a sats comparison — a watch
+            // wallet's real cost isn't knowable up front (unchanged rule).
+            let ready = st.funding.is_some() && !st.funding_coins.is_empty();
+            change_valid && ready && ext_total > 0 && !text.is_empty()
+        }
+    };
+
+    PayfromState { required, required_line, selected, enough, source_label }
+}
+
 /// Recompute the mixed-source bookkeeping after `refresh_compose`'s active-
 /// source branch runs: mirror its (possibly just auto-suggested) selection
 /// into the cross-wallet memory, flag the linkage hint when the total
 /// selection spans more than one wallet, and resolve the Change screen's
-/// current destination label. A loose sufficiency check stands in for the
-/// mixed case's "enough" gate — `on_compose_send_mixed`'s real PSBT build is
-/// the actual arbiter and reports a precise error via `status` if it fails.
+/// current destination label. Also the ONE place [`payfrom_state`] is
+/// computed and fanned out to every consumer (summary card, insufficiency
+/// message, compose row, Sign gate) — see its doc comment for why this
+/// replaced each branch setting `spend_enough`/`payfrom_required_line`
+/// independently (Sal's iPhone bug cluster, 2026-07-18).
 fn sync_and_finalize_payfrom(w: &AppWindow, st: &mut State) {
     let active = st.payfrom_active_source.clone();
     if !active.is_empty() {
@@ -4248,15 +4464,24 @@ fn sync_and_finalize_payfrom(w: &AppWindow, st: &mut State) {
         st.mixed_selected.iter().map(|(s, _, _)| s.as_str()).collect();
     let mixed = sources.len() > 1;
     w.set_mixed_linkage_hint(mixed);
-    if mixed {
-        w.set_spend_enough(mixed_selected_total(st) > 0);
-    }
-    // Pay-from screen summary card (independent-expand rework, 2026-07-18):
-    // "Selected" is the true cross-wallet total regardless of which source
-    // is active or expanded; "Required" is set directly by whichever of
-    // `refresh_compose`'s three branches just ran (the same fee figure it
-    // already shows in `cost_line` — never a separately invented estimate).
-    w.set_payfrom_selected_line(format!("{} sats", commas(mixed_selected_total(st))).into());
+
+    let pf = payfrom_state(w, st);
+    // The note-size ceiling (`compose_oversize`, set by the notebook
+    // branch's `fit_check`) is a hard broadcast-legality gate independent of
+    // fund sufficiency — AND it in here rather than duplicating it into
+    // every branch's own `enough` computation.
+    let enough = pf.enough && !st.compose_oversize;
+    w.set_spend_enough(enough);
+    w.set_payfrom_required_line(pf.required_line.into());
+    w.set_payfrom_selected_line(format!("{} sats", commas(pf.selected)).into());
+    w.set_payfrom_source_label(pf.source_label.clone().into());
+    println!(
+        "cb: payfrom state src={} required={} selected={} enough={}",
+        pf.source_label,
+        pf.required.map(|r| r.to_string()).unwrap_or_else(|| "?".to_string()),
+        pf.selected,
+        if enough { 1 } else { 0 },
+    );
     update_change_label(w, st);
 }
 
@@ -4455,11 +4680,13 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     };
     w.set_change_error(change_err.clone().into());
 
-    // Pay-from screen summary card (independent-expand rework, 2026-07-18):
-    // cleared up front so a stale figure from a PRIOR keystroke/branch never
-    // lingers on screen; filled in below wherever a real fee number exists —
-    // never a separately invented estimate.
-    w.set_payfrom_required_line("".into());
+    // Pay-from screen summary card / Sign gate: computed ONCE, centrally, by
+    // `payfrom_state` inside `sync_and_finalize_payfrom` below — from the
+    // TRUE cross-wallet selection, not from whichever branch happens to run
+    // here. This function still computes its own `cost_line`/`change_amount`
+    // preview text (compose-screen display, unrelated to the Pay-from
+    // cluster) but no longer sets `spend_enough`/`payfrom_required_line`
+    // itself (Sal's iPhone bug cluster, 2026-07-18).
     let consolidate = st.consolidate_coins;
     let Some(store) = &st.store else { return };
     // Auto-suggest a selection until the user overrides it.
@@ -4511,10 +4738,6 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             .unwrap_or_default();
         w.set_cost_line(min_line.into());
         w.set_change_amount(format!("Change to {change_dest}").into());
-        w.set_spend_enough(true);
-        if let Some(fee) = est_fee {
-            w.set_payfrom_required_line(format!("~{} sats", commas(fee + sent)).into());
-        }
         st.compose_oversize = false;
         sync_and_finalize_payfrom(w, st);
         return;
@@ -4526,7 +4749,6 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     match est {
         Ok((chunks, vsize)) if !over => {
             let fee = (vsize as f64 * rate).ceil() as u64;
-            let enough = sel_count > 0 && sel_total >= fee + sent;
             let change = sel_total.saturating_sub(fee + sent);
             let usd = st
                 .usd
@@ -4541,21 +4763,18 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
                 format!("{chunks} chunk(s) · ~{vsize} vB · ~{fee} sats{usd}{gift_line}").into(),
             );
             w.set_change_amount(format!("Change to {change_dest} · ~{change} sats").into());
-            w.set_spend_enough(enough);
-            w.set_payfrom_required_line(format!("~{} sats", commas(fee + sent)).into());
         }
         // Over the per-tx broadcast ceiling: vsize > 100 kB (Ok arm) or the
-        // body needs > 255 chunks (Err arm). Sign is gated off; the dialog
-        // below offers the fix.
+        // body needs > 255 chunks (Err arm). Sign is gated off via
+        // `compose_oversize` (ANDed into `spend_enough` centrally below) —
+        // the dialog below offers the fix.
         Ok((chunks, vsize)) => {
             w.set_cost_line(
                 format!("{chunks} chunk(s) · ~{vsize} vB — too large to broadcast").into(),
             );
-            w.set_spend_enough(false);
         }
         Err(_) => {
             w.set_cost_line("Too large to broadcast (> 255 chunks)".into());
-            w.set_spend_enough(false);
         }
     }
 
@@ -4674,14 +4893,9 @@ fn funding_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         format!("Funding {sel_count}/{n} coin{} · {} sats", if n == 1 { "" } else { "s" }, commas(sel_total)).into(),
     );
     w.set_cost_line(if text.is_empty() { String::new() } else { "funded from the external wallet".into() }.into());
-    let enough = ready && sel_count > 0 && !text.is_empty();
-    w.set_spend_enough(enough);
-    // No numeric fee is ever computed for external funding (the wallet pays
-    // whatever it pays) — the Pay-from screen's summary card gets a
-    // descriptive line instead of an invented sats figure.
-    w.set_payfrom_required_line(
-        if enough { format!("funded by {}", w.get_pay_from_label()) } else { String::new() }.into(),
-    );
+    // `spend_enough`/`payfrom_required_line` are no longer set here — see
+    // `payfrom_state`'s external-only branch (same readiness rule: a funding
+    // wallet's real cost isn't knowable up front, so no numeric fee).
 
     // Change: blank = the funding wallet's own change; a valid custom address
     // overrides it. Same validation/label pattern as the self-funded path.
@@ -4709,10 +4923,12 @@ fn funding_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
 /// SELECTED coins, so the preview and the real build can never disagree.
 fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     let net = st.network;
-    // Cleared up front (independent-expand rework, 2026-07-18) — filled in
-    // below only where a real dry-run fee exists; every early return here
-    // leaves it blank rather than showing a stale figure.
-    w.set_payfrom_required_line("".into());
+    // `spend_enough`/`payfrom_required_line` are no longer set anywhere in
+    // this function — `payfrom_state` (called centrally in
+    // `sync_and_finalize_payfrom` right after this returns) now computes
+    // both from the TRUE cross-wallet selection, using the same funded-shape
+    // math this function's `build_funding_psbt_amount` dry-run uses, minus
+    // its insufficiency gate (Sal's iPhone bug cluster, 2026-07-18).
     let n = st.spending_coins.len();
     if !st.coins_overridden {
         st.selected_coins = st.spending_coins.iter().map(|c| (c.txid.clone(), c.vout)).collect();
@@ -4763,7 +4979,6 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
             Err(_) => {
                 w.set_change_amount("Change: ⚠ invalid".into());
                 w.set_change_error(format!("Not a valid {} address.", net.as_str()).into());
-                w.set_spend_enough(false);
                 return;
             }
         }
@@ -4772,13 +4987,11 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     if n == 0 {
         w.set_cost_line("".into());
         w.set_change_amount("Spending wallet has no coins yet — fund its receive address in Settings.".into());
-        w.set_spend_enough(false);
         return;
     }
     if sel_count == 0 {
         w.set_cost_line("".into());
         w.set_change_amount("No coins selected — select at least one below.".into());
-        w.set_spend_enough(false);
         return;
     }
     if text.is_empty() {
@@ -4791,7 +5004,6 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
             }
             .into(),
         );
-        w.set_spend_enough(true);
         return;
     }
     let (Some(source), Some(store), Some(identity)) = (
@@ -4800,7 +5012,6 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         st.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()),
     ) else {
         w.set_cost_line("".into());
-        w.set_spend_enough(false);
         return;
     };
     let recipient = st.to_address.as_deref().and_then(|a| Recipient::parse(net, a).ok());
@@ -4847,9 +5058,6 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
             w.set_cost_line(
                 format!("~{} sats fee{usd}{gift_line} · +330 sats dust-to-self", built.fee).into(),
             );
-            w.set_payfrom_required_line(
-                format!("~{} sats", commas(built.fee + built.sent_to_recipient + DUST_SATS)).into(),
-            );
             w.set_change_amount(
                 if has_custom_change {
                     format!(
@@ -4862,12 +5070,10 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                 }
                 .into(),
             );
-            w.set_spend_enough(true);
         }
         Err(e) => {
             w.set_cost_line("".into());
             w.set_change_amount(format!("{e}").into());
-            w.set_spend_enough(false);
         }
     }
 }
