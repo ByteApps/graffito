@@ -519,6 +519,56 @@ mod tests {
         assert!(!raw.is_empty());
     }
 
+    /// `estimate_funded_fee` must equal the REAL builder's fee for the same
+    /// selection — its output-shape list is a duplicate of
+    /// `assemble_mixed_note_psbt`'s, and this pin is what keeps the two from
+    /// drifting (a drifted estimate makes the Pay-from sufficiency verdict
+    /// lie, the exact bug class the 2026-07-18 rework fixed).
+    #[test]
+    fn estimate_funded_fee_matches_real_mixed_build() {
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let spending_src = crate::spending::funding_source(&material, net, 0).unwrap();
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let notebook_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let recipient_spk = notes_core::address::p2tr_script_pubkey(&bob.output_x);
+        let coins = vec![
+            MixedCoin { source: CoinSource::Notebook, txid: "a".repeat(64), vout: 0, value: 60_000, chain: 0, index: 0 },
+            MixedCoin { source: CoinSource::Spending, txid: "b".repeat(64), vout: 1, value: 40_000, chain: 0, index: 0 },
+        ];
+        let payloads = notes_core::envelope::encode_chunks(
+            [1, 2, 3, 4],
+            notes_core::envelope::FLAG_DIRECTED,
+            b"mixed source note",
+            80,
+        )
+        .unwrap();
+        let built = assemble_mixed_note_psbt(
+            &coins,
+            notebook_spk.clone(),
+            Some(&spending_src),
+            &HashMap::new(),
+            &payloads,
+            Some(recipient_spk.clone()),
+            330,
+            &ChangeDefault::Spending,
+            None,
+            0,
+            2.0,
+        )
+        .unwrap();
+        let change_spk_len = spending_src.derive(1, 0).unwrap().spk.len();
+        let est = estimate_funded_fee(
+            &[InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH, InputWeightPrediction::P2WPKH_MAX],
+            &payloads,
+            Some(recipient_spk.len()),
+            change_spk_len,
+            2.0,
+        );
+        assert_eq!(est, built.fee, "estimate drifted from the real builder's fee");
+    }
+
     /// The four change-default scenarios Sal's rule distinguishes.
     #[test]
     fn change_default_resolution_covers_all_scenarios() {
