@@ -36,15 +36,30 @@ pub struct ComposeRequest<'a> {
     pub now: u64,
 }
 
+#[derive(Clone)]
 pub struct ComposedNote {
     pub note_id: String, // hex8
     pub tx: NoteTx,
+    /// The directed-note recipient's address, if any — carried alongside
+    /// the built tx so a deferred recording step (the universal confirm
+    /// screen's stage B) doesn't need to re-parse `req.recipient`.
+    pub recipient_address: Option<String>,
+    /// Whether change (if any) returns to the notes address (true) or a
+    /// custom `req.change_to` destination (false) — mirrors the
+    /// `change_spk.is_none()` check `compose_and_record` used to make
+    /// inline before it split into `compose_note` + `record_composed_note`.
+    pub change_is_self: bool,
 }
 
-/// Build + sign + record. The store afterwards: note Pending, inputs
-/// locked, change spendable (unconfirmed chaining).
-pub fn compose_and_record(
-    store: &mut Store,
+/// Build + sign ONLY — no store mutation. The paranoid "cancel leaves zero
+/// trace" seam: this is everything `compose_and_record` used to do up to
+/// the point notes-core hands back a signed [`NoteTx`]. Callers that want
+/// the original build-then-record behavior in one step should call
+/// [`compose_and_record`]; the universal confirm screen calls this alone at
+/// build time and defers [`record_composed_note`] to the user's Broadcast
+/// tap.
+pub fn compose_note(
+    store: &Store,
     identity: &Identity,
     network: Network,
     req: &ComposeRequest,
@@ -105,6 +120,28 @@ pub fn compose_and_record(
         ),
     }?;
 
+    Ok(ComposedNote {
+        note_id: hex::encode(note_id),
+        recipient_address: recipient.map(|r| r.address),
+        change_is_self: change_spk.is_none(),
+        tx,
+    })
+}
+
+/// Record an already-built [`ComposedNote`] (see [`compose_note`]) into the
+/// store: note Pending, inputs locked, change spendable (unconfirmed
+/// chaining), contact touched. Split out of `compose_and_record` so the
+/// universal confirm screen can defer this — the only store-mutating half
+/// of composing a note — to the user's explicit Broadcast tap.
+pub fn record_composed_note(
+    store: &mut Store,
+    text: &str,
+    private: bool,
+    change_to: Option<&str>,
+    created_at: u64,
+    composed: &ComposedNote,
+) {
+    let tx = &composed.tx;
     let spent: Vec<OutPointRef> = tx
         .spent_outpoints
         .iter()
@@ -118,7 +155,7 @@ pub fn compose_and_record(
     // Only track change as our own coin when it returns to the notes
     // address. Custom change leaves the wallet (re-discovered by a scan
     // only if it happens to pay us).
-    let change_utxo = (tx.change > 0 && change_spk.is_none()).then(|| LedgerUtxo {
+    let change_utxo = (tx.change > 0 && composed.change_is_self).then(|| LedgerUtxo {
         txid: tx.txid_hex.clone(),
         vout: (tx.tx.outputs.len() - 1) as u32,
         value: tx.change,
@@ -127,34 +164,47 @@ pub fn compose_and_record(
     });
 
     let record = NoteRecord {
-        note_id: hex::encode(note_id),
+        note_id: composed.note_id.clone(),
         status: NoteStatus::Pending,
-        text: Some(req.text.to_string()),
-        private: req.private,
-        directed: recipient.is_some(),
+        text: Some(text.to_string()),
+        private,
+        directed: composed.recipient_address.is_some(),
         received: false,
         sender: None,
-        recipient: recipient.as_ref().map(|r| r.address.clone()),
+        recipient: composed.recipient_address.clone(),
         txids: vec![tx.txid_hex.clone()],
         height: None,
         blocktime: None,
-        created_at: Some(req.now),
+        created_at: Some(created_at),
         spent,
         raw_hex: Some(tx.raw_hex.clone()),
         fee: Some(tx.fee),
         vsize: Some(tx.vsize as u64),
-        change_to: req.change_to.map(str::to_string),
-        gift_amount: recipient.as_ref().map(|_| tx.sent),
+        change_to: change_to.map(str::to_string),
+        gift_amount: composed.recipient_address.as_ref().map(|_| tx.sent),
         funded_by: None,
         dropped: false,
     };
     store.record_signed(record, change_utxo);
 
-    if let Some(r) = &recipient {
-        store.touch_contact(&r.address);
+    if let Some(addr) = &composed.recipient_address {
+        store.touch_contact(addr);
     }
+}
 
-    Ok(ComposedNote { note_id: hex::encode(note_id), tx })
+/// Build + sign + record in one call — `compose_note` then
+/// `record_composed_note` back to back. Kept for every pre-existing caller
+/// (the CLI, host tests) so their behavior is byte-identical to before this
+/// split.
+pub fn compose_and_record(
+    store: &mut Store,
+    identity: &Identity,
+    network: Network,
+    req: &ComposeRequest,
+) -> Result<ComposedNote, Error> {
+    let composed = compose_note(store, identity, network, req)?;
+    record_composed_note(store, req.text, req.private, req.change_to, req.now, &composed);
+    Ok(composed)
 }
 
 /// RBF fee-bump a Pending note: re-sign the SAME note_id spending the
@@ -243,7 +293,12 @@ pub fn bump_fee(
     rec.fee = Some(tx.fee);
     rec.vsize = Some(tx.vsize as u64);
 
-    Ok(ComposedNote { note_id: note_id_hex.to_string(), tx })
+    Ok(ComposedNote {
+        note_id: note_id_hex.to_string(),
+        recipient_address: recipient_addr,
+        change_is_self: change_spk.is_none(),
+        tx,
+    })
 }
 
 /// RBF-bump a pending sweep/consolidate: re-sign the SAME inputs to the

@@ -20,7 +20,7 @@ use app_core::chain::{
     default_base, explorer_presets, explorer_tx_url, node_presets, ChainClient, HttpTransport,
     TxLookupStatus,
 };
-use app_core::compose::{compose_and_record, ComposeRequest};
+use app_core::compose::ComposeRequest;
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
 use app_core::identity::{
     generate_mnemonic, generate_mnemonic_with_salt, index_fp8, parse_key_material, realize,
@@ -236,6 +236,107 @@ struct State {
     /// `compose_busy`, kept separate since the two never overlap but
     /// represent different flows).
     wallet_tx_busy: bool,
+    /// The universal confirm screen (26) session in progress, if any — see
+    /// [`PendingBroadcast`]. `show_confirm` sets it, `on_confirm_broadcast`
+    /// consumes it, `on_confirm_cancel` drops it (leaving zero trace: stage
+    /// A never mutates the store, so cancel is just a navigation).
+    pending_broadcast: Option<PendingBroadcast>,
+}
+
+/// A build+sign result awaiting the user's explicit "Broadcast" tap on the
+/// universal confirm screen (26). `raw_hex`/`txid` are the byte-truth of
+/// the signed tx (already decoded once by `show_confirm`'s
+/// `summarize_signed_tx` call — stage B doesn't re-derive them, just POSTs
+/// `raw_hex`). `payload` carries exactly what each `kind` needs to finish:
+/// record-then-broadcast for the notebook path, or (for every other path)
+/// the same fields its pre-existing async broadcast thread already closed
+/// over, now deferred from "right after Sign" to "right after Broadcast".
+///
+/// Cloned (not taken) out of `State` at the Broadcast tap — `on_psbt_broadcast`
+/// (the "psbt" kind's stage B) reads `State.signed_psbt` directly and
+/// manages its own retry, so leaving this in place lets a failed PSBT POST
+/// be retried by tapping Broadcast again. Every other kind drops it
+/// (`on_confirm_broadcast` sets `pending_broadcast = None` once stage B
+/// fires): the notebook kind's record is one-shot (its existing failure
+/// path redirects to Activity/Rebroadcast instead), and the spending/mixed
+/// kinds' failure path returns to compose (screen 6, draft intact) to
+/// rebuild rather than re-POST possibly-stale signed bytes.
+#[derive(Clone)]
+struct PendingBroadcast {
+    kind: &'static str, // "compose" | "compose-spending" | "compose-mixed" | "psbt"
+    raw_hex: String,
+    txid: String,
+    vsize: usize,
+    /// The confirm screen's one-liner caption (`confirm-context`), e.g.
+    /// "Public note · testnet4" / "Sweep to bc1q…" — computed by the
+    /// caller (it knows things `summarize_signed_tx`'s byte-truth view
+    /// deliberately doesn't, like the human note-kind label) and just
+    /// carried through by `show_confirm`.
+    context: String,
+    return_screen: i32,
+    payload: PendingPayload,
+}
+
+#[derive(Clone)]
+enum PendingPayload {
+    /// Notebook compose (`on_compose_send`'s keyed non-watch path): stage A
+    /// built + signed via `compose::compose_note` (no store mutation).
+    /// Stage B calls `compose::record_composed_note` + `save_store()` —
+    /// exactly what `compose_and_record` used to do before its POST — then
+    /// spawns the SAME broadcast worker pushing `NotebookComposeResult`.
+    Compose {
+        composed: app_core::compose::ComposedNote,
+        text: String,
+        private: bool,
+        change_to: Option<String>,
+        created_at: u64,
+        to: Option<String>,
+    },
+    /// Spending-wallet-funded compose (`on_spending_compose_send`): already
+    /// recorded nothing until broadcast success today, so stage B is just
+    /// the pre-existing thread-spawn verbatim — this carries exactly the
+    /// fields `SpendingComposeResult` needs minus `result`/`raw`/`txid`/
+    /// `vsize` (those live on `PendingBroadcast` itself).
+    ComposeSpending {
+        note_id: [u8; 4],
+        text: String,
+        private: bool,
+        to: Option<String>,
+        gift: u64,
+        built_fee: u64,
+        built_change: u64,
+        spent_outpoints: Vec<(String, u32)>,
+        change_index: u32,
+        change_raw: String,
+        source: FundingSource,
+    },
+    /// Mixed-source direct-broadcast compose (`on_compose_send_mixed`'s
+    /// no-external-coin tail): same "nothing recorded until broadcast"
+    /// shape as spending — stage B is the pre-existing thread-spawn
+    /// verbatim.
+    ComposeMixed {
+        note_id: [u8; 4],
+        text: String,
+        private: bool,
+        to: Option<String>,
+        gift: u64,
+        built_fee: u64,
+        built_change: u64,
+        change_default: app_core::mixed::ChangeDefault,
+        notebook_spent: Vec<app_core::store::OutPointRef>,
+        spent_spending: Vec<(String, u32)>,
+        payloads_len: usize,
+        recipient_present: bool,
+        change_index: u32,
+        spending_source: Option<FundingSource>,
+    },
+    /// External-wallet-funded / watch-only signed-PSBT path
+    /// (`set_confirm_from_psbt` + `on_psbt_broadcast`): every bookkeeping
+    /// field this needs (`State.signed_psbt`/`built_psbt`/`watch_note`/
+    /// `watch_spend`) already lives in `State` untouched by the confirm
+    /// screen's navigation, so stage B is the pre-existing
+    /// `on_psbt_broadcast` body verbatim — this variant carries nothing.
+    Psbt,
 }
 
 /// One wallet-consolidate session (Coins → "Consolidate into one coin…").
@@ -3130,7 +3231,15 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
             w.set_screen(4);
             refresh_async(w, st);
         }
-        Err(e) => w.set_status(format!("broadcast failed: {e}").into()),
+        // Universal confirm screen (2026-07-17): nothing was recorded, so
+        // this is still safe to retry — but the retry point is compose
+        // (screen 6, draft intact), not the confirm screen the user is
+        // currently on (its Broadcast button is now inert: stage B already
+        // dropped `pending_broadcast` for every non-psbt kind once it fired).
+        Err(e) => {
+            w.set_status(format!("broadcast failed: {e}").into());
+            w.set_screen(6);
+        }
     }
 }
 
@@ -3263,6 +3372,13 @@ fn apply_compose_results(w: &AppWindow, st: &mut State) {
     st.compose_busy = false;
     w.set_compose_sending(false);
     w.set_compose_stage("".into());
+    // Universal confirm screen (2026-07-17): every compose broadcast now
+    // fires from screen 26, gated on wallet_tx_busy, not compose_busy — see
+    // `on_confirm_broadcast`. Unset it here alongside the (now largely
+    // vestigial) compose flags so a failed spending/mixed attempt leaves
+    // screen 26's Broadcast button tappable again.
+    st.wallet_tx_busy = false;
+    w.set_wallet_tx_busy(false);
     for r in nb {
         apply_notebook_compose_result(w, st, r);
     }
@@ -4783,6 +4899,126 @@ fn load_signed_psbt(w: &AppWindow, st: &mut State, data: &[u8]) {
     }
 }
 
+// ---- Universal confirm screen (26) — infrastructure shared by every
+// broadcast path (funding-unification follow-up, 2026-07-17). See
+// `app_core::confirm` for the byte-truth summarizer this all feeds; the
+// philosophy is the same here: every fact on screen 26 is decoded from the
+// SIGNED raw tx about to hit the wire, never from the app's own intent.
+
+/// Every scriptPubKey this account controls: every ACTIVE notebook's own
+/// address (not just the current one — a directed self-note from a sibling
+/// notebook must still classify as "self", same rule `xacct_addrs`/
+/// `sender_label` already follow) plus every spending-wallet address
+/// handed out so far (`Store::spending_self_spks`). Feeds
+/// `ConfirmCtx.self_spks`/`spending_spks` for every compose path; PSBT-path
+/// callers reuse it too. A change output going to an address not yet
+/// recorded as "used" (the spending wallet's NEXT receive/change index, or
+/// a freshly discovered one) must be added by the caller on top of this —
+/// see the spending/mixed compose call sites below.
+fn confirm_self_spks(st: &State) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut self_spks: Vec<Vec<u8>> = Vec::new();
+    if let (Some(ix), Some(material_str)) = (&st.notebooks, st.material.as_deref()) {
+        if let Ok(material) = parse_key_material(material_str, st.network) {
+            for m in ix.active(st.account) {
+                if let Ok(ident) = realize(&material, st.network, st.account, m.index) {
+                    self_spks.push(p2tr_script_pubkey(&ident.output_x()));
+                }
+            }
+        }
+    }
+    let spending_spks = st.store.as_ref().map(|s| s.spending_self_spks()).unwrap_or_default();
+    self_spks.extend(spending_spks.iter().cloned());
+    (self_spks, spending_spks)
+}
+
+/// The confirm screen's one-liner caption for any note-composing tx:
+/// "Public note · testnet4" / "Private note · testnet4" / "Directed note ·
+/// testnet4". Directed takes priority in the label — a directed note's own
+/// privacy is already visible on its NOTE card and recipient row.
+fn note_context(directed: bool, private: bool, network: Network) -> String {
+    let kind = if directed { "Directed note" } else if private { "Private note" } else { "Public note" };
+    format!("{kind} · {}", network.as_str())
+}
+
+/// `ConfirmCtx.prevouts` for a notebook compose's spent coins — every input
+/// is this notebook's own single address (coin control only ever selects
+/// among this notebook's own UTXOs, so one address covers every entry).
+/// `spent` is `NoteTx.spent_outpoints` — internal (non-reversed) txid
+/// bytes, matching `compose::record_composed_note`'s own reversal.
+fn notebook_prevouts(
+    store: &Store,
+    address: &str,
+    name: &str,
+    spent: &[([u8; 32], u32)],
+) -> HashMap<String, app_core::confirm::PrevoutInfo> {
+    spent
+        .iter()
+        .map(|(txid, vout)| {
+            let mut d = *txid;
+            d.reverse();
+            let txid_hex = hex::encode(d);
+            let value =
+                store.utxos.iter().find(|u| u.txid == txid_hex && u.vout == *vout).map(|u| u.value).unwrap_or(0);
+            (
+                format!("{txid_hex}:{vout}"),
+                app_core::confirm::PrevoutInfo {
+                    value,
+                    address: Some(address.to_string()),
+                    source: format!("Notebook · {name}"),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Populate the universal confirm screen (26) from a signed raw tx +
+/// [`app_core::confirm::ConfirmCtx`], and stash `pending` for the
+/// Broadcast/Cancel taps. `summarize_signed_tx` decodes `pending.raw_hex`
+/// itself (the paranoid byte-truth rule); `ctx` only supplies lookups. On a
+/// decode error, sets `status` and does NOT navigate — the caller stays
+/// wherever it was (compose/sign/etc).
+fn show_confirm(w: &AppWindow, st: &mut State, pending: PendingBroadcast, ctx: app_core::confirm::ConfirmCtx) {
+    let sum = match app_core::confirm::summarize_signed_tx(&pending.raw_hex, &ctx) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("cb: confirm summarize err={e}");
+            w.set_status(format!("confirm: {e}").into());
+            return;
+        }
+    };
+    let to_rows = |rows: &[app_core::confirm::SummaryRow]| -> Vec<PsbtRow> {
+        rows.iter()
+            .map(|r| PsbtRow {
+                title: r.title.clone().into(),
+                subtitle: r.subtitle.clone().into(),
+                amount: r.amount.clone().into(),
+                kind: r.kind.clone().into(),
+            })
+            .collect()
+    };
+    w.set_confirm_inputs(VecModel::from_slice(&to_rows(&sum.inputs)));
+    w.set_confirm_outputs(VecModel::from_slice(&to_rows(&sum.outputs)));
+    w.set_confirm_note(ctx.note_preview.clone().unwrap_or_default().into());
+    w.set_confirm_fee_line(sum.fee_line.clone().into());
+    w.set_confirm_warn(sum.warn.clone().unwrap_or_default().into());
+    w.set_confirm_txid(sum.txid.clone().into());
+    w.set_confirm_context(pending.context.clone().into());
+    println!(
+        "cb: confirm show kind={} txid={} fee={} vsize={} inputs={} outputs={} warn={}",
+        pending.kind,
+        sum.txid,
+        sum.fee.map(|f| f.to_string()).unwrap_or_else(|| "?".to_string()),
+        sum.vsize,
+        sum.inputs.len(),
+        sum.outputs.len(),
+        i32::from(sum.warn.is_some()),
+    );
+    let return_screen = w.get_screen();
+    w.set_status("".into());
+    st.pending_broadcast = Some(PendingBroadcast { return_screen, ..pending });
+    w.set_screen(26);
+}
+
 /// Put a freshly built unsigned PSBT on the sign screen (13): animated-UR
 /// QR, cost line, save/copy state. Shared by external funding and the
 /// watch-mode spend flows.
@@ -4802,6 +5038,12 @@ fn show_psbt_sign_screen(w: &AppWindow, st: &mut State, built: BuiltPsbt, cost_l
 }
 
 /// Validate + summarize a signed PSBT into the confirmation screen.
+/// Validate a signed PSBT, finalize it to raw broadcastable bytes, and hand
+/// it to the universal confirm screen (kind "psbt" — external-wallet-funded
+/// notes AND every watch-only spend share this path). `State.signed_psbt`/
+/// `built_psbt`/`watch_note`/`watch_spend` are left exactly as before: they
+/// already carry everything `on_psbt_broadcast`'s stage-B needs, untouched
+/// by the confirm screen's navigation.
 fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
     let Some(built) = st.built_psbt.as_ref() else {
         w.set_status("build a transaction first".into());
@@ -4826,71 +5068,110 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
             .and_then(|src| src.derive(1, st.funding_change_index).ok())
             .map(|d| d.address),
     };
-    let ctx = SummaryContext {
+    // Only used here to pull the (public) note text back out / detect
+    // whether this tx carries a note at all — the OUTPUTS list itself now
+    // comes from the raw-hex decode below, not this PSBT-level summary.
+    let sum_ctx = SummaryContext {
         identity_output_x: output_x,
         network: st.network,
         recipient_addr: recipient_addr.as_deref(),
         change_addr: change_addr.as_deref(),
     };
-    let sum = match summarize(&psbt, &ctx) {
+    let sum = match summarize(&psbt, &sum_ctx) {
         Ok(s) => s,
         Err(e) => {
             w.set_status(format!("{e}").into());
             return;
         }
     };
-    let inputs: Vec<PsbtRow> = sum
-        .inputs
-        .iter()
-        .map(|i| PsbtRow {
-            title: i.address.clone().unwrap_or_else(|| "(unknown)".into()).into(),
-            subtitle: i.outpoint.clone().into(),
-            amount: i.value.to_string().into(),
-            kind: "input".into(),
-        })
-        .collect();
     let mut note_text = String::new();
-    let outputs: Vec<PsbtRow> = sum
-        .outputs
-        .iter()
-        .map(|o| {
-            let (kind, title, subtitle) = match &o.role {
-                OutputRole::Note { text, chunks } => {
-                    if let Some(t) = text {
-                        note_text = t.clone();
-                    }
-                    (
-                        "note",
-                        String::new(),
-                        if text.is_some() {
-                            "OP_RETURN · PNTE note".to_string()
-                        } else {
-                            format!("OP_RETURN · encrypted note ({chunks} chunk)")
-                        },
-                    )
-                }
-                OutputRole::SelfDust => ("self", o.address.clone().unwrap_or_default(), "your notebook (keeps the note yours)".into()),
-                OutputRole::Recipient => ("recipient", o.address.clone().unwrap_or_default(), "directed recipient".into()),
-                OutputRole::Change => ("change", o.address.clone().unwrap_or_default(), "change back to the funding wallet".into()),
-                OutputRole::Other => ("other", o.address.clone().unwrap_or_default(), String::new()),
-            };
-            PsbtRow { title: title.into(), subtitle: subtitle.into(), amount: o.value.to_string().into(), kind: kind.into() }
-        })
-        .collect();
-    if note_text.is_empty() {
-        note_text = match &st.watch_spend {
-            Some(ws) => format!("{} · {} sats → {}", ws.kind, ws.value, ws.dest),
-            None => "Encrypted note — readable only by you and the recipient.".into(),
-        };
+    let mut has_note = false;
+    for o in &sum.outputs {
+        if let OutputRole::Note { text, .. } = &o.role {
+            has_note = true;
+            if let Some(t) = text {
+                note_text = t.clone();
+            }
+        }
     }
-    w.set_confirm_note(note_text.into());
-    w.set_confirm_inputs(VecModel::from_slice(&inputs));
-    w.set_confirm_outputs(VecModel::from_slice(&outputs));
-    w.set_confirm_fee_line(format!("{} sats", sum.fee).into());
+    let note_preview = has_note.then(|| {
+        if note_text.is_empty() { "Private note (encrypted)".to_string() } else { note_text.clone() }
+    });
+    // Sweep/consolidate/bump carry no OP_RETURN at all — label them from
+    // `watch_spend` instead of the (note-shaped) public/private/directed
+    // formula.
+    let context = if has_note {
+        note_context(recipient_addr.is_some(), note_text.is_empty(), st.network)
+    } else {
+        match &st.watch_spend {
+            Some(ws) if ws.kind == "bump" => format!("Speed up · {}", st.network.as_str()),
+            Some(ws) => {
+                let label = match ws.kind {
+                    "sweep" => "Sweep",
+                    "consolidate" => "Consolidate",
+                    other => other,
+                };
+                format!("{label} to {}", short_addr(&ws.dest))
+            }
+            None => format!("Transaction · {}", st.network.as_str()),
+        }
+    };
+
+    // Prevout lookups straight from the PSBT's own witness_utxo — every
+    // input here was funded externally (a watch identity's own coin,
+    // signed off-device, or a separate funding wallet's coin), so there's
+    // one source label for the whole tx: the active funding wallet's
+    // label when known, else a generic "external signer".
+    let source_label = active_funding_pill(st)
+        .and_then(|s| s.strip_prefix("wallet:").map(str::to_string))
+        .unwrap_or_else(|| "external signer".to_string());
+    let btc_net = app_core::derive::btc_network(st.network);
+    let mut prevouts: HashMap<String, app_core::confirm::PrevoutInfo> = HashMap::new();
+    for (i, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+        let wu = psbt.inputs.get(i).and_then(|pi| pi.witness_utxo.as_ref());
+        let value = wu.map(|o| o.value.to_sat()).unwrap_or(0);
+        let address = wu.and_then(|o| bitcoin::Address::from_script(&o.script_pubkey, btc_net).ok()).map(|a| a.to_string());
+        prevouts.insert(
+            format!("{}:{}", txin.previous_output.txid, txin.previous_output.vout),
+            app_core::confirm::PrevoutInfo { value, address, source: source_label.clone() },
+        );
+    }
+
+    let (raw, txid, vsize) = match finalize_extract(psbt.clone()) {
+        Ok(x) => x,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
+
+    let (self_spks, spending_spks) = confirm_self_spks(st);
+    let recipient_name = recipient_addr.as_deref().and_then(|a| {
+        st.store.as_ref().and_then(|s| s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone()))
+    });
+    let confirm_ctx = app_core::confirm::ConfirmCtx {
+        network: btc_net,
+        prevouts,
+        self_spks,
+        spending_spks,
+        expected_change: change_addr,
+        recipient: recipient_addr,
+        recipient_name,
+        note_preview,
+    };
+
     st.signed_psbt = Some(psbt);
     w.set_psbt_signed(true);
-    w.set_status("".into());
-    w.set_screen(14);
+    let pending = PendingBroadcast {
+        kind: "psbt",
+        raw_hex: raw,
+        txid,
+        vsize,
+        context,
+        return_screen: 14, // overwritten by show_confirm
+        payload: PendingPayload::Psbt,
+    };
+    show_confirm(w, st, pending, confirm_ctx);
 }
 
 /// Read the platform safe-area insets (converting with the window's scale
@@ -4943,7 +5224,7 @@ pub fn run() {
             let screens: Vec<i32> = args
                 .get(3)
                 .map(|s| s.split(',').filter_map(|n| n.trim().parse().ok()).collect())
-                .unwrap_or_else(|| vec![6, 12, 13, 14]);
+                .unwrap_or_else(|| vec![6, 12, 13, 26]);
             render_previews(480, 900, &screens, &out_dir);
             return;
         }
@@ -5056,6 +5337,7 @@ pub fn run() {
         act_pending_ref: None,
         payfrom_manual: false,
         wallet_tx_busy: false,
+        pending_broadcast: None,
     }));
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -7776,6 +8058,215 @@ pub fn run() {
         });
     });
 
+    // ---- Universal confirm screen (26) — stage B ----
+    //
+    // Every broadcast path lands here now: stage A (each compose/sign
+    // callback above) builds + signs synchronously and hands the result to
+    // `show_confirm`, which stashes it as `State.pending_broadcast` and
+    // navigates to screen 26. Tapping Broadcast there runs stage B: for
+    // "psbt" that's the pre-existing `on_psbt_broadcast` handler above,
+    // invoked verbatim (`invoke_psbt_broadcast`) — it already manages its
+    // own `wallet_tx_busy` and reads `State.signed_psbt`/`watch_note`/
+    // `watch_spend`, none of which the confirm screen touched. For the
+    // three compose kinds, stage B is the exact record/spawn tail their
+    // Stage-A callbacks used to run immediately after signing — moved here
+    // so a Cancel tap (before Broadcast) never runs it at all.
+    cb!(on_confirm_broadcast, |w, s| {
+        if s.wallet_tx_busy {
+            return;
+        }
+        let Some(pending) = s.pending_broadcast.clone() else { return };
+        println!("cb: confirm broadcast kind={} txid={}", pending.kind, pending.txid);
+        match pending.payload {
+            PendingPayload::Psbt => {
+                // Self-managed: reads State.signed_psbt directly, sets its
+                // own wallet_tx_busy, pushes PSBT_BROADCAST_RESULTS. Leaving
+                // `pending_broadcast` in place lets a failed POST be retried
+                // by tapping Broadcast again (re-invokes this same path).
+                // `on_psbt_broadcast` takes its own `st.borrow_mut()` — drop
+                // ours first or the shared RefCell double-borrows and panics.
+                drop(s);
+                w.invoke_psbt_broadcast();
+            }
+            PendingPayload::Compose { composed, text, private, change_to, created_at, to } => {
+                let Some(base) = s.base_url() else {
+                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                // Record-before-POST, moved here from stage A: exactly what
+                // `compose_and_record` used to do before its own broadcast
+                // call. Recording is one-shot, so drop `pending_broadcast`
+                // now — a failed POST is retried from Activity's
+                // Rebroadcast (existing `apply_notebook_compose_result`
+                // behavior, unchanged), never by re-tapping this button.
+                if let Some(store) = s.store.as_mut() {
+                    app_core::compose::record_composed_note(
+                        store,
+                        &text,
+                        private,
+                        change_to.as_deref(),
+                        created_at,
+                        &composed,
+                    );
+                }
+                s.save_store();
+                s.pending_broadcast = None;
+                s.wallet_tx_busy = true;
+                w.set_wallet_tx_busy(true);
+                let note_id = composed.note_id.clone();
+                let fee = composed.tx.fee;
+                let vsize = composed.tx.vsize;
+                let raw = pending.raw_hex.clone();
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(&base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    NOTEBOOK_COMPOSE_RESULTS.lock().expect("notebook compose results mutex").push(
+                        NotebookComposeResult { note_id, fee, vsize, to, private, result },
+                    );
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+                });
+            }
+            PendingPayload::ComposeSpending {
+                note_id,
+                text,
+                private,
+                to,
+                gift,
+                built_fee,
+                built_change,
+                spent_outpoints,
+                change_index,
+                change_raw,
+                source,
+            } => {
+                let Some(base) = s.base_url() else {
+                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                s.wallet_tx_busy = true;
+                w.set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let txid = pending.txid.clone();
+                let vsize = pending.vsize;
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(&base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    SPENDING_COMPOSE_RESULTS.lock().expect("spending compose results mutex").push(
+                        SpendingComposeResult {
+                            note_id,
+                            text,
+                            private,
+                            to,
+                            gift,
+                            raw,
+                            txid,
+                            vsize,
+                            built_fee,
+                            built_change,
+                            spent_outpoints,
+                            change_index,
+                            change_raw,
+                            source,
+                            result,
+                        },
+                    );
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+                });
+            }
+            PendingPayload::ComposeMixed {
+                note_id,
+                text,
+                private,
+                to,
+                gift,
+                built_fee,
+                built_change,
+                change_default,
+                notebook_spent,
+                spent_spending,
+                payloads_len,
+                recipient_present,
+                change_index,
+                spending_source,
+            } => {
+                let Some(base) = s.base_url() else {
+                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                s.wallet_tx_busy = true;
+                w.set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let txid = pending.txid.clone();
+                let vsize = pending.vsize;
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let client = ChainClient::new(HttpTransport::new(&base), net);
+                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    MIXED_COMPOSE_RESULTS.lock().expect("mixed compose results mutex").push(
+                        MixedComposeResult {
+                            note_id,
+                            text,
+                            private,
+                            to,
+                            gift,
+                            raw,
+                            txid,
+                            vsize,
+                            built_fee,
+                            built_change,
+                            change_default,
+                            notebook_spent,
+                            spent_spending,
+                            payloads_len,
+                            recipient_present,
+                            change_index,
+                            spending_source,
+                            result,
+                        },
+                    );
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+                });
+            }
+        }
+    });
+
+    cb!(on_confirm_cancel, |w, s| {
+        // Busy-guard: a broadcast already in flight can't be canceled out
+        // from under itself (mirrors the Broadcast-tap guard above) — the
+        // psbt kind in particular delegates to on_psbt_broadcast's own
+        // wallet_tx_busy management, so this is the same flag either way.
+        if s.wallet_tx_busy {
+            return;
+        }
+        let kind = s.pending_broadcast.as_ref().map(|p| p.kind).unwrap_or("?");
+        println!("cb: confirm cancel kind={kind}");
+        let return_screen = s.pending_broadcast.take().map(|p| p.return_screen).unwrap_or(4);
+        w.set_confirm_warn("".into());
+        w.set_confirm_txid("".into());
+        w.set_confirm_context("".into());
+        w.set_confirm_note("".into());
+        w.set_confirm_inputs(VecModel::<PsbtRow>::from_slice(&[]));
+        w.set_confirm_outputs(VecModel::<PsbtRow>::from_slice(&[]));
+        w.set_status("".into());
+        if kind == "psbt" {
+            // Zero-trace for the PSBT path means discarding the loaded
+            // signed PSBT too — nothing was recorded, and re-showing a
+            // stale confirm screen next load would be wrong. The unsigned
+            // built PSBT / UR export (screen 13) is untouched, so backing
+            // further out and re-exporting still works.
+            s.signed_psbt = None;
+            w.set_psbt_signed(false);
+        }
+        w.set_screen(return_screen);
+    });
+
     cb!(on_compose_send, |w, s| {
         // Async sign+broadcast (2026-07-16): re-entrancy guard so a
         // double-tap on Sign can't double-broadcast.
@@ -7797,10 +8288,10 @@ pub fn run() {
         }
         let net = s.network;
         let to = s.to_address.clone();
-        let Some(base) = s.base_url() else {
+        if s.base_url().is_none() {
             w.set_status("no Bitcoin node — set one in Settings".into());
             return;
-        };
+        }
         if !w.get_spend_enough() {
             w.set_status("selected coins don't cover the note + fee".into());
             return;
@@ -7910,49 +8401,76 @@ pub fn run() {
             w.set_status("no identity".into());
             return;
         };
+        // Universal confirm screen (2026-07-17): stage A builds + signs
+        // via the PURE `compose_note` (split out of `compose_and_record` —
+        // see app-core/src/compose.rs) — no store mutation, so a Cancel on
+        // screen 26 leaves zero trace. Stage B (`on_confirm_broadcast`)
+        // calls `record_composed_note` + `save_store()` at the Broadcast
+        // tap — exactly what `compose_and_record` used to do before its
+        // own POST — then spawns the SAME broadcast worker below.
         let coins_vec = s.selected_coins.clone();
-        let result = compose_and_record(
-            s.store.as_mut().unwrap(),
-            &identity,
-            net,
-            &ComposeRequest {
-                text: &text,
-                private,
-                recipient: to.as_deref(),
-                change_to: (!change_addr.is_empty()).then_some(change_addr.as_str()),
-                coins: (!coins_vec.is_empty()).then_some(coins_vec.as_slice()),
-                fee_rate: rate,
-                gift_amount: to.as_ref().map(|_| {
-                    w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
-                }),
-                now: now(),
-            },
-        );
-        match result {
-            Ok(c) => {
-                // compose_and_record already wrote the note Pending + locked
-                // its inputs (existing invariant — a failed POST leaves a
-                // retryable record with the tx hex in hand), so from here a
-                // broadcast failure is NOT a build/sign failure: staying on
-                // compose would risk a double-compose on retry.
-                s.save_store();
-                s.compose_busy = true;
-                w.set_compose_sending(true);
-                w.set_compose_stage("broadcasting".into());
-                let note_id = c.note_id.clone();
-                let fee = c.tx.fee;
-                let vsize = c.tx.vsize;
-                let raw = c.tx.raw_hex.clone();
-                let weak = w.as_weak();
-                std::thread::spawn(move || {
-                    let client = ChainClient::new(HttpTransport::new(base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
-                    NOTEBOOK_COMPOSE_RESULTS
-                        .lock()
-                        .expect("notebook compose results mutex")
-                        .push(NotebookComposeResult { note_id, fee, vsize, to, private, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+        let created_at = now();
+        let gift_amount = to
+            .as_ref()
+            .map(|_| w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS));
+        let change_to = (!change_addr.is_empty()).then(|| change_addr.clone());
+        let req = ComposeRequest {
+            text: &text,
+            private,
+            recipient: to.as_deref(),
+            change_to: change_to.as_deref(),
+            coins: (!coins_vec.is_empty()).then_some(coins_vec.as_slice()),
+            fee_rate: rate,
+            gift_amount,
+            now: created_at,
+        };
+        let Some(store) = s.store.as_ref() else {
+            w.set_status("no store".into());
+            return;
+        };
+        match app_core::compose::compose_note(store, &identity, net, &req) {
+            Ok(composed) => {
+                let name = s.notebook_display_name(s.nb_index);
+                let identity_addr = s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
+                let prevouts = notebook_prevouts(
+                    s.store.as_ref().unwrap(),
+                    &identity_addr,
+                    &name,
+                    &composed.tx.spent_outpoints,
+                );
+                let (self_spks, spending_spks) = confirm_self_spks(&s);
+                let recipient_name = to.as_deref().and_then(|a| {
+                    s.store.as_ref().and_then(|st| {
+                        st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
+                    })
                 });
+                let ctx = app_core::confirm::ConfirmCtx {
+                    network: app_core::derive::btc_network(net),
+                    prevouts,
+                    self_spks,
+                    spending_spks,
+                    expected_change: change_to.clone(),
+                    recipient: to.clone(),
+                    recipient_name,
+                    note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
+                };
+                let pending = PendingBroadcast {
+                    kind: "compose",
+                    raw_hex: composed.tx.raw_hex.clone(),
+                    txid: composed.tx.txid_hex.clone(),
+                    vsize: composed.tx.vsize,
+                    context: note_context(to.is_some(), private, net),
+                    return_screen: 6, // overwritten by show_confirm
+                    payload: PendingPayload::Compose {
+                        composed,
+                        text: text.clone(),
+                        private,
+                        change_to,
+                        created_at,
+                        to: to.clone(),
+                    },
+                };
+                show_confirm(&w, &mut s, pending, ctx);
             }
             Err(e) => {
                 println!("cb: compose err={e}");
@@ -7979,10 +8497,10 @@ pub fn run() {
             return;
         }
         let net = s.network;
-        let Some(base) = s.base_url() else {
+        if s.base_url().is_none() {
             w.set_status("no Bitcoin node — set one in Settings".into());
             return;
-        };
+        }
         let to = s.to_address.clone();
         let recipient = match to.as_deref() {
             Some(a) => match Recipient::parse(net, a) {
@@ -8121,39 +8639,77 @@ pub fn run() {
                 return;
             }
         };
-        // Nothing is recorded until broadcast actually succeeds (unlike the
-        // notebook path) — a failure leaves the draft untouched, so the
-        // apply step can safely leave the user on compose to retry.
-        s.compose_busy = true;
-        w.set_compose_sending(true);
-        w.set_compose_stage("broadcasting".into());
+        // Universal confirm screen (2026-07-17): nothing is recorded here —
+        // that was already true before this refactor (unlike the notebook
+        // path) — so stage A just hands the signed tx to the confirm
+        // screen. Stage B (`on_confirm_broadcast`) is this exact
+        // thread-spawn, moved verbatim to the Broadcast tap.
         let built_fee = built.fee;
         let built_change = built.change;
-        let weak = w.as_weak();
-        std::thread::spawn(move || {
-            let client = ChainClient::new(HttpTransport::new(base), net);
-            let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
-            SPENDING_COMPOSE_RESULTS.lock().expect("spending compose results mutex").push(
-                SpendingComposeResult {
-                    note_id,
-                    text,
-                    private,
-                    to,
-                    gift,
-                    raw,
-                    txid,
-                    vsize,
-                    built_fee,
-                    built_change,
-                    spent_outpoints,
-                    change_index,
-                    change_raw,
-                    source,
-                    result,
+        let (mut self_spks, mut spending_spks) = confirm_self_spks(&s);
+        // A custom change override leaves the wallet entirely (classified
+        // via `expected_change`, not self); the default spending-wallet
+        // change address is freshly derived and not yet "used" bookkeeping,
+        // so it must be added on top of `confirm_self_spks`'s set.
+        let expected_change = if !change_raw.is_empty() {
+            Some(change_raw.clone())
+        } else {
+            if built_change > 0 {
+                if let Ok(d) = source.derive(1, change_index) {
+                    self_spks.push(d.spk.clone());
+                    spending_spks.push(d.spk);
+                }
+            }
+            None
+        };
+        let mut prevouts: HashMap<String, app_core::confirm::PrevoutInfo> = HashMap::new();
+        for c in &selected_spending_coins {
+            prevouts.insert(
+                format!("{}:{}", c.txid, c.vout),
+                app_core::confirm::PrevoutInfo {
+                    value: c.value,
+                    address: Some(c.address.clone()),
+                    source: "Spending wallet".to_string(),
                 },
             );
-            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+        }
+        let recipient_name = to.as_deref().and_then(|a| {
+            s.store.as_ref().and_then(|st| {
+                st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
+            })
         });
+        let ctx = app_core::confirm::ConfirmCtx {
+            network: app_core::derive::btc_network(net),
+            prevouts,
+            self_spks,
+            spending_spks,
+            expected_change,
+            recipient: to.clone(),
+            recipient_name,
+            note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
+        };
+        let pending = PendingBroadcast {
+            kind: "compose-spending",
+            raw_hex: raw,
+            txid,
+            vsize,
+            context: note_context(to.is_some(), private, net),
+            return_screen: 6, // overwritten by show_confirm
+            payload: PendingPayload::ComposeSpending {
+                note_id,
+                text: text.clone(),
+                private,
+                to: to.clone(),
+                gift,
+                built_fee,
+                built_change,
+                spent_outpoints,
+                change_index,
+                change_raw,
+                source,
+            },
+        };
+        show_confirm(&w, &mut s, pending, ctx);
     });
 
     // Funding-unification UI rework (2026-07-16): the selection on the
@@ -8180,10 +8736,10 @@ pub fn run() {
             return;
         }
         let net = s.network;
-        let Some(base) = s.base_url() else {
+        if s.base_url().is_none() {
             w.set_status("no Bitcoin node — set one in Settings".into());
             return;
-        };
+        }
         let to = s.to_address.clone();
         let recipient = match to.as_deref() {
             Some(a) => match Recipient::parse(net, a) {
@@ -8413,7 +8969,11 @@ pub fn run() {
             return;
         }
 
-        // No external coin: finalize + broadcast directly.
+        // No external coin: finalize + hand off to the universal confirm
+        // screen. Nothing is recorded here — same "safe to retry from
+        // compose on failure" shape as the spending path; stage B
+        // (`on_confirm_broadcast`) is this exact thread-spawn, moved
+        // verbatim to the Broadcast tap.
         let psbt = built.psbt.clone();
         let (raw, txid, vsize) = match finalize_extract(psbt) {
             Ok(x) => x,
@@ -8422,50 +8982,112 @@ pub fn run() {
                 return;
             }
         };
-        // Nothing is recorded until broadcast actually succeeds — same
-        // "safe to retry from compose on failure" shape as the spending
-        // path.
         let spent_spending: Vec<(String, u32)> = coins
             .iter()
             .filter(|c| matches!(c.source, app_core::mixed::CoinSource::Spending))
             .map(|c| (c.txid.clone(), c.vout))
             .collect();
         let spending_source = s.spending_source.clone();
-        s.compose_busy = true;
-        w.set_compose_sending(true);
-        w.set_compose_stage("broadcasting".into());
         let built_fee = built.fee;
         let built_change = built.change;
         let payloads_len = payloads.len();
         let recipient_present = recipient.is_some();
-        let weak = w.as_weak();
-        std::thread::spawn(move || {
-            let client = ChainClient::new(HttpTransport::new(base), net);
-            let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
-            MIXED_COMPOSE_RESULTS.lock().expect("mixed compose results mutex").push(
-                MixedComposeResult {
-                    note_id,
-                    text,
-                    private,
-                    to,
-                    gift,
-                    raw,
-                    txid,
-                    vsize,
-                    built_fee,
-                    built_change,
-                    change_default,
-                    notebook_spent,
-                    spent_spending,
-                    payloads_len,
-                    recipient_present,
-                    change_index,
-                    spending_source,
-                    result,
-                },
-            );
-            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+
+        let identity_addr = s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
+        let name = s.notebook_display_name(s.nb_index);
+        let mut prevouts: HashMap<String, app_core::confirm::PrevoutInfo> = HashMap::new();
+        for c in &coins {
+            let key = format!("{}:{}", c.txid, c.vout);
+            match &c.source {
+                app_core::mixed::CoinSource::Notebook => {
+                    prevouts.insert(
+                        key,
+                        app_core::confirm::PrevoutInfo {
+                            value: c.value,
+                            address: Some(identity_addr.clone()),
+                            source: format!("Notebook · {name}"),
+                        },
+                    );
+                }
+                app_core::mixed::CoinSource::Spending => {
+                    let addr = s
+                        .spending_coins
+                        .iter()
+                        .find(|sc| sc.txid == c.txid && sc.vout == c.vout)
+                        .map(|sc| sc.address.clone());
+                    prevouts.insert(
+                        key,
+                        app_core::confirm::PrevoutInfo {
+                            value: c.value,
+                            address: addr,
+                            source: "Spending wallet".to_string(),
+                        },
+                    );
+                }
+                // Unreachable here: `has_external` (Wallet(_) coins present)
+                // returned above via the external-sign screen instead.
+                app_core::mixed::CoinSource::Wallet(_) => {}
+            }
+        }
+        let (mut self_spks, mut spending_spks) = confirm_self_spks(&s);
+        // A custom change override (screen 21 "custom") leaves the wallet
+        // entirely; the default spending-wallet change address is freshly
+        // derived and not yet "used" bookkeeping, so — like the spending
+        // path — it must be added on top of `confirm_self_spks`'s set. A
+        // notebook-default change needs no augmentation (already covered).
+        let expected_change = if choice == "custom" {
+            Some(normalize_addr(w.get_change_address().as_str()))
+        } else {
+            if change_default == app_core::mixed::ChangeDefault::Spending && built_change > 0 {
+                if let Some(src) = s.spending_source.as_ref() {
+                    if let Ok(d) = src.derive(1, change_index) {
+                        self_spks.push(d.spk.clone());
+                        spending_spks.push(d.spk);
+                    }
+                }
+            }
+            None
+        };
+        let recipient_name = to.as_deref().and_then(|a| {
+            s.store.as_ref().and_then(|st| {
+                st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
+            })
         });
+        let ctx = app_core::confirm::ConfirmCtx {
+            network: app_core::derive::btc_network(net),
+            prevouts,
+            self_spks,
+            spending_spks,
+            expected_change,
+            recipient: to.clone(),
+            recipient_name,
+            note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
+        };
+        let pending = PendingBroadcast {
+            kind: "compose-mixed",
+            raw_hex: raw,
+            txid,
+            vsize,
+            context: note_context(to.is_some(), private, net),
+            return_screen: 6, // overwritten by show_confirm
+            payload: PendingPayload::ComposeMixed {
+                note_id,
+                text: text.clone(),
+                private,
+                to: to.clone(),
+                gift,
+                built_fee,
+                built_change,
+                change_default,
+                notebook_spent,
+                spent_spending,
+                payloads_len,
+                recipient_present,
+                change_index,
+                spending_source,
+            },
+        };
+        show_confirm(&w, &mut s, pending, ctx);
     });
 
     cb!(on_settings_open, |w, s| {
@@ -9293,6 +9915,9 @@ fn preview_mock(w: &AppWindow) {
     w.set_psbt_signed(true);
     w.set_confirm_note("Happy birthday! Paid from cold storage.".into());
     w.set_confirm_fee_line("360 sats · 2.0 sat/vB".into());
+    w.set_confirm_warn("".into());
+    w.set_confirm_txid("aaaaaaaabbbbbbbbccccccccddddddddaaaaaaaabbbbbbbbccccccccdddddddd".into());
+    w.set_confirm_context("Directed note · regtest".into());
     let ins = [PsbtRow {
         title: "bcrt1p2caqg0ht8m7dykfrx2lnrcc85kx…".into(),
         subtitle: "aaaaaaaa…aaaaaaaa : 0".into(),

@@ -1146,6 +1146,143 @@ component CoinListPanel inherits VerticalLayout {
     }
 }
 
+// The universal "Confirm & broadcast" screen's decoded-tx view (extracted
+// out of the old screen 14 inline confirm block, funding-unification
+// follow-up 2026-07-17): a paranoid-bitcoiner readout of the SIGNED tx
+// about to hit the wire — every fact here comes from `app_core::confirm::
+// summarize_signed_tx` decoding the actual raw bytes, never from the app's
+// own intent. Screen 26 is the only user of this; screen 14 now stops at
+// loading + validating the signed PSBT.
+component TxConfirmView inherits Flickable {
+    in property <string> note;
+    in property <[PsbtRow]> inputs;
+    in property <[PsbtRow]> outputs;
+    in property <string> fee-line;
+    in property <string> warn;
+    in property <string> txid;
+    viewport-height: conf-col.preferred-height;
+    conf-col := VerticalLayout {
+        spacing: 10px;
+        alignment: start;
+        if root.warn != "": Rectangle {
+            border-radius: 10px;
+            background: Pal.warn.with-alpha(0.12);
+            border-width: 1px;
+            border-color: Pal.warn.with-alpha(0.4);
+            height: warn-t.preferred-height + 20px;
+            warn-t := Caption {
+                x: 12px;
+                y: 10px;
+                width: parent.width - 24px;
+                color: Pal.warn;
+                text: root.warn;
+            }
+        }
+        if root.txid != "": Mono {
+            text: "txid " + root.txid;
+            font-size: 10px;
+            color: Pal.muted;
+            overflow: elide;
+            wrap: no-wrap;
+        }
+        if root.note != "": Rectangle {
+            border-radius: 10px;
+            background: Pal.accent.with-alpha(0.08);
+            border-width: 1px;
+            border-color: Pal.accent.with-alpha(0.35);
+            height: ncard.preferred-height;
+            ncard := VerticalLayout {
+                padding: 14px;
+                spacing: 6px;
+                Caption { text: "NOTE"; color: Pal.accent; }
+                Body { text: root.note; }
+            }
+        }
+        Caption { text: "INPUTS"; }
+        for i in root.inputs: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: irow.preferred-height;
+            irow := HorizontalLayout {
+                padding: 12px;
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 3px;
+                    horizontal-stretch: 1;
+                    Mono { text: i.title; font-size: 11px; overflow: elide; wrap: no-wrap; }
+                    Caption { text: i.subtitle; font-size: 10px; overflow: elide; }
+                }
+                Mono {
+                    text: i.amount + " sats";
+                    color: Pal.text;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Caption { text: "OUTPUTS"; }
+        for o in root.outputs: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: o.kind == "self" ? Pal.good.with-alpha(0.4)
+                : (o.kind == "recipient" ? Pal.accent.with-alpha(0.4)
+                : (o.kind == "other" ? Pal.bad.with-alpha(0.4) : Pal.line));
+            height: orow.preferred-height;
+            orow := HorizontalLayout {
+                padding: 12px;
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 3px;
+                    horizontal-stretch: 1;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Badge {
+                            label: o.kind;
+                            tint: o.kind == "self" ? Pal.good
+                                : (o.kind == "recipient" ? Pal.accent
+                                : (o.kind == "change" ? Pal.faint
+                                : (o.kind == "note" ? Pal.accent
+                                : (o.kind == "other" ? Pal.bad : Pal.muted))));
+                        }
+                    }
+                    if o.title != "": Mono { text: o.title; font-size: 11px; overflow: elide; wrap: no-wrap; }
+                    if o.subtitle != "": Caption { text: o.subtitle; font-size: 10px; overflow: elide; }
+                }
+                Mono {
+                    text: o.amount + " sats";
+                    color: o.kind == "self" ? Pal.good : Pal.text;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: frow.preferred-height;
+            frow := HorizontalLayout {
+                padding: 14px;
+                Text {
+                    text: "Network fee";
+                    font-size: 13px;
+                    color: Pal.muted;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Mono { text: root.fee-line; color: Pal.text; }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     preferred-width: 480px;
     preferred-height: 780px;
@@ -1284,6 +1421,10 @@ export component AppWindow inherits Window {
     in property <[PsbtRow]> confirm-outputs;
     in property <string> confirm-note;         // decoded note text (public) or placeholder
     in property <string> confirm-fee-line;
+    // ---- universal confirm screen (26), funding-unification follow-up ----
+    in property <string> confirm-warn;         // amber warning banner text, "" = none
+    in property <string> confirm-txid;         // decoded from the signed raw tx
+    in property <string> confirm-context;      // one-liner under the header, e.g. "Public note · testnet4"
     in property <[FundingWalletRow]> funding-wallets;   // saved wallet manager
     in-out property <string> fund-rename-id;            // non-empty = rename modal open
     in-out property <string> fund-rename-input;
@@ -1562,6 +1703,8 @@ export component AppWindow inherits Window {
     callback psbt-import-scan();
     callback psbt-loaded(string);  // internal: a scanned PSBT string → validate + confirm
     callback psbt-broadcast();     // finalize + broadcast the signed PSBT
+    callback confirm-broadcast();  // universal confirm screen (26) — Broadcast tap
+    callback confirm-cancel();     // universal confirm screen (26) — back/Cancel
     callback settings-open();
     callback set-network(string);
     callback reset-identity();
@@ -1747,6 +1890,10 @@ export component AppWindow inherits Window {
             return true;
         }
         if (root.screen == 25) { root.screen = 8; return true; } // info → Settings
+        // Universal confirm screen: back always cancels (never a bare nav —
+        // Rust's on_confirm_cancel clears the pending broadcast + props and
+        // picks the return screen), so Android back can't quit from here.
+        if (root.screen == 26) { root.confirm-cancel(); return true; }
         return false; // 0 onboarding / 17 notebook list: nothing to go back to
     }
     // Focus must never be nobody's, or key events (incl. Back) are dropped
@@ -3424,7 +3571,11 @@ export component AppWindow inherits Window {
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
     }
 
-    // ---------- 14 · import signed PSBT + confirmation ----------
+    // ---------- 14 · import signed PSBT ----------
+    // ONLY the load-signed-PSBT stage (funding-unification follow-up,
+    // 2026-07-17): once a scanned/loaded PSBT validates, Rust navigates
+    // straight to the universal confirm screen (26) — this screen never
+    // shows a confirm view or a Broadcast button itself anymore.
     if screen == 14: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
@@ -3433,120 +3584,15 @@ export component AppWindow inherits Window {
             title: "Review + broadcast";
             back => { root.nav-back(); }
         }
-        if !root.psbt-signed: Caption {
+        Caption {
             text: root.desktop-platform
                 ? "Load the signed PSBT from your wallet — file or QR."
                 : "Scan the signed PSBT from your wallet.";
         }
-        if !root.psbt-signed: HorizontalLayout {
+        HorizontalLayout {
             spacing: 10px;
             if root.desktop-platform: GhostButton { text: "Load .psbt file"; clicked => { root.psbt-import-file(); } }
             GhostButton { text: "Scan QR"; clicked => { root.psbt-import-scan(); } }
-        }
-        if root.psbt-signed: Flickable {
-            viewport-height: conf-col.preferred-height;
-            conf-col := VerticalLayout {
-                spacing: 10px;
-                alignment: start;
-                Rectangle {
-                    border-radius: 10px;
-                    background: Pal.accent.with-alpha(0.08);
-                    border-width: 1px;
-                    border-color: Pal.accent.with-alpha(0.35);
-                    height: ncard.preferred-height;
-                    ncard := VerticalLayout {
-                        padding: 14px;
-                        spacing: 6px;
-                        Caption { text: "NOTE"; color: Pal.accent; }
-                        Body { text: root.confirm-note; }
-                    }
-                }
-                Caption { text: "INPUTS"; }
-                for i in root.confirm-inputs: Rectangle {
-                    border-radius: 10px;
-                    background: Pal.card;
-                    border-width: 1px;
-                    border-color: Pal.line;
-                    height: irow.preferred-height;
-                    irow := HorizontalLayout {
-                        padding: 12px;
-                        spacing: 10px;
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 3px;
-                            horizontal-stretch: 1;
-                            Mono { text: i.title; font-size: 11px; overflow: elide; wrap: no-wrap; }
-                            Caption { text: i.subtitle; font-size: 10px; overflow: elide; }
-                        }
-                        Mono {
-                            text: i.amount + " sats";
-                            color: Pal.text;
-                            horizontal-alignment: right;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
-                Caption { text: "OUTPUTS"; }
-                for o in root.confirm-outputs: Rectangle {
-                    border-radius: 10px;
-                    background: Pal.card;
-                    border-width: 1px;
-                    border-color: o.kind == "self" ? Pal.good.with-alpha(0.4)
-                        : (o.kind == "recipient" ? Pal.accent.with-alpha(0.4) : Pal.line);
-                    height: orow.preferred-height;
-                    orow := HorizontalLayout {
-                        padding: 12px;
-                        spacing: 10px;
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 3px;
-                            horizontal-stretch: 1;
-                            HorizontalLayout {
-                                spacing: 6px;
-                                alignment: start;
-                                Badge {
-                                    label: o.kind;
-                                    tint: o.kind == "self" ? Pal.good
-                                        : (o.kind == "recipient" ? Pal.accent
-                                        : (o.kind == "change" ? Pal.faint
-                                        : (o.kind == "note" ? Pal.accent : Pal.muted)));
-                                }
-                            }
-                            if o.title != "": Mono { text: o.title; font-size: 11px; overflow: elide; wrap: no-wrap; }
-                            if o.subtitle != "": Caption { text: o.subtitle; font-size: 10px; overflow: elide; }
-                        }
-                        Mono {
-                            text: o.amount + " sats";
-                            color: o.kind == "self" ? Pal.good : Pal.text;
-                            horizontal-alignment: right;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
-                Rectangle {
-                    border-radius: 10px;
-                    background: Pal.card;
-                    border-width: 1px;
-                    border-color: Pal.line;
-                    height: frow.preferred-height;
-                    frow := HorizontalLayout {
-                        padding: 14px;
-                        Text {
-                            text: "Network fee";
-                            font-size: 13px;
-                            color: Pal.muted;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                        }
-                        Mono { text: root.confirm-fee-line; color: Pal.text; }
-                    }
-                }
-            }
-        }
-        if root.psbt-signed: PrimaryButton {
-            text: root.wallet-tx-busy ? "Broadcasting…" : "Broadcast";
-            tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
-            clicked => { if (!root.wallet-tx-busy) { root.psbt-broadcast(); } }
         }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
     }
@@ -4510,6 +4556,36 @@ export component AppWindow inherits Window {
                 font-size: 17px;
             }
         }
+    }
+
+    // ---------- 26 · Confirm & broadcast (universal) ----------
+    // Every broadcast path (compose/spending/mixed/signed-PSBT) lands here
+    // before anything hits the wire — full decoded tx, Broadcast is the
+    // only way out besides Cancel. Funding-unification follow-up,
+    // 2026-07-17.
+    if screen == 26: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Confirm & broadcast";
+            back => { root.confirm-cancel(); }
+        }
+        if root.confirm-context != "": Caption { text: root.confirm-context; }
+        TxConfirmView {
+            note: root.confirm-note;
+            inputs: root.confirm-inputs;
+            outputs: root.confirm-outputs;
+            fee-line: root.confirm-fee-line;
+            warn: root.confirm-warn;
+            txid: root.confirm-txid;
+        }
+        PrimaryButton {
+            text: root.wallet-tx-busy ? "Broadcasting…" : "Broadcast";
+            tint: root.wallet-tx-busy ? Pal.faint : Pal.accent;
+            clicked => { if (!root.wallet-tx-busy) { root.confirm-broadcast(); } }
+        }
+        if root.status != "": Caption { text: root.status; color: Pal.bad; }
     }
 
     // ---------- shared camera-scan overlay (live preview) ----------
