@@ -1310,7 +1310,9 @@ component TxConfirmView inherits Flickable {
                     if o.subtitle != "": Caption { text: o.subtitle; font-size: 10px; overflow: elide; }
                 }
                 Mono {
-                    text: o.amount + " sats";
+                    // A 0-value OP_RETURN row has an empty amount — no
+                    // orphaned "sats" suffix (Sal, testnet4 build-14 review).
+                    text: o.amount == "" ? "" : o.amount + " sats";
                     color: o.kind == "self" ? Pal.good : Pal.text;
                     horizontal-alignment: right;
                     vertical-alignment: center;

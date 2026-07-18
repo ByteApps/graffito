@@ -5506,6 +5506,33 @@ fn note_context(directed: bool, private: bool, network: Network) -> String {
     format!("{kind} · {}", network.as_str())
 }
 
+/// The tx builders fold sub-dust change into the fee (notes-core rule: a
+/// leftover below the 330-sat dust minimum can't be an output, and the
+/// builder never burns MORE than dust — larger leftovers force a change
+/// output). Without this note the confirm screen shows a fee visibly above
+/// rate×vsize with no explanation — Sal hit exactly that on testnet4
+/// (single 330-sat coin → whole coin to fee) and asked if dust was
+/// forgotten. Appends to the warn banner AFTER show_confirm populated it;
+/// only when the confirm screen actually navigated.
+fn note_subdust_fold_warn(w: &AppWindow, change: u64, fee: u64, vsize: u64, rate: f64) {
+    if change != 0 || w.get_screen() != 26 {
+        return;
+    }
+    let nominal = (vsize as f64 * rate).ceil() as u64;
+    let folded = fee.saturating_sub(nominal);
+    if folded == 0 {
+        return;
+    }
+    println!("cb: confirm subdust-fold folded={folded}");
+    let msg = format!(
+        "no change output: the {} sat leftover is below the {} sat dust minimum, so it goes to the network fee",
+        commas(folded),
+        DUST_SATS
+    );
+    let existing = w.get_confirm_warn().to_string();
+    w.set_confirm_warn(if existing.is_empty() { msg.into() } else { format!("{existing}; {msg}").into() });
+}
+
 /// `ConfirmCtx.prevouts` for a notebook compose's spent coins — every input
 /// is this notebook's own single address (coin control only ever selects
 /// among this notebook's own UTXOs, so one address covers every entry).
@@ -9513,6 +9540,7 @@ pub fn run() {
                     recipient_name,
                     note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
                 };
+                let (fchange, ffee, fvsize) = (composed.tx.change, composed.tx.fee, composed.tx.vsize);
                 let pending = PendingBroadcast {
                     kind: "compose",
                     raw_hex: composed.tx.raw_hex.clone(),
@@ -9530,6 +9558,7 @@ pub fn run() {
                     },
                 };
                 show_confirm(&w, &mut s, pending, ctx);
+                note_subdust_fold_warn(&w, fchange, ffee, fvsize as u64, rate);
             }
             Err(e) => {
                 println!("cb: compose err={e}");
@@ -9770,6 +9799,7 @@ pub fn run() {
             },
         };
         show_confirm(&w, &mut s, pending, ctx);
+        note_subdust_fold_warn(&w, built_change, built_fee, vsize as u64, rate);
     });
 
     // Funding-unification UI rework (2026-07-16): the selection on the
@@ -10150,6 +10180,7 @@ pub fn run() {
             },
         };
         show_confirm(&w, &mut s, pending, ctx);
+        note_subdust_fold_warn(&w, built_change, built_fee, vsize as u64, rate);
     });
 
     cb!(on_settings_open, |w, s| {
