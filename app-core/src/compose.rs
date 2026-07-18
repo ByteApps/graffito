@@ -207,12 +207,17 @@ pub fn compose_and_record(
     Ok(composed)
 }
 
-/// RBF fee-bump a Pending note: re-sign the SAME note_id spending the
-/// SAME inputs at a higher rate. The envelope's note_id is unchanged, so
-/// the next scan re-matches whichever tx confirms; the store keeps both
-/// txids and swaps the change UTXO.
-pub fn bump_fee(
-    store: &mut Store,
+/// Build + sign an RBF fee-bump replacement for a Pending note — PURE, no
+/// store mutation (the universal confirm screen's stage-A seam, same
+/// pattern as [`compose_note`] / [`record_composed_note`]): re-sign the
+/// SAME note_id spending the SAME inputs at a higher rate. The envelope's
+/// note_id is unchanged, so the next scan re-matches whichever tx
+/// confirms. Callers that want the original build-then-record behavior in
+/// one step call [`bump_fee`]; the universal confirm screen calls this
+/// alone at Sign time and defers [`record_bumped_note`] to the user's
+/// Broadcast tap — a Cancel then leaves the store byte-identical.
+pub fn bump_fee_build(
+    store: &Store,
     identity: &Identity,
     network: Network,
     note_id_hex: &str,
@@ -228,7 +233,6 @@ pub fn bump_fee(
     let recipient_addr = rec.recipient.clone();
     let gift = rec.gift_amount.unwrap_or(notes_core::DUST_LIMIT);
     let change_to = rec.change_to.clone();
-    let old_txids = rec.txids.clone();
     let spent = rec.spent.clone();
 
     let mut note_id = [0u8; 4];
@@ -271,28 +275,6 @@ pub fn bump_fee(
         ),
     }?;
 
-    // Swap ledger change: drop the replaced tx's outputs; re-add only if
-    // change returns to self.
-    store.utxos.retain(|u| !old_txids.contains(&u.txid));
-    if tx.change > 0 && change_spk.is_none() {
-        store.utxos.push(crate::store::LedgerUtxo {
-            txid: tx.txid_hex.clone(),
-            vout: (tx.tx.outputs.len() - 1) as u32,
-            value: tx.change,
-            height: None,
-            pending_spend: false,
-        });
-    }
-    let rec = store
-        .notes
-        .iter_mut()
-        .find(|n| n.note_id == note_id_hex)
-        .expect("checked above");
-    rec.txids.push(tx.txid_hex.clone());
-    rec.raw_hex = Some(tx.raw_hex.clone());
-    rec.fee = Some(tx.fee);
-    rec.vsize = Some(tx.vsize as u64);
-
     Ok(ComposedNote {
         note_id: note_id_hex.to_string(),
         recipient_address: recipient_addr,
@@ -301,11 +283,61 @@ pub fn bump_fee(
     })
 }
 
-/// RBF-bump a pending sweep/consolidate: re-sign the SAME inputs to the
-/// SAME destination at a higher rate. Returns the new signed tx; the
-/// caller broadcasts it and the store swaps txids/raw_hex/fee.
-pub fn bump_raw_tx(
+/// Apply EXACTLY the store mutation the one-shot [`bump_fee`] makes after
+/// building: swap the ledger change (drop the replaced tx's outputs,
+/// re-add only if change returns to self), then append the replacement
+/// txid + update raw_hex/fee/vsize on the note record — nothing more or
+/// less. A vanished record (e.g. it confirmed between build and record)
+/// is a quiet no-op rather than a panic; the one-shot path can never hit
+/// that, so its behavior is unchanged.
+pub fn record_bumped_note(store: &mut Store, composed: &ComposedNote) {
+    let Some(rec) = store.notes.iter().find(|n| n.note_id == composed.note_id) else {
+        return;
+    };
+    let old_txids = rec.txids.clone();
+    store.utxos.retain(|u| !old_txids.contains(&u.txid));
+    if composed.tx.change > 0 && composed.change_is_self {
+        store.utxos.push(crate::store::LedgerUtxo {
+            txid: composed.tx.txid_hex.clone(),
+            vout: (composed.tx.tx.outputs.len() - 1) as u32,
+            value: composed.tx.change,
+            height: None,
+            pending_spend: false,
+        });
+    }
+    let rec = store
+        .notes
+        .iter_mut()
+        .find(|n| n.note_id == composed.note_id)
+        .expect("checked above");
+    rec.txids.push(composed.tx.txid_hex.clone());
+    rec.raw_hex = Some(composed.tx.raw_hex.clone());
+    rec.fee = Some(composed.tx.fee);
+    rec.vsize = Some(composed.tx.vsize as u64);
+}
+
+/// RBF fee-bump a Pending note: [`bump_fee_build`] then
+/// [`record_bumped_note`] back to back — kept for every pre-existing
+/// caller (CLI, host tests) so their behavior is byte-identical to before
+/// this split (same pattern as [`compose_and_record`]).
+pub fn bump_fee(
     store: &mut Store,
+    identity: &Identity,
+    network: Network,
+    note_id_hex: &str,
+    new_rate: f64,
+) -> Result<ComposedNote, Error> {
+    let composed = bump_fee_build(store, identity, network, note_id_hex, new_rate)?;
+    record_bumped_note(store, &composed);
+    Ok(composed)
+}
+
+/// Build + sign an RBF-bump replacement for a pending sweep/consolidate —
+/// PURE, no store mutation (universal confirm stage-A seam): re-sign the
+/// SAME inputs to the SAME destination at a higher rate. The one-shot
+/// [`bump_raw_tx`] is build + [`record_bumped_tx`] back to back.
+pub fn bump_raw_tx_build(
+    store: &Store,
     identity: &Identity,
     txid: &str,
     new_rate: f64,
@@ -329,24 +361,45 @@ pub fn bump_raw_tx(
         .collect::<Result<_, Error>>()?;
     let dest_spk =
         hex::decode(&rec.dest_spk_hex).map_err(|_| Error::Store("bad dest spk".into()))?;
-    let tx = notes_core::tx::build_sweep_tx(
+    notes_core::tx::build_sweep_tx(
         &inputs,
         &identity.output_x,
         dest_spk,
         new_rate,
         &identity.tweaked_seckey,
         generate_aux_rand,
-    )?;
-    let rec = store
-        .txs
-        .iter_mut()
-        .find(|t| t.txids.iter().any(|x| x == txid))
-        .expect("checked above");
+    )
+    .map_err(Into::into)
+}
+
+/// Apply EXACTLY the store mutation the one-shot [`bump_raw_tx`] /
+/// [`bump_raw_tx_multi`] make after building: append the replacement txid
+/// + update raw_hex/fee/vsize/value on the tx record — nothing more or
+/// less. `txid` is the SAME reference the build step looked the record up
+/// by (any txid in its chain). A vanished record is a quiet no-op; the
+/// one-shot paths can never hit that.
+pub fn record_bumped_tx(store: &mut Store, txid: &str, tx: &notes_core::tx::NoteTx) {
+    let Some(rec) = store.txs.iter_mut().find(|t| t.txids.iter().any(|x| x == txid)) else {
+        return;
+    };
     rec.txids.push(tx.txid_hex.clone());
     rec.raw_hex = Some(tx.raw_hex.clone());
     rec.fee = tx.fee;
     rec.vsize = tx.vsize as u64;
     rec.value = tx.tx.outputs[0].value;
+}
+
+/// RBF-bump a pending sweep/consolidate: [`bump_raw_tx_build`] then
+/// [`record_bumped_tx`] back to back — kept for every pre-existing caller
+/// so behavior is byte-identical to before this split.
+pub fn bump_raw_tx(
+    store: &mut Store,
+    identity: &Identity,
+    txid: &str,
+    new_rate: f64,
+) -> Result<notes_core::tx::NoteTx, Error> {
+    let tx = bump_raw_tx_build(store, identity, txid, new_rate)?;
+    record_bumped_tx(store, txid, &tx);
     Ok(tx)
 }
 
@@ -360,6 +413,20 @@ pub fn bump_raw_tx(
 /// higher rate.
 pub fn bump_raw_tx_multi(
     store: &mut Store,
+    identities: &[(u32, Identity)],
+    txid: &str,
+    new_rate: f64,
+) -> Result<notes_core::tx::NoteTx, Error> {
+    let tx = bump_raw_tx_multi_build(store, identities, txid, new_rate)?;
+    record_bumped_tx(store, txid, &tx);
+    Ok(tx)
+}
+
+/// [`bump_raw_tx_multi`]'s PURE build half (universal confirm stage-A
+/// seam) — no store mutation; the one-shot wrapper above records via the
+/// shared [`record_bumped_tx`].
+pub fn bump_raw_tx_multi_build(
+    store: &Store,
     identities: &[(u32, Identity)],
     txid: &str,
     new_rate: f64,
@@ -408,18 +475,8 @@ pub fn bump_raw_tx_multi(
             })
         })
         .collect::<Result<_, Error>>()?;
-    let tx = notes_core::tx::build_sweep_tx_multi(&sources, dest_spk, new_rate, generate_aux_rand)?;
-    let rec = store
-        .txs
-        .iter_mut()
-        .find(|t| t.txids.iter().any(|x| x == txid))
-        .expect("checked above");
-    rec.txids.push(tx.txid_hex.clone());
-    rec.raw_hex = Some(tx.raw_hex.clone());
-    rec.fee = tx.fee;
-    rec.vsize = tx.vsize as u64;
-    rec.value = tx.tx.outputs[0].value;
-    Ok(tx)
+    notes_core::tx::build_sweep_tx_multi(&sources, dest_spk, new_rate, generate_aux_rand)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -527,5 +584,122 @@ mod bump_tests {
         store.txs[0].status = NoteStatus::Pending;
         let last = store.txs[0].txids.last().unwrap().clone();
         assert!(bump_raw_tx_multi(&mut store, &idents, &last, 9.0).is_err());
+    }
+
+    /// Universal-confirm split (zero-trace cancel): the `_build` halves
+    /// must not touch the store AT ALL, and build + record must land the
+    /// store in the same state the original one-shot functions produce.
+    /// Raw hex is the one field that can't be byte-compared across two
+    /// independent signing runs (schnorr aux-rand randomizes the witness;
+    /// the txid — non-witness serialization — IS deterministic), so each
+    /// store's raw_hex is checked against its own returned tx instead.
+    #[test]
+    fn bump_builds_are_pure_and_build_plus_record_matches_one_shot() {
+        let id = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let dest_spk = notes_core::address::p2tr_script_pubkey(
+            &Identity::from_app_seed(&[11u8; 32]).unwrap().output_x,
+        );
+
+        // ---- TxRecord (sweep/consolidate) case: bump_raw_tx ----
+        let mut base = Store::new(&id.output_x, Network::Regtest);
+        base.txs.push(TxRecord {
+            kind: "sweep".into(),
+            txids: vec!["00".repeat(32)],
+            status: NoteStatus::Pending,
+            value: 69_000,
+            fee: 100,
+            vsize: 160,
+            created_at: Some(1),
+            raw_hex: Some(String::new()),
+            dest: "ext".into(),
+            inputs: vec![
+                TxInput { txid: "11".repeat(32), vout: 0, value: 40_000 },
+                TxInput { txid: "22".repeat(32), vout: 1, value: 30_000 },
+            ],
+            dest_spk_hex: hex::encode(&dest_spk),
+            input_accounts: Vec::new(),
+            input_indexes: Vec::new(),
+            mixed_inputs: false,
+            dropped: false,
+        });
+        let mut one_shot = base.clone();
+        let mut split = base.clone();
+
+        // Purity: a build-only call leaves the store byte-identical.
+        let before = serde_json::to_string(&split).unwrap();
+        let built = bump_raw_tx_build(&split, &id, &"00".repeat(32), 5.0).unwrap();
+        assert_eq!(
+            serde_json::to_string(&split).unwrap(),
+            before,
+            "bump_raw_tx_build must not mutate the store"
+        );
+
+        // Build + record == one-shot on every deterministic field.
+        let one = bump_raw_tx(&mut one_shot, &id, &"00".repeat(32), 5.0).unwrap();
+        record_bumped_tx(&mut split, &"00".repeat(32), &built);
+        let (ra, rb) = (&one_shot.txs[0], &split.txs[0]);
+        assert_eq!(ra.txids, rb.txids, "same replacement txid appended");
+        assert_eq!(ra.fee, rb.fee);
+        assert_eq!(ra.vsize, rb.vsize);
+        assert_eq!(ra.value, rb.value);
+        assert_eq!(ra.raw_hex.as_deref(), Some(one.raw_hex.as_str()));
+        assert_eq!(rb.raw_hex.as_deref(), Some(built.raw_hex.as_str()));
+
+        // ---- NoteRecord case: bump_fee (record step also swaps the
+        // ledger change UTXO) ----
+        let mut note_base = Store::new(&id.output_x, Network::Regtest);
+        note_base.utxos.push(crate::store::LedgerUtxo {
+            txid: "33".repeat(32),
+            vout: 0,
+            value: 80_000,
+            height: Some(1),
+            pending_spend: false,
+        });
+        let composed = compose_and_record(
+            &mut note_base,
+            &id,
+            Network::Regtest,
+            &ComposeRequest {
+                text: "bump me",
+                private: false,
+                recipient: None,
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: None,
+                now: 1,
+            },
+        )
+        .unwrap();
+        let note_id = composed.note_id.clone();
+        let mut one_shot = note_base.clone();
+        let mut split = note_base.clone();
+
+        let before = serde_json::to_string(&split).unwrap();
+        let built = bump_fee_build(&split, &id, Network::Regtest, &note_id, 5.0).unwrap();
+        assert_eq!(
+            serde_json::to_string(&split).unwrap(),
+            before,
+            "bump_fee_build must not mutate the store"
+        );
+
+        let one = bump_fee(&mut one_shot, &id, Network::Regtest, &note_id, 5.0).unwrap();
+        record_bumped_note(&mut split, &built);
+        let (na, nb) = (&one_shot.notes[0], &split.notes[0]);
+        assert_eq!(na.txids, nb.txids, "same replacement txid appended");
+        assert_eq!(na.fee, nb.fee);
+        assert_eq!(na.vsize, nb.vsize);
+        assert_eq!(na.raw_hex.as_deref(), Some(one.tx.raw_hex.as_str()));
+        assert_eq!(nb.raw_hex.as_deref(), Some(built.tx.raw_hex.as_str()));
+        // Ledger change swap matches too: old change gone, the same new
+        // change UTXO (deterministic txid/vout/value) in both stores.
+        let utxo_key = |s: &Store| -> Vec<(String, u32, u64, bool)> {
+            s.utxos.iter().map(|u| (u.txid.clone(), u.vout, u.value, u.pending_spend)).collect()
+        };
+        assert_eq!(utxo_key(&one_shot), utxo_key(&split));
+        assert!(
+            split.utxos.iter().any(|u| u.txid == built.tx.txid_hex),
+            "replacement change UTXO tracked"
+        );
     }
 }

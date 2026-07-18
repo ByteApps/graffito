@@ -353,17 +353,31 @@ enum PendingPayload {
     /// Spending-wallet consolidate ("Consolidate spending coins…", kind
     /// "spending-consolidate").
     SpendingConsolidate { snap: SpendingConsolidateSnapshot },
-    /// Activity Speed-up (`on_act_bump_confirm`, kind "bump") — the
-    /// re-sign already ran + saved in stage A; stage B re-arms
-    /// `act_pending_ref` (moved here from the old pre-broadcast point,
-    /// mirroring `wallet_tx_busy` elsewhere) and spawns the SAME
-    /// broadcast worker pushing `ActBumpResult`.
-    Bump { ref_id: String, fee: u64, new_rate: f64 },
+    /// Activity Speed-up (`on_act_bump_confirm`, kind "bump") — stage A
+    /// runs the PURE `bump_*_build` halves only (zero-trace cancel: the
+    /// store still points at the ORIGINAL pending tx until Broadcast);
+    /// stage B applies the matching `record_bumped_*` mutation +
+    /// `save_store()` FIRST (record-before-POST, exactly like the
+    /// notebook-compose arm), re-arms `act_pending_ref`, and spawns the
+    /// SAME broadcast worker pushing `ActBumpResult`.
+    Bump { ref_id: String, fee: u64, new_rate: f64, bumped: BumpedBuild },
     /// Activity Rebroadcast (`on_act_retry`, kind "rebroadcast") — stage A
     /// already resolved the raw hex (locally cached, or via a worker
     /// fetch for chain-recovered/watch records with none cached); stage B
     /// is the pre-existing broadcast thread-spawn pushing `ActRetryResult`.
     Rebroadcast { ref_id: String },
+}
+
+/// A Speed-up's signed-but-not-yet-recorded replacement, built by the pure
+/// `app_core::compose::bump_*_build` halves at stage A and applied by the
+/// matching `record_bumped_*` at stage B's Broadcast tap. A note bump
+/// carries the full [`app_core::compose::ComposedNote`] (its record step
+/// also swaps the ledger change UTXO); a sweep/consolidate bump needs only
+/// the bare signed tx.
+#[derive(Clone)]
+enum BumpedBuild {
+    Note(app_core::compose::ComposedNote),
+    Tx(app_core::notes_core::tx::NoteTx),
 }
 
 /// One wallet-consolidate session (Coins → "Consolidate into one coin…").
@@ -2459,7 +2473,8 @@ fn apply_act_retry_results(w: &AppWindow, st: &mut State) {
 }
 
 /// A finished Activity Speed-up (`on_act_bump_confirm`) broadcast POST. The
-/// re-sign (bump_fee/bump_raw_tx[_multi]) already ran synchronously and
+/// re-sign (bump_*_build at stage A, record_bumped_* + save at the
+/// Broadcast tap) already ran synchronously and
 /// saved the store BEFORE this — same "record already saved" shape as the
 /// notebook compose path — so a broadcast failure here needs no navigation
 /// (the bump dialog already closed onto the Activity screen); only status +
@@ -6989,9 +7004,20 @@ pub fn run() {
             })
             .unwrap_or_default();
         let active_account = s.account;
-        let result: Result<(String, String, u64, usize), app_core::Error> = if is_note {
-            app_core::compose::bump_fee(s.store.as_mut().unwrap(), &identity, net, &ref_id, new_rate)
-                .map(|c| (c.tx.raw_hex.clone(), c.tx.txid_hex.clone(), c.tx.fee, c.tx.vsize))
+        // PURE builds only (zero-trace cancel): the store is not touched
+        // — no txid append, no fee/raw_hex update, no ledger swap, no
+        // save — until the Broadcast tap runs `record_bumped_*` in stage
+        // B. Cancel on screen 26 leaves the original pending tx exactly
+        // as it was.
+        let result: Result<BumpedBuild, app_core::Error> = if is_note {
+            app_core::compose::bump_fee_build(
+                s.store.as_ref().unwrap(),
+                &identity,
+                net,
+                &ref_id,
+                new_rate,
+            )
+            .map(BumpedBuild::Note)
         } else if !owner_ids.is_empty() {
             let mut distinct = owner_ids.clone();
             distinct.sort_unstable();
@@ -7024,27 +7050,39 @@ pub fn run() {
                             .collect()
                     });
             idents.and_then(|idents| {
-                app_core::compose::bump_raw_tx_multi(
-                    s.store.as_mut().unwrap(),
+                app_core::compose::bump_raw_tx_multi_build(
+                    s.store.as_ref().unwrap(),
                     &idents,
                     &ref_id,
                     new_rate,
                 )
-                .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee, tx.vsize))
+                .map(BumpedBuild::Tx)
             })
         } else {
-            app_core::compose::bump_raw_tx(s.store.as_mut().unwrap(), &identity, &ref_id, new_rate)
-                .map(|tx| (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee, tx.vsize))
+            app_core::compose::bump_raw_tx_build(
+                s.store.as_ref().unwrap(),
+                &identity,
+                &ref_id,
+                new_rate,
+            )
+            .map(BumpedBuild::Tx)
         };
         match result {
-            Ok((raw, txid, fee, vsize)) => {
-                // The re-signed replacement is already saved (same shape as
-                // the notebook compose path). Hand off to the universal
-                // confirm screen instead of broadcasting immediately —
-                // stage B (`on_confirm_broadcast`) re-arms `act_pending_ref`
-                // right before the POST and spawns the SAME worker pushing
-                // `ActBumpResult`.
-                s.save_store();
+            Ok(bumped) => {
+                let (raw, txid, fee, vsize) = match &bumped {
+                    BumpedBuild::Note(c) => {
+                        (c.tx.raw_hex.clone(), c.tx.txid_hex.clone(), c.tx.fee, c.tx.vsize)
+                    }
+                    BumpedBuild::Tx(tx) => {
+                        (tx.raw_hex.clone(), tx.txid_hex.clone(), tx.fee, tx.vsize)
+                    }
+                };
+                // NOTHING is recorded or saved here — hand the signed
+                // replacement to the universal confirm screen; stage B
+                // (`on_confirm_broadcast`) applies `record_bumped_*` +
+                // `save_store()` at the Broadcast tap, re-arms
+                // `act_pending_ref` right before the POST, and spawns the
+                // SAME worker pushing `ActBumpResult`.
                 w.set_show_bump_dialog(false);
                 let prevouts = stored_record_prevouts(&s, &ref_id, is_note);
                 let expected_change = stored_record_expected_change(&s, &ref_id, is_note);
@@ -7066,7 +7104,7 @@ pub fn run() {
                     vsize,
                     context: format!("Speed-up · {}", net.as_str()),
                     return_screen: 11, // overwritten by show_confirm
-                    payload: PendingPayload::Bump { ref_id: ref_id.clone(), fee, new_rate },
+                    payload: PendingPayload::Bump { ref_id: ref_id.clone(), fee, new_rate, bumped },
                 };
                 show_confirm(&w, &mut s, pending, ctx);
             }
@@ -8603,12 +8641,28 @@ pub fn run() {
             // back on the Activity screen while the POST runs) and spawns
             // the SAME broadcast worker their (UNTOUCHED) apply_act_*
             // functions already drain.
-            PendingPayload::Bump { ref_id, fee, new_rate } => {
+            PendingPayload::Bump { ref_id, fee, new_rate, bumped } => {
                 let Some(base) = s.base_url() else {
                     w.set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
                 let net = s.network;
+                // Record-before-POST, moved here from stage A (zero-trace
+                // cancel fix): apply the exact mutation the one-shot
+                // bump_* functions used to make — replacement txid append,
+                // fee/vsize/raw_hex update, and (notes) the ledger change
+                // swap — then save, exactly like the Compose arm. A failed
+                // POST leaves a retryable record with the replacement hex
+                // in hand (`apply_act_bump_results` behavior, unchanged).
+                if let Some(store) = s.store.as_mut() {
+                    match &bumped {
+                        BumpedBuild::Note(c) => app_core::compose::record_bumped_note(store, c),
+                        BumpedBuild::Tx(tx) => {
+                            app_core::compose::record_bumped_tx(store, &ref_id, tx)
+                        }
+                    }
+                }
+                s.save_store();
                 s.pending_broadcast = None;
                 w.set_screen(pending.return_screen);
                 s.act_pending_ref = Some(ref_id.clone());
