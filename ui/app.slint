@@ -2956,7 +2956,11 @@ export component AppWindow inherits Window {
                     }
                     GhostButton {
                         text: "View in Coins…";
-                        clicked => { root.coins-segment = "spending"; root.open-coins(); }
+                        // Through the callback, NOT a direct property write —
+                        // set-coins-segment kicks the spending scan when the
+                        // cache is cold (first-time View-in-Coins showed an
+                        // empty spending list otherwise).
+                        clicked => { root.set-coins-segment("spending"); root.open-coins(); }
                     }
                 }
             }

@@ -3559,6 +3559,23 @@ fn spending_refresh_async(w: &AppWindow, st: &mut State) {
     });
 }
 
+/// Derive `spending_source` on demand from the session key material. The
+/// descriptor needs no network scan — it was only ever populated by
+/// [`apply_spending_refresh_results`], which made scan-independent flows
+/// ("Sweep notebook funds here", spending consolidate — both only need the
+/// descriptor + a store index) fail with "not scanned yet" when tapped
+/// before a fresh session's first scan landed.
+fn ensure_spending_source(st: &mut State) {
+    if st.spending_source.is_some() || !st.spending_capable {
+        return;
+    }
+    if let Some(material) = st.material.as_ref() {
+        if let Ok(m) = parse_key_material(material.as_str(), st.network) {
+            st.spending_source = app_core::spending::funding_source(&m, st.network, st.account).ok();
+        }
+    }
+}
+
 /// The UI-thread half of [`spending_refresh_async`]: cache the coins +
 /// source, log the result, and repaint every screen that shows the
 /// spending wallet (Settings card, compose picker, Coins segment).
@@ -6375,8 +6392,9 @@ pub fn run() {
     // receive address. `pending_spending_sweep_index` tells on_sweep's
     // success handler to mark that address used (fresh-address discipline).
     cb!(on_spending_sweep_here, |w, s| {
+        ensure_spending_source(&mut s);
         let Some(src) = s.spending_source.clone() else {
-            w.set_status("spending wallet not scanned yet".into());
+            w.set_status("spending wallet unavailable for this identity".into());
             return;
         };
         let Some(idx) = s.store.as_ref().map(|st| st.spending.next_receive) else { return };
@@ -6392,8 +6410,9 @@ pub fn run() {
     // estimator (all-P2WPKH inputs, one P2WPKH output), then open the
     // confirm modal.
     cb!(on_spending_consolidate_open, |w, s| {
+        ensure_spending_source(&mut s);
         let Some(src) = s.spending_source.clone() else {
-            w.set_status("spending wallet not scanned yet".into());
+            w.set_status("spending wallet unavailable for this identity".into());
             return;
         };
         let n = s.spending_coins.len();
