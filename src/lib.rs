@@ -241,6 +241,11 @@ struct State {
     /// wallet's live selection. Populated by `payfrom_scan_wallet_for_display`
     /// on first expand; cleared at the start of every fresh compose session.
     payfrom_wallet_coins: std::collections::HashMap<String, Vec<FundingUtxo>>,
+    /// Re-entrancy guard for `sync_and_finalize_payfrom`'s dispatch
+    /// alignment (it re-runs `refresh_compose` once after switching the
+    /// active source to match the verdict's shape — TestFlight-13 fix,
+    /// 2026-07-18).
+    payfrom_aligning: bool,
     /// Explicit change destination pick made this compose session (screen
     /// 21) — "" = unset, `app_core::mixed::resolve_change_default` applies.
     /// Never overridden by a refresh once chosen; cleared with the rest of
@@ -4234,6 +4239,22 @@ struct PayfromState {
     enough: bool,
     /// "Notebook" | "Spending wallet" | the external wallet's label | "N wallets".
     source_label: String,
+    /// Machine-readable selection shape — drives the Sign-button DISPATCH
+    /// inputs too (Sal's TestFlight-build-13 follow-up, 2026-07-18): see
+    /// `sync_and_finalize_payfrom`'s alignment step.
+    shape: PayfromShape,
+}
+
+/// Which single compose path (or the mixed one) the CURRENT cross-wallet
+/// selection actually needs. `External` carries the full source key
+/// ("wallet:<id>").
+#[derive(Clone, PartialEq, Eq)]
+enum PayfromShape {
+    Empty,
+    Notebook,
+    Spending,
+    External(String),
+    Mixed,
 }
 
 /// Compute [`PayfromState`] for the CURRENT cross-wallet selection, using
@@ -4336,6 +4357,7 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
     };
 
     let (required, required_line, source_label): (Option<u64>, String, String);
+    let shape: PayfromShape;
     if groups == 0 {
         // Nothing selected in ANY source — estimate the minimal 1-input
         // self-funded shape (what auto-suggest will land on): never leave
@@ -4350,6 +4372,7 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         required = fee.map(|f| f + gift);
         source_label = if st.payfrom_active_source == "spending" { "Spending wallet".to_string() } else { "Notebook".to_string() };
         required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
+        shape = PayfromShape::Empty;
     } else if nb_total > 0 && groups == 1 {
         // Notebook-only — same self-funded estimator the plain compose path
         // already uses (no dust-to-self: change naturally returns to the
@@ -4364,6 +4387,7 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         required = fee.map(|f| f + gift);
         source_label = "Notebook".to_string();
         required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
+        shape = PayfromShape::Notebook;
     } else if sp_total > 0 && groups == 1 {
         // Spending-only — same funded shape `spending_compose_ui` builds for
         // real (dust-to-self ALWAYS), just never gated on affordability.
@@ -4375,6 +4399,7 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         required = fee.map(|f| f + gift + DUST_SATS);
         source_label = "Spending wallet".to_string();
         required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
+        shape = PayfromShape::Spending;
     } else if groups == 1 {
         // External-only — cost is "whatever the wallet pays"; never invent a
         // numeric fee for it (unchanged design intent).
@@ -4389,6 +4414,7 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         // below still gates Sign on text being present.
         required_line = format!("funded by {label}");
         source_label = label;
+        shape = PayfromShape::External(wallet_sources.first().cloned().unwrap_or_default());
     } else {
         // Mixed: 2+ source groups in ONE tx — the real mixed builder
         // (`assemble_mixed_note_psbt`) is the only correct sizer for this
@@ -4430,6 +4456,7 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         required = fee.map(|f| f + gift + DUST_SATS);
         source_label = format!("{groups} wallets");
         required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
+        shape = PayfromShape::Mixed;
     }
 
     let enough = match required {
@@ -4442,7 +4469,7 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         }
     };
 
-    PayfromState { required, required_line, selected, enough, source_label }
+    PayfromState { required, required_line, selected, enough, source_label, shape }
 }
 
 /// Recompute the mixed-source bookkeeping after `refresh_compose`'s active-
@@ -4455,15 +4482,19 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
 /// replaced each branch setting `spend_enough`/`payfrom_required_line`
 /// independently (Sal's iPhone bug cluster, 2026-07-18).
 fn sync_and_finalize_payfrom(w: &AppWindow, st: &mut State) {
+    // Mirror the active source's scratch selection into the cross-wallet
+    // memory — ONLY for notebook/spending, the two sources whose compose
+    // branches actually maintain `selected_coins`. External wallets keep
+    // their entries via `on_toggle_coin` + `funding_compose_ui`'s
+    // default-all seeding; mirroring the (necessarily stale) scratch under
+    // a "wallet:<id>" key would clobber the wallet's real selection with
+    // another source's coin list (a latent 3f29024 hazard, closed in the
+    // TestFlight-13 dispatch fix, 2026-07-18).
     let active = st.payfrom_active_source.clone();
-    if !active.is_empty() {
+    if active == "notebook" || active == "spending" {
         let coins = st.selected_coins.clone();
         mixed_sync_source(st, &active, &coins);
     }
-    let sources: std::collections::HashSet<&str> =
-        st.mixed_selected.iter().map(|(s, _, _)| s.as_str()).collect();
-    let mixed = sources.len() > 1;
-    w.set_mixed_linkage_hint(mixed);
 
     let pf = payfrom_state(w, st);
     // The note-size ceiling (`compose_oversize`, set by the notebook
@@ -4475,6 +4506,10 @@ fn sync_and_finalize_payfrom(w: &AppWindow, st: &mut State) {
     w.set_payfrom_required_line(pf.required_line.into());
     w.set_payfrom_selected_line(format!("{} sats", commas(pf.selected)).into());
     w.set_payfrom_source_label(pf.source_label.clone().into());
+    // The linkage hint doubles as the Sign-button dispatch selector for the
+    // mixed path — derived from the verdict's shape, same source of truth
+    // as everything else here.
+    w.set_mixed_linkage_hint(pf.shape == PayfromShape::Mixed);
     println!(
         "cb: payfrom state src={} required={} selected={} enough={}",
         pf.source_label,
@@ -4482,6 +4517,55 @@ fn sync_and_finalize_payfrom(w: &AppWindow, st: &mut State) {
         pf.selected,
         if enough { 1 } else { 0 },
     );
+
+    // ---- Dispatch alignment (Sal's TestFlight-build-13 follow-up,
+    // 2026-07-18): the Sign button in app.slint picks its send callback
+    // from `mixed-linkage-hint` + `pay-from`/`fund-external`/
+    // `spend-from-wallet`, which until now were LAST-TAPPED state — e.g.
+    // deselecting the spending wallet's final coin (a tap ON the spending
+    // source) left `pay-from` = "spending" while the actual selection was
+    // notebook-only, so Sign invoked the spending branch, which bailed red
+    // "no coins selected" despite a green globally-sufficient verdict.
+    // Whenever the verdict's shape names ONE source, force the dispatch
+    // inputs (and the active-source scratch the compose branches read) to
+    // that source — payfrom_state is the single source of truth for which
+    // send path runs, structurally. Empty/Mixed leave the flags alone
+    // (Empty can't Sign — enough=0; Mixed dispatches via the hint,
+    // ignoring `pay-from`). Re-runs `refresh_compose` once after a switch
+    // so the preview lines come from the branch that will actually send;
+    // `payfrom_aligning` guards the recursion (the inner pass finds the
+    // flags agreeing and falls through).
+    let desired: Option<String> = match &pf.shape {
+        PayfromShape::Notebook => Some("notebook".to_string()),
+        PayfromShape::Spending => Some("spending".to_string()),
+        PayfromShape::External(key) => Some(key.clone()),
+        PayfromShape::Empty | PayfromShape::Mixed => None,
+    };
+    if let Some(src) = desired {
+        let flags_agree = w.get_pay_from().as_str() == src
+            && st.payfrom_active_source == src
+            && w.get_fund_external() == src.starts_with("wallet:")
+            && w.get_spend_from_wallet() == (src == "spending");
+        if !flags_agree && !st.payfrom_aligning {
+            st.payfrom_aligning = true;
+            println!("cb: payfrom align src={src}");
+            st.payfrom_active_source = src.clone();
+            if let Some(id) = src.strip_prefix("wallet:") {
+                let id = id.to_string();
+                promote_wallet_active(w, st, &id);
+            } else {
+                // Seed the scratch from the source's remembered selection so
+                // the branch (and the send path) spends exactly what the
+                // verdict counted — never a re-auto-suggest.
+                st.selected_coins = mixed_coins_for(st, &src);
+                st.coins_overridden = true;
+                apply_pay_from(w, st, &src);
+            }
+            refresh_compose(w, st);
+            st.payfrom_aligning = false;
+            return;
+        }
+    }
     update_change_label(w, st);
 }
 
@@ -6478,6 +6562,7 @@ pub fn run() {
         sp_expanded: false,
         payfrom_active_source: String::new(),
         payfrom_wallet_coins: std::collections::HashMap::new(),
+        payfrom_aligning: false,
         change_choice: String::new(),
         compose_busy: false,
         act_pending_ref: None,
@@ -9303,6 +9388,7 @@ pub fn run() {
                 .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: nb })
                 .collect();
             if coins.is_empty() {
+                println!("cb: compose-send bail=no-coins src=watch");
                 w.set_status("no coins selected".into());
                 return;
             }
@@ -9521,6 +9607,7 @@ pub fn run() {
             .cloned()
             .collect();
         if selected_spending_coins.is_empty() {
+            println!("cb: compose-send bail=no-coins src=spending");
             w.set_status("no coins selected".into());
             return;
         }
@@ -9792,10 +9879,12 @@ pub fn run() {
         }
 
         if coins.is_empty() {
+            println!("cb: compose-send bail=no-coins src=mixed");
             w.set_status("no coins selected".into());
             return;
         }
         if !app_core::mixed::spans_multiple_wallets(&coins) {
+            println!("cb: compose-send bail=single-source src=mixed");
             w.set_status("selection is single-source — use the Sign button on that source instead".into());
             return;
         }
