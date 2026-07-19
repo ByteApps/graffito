@@ -2744,6 +2744,14 @@ export component AppWindow inherits Window {
             font-size: 13px;
             font-weight: 600;
             color: Pal.accent;
+            // The dust-rule leftover suffix can exceed the screen width — an
+            // unwrapped Text widens the whole compose column past the right
+            // edge (Sal's build-16 iPhone report; same overflow class as the
+            // iteration-2 cutoff). Wrap to multiple rows instead: cap the
+            // preferred width so the layout never stretches to fit one line.
+            wrap: word-wrap;
+            preferred-width: 0;
+            horizontal-stretch: 1;
         }
         // ---- gift amount (directed notes only), collapsible ----
         if root.directed: Rectangle {

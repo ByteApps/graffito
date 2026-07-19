@@ -11199,7 +11199,9 @@ fn preview_mock(w: &AppWindow) {
     w.set_to_label("To  bcrt1pxs94vakt8gnq…rqmeyu58".into());
     w.set_compose_text("Happy birthday! Paid from cold storage.".into());
     w.set_rate_text("2".into());
-    w.set_cost_line("1 chunk · ~180 vB · ~360 sats".into());
+    // Worst-case length on purpose: the dust-rule suffix is the longest
+    // cost line the app produces — the preview harness must show it wrapped.
+    w.set_cost_line("1 chunk(s) · ~180 vB · ~360 sats (~$0.26) + 227 sats leftover (dust rule)".into());
 
     let coins = [
         SpendCoin { outpoint: "aa:0".into(), value: "200,000".into(), confirmed: true, selected: true, txid_short: "aaaa…aaaa".into(), explorer: "".into() },
