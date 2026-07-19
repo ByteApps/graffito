@@ -634,6 +634,17 @@ pub fn build_watch_funded_note_psbt(
 /// Shared tail of both funded-note builders: payloads → outputs (OP_RETURNs,
 /// recipient carrying `recipient_amount`, dust-to-self, funding change) →
 /// PSBT with witness data + key origins on every funding input.
+///
+/// The dust-to-self output here is UNCONDITIONAL, unlike
+/// [`crate::mixed::assemble_mixed_note_psbt`]'s input-anchored skip: `plan`
+/// only ever carries `FundingPlan::coins` from a single external/spending
+/// `FundingSource` (`build_funding_psbt_amount`'s own doc — this is the
+/// spending-wallet-only or external-wallet-only path), never the identity's
+/// own notebook UTXOs, so a note built here is NEVER already input-anchored
+/// — the dust-to-self is the only thing that keeps it discoverable/owned.
+/// (No `CoinSource` flows through this path to assert against; the
+/// invariant is structural, enforced by `FundingPlan`'s shape rather than a
+/// runtime flag.)
 fn assemble_funded_note_psbt(
     plan: &FundingPlan,
     payloads: &[Vec<u8>],

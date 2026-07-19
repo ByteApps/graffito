@@ -4,9 +4,16 @@
 //! watch-only sources — a single note may spend all three kinds of coin in
 //! one PSBT. This module is ADDITIVE glue over the existing single-source
 //! machinery: [`crate::psbt_build::assemble_funded_note_psbt`]'s output
-//! shape (OP_RETURNs, optional recipient, dust-to-self ALWAYS, then change)
-//! is reused verbatim — only input assembly generalizes to per-coin
-//! sources. Signing still dispatches to the existing per-kind signers
+//! shape (OP_RETURNs, optional recipient, dust-to-self, then change) is
+//! reused verbatim, with ONE additive rule on top —
+//! [`assemble_mixed_note_psbt`] SKIPS the dust-to-self output when the
+//! selection includes a `CoinSource::Notebook` coin (input-anchored: the
+//! note's ownership/discoverability already hold via the input side, so
+//! the extra output is redundant there); `assemble_funded_note_psbt` never
+//! sees a notebook coin by construction (spending/external funding never
+//! spends notebook UTXOs), so its own dust-to-self stays unconditional.
+//! Only input assembly otherwise generalizes to per-coin sources. Signing
+//! still dispatches to the existing per-kind signers
 //! ([`crate::psbt_build::sign_own_taproot_inputs`],
 //! [`crate::psbt_build::sign_own_wpkh_inputs`]); external-wallet inputs are
 //! left unsigned with key-origin metadata so the existing screens-13/14
@@ -169,7 +176,7 @@ pub(crate) fn commas(n: u64) -> String {
 }
 
 /// Fee-only estimate for the FUNDED output shape (OP_RETURNs + optional
-/// recipient dust/gift + an ALWAYS dust-to-self output + change) —
+/// recipient dust/gift + an optional dust-to-self output + change) —
 /// [`crate::psbt_build::assemble_funded_note_psbt`] / [`assemble_mixed_note_psbt`]'s
 /// exact output order, but WITHOUT their insufficiency gate: both builders
 /// intentionally `Err` rather than report a fee once the selected coins
@@ -180,11 +187,17 @@ pub(crate) fn commas(n: u64) -> String {
 /// the SAME `sealed_note_payloads` call those builders make internally —
 /// this function only does the weight/fee arithmetic, via the same
 /// `predict_weight` call they use, never a separately invented formula.
+/// `dust_to_self`: pass `false` only when the caller's selection already
+/// includes a `CoinSource::Notebook` coin (the same condition
+/// [`assemble_mixed_note_psbt`] uses to skip the output for real) — every
+/// other caller (spending-only, external-only) passes `true`, matching
+/// `assemble_funded_note_psbt`'s unconditional dust-to-self.
 pub fn estimate_funded_fee(
     input_weights: &[InputWeightPrediction],
     payloads: &[Vec<u8>],
     recipient_spk_len: Option<usize>,
     change_spk_len: usize,
+    dust_to_self: bool,
     fee_rate: f64,
 ) -> u64 {
     let mut lens: Vec<usize> =
@@ -192,24 +205,27 @@ pub fn estimate_funded_fee(
     if let Some(l) = recipient_spk_len {
         lens.push(l);
     }
-    lens.push(34); // dust-to-self: always our own P2TR notebook address
+    if dust_to_self {
+        lens.push(34); // our own P2TR notebook address, when present
+    }
     lens.push(change_spk_len);
     let vsize = predict_weight(input_weights.iter().copied(), lens.into_iter()).to_vbytes_ceil();
     (vsize as f64 * fee_rate).ceil().max(0.0) as u64
 }
 
 /// The other half of [`estimate_funded_fee`]'s output-shape list: the SAME
-/// funded shape (OP_RETURNs + optional recipient + the ALWAYS-present
+/// funded shape (OP_RETURNs + optional recipient + the same optional
 /// dust-to-self) but WITHOUT a discretionary change output — the "no
 /// change" branch of the with-change/no-change decision
 /// [`assemble_mixed_note_psbt`] / [`crate::psbt_build::assemble_funded_note_psbt`]
 /// make for real. Paired with `estimate_funded_fee` by [`predict_fold`] to
 /// tell whether the CURRENT selection would fold a sub-dust leftover into
-/// the fee.
+/// the fee. `dust_to_self`: same rule as [`estimate_funded_fee`]'s.
 pub fn estimate_funded_fee_no_change(
     input_weights: &[InputWeightPrediction],
     payloads: &[Vec<u8>],
     recipient_spk_len: Option<usize>,
+    dust_to_self: bool,
     fee_rate: f64,
 ) -> u64 {
     let mut lens: Vec<usize> =
@@ -217,7 +233,9 @@ pub fn estimate_funded_fee_no_change(
     if let Some(l) = recipient_spk_len {
         lens.push(l);
     }
-    lens.push(34); // dust-to-self: always present, with or without change
+    if dust_to_self {
+        lens.push(34); // present with or without change, unless anchored
+    }
     let vsize = predict_weight(input_weights.iter().copied(), lens.into_iter()).to_vbytes_ceil();
     (vsize as f64 * fee_rate).ceil().max(0.0) as u64
 }
@@ -316,17 +334,22 @@ pub fn notebook_vsize_no_change(vsize_with_change: usize, change_len: usize) -> 
 /// mixed compose) — the `estimate_funded_fee` / `estimate_funded_fee_no_change`
 /// pair IS the with-change/no-change comparison, so this just runs both and
 /// hands them to `predict_fold` with `cap_at_dust = false` (see its doc).
+/// `dust_to_self`: forwarded to both estimators — `false` when the
+/// selection includes a `CoinSource::Notebook` coin, `true` otherwise (see
+/// [`estimate_funded_fee`]'s doc).
 pub fn predict_funded_fold(
     input_weights: &[InputWeightPrediction],
     payloads: &[Vec<u8>],
     recipient_spk_len: Option<usize>,
     change_spk_len: usize,
+    dust_to_self: bool,
     in_value: u64,
     fixed_out: u64,
     fee_rate: f64,
 ) -> Option<(u64, u64)> {
-    let fee_wc = estimate_funded_fee(input_weights, payloads, recipient_spk_len, change_spk_len, fee_rate);
-    let fee_nc = estimate_funded_fee_no_change(input_weights, payloads, recipient_spk_len, fee_rate);
+    let fee_wc =
+        estimate_funded_fee(input_weights, payloads, recipient_spk_len, change_spk_len, dust_to_self, fee_rate);
+    let fee_nc = estimate_funded_fee_no_change(input_weights, payloads, recipient_spk_len, dust_to_self, fee_rate);
     predict_fold(in_value, fixed_out, fee_wc, fee_nc, false)
 }
 
@@ -352,11 +375,16 @@ pub fn spending_funding_utxos(coins: &[MixedCoin]) -> Vec<crate::funding::Fundin
 /// notebook + spending + several external wallets, in ONE transaction.
 /// Output shape mirrors
 /// [`crate::psbt_build::assemble_funded_note_psbt`] byte-for-byte (OP_RETURNs,
-/// optional recipient, dust-to-self ALWAYS, then change) — this is additive
+/// optional recipient, dust-to-self, then change) — EXCEPT the dust-to-self
+/// output is SKIPPED when `coins` includes any `CoinSource::Notebook` coin
+/// (input-anchored: the note is already provably ours via the input side,
+/// so the discoverability/ownership dust would be redundant — Sal's rule,
+/// funding-unification, 2026-07-18). Otherwise this is an additive
 /// generalization of that function's INPUT side only.
 ///
 /// `notebook_spk` is the identity's own P2TR scriptPubkey (Notebook coins'
-/// prevout and the dust-to-self output — one notebook, one fixed address).
+/// prevout and, when present, the dust-to-self output — one notebook, one
+/// fixed address).
 /// `wallets` resolves an external wallet id to its live `FundingSource`;
 /// `spending_source` is the identity's own BIP-84 wallet. `change_spk_override`
 /// mirrors `FundingPlan::change_override` (an explicit pick always wins);
@@ -430,8 +458,19 @@ pub fn assemble_mixed_note_psbt(
         });
         sent_to_recipient = recipient_amount;
     }
-    outputs.push(TxOut { value: Amount::from_sat(DUST_LIMIT), script_pubkey: ScriptBuf::from_bytes(notebook_spk.clone()) });
-    let dust_to_self = DUST_LIMIT;
+    // Input-anchored skip (Sal's rule, funding-unification, 2026-07-18): a
+    // notebook coin in this selection is always this identity's OWN
+    // notebook UTXO (see `notebook_prevouts`'s doc comment in src/lib.rs —
+    // coin control never crosses notebooks), so the tx already spends from
+    // self; the dust-to-self output would be a redundant discoverability
+    // signal and is skipped entirely.
+    let has_notebook_input = coins.iter().any(|c| c.source == CoinSource::Notebook);
+    let dust_to_self = if has_notebook_input {
+        0
+    } else {
+        outputs.push(TxOut { value: Amount::from_sat(DUST_LIMIT), script_pubkey: ScriptBuf::from_bytes(notebook_spk.clone()) });
+        DUST_LIMIT
+    };
 
     let change_spk: Vec<u8> = if let Some(spk) = change_spk_override {
         spk
@@ -594,7 +633,12 @@ mod tests {
     /// sign via their existing per-kind signer and the result verifies
     /// under rust-bitcoin (BIP-341 taproot + BIP-143 wpkh sighashes both
     /// checked by `validate_signed`/`finalize_extract`, the same pipeline
-    /// the funded-sweep and watch-spend tests use).
+    /// the funded-sweep and watch-spend tests use). ALSO the input-anchored
+    /// dust-to-self pin (2026-07-18): a notebook coin participates here, so
+    /// the built tx must carry NO dust-to-self output at all — the note is
+    /// already input-anchored — while everything else about the mixed shape
+    /// (recipient, spending-wallet change, both signers, finalize) stays
+    /// exactly as before.
     #[test]
     fn mixed_notebook_and_spending_psbt_signs_both_kinds() {
         let net = Network::Mainnet;
@@ -632,7 +676,11 @@ mod tests {
         .unwrap();
 
         let tx = &built.psbt.unsigned_tx;
-        assert!(tx.output.iter().any(|o| o.script_pubkey.as_bytes() == notebook_spk && o.value.to_sat() == 330));
+        assert_eq!(built.dust_to_self, 0, "a notebook coin is spending — the tx is already input-anchored");
+        assert!(
+            !tx.output.iter().any(|o| o.script_pubkey.as_bytes() == notebook_spk),
+            "no dust-to-self output at all when a notebook coin funds the tx"
+        );
         assert!(tx.output.iter().any(|o| o.script_pubkey.as_bytes() == recipient_spk && o.value.to_sat() == 330));
         let change_spk = spending_src.derive(1, 0).unwrap().spk;
         assert!(tx.output.iter().any(|o| o.script_pubkey.as_bytes() == change_spk));
@@ -655,9 +703,12 @@ mod tests {
     /// selection — its output-shape list is a duplicate of
     /// `assemble_mixed_note_psbt`'s, and this pin is what keeps the two from
     /// drifting (a drifted estimate makes the Pay-from sufficiency verdict
-    /// lie, the exact bug class the 2026-07-18 rework fixed).
+    /// lie, the exact bug class the 2026-07-18 rework fixed). ANCHORED shape
+    /// (2026-07-18 dust-skip rework): notebook + spending coins together —
+    /// the real builder omits dust-to-self, so the estimate must be called
+    /// with `dust_to_self = false` to match.
     #[test]
-    fn estimate_funded_fee_matches_real_mixed_build() {
+    fn estimate_funded_fee_matches_real_mixed_build_anchored() {
         let net = Network::Mainnet;
         let material = parse_key_material(MNEMONIC, net).unwrap();
         let spending_src = crate::spending::funding_source(&material, net, 0).unwrap();
@@ -690,12 +741,70 @@ mod tests {
             2.0,
         )
         .unwrap();
+        assert_eq!(built.dust_to_self, 0, "notebook input present — anchored, no dust-to-self");
         let change_spk_len = spending_src.derive(1, 0).unwrap().spk.len();
         let est = estimate_funded_fee(
             &[InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH, InputWeightPrediction::P2WPKH_MAX],
             &payloads,
             Some(recipient_spk.len()),
             change_spk_len,
+            false, // anchored: no dust-to-self, matching the real build
+            2.0,
+        );
+        assert_eq!(est, built.fee, "estimate drifted from the real builder's fee");
+    }
+
+    /// The UNANCHORED sibling of the above (2026-07-18 dust-skip rework): no
+    /// notebook coin in the selection (spending + an external wallet coin)
+    /// — the real builder keeps its unconditional dust-to-self, so the
+    /// estimate must be called with `dust_to_self = true` to match. Exercises
+    /// the WITH-CHANGE branch (plenty of value for a change output), the
+    /// complement of `predict_funded_fold_matches_real_build`'s no-change
+    /// case below.
+    #[test]
+    fn estimate_funded_fee_matches_real_mixed_build_unanchored() {
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let spending_src = crate::spending::funding_source(&material, net, 0).unwrap();
+        let notebook_spk = notes_core::address::p2tr_script_pubkey(&Identity::from_app_seed(&[7u8; 32]).unwrap().output_x);
+        // Official BIP-86 test vector xpub (mainnet account m/86'/0'/0') —
+        // same one `funding::tests::taproot_multipath_derives_bip86_vectors`
+        // uses; a bare xpub parses as taproot BIP-86 (`FundingSource::parse`).
+        let external = crate::funding::FundingSource::parse(
+            "xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ",
+            net,
+        )
+        .unwrap();
+        let mut wallets = HashMap::new();
+        wallets.insert("ext1".to_string(), external);
+        let coins = vec![
+            MixedCoin { source: CoinSource::Spending, txid: "b".repeat(64), vout: 1, value: 40_000, chain: 0, index: 0 },
+            MixedCoin { source: CoinSource::Wallet("ext1".to_string()), txid: "c".repeat(64), vout: 0, value: 40_000, chain: 0, index: 0 },
+        ];
+        let payloads = notes_core::envelope::encode_chunks([1, 2, 3, 4], 0, b"unanchored mixed note", 80).unwrap();
+        let built = assemble_mixed_note_psbt(
+            &coins,
+            notebook_spk,
+            Some(&spending_src),
+            &wallets,
+            &payloads,
+            None,
+            0,
+            &ChangeDefault::Spending,
+            None,
+            0,
+            2.0,
+        )
+        .unwrap();
+        assert!(built.dust_to_self > 0, "no notebook input — unanchored, dust-to-self stays");
+        assert!(built.change > 0, "plenty of value — this must exercise the WITH-CHANGE branch");
+        let change_spk_len = spending_src.derive(1, 0).unwrap().spk.len();
+        let est = estimate_funded_fee(
+            &[InputWeightPrediction::P2WPKH_MAX, InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH],
+            &payloads,
+            None,
+            change_spk_len,
+            true, // unanchored: dust-to-self present, matching the real build
             2.0,
         );
         assert_eq!(est, built.fee, "estimate drifted from the real builder's fee");
@@ -751,10 +860,13 @@ mod tests {
     /// mixed compose): a spending-wallet-only selection too small to leave
     /// a P2WPKH change output must fold, and `predict_funded_fold`'s split
     /// must equal `assemble_mixed_note_psbt`'s real fee — the same drift
-    /// guard `estimate_funded_fee_matches_real_mixed_build` gives the
-    /// with-change case, for the no-change one.
+    /// guard `estimate_funded_fee_matches_real_mixed_build_unanchored` gives
+    /// the with-change case, for the no-change one. UNANCHORED (2026-07-18
+    /// dust-skip rework): no notebook coin here, so the real build keeps its
+    /// unconditional dust-to-self — `predict_funded_fold` is called with
+    /// `dust_to_self = true` to match.
     #[test]
-    fn predict_funded_fold_matches_real_build() {
+    fn predict_funded_fold_matches_real_build_unanchored() {
         let net = Network::Mainnet;
         let material = parse_key_material(MNEMONIC, net).unwrap();
         let spending_src = crate::spending::funding_source(&material, net, 0).unwrap();
@@ -787,9 +899,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(built.change, 0, "the 700-sat coin must force the no-change fold shape");
+        assert!(built.dust_to_self > 0, "no notebook input — unanchored, dust-to-self stays");
 
         let weights = [InputWeightPrediction::P2WPKH_MAX];
-        let (nominal, folded) = predict_funded_fold(&weights, &payloads, None, 22, value, DUST_LIMIT, rate)
+        let (nominal, folded) = predict_funded_fold(&weights, &payloads, None, 22, true, value, DUST_LIMIT, rate)
             .expect("fold predicted");
         assert_eq!(nominal + folded, built.fee, "predicted split must equal the real builder's fee");
         assert_eq!(
@@ -797,6 +910,57 @@ mod tests {
             value,
             "no discretionary change: the whole coin covers dust-to-self + fee"
         );
+    }
+
+    /// The ANCHORED sibling of the above (2026-07-18 dust-skip rework): a
+    /// notebook coin participates alongside a spending coin, both too small
+    /// to leave a change output — the real build omits dust-to-self
+    /// entirely, so `predict_funded_fold` is called with `dust_to_self =
+    /// false` to match, and the WHOLE selection (not selection-minus-dust)
+    /// folds into the fee.
+    #[test]
+    fn predict_funded_fold_matches_real_build_anchored() {
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let spending_src = crate::spending::funding_source(&material, net, 0).unwrap();
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let notebook_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
+
+        let notebook_value = 300u64;
+        let spending_value = 300u64;
+        let rate = 2.0;
+        let coins = vec![
+            MixedCoin { source: CoinSource::Notebook, txid: "d".repeat(64), vout: 0, value: notebook_value, chain: 0, index: 0 },
+            MixedCoin { source: CoinSource::Spending, txid: "e".repeat(64), vout: 0, value: spending_value, chain: 0, index: 0 },
+        ];
+        let payloads = notes_core::envelope::encode_chunks([1, 2, 3, 4], 0, b"anchored fold pin test", 80).unwrap();
+        let built = assemble_mixed_note_psbt(
+            &coins,
+            notebook_spk.clone(),
+            Some(&spending_src),
+            &HashMap::new(),
+            &payloads,
+            None,
+            0,
+            &ChangeDefault::Spending,
+            None,
+            0,
+            rate,
+        )
+        .unwrap();
+        assert_eq!(built.dust_to_self, 0, "notebook input present — anchored, no dust-to-self");
+        assert!(
+            !built.psbt.unsigned_tx.output.iter().any(|o| o.script_pubkey.as_bytes() == notebook_spk),
+            "no dust-to-self output when a notebook coin funds the tx"
+        );
+        assert_eq!(built.change, 0, "small coins must force the no-change fold shape");
+
+        let weights = [InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH, InputWeightPrediction::P2WPKH_MAX];
+        let in_value = notebook_value + spending_value;
+        let (nominal, folded) = predict_funded_fold(&weights, &payloads, None, 22, false, in_value, 0, rate)
+            .expect("fold predicted");
+        assert_eq!(nominal + folded, built.fee, "predicted split must equal the real builder's fee");
+        assert_eq!(built.fee, in_value, "anchored + no fixed output: the whole selection covers the fee");
     }
 
     /// The four change-default scenarios Sal's rule distinguishes.

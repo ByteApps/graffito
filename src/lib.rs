@@ -3445,12 +3445,21 @@ static MIXED_COMPOSE_RESULTS: std::sync::Mutex<Vec<MixedComposeResult>> =
 fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResult) {
     match r.result {
         Ok(_echo) => {
+            // Input-anchored skip (2026-07-18 dust-skip rework): the
+            // dust-to-self output — and therefore its BEFORE-change vout
+            // slot — only exists when NO notebook coin funded this tx (same
+            // condition `assemble_mixed_note_psbt` used for real); a
+            // notebook coin can still participate while change defaults
+            // elsewhere-or-Notebook (the safe fallback), so this must be
+            // derived from `notebook_spent`, never assumed.
+            let dust_included = r.notebook_spent.is_empty();
             if let Some(store) = st.store.as_mut() {
                 let change_utxo = (r.built_change > 0
                     && r.change_default == app_core::mixed::ChangeDefault::Notebook)
                     .then(|| app_core::store::LedgerUtxo {
                         txid: r.txid.clone(),
-                        vout: (r.payloads_len + usize::from(r.recipient_present) + 1) as u32,
+                        vout: (r.payloads_len + usize::from(r.recipient_present) + usize::from(dust_included))
+                            as u32,
                         value: r.built_change,
                         height: None,
                         pending_spend: false,
@@ -4466,8 +4475,11 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
     // always comes back. Returns (fee_with_change, fee_no_change): the pair
     // `app_core::mixed::predict_fold` needs to tell whether THIS selection
     // would fold a sub-dust leftover into the fee (honest-fee-label,
-    // 2026-07-18).
-    let funded_fee_pair = |input_weights: &[bitcoin::transaction::InputWeightPrediction], change_spk_len: usize| -> Option<(u64, u64)> {
+    // 2026-07-18). `dust_to_self` mirrors `assemble_mixed_note_psbt`'s own
+    // input-anchored skip (2026-07-18 dust-skip rework): callers pass
+    // `false` when the selection includes a notebook coin, so the preview
+    // stays byte-exact with the real build either way.
+    let funded_fee_pair = |input_weights: &[bitcoin::transaction::InputWeightPrediction], change_spk_len: usize, dust_to_self: bool| -> Option<(u64, u64)> {
         let identity = st.ident.as_ref().and_then(|i| i.full())?.clone_fields();
         let chunk = st.store.as_ref().map(|s| s.chunk_size).unwrap_or(DEFAULT_CHUNK);
         let (payloads, recipient_spk) = app_core::notes_core::bundle::sealed_note_payloads(
@@ -4480,8 +4492,8 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         )
         .ok()?;
         let recipient_spk_len = recipient_spk.map(|s| s.len()).or_else(|| recipient.as_ref().map(|r| r.spk.len()));
-        let fee_wc = app_core::mixed::estimate_funded_fee(input_weights, &payloads, recipient_spk_len, change_spk_len, rate);
-        let fee_nc = app_core::mixed::estimate_funded_fee_no_change(input_weights, &payloads, recipient_spk_len, rate);
+        let fee_wc = app_core::mixed::estimate_funded_fee(input_weights, &payloads, recipient_spk_len, change_spk_len, dust_to_self, rate);
+        let fee_nc = app_core::mixed::estimate_funded_fee_no_change(input_weights, &payloads, recipient_spk_len, dust_to_self, rate);
         Some((fee_wc, fee_nc))
     };
 
@@ -4535,7 +4547,10 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
             .take(sp_sel.len().max(1))
             .collect();
         let change_len = custom_change_spk_len.unwrap_or(22); // BIP84 p2wpkh spk is always 22 bytes
-        let fees = funded_fee_pair(&weights, change_len);
+        // Spending-only can never include a notebook coin (groups == 1,
+        // nb_total == 0 by this branch's own guard) — dust-to-self always
+        // rides, same as `assemble_funded_note_psbt`'s unconditional rule.
+        let fees = funded_fee_pair(&weights, change_len, true);
         let fixed_out = gift + DUST_SATS; // recipient (if any) + the ALWAYS dust-to-self output
         let fold = fees.and_then(|(fee_wc, fee_nc)| app_core::mixed::predict_fold(sp_total, fixed_out, fee_wc, fee_nc, false));
         let nominal = fold.map(|(n, _)| n).or_else(|| fees.map(|(wc, _)| wc));
@@ -4595,11 +4610,18 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
                 .map(|fw| if fw.kind == "taproot" { 34 } else { 22 })
                 .unwrap_or(34),
         });
-        let fees = funded_fee_pair(&weights, change_len);
-        let fixed_out = gift + DUST_SATS; // recipient (if any) + the ALWAYS dust-to-self output
+        // Input-anchored skip (2026-07-18 dust-skip rework): a notebook coin
+        // in this mixed selection means the tx is already input-anchored —
+        // `assemble_mixed_note_psbt` omits dust-to-self, so the preview
+        // must too, or the Required/Leftover figures drift from the real
+        // build's fee.
+        let has_notebook = nb_total > 0;
+        let dust_sats = if has_notebook { 0 } else { DUST_SATS };
+        let fees = funded_fee_pair(&weights, change_len, !has_notebook);
+        let fixed_out = gift + dust_sats; // recipient (if any) + dust-to-self, when present
         let fold = fees.and_then(|(fee_wc, fee_nc)| app_core::mixed::predict_fold(selected, fixed_out, fee_wc, fee_nc, false));
         let nominal = fold.map(|(n, _)| n).or_else(|| fees.map(|(wc, _)| wc));
-        required = nominal.map(|f| f + gift + DUST_SATS);
+        required = nominal.map(|f| f + gift + dust_sats);
         source_label = format!("{groups} wallets");
         required_line = fold_required_line(required, fold);
         shape = PayfromShape::Mixed;
@@ -5371,8 +5393,16 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                 .map(|(payloads, recipient_spk)| {
                     let recipient_spk_len =
                         recipient_spk.map(|s| s.len()).or_else(|| recipient.as_ref().map(|r| r.spk.len()));
-                    let nominal =
-                        app_core::mixed::estimate_funded_fee_no_change(&weights, &payloads, recipient_spk_len, rate);
+                    // Spending-only path: never a notebook coin, so
+                    // dust-to-self is always present (matches
+                    // `build_funding_psbt_amount`'s unconditional rule).
+                    let nominal = app_core::mixed::estimate_funded_fee_no_change(
+                        &weights,
+                        &payloads,
+                        recipient_spk_len,
+                        true,
+                        rate,
+                    );
                     (nominal, built.fee.saturating_sub(nominal))
                 })
                 .filter(|(_, folded)| *folded > 0)
@@ -10288,6 +10318,11 @@ pub fn run() {
             .map(|c| app_core::store::OutPointRef { txid: c.txid.clone(), vout: c.vout })
             .collect();
         let has_external = coins.iter().any(|c| matches!(c.source, app_core::mixed::CoinSource::Wallet(_)));
+        // Input-anchored skip (2026-07-18 dust-skip rework): mirrors
+        // `assemble_mixed_note_psbt`'s own condition exactly, so a bumped/
+        // re-read `WatchNote`'s change-vout math (`wn.dust_to_self`) stays
+        // byte-true to what the built tx actually contains.
+        let has_notebook_input = !notebook_spent.is_empty();
 
         if has_external {
             // Our own inputs are already signed above; export for the
@@ -10305,7 +10340,7 @@ pub fn run() {
                 funded: Some("mixed".to_string()),
                 is_watch: false,
                 private,
-                dust_to_self: true,
+                dust_to_self: !has_notebook_input,
             });
             let n = coins.len();
             let sources: std::collections::HashSet<&str> =
