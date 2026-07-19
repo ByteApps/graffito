@@ -8,12 +8,15 @@
 //! plaintext wins over a missing cache, and re-applying the same bundle
 //! is a no-op.
 
-use notes_core::address::taproot_address;
-use notes_core::bundle::{extract_notes, extract_notes_watch, Identity, RecoveredNote, SyncBundle};
+use notes_core::address::{p2tr_script_pubkey, taproot_address};
+use notes_core::bundle::{
+    extract_notes_multi_deduped, extract_notes_watch_multi_deduped, Identity, RecoveredNote, SyncBundle,
+};
 use notes_core::tx::Utxo;
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
 
+use crate::notebooks::{SpendingAddr, SpendingSection};
 use crate::Error;
 
 pub const DEFAULT_CHUNK: usize = 100_000;
@@ -77,6 +80,22 @@ pub struct NoteRecord {
     /// self-notes; preserved across RBF so a fee-bump keeps the same gift.
     #[serde(default)]
     pub gift_amount: Option<u64>,
+    /// Funding-unification M3: who paid for this note besides the
+    /// notebook itself — `Some("spending")` for the internal BIP-84
+    /// spending wallet, `Some("wallet:<label>")` for an external funding
+    /// wallet, `None` for the ordinary notebook-funded path (today's
+    /// default — every pre-M3 record loads with `None`, so Activity shows
+    /// no source pill for it, matching current behavior byte-for-byte).
+    #[serde(default)]
+    pub funded_by: Option<String>,
+    /// Task #14 (dropped-pending detection): true once a PENDING record's
+    /// tx lookup came back a definitive not-found AND its first spent
+    /// input was verifiably still unspent — the mempool genuinely lost the
+    /// broadcast (as opposed to Orphaned, where a DIFFERENT tx spent the
+    /// inputs). Cleared the moment the tx is seen again. Never true for a
+    /// Confirmed/Orphaned record. See [`resolve_dropped`].
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 /// One input spent by a sweep/consolidate tx — kept for RBF re-signing.
@@ -123,6 +142,25 @@ pub struct TxRecord {
     /// Empty on legacy records (see `input_accounts`).
     #[serde(default)]
     pub input_indexes: Vec<u32>,
+    /// CHANGE 2 (funding-unification wallet-level flows, 2026-07-17): true
+    /// when this record's inputs mix notebook (taproot) coins with
+    /// spending-wallet (P2WPKH) coins — `build_wallet_sweep_mixed`'s
+    /// output. `input_accounts`/`input_indexes` are left EMPTY on a mixed
+    /// record (no single per-input owner scheme covers both kinds), so the
+    /// existing multi-key bump path (`bump_raw_tx_multi`, taproot-only)
+    /// must never be reached for one — the UI hides Speed-up
+    /// (`ActivityItem.bumpable`) and `on_act_bump_open`/`_confirm` refuse
+    /// defensively too. Rebroadcast still works (`raw_hex` is kept exactly
+    /// like any other pending record) — only RBF re-signing is unavailable.
+    /// Default false: every pre-existing record (single-key or
+    /// taproot-only multi-key) is unaffected and stays bumpable.
+    #[serde(default)]
+    pub mixed_inputs: bool,
+    /// Task #14 (dropped-pending detection): see `NoteRecord::dropped` —
+    /// same meaning, same [`resolve_dropped`] state machine, applied to
+    /// sweep/consolidate records via [`Store::resolve_dropped_tx`].
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,10 +221,59 @@ pub struct Store {
     /// user has already had on screen (marked when the notebook opens).
     #[serde(default)]
     pub seen_received: Vec<String>,
+    /// RUNTIME cache of the identity's spending wallet (funding-
+    /// unification M2/M3.1). `#[serde(skip)]` — this field never
+    /// round-trips with the store file: the section is per (network,
+    /// identity, ACCOUNT), shared by every notebook of the account, so it
+    /// now persists in the per-identity notebooks index
+    /// (`NotebookIndex.spending`, see `notebooks.rs`) instead. Whatever
+    /// loads a store for the active (account, notebook) must stamp this
+    /// field from `NotebookIndex::spending_for(account)`, and every
+    /// mutation (`spending_mark_used` etc.) must be written back through
+    /// `NotebookIndex::set_spending` + save — the [`Store`] methods below
+    /// only touch the in-memory copy. Defaults empty/disabled until
+    /// stamped.
+    #[serde(skip)]
+    pub spending: SpendingSection,
 }
 
 fn default_chunk() -> usize {
     DEFAULT_CHUNK
+}
+
+/// Task #14 (dropped-pending detection): the pure state-machine core —
+/// no I/O, so it's host-testable with canned inputs. Decides the NEXT
+/// `dropped` flag for one PENDING record from its tx-lookup result and
+/// (lazily — only evaluated when the lookup is `NotFound`) whether its
+/// first spent input is still sitting unspent.
+///
+/// - `Found(_)`            → false. The tx is back (still there, or newly
+///   seen) — clears a stale `dropped` from an earlier flaky lookup.
+/// - `Unknown`              → unchanged. A transient error (offline,
+///   non-404 HTTP failure, bad body) must NEVER move the flag either way.
+/// - `NotFound` + unspent   → true. The node has no record of the tx AND
+///   the coin it was supposed to spend never left — the broadcast
+///   genuinely evaporated (as opposed to Orphaned, where something ELSE
+///   spent the input).
+/// - `NotFound` + spent, or unspent-check itself inconclusive → unchanged
+///   (never guess a positive from a `NotFound` alone — the coin may have
+///   been consumed by an RBF replacement or a different owner entirely;
+///   the caller's own orphan-detection pass handles the "spent by
+///   something else" case separately).
+pub fn resolve_dropped(
+    was_dropped: bool,
+    lookup: crate::chain::TxLookupStatus,
+    first_input_unspent: impl FnOnce() -> Option<bool>,
+) -> bool {
+    use crate::chain::TxLookupStatus;
+    match lookup {
+        TxLookupStatus::Found(_) => false,
+        TxLookupStatus::Unknown => was_dropped,
+        TxLookupStatus::NotFound => match first_input_unspent() {
+            Some(true) => true,
+            _ => was_dropped,
+        },
+    }
 }
 
 impl Store {
@@ -206,6 +293,7 @@ impl Store {
             node_url: None,
             excluded_senders: Vec::new(),
             seen_received: Vec::new(),
+            spending: SpendingSection::default(),
         }
     }
 
@@ -265,27 +353,60 @@ impl Store {
 
     /// Merge a scan into the store. `bundle` must be for our address;
     /// full bundles are authoritative for the UTXO set and run orphan
-    /// detection, incrementals only add.
+    /// detection, incrementals only add. The self-spk SET (funding-
+    /// unification M2) is the notebook's own spk plus the spending
+    /// wallet's used addresses — empty `spending.used` (every pre-M2 store,
+    /// or the setting left off) makes this byte-identical to the old
+    /// singleton-spk `extract_notes` call.
+    ///
+    /// `notebook_spks` (2026-07-18, notes-core rev 6e36a23) is the DISPLAY-
+    /// OWNER anchor set: the p2tr scriptPubKeys of every ACTIVE notebook of
+    /// this identity's account, in index order — see
+    /// `identity::active_notebook_spks`, the caller's usual source. An
+    /// empty slice is a strict no-op (byte-identical to the pre-dedup
+    /// `extract_notes_multi` call), so old callers/tests are unaffected.
     pub fn apply_bundle(
         &mut self,
         bundle: &SyncBundle,
         identity: &Identity,
         network: Network,
+        notebook_spks: &[Vec<u8>],
     ) -> Result<ApplyStats, Error> {
         self.check_identity(&identity.output_x)?;
-        self.apply_recovered(bundle, extract_notes(bundle, identity, network))
+        let mut self_spks = vec![p2tr_script_pubkey(&identity.output_x)];
+        self_spks.extend(self.spending_self_spks());
+        self.apply_recovered(
+            bundle,
+            extract_notes_multi_deduped(bundle, identity, network, &self_spks, notebook_spks),
+        )
     }
 
     /// Watch-only [`Self::apply_bundle`]: same merge, but notes extract
-    /// without keys — every private body stays sealed (text: None).
+    /// without keys — every private body stays sealed (text: None). Watch
+    /// identities have no spending wallet (PLAN decision 7), so
+    /// `spending_self_spks` is always empty here — this stays byte-
+    /// identical to the old `extract_notes_watch` call. `notebook_spks`:
+    /// see [`Self::apply_bundle`] — this scan's own notebook spk (derived
+    /// from `output_x`) is the anchor identity compared against.
     pub fn apply_bundle_watch(
         &mut self,
         bundle: &SyncBundle,
         output_x: &[u8; 32],
         network: Network,
+        notebook_spks: &[Vec<u8>],
     ) -> Result<ApplyStats, Error> {
         self.check_identity(output_x)?;
-        self.apply_recovered(bundle, extract_notes_watch(bundle, network))
+        let own_spk = p2tr_script_pubkey(output_x);
+        self.apply_recovered(
+            bundle,
+            extract_notes_watch_multi_deduped(
+                bundle,
+                network,
+                &self.spending_self_spks(),
+                notebook_spks,
+                &own_spk,
+            ),
+        )
     }
 
     fn check_identity(&self, output_x: &[u8; 32]) -> Result<(), Error> {
@@ -325,6 +446,7 @@ impl Store {
                     n.height = *h;
                     n.blocktime = *bt;
                     n.raw_hex = None; // on-chain now — no rebroadcast needed
+                    n.dropped = false; // it reappeared — task #14
                 }
             }
         }
@@ -362,10 +484,78 @@ impl Store {
             if t.txids.iter().any(|x| lookup(x) == Some(true)) {
                 t.status = NoteStatus::Confirmed;
                 t.raw_hex = None; // on-chain now — no rebroadcast needed
+                t.dropped = false; // it reappeared — task #14
                 confirmed += 1;
             }
         }
         confirmed
+    }
+
+    /// Task #14 (dropped-pending detection): resolve `dropped` for every
+    /// PENDING sweep/consolidate record, same pass as
+    /// [`Self::resolve_spend_statuses`] (both run from the async refresh's
+    /// pending-status sweep, fed by the same node round trip). `lookup`
+    /// gives the CURRENT (latest RBF bump) txid's definitive-vs-transient
+    /// status; `unspent(address, txid, vout)` is called ONLY when `lookup`
+    /// says `NotFound`, checking whether the record's first spent input is
+    /// still sitting unspent at the store's own address (the common case —
+    /// see [`resolve_dropped`]'s doc for the mixed/spending-wallet-funded
+    /// caveat). Returns the CURRENT txid of every record that just
+    /// transitioned INTO dropped (for the caller's one-line-per-transition
+    /// log) — a record clearing back to not-dropped isn't included (no log
+    /// line asked for that direction).
+    pub fn resolve_dropped_tx(
+        &mut self,
+        lookup: impl Fn(&str) -> crate::chain::TxLookupStatus,
+        unspent: impl Fn(&str, &str, u32) -> Option<bool>,
+    ) -> Vec<String> {
+        let address = self.address.clone();
+        let mut newly_dropped = Vec::new();
+        for t in &mut self.txs {
+            if t.status != NoteStatus::Pending {
+                continue;
+            }
+            let Some(current) = t.txids.last() else { continue };
+            let Some(first) = t.inputs.first() else { continue };
+            let status = lookup(current);
+            let next = resolve_dropped(t.dropped, status, || {
+                unspent(&address, &first.txid, first.vout)
+            });
+            if next && !t.dropped {
+                newly_dropped.push(current.clone());
+            }
+            t.dropped = next;
+        }
+        newly_dropped
+    }
+
+    /// Task #14: the note-record twin of [`Self::resolve_dropped_tx`] — a
+    /// note's own broadcast can go missing exactly the same way a sweep's
+    /// can. Same signature/semantics; `t.spent` (the note's locked inputs)
+    /// stands in for `TxRecord.inputs`.
+    pub fn resolve_dropped_notes(
+        &mut self,
+        lookup: impl Fn(&str) -> crate::chain::TxLookupStatus,
+        unspent: impl Fn(&str, &str, u32) -> Option<bool>,
+    ) -> Vec<String> {
+        let address = self.address.clone();
+        let mut newly_dropped = Vec::new();
+        for n in &mut self.notes {
+            if n.status != NoteStatus::Pending {
+                continue;
+            }
+            let Some(current) = n.txids.last() else { continue };
+            let Some(first) = n.spent.first() else { continue };
+            let status = lookup(current);
+            let next = resolve_dropped(n.dropped, status, || {
+                unspent(&address, &first.txid, first.vout)
+            });
+            if next && !n.dropped {
+                newly_dropped.push(current.clone());
+            }
+            n.dropped = next;
+        }
+        newly_dropped
     }
 
     /// Record a broadcast sweep/consolidate for the activity view + RBF.
@@ -397,6 +587,8 @@ impl Store {
             dest_spk_hex,
             input_accounts: Vec::new(),
             input_indexes: Vec::new(),
+            mixed_inputs: false,
+            dropped: false,
         });
     }
 
@@ -452,6 +644,8 @@ impl Store {
                     vsize: None,
                     change_to: None,
                     gift_amount: None,
+                    funded_by: None,
+                    dropped: false,
                 });
                 true
             }
@@ -684,6 +878,46 @@ impl Store {
     pub fn remove_contact(&mut self, address: &str) {
         self.contacts.retain(|c| c.address != address);
     }
+
+    /// Merge a freshly derived spending address into the used list
+    /// (idempotent by (chain, index)) and bump the matching next-index
+    /// past it — fresh-address discipline (funding-unification PLAN): the
+    /// NEXT unused index always comes after every address actually handed
+    /// out or discovered. Mutates only the in-memory runtime cache — the
+    /// caller must write it back through `NotebookIndex::set_spending` +
+    /// save so the rest of the account's notebooks see the update.
+    pub fn spending_mark_used(&mut self, addr: SpendingAddr) {
+        self.spending.mark_used(addr);
+    }
+
+    /// The spending wallet's self-spk SET: every used address's
+    /// scriptPubKey — fed to `extract_notes_multi`/`_watch_multi` alongside
+    /// the notebook's own spk so a spending-wallet-funded note scans back
+    /// as OWN. Empty when the section has never been used (or the runtime
+    /// cache hasn't been stamped), which keeps scan behavior identical to
+    /// pre-M2 stores.
+    pub fn spending_self_spks(&self) -> Vec<Vec<u8>> {
+        self.spending.self_spks()
+    }
+
+    /// Merge a gap-scan's findings (`chain::discover_spending`) into the
+    /// section: every discovered used address, plus each chain's next-
+    /// unused index raised (never lowered — an unconfirmed local spend the
+    /// scan can't see yet must not un-advance the index). Same write-back
+    /// caveat as [`Self::spending_mark_used`].
+    pub fn spending_apply_discovery(
+        &mut self,
+        used: Vec<SpendingAddr>,
+        next_receive: u32,
+        next_change: u32,
+    ) {
+        self.spending.apply_discovery(used, next_receive, next_change);
+    }
+
+    /// Same write-back caveat as [`Self::spending_mark_used`].
+    pub fn spending_set_enabled(&mut self, on: bool) {
+        self.spending.enabled = on;
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -717,6 +951,8 @@ mod tests {
             vsize: None,
             change_to: None,
             gift_amount: None,
+            funded_by: None,
+            dropped: false,
         }
     }
 
@@ -767,5 +1003,309 @@ mod tests {
         assert_eq!(s.mark_seen(), 0); // idempotent
         s.notes.push(note("ee", true, Some("tb1p-carol")));
         assert_eq!(s.unread_count(), 1);
+    }
+
+    #[test]
+    fn spending_section_defaults_empty_and_disabled() {
+        let s = Store::new(&[7u8; 32], Network::Regtest);
+        assert!(!s.spending.enabled);
+        assert_eq!(s.spending.next_receive, 0);
+        assert_eq!(s.spending.next_change, 0);
+        assert!(s.spending.used.is_empty());
+        assert!(s.spending_self_spks().is_empty());
+    }
+
+    #[test]
+    fn spending_mark_used_advances_indexes_and_dedupes() {
+        let mut s = Store::new(&[7u8; 32], Network::Regtest);
+        s.spending_mark_used(SpendingAddr {
+            chain: 0,
+            index: 0,
+            address: "bc1qreceive0".into(),
+            script_pubkey_hex: "0014aa".into(),
+        });
+        s.spending_mark_used(SpendingAddr {
+            chain: 1,
+            index: 2,
+            address: "bc1qchange2".into(),
+            script_pubkey_hex: "0014bb".into(),
+        });
+        assert_eq!(s.spending.next_receive, 1);
+        assert_eq!(s.spending.next_change, 3);
+        assert_eq!(s.spending.used.len(), 2);
+        assert_eq!(s.spending_self_spks(), vec![hex::decode("0014aa").unwrap(), hex::decode("0014bb").unwrap()]);
+
+        // Re-marking the same (chain, index) is idempotent and never
+        // lowers an index a later observation already advanced past.
+        s.spending_mark_used(SpendingAddr {
+            chain: 0,
+            index: 0,
+            address: "bc1qreceive0".into(),
+            script_pubkey_hex: "0014aa".into(),
+        });
+        assert_eq!(s.spending.used.len(), 2);
+        assert_eq!(s.spending.next_receive, 1);
+    }
+
+    #[test]
+    fn spending_apply_discovery_merges_and_never_lowers_indexes() {
+        let mut s = Store::new(&[7u8; 32], Network::Regtest);
+        // Local state already advanced past index 5 on an unconfirmed
+        // change spend the discovery scan below can't see yet.
+        s.spending.next_change = 5;
+
+        s.spending_apply_discovery(
+            vec![
+                SpendingAddr { chain: 0, index: 0, address: "r0".into(), script_pubkey_hex: "00".into() },
+                SpendingAddr { chain: 0, index: 2, address: "r2".into(), script_pubkey_hex: "01".into() },
+            ],
+            3,
+            1,
+        );
+        assert_eq!(s.spending.used.len(), 2);
+        assert_eq!(s.spending.next_receive, 3);
+        // Discovery's next_change=1 must not un-advance the local 5.
+        assert_eq!(s.spending.next_change, 5);
+    }
+
+    #[test]
+    fn spending_field_is_runtime_only_and_never_round_trips_via_store() {
+        // Funding-unification M3.1: the spending section moved to the
+        // per-identity notebooks index (account-level), so `Store.spending`
+        // is now `#[serde(skip)]` — a populated cache must NOT survive a
+        // plain store save/load cycle, and the saved JSON must carry no
+        // "spending" key at all (requirement: no stale field in per-
+        // notebook store files).
+        let dir = std::env::temp_dir().join(format!("cn-store-spending-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("store-regtest-aabbccdd.json");
+        let mut s = Store::new(&[7u8; 32], Network::Regtest);
+        s.spending_set_enabled(true);
+        s.spending_mark_used(SpendingAddr {
+            chain: 0,
+            index: 0,
+            address: "bc1qreceive0".into(),
+            script_pubkey_hex: "0014aa".into(),
+        });
+        s.save(&path).unwrap();
+        let back = Store::load(&path).unwrap();
+        assert!(!back.spending.enabled);
+        assert!(back.spending.used.is_empty());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"spending\""));
+
+        // A STALE store file left over from an M2/M3 build (spending key
+        // still in the JSON) loads fine — the field is simply ignored, not
+        // adopted and not an error.
+        let legacy_path = dir.join("store-regtest-legacy.json");
+        std::fs::write(
+            &legacy_path,
+            r#"{
+                "version": 1,
+                "network": "regtest",
+                "identity_fingerprint": "aa",
+                "address": "bcrt1paaaa",
+                "notes": [],
+                "utxos": [],
+                "contacts": [],
+                "txs": [],
+                "spending": {"enabled": true, "next_receive": 3, "next_change": 1, "used": []}
+            }"#,
+        )
+        .unwrap();
+        let legacy = Store::load(&legacy_path).unwrap();
+        assert!(!legacy.spending.enabled);
+        assert!(legacy.spending_self_spks().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spending_shared_across_notebooks_via_notebook_index() {
+        use crate::notebooks::NotebookIndex;
+        // Simulates the app's stamp-then-write-back pattern (`activate()` /
+        // `State::save_spending`): load a store for a notebook, stamp its
+        // `spending` runtime cache from the ACCOUNT-level `NotebookIndex`,
+        // mutate, write back — proving two notebooks of the same account
+        // (different leaves, so different store files) never diverge, and
+        // that a mark-used via either one advances the index the other
+        // sees (fresh-address discipline across the whole account).
+        let mut ix = NotebookIndex::new();
+        let mut store_a = Store::new(&[1u8; 32], Network::Regtest); // notebook 0
+        let mut store_b = Store::new(&[2u8; 32], Network::Regtest); // notebook 1, same account
+
+        store_a.spending = ix.spending_for(0);
+        store_a.spending_set_enabled(true);
+        store_a.spending_mark_used(SpendingAddr {
+            chain: 0,
+            index: 0,
+            address: "a0".into(),
+            script_pubkey_hex: "00".into(),
+        });
+        ix.set_spending(0, store_a.spending.clone());
+
+        // Notebook B stamps FRESH from the account-level section and sees
+        // notebook A's enabled flag + index — not independent, empty state.
+        store_b.spending = ix.spending_for(0);
+        assert!(store_b.spending.enabled);
+        assert_eq!(store_b.spending.next_receive, 1);
+
+        // A mark-used via B advances the SAME index A will see next.
+        store_b.spending_mark_used(SpendingAddr {
+            chain: 0,
+            index: 1,
+            address: "a1".into(),
+            script_pubkey_hex: "01".into(),
+        });
+        ix.set_spending(0, store_b.spending.clone());
+        store_a.spending = ix.spending_for(0);
+        assert_eq!(store_a.spending.next_receive, 2);
+        assert_eq!(store_a.spending.used.len(), 2);
+        // Feeds the self-spk SCAN SET identically for every notebook of
+        // the account (requirement: apply_bundle recognizes the account's
+        // spending spks for every notebook).
+        assert_eq!(store_a.spending_self_spks().len(), 2);
+    }
+
+    // ---- task #14: dropped-pending detection — the pure state machine
+    // (`resolve_dropped`) plus its two Store-level wirings. ----
+
+    use crate::chain::TxLookupStatus;
+
+    #[test]
+    fn resolve_dropped_marks_notfound_plus_unspent_as_dropped() {
+        assert!(resolve_dropped(false, TxLookupStatus::NotFound, || Some(true)));
+    }
+
+    #[test]
+    fn resolve_dropped_transient_error_never_changes_state() {
+        // Not-yet-dropped stays not-dropped...
+        assert!(!resolve_dropped(false, TxLookupStatus::Unknown, || {
+            panic!("must not evaluate the unspent check on a transient error")
+        }));
+        // ...and an already-dropped record STAYS dropped through a blip
+        // (a transient error must never clear it either — that would need
+        // a real reappearance).
+        assert!(resolve_dropped(true, TxLookupStatus::Unknown, || {
+            panic!("must not evaluate the unspent check on a transient error")
+        }));
+    }
+
+    #[test]
+    fn resolve_dropped_reappearing_tx_clears_the_flag() {
+        assert!(!resolve_dropped(true, TxLookupStatus::Found(false), || {
+            panic!("Found must never consult the unspent check")
+        }));
+        assert!(!resolve_dropped(true, TxLookupStatus::Found(true), || {
+            panic!("Found must never consult the unspent check")
+        }));
+    }
+
+    #[test]
+    fn resolve_dropped_notfound_but_input_spent_stays_unchanged() {
+        // NotFound alone is not enough — the coin being gone too (spent by
+        // something else, or just an inconclusive check) must never flip
+        // an un-dropped record to dropped.
+        assert!(!resolve_dropped(false, TxLookupStatus::NotFound, || Some(false)));
+        assert!(!resolve_dropped(false, TxLookupStatus::NotFound, || None));
+    }
+
+    fn tx_input(txid: &str, vout: u32, value: u64) -> TxInput {
+        TxInput { txid: txid.into(), vout, value }
+    }
+
+    fn pending_tx(txid: &str, first_input: &str) -> TxRecord {
+        TxRecord {
+            kind: "sweep".into(),
+            txids: vec![txid.into()],
+            status: NoteStatus::Pending,
+            value: 1000,
+            fee: 100,
+            vsize: 150,
+            created_at: Some(1),
+            raw_hex: Some("00".into()),
+            dest: "ext".into(),
+            inputs: vec![tx_input(first_input, 0, 2000)],
+            dest_spk_hex: "51".into(),
+            input_accounts: vec![0],
+            input_indexes: vec![0],
+            mixed_inputs: false,
+            dropped: false,
+        }
+    }
+
+    #[test]
+    fn resolve_dropped_tx_marks_and_logs_the_transition() {
+        let mut store = Store::new(&[3u8; 32], Network::Regtest);
+        store.txs.push(pending_tx("deadbeef", "coin1"));
+
+        let newly = store.resolve_dropped_tx(
+            |txid| if txid == "deadbeef" { TxLookupStatus::NotFound } else { TxLookupStatus::Unknown },
+            |_addr, txid, _vout| if txid == "coin1" { Some(true) } else { None },
+        );
+        assert_eq!(newly, vec!["deadbeef".to_string()]);
+        assert!(store.txs[0].dropped);
+
+        // A second pass with the SAME inputs is not a new transition (the
+        // record is already dropped) — the caller must not re-log it.
+        let newly2 = store.resolve_dropped_tx(
+            |_| TxLookupStatus::NotFound,
+            |_addr, txid, _vout| if txid == "coin1" { Some(true) } else { None },
+        );
+        assert!(newly2.is_empty());
+        assert!(store.txs[0].dropped);
+
+        // The tx reappears (found in the mempool again) — cleared.
+        let newly3 = store.resolve_dropped_tx(|_| TxLookupStatus::Found(false), |_, _, _| None);
+        assert!(newly3.is_empty()); // "cleared" isn't a "newly dropped" transition
+        assert!(!store.txs[0].dropped);
+    }
+
+    #[test]
+    fn resolve_dropped_tx_transient_error_never_marks_dropped() {
+        let mut store = Store::new(&[4u8; 32], Network::Regtest);
+        store.txs.push(pending_tx("cafef00d", "coin2"));
+        let newly = store.resolve_dropped_tx(
+            |_| TxLookupStatus::Unknown,
+            |_, _, _| panic!("must not be called on a non-NotFound lookup"),
+        );
+        assert!(newly.is_empty());
+        assert!(!store.txs[0].dropped);
+    }
+
+    #[test]
+    fn resolve_dropped_tx_ignores_confirmed_and_orphaned_records() {
+        let mut store = Store::new(&[5u8; 32], Network::Regtest);
+        let mut t = pending_tx("11111111", "coin3");
+        t.status = NoteStatus::Confirmed;
+        store.txs.push(t);
+        let newly = store.resolve_dropped_tx(
+            |_| TxLookupStatus::NotFound,
+            |_, _, _| panic!("a Confirmed record must never reach the unspent check"),
+        );
+        assert!(newly.is_empty());
+        assert!(!store.txs[0].dropped);
+    }
+
+    #[test]
+    fn resolve_dropped_notes_mirrors_the_tx_state_machine() {
+        let mut store = Store::new(&[6u8; 32], Network::Regtest);
+        let mut n = note("aa", false, None);
+        n.status = NoteStatus::Pending;
+        n.txids = vec!["notetxid".into()];
+        n.spent = vec![OutPointRef { txid: "notecoin".into(), vout: 0 }];
+        store.notes.push(n);
+
+        let newly = store.resolve_dropped_notes(
+            |txid| if txid == "notetxid" { TxLookupStatus::NotFound } else { TxLookupStatus::Unknown },
+            |_addr, txid, _vout| if txid == "notecoin" { Some(true) } else { None },
+        );
+        assert_eq!(newly, vec!["notetxid".to_string()]);
+        assert!(store.notes[0].dropped);
+
+        // Reappears — cleared.
+        store.resolve_dropped_notes(|_| TxLookupStatus::Found(true), |_, _, _| None);
+        assert!(!store.notes[0].dropped);
     }
 }

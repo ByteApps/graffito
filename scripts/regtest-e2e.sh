@@ -189,3 +189,112 @@ pass "prime → app notebook 1 (index 0/1): decrypted by its own leaf key only"
 
 echo
 pass "interop matrix + external funding (P2TR + P2WPKH) complete (work dir: $WORK)"
+
+# ---------------------------------------------------------------------------
+# Funding-unification M4: the INTERNAL spending wallet (BIP-84 of the same
+# seed, signed fully in-app — see ../PLAN-chain-notes-funding-unification.md).
+# A dedicated identity (own mnemonic, own store) so its notebook stays
+# dust-only and the balance/utxo assertions below aren't polluted by the
+# self/directed notes composed against $STORE above.
+#
+# gap=0 (still exported from the external-funding block above) would only
+# ever probe receive/change index 0 — wrong here, since these legs hand out
+# MULTIPLE spending-wallet addresses over time. A small nonzero gap keeps the
+# regtest shim's per-address genesis-rescan cost down while still reaching
+# every index actually used.
+export CN_FUND_GAP=2
+FU_KEY="zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong"
+FU_STORE="$WORK/fu-store.json"
+export APP_KEY="$FU_KEY"
+"$APP" init "$FU_STORE" regtest | grep -q "kind=mnemonic" || fail "fu: init"
+FU_ADDR="$("$APP" address regtest)"
+[[ "$FU_ADDR" == bcrt1p* ]] || fail "fu: notebook address not taproot: $FU_ADDR"
+pass "fu: dedicated funding-unification identity $FU_ADDR (notebook stays dust-only)"
+
+echo "== fu leg 1: funded self-note (public) — self-spk-SET marks it OWN =="
+SPEND_ADDR1="$("$APP" spending-address "$FU_STORE" regtest | tail -1)"
+[[ "$SPEND_ADDR1" == bcrt1q* ]] || fail "fu leg1: spending address not segwit v0: $SPEND_ADDR1"
+curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$SPEND_ADDR1\",\"amount\":0.0005}" >/dev/null
+curl -sf -X POST "$BASE/mine?blocks=1" >/dev/null
+"$APP" note-spend-funded "$FU_STORE" "$BASE" public 2.0 "funded self note" \
+    | tee "$WORK/fu-leg1.log" | grep -q "broadcast=ok" || fail "fu leg1: note-spend-funded: $(cat "$WORK/fu-leg1.log")"
+pass "fu leg1: funded self-note composed + signed + broadcast entirely in-app via the spending wallet"
+
+"$APP" scan "$FU_STORE" "$BASE" >/dev/null
+"$APP" notes "$FU_STORE" | tee "$WORK/fu-notes1" \
+    | grep -q "private=false directed=false received=false from=- to=- text=funded self note" \
+    || fail "fu leg1: funded self-note did not scan back as OWN: $(cat "$WORK/fu-notes1")"
+pass "fu leg1: a fresh scan classifies the spending-wallet-funded note as OWN (self-spk SET, not the old notebook-spk-only rule)"
+
+echo "== fu leg 2: funded directed-private note → prime =="
+SPEND_ADDR2="$("$APP" spending-address "$FU_STORE" regtest | tail -1)"
+[ "$SPEND_ADDR2" != "$SPEND_ADDR1" ] || fail "fu leg2: spending wallet reused a receive address"
+curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$SPEND_ADDR2\",\"amount\":0.0005}" >/dev/null
+curl -sf -X POST "$BASE/mine?blocks=1" >/dev/null
+"$APP" note-spend-funded "$FU_STORE" "$BASE" private 2.0 "funded directed note" "$P_ADDR" \
+    | tee "$WORK/fu-leg2.log" | grep -q "broadcast=ok" || fail "fu leg2: note-spend-funded: $(cat "$WORK/fu-leg2.log")"
+pass "fu leg2: funded directed-private note composed + signed + broadcast entirely in-app via the spending wallet"
+
+"$APP" scan "$FU_STORE" "$BASE" >/dev/null
+"$APP" notes "$FU_STORE" | tee "$WORK/fu-notes2" \
+    | grep -q "private=true directed=true received=false from=- to=$P_ADDR text=funded directed note" \
+    || fail "fu leg2: sender's own scan did not re-read its funded directed note: $(cat "$WORK/fu-notes2")"
+pass "fu leg2: the sender's own scan re-reads its funded directed-private note (self-spk SET, own dust-output recipient key)"
+
+echo "== fu leg 4: device-side interop — prime's scanner doesn't know the spending branch =="
+# Prime (device role) scans with only a SINGLETON notebook spk — the
+# funding-unification scanner generalization is opt-in, and a device that
+# never passes a self-spk set gets exactly the pre-M0 behavior. It cannot
+# see the spending-wallet input, so it falls to the pays-notebook+PNTE
+# RECEIVED path and decrypts via the candidate-key walk (the dust-to-self
+# output, a taproot address) — same mechanism the external-funding legs
+# above already proved, now exercised for the INTERNAL kind.
+"$APP" bundle "$P_ADDR" regtest "$BASE" "$WORK/fu-prime-bundle.json" >/dev/null
+"$NOTES" scan "$WORK/fu-prime-bundle.json" >"$WORK/fu-prime-scan.json"
+jq -e --arg from "$FU_ADDR" --arg text "funded directed note" \
+    '.[] | select(.received and .private and .from == $from and .text == $text)' \
+    "$WORK/fu-prime-scan.json" >/dev/null \
+    || fail "fu leg4: prime did not decrypt the spending-wallet-funded directed note: $(cat "$WORK/fu-prime-scan.json")"
+jq -e --arg text "funded directed note" '[.[] | select(.text == $text)] | length == 1' \
+    "$WORK/fu-prime-scan.json" >/dev/null \
+    || fail "fu leg4: note vanished or duplicated in prime's scan: $(cat "$WORK/fu-prime-scan.json")"
+pass "fu leg4: prime's scanner (singleton spk) neither drops the note nor calls it its own — received, attributed to the app identity, not the funder"
+
+echo "== fu leg 5: dust accumulation — two funded notes leave two 330-sat dust coins on the notebook =="
+"$APP" scan "$FU_STORE" "$BASE" | tee "$WORK/fu-scan-dust" | grep -q "balance=660" \
+    || fail "fu leg5: expected 660 sats (2x330 dust-to-self) on the notebook: $(cat "$WORK/fu-scan-dust")"
+pass "fu leg5: notebook balance accounts for both dust-to-self outputs"
+
+echo "== fu leg 5b: the EXISTING consolidate (sweep-to-self) path sweeps the accumulated dust =="
+"$APP" sweep "$FU_STORE" "$BASE" "$FU_ADDR" 1.0 \
+    | tee "$WORK/fu-consolidate.log" | grep -q "^cli: sweep txid=" \
+    || fail "fu leg5b: dust consolidate: $(cat "$WORK/fu-consolidate.log")"
+"$APP" scan "$FU_STORE" "$BASE" | tee "$WORK/fu-scan-post-consolidate" >/dev/null
+FU_BAL_POST="$(grep -o 'balance=[0-9]*' "$WORK/fu-scan-post-consolidate" | cut -d= -f2)"
+[[ "$FU_BAL_POST" -gt 0 && "$FU_BAL_POST" -lt 660 ]] \
+    || fail "fu leg5b: post-consolidate balance unexpected: $FU_BAL_POST (want 0 < n < 660)"
+pass "fu leg5b: the two dust coins merged into one via the notebook's existing sweep/consolidate flow (balance $FU_BAL_POST sats after fee, no new mechanism)"
+
+echo "== fu leg 3: words-only recovery re-labels the funded self-note OWN, with NO local state =="
+# "Wipe the app's data dir": a brand-new work directory means a brand-new
+# notebooks index path too (it's keyed off APP_KEY's fingerprint + this
+# store's directory) — nothing survives except the SAME mnemonic. Discovery
+# re-derives the spending branch's used addresses from chain data alone,
+# proving the recovery property the whole self-spk-SET rule exists for.
+FU_RECOVERY_DIR="$WORK/fu-recovery"
+mkdir -p "$FU_RECOVERY_DIR"
+FU_STORE3="$FU_RECOVERY_DIR/fu-store.json"
+"$APP" init "$FU_STORE3" regtest >/dev/null
+"$APP" spending-discover "$FU_STORE3" "$BASE" 3 \
+    | tee "$WORK/fu-discover.log" | grep -q "^cli: spending-discover found=" \
+    || fail "fu leg3: spending-discover: $(cat "$WORK/fu-discover.log")"
+FU_FOUND="$(grep -o 'found=[0-9]*' "$WORK/fu-discover.log" | cut -d= -f2)"
+[[ "$FU_FOUND" -ge 2 ]] || fail "fu leg3: expected discovery to find both used receive addresses (leg1 + leg2), got found=$FU_FOUND"
+"$APP" scan "$FU_STORE3" "$BASE" >/dev/null
+"$APP" notes "$FU_STORE3" | tee "$WORK/fu-notes3" \
+    | grep -q "private=false directed=false received=false from=- to=- text=funded self note" \
+    || fail "fu leg3: words-only recovery did not re-label the funded self-note OWN: $(cat "$WORK/fu-notes3")"
+pass "fu leg3: words-only recovery (fresh store + fresh notebooks index, same mnemonic) re-derives the spending branch via gap discovery and re-labels the funded note OWN"
+
+echo
+pass "funding-unification M4: internal spending wallet e2e (funded self-note, funded directed-private, words-only recovery re-labeling, device-side interop, dust accumulation + consolidate) complete (work dir: $WORK)"

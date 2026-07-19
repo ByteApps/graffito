@@ -41,11 +41,13 @@ pub fn btc_network(network: Network) -> bitcoin::Network {
     }
 }
 
-fn hardened(i: u32) -> ChildNumber {
+// pub(crate): the spending-wallet module (funding-unification M2) reuses
+// these for its own BIP-84 path off the SAME master.
+pub(crate) fn hardened(i: u32) -> ChildNumber {
     ChildNumber::from_hardened_idx(i).expect("index < 2^31")
 }
 
-fn normal(i: u32) -> ChildNumber {
+pub(crate) fn normal(i: u32) -> ChildNumber {
     ChildNumber::from_normal_idx(i).expect("index < 2^31")
 }
 

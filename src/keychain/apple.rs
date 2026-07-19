@@ -110,6 +110,16 @@ pub fn store_secret_protected(account: &str, secret: &str, synced: bool) -> Resu
                 println!("cb: keychain stored synced=1");
                 Ok(())
             }
+            -34018 => {
+                // errSecMissingEntitlement: unsigned dev builds have no
+                // data-protection keychain, so a synchronizable item can't
+                // be created either. Same fallback as the non-synced path
+                // below: a plain item under the #la account, reads gated
+                // by LAContext.
+                println!("cb: keychain sync=unavailable fallback=lacontext");
+                set_generic_password(SERVICE, &la_account(account), secret.as_bytes())
+                    .map_err(|e| e.to_string())
+            }
             other => Err(format!("SecItemAdd(sync) failed ({other})")),
         };
     }

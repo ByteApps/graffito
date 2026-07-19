@@ -39,6 +39,8 @@ pub struct FundingWallet {
     pub coins: usize,
     #[serde(default)]
     pub scanned: bool,
+    #[serde(default)]
+    pub next_change_index: u32,
 }
 
 impl FundingWallet {
@@ -58,7 +60,16 @@ impl FundingWallet {
         } else {
             label.trim().to_string()
         };
-        Ok(FundingWallet { id, label, descriptor, kind: src.kind.label().into(), balance: 0, coins: 0, scanned: false })
+        Ok(FundingWallet {
+            id,
+            label,
+            descriptor,
+            kind: src.kind.label().into(),
+            balance: 0,
+            coins: 0,
+            scanned: false,
+            next_change_index: 0,
+        })
     }
 
     /// Re-parse the stored descriptor into a live `FundingSource`.

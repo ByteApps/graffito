@@ -1603,6 +1603,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
+ "const-oid",
  "crypto-common",
  "subtle",
 ]
@@ -1716,7 +1717,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee27f32b5c5292967d2d4a9d7f1e0b0aed2c15daded5a60300e4abb9d8020bca"
 dependencies = [
  "der",
+ "digest",
  "elliptic-curve",
+ "rfc6979",
  "signature",
  "spki",
 ]
@@ -3481,6 +3484,7 @@ dependencies = [
  "ecdsa",
  "elliptic-curve",
  "once_cell",
+ "sha2",
 ]
 
 [[package]]
@@ -4078,7 +4082,7 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 [[package]]
 name = "notes-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ObjSal/prime-chain-notes.git?rev=4ae1ef0ac39599c29e88a746814064dfb53b9c48#4ae1ef0ac39599c29e88a746814064dfb53b9c48"
+source = "git+ssh://git@github.com/ObjSal/prime-chain-notes.git?rev=dbbc02c93bebd9932e54b93d15819d94583b8ec7#dbbc02c93bebd9932e54b93d15819d94583b8ec7"
 dependencies = [
  "bech32",
  "bs58",
@@ -5596,6 +5600,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rfc6979"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dd2a808d456c4a54e300a23e9f5a67e122c3024119acbfd73e3bf664491cb2"
+dependencies = [
+ "hmac",
+ "subtle",
+]
+
+[[package]]
 name = "rfd"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6034,6 +6048,7 @@ version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
+ "digest",
  "rand_core 0.6.4",
 ]
 

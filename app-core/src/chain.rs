@@ -11,6 +11,7 @@
 //!
 //! The `Transport` trait isolates HTTP so tests inject canned JSON.
 
+use notes_core::address::address_to_script_pubkey;
 use notes_core::bundle::{BundleUtxo, FeeRates, OnchainTx, SyncBundle};
 use notes_core::tx::op_return_payload;
 use notes_core::Network;
@@ -21,6 +22,20 @@ use crate::Error;
 pub trait Transport {
     fn get_text(&self, path: &str) -> Result<String, Error>;
     fn post_text(&self, path: &str, body: String) -> Result<String, Error>;
+}
+
+/// Task #14 (dropped-pending detection): the outcome of a `/tx/:txid`
+/// lookup, kept distinct from a plain `Option` so a definitive "no such
+/// tx" (esplora 404) can never be confused with "couldn't tell" (network
+/// error, non-404 status, bad body) — see [`ChainClient::tx_lookup_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxLookupStatus {
+    /// The node has it — Some(confirmed-in-a-block?).
+    Found(bool),
+    /// The node definitively has no record of this txid.
+    NotFound,
+    /// Anything else — never grounds for a dropped verdict.
+    Unknown,
 }
 
 /// mempool.space bases per network. Regtest has no public instance —
@@ -111,14 +126,23 @@ impl HttpTransport {
 }
 
 impl Transport for HttpTransport {
+    // `.send()` failing means the request never reached a server at all
+    // (DNS, connection refused/reset, timeout) — `Error::Transport`, the
+    // class `ChainClient::broadcast` retries once. A `.text()` failure
+    // happens after a response header/status DID arrive, but a body that
+    // never fully lands (connection dropped mid-transfer) is the same
+    // "no usable server response" shape, so it's tagged `Transport` too.
+    // Only a cleanly-received non-2xx status (a real response, just an
+    // error one) is `Error::Http` — never retried, since retrying a
+    // rejected request can't help.
     fn get_text(&self, path: &str) -> Result<String, Error> {
         let resp = self
             .client
             .get(format!("{}{}", self.base, path))
             .send()
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(|e| Error::Transport(e.to_string()))?;
         let status = resp.status();
-        let text = resp.text().map_err(|e| Error::Http(e.to_string()))?;
+        let text = resp.text().map_err(|e| Error::Transport(e.to_string()))?;
         if !status.is_success() {
             return Err(Error::Http(format!("{status}: {text}")));
         }
@@ -131,9 +155,9 @@ impl Transport for HttpTransport {
             .post(format!("{}{}", self.base, path))
             .body(body)
             .send()
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(|e| Error::Transport(e.to_string()))?;
         let status = resp.status();
-        let text = resp.text().map_err(|e| Error::Http(e.to_string()))?;
+        let text = resp.text().map_err(|e| Error::Transport(e.to_string()))?;
         if !status.is_success() {
             return Err(Error::Http(format!("{status}: {text}")));
         }
@@ -237,6 +261,10 @@ impl<T: Transport> ChainClient<T> {
                 vout: u.vout,
                 value: u.value,
                 height: u.status.block_height.filter(|_| u.status.confirmed),
+                // None = "the bundle's scanned address" (this call scans
+                // exactly one address's own UTXOs) — notes-core's documented
+                // default, byte-identical to pre-bump behavior.
+                owner_address: None,
             })
             .collect())
     }
@@ -351,13 +379,73 @@ impl<T: Transport> ChainClient<T> {
     }
 
     /// Broadcast raw tx hex; returns the txid mempool.space echoes back.
+    ///
+    /// One automatic retry, TRANSPORT-class failures only (`Error::Transport`
+    /// — the request never reached a server: connection reset, timeout, a
+    /// dying cellular link; the exact shape a weak-connection broadcast hits,
+    /// see the "note saved, retry from here" Activity path). A real server
+    /// RESPONSE with an error status (`Error::Http` — 400 bad tx, 409, ...)
+    /// is reported immediately, no retry: retrying a rejected tx can't help,
+    /// and could even mask the real reason for a caller that only sees the
+    /// final error. Sleeping ~2s between attempts is fine to block on: this
+    /// always runs on a worker `std::thread` (every call site here spawns
+    /// one for exactly this reason), never the UI/event-loop thread. A
+    /// retried broadcast re-POSTs the SAME raw bytes, so it's idempotent —
+    /// same tx, same computed txid — a duplicate submission after a timeout
+    /// is a harmless no-op server-side, not a double-spend.
     pub fn broadcast(&self, raw_hex: &str) -> Result<String, Error> {
-        Ok(self.transport.post_text("/tx", raw_hex.to_string())?.trim().to_string())
+        match self.transport.post_text("/tx", raw_hex.to_string()) {
+            Ok(txid) => Ok(txid.trim().to_string()),
+            Err(Error::Transport(_)) => {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                self.transport
+                    .post_text("/tx", raw_hex.to_string())
+                    .map(|txid| txid.trim().to_string())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Raw hex of an on-chain/mempool tx — the keyless rebroadcast source.
     pub fn fetch_tx_hex(&self, txid: &str) -> Result<String, Error> {
         Ok(self.transport.get_text(&format!("/tx/{txid}/hex"))?.trim().to_string())
+    }
+
+    /// Task #14 (dropped-pending detection): unlike [`Self::fetch_tx_status`]
+    /// — which collapses "definitely doesn't exist" and "transient network
+    /// error" into the same `None` — this distinguishes them, since a
+    /// dropped-tx verdict must NEVER be based on a mere hiccup. `NotFound`
+    /// requires a definitive esplora 404 (what real mempool.space/esplora
+    /// returns for an unknown txid); anything else — a non-404 error status,
+    /// a connection failure, an unparseable body — is `Unknown` and must
+    /// leave the caller's state untouched. (companion/server.py's regtest
+    /// shim currently answers an unknown txid with a 400 carrying the raw
+    /// bitcoind RPC error, not a 404 — so `NotFound` is reachable against
+    /// real esplora/mempool.space but not through the local shim; see the
+    /// e2e suite's dropped-tx leg, which therefore stays host-unit-test-only.)
+    pub fn tx_lookup_status(&self, txid: &str) -> TxLookupStatus {
+        match self.transport.get_text(&format!("/tx/{txid}")) {
+            Ok(text) => match parse_json::<EsploraTx>(&text) {
+                Ok(t) => TxLookupStatus::Found(t.status.confirmed),
+                Err(_) => TxLookupStatus::Unknown,
+            },
+            Err(Error::Http(msg)) if msg.trim_start().starts_with("404") => TxLookupStatus::NotFound,
+            Err(_) => TxLookupStatus::Unknown,
+        }
+    }
+
+    /// Task #14: is this specific outpoint still sitting spendable at
+    /// `address`? Backs the dropped-tx detector's second condition — a
+    /// `NotFound` tx whose funding coin is STILL unspent means the
+    /// broadcast never really took (as opposed to Orphaned, where the coin
+    /// was spent by something else). Uses the same `/address/:a/utxo`
+    /// endpoint `Self::utxos` already calls (esplora-shape already
+    /// supported by both real esplora and companion/server.py — no new
+    /// endpoint needed). `None` on a transport/parse failure — the caller
+    /// must treat that as "don't know", not "unspent".
+    pub fn outpoint_unspent(&self, address: &str, txid: &str, vout: u32) -> Option<bool> {
+        let utxos = self.utxos(address).ok()?;
+        Some(utxos.iter().any(|u| u.txid == txid && u.vout == vout))
     }
 
     /// Real confirmation status of a txid: Some(true) = in a block,
@@ -433,7 +521,7 @@ impl<T: Transport> ChainClient<T> {
                 Some(h) => !t.status.confirmed || t.status.block_height.unwrap_or(u64::MAX) > h,
                 None => true,
             })
-            .filter_map(|t| classify_tx(t, address))
+            .filter_map(|t| classify_tx_net(t, address, self.network))
             .collect();
 
         Ok(SyncBundle {
@@ -497,9 +585,90 @@ pub fn discover_indexes<T: Transport>(
     found
 }
 
+/// Spending-wallet analog of [`discover_indexes`] (funding-unification
+/// M2): probe BOTH chains of the wallet's BIP-84 branch — receive (0) and
+/// change (1) — for on-chain history, stopping each chain after `gap`
+/// consecutive never-used indexes (the same rule `discover_indexes` and
+/// `scan_funding` use). Returns every address found used (for the store's
+/// persisted list and self-spk set, via `Store::spending_apply_discovery`)
+/// plus each chain's next-unused index. Best-effort like `discover_indexes`:
+/// a transport error stops the walk and returns what was found so far, so a
+/// words-only restore without a node simply discovers nothing yet.
+pub fn discover_spending<T: Transport>(
+    client: &ChainClient<T>,
+    source: &crate::funding::FundingSource,
+    gap: u32,
+) -> (Vec<crate::notebooks::SpendingAddr>, u32, u32) {
+    let mut used = Vec::new();
+    let mut next_receive = 0u32;
+    let mut next_change = 0u32;
+    for chain in [0usize, 1usize] {
+        let mut consecutive_unused = 0u32;
+        let mut index = 0u32;
+        let mut first_unused: Option<u32> = None;
+        let mut transport_error = false;
+        loop {
+            let Ok(d) = source.derive(chain, index) else { break };
+            match client.address_probe(&d.address) {
+                Ok((true, _)) => {
+                    used.push(crate::notebooks::SpendingAddr {
+                        chain: chain as u32,
+                        index,
+                        address: d.address.clone(),
+                        script_pubkey_hex: hex::encode(&d.spk),
+                    });
+                    consecutive_unused = 0;
+                }
+                Ok((false, _)) => {
+                    if first_unused.is_none() {
+                        first_unused = Some(index);
+                    }
+                    consecutive_unused += 1;
+                }
+                Err(_) => {
+                    transport_error = true;
+                    break;
+                }
+            }
+            index += 1;
+            // Same runaway backstop as scan_funding/discover_indexes.
+            if consecutive_unused >= gap || index >= 10_000 {
+                break;
+            }
+        }
+        let next = first_unused.unwrap_or(0);
+        if chain == 0 {
+            next_receive = next;
+        } else {
+            next_change = next;
+        }
+        if transport_error {
+            break;
+        }
+    }
+    (used, next_receive, next_change)
+}
+
 /// tx → OnchainTx iff it carries ≥1 OP_RETURN payload. Classification
 /// rules mirror chain-scan.js; payload parsing is notes-core's own.
+/// Kept exactly as shipped (no `input_prevout_spks`) — additive sibling is
+/// [`classify_tx_net`], which also needs a network to decode addresses
+/// that arrive with no raw script hex (the regtest server.py shape).
 pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
+    classify_tx_inner(tx, address, None)
+}
+
+/// [`classify_tx`] plus `input_prevout_spks` (funding-unification M2's
+/// self-spk-SET ownership rule): every input's raw prevout scriptPubKey,
+/// hex-encoded. Uses the raw `scriptpubkey` hex when the backend sends one
+/// (real esplora); when it sends only `scriptpubkey_address` (the regtest
+/// server.py shape — see the module-level gotcha), the spk is derived from
+/// the address instead of left empty.
+pub fn classify_tx_net(tx: &EsploraTx, address: &str, network: Network) -> Option<OnchainTx> {
+    classify_tx_inner(tx, address, Some(network))
+}
+
+fn classify_tx_inner(tx: &EsploraTx, address: &str, network: Option<Network>) -> Option<OnchainTx> {
     let payloads: Vec<String> = tx
         .vout
         .iter()
@@ -557,6 +726,29 @@ pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
         }
     }
 
+    // Raw prevout spks for the self-spk-SET ownership rule (funding-
+    // unification M2): prefer the raw hex esplora sends; fall back to
+    // decoding `scriptpubkey_address` (the regtest server.py shape, which
+    // carries no script hex at all — the module-level gotcha). `None`
+    // network (the legacy `classify_tx` entry point) leaves this empty,
+    // matching the pre-M2 behavior byte-for-byte.
+    let input_prevout_spks: Vec<String> = match network {
+        Some(net) => tx
+            .vin
+            .iter()
+            .filter_map(|i| {
+                let p = i.prevout.as_ref()?;
+                if let Some(hex) = p.scriptpubkey.as_deref().filter(|h| !h.is_empty()) {
+                    Some(hex.to_string())
+                } else {
+                    let addr = p.scriptpubkey_address.as_deref()?;
+                    address_to_script_pubkey(net, addr).ok().map(|spk| hex::encode(&spk))
+                }
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
     Some(OnchainTx {
         txid: tx.txid.clone(),
         height: tx.status.block_height.filter(|_| tx.status.confirmed),
@@ -566,7 +758,14 @@ pub fn classify_tx(tx: &EsploraTx, address: &str) -> Option<OnchainTx> {
         pays_self,
         sender: if spends_from_self { None } else { sender },
         author_candidates,
-        recipient: if spends_from_self { recipient } else { None },
+        // Unconditional: ownership is no longer equivalent to
+        // spends_from_self (a spending-wallet- or externally-funded own
+        // note spends other inputs), and the sender needs this field to
+        // re-derive its own directed-private DM key on rescan. notes-core
+        // surfaces it only for directed notes (the envelope flag), so a
+        // self-note's "first non-self output" (its change) stays hidden.
+        recipient,
+        input_prevout_spks,
     })
 }
 
@@ -675,5 +874,244 @@ mod tests {
         // Unknown address (not one of our notebooks) stamps index 0.
         assert_eq!((coins[1].index, coins[1].value), (0, 2000));
         assert_eq!(outputs, vec![(vec![0x51], 2500)]);
+    }
+
+    const SPENDING_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon \
+                                      abandon abandon abandon abandon about";
+
+    #[test]
+    fn discover_spending_finds_both_chains_past_holes() {
+        let m = parse_key_material(SPENDING_MNEMONIC, Network::Mainnet).unwrap();
+        let src = crate::spending::funding_source(&m, Network::Mainnet, 0).unwrap();
+        let r0 = src.derive(0, 0).unwrap().address;
+        let r2 = src.derive(0, 2).unwrap().address; // index 1 is a hole
+        let c0 = src.derive(1, 0).unwrap().address;
+        let client = ChainClient::new(
+            ProbeTransport { used: vec![r0.clone(), r2.clone(), c0.clone()], fail: false },
+            Network::Mainnet,
+        );
+        let (used, next_receive, next_change) = discover_spending(&client, &src, 5);
+
+        assert_eq!(used.iter().filter(|a| a.chain == 0).count(), 2);
+        assert!(used.iter().any(|a| a.chain == 0 && a.index == 0 && a.address == r0));
+        assert!(used.iter().any(|a| a.chain == 0 && a.index == 2 && a.address == r2));
+        // First unused receive index is the hole at 1 (same "first unused,
+        // holes don't count as the frontier" rule scan_funding uses).
+        assert_eq!(next_receive, 1);
+        assert_eq!(used.iter().filter(|a| a.chain == 1).count(), 1);
+        assert_eq!(next_change, 1);
+        for a in &used {
+            assert!(hex::decode(&a.script_pubkey_hex).is_ok(), "spk must be valid hex");
+        }
+    }
+
+    #[test]
+    fn discover_spending_on_fresh_wallet_is_empty() {
+        let m = parse_key_material(SPENDING_MNEMONIC, Network::Mainnet).unwrap();
+        let src = crate::spending::funding_source(&m, Network::Mainnet, 0).unwrap();
+        let client = ChainClient::new(ProbeTransport { used: vec![], fail: false }, Network::Mainnet);
+        let (used, next_receive, next_change) = discover_spending(&client, &src, 5);
+        assert!(used.is_empty());
+        assert_eq!(next_receive, 0);
+        assert_eq!(next_change, 0);
+    }
+
+    #[test]
+    fn discover_spending_offline_is_best_effort() {
+        let m = parse_key_material(SPENDING_MNEMONIC, Network::Mainnet).unwrap();
+        let src = crate::spending::funding_source(&m, Network::Mainnet, 0).unwrap();
+        let r0 = src.derive(0, 0).unwrap().address;
+        let client = ChainClient::new(ProbeTransport { used: vec![r0], fail: true }, Network::Mainnet);
+        let (used, next_receive, next_change) = discover_spending(&client, &src, 5);
+        assert!(used.is_empty());
+        assert_eq!((next_receive, next_change), (0, 0));
+    }
+
+    #[test]
+    fn classify_tx_net_populates_input_prevout_spks_from_address_or_hex() {
+        use notes_core::tx::op_return_script;
+        let m = parse_key_material(SPENDING_MNEMONIC, Network::Regtest).unwrap();
+        let key = crate::spending::derive_spending_key(&m, Network::Regtest, 0, 0, 0).unwrap();
+        let payload_hex = hex::encode(op_return_script(b"hi"));
+        let spk_hex = hex::encode(&key.script_pubkey);
+
+        // Regtest server.py shape: only `scriptpubkey_address` on the
+        // prevout, no raw script hex — the spk must be DERIVED from it.
+        let json_addr_only = format!(
+            r#"{{"txid":"t1","vin":[{{"txid":"a","vout":0,"prevout":{{"scriptpubkey_address":"{}","value":1000}}}}],"vout":[{{"scriptpubkey":"{payload_hex}","scriptpubkey_type":"op_return","value":0}}],"status":{{"confirmed":false}}}}"#,
+            key.address
+        );
+        let tx: EsploraTx = serde_json::from_str(&json_addr_only).unwrap();
+        let onchain = classify_tx_net(&tx, "not-our-address", Network::Regtest).unwrap();
+        assert_eq!(onchain.input_prevout_spks, vec![spk_hex.clone()]);
+        // The legacy no-network entry point stays empty — byte-identical
+        // to pre-M2 behavior.
+        assert!(classify_tx(&tx, "not-our-address").unwrap().input_prevout_spks.is_empty());
+
+        // Real esplora shape: raw scriptpubkey hex present — used directly.
+        let json_hex = format!(
+            r#"{{"txid":"t2","vin":[{{"txid":"a","vout":0,"prevout":{{"scriptpubkey":"{spk_hex}","value":1000}}}}],"vout":[{{"scriptpubkey":"{payload_hex}","scriptpubkey_type":"op_return","value":0}}],"status":{{"confirmed":false}}}}"#
+        );
+        let tx2: EsploraTx = serde_json::from_str(&json_hex).unwrap();
+        let onchain2 = classify_tx_net(&tx2, "not-our-address", Network::Regtest).unwrap();
+        assert_eq!(onchain2.input_prevout_spks, vec![spk_hex]);
+    }
+
+    // ---- task #14: dropped-pending detection — tx_lookup_status /
+    // outpoint_unspent (the ChainClient half; the pure state machine that
+    // consumes them, `store::resolve_dropped`, is tested in store.rs). ----
+
+    /// Canned `/tx/:txid` transport: a 404 (real-esplora "definitely no
+    /// such tx"), a non-404 error (transient), and a found tx, keyed by
+    /// txid. `/address/:a/utxo` answers from a fixed outpoint list.
+    struct TxLookupTransport {
+        found_confirmed: Option<bool>, // Some(confirmed) for txid "found"
+        utxos: Vec<(&'static str, u32)>, // (txid, vout) pairs deemed unspent
+    }
+
+    impl Transport for TxLookupTransport {
+        fn get_text(&self, path: &str) -> Result<String, Error> {
+            if path == "/tx/found" {
+                let confirmed = self.found_confirmed.expect("found_confirmed must be set");
+                return Ok(format!(
+                    r#"{{"txid":"found","vin":[],"vout":[],"status":{{"confirmed":{confirmed}}}}}"#
+                ));
+            }
+            if path == "/tx/missing" {
+                return Err(Error::Http("404 Not Found: Transaction not found".into()));
+            }
+            if path == "/tx/flaky" {
+                return Err(Error::Http("connection reset".into()));
+            }
+            if path == "/tx/bad-status" {
+                // A non-404 HTTP error must NOT read as NotFound.
+                return Err(Error::Http("500 Internal Server Error: oops".into()));
+            }
+            if path.starts_with("/address/") && path.ends_with("/utxo") {
+                let items: Vec<String> = self
+                    .utxos
+                    .iter()
+                    .map(|(t, v)| {
+                        format!(
+                            r#"{{"txid":"{t}","vout":{v},"value":1000,"status":{{"confirmed":true,"block_height":1}}}}"#
+                        )
+                    })
+                    .collect();
+                return Ok(format!("[{}]", items.join(",")));
+            }
+            Err(Error::Http(format!("unexpected path: {path}")))
+        }
+        fn post_text(&self, _path: &str, _body: String) -> Result<String, Error> {
+            unreachable!("dropped-detection never POSTs")
+        }
+    }
+
+    #[test]
+    fn tx_lookup_status_distinguishes_found_notfound_unknown() {
+        let client = ChainClient::new(
+            TxLookupTransport { found_confirmed: Some(true), utxos: vec![] },
+            Network::Regtest,
+        );
+        assert_eq!(client.tx_lookup_status("found"), TxLookupStatus::Found(true));
+        assert_eq!(client.tx_lookup_status("missing"), TxLookupStatus::NotFound);
+        // A transport-level failure (no HTTP status at all) is Unknown, not
+        // NotFound — a dropped verdict must never come from a network blip.
+        assert_eq!(client.tx_lookup_status("flaky"), TxLookupStatus::Unknown);
+        // A definite HTTP error that ISN'T a 404 is also Unknown, never
+        // NotFound — only a real esplora 404 counts as definitive.
+        assert_eq!(client.tx_lookup_status("bad-status"), TxLookupStatus::Unknown);
+    }
+
+    #[test]
+    fn tx_lookup_status_found_reports_mempool_vs_confirmed() {
+        let client = ChainClient::new(
+            TxLookupTransport { found_confirmed: Some(false), utxos: vec![] },
+            Network::Regtest,
+        );
+        assert_eq!(client.tx_lookup_status("found"), TxLookupStatus::Found(false));
+    }
+
+    #[test]
+    fn outpoint_unspent_checks_the_address_utxo_set() {
+        let client = ChainClient::new(
+            TxLookupTransport { found_confirmed: None, utxos: vec![("aa", 0), ("bb", 1)] },
+            Network::Regtest,
+        );
+        assert_eq!(client.outpoint_unspent("addr1", "aa", 0), Some(true));
+        assert_eq!(client.outpoint_unspent("addr1", "aa", 1), Some(false));
+        assert_eq!(client.outpoint_unspent("addr1", "cc", 0), Some(false));
+    }
+
+    // ---- broadcast: one retry, transport-class failures only ----
+
+    /// Canned `/tx` POST transport whose first N attempts fail with a fixed
+    /// error (transport- or response-shaped, caller's choice), then succeed
+    /// — `attempts` counts every `post_text` call so tests can assert the
+    /// retry fired exactly once (never more).
+    struct BroadcastTransport {
+        fail_first: std::cell::Cell<u32>,
+        fail_err: Error,
+        attempts: std::cell::Cell<u32>,
+    }
+    impl Transport for BroadcastTransport {
+        fn get_text(&self, _path: &str) -> Result<String, Error> {
+            unreachable!("broadcast never GETs")
+        }
+        fn post_text(&self, path: &str, _body: String) -> Result<String, Error> {
+            assert_eq!(path, "/tx");
+            self.attempts.set(self.attempts.get() + 1);
+            let remaining = self.fail_first.get();
+            if remaining > 0 {
+                self.fail_first.set(remaining - 1);
+                return Err(self.fail_err.clone());
+            }
+            Ok("deadbeef".into())
+        }
+    }
+
+    #[test]
+    fn broadcast_retries_once_after_a_transport_failure_then_succeeds() {
+        let transport = BroadcastTransport {
+            fail_first: std::cell::Cell::new(1),
+            fail_err: Error::Transport("error sending request for url (...)".into()),
+            attempts: std::cell::Cell::new(0),
+        };
+        let client = ChainClient::new(transport, Network::Testnet4);
+        assert_eq!(client.broadcast("aabbcc").unwrap(), "deadbeef");
+        assert_eq!(client.transport.attempts.get(), 2, "one retry after the transport failure");
+    }
+
+    #[test]
+    fn broadcast_gives_up_after_two_transport_failures() {
+        let transport = BroadcastTransport {
+            fail_first: std::cell::Cell::new(99), // every attempt fails
+            fail_err: Error::Transport("connection reset".into()),
+            attempts: std::cell::Cell::new(0),
+        };
+        let client = ChainClient::new(transport, Network::Testnet4);
+        let err = client.broadcast("aabbcc").unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
+        assert_eq!(
+            client.transport.attempts.get(),
+            2,
+            "exactly one retry, not an unbounded loop"
+        );
+    }
+
+    #[test]
+    fn broadcast_never_retries_a_server_rejection() {
+        let transport = BroadcastTransport {
+            fail_first: std::cell::Cell::new(99),
+            fail_err: Error::Http("400 Bad Request: bad-txns-in-belowout".into()),
+            attempts: std::cell::Cell::new(0),
+        };
+        let client = ChainClient::new(transport, Network::Testnet4);
+        let err = client.broadcast("aabbcc").unwrap_err();
+        assert!(matches!(err, Error::Http(_)));
+        assert_eq!(
+            client.transport.attempts.get(),
+            1,
+            "a real server response (even an error one) is reported immediately"
+        );
     }
 }

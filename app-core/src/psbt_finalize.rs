@@ -6,7 +6,6 @@ use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Address, Psbt};
 use miniscript::psbt::PsbtExt;
 use notes_core::address::p2tr_script_pubkey;
-use notes_core::bundle::Identity;
 use notes_core::envelope;
 use notes_core::tx::op_return_payload;
 use notes_core::Network;
@@ -191,6 +190,7 @@ mod tests {
     use crate::funding::{FundingSource, FundingUtxo};
     use crate::psbt_build::{build_funding_psbt, FundingPlan, NoteParams};
     use notes_core::address::Recipient;
+    use notes_core::bundle::Identity;
 
     const BIP86_ACCT_XPUB: &str = "xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ";
     const NET: Network = Network::Mainnet;
