@@ -95,6 +95,20 @@ struct State {
     fees: Option<FeeRates>,
     usd: Option<f64>,
     to_address: Option<String>, // None = self-note
+    /// Multi-recipient directed notes: EXTRA recipient addresses beyond
+    /// `to_address` (the compose screen's removable To-chips). Empty =
+    /// today's ordinary single-recipient flow. Notebook-funded compose
+    /// only (`pay_from == "notebook"`) — hidden/disabled for watch-only
+    /// and for the spending/mixed/external funding paths (a later unit;
+    /// see the PR description). Reset by `pick_contact_core` (a fresh
+    /// primary pick starts a fresh recipient list) and on any compose-
+    /// session reset.
+    to_addresses_extra: Vec<String>,
+    /// True while the send-to picker (screen 7) was opened via "+ Add
+    /// recipient" on compose — `on_pick_contact` appends to
+    /// `to_addresses_extra` instead of replacing the primary recipient,
+    /// and Back returns to compose (screen 6) instead of home.
+    picking_extra: bool,
     /// Coin control: selected inputs (display-txid, vout) for the compose
     /// in progress; `coins_overridden` = the user has touched the set (so
     /// stop auto-suggesting).
@@ -743,6 +757,7 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
             received: false,
             sender: None,
             recipient: wn.recipient.clone(),
+            recipients: Vec::new(),
             txids: vec![txid.to_string()],
             height: None,
             blocktime: None,
@@ -1861,7 +1876,102 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
     st.sp_expanded = false;
     st.payfrom_expanded_source.clear();
     st.payfrom_wallet_coins.clear();
+    // A fresh primary pick starts a fresh recipient list — extra
+    // multi-select chips from a PRIOR compose must never leak into this
+    // one (mirrors every other per-compose-session reset above).
+    st.to_addresses_extra.clear();
+    refresh_to_chips(w, st);
     resolve_payfrom_default(w, st);
+    w.set_screen(6);
+    refresh_compose(w, st);
+}
+
+/// Refresh the compose screen's removable To-chips (`AppWindow.to-chips`)
+/// from `st.to_addresses_extra`, resolving each address to its contact
+/// name (if any) the same way the confirm screen's `recipient_name`
+/// lookup does. Called whenever the extra-recipient list changes: a fresh
+/// primary pick (cleared), `on_add_chip` (appended), `on_remove_chip`
+/// (removed).
+fn refresh_to_chips(w: &AppWindow, st: &State) {
+    let rows: Vec<ContactItem> = st
+        .to_addresses_extra
+        .iter()
+        .map(|a| {
+            let name = st
+                .store
+                .as_ref()
+                .and_then(|s| s.contacts.iter().find(|c| &c.address == a && !c.name.is_empty()))
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            ContactItem { address: a.clone().into(), name: name.into() }
+        })
+        .collect();
+    w.set_to_chips(VecModel::from_slice(&rows));
+}
+
+/// Multi-select: append `addr` to `st.to_addresses_extra` (validated,
+/// normalized/lowercased the same way `pick_contact_core` handles a typo'd
+/// address case, deduped against BOTH the primary `to_address` and the
+/// existing extras, capped at 255 total recipients — the UI selection cap;
+/// notes-core's own compose-time 1..=255 dedupe is the wire-level
+/// backstop). Touches the contact (recency) and returns to compose
+/// (screen 6), reusing the SAME `refresh_compose` the primary picker uses
+/// so the cost line/preview updates immediately.
+fn add_recipient_chip(w: &AppWindow, st: &mut State, addr: &str) {
+    let mut a = normalize_addr(addr);
+    if a == "self" || a.is_empty() {
+        w.set_status("pick an address".into());
+        return;
+    }
+    let parsed = match Recipient::parse(st.network, &a) {
+        Ok(r) => r,
+        Err(_) => {
+            let lower = a.to_lowercase();
+            match Recipient::parse(st.network, &lower) {
+                Ok(r) => {
+                    a = lower;
+                    r
+                }
+                Err(_) => {
+                    println!("cb: add-chip err=bad-address");
+                    w.set_status(format!("not a valid {} address", st.network.as_str()).into());
+                    return;
+                }
+            }
+        }
+    };
+    // Same inline error pattern as the single-recipient compose path
+    // (notes-core's `Error::RecipientNotTaproot`, surfaced when Sign is
+    // tapped) — checked proactively here too, before it's even added as a
+    // chip, since private+non-taproot is knowable immediately.
+    if w.get_compose_private() && parsed.p2tr_x.is_none() {
+        println!("cb: add-chip err=not-taproot");
+        w.set_status("private directed notes need a taproot (bc1p…) recipient".into());
+        return;
+    }
+    let already = st.to_address.as_deref() == Some(a.as_str()) || st.to_addresses_extra.iter().any(|x| x == &a);
+    st.picking_extra = false;
+    if already {
+        println!("cb: add-chip dup");
+        w.set_status("already added".into());
+        w.set_screen(6);
+        return;
+    }
+    let total = 1 + st.to_addresses_extra.len();
+    if total >= 255 {
+        println!("cb: add-chip err=limit");
+        w.set_status("recipient limit reached (255)".into());
+        w.set_screen(6);
+        return;
+    }
+    if let Some(store) = &mut st.store {
+        store.touch_contact(&a);
+    }
+    st.save_store();
+    refresh_contacts(w, st);
+    st.to_addresses_extra.push(a.clone());
+    println!("cb: add-chip n={}", st.to_addresses_extra.len() + 1);
+    refresh_to_chips(w, st);
     w.set_screen(6);
     refresh_compose(w, st);
 }
@@ -3379,6 +3489,7 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
                         received: false,
                         sender: None,
                         recipient: r.to.clone(),
+                        recipients: Vec::new(),
                         txids: vec![r.txid.clone()],
                         height: None,
                         blocktime: None,
@@ -3486,6 +3597,7 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                         received: false,
                         sender: None,
                         recipient: r.to.clone(),
+                        recipients: Vec::new(),
                         txids: vec![r.txid.clone()],
                         height: None,
                         blocktime: None,
@@ -4062,6 +4174,68 @@ fn note_est_at(
     Ok((chunks, vsize))
 }
 
+/// Multi-recipient (2+ chips) analog of `note_est`: notes-core's
+/// `estimate_note_cost` only takes a single optional recipient spk length,
+/// and doesn't expose the intermediate payload-chunk LENGTHS it computes
+/// internally (only a total count + a <=1-recipient vsize) — so this
+/// reimplements that same chunking arithmetic from notes-core's own public
+/// size constants (`envelope::HEADER_LEN`, `crypt::SEAL_OVERHEAD`,
+/// `dm::WRAP_LEN`, matching `multi_body`'s framing exactly: `count(u8) ||
+/// text` public, `count(u8) || count×WRAP_LEN || SEAL_OVERHEAD+text`
+/// private) and feeds the result to `tx::estimate_vsize_multi`. This is a
+/// PREVIEW convenience only — the universal confirm screen prices the
+/// ACTUAL signed tx regardless, so an approximation here can never desync
+/// what gets broadcast from what the user confirmed.
+fn multi_note_est(
+    text_len: usize,
+    private: bool,
+    chunk_size: usize,
+    n_inputs: usize,
+    recipient_spk_lens: &[usize],
+    change_spk_len: Option<usize>,
+) -> Result<(usize, usize), app_core::notes_core::Error> {
+    use app_core::notes_core::{crypt, dm, envelope, tx, Error};
+    let n = recipient_spk_lens.len();
+    let body_len = if private { 1 + n * dm::WRAP_LEN + crypt::SEAL_OVERHEAD + text_len } else { 1 + text_len };
+    if body_len == 0 {
+        return Err(Error::Envelope("empty body"));
+    }
+    if chunk_size <= envelope::HEADER_LEN {
+        return Err(Error::Envelope("max_payload smaller than header"));
+    }
+    let inner = chunk_size - envelope::HEADER_LEN;
+    let total = body_len.div_ceil(inner);
+    if total > u8::MAX as usize {
+        return Err(Error::PayloadTooLarge);
+    }
+    let mut payload_lens = vec![chunk_size; total.saturating_sub(1)];
+    let tail = body_len - (total - 1) * inner;
+    payload_lens.push(envelope::HEADER_LEN + tail);
+    let vsize = tx::estimate_vsize_multi(n_inputs.max(1), &payload_lens, recipient_spk_lens, true);
+    let vsize = change_spk_len.map_or(vsize, |l| (vsize as i64 + l as i64 - 34).max(0) as usize);
+    Ok((total, vsize))
+}
+
+/// Single call site for the compose preview's cost estimate: delegates to
+/// the ordinary single-recipient `note_est` for 0 or 1 recipients (today's
+/// exact byte-identical estimator) and to `multi_note_est` for 2+ — so
+/// every existing caller (self-notes, ordinary directed notes) is
+/// unaffected.
+fn compose_est(
+    store: &Store,
+    text_len: usize,
+    private: bool,
+    n_inputs: usize,
+    recipient_spk_lens: &[usize],
+    change_spk_len: Option<usize>,
+) -> Result<(usize, usize), app_core::notes_core::Error> {
+    if recipient_spk_lens.len() >= 2 {
+        multi_note_est(text_len, private, store.chunk_size, n_inputs, recipient_spk_lens, change_spk_len)
+    } else {
+        note_est(store, text_len, private, n_inputs, recipient_spk_lens.first().copied(), change_spk_len)
+    }
+}
+
 /// Whether the composed note can go out as one standard tx, and if not, whether
 /// bumping the chunk size to Standard would rescue it.
 enum FitCheck {
@@ -4100,13 +4274,19 @@ fn fit_check(
 /// never auto-selected — the user adds them manually). `consolidate` = pick
 /// SMALLEST coins first (sweeps dust up into the change); otherwise LARGEST
 /// first (fewest inputs, lowest fee). Stops once the note + fee is covered.
+/// `recipient_spk_lens` replaces the old singular `spk_len` (additive,
+/// 2026-07 multi-recipient): 0 entries = self-note, 1 = an ordinary
+/// directed note (byte-identical to before via `compose_est`'s
+/// delegation), 2+ = a multi-recipient note priced through
+/// `multi_note_est`. `sent` is the TOTAL sats sent to every recipient
+/// (gift × recipient count), not a single recipient's gift.
 #[allow(clippy::too_many_arguments)]
 fn suggested_coins(
     store: &Store,
     text_len: usize,
     private: bool,
     rate: f64,
-    spk_len: Option<usize>,
+    recipient_spk_lens: &[usize],
     change_spk_len: Option<usize>,
     sent: u64,
     consolidate: bool,
@@ -4127,7 +4307,7 @@ fn suggested_coins(
         chosen.push((u.txid.clone(), u.vout));
         total += u.value;
         if let Ok((_, vsize)) =
-            note_est(store, text_len.max(1), private, chosen.len(), spk_len, change_spk_len)
+            compose_est(store, text_len.max(1), private, chosen.len(), recipient_spk_lens, change_spk_len)
         {
             let fee = (vsize as f64 * rate).ceil() as u64;
             if total >= fee + sent {
@@ -4591,6 +4771,20 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
     } else {
         0
     };
+    // Multi-recipient: every chip's spk length (uniform gift each) — empty
+    // when self-note, one entry for an ordinary directed note (unchanged
+    // estimate via `compose_est`'s delegation), 2+ for a real multi note.
+    let recipient_spk_lens: Vec<usize> = match recipient.as_ref() {
+        Some(r) => {
+            let mut v = vec![r.spk.len()];
+            v.extend(st.to_addresses_extra.iter().filter_map(|a| Recipient::parse(net, a).ok()).map(|x| x.spk.len()));
+            v
+        }
+        None => Vec::new(),
+    };
+    // `gift` is already 0 for a self-note, so this is 0 there regardless
+    // of the `.max(1)` below (empty `recipient_spk_lens`).
+    let total_sent = gift * recipient_spk_lens.len().max(1) as u64;
     let change_raw = w.get_change_address().to_string();
     let change_trim = change_raw.trim();
     let custom_change = if change_trim.is_empty() { None } else { Recipient::parse(net, change_trim).ok() };
@@ -4638,14 +4832,13 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         // the line blank just because the user hasn't picked a coin yet.
         // No fold prediction here — there's no real selection yet to fold
         // FROM (`in_value` would be 0), so this stays the plain estimate.
-        let spk_len = recipient.as_ref().map(|r| r.spk.len());
         let change_len = custom_change_spk_len.or(Some(34));
         let fee = st
             .store
             .as_ref()
-            .and_then(|store| note_est(store, text_for_est.len(), private, 1, spk_len, change_len).ok())
+            .and_then(|store| compose_est(store, text_for_est.len(), private, 1, &recipient_spk_lens, change_len).ok())
             .map(|(_, vsize)| (vsize as f64 * rate).ceil().max(0.0) as u64);
-        required = fee.map(|f| f + gift);
+        required = fee.map(|f| f + total_sent);
         source_label = if st.payfrom_active_source == "spending" { "Spending wallet".to_string() } else { "Notebook".to_string() };
         required_line = required.map(|r| format!("~{} sats", commas(r))).unwrap_or_else(|| "~0 sats".to_string());
         shape = PayfromShape::Empty;
@@ -4657,17 +4850,18 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         // the NOMINAL fee (what the no-change shape actually needs), and
         // the line notes the folded leftover separately so it never reads
         // as an inflated/expensive fee.
-        let spk_len = recipient.as_ref().map(|r| r.spk.len());
         let change_len = custom_change_spk_len.unwrap_or(34);
         let vsize = st
             .store
             .as_ref()
-            .and_then(|store| note_est(store, text_for_est.len(), private, nb_sel.len().max(1), spk_len, Some(change_len)).ok())
+            .and_then(|store| {
+                compose_est(store, text_for_est.len(), private, nb_sel.len().max(1), &recipient_spk_lens, Some(change_len)).ok()
+            })
             .map(|(_, vsize)| vsize);
         let fee_wc = vsize.map(|v| (v as f64 * rate).ceil().max(0.0) as u64);
-        let fold = vsize.and_then(|v| app_core::mixed::predict_notebook_fold(nb_total, gift, v, change_len, rate));
+        let fold = vsize.and_then(|v| app_core::mixed::predict_notebook_fold(nb_total, total_sent, v, change_len, rate));
         let nominal = fold.map(|(n, _)| n).or(fee_wc);
-        required = nominal.map(|f| f + gift);
+        required = nominal.map(|f| f + total_sent);
         source_label = "Notebook".to_string();
         required_line = fold_required_line(required, fold);
         shape = PayfromShape::Notebook;
@@ -5112,9 +5306,22 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         .as_deref()
         .and_then(|a| Recipient::parse(net, a).ok())
         .map(|r| r.spk.len());
-    // Directed notes send a "gift" to the recipient (>= dust); self-notes send 0.
+    // Multi-recipient: every chip's spk length (uniform gift each) — empty
+    // for a self-note, one entry for an ordinary directed note (byte-
+    // identical estimate via `compose_est`'s <=1 delegation), 2+ for a
+    // real multi-recipient note.
+    let recipient_spk_lens: Vec<usize> = match spk_len {
+        Some(l) => {
+            let mut v = vec![l];
+            v.extend(st.to_addresses_extra.iter().filter_map(|a| Recipient::parse(net, a).ok()).map(|r| r.spk.len()));
+            v
+        }
+        None => Vec::new(),
+    };
+    let n_recipients = recipient_spk_lens.len();
+    // Directed notes send a "gift" to EACH recipient (>= dust); self-notes send 0.
     let gift = w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS);
-    let sent = if spk_len.is_some() { gift } else { 0 };
+    let sent = if spk_len.is_some() { gift * n_recipients.max(1) as u64 } else { 0 };
 
     // Change-address destination label + validation. A valid custom change
     // address also yields its scriptPubKey length so the fee/change preview
@@ -5150,8 +5357,16 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     let Some(store) = &st.store else { return };
     // Auto-suggest a selection until the user overrides it.
     if !st.coins_overridden {
-        st.selected_coins =
-            suggested_coins(store, text.len(), private, rate, spk_len, change_spk_len, sent, consolidate);
+        st.selected_coins = suggested_coins(
+            store,
+            text.len(),
+            private,
+            rate,
+            &recipient_spk_lens,
+            change_spk_len,
+            sent,
+            consolidate,
+        );
     }
     let store = st.store.as_ref().unwrap();
     let exb = st.explorer_base();
@@ -5189,7 +5404,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         // the line still reads as a real (labeled) estimate instead of
         // going blank.
         let n = sel_count.max(1);
-        let est_fee = note_est(store, 1, private, n, spk_len, change_spk_len)
+        let est_fee = compose_est(store, 1, private, n, &recipient_spk_lens, change_spk_len)
             .ok()
             .map(|(_, vsize)| (vsize as f64 * rate).ceil().max(0.0) as u64);
         let min_line = est_fee
@@ -5202,7 +5417,13 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         return;
     }
     let n = sel_count.max(1);
-    let est = note_est(store, text.len(), private, n, spk_len, change_spk_len);
+    let est = compose_est(store, text.len(), private, n, &recipient_spk_lens, change_spk_len);
+    // fit_check stays the single-recipient shape on purpose: the >255-
+    // chunk/100kB-vsize ceiling it guards is dominated by the TEXT/chunk
+    // count, which multi-recipient outputs don't change (recipients add a
+    // fixed handful of vB each — `est` above already prices them exactly;
+    // this only decides whether the oversize dialog shows, so an N-
+    // recipient note stays governed by the same body-size wall as N=1).
     let fit = fit_check(store, text.len(), private, n, spk_len, change_spk_len);
     let over = !matches!(fit, FitCheck::Ok);
     match est {
@@ -5235,11 +5456,22 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
                 }
                 st.compose_fold_shown = fold_amount;
             }
+            // "+330 sats to recipient" for one recipient (unchanged copy);
+            // "3 recipients · +990 sats total" for a multi-recipient note
+            // (uniform gift × N — consistent with the existing cost-line
+            // "key: value" style, just pluralized).
+            let gift_line = if n_recipients >= 2 {
+                format!("{n_recipients} recipients · +{} sats total", commas(sent))
+            } else if spk_len.is_some() {
+                format!("+{} sats", commas(sent))
+            } else {
+                String::new()
+            };
             set_cost_card(
                 w,
                 format!("{chunks} chunk{} · ~{vsize} vB", if chunks == 1 { "" } else { "s" }),
                 format!("~{} sats{usd}", commas(fee)),
-                if spk_len.is_some() { format!("+{} sats", commas(sent)) } else { String::new() },
+                gift_line,
                 String::new(), // no dust-to-self on the self-funded notebook shape
                 fold.map(|(nominal, folded)| (folded, nominal + folded)),
             );
@@ -6554,6 +6786,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
                 expected_change: None,
                 recipient: Some(dest.clone()),
                 recipient_name: None,
+                recipients: Vec::new(),
                 note_preview: None,
             };
             let pending = PendingBroadcast {
@@ -6632,6 +6865,7 @@ fn build_consolidate_confirm(w: &AppWindow, s: &mut State, rate: f64) {
                 expected_change: None,
                 recipient: None,
                 recipient_name: None,
+                recipients: Vec::new(),
                 note_preview: None,
             };
             let pending = PendingBroadcast {
@@ -6850,6 +7084,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
         expected_change: None,
         recipient: None,
         recipient_name: None,
+        recipients: Vec::new(),
         note_preview: None,
     };
     let pending = PendingBroadcast {
@@ -6887,6 +7122,7 @@ fn enter_rebroadcast_confirm(w: &AppWindow, st: &mut State, ref_id: String, is_n
         expected_change,
         recipient: None,
         recipient_name: None,
+        recipients: Vec::new(),
         note_preview: None,
     };
     let pending = PendingBroadcast {
@@ -7039,6 +7275,7 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
         expected_change: change_addr,
         recipient: recipient_addr,
         recipient_name,
+        recipients: Vec::new(),
         note_preview,
     };
 
@@ -7178,6 +7415,8 @@ pub fn run() {
         fees: None,
         usd: None,
         to_address: None,
+        to_addresses_extra: Vec::new(),
+        picking_extra: false,
         selected_coins: Vec::new(),
         coins_overridden: false,
         consolidate_coins: false,
@@ -7938,6 +8177,24 @@ pub fn run() {
             w.set_note_txid(n.txids.last().cloned().unwrap_or_default().into());
             let reply_addr = if n.received { n.sender.clone().unwrap_or_default() } else { String::new() };
             w.set_note_reply_address(reply_addr.into());
+            // Reply-all set ({sender} ∪ recipients minus me) — meaningful
+            // for both a received note (sender + other recipients) and an
+            // OWN multi-recipient note (reply to everyone else on it).
+            let my_addr = s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
+            let reply_rows: Vec<ContactItem> = n
+                .reply_set(&my_addr)
+                .iter()
+                .map(|a| {
+                    let name = store
+                        .contacts
+                        .iter()
+                        .find(|c| &c.address == a && !c.name.is_empty())
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    ContactItem { address: a.clone().into(), name: name.into() }
+                })
+                .collect();
+            w.set_note_reply_set(VecModel::from_slice(&reply_rows));
             let web = match s.network {
                 Network::Regtest => String::new(),
                 net => {
@@ -8302,6 +8559,7 @@ pub fn run() {
                     expected_change,
                     recipient: None,
                     recipient_name: None,
+                    recipients: Vec::new(),
                     note_preview: None,
                 };
                 let pending = PendingBroadcast {
@@ -8480,6 +8738,7 @@ pub fn run() {
                     expected_change: None,
                     recipient: None,
                     recipient_name: None,
+                    recipients: Vec::new(),
                     note_preview: None,
                 };
                 let pending = PendingBroadcast {
@@ -8731,6 +8990,12 @@ pub fn run() {
             set_sweep_dest(&w, &mut s, a);
             return;
         }
+        // Multi-select: the picker was reopened via compose's "+ Add
+        // recipient" — append instead of replacing the primary recipient.
+        if s.picking_extra {
+            add_recipient_chip(&w, &mut s, addr.as_str());
+            return;
+        }
         w.set_compose_return(7);
         pick_contact_core(&w, &mut s, addr.as_str());
     });
@@ -8743,6 +9008,47 @@ pub fn run() {
         println!("cb: reply to={addr}");
         w.set_compose_return(5);
         pick_contact_core(&w, &mut s, &addr);
+    });
+
+    cb!(on_reply_all_to_note, |w, s| {
+        let addrs: Vec<String> = w.get_note_reply_set().iter().map(|c| c.address.to_string()).collect();
+        let Some((first, rest)) = addrs.split_first() else { return };
+        println!("cb: reply-all to={} n={}", addrs.join(","), addrs.len());
+        w.set_compose_return(5);
+        // pick_contact_core resets the compose session (clearing any prior
+        // to_addresses_extra) before we seed the rest as extra chips.
+        pick_contact_core(&w, &mut s, first);
+        s.to_addresses_extra = rest.to_vec();
+        refresh_to_chips(&w, &s);
+        refresh_compose(&w, &mut s);
+    });
+
+    cb!(on_add_recipient_open, |w, s| {
+        // Multi-select stays notebook-funded-compose only (watch-only has
+        // no multi-recipient PSBT builder yet — a later unit).
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            return;
+        }
+        let total = 1 + s.to_addresses_extra.len();
+        if total >= 255 {
+            w.set_status("recipient limit reached (255)".into());
+            return;
+        }
+        println!("cb: add-recipient-open");
+        s.picking_extra = true;
+        w.set_contact_input("".into());
+        w.set_status("".into());
+        w.set_pick_mode("compose".into());
+        refresh_contacts(&w, &s);
+        w.set_screen(7);
+    });
+
+    cb!(on_remove_chip, |w, s, addr: SharedString| {
+        let a = addr.to_string();
+        s.to_addresses_extra.retain(|x| x != &a);
+        println!("cb: remove-chip n={}", s.to_addresses_extra.len() + 1);
+        refresh_to_chips(&w, &s);
+        refresh_compose(&w, &mut s);
     });
 
     {
@@ -10131,10 +10437,18 @@ pub fn run() {
             .as_ref()
             .map(|_| w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS));
         let change_to = (!change_addr.is_empty()).then(|| change_addr.clone());
+        // Multi-recipient (notebook-funded compose only, see State::
+        // to_addresses_extra): the compose screen's removable To-chips,
+        // beyond the primary `to`. Empty for every other pay-from source
+        // and for watch-only (the picker's "+ Add recipient" affordance is
+        // hidden there) — so this stays the exact single-recipient flow,
+        // byte-identical, for every path but this one.
+        let extra_recipients: Vec<&str> = s.to_addresses_extra.iter().map(String::as_str).collect();
         let req = ComposeRequest {
             text: &text,
             private,
             recipient: to.as_deref(),
+            extra_recipients: &extra_recipients,
             change_to: change_to.as_deref(),
             coins: (!coins_vec.is_empty()).then_some(coins_vec.as_slice()),
             fee_rate: rate,
@@ -10156,11 +10470,19 @@ pub fn run() {
                     &composed.tx.spent_outpoints,
                 );
                 let (self_spks, spending_spks) = confirm_self_spks(&s);
-                let recipient_name = to.as_deref().and_then(|a| {
+                let contact_name = |a: &str| -> Option<String> {
                     s.store.as_ref().and_then(|st| {
                         st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
                     })
-                });
+                };
+                let recipient_name = to.as_deref().and_then(contact_name);
+                // Multi-recipient: `composed.recipients` is only populated
+                // (2+ entries) for an actual multi-recipient note — every
+                // other compose (self or ordinary single-recipient) keeps
+                // this empty and relies on `recipient`/`recipient_name`
+                // above, unchanged.
+                let recipients: Vec<(String, Option<String>)> =
+                    composed.recipients.iter().map(|a| (a.clone(), contact_name(a))).collect();
                 let ctx = app_core::confirm::ConfirmCtx {
                     network: app_core::derive::btc_network(net),
                     prevouts,
@@ -10169,6 +10491,7 @@ pub fn run() {
                     expected_change: change_to.clone(),
                     recipient: to.clone(),
                     recipient_name,
+                    recipients,
                     note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
                 };
                 let (fchange, ffee, fvsize) = (composed.tx.change, composed.tx.fee, composed.tx.vsize);
@@ -10406,6 +10729,7 @@ pub fn run() {
             expected_change,
             recipient: to.clone(),
             recipient_name,
+            recipients: Vec::new(),
             note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
         };
         let pending = PendingBroadcast {
@@ -10719,6 +11043,7 @@ pub fn run() {
             expected_change,
             recipient: to.clone(),
             recipient_name,
+            recipients: Vec::new(),
             note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
         };
         let pending = PendingBroadcast {
@@ -10971,6 +11296,8 @@ pub fn run() {
         s.xacct_addrs.clear();
         s.discovery_pending = false;
         s.to_address = None;
+        s.to_addresses_extra.clear();
+        s.picking_extra = false;
         s.icloud_backup = false;
         w.set_icloud_backup(false);
         w.set_icloud_available(false);

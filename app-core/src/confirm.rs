@@ -42,6 +42,15 @@ pub struct ConfirmCtx {
     /// directed-note recipient address + optional contact name
     pub recipient: Option<String>,
     pub recipient_name: Option<String>,
+    /// Full recipient list for a MULTI-recipient directed note (address,
+    /// optional contact name), in output order (recipients precede
+    /// change). Empty = every existing single-recipient/self caller —
+    /// they keep using `recipient`/`recipient_name` above, unchanged.
+    /// When non-empty, EVERY output matching one of these addresses
+    /// classifies "recipient" (subtitle = the paired contact name, or a
+    /// numbered "Recipient N" fallback when unnamed) and `recipient`/
+    /// `recipient_name` are ignored for output classification.
+    pub recipients: Vec<(String, Option<String>)>,
     /// decoded note text to display (public notes) — display-only, pass-through
     pub note_preview: Option<String>,
 }
@@ -85,10 +94,31 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
 
     let mut warns: Vec<String> = Vec::new();
 
-    // Resolve the two "known destination" addresses to scriptPubKeys ONCE
-    // (spk compare, never string compare, per the paranoid rule — a string
+    // Resolve the "known destination" addresses to scriptPubKeys ONCE (spk
+    // compare, never string compare, per the paranoid rule — a string
     // compare can be fooled by address-encoding quirks the spk can't be).
-    let recipient_spk: Option<Vec<u8>> = ctx.recipient.as_deref().and_then(|a| resolve_spk(a, ctx.network));
+    //
+    // Multi-recipient (`ctx.recipients` non-empty) takes priority over the
+    // legacy singular `ctx.recipient`/`ctx.recipient_name` — every existing
+    // caller leaves `recipients` empty, so their behavior (and this single-
+    // entry list's shape) is unchanged byte-for-byte.
+    let recipient_spks: Vec<(Vec<u8>, String)> = if !ctx.recipients.is_empty() {
+        ctx.recipients
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (addr, name))| {
+                resolve_spk(addr, ctx.network)
+                    .map(|spk| (spk, name.clone().unwrap_or_else(|| format!("recipient {}", i + 1))))
+            })
+            .collect()
+    } else {
+        ctx.recipient
+            .as_deref()
+            .and_then(|a| resolve_spk(a, ctx.network))
+            .map(|spk| (spk, ctx.recipient_name.clone().unwrap_or_else(|| "directed recipient".to_string())))
+            .into_iter()
+            .collect()
+    };
     let expected_change_spk: Option<Vec<u8>> =
         ctx.expected_change.as_deref().and_then(|a| resolve_spk(a, ctx.network));
 
@@ -150,8 +180,8 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
             continue;
         };
 
-        let (kind, subtitle) = if recipient_spk.as_deref() == Some(spk) {
-            ("recipient", ctx.recipient_name.clone().unwrap_or_else(|| "directed recipient".to_string()))
+        let (kind, subtitle) = if let Some((_, label)) = recipient_spks.iter().find(|(s, _)| s.as_slice() == spk) {
+            ("recipient", label.clone())
         } else if ctx.self_spks.iter().any(|s| s.as_slice() == spk) {
             if ctx.spending_spks.iter().any(|s| s.as_slice() == spk) {
                 ("change", "change · Spending wallet".to_string())
@@ -276,6 +306,7 @@ mod tests {
             expected_change: None,
             recipient: None,
             recipient_name: None,
+            recipients: Vec::new(),
             note_preview: None,
         }
     }
@@ -411,6 +442,53 @@ mod tests {
         assert_eq!(recipient_row.title, bob_addr);
         assert_eq!(recipient_row.subtitle, "Bob");
         assert_eq!(recipient_row.amount, "5,000");
+        assert!(sum.warn.is_none());
+    }
+
+    /// Multi-recipient (FLAG_MULTI) directed note: N recipient outputs,
+    /// each independently classified "recipient" — named ones carry the
+    /// contact name, an unnamed one falls back to a numbered label — and
+    /// `ctx.recipient`/`recipient_name` (left unset here) are ignored once
+    /// `ctx.recipients` is non-empty.
+    #[test]
+    fn multi_recipient_note_labels_every_recipient_row() {
+        let (_, spk_a) = notebook_spk(7);
+        let (_, spk_bob) = notebook_spk(9);
+        let (_, spk_carol) = notebook_spk(11);
+        let bob_addr = addr_of(&spk_bob);
+        let carol_addr = addr_of(&spk_carol);
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![txin(1, 0)],
+            output: vec![
+                txout(0, pnte_op_return("gift for bob and carol")),
+                txout(5_000, spk_bob.clone()),
+                txout(330, spk_carol.clone()),
+                txout(94_170, spk_a.clone()),
+            ],
+        };
+        let hex_str = raw_hex(&tx);
+
+        let mut ctx = base_ctx(vec![spk_a.clone()], vec![]);
+        ctx.recipients = vec![(bob_addr.clone(), Some("Bob".to_string())), (carol_addr.clone(), None)];
+        ctx.prevouts.insert(
+            prevout_key(1, 0),
+            PrevoutInfo { value: 100_000, address: Some(addr_of(&spk_a)), source: "Notebook · Alice".into() },
+        );
+
+        let sum = summarize_signed_tx(&hex_str, &ctx).unwrap();
+        let recipient_rows: Vec<_> = sum.outputs.iter().filter(|o| o.kind == "recipient").collect();
+        assert_eq!(recipient_rows.len(), 2);
+        let bob_row = recipient_rows.iter().find(|o| o.title == bob_addr).expect("bob row");
+        assert_eq!(bob_row.subtitle, "Bob");
+        assert_eq!(bob_row.amount, "5,000");
+        let carol_row = recipient_rows.iter().find(|o| o.title == carol_addr).expect("carol row");
+        assert_eq!(carol_row.subtitle, "recipient 2");
+        assert_eq!(carol_row.amount, "330");
+
+        let change_row = sum.outputs.iter().find(|o| o.kind == "change").expect("change output");
+        assert_eq!(change_row.amount, "94,170");
         assert!(sum.warn.is_none());
     }
 

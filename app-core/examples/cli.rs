@@ -482,7 +482,7 @@ fn main() {
                 &ComposeRequest {
                     text: &args[6],
                     private,
-                    recipient: to,
+                    recipient: to, extra_recipients: &[],
                     change_to: None,
                     coins: None,
                     fee_rate,

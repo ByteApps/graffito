@@ -1454,8 +1454,20 @@ export component AppWindow inherits Window {
     in property <bool> note-pending;
     in property <string> note-txid;
     in property <string> note-reply-address;   // sender address, only when this note is RECEIVED with a known sender; "" hides Reply
+    // Reply-all (multi-recipient): {sender} ∪ recipients minus me, sender
+    // first (notes-core's `reply_set`), contact names resolved. Hidden
+    // whenever length <= 1 — nothing to add beyond what plain Reply covers.
+    in property <[ContactItem]> note-reply-set;
 
     in property <string> to-label;
+    // Multi-recipient directed notes: removable To-chips beyond the
+    // primary recipient (`to-label`) — the compose screen's "+ Add
+    // recipient" flow. Empty = today's ordinary single-recipient compose.
+    in property <[ContactItem]> to-chips;
+    // True while the send-to picker (screen 7) is collecting an EXTRA
+    // recipient (opened via "+ Add recipient") rather than picking the
+    // primary one.
+    in-out property <bool> picking-extra: false;
     in-out property <string> compose-text;
     in-out property <bool> compose-private: true;
     in-out property <string> rate-text;
@@ -1738,6 +1750,9 @@ export component AppWindow inherits Window {
     callback open-note-web-url(string);
     callback open-note-web();
     callback reply-to-note();
+    callback reply-all-to-note();
+    callback add-recipient-open();   // compose "+ Add recipient" → picker
+    callback remove-chip(string);    // compose To-chip's × button
     callback copy-text(string, string);
     callback set-fee-tier(int);
     callback sweep-open();                 // settings → destination picker
@@ -1959,6 +1974,11 @@ export component AppWindow inherits Window {
             if (root.pick-mode == "sweep") {
                 root.pick-mode = "compose";
                 root.screen = 8;
+            } else if (root.picking-extra) {
+                // "+ Add recipient" reopened the picker on top of compose —
+                // back returns to compose, not home.
+                root.picking-extra = false;
+                root.screen = 6;
             } else {
                 root.go-home();
             }
@@ -2672,9 +2692,18 @@ export component AppWindow inherits Window {
             text: "Open in web viewer";
             clicked => { root.open-note-web(); }
         }
-        if root.note-reply-address != "": GhostButton {
-            text: "Reply";
-            clicked => { root.reply-to-note(); }
+        if root.note-reply-address != "" || root.note-reply-set.length > 1: HorizontalLayout {
+            spacing: 10px;
+            if root.note-reply-address != "": GhostButton {
+                text: "Reply";
+                clicked => { root.reply-to-note(); }
+            }
+            // Hidden when the reply set has <= 1 entry — nothing beyond
+            // plain Reply to add (a single-recipient note, or a self-note).
+            if root.note-reply-set.length > 1: GhostButton {
+                text: "Reply all";
+                clicked => { root.reply-all-to-note(); }
+            }
         }
         Caption { text: root.status; }
         if root.note-web-url == "": Caption {
@@ -2727,6 +2756,46 @@ export component AppWindow inherits Window {
                 color: Pal.muted;
                 overflow: elide;
             }
+        }
+        // Multi-recipient: removable To-chips beyond the primary recipient
+        // — one row per extra address, "×" removes it (mirrors the
+        // contacts screen's recent-contact remove pattern). Notebook-
+        // funded compose only; hidden for watch-only (Rust never opens the
+        // add-recipient picker there, but the button below is also gated).
+        if root.to-chips.length > 0: VerticalLayout {
+            spacing: 6px;
+            for c in root.to-chips: Rectangle {
+                height: 30px;
+                border-radius: 8px;
+                background: Pal.card;
+                border-width: 1px;
+                border-color: Pal.line;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 4px;
+                    spacing: 4px;
+                    Text {
+                        text: "+ " + (c.name == "" ? c.address : c.name);
+                        font-size: 11px;
+                        color: Pal.muted;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    IconButton {
+                        glyph: "×";
+                        glyph-size: 16px;
+                        width: 26px;
+                        height: 26px;
+                        glyph-color: Pal.bad;
+                        clicked => { root.remove-chip(c.address); }
+                    }
+                }
+            }
+        }
+        if root.directed && !root.watch-only: GhostButton {
+            text: root.to-chips.length + 1 >= 255 ? "Recipient limit reached (255)" : "+ Add recipient";
+            clicked => { root.add-recipient-open(); }
         }
         // Just the label. Paste removed (native paste / the edit bubble
         // covers it) and Done removed (tapping empty space dismisses the
@@ -2968,17 +3037,19 @@ export component AppWindow inherits Window {
         spacing: 12px;
         alignment: start;
         Header {
-            title: root.pick-mode == "sweep" ? "Sweep to" : "Send to";
+            title: root.picking-extra ? "Add recipient" : (root.pick-mode == "sweep" ? "Sweep to" : "Send to");
             back => { root.nav-back(); }
         }
-        if root.pick-mode != "sweep": DoorCard {
+        // Self can't be an EXTRA recipient on a multi-recipient note (it's
+        // already the notebook composing the tx) — hidden while adding.
+        if root.pick-mode != "sweep" && !root.picking-extra: DoorCard {
             highlight: true;
             title: "Self — my notebook";
             subtitle: "A note in your own notebook.";
             clicked => { root.pick-contact("self"); }
         }
         // Divider between the Self card and the address-entry section.
-        if root.pick-mode != "sweep": Rectangle { height: 1px; background: Pal.line; }
+        if root.pick-mode != "sweep" && !root.picking-extra: Rectangle { height: 1px; background: Pal.line; }
         HorizontalLayout {
             spacing: 10px;
             EditField {

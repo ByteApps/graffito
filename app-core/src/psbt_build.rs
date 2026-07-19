@@ -828,6 +828,7 @@ mod tests {
             author_candidates: vec![alice.address(NET)], // dust-to-self carries the author key
             recipient: None,
             input_prevout_spks: Vec::new(),
+            output_addrs: Vec::new(),
         };
         let bundle = SyncBundle { network: "mainnet".into(), notes_onchain: vec![onchain], ..Default::default() };
         let notes = extract_notes(&bundle, &bob, NET);
@@ -1137,6 +1138,7 @@ mod tests {
                 author_candidates: vec![],
                 recipient: None,
                 input_prevout_spks: Vec::new(),
+                output_addrs: Vec::new(),
             }],
             ..Default::default()
         };
@@ -1254,6 +1256,7 @@ mod tests {
                 author_candidates: vec![],
                 recipient: None,
                 input_prevout_spks: Vec::new(),
+                output_addrs: Vec::new(),
             }],
             ..Default::default()
         };
@@ -1405,6 +1408,7 @@ mod tests {
             author_candidates: vec![],
             recipient: None,
             input_prevout_spks: vec![hex::encode(&coin_addr.spk)],
+            output_addrs: Vec::new(),
         };
         let bundle = SyncBundle { network: "mainnet".into(), notes_onchain: vec![onchain], ..Default::default() };
         let self_spks = vec![self_spk, coin_addr.spk.clone()];

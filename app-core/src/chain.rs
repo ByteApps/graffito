@@ -749,6 +749,20 @@ fn classify_tx_inner(tx: &EsploraTx, address: &str, network: Option<Network>) ->
         None => Vec::new(),
     };
 
+    // Addresses of every NON-OP_RETURN output, in ascending vout order
+    // (multi-recipient directed notes, FLAG_MULTI: notes-core's decoder
+    // slices `output_addrs[0..count]` as the recipient list — recipients
+    // precede change by construction). Skips an output whose script
+    // doesn't decode to an address (never happens for our own P2TR/P2WPKH
+    // outputs; notes-core degrades gracefully — never crashes — if it
+    // ever did).
+    let output_addrs: Vec<String> = tx
+        .vout
+        .iter()
+        .filter(|o| o.scriptpubkey_type.as_deref() != Some("op_return"))
+        .filter_map(|o| o.scriptpubkey_address.clone())
+        .collect();
+
     Some(OnchainTx {
         txid: tx.txid.clone(),
         height: tx.status.block_height.filter(|_| tx.status.confirmed),
@@ -766,6 +780,7 @@ fn classify_tx_inner(tx: &EsploraTx, address: &str, network: Option<Network>) ->
         // self-note's "first non-self output" (its change) stays hidden.
         recipient,
         input_prevout_spks,
+        output_addrs,
     })
 }
 

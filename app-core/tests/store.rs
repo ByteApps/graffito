@@ -52,6 +52,7 @@ fn onchain(tx: &NoteTx, height: u64, from_self: bool, sender: Option<&str>, reci
         author_candidates: sender.map(|s| vec![String::from(s)]).unwrap_or_default(),
         recipient: recipient.map(String::from),
         input_prevout_spks: Vec::new(),
+        output_addrs: Vec::new(),
     }
 }
 
@@ -89,7 +90,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "first, public", private: false, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1000 },
+        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1000 },
     )
     .unwrap();
     assert_eq!(store.notes.len(), 1);
@@ -100,7 +101,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "second, private", private: true, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 2000 },
+        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 2000 },
     )
     .unwrap();
     assert_eq!(
@@ -154,7 +155,7 @@ fn directed_private_note_both_sides() {
         &ComposeRequest {
             text: "for bob only",
             private: true,
-            recipient: Some(&bob_addr),
+            recipient: Some(&bob_addr), extra_recipients: &[],
             change_to: None,
             coins: None,
             fee_rate: 1.0,
@@ -194,6 +195,86 @@ fn directed_private_note_both_sides() {
     assert_eq!(received.text.as_deref(), Some("for bob only"));
 }
 
+fn carol() -> Identity {
+    identity_from_leaf(&[0x55u8; 32]).unwrap()
+}
+
+/// An `OnchainTx` for an OWN multi-recipient note tx, with `output_addrs`
+/// populated the way `app_core::chain::classify_tx_inner` populates it in
+/// the real client (every NON-OP_RETURN output's address, in vout order —
+/// recipients precede change by construction) — the field notes-core's
+/// scanner needs to reconstruct `RecoveredNote.recipients` for a
+/// FLAG_MULTI note.
+fn onchain_own_multi(tx: &NoteTx, height: u64) -> OnchainTx {
+    let output_addrs: Vec<String> = tx
+        .tx
+        .outputs
+        .iter()
+        .filter(|o| op_return_payload(&o.script_pubkey).is_none())
+        .filter_map(|o| app_core::notes_core::address::address_from_spk(&o.script_pubkey, NET))
+        .collect();
+    OnchainTx {
+        txid: tx.txid_hex.clone(),
+        height: Some(height),
+        blocktime: Some(1_700_000_000 + height),
+        spends_from_self: true,
+        payloads: tx
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey).map(hex::encode))
+            .collect(),
+        pays_self: true,
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        input_prevout_spks: Vec::new(),
+        output_addrs,
+    }
+}
+
+/// A multi-recipient directed note (2 recipients) round-trips through
+/// scan: the store's OWN view recovers the plural `recipients` list (both
+/// addresses, in order) via `output_addrs`, proving the app's
+/// `classify_tx_inner`-shaped bundle producer feeds notes-core's
+/// `extract_notes_multi` correctly end to end — not just at the notes-core
+/// unit-test layer.
+#[test]
+fn multi_recipient_note_recovers_recipients_on_rescan() {
+    let a = alice();
+    let bob_addr = bob().address(NET);
+    let carol_addr = carol().address(NET);
+    let mut store = funded_store(&a);
+
+    let composed = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "group note",
+            private: false,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[&carol_addr],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            now: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(composed.recipients, vec![bob_addr.clone(), carol_addr.clone()]);
+
+    let b = bundle(vec![onchain_own_multi(&composed.tx, 105)], vec![change_utxo(&composed.tx, Some(105))], 105);
+    let mut fresh = Store::new(&a.output_x, NET);
+    fresh.apply_bundle(&b, &a, NET, &[]).unwrap();
+    let note = &fresh.notes[0];
+    assert!(note.directed && !note.received);
+    assert_eq!(note.recipient.as_deref(), Some(bob_addr.as_str()), "singular field keeps the first recipient");
+    assert_eq!(note.recipients, vec![bob_addr, carol_addr], "plural field carries the full list");
+    assert_eq!(note.text.as_deref(), Some("group note"));
+}
+
 #[test]
 fn unconfirmed_scanned_utxo_is_spendable() {
     let a = alice();
@@ -212,7 +293,7 @@ fn unconfirmed_scanned_utxo_is_spendable() {
     let n = compose_and_record(
         &mut store, &a, NET,
         &ComposeRequest {
-            text: "spend unconfirmed", private: false, recipient: None,
+            text: "spend unconfirmed", private: false, recipient: None, extra_recipients: &[],
             change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1,
         },
     )
@@ -239,7 +320,7 @@ fn coin_control_spends_exactly_selected() {
     let n = compose_and_record(
         &mut store, &a, NET,
         &ComposeRequest {
-            text: "coin control", private: false, recipient: None,
+            text: "coin control", private: false, recipient: None, extra_recipients: &[],
             change_to: None, coins: Some(&picks), fee_rate: 1.0, gift_amount: None, now: 1,
         },
     )
@@ -265,7 +346,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
     let n = compose_and_record(
         &mut store, &a, NET,
         &ComposeRequest {
-            text: "change goes to bob", private: false, recipient: None,
+            text: "change goes to bob", private: false, recipient: None, extra_recipients: &[],
             change_to: Some(&bob_addr), coins: None, fee_rate: 1.0, gift_amount: None, now: 1,
         },
     )
@@ -282,7 +363,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
     compose_and_record(
         &mut store2, &a, NET,
         &ComposeRequest {
-            text: "change to self", private: false, recipient: None,
+            text: "change to self", private: false, recipient: None, extra_recipients: &[],
             change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1,
         },
     )
@@ -297,7 +378,7 @@ fn bump_fee_same_note_id_same_inputs_higher_fee() {
     let mut store = funded_store(&a);
     let n1 = compose_and_record(
         &mut store, &a, NET,
-        &ComposeRequest { text: "bump me", private: true, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1 },
+        &ComposeRequest { text: "bump me", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1 },
     )
     .unwrap();
     assert!(store.notes[0].raw_hex.is_some(), "raw kept for rebroadcast");
@@ -333,7 +414,7 @@ fn orphaned_when_inputs_spent_elsewhere() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "never broadcast", private: false, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1 },
+        &ComposeRequest { text: "never broadcast", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1 },
     )
     .unwrap();
 
@@ -444,7 +525,7 @@ fn directed_gift_amount_plumbs_through() {
         &ComposeRequest {
             text: "happy birthday",
             private: false,
-            recipient: Some(&bob_addr),
+            recipient: Some(&bob_addr), extra_recipients: &[],
             change_to: None,
             coins: None,
             fee_rate: 1.0,
@@ -471,7 +552,7 @@ fn directed_gift_amount_plumbs_through() {
         &ComposeRequest {
             text: "hi",
             private: false,
-            recipient: Some(&bob_addr),
+            recipient: Some(&bob_addr), extra_recipients: &[],
             change_to: None,
             coins: None,
             fee_rate: 1.0,
@@ -495,14 +576,14 @@ fn watch_store_recovers_notebook_without_keys() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "first, public", private: false, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1000 },
+        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1000 },
     )
     .unwrap();
     let n2 = compose_and_record(
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "second, private", private: true, recipient: None, change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 2000 },
+        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 2000 },
     )
     .unwrap();
     let b = bundle(
@@ -620,6 +701,7 @@ fn onchain_multi_notebook_input(tx: &NoteTx, height: u64, input_notebooks: &[&Id
         author_candidates: Vec::new(),
         recipient: None,
         input_prevout_spks: input_notebooks.iter().map(|id| hex::encode(notebook_spk(id))).collect(),
+        output_addrs: Vec::new(),
     }
 }
 
@@ -642,7 +724,7 @@ fn display_owner_dedup_keeps_note_only_in_first_notebook_input_scan() {
         &ComposeRequest {
             text: "owned by two notebooks",
             private: false,
-            recipient: None,
+            recipient: None, extra_recipients: &[],
             change_to: None,
             coins: None,
             fee_rate: 1.0,
@@ -691,7 +773,7 @@ fn display_owner_dedup_archived_notebook_input_never_anchors() {
         &ComposeRequest {
             text: "b archived, a active",
             private: false,
-            recipient: None,
+            recipient: None, extra_recipients: &[],
             change_to: None,
             coins: None,
             fee_rate: 1.0,

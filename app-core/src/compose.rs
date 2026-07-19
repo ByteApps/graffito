@@ -6,21 +6,44 @@
 use notes_core::address::Recipient;
 use notes_core::address::address_to_script_pubkey;
 use notes_core::bundle::{
-    compose_directed_note_exact_amount, compose_directed_note_with_change_amount,
-    compose_note_exact, compose_note_with_change, Identity,
+    compose_directed_note_multi_exact, compose_directed_note_multi_with_change,
+    compose_directed_note_with_change_amount, compose_note_exact, compose_note_with_change, Identity,
 };
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::tx::NoteTx;
 use notes_core::Network;
+use zeroize::Zeroize;
 
 use crate::store::{LedgerUtxo, NoteRecord, NoteStatus, OutPointRef, Store};
 use crate::Error;
+
+/// Fresh 32-byte OS-TRNG content key for a multi-recipient private compose
+/// (notes-core's `multi_body` hybrid seal, dm.rs) — same one-shot,
+/// never-persisted handling as `note_id`/aux-rand: generated fresh per
+/// compose attempt, never stored, never logged, and zeroized by the caller
+/// immediately after the notes-core call returns.
+fn fresh_content_key() -> Result<[u8; 32], Error> {
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key).map_err(|_| Error::Entropy)?;
+    Ok(key)
+}
 
 pub struct ComposeRequest<'a> {
     pub text: &'a str,
     pub private: bool,
     /// None = self-note; Some = directed note (dust output).
     pub recipient: Option<&'a str>,
+    /// Multi-recipient directed notes: EXTRA recipient addresses beyond
+    /// `recipient` (the multi-select contact picker's chips minus the
+    /// first). Empty = today's exact single-recipient flow, byte-
+    /// identical on the wire — notes-core's multi-recipient entry points
+    /// dedupe-then-delegate to the single-recipient builders for exactly
+    /// one unique address, so this app only bothers routing through them
+    /// at all when there's more than one distinct chip. Every recipient
+    /// (primary + extras) gets the SAME `gift_amount` (uniform gift per
+    /// recipient — the existing collapsible "Gift · N sats" panel value).
+    /// Ignored when `recipient` is None (self-notes never have extras).
+    pub extra_recipients: &'a [&'a str],
     /// Where the change goes. None = back to the notes address (default).
     /// Some = a custom address; that change is NOT tracked as a spendable
     /// coin (it leaves this wallet).
@@ -29,21 +52,27 @@ pub struct ComposeRequest<'a> {
     /// None = auto-select (largest-first).
     pub coins: Option<&'a [(String, u32)]>,
     pub fee_rate: f64,
-    /// Directed notes only: sats to send the recipient (the "gift"). None =
+    /// Directed notes only: sats to send EACH recipient (the "gift"). None =
     /// DUST_LIMIT (the minimum, and the default). Ignored for self-notes.
     pub gift_amount: Option<u64>,
     /// Local wall-clock seconds for created_at (display only).
     pub now: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ComposedNote {
     pub note_id: String, // hex8
     pub tx: NoteTx,
-    /// The directed-note recipient's address, if any — carried alongside
-    /// the built tx so a deferred recording step (the universal confirm
-    /// screen's stage B) doesn't need to re-parse `req.recipient`.
+    /// The directed-note recipient's address, if any (the FIRST recipient
+    /// for a multi-recipient note) — carried alongside the built tx so a
+    /// deferred recording step (the universal confirm screen's stage B)
+    /// doesn't need to re-parse `req.recipient`.
     pub recipient_address: Option<String>,
+    /// Full recipient list, ONLY populated (2+ entries) for a multi-
+    /// recipient note — empty for a self-note or an ordinary single-
+    /// recipient directed note (mirrors notes-core's/`NoteRecord`'s "empty
+    /// means single" convention exactly).
+    pub recipients: Vec<String>,
     /// Whether change (if any) returns to the notes address (true) or a
     /// custom `req.change_to` destination (false) — mirrors the
     /// `change_spk.is_none()` check `compose_and_record` used to make
@@ -68,10 +97,29 @@ pub fn compose_note(
         pick_unique_note_id(generate_note_id, |id| store.note_id_taken(id))?;
 
     let utxos = store.available_utxos();
-    let recipient = match req.recipient {
-        Some(addr) => Some(Recipient::parse(network, addr)?),
-        None => None,
-    };
+    // Every recipient (primary `req.recipient` + `req.extra_recipients`,
+    // parsed in that order), each paired with the SAME gift amount —
+    // empty for a self-note.
+    let gift = req.gift_amount.unwrap_or(notes_core::DUST_LIMIT);
+    let mut recipients: Vec<(Recipient, u64)> = Vec::new();
+    if let Some(addr) = req.recipient {
+        recipients.push((Recipient::parse(network, addr)?, gift));
+        for extra in req.extra_recipients {
+            let r = Recipient::parse(network, extra)?;
+            // Dedupe by address (first occurrence wins) BEFORE deciding
+            // single-vs-multi — mirrors notes-core's own
+            // `dedupe_recipients` so a UI double-pick of the same address
+            // (chip re-added, or the primary re-selected as an extra)
+            // collapses to a genuine single-recipient note here too, not
+            // just at the wire-format layer.
+            if !recipients.iter().any(|(existing, _)| existing.address == r.address) {
+                recipients.push((r, gift));
+            }
+        }
+    }
+    let recipient_address = recipients.first().map(|(r, _)| r.address.clone());
+    let recipient_addresses: Vec<String> =
+        if recipients.len() >= 2 { recipients.iter().map(|(r, _)| r.address.clone()).collect() } else { Vec::new() };
     // Custom change destination (leaves this wallet, so not ledger-tracked).
     let change = match req.change_to {
         Some(addr) => Some(Recipient::parse(network, addr)?),
@@ -100,29 +148,43 @@ pub fn compose_note(
         None => None,
     };
 
-    let gift = req.gift_amount.unwrap_or(notes_core::DUST_LIMIT);
-    let tx = match (&recipient, &selected) {
-        (Some(r), Some(ins)) => compose_directed_note_exact_amount(
-            identity, ins, req.text, req.private, note_id, r, gift, change_spk,
-            store.chunk_size, req.fee_rate, generate_aux_rand,
-        ),
-        (Some(r), None) => compose_directed_note_with_change_amount(
-            identity, &utxos, req.text, req.private, note_id, r, gift, change_spk,
-            store.chunk_size, req.fee_rate, generate_aux_rand,
-        ),
-        (None, Some(ins)) => compose_note_exact(
-            identity, ins, req.text, req.private, note_id, change_spk,
-            store.chunk_size, req.fee_rate, generate_aux_rand,
-        ),
-        (None, None) => compose_note_with_change(
-            identity, &utxos, req.text, req.private, note_id, change_spk,
-            store.chunk_size, req.fee_rate, generate_aux_rand,
-        ),
+    let tx = if recipients.is_empty() {
+        match &selected {
+            Some(ins) => compose_note_exact(
+                identity, ins, req.text, req.private, note_id, change_spk,
+                store.chunk_size, req.fee_rate, generate_aux_rand,
+            ),
+            None => compose_note_with_change(
+                identity, &utxos, req.text, req.private, note_id, change_spk,
+                store.chunk_size, req.fee_rate, generate_aux_rand,
+            ),
+        }
+    } else {
+        // Always the MULTI notes-core entry points, even for exactly one
+        // recipient: they dedupe-then-delegate to the single-recipient
+        // builders in that case, so the wire bytes stay byte-identical to
+        // the legacy path — see `compose_directed_note_multi_with_change`'s
+        // doc comment. This keeps ONE call site instead of branching the
+        // single/multi builders here too.
+        let mut content_key = fresh_content_key()?;
+        let result = match &selected {
+            Some(ins) => compose_directed_note_multi_exact(
+                identity, ins, req.text, req.private, note_id, &recipients, content_key,
+                change_spk, store.chunk_size, req.fee_rate, generate_aux_rand,
+            ),
+            None => compose_directed_note_multi_with_change(
+                identity, &utxos, req.text, req.private, note_id, &recipients, content_key,
+                change_spk, store.chunk_size, req.fee_rate, generate_aux_rand,
+            ),
+        };
+        content_key.zeroize();
+        result
     }?;
 
     Ok(ComposedNote {
         note_id: hex::encode(note_id),
-        recipient_address: recipient.map(|r| r.address),
+        recipient_address,
+        recipients: recipient_addresses,
         change_is_self: change_spk.is_none(),
         tx,
     })
@@ -172,6 +234,7 @@ pub fn record_composed_note(
         received: false,
         sender: None,
         recipient: composed.recipient_address.clone(),
+        recipients: composed.recipients.clone(),
         txids: vec![tx.txid_hex.clone()],
         height: None,
         blocktime: None,
@@ -187,8 +250,16 @@ pub fn record_composed_note(
     };
     store.record_signed(record, change_utxo);
 
-    if let Some(addr) = &composed.recipient_address {
-        store.touch_contact(addr);
+    // Touch every recipient (multi-recipient: all of them; single: just
+    // the one) so the contacts "recents" list reflects the whole To list.
+    if composed.recipients.is_empty() {
+        if let Some(addr) = &composed.recipient_address {
+            store.touch_contact(addr);
+        }
+    } else {
+        for addr in &composed.recipients {
+            store.touch_contact(addr);
+        }
     }
 }
 
@@ -231,6 +302,13 @@ pub fn bump_fee_build(
     let text = rec.text.clone().ok_or(Error::Store("no cached text".into()))?;
     let private = rec.private;
     let recipient_addr = rec.recipient.clone();
+    // Multi-recipient RBF isn't built yet (would need to re-run the whole
+    // recipient list + a fresh content_key through the multi builder) —
+    // refuse loudly rather than silently rebuild a replacement that drops
+    // every recipient but the first.
+    if rec.recipients.len() > 1 {
+        return Err(Error::Store("fee-bumping a multi-recipient note isn't supported yet".into()));
+    }
     let gift = rec.gift_amount.unwrap_or(notes_core::DUST_LIMIT);
     let change_to = rec.change_to.clone();
     let spent = rec.spent.clone();
@@ -278,6 +356,7 @@ pub fn bump_fee_build(
     Ok(ComposedNote {
         note_id: note_id_hex.to_string(),
         recipient_address: recipient_addr,
+        recipients: Vec::new(),
         change_is_self: change_spk.is_none(),
         tx,
     })
@@ -663,6 +742,7 @@ mod bump_tests {
                 text: "bump me",
                 private: false,
                 recipient: None,
+                extra_recipients: &[],
                 change_to: None,
                 coins: None,
                 fee_rate: 1.0,
@@ -701,5 +781,273 @@ mod bump_tests {
             split.utxos.iter().any(|u| u.txid == built.tx.txid_hex),
             "replacement change UTXO tracked"
         );
+    }
+}
+
+#[cfg(test)]
+mod multi_recipient_tests {
+    use super::*;
+    use crate::store::Store;
+    use notes_core::Network;
+
+    const NET: Network = Network::Regtest;
+
+    fn funded_store(identity: &Identity) -> Store {
+        let mut store = Store::new(&identity.output_x, NET);
+        store.utxos.push(LedgerUtxo {
+            txid: "aa".repeat(32),
+            vout: 0,
+            value: 100_000,
+            height: Some(100),
+            pending_spend: false,
+        });
+        store
+    }
+
+    /// A directed note with `extra_recipients` empty (the ordinary single-
+    /// recipient flow) must stay byte-identical to notes-core's own
+    /// single-recipient builder — proves this app's new multi-aware branch
+    /// in `compose_note` didn't change the legacy wire format.
+    #[test]
+    fn single_recipient_via_multi_branch_is_byte_identical() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let bob_addr = bob.address(NET);
+        let store = funded_store(&a);
+
+        let composed = compose_note(
+            &store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "hi bob",
+                private: false,
+                recipient: Some(&bob_addr),
+                extra_recipients: &[],
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: None,
+                now: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(composed.recipient_address.as_deref(), Some(bob_addr.as_str()));
+        assert!(composed.recipients.is_empty(), "single recipient: plural list stays empty");
+
+        // Rebuild directly through notes-core's single-recipient entry
+        // point with the SAME note_id/aux (both zero, deterministic aux
+        // for this cross-check) and compare txids (non-witness bytes —
+        // schnorr aux-rand makes the witness itself non-deterministic
+        // across two independent runs).
+        let recipient = notes_core::address::Recipient::parse(NET, &bob_addr).unwrap();
+        let note_id = {
+            let mut id = [0u8; 4];
+            hex::decode_to_slice(&composed.note_id, &mut id).unwrap();
+            id
+        };
+        let direct = notes_core::bundle::compose_directed_note_with_change_amount(
+            &a,
+            &store.available_utxos(),
+            "hi bob",
+            false,
+            note_id,
+            &recipient,
+            notes_core::DUST_LIMIT,
+            None,
+            store.chunk_size,
+            1.0,
+            notes_core::keys::generate_aux_rand,
+        )
+        .unwrap();
+        assert_eq!(composed.tx.txid_hex, direct.txid_hex);
+        assert_eq!(composed.tx.raw_hex.len(), direct.raw_hex.len(), "same shape/size");
+    }
+
+    /// `extra_recipients` with the SAME address as `recipient` (a UI
+    /// double-pick) dedupes down to one unique address — the plural
+    /// `recipients` list stays empty, same as any other single-recipient
+    /// compose (notes-core's `dedupe_recipients` + 1-entry delegation).
+    #[test]
+    fn duplicate_recipient_dedupes_to_single() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let bob_addr = bob.address(NET);
+        let store = funded_store(&a);
+
+        let composed = compose_note(
+            &store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "hi bob",
+                private: false,
+                recipient: Some(&bob_addr),
+                extra_recipients: &[&bob_addr],
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: None,
+                now: 1,
+            },
+        )
+        .unwrap();
+        assert!(composed.recipients.is_empty());
+        // Exactly one recipient output at the dust gift, not two.
+        let gift_outputs =
+            composed.tx.tx.outputs.iter().filter(|o| o.value == notes_core::DUST_LIMIT).count();
+        assert_eq!(gift_outputs, 1);
+    }
+
+    /// A public note to 3 distinct recipients: three DUST_LIMIT outputs
+    /// (uniform gift), `recipients` carries all three in order, and
+    /// `record_composed_note` persists the plural list + touches every
+    /// recipient as a recent contact.
+    #[test]
+    fn multi_recipient_public_note_builds_and_records() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let carol = Identity::from_app_seed(&[11u8; 32]).unwrap();
+        let dave = Identity::from_app_seed(&[13u8; 32]).unwrap();
+        let (bob_addr, carol_addr, dave_addr) = (bob.address(NET), carol.address(NET), dave.address(NET));
+        let mut store = funded_store(&a);
+
+        let composed = compose_and_record(
+            &mut store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "group note",
+                private: false,
+                recipient: Some(&bob_addr),
+                extra_recipients: &[&carol_addr, &dave_addr],
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: None,
+                now: 42,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(composed.recipient_address.as_deref(), Some(bob_addr.as_str()));
+        assert_eq!(composed.recipients, vec![bob_addr.clone(), carol_addr.clone(), dave_addr.clone()]);
+        let gift_outputs: Vec<u64> = composed
+            .tx
+            .tx
+            .outputs
+            .iter()
+            .filter(|o| o.value == notes_core::DUST_LIMIT)
+            .map(|o| o.value)
+            .collect();
+        assert_eq!(gift_outputs.len(), 3, "one dust output per recipient");
+
+        let rec = store.notes.iter().find(|n| n.note_id == composed.note_id).unwrap();
+        assert_eq!(rec.recipient.as_deref(), Some(bob_addr.as_str()));
+        assert_eq!(rec.recipients, vec![bob_addr.clone(), carol_addr.clone(), dave_addr.clone()]);
+        assert!(rec.directed);
+
+        // All three landed as recent contacts.
+        for addr in [&bob_addr, &carol_addr, &dave_addr] {
+            assert!(store.contacts.iter().any(|c| &c.address == addr), "{addr} touched as contact");
+        }
+    }
+
+    /// A custom (uniform) gift applies to EVERY recipient, not just the
+    /// first.
+    #[test]
+    fn multi_recipient_gift_is_uniform() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let carol = Identity::from_app_seed(&[11u8; 32]).unwrap();
+        let (bob_addr, carol_addr) = (bob.address(NET), carol.address(NET));
+        let store = funded_store(&a);
+
+        let composed = compose_note(
+            &store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "gift for both",
+                private: false,
+                recipient: Some(&bob_addr),
+                extra_recipients: &[&carol_addr],
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: Some(5_000),
+                now: 1,
+            },
+        )
+        .unwrap();
+        let gift_outputs: Vec<u64> =
+            composed.tx.tx.outputs.iter().map(|o| o.value).filter(|&v| v == 5_000).collect();
+        assert_eq!(gift_outputs.len(), 2, "both recipients get the SAME 5,000-sat gift");
+    }
+
+    /// Private + a non-taproot recipient among the extras errors BEFORE
+    /// any signing happens — same `RecipientNotTaproot` notes-core raises
+    /// for the single-recipient path today, just reached through the
+    /// multi entry point.
+    #[test]
+    fn private_multi_recipient_requires_every_recipient_taproot() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let bob_addr = bob.address(NET);
+        // A P2WPKH (non-taproot) segwit address on regtest.
+        let non_taproot = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        let store = funded_store(&a);
+
+        let err = compose_note(
+            &store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "secret",
+                private: true,
+                recipient: Some(&bob_addr),
+                extra_recipients: &[non_taproot],
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: None,
+                now: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("taproot"), "got: {err}");
+    }
+
+    /// Fee-bumping a multi-recipient note is refused (not silently rebuilt
+    /// with only the first recipient) — `bump_fee_build` checks the
+    /// stored record's `recipients` list.
+    #[test]
+    fn bump_fee_refuses_multi_recipient_record() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let carol = Identity::from_app_seed(&[11u8; 32]).unwrap();
+        let (bob_addr, carol_addr) = (bob.address(NET), carol.address(NET));
+        let mut store = funded_store(&a);
+
+        let composed = compose_and_record(
+            &mut store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "group note",
+                private: false,
+                recipient: Some(&bob_addr),
+                extra_recipients: &[&carol_addr],
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: None,
+                now: 1,
+            },
+        )
+        .unwrap();
+
+        let err = bump_fee_build(&store, &a, NET, &composed.note_id, 5.0).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("multi-recipient"), "got: {err}");
     }
 }

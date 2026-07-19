@@ -51,6 +51,14 @@ pub struct NoteRecord {
     pub sender: Option<String>,
     #[serde(default)]
     pub recipient: Option<String>,
+    /// Full recipient list of a MULTI-recipient directed note (FLAG_MULTI,
+    /// 2+ recipients), in output order. Empty for a self-note or an
+    /// ordinary single-recipient directed note — use `recipient` instead
+    /// (mirrors notes-core's `RecoveredNote.recipients` convention
+    /// exactly, including "empty means single"). Populated for BOTH own
+    /// (compose-time) and received (scan-derived) multi notes.
+    #[serde(default)]
+    pub recipients: Vec<String>,
     pub txids: Vec<String>,
     #[serde(default)]
     pub height: Option<u64>,
@@ -96,6 +104,39 @@ pub struct NoteRecord {
     /// Confirmed/Orphaned record. See [`resolve_dropped`].
     #[serde(default)]
     pub dropped: bool,
+}
+
+impl NoteRecord {
+    /// `{sender} ∪ recipients` minus `my_address`, deduped, sender first
+    /// then recipients in order — "who else was on this note", for a
+    /// Reply-all picker. Mirrors notes-core's `bundle::reply_set` exactly
+    /// (same rule), applied to the app's persisted `NoteRecord` instead of
+    /// a freshly-scanned `RecoveredNote` — both carry the same
+    /// sender/recipient/recipients shape. Falls back to the legacy
+    /// singular `recipient` field when `recipients` is empty (an ordinary
+    /// single-recipient directed note). A self-note (no sender, no
+    /// recipients) returns an empty list.
+    pub fn reply_set(&self, my_address: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |addr: &str, out: &mut Vec<String>| {
+            if addr != my_address && !out.iter().any(|a| a == addr) {
+                out.push(addr.to_string());
+            }
+        };
+        if let Some(s) = &self.sender {
+            push(s, &mut out);
+        }
+        if self.recipients.is_empty() {
+            if let Some(r) = &self.recipient {
+                push(r, &mut out);
+            }
+        } else {
+            for r in &self.recipients {
+                push(r, &mut out);
+            }
+        }
+        out
+    }
 }
 
 /// One input spent by a sweep/consolidate tx — kept for RBF re-signing.
@@ -618,6 +659,9 @@ impl Store {
                 if n.recipient.is_none() {
                     n.recipient = note.recipient.clone();
                 }
+                if n.recipients.is_empty() {
+                    n.recipients = note.recipients.clone();
+                }
                 false
             }
             None => {
@@ -634,6 +678,7 @@ impl Store {
                     received: note.received,
                     sender: note.sender.clone(),
                     recipient: note.recipient.clone(),
+                    recipients: note.recipients.clone(),
                     txids: note.txids.clone(),
                     height: note.height,
                     blocktime: note.blocktime,
@@ -941,6 +986,7 @@ mod tests {
             received,
             sender: sender.map(String::from),
             recipient: None,
+            recipients: vec![],
             txids: vec![],
             height: Some(1),
             blocktime: Some(1),
@@ -1307,5 +1353,34 @@ mod tests {
         // Reappears — cleared.
         store.resolve_dropped_notes(|_| TxLookupStatus::Found(true), |_, _, _| None);
         assert!(!store.notes[0].dropped);
+    }
+
+    /// `NoteRecord::reply_set` mirrors notes-core's `bundle::reply_set`:
+    /// sender first, then recipients, minus me, deduped; falls back to the
+    /// singular `recipient` when `recipients` is empty; a self-note yields
+    /// nothing.
+    #[test]
+    fn reply_set_covers_sender_recipients_self_and_dedup() {
+        let me = "tb1p-me";
+
+        // Received single-recipient note: just the sender.
+        let mut n = note("aa", true, Some("tb1p-alice"));
+        n.recipient = Some(me.to_string());
+        assert_eq!(n.reply_set(me), vec!["tb1p-alice".to_string()]);
+
+        // Received MULTI-recipient note: sender first, then every OTHER
+        // recipient (me excluded), in order.
+        let mut n = note("bb", true, Some("tb1p-alice"));
+        n.recipients = vec![me.to_string(), "tb1p-carol".to_string(), "tb1p-dave".to_string()];
+        assert_eq!(n.reply_set(me), vec!["tb1p-alice".to_string(), "tb1p-carol".to_string(), "tb1p-dave".to_string()]);
+
+        // Sender appearing again as a recipient (edge case) dedupes.
+        let mut n = note("cc", true, Some("tb1p-alice"));
+        n.recipients = vec![me.to_string(), "tb1p-alice".to_string()];
+        assert_eq!(n.reply_set(me), vec!["tb1p-alice".to_string()]);
+
+        // A self-note (no sender, no recipients) has nothing to reply to.
+        let n = note("dd", false, None);
+        assert!(n.reply_set(me).is_empty());
     }
 }
