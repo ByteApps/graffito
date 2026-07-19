@@ -615,6 +615,44 @@ fn main() {
                 "cli: spending-discover found={found} next_receive={next_receive} next_change={next_change}"
             );
         }
+        Some("spending-xpub") => {
+            // spending-xpub <net>
+            // The spending wallet's account-level xpub
+            // (m/84'/{coin}'/{account}') plus master fingerprint — the
+            // third-party-restore comparison surface: a wallet that
+            // derives this xpub from the words derives every spending
+            // address by BIP-32 math. Needs a BIP-39/master-xprv APP_KEY
+            // (APP_ACCOUNT selects the account).
+            let net = network(&args[2]);
+            let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | master xprv");
+            let account: u32 =
+                std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
+            let material = parse_key_material(&key, net).expect("APP_KEY parse");
+            let (xpub, fp) = app_core::spending::account_xpub(&material, net, account)
+                .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
+            println!("cli: spending-xpub fp={fp} xpub={xpub}");
+            println!("{xpub}");
+        }
+        Some("spending-derive") => {
+            // spending-derive <net> <chain> <index>
+            // Stateless single-leaf derivation
+            // (m/84'/{coin}'/{account}'/{chain}/{index}) — prints the
+            // address without touching the notebooks index, so restore
+            // checks can compare CHANGE-chain (1/…) addresses too;
+            // spending-address only walks the receive chain and marks
+            // indexes handed out. Needs a BIP-39/master-xprv APP_KEY.
+            let net = network(&args[2]);
+            let chain: u32 = args[3].parse().expect("chain: 0=receive | 1=change");
+            let index: u32 = args[4].parse().expect("index");
+            let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | master xprv");
+            let account: u32 =
+                std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
+            let material = parse_key_material(&key, net).expect("APP_KEY parse");
+            let leaf = app_core::spending::derive_spending_key(&material, net, account, chain, index)
+                .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
+            println!("cli: spending-derive chain={chain} index={index} address={}", leaf.address);
+            println!("{}", leaf.address);
+        }
         Some("note-spend-funded") => {
             // note-spend-funded <store.json> <base-url> <public|private> <rate> <text> [to]
             // Fully in-app internal funding kind: scan the identity's OWN
@@ -987,6 +1025,7 @@ fn main() {
                  notes <store> | compose <store> <base> <public|private> <rate> <text> [to] | \
                  bundle <addr> <net> <base> <out> | \
                  spending-address <store> <net> | \
+                 spending-xpub <net> | spending-derive <net> <chain> <index> | \
                  spending-discover <store> <base> [gap] | \
                  note-spend-funded <store> <base> <public|private> <rate> <text> [to] | \
                  fund-keygen <net> <seed-hex> [tr|wpkh] | \
