@@ -1061,6 +1061,28 @@ component SettingsCard inherits Rectangle {
     }
 }
 
+// One key:value line of a breakdown card — label muted-left, value
+// bold-right (the Pay-from summary card's row idiom, extracted for the
+// compose cost card; Sal's build-17 follow-up 2026-07-18: "use sections
+// key: value so it's more clear" instead of one long wrapped string).
+component KvRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <color> value-color: Pal.text;
+    spacing: 6px;
+    Text { text: root.label; font-size: 11px; color: Pal.muted; vertical-alignment: center; }
+    Text {
+        text: root.value;
+        font-size: 13px;
+        font-weight: 600;
+        color: root.value-color;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+        horizontal-alignment: right;
+        overflow: elide;
+    }
+}
+
 component DoorCard inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
@@ -1438,7 +1460,22 @@ export component AppWindow inherits Window {
     in-out property <bool> compose-private: true;
     in-out property <string> rate-text;
     in-out property <int> fee-tier: 1;
+    // Plain accent text under the rate box — ERROR/status messaging only
+    // since the structured cost card (build-17 follow-up, Sal 2026-07-18:
+    // "use sections key: value so it's more clear"): "Too large to
+    // broadcast…", "~N sats fee minimum", "funded from the external
+    // wallet". Rendered only while the structured props below are empty.
     in property <string> cost-line;
+    // Structured cost breakdown card (key:value rows). An empty string
+    // hides that row; all-empty hides the whole card. `cost-fold`/
+    // `cost-total` only populate when the dust-rule fold prediction fires
+    // (Total == Fee otherwise — the row would be noise).
+    in property <string> cost-size;   // "1 chunk · ~151 vB"
+    in property <string> cost-fee;    // "~151 sats (~$0.00)" — NOMINAL fee
+    in property <string> cost-gift;   // "+330 sats" (directed: recipient output)
+    in property <string> cost-dust;   // "+330 sats" (funded shapes: dust-to-self)
+    in property <string> cost-fold;   // "+227 sats" (dust-rule leftover)
+    in property <string> cost-total;  // "~330 sats" (fee + leftover, fold only)
     // Async sign+broadcast (2026-07-16): true while a compose send
     // (notebook/spending/mixed) is building or broadcasting — disables the
     // Sign button and swaps its caption; compose-stage names the phase.
@@ -2739,16 +2776,39 @@ export component AppWindow inherits Window {
             }
             Caption { text: "sat/vB"; vertical-alignment: center; }
         }
-        if root.cost-line != "": Text {
+        // Structured cost breakdown (Sal's build-17 follow-up, 2026-07-18:
+        // the wrapped one-line string "doesn't look organized, use sections
+        // key: value so it's more clear"): a compact card with one row per
+        // figure. Empty value hides its row; the fold/total rows only exist
+        // while the dust-rule fold prediction fires.
+        if root.cost-size != "" || root.cost-fee != "": Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: cost-col.preferred-height;
+            cost-col := VerticalLayout {
+                padding: 12px;
+                spacing: 4px;
+                if root.cost-size != "": KvRow { label: "Size"; value: root.cost-size; }
+                if root.cost-fee != "": KvRow { label: "Fee"; value: root.cost-fee; }
+                if root.cost-gift != "": KvRow { label: "To recipient"; value: root.cost-gift; }
+                if root.cost-dust != "": KvRow { label: "Dust to self"; value: root.cost-dust; }
+                if root.cost-fold != "": KvRow { label: "Leftover (dust rule)"; value: root.cost-fold; value-color: Pal.warn; }
+                if root.cost-total != "": KvRow { label: "Total"; value: root.cost-total; value-color: Pal.accent; }
+            }
+        }
+        // Plain accent text: ERROR/status messaging only ("Too large to
+        // broadcast…", "~N sats fee minimum", "funded from the external
+        // wallet") — renders only while the structured card is empty, so
+        // those look exactly as before.
+        if root.cost-line != "" && root.cost-size == "" && root.cost-fee == "": Text {
             text: root.cost-line;
             font-size: 13px;
             font-weight: 600;
             color: Pal.accent;
-            // The dust-rule leftover suffix can exceed the screen width — an
-            // unwrapped Text widens the whole compose column past the right
-            // edge (Sal's build-16 iPhone report; same overflow class as the
-            // iteration-2 cutoff). Wrap to multiple rows instead: cap the
-            // preferred width so the layout never stretches to fit one line.
+            // The long-text overflow rule stands (Sal's build-16 iPhone
+            // report): wrap instead of widening the compose column.
             wrap: word-wrap;
             preferred-width: 0;
             horizontal-stretch: 1;

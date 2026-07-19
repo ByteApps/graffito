@@ -4856,6 +4856,53 @@ fn log_funding_refresh(st: &State) {
     println!("cb: funding-refresh notebook={notebook} spending={spending}");
 }
 
+/// Fill the compose screen's structured cost-breakdown card (Sal's
+/// build-17 follow-up, 2026-07-18: replace the single wrapped cost-line
+/// string with key:value sections). Empty strings hide their row;
+/// `fold_total` is `(folded_leftover, byte-true_total_fee)` when the
+/// dust-rule fold prediction fired — it populates the "Leftover (dust
+/// rule)" and "Total" rows (Total == Fee otherwise, so both stay hidden).
+/// Clears `cost_line`: the plain accent text only renders while the card
+/// is empty (error/status messaging goes through [`set_cost_status`]).
+fn set_cost_card(
+    w: &AppWindow,
+    size: String,
+    fee: String,
+    gift: String,
+    dust: String,
+    fold_total: Option<(u64, u64)>,
+) {
+    w.set_cost_line("".into());
+    w.set_cost_size(size.into());
+    w.set_cost_fee(fee.into());
+    w.set_cost_gift(gift.into());
+    w.set_cost_dust(dust.into());
+    match fold_total {
+        Some((folded, total)) => {
+            w.set_cost_fold(format!("+{} sats", commas(folded)).into());
+            w.set_cost_total(format!("~{} sats", commas(total)).into());
+        }
+        None => {
+            w.set_cost_fold("".into());
+            w.set_cost_total("".into());
+        }
+    }
+}
+
+/// ERROR/status text under the rate box ("Too large to broadcast…",
+/// "~N sats fee minimum", "funded from the external wallet"): plain
+/// accent `cost_line` text, structured card hidden — these render exactly
+/// as they did before the card existed.
+fn set_cost_status(w: &AppWindow, text: String) {
+    w.set_cost_size("".into());
+    w.set_cost_fee("".into());
+    w.set_cost_gift("".into());
+    w.set_cost_dust("".into());
+    w.set_cost_fold("".into());
+    w.set_cost_total("".into());
+    w.set_cost_line(text.into());
+}
+
 fn refresh_compose(w: &AppWindow, st: &mut State) {
     let net = st.network;
     let text = w.get_compose_text().to_string();
@@ -4966,7 +5013,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         let min_line = est_fee
             .map(|fee| format!("~{} sats fee minimum", commas(fee)))
             .unwrap_or_default();
-        w.set_cost_line(min_line.into());
+        set_cost_status(w, min_line);
         w.set_change_amount(format!("Change to {change_dest}").into());
         st.compose_oversize = false;
         sync_and_finalize_payfrom(w, st);
@@ -4999,15 +5046,6 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
                 .usd
                 .map(|p| format!(" (~${:.2})", fee as f64 * p / 1e8))
                 .unwrap_or_default();
-            let gift_line = if spk_len.is_some() {
-                format!(" + {} sats to recipient", commas(sent))
-            } else {
-                String::new()
-            };
-            let fold_line = match fold {
-                Some((_, folded)) => format!(" + {} sats leftover (dust rule)", commas(folded)),
-                None => String::new(),
-            };
             let fold_amount = fold.map(|(_, folded)| folded).unwrap_or(0);
             if fold_amount != st.compose_fold_shown {
                 if fold_amount > 0 {
@@ -5015,8 +5053,13 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
                 }
                 st.compose_fold_shown = fold_amount;
             }
-            w.set_cost_line(
-                format!("{chunks} chunk(s) · ~{vsize} vB · ~{fee} sats{usd}{gift_line}{fold_line}").into(),
+            set_cost_card(
+                w,
+                format!("{chunks} chunk{} · ~{vsize} vB", if chunks == 1 { "" } else { "s" }),
+                format!("~{} sats{usd}", commas(fee)),
+                if spk_len.is_some() { format!("+{} sats", commas(sent)) } else { String::new() },
+                String::new(), // no dust-to-self on the self-funded notebook shape
+                fold.map(|(nominal, folded)| (folded, nominal + folded)),
             );
             w.set_change_amount(format!("Change to {change_dest} · ~{change} sats").into());
         }
@@ -5025,12 +5068,13 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
         // `compose_oversize` (ANDed into `spend_enough` centrally below) —
         // the dialog below offers the fix.
         Ok((chunks, vsize)) => {
-            w.set_cost_line(
-                format!("{chunks} chunk(s) · ~{vsize} vB — too large to broadcast").into(),
+            set_cost_status(
+                w,
+                format!("{chunks} chunk(s) · ~{vsize} vB — too large to broadcast"),
             );
         }
         Err(_) => {
-            w.set_cost_line("Too large to broadcast (> 255 chunks)".into());
+            set_cost_status(w, "Too large to broadcast (> 255 chunks)".to_string());
         }
     }
 
@@ -5148,7 +5192,7 @@ fn funding_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     w.set_spend_title(
         format!("Funding {sel_count}/{n} coin{} · {} sats", if n == 1 { "" } else { "s" }, commas(sel_total)).into(),
     );
-    w.set_cost_line(if text.is_empty() { String::new() } else { "funded from the external wallet".into() }.into());
+    set_cost_status(w, if text.is_empty() { String::new() } else { "funded from the external wallet".to_string() });
     // `spend_enough`/`payfrom_required_line` are no longer set here — see
     // `payfrom_state`'s external-only branch (same readiness rule: a funding
     // wallet's real cost isn't knowable up front, so no numeric fee).
@@ -5241,17 +5285,17 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     };
 
     if n == 0 {
-        w.set_cost_line("".into());
+        set_cost_status(w, String::new());
         w.set_change_amount("Spending wallet has no coins yet — fund its receive address in Settings.".into());
         return;
     }
     if sel_count == 0 {
-        w.set_cost_line("".into());
+        set_cost_status(w, String::new());
         w.set_change_amount("No coins selected — select at least one below.".into());
         return;
     }
     if text.is_empty() {
-        w.set_cost_line("".into());
+        set_cost_status(w, String::new());
         w.set_change_amount(
             if change_override_spk.is_some() {
                 format!("Change to {}…", &change_trim[..14.min(change_trim.len())])
@@ -5267,7 +5311,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         st.store.as_ref(),
         st.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()),
     ) else {
-        w.set_cost_line("".into());
+        set_cost_status(w, String::new());
         return;
     };
     let recipient = st.to_address.as_deref().and_then(|a| Recipient::parse(net, a).ok());
@@ -5344,16 +5388,14 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
             }
             let fee_shown = fold.map(|(nominal, _)| nominal).unwrap_or(built.fee);
             let usd = st.usd.map(|p| format!(" (~${:.2})", fee_shown as f64 * p / 1e8)).unwrap_or_default();
-            let gift_line = if recipient.is_some() {
-                format!(" + {} sats to recipient", commas(built.sent_to_recipient))
-            } else {
-                String::new()
-            };
-            let fold_line = fold
-                .map(|(_, folded)| format!(" + {} sats leftover (dust rule)", commas(folded)))
-                .unwrap_or_default();
-            w.set_cost_line(
-                format!("~{} sats fee{usd}{gift_line} · +330 sats dust-to-self{fold_line}", fee_shown).into(),
+            set_cost_card(
+                w,
+                String::new(), // funded shape: no chunk/vsize estimate on this path
+                format!("~{} sats{usd}", commas(fee_shown)),
+                if recipient.is_some() { format!("+{} sats", commas(built.sent_to_recipient)) } else { String::new() },
+                format!("+{} sats", commas(built.dust_to_self)),
+                // Total = the byte-true fee the tx pays (nominal + leftover).
+                fold.map(|(_, folded)| (folded, built.fee)),
             );
             w.set_change_amount(
                 if has_custom_change {
@@ -5369,7 +5411,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
             );
         }
         Err(e) => {
-            w.set_cost_line("".into());
+            set_cost_status(w, String::new());
             w.set_change_amount(format!("{e}").into());
         }
     }
@@ -11199,9 +11241,17 @@ fn preview_mock(w: &AppWindow) {
     w.set_to_label("To  bcrt1pxs94vakt8gnq…rqmeyu58".into());
     w.set_compose_text("Happy birthday! Paid from cold storage.".into());
     w.set_rate_text("2".into());
-    // Worst-case length on purpose: the dust-rule suffix is the longest
-    // cost line the app produces — the preview harness must show it wrapped.
-    w.set_cost_line("1 chunk(s) · ~180 vB · ~360 sats (~$0.26) + 227 sats leftover (dust rule)".into());
+    // Worst case on purpose: EVERY row of the structured cost card
+    // populated, including the dust-rule fold split (Sal's build-17
+    // follow-up — the card replaced the long wrapped cost-line string).
+    set_cost_card(
+        w,
+        "1 chunk · ~180 vB".to_string(),
+        "~360 sats (~$0.26)".to_string(),
+        "+330 sats".to_string(),
+        "+330 sats".to_string(),
+        Some((227, 587)),
+    );
 
     let coins = [
         SpendCoin { outpoint: "aa:0".into(), value: "200,000".into(), confirmed: true, selected: true, txid_short: "aaaa…aaaa".into(), explorer: "".into() },
@@ -11267,6 +11317,8 @@ fn render_previews(w: u32, h: u32, screens: &[i32], out_dir: &str) {
         .expect("set_platform");
     let app = AppWindow::new().expect("window");
     win.set_size(slint::PhysicalSize::new(w, h));
+    // No safe-area pass runs headless — lift the splash cover directly.
+    app.set_ready(true);
 
     for &n in screens {
         preview_mock(&app);
