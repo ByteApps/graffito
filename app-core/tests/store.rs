@@ -115,7 +115,7 @@ fn compose_confirm_recover_lifecycle() {
         vec![change_utxo(&n2.tx, Some(102))],
         102,
     );
-    let stats = store.apply_bundle(&b, &a, NET).unwrap();
+    let stats = store.apply_bundle(&b, &a, NET, &[]).unwrap();
     assert_eq!(stats.orphaned, 0);
     assert!(store.notes.iter().all(|n| n.status == NoteStatus::Confirmed));
     assert_eq!(store.balance(), n2.tx.change);
@@ -123,13 +123,13 @@ fn compose_confirm_recover_lifecycle() {
 
     // Idempotency: re-applying the identical bundle changes nothing.
     let snapshot = serde_json::to_string(&store).unwrap();
-    store.apply_bundle(&b, &a, NET).unwrap();
+    store.apply_bundle(&b, &a, NET, &[]).unwrap();
     assert_eq!(serde_json::to_string(&store).unwrap(), snapshot);
 
     // Wipe recovery: fresh store + bare key + full bundle = notebook
     // back, INCLUDING the private note's plaintext.
     let mut fresh = Store::new(&a.output_x, NET);
-    fresh.apply_bundle(&b, &a, NET).unwrap();
+    fresh.apply_bundle(&b, &a, NET, &[]).unwrap();
     assert_eq!(fresh.notes.len(), 2);
     let recovered_private = fresh.notes.iter().find(|n| n.private).unwrap();
     assert_eq!(recovered_private.text.as_deref(), Some("second, private"));
@@ -173,7 +173,7 @@ fn directed_private_note_both_sides() {
         105,
     );
     let mut alice_fresh = Store::new(&a.output_x, NET);
-    alice_fresh.apply_bundle(&alice_bundle, &a, NET).unwrap();
+    alice_fresh.apply_bundle(&alice_bundle, &a, NET, &[]).unwrap();
     let note = &alice_fresh.notes[0];
     assert!(note.directed && note.private && !note.received);
     assert_eq!(note.recipient.as_deref(), Some(bob_addr.as_str()));
@@ -187,7 +187,7 @@ fn directed_private_note_both_sides() {
         105,
     );
     let mut bob_store = Store::new(&b.output_x, NET);
-    bob_store.apply_bundle(&bob_bundle, &b, NET).unwrap();
+    bob_store.apply_bundle(&bob_bundle, &b, NET, &[]).unwrap();
     let received = &bob_store.notes[0];
     assert!(received.received && received.private && received.directed);
     assert_eq!(received.sender.as_deref(), Some(alice_addr.as_str()));
@@ -204,7 +204,7 @@ fn unconfirmed_scanned_utxo_is_spendable() {
         vec![BundleUtxo { txid: "ab".repeat(32), vout: 0, value: 50_000, height: None, owner_address: None }],
         100,
     );
-    store.apply_bundle(&b, &a, NET).unwrap();
+    store.apply_bundle(&b, &a, NET, &[]).unwrap();
     // Counts toward balance and is spendable (0-conf), not filtered out.
     assert_eq!(store.balance(), 50_000);
     assert_eq!(store.available_utxos().len(), 1);
@@ -320,7 +320,7 @@ fn bump_fee_same_note_id_same_inputs_higher_fee() {
         vec![change_utxo(&bumped.tx, Some(120))],
         120,
     );
-    store.apply_bundle(&b, &a, NET).unwrap();
+    store.apply_bundle(&b, &a, NET, &[]).unwrap();
     assert_eq!(store.notes[0].status, NoteStatus::Confirmed);
     assert!(store.notes[0].raw_hex.is_none());
 }
@@ -340,7 +340,7 @@ fn orphaned_when_inputs_spent_elsewhere() {
     // Full rescan: the funding UTXO is gone (spent by another wallet
     // holding the same key) and our txid never appeared.
     let empty = bundle(vec![], vec![], 110);
-    let stats = store.apply_bundle(&empty, &a, NET).unwrap();
+    let stats = store.apply_bundle(&empty, &a, NET, &[]).unwrap();
     assert_eq!(stats.orphaned, 1);
     assert_eq!(store.notes[0].status, NoteStatus::Orphaned);
     assert_eq!(store.balance(), 0);
@@ -380,7 +380,7 @@ fn sweep_tx_record_bump_and_confirm() {
     // mempool acceptance); the record settles when the node reports the
     // REPLACEMENT txid in a block.
     let b = bundle(vec![], vec![change_utxo(&bumped, Some(120))], 120);
-    store.apply_bundle(&b, &a, NET).unwrap();
+    store.apply_bundle(&b, &a, NET, &[]).unwrap();
     assert_eq!(store.txs[0].status, NoteStatus::Pending);
     let winner = bumped.txid_hex.clone();
     store.resolve_spend_statuses(|t| if t == winner { Some(true) } else { None });
@@ -392,7 +392,7 @@ fn sweep_tx_record_bump_and_confirm() {
 fn identity_mismatch_rejected_and_persistence_roundtrip() {
     let a = alice();
     let mut store = funded_store(&a);
-    let err = store.apply_bundle(&bundle(vec![], vec![], 1), &bob(), NET);
+    let err = store.apply_bundle(&bundle(vec![], vec![], 1), &bob(), NET, &[]);
     assert!(err.is_err(), "bundle for a different identity must be refused");
 
     store.touch_contact("bcrt1qsomeone");
@@ -512,9 +512,9 @@ fn watch_store_recovers_notebook_without_keys() {
     );
 
     let mut keyed = Store::new(&a.output_x, NET);
-    keyed.apply_bundle(&b, &a, NET).unwrap();
+    keyed.apply_bundle(&b, &a, NET, &[]).unwrap();
     let mut watch = Store::new(&a.output_x, NET);
-    let stats = watch.apply_bundle_watch(&b, &a.output_x, NET).unwrap();
+    let stats = watch.apply_bundle_watch(&b, &a.output_x, NET, &[]).unwrap();
     assert_eq!(stats.notes_new, 2);
     assert_eq!(watch.address, keyed.address);
     assert_eq!(watch.balance(), keyed.balance());
@@ -528,11 +528,11 @@ fn watch_store_recovers_notebook_without_keys() {
 
     // Idempotent re-apply: private stays sealed, nothing duplicates.
     let snapshot = serde_json::to_string(&watch).unwrap();
-    watch.apply_bundle_watch(&b, &a.output_x, NET).unwrap();
+    watch.apply_bundle_watch(&b, &a.output_x, NET, &[]).unwrap();
     assert_eq!(serde_json::to_string(&watch).unwrap(), snapshot);
 
     // Fingerprint guard works keyless too.
-    assert!(watch.apply_bundle_watch(&b, &bob().output_x, NET).is_err());
+    assert!(watch.apply_bundle_watch(&b, &bob().output_x, NET, &[]).is_err());
 }
 
 /// Spend records settle on REAL confirmation, not on their inputs
@@ -559,7 +559,7 @@ fn spend_records_confirm_by_tx_status_not_utxo_disappearance() {
     // Full bundle WITHOUT the spent coin: the old inference would have
     // confirmed here. It must stay Pending now.
     let empty = bundle(vec![], vec![], 200);
-    store.apply_bundle(&empty, &a, NET).unwrap();
+    store.apply_bundle(&empty, &a, NET, &[]).unwrap();
     assert_eq!(store.txs[0].status, NoteStatus::Pending, "mempool-spent is not finality");
     assert!(store.txs[0].raw_hex.is_some(), "rebroadcast must stay possible");
 
@@ -578,4 +578,142 @@ fn spend_records_confirm_by_tx_status_not_utxo_disappearance() {
     store.record_tx("consolidate", "cc".repeat(32), 1, 1, 1, "r".into(), "self".into(), vec![], "51".into(), 2_000);
     assert_eq!(store.resolve_spend_statuses(|_| None), 0);
     assert_eq!(store.txs[1].status, NoteStatus::Pending);
+}
+
+// ---------------------------------------------------------------------
+// DISPLAY-OWNER dedup for multi-notebook own notes (notes-core rev
+// 6e36a23, 2026-07-18 design decision — a protocol DISPLAY rule, not an
+// ownership change): a tx that spends from MULTIPLE of a wallet's
+// notebook addresses must display in only ONE notebook's store — the
+// scan of the notebook whose spk is the FIRST notebook input in tx
+// order. `Store::apply_bundle`'s new `notebook_spks` argument threads
+// straight into `extract_notes_multi_deduped`; these tests prove that
+// plumbing at the store level (notes-core's own tests already cover the
+// extraction rule itself byte-for-byte). `alice`/`bob` stand in for two
+// sibling notebooks of the same wallet — their derivation path is
+// irrelevant here, only their distinct notebook spks matter.
+// ---------------------------------------------------------------------
+
+fn notebook_spk(identity: &Identity) -> Vec<u8> {
+    app_core::notes_core::address::p2tr_script_pubkey(&identity.output_x)
+}
+
+/// A crafted `OnchainTx` for `tx` whose `input_prevout_spks` claims it
+/// spends from every notebook in `input_notebooks`, in that order —
+/// never a shape our own composers produce (they only ever spend from
+/// one notebook), but exactly what a foreign wallet could craft, which
+/// is what `extract_notes_multi_deduped` disambiguates.
+fn onchain_multi_notebook_input(tx: &NoteTx, height: u64, input_notebooks: &[&Identity]) -> OnchainTx {
+    OnchainTx {
+        txid: tx.txid_hex.clone(),
+        height: Some(height),
+        blocktime: Some(1_700_000_000 + height),
+        spends_from_self: false,
+        payloads: tx
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey).map(hex::encode))
+            .collect(),
+        pays_self: true,
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        input_prevout_spks: input_notebooks.iter().map(|id| hex::encode(notebook_spk(id))).collect(),
+    }
+}
+
+/// The core rule: notebook A's input comes first in the crafted tx, so
+/// scanning the SAME tx independently as both notebook A's and notebook
+/// B's store keeps the note only in A's — never-zero across the pair,
+/// never doubled either.
+#[test]
+fn display_owner_dedup_keeps_note_only_in_first_notebook_input_scan() {
+    let a = alice();
+    let b = bob();
+    let spk_a = notebook_spk(&a);
+    let spk_b = notebook_spk(&b);
+
+    let mut store = funded_store(&a);
+    let n = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "owned by two notebooks",
+            private: false,
+            recipient: None,
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            now: 4000,
+        },
+    )
+    .unwrap();
+
+    // Crafted: the tx's input_prevout_spks claims A's input first, B's second.
+    let tx = onchain_multi_notebook_input(&n.tx, 700, &[&a, &b]);
+    let scan_bundle = bundle(vec![tx], vec![], 700);
+    let notebook_spks = vec![spk_a.clone(), spk_b.clone()];
+
+    let mut store_a = Store::new(&a.output_x, NET);
+    let stats_a = store_a.apply_bundle(&scan_bundle, &a, NET, &notebook_spks).unwrap();
+    let mut store_b = Store::new(&b.output_x, NET);
+    let stats_b = store_b.apply_bundle(&scan_bundle, &b, NET, &notebook_spks).unwrap();
+
+    assert_eq!(store_a.notes.len(), 1, "notebook A (first notebook input) keeps the note");
+    assert_eq!(stats_a.notes_seen, 1);
+    assert_eq!(store_b.notes.len(), 0, "notebook B must not also display it");
+    assert_eq!(stats_b.notes_seen, 0);
+}
+
+/// EDGE RULE (review): an ARCHIVED notebook must be excluded from the
+/// `notebook_spks` set fed to `apply_bundle` (see
+/// `identity::active_notebook_spks`), so its input can never anchor —
+/// and therefore never suppress — a note that also touches an ACTIVE
+/// notebook. Same crafted shape, but B's input is now FIRST in tx order
+/// while the caller's `notebook_spks` (standing in for "B is archived,
+/// only A is active") omits B entirely. The anchor search must skip
+/// straight past B to A's (later) input, so A still keeps the note
+/// despite not being first in the tx.
+#[test]
+fn display_owner_dedup_archived_notebook_input_never_anchors() {
+    let a = alice();
+    let b = bob();
+    let spk_a = notebook_spk(&a);
+
+    let mut store = funded_store(&a);
+    let n = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "b archived, a active",
+            private: false,
+            recipient: None,
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            now: 4100,
+        },
+    )
+    .unwrap();
+
+    // B's input FIRST, A's SECOND — but notebook_spks (the archived-
+    // exclusion caller contract) omits B, as if it were archived.
+    let tx = onchain_multi_notebook_input(&n.tx, 701, &[&b, &a]);
+    let scan_bundle = bundle(vec![tx], vec![], 701);
+    let notebook_spks = vec![spk_a.clone()]; // B deliberately excluded
+
+    let mut store_a = Store::new(&a.output_x, NET);
+    let stats_a = store_a.apply_bundle(&scan_bundle, &a, NET, &notebook_spks).unwrap();
+
+    assert_eq!(
+        store_a.notes.len(),
+        1,
+        "active notebook A must keep the note even though the (archived) B input came first"
+    );
+    assert_eq!(stats_a.notes_seen, 1);
 }

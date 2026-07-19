@@ -136,17 +136,26 @@ fn main() {
             let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | xprv | WIF | hex32");
             let account: u32 =
                 std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
+            // DISPLAY-OWNER anchor set (notes-core rev 6e36a23): every
+            // ACTIVE notebook's own spk, best-effort from the same
+            // notebooks index loaded above for the spending section —
+            // empty (no-op) for non-hierarchical APP_KEY or no index yet.
+            let mut notebook_spks: Vec<Vec<u8>> = Vec::new();
             if let Ok(material) = parse_key_material(&key, net) {
                 let ix_path = spending_index_path(&args[2], net, &material);
                 if let Ok(ix) = NotebookIndex::load(&ix_path) {
                     store.spending = ix.spending_for(account);
+                    notebook_spks =
+                        app_core::identity::active_notebook_spks(&material, net, account, &ix);
                 }
             }
             let client = ChainClient::new(HttpTransport::new(&args[3]), net);
             let bundle = client.build_bundle(&store.address, None).expect("build bundle");
             let stats = match ident.full() {
-                Some(id) => store.apply_bundle(&bundle, id, net).expect("apply"),
-                None => store.apply_bundle_watch(&bundle, &ident.output_x(), net).expect("apply"),
+                Some(id) => store.apply_bundle(&bundle, id, net, &notebook_spks).expect("apply"),
+                None => store
+                    .apply_bundle_watch(&bundle, &ident.output_x(), net, &notebook_spks)
+                    .expect("apply"),
             };
             store.resolve_spend_statuses(|t| client.fetch_tx_status(t));
             save(&store, &args[2]);

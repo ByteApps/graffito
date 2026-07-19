@@ -366,3 +366,89 @@ pub fn realize(
         address,
     })
 }
+
+/// Every ACTIVE (non-archived) notebook's own p2tr scriptPubKey for
+/// `account`, in notebook-index order — the DISPLAY-OWNER anchor set fed
+/// to notes-core's `extract_notes_multi_deduped`/
+/// `extract_notes_watch_multi_deduped` (rev 6e36a23). Archived notebooks
+/// are deliberately EXCLUDED: an anchor pointing at an archived notebook
+/// must never suppress a note in an active notebook that also
+/// contributed an input to the same tx, and a tx touching ONLY archived
+/// notebooks never reaches an active store's bundle anyway. Mirrors
+/// `confirm_self_spks`'s enumeration (`ix.active(account)` + `realize`)
+/// in `src/lib.rs`, but collects notebook spks ONLY — never the spending
+/// wallet's addresses, which must NOT be in this set (a spending-wallet
+/// input earlier in a tx must never steal the anchor; see notes-core's
+/// doc comment on `extract_notes_multi_deduped`). A `realize` failure for
+/// one notebook (should not happen for material that already produced
+/// this `NotebookIndex`) is skipped rather than propagated —
+/// best-effort, matching `confirm_self_spks`.
+pub fn active_notebook_spks(
+    material: &KeyMaterial,
+    network: Network,
+    account: u32,
+    ix: &crate::notebooks::NotebookIndex,
+) -> Vec<Vec<u8>> {
+    ix.active(account)
+        .filter_map(|m| realize(material, network, account, m.index).ok())
+        .map(|ident| notes_core::address::p2tr_script_pubkey(&ident.output_x()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notebooks::NotebookIndex;
+
+    const MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// DISPLAY-OWNER anchor-set sourcing (notes-core rev 6e36a23, EDGE
+    /// RULE from review): an archived notebook must be EXCLUDED from
+    /// `notebook_spks` — its spk must never be able to anchor/suppress a
+    /// note in a sibling active notebook — and the surviving set stays in
+    /// notebook-index order.
+    #[test]
+    fn active_notebook_spks_excludes_archived_and_keeps_index_order() {
+        let net = Network::Regtest;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let mut ix = NotebookIndex::new();
+        ix.ensure(0, 0);
+        ix.ensure(0, 1);
+        ix.ensure(0, 2);
+        ix.set_archived(0, 1, true); // notebook 1 archived — must drop out
+
+        let spks = active_notebook_spks(&material, net, 0, &ix);
+
+        let spk0 = notes_core::address::p2tr_script_pubkey(
+            &realize(&material, net, 0, 0).unwrap().output_x(),
+        );
+        let spk1 = notes_core::address::p2tr_script_pubkey(
+            &realize(&material, net, 0, 1).unwrap().output_x(),
+        );
+        let spk2 = notes_core::address::p2tr_script_pubkey(
+            &realize(&material, net, 0, 2).unwrap().output_x(),
+        );
+
+        assert_eq!(spks, vec![spk0, spk2], "archived notebook 1 excluded; 0 then 2, index order");
+        assert!(!spks.contains(&spk1), "the archived notebook's spk must never appear");
+    }
+
+    /// A different account's notebooks never leak into this one's set —
+    /// no cross-account anchor stealing.
+    #[test]
+    fn active_notebook_spks_is_scoped_to_the_requested_account() {
+        let net = Network::Regtest;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let mut ix = NotebookIndex::new();
+        ix.ensure(0, 0);
+        ix.ensure(1, 0);
+
+        let spks = active_notebook_spks(&material, net, 0, &ix);
+        let acct1_spk = notes_core::address::p2tr_script_pubkey(
+            &realize(&material, net, 1, 0).unwrap().output_x(),
+        );
+        assert_eq!(spks.len(), 1, "only account 0's notebook");
+        assert!(!spks.contains(&acct1_spk), "account 1's notebook must not appear");
+    }
+}

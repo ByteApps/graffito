@@ -9,7 +9,9 @@
 //! is a no-op.
 
 use notes_core::address::{p2tr_script_pubkey, taproot_address};
-use notes_core::bundle::{extract_notes_multi, extract_notes_watch_multi, Identity, RecoveredNote, SyncBundle};
+use notes_core::bundle::{
+    extract_notes_multi_deduped, extract_notes_watch_multi_deduped, Identity, RecoveredNote, SyncBundle,
+};
 use notes_core::tx::Utxo;
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
@@ -356,31 +358,55 @@ impl Store {
     /// wallet's used addresses — empty `spending.used` (every pre-M2 store,
     /// or the setting left off) makes this byte-identical to the old
     /// singleton-spk `extract_notes` call.
+    ///
+    /// `notebook_spks` (2026-07-18, notes-core rev 6e36a23) is the DISPLAY-
+    /// OWNER anchor set: the p2tr scriptPubKeys of every ACTIVE notebook of
+    /// this identity's account, in index order — see
+    /// `identity::active_notebook_spks`, the caller's usual source. An
+    /// empty slice is a strict no-op (byte-identical to the pre-dedup
+    /// `extract_notes_multi` call), so old callers/tests are unaffected.
     pub fn apply_bundle(
         &mut self,
         bundle: &SyncBundle,
         identity: &Identity,
         network: Network,
+        notebook_spks: &[Vec<u8>],
     ) -> Result<ApplyStats, Error> {
         self.check_identity(&identity.output_x)?;
         let mut self_spks = vec![p2tr_script_pubkey(&identity.output_x)];
         self_spks.extend(self.spending_self_spks());
-        self.apply_recovered(bundle, extract_notes_multi(bundle, identity, network, &self_spks))
+        self.apply_recovered(
+            bundle,
+            extract_notes_multi_deduped(bundle, identity, network, &self_spks, notebook_spks),
+        )
     }
 
     /// Watch-only [`Self::apply_bundle`]: same merge, but notes extract
     /// without keys — every private body stays sealed (text: None). Watch
     /// identities have no spending wallet (PLAN decision 7), so
     /// `spending_self_spks` is always empty here — this stays byte-
-    /// identical to the old `extract_notes_watch` call.
+    /// identical to the old `extract_notes_watch` call. `notebook_spks`:
+    /// see [`Self::apply_bundle`] — this scan's own notebook spk (derived
+    /// from `output_x`) is the anchor identity compared against.
     pub fn apply_bundle_watch(
         &mut self,
         bundle: &SyncBundle,
         output_x: &[u8; 32],
         network: Network,
+        notebook_spks: &[Vec<u8>],
     ) -> Result<ApplyStats, Error> {
         self.check_identity(output_x)?;
-        self.apply_recovered(bundle, extract_notes_watch_multi(bundle, network, &self.spending_self_spks()))
+        let own_spk = p2tr_script_pubkey(output_x);
+        self.apply_recovered(
+            bundle,
+            extract_notes_watch_multi_deduped(
+                bundle,
+                network,
+                &self.spending_self_spks(),
+                notebook_spks,
+                &own_spk,
+            ),
+        )
     }
 
     fn check_identity(&self, output_x: &[u8; 32]) -> Result<(), Error> {

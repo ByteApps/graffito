@@ -23,8 +23,8 @@ use app_core::chain::{
 use app_core::compose::ComposeRequest;
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
 use app_core::identity::{
-    generate_mnemonic, generate_mnemonic_with_salt, index_fp8, parse_key_material, realize,
-    AppIdentity,
+    active_notebook_spks, generate_mnemonic, generate_mnemonic_with_salt, index_fp8,
+    parse_key_material, realize, AppIdentity,
 };
 use app_core::notebooks::{NotebookIndex, SpendingAddr};
 use app_core::psbt_build::{
@@ -2385,6 +2385,10 @@ fn refresh_wallet_stores(st: &State) -> usize {
     let Some(ix) = &st.notebooks else { return 0 };
     let client = ChainClient::new(HttpTransport::new(base), st.network);
     let current = st.ident.as_ref().map(|i| i.index);
+    // DISPLAY-OWNER anchor set (notes-core rev 6e36a23): every ACTIVE
+    // notebook's own spk, computed once for the whole rescan loop —
+    // archived notebooks are excluded (see `active_notebook_spks`).
+    let notebook_spks = active_notebook_spks(&material, st.network, st.account, ix);
     let mut scanned = 0;
     for m in ix.active(st.account) {
         if current == Some(m.index) {
@@ -2395,8 +2399,8 @@ fn refresh_wallet_stores(st: &State) -> usize {
             .unwrap_or_else(|| Store::new(&ident.output_x(), st.network));
         let Ok(bundle) = client.build_bundle(&ident.address, None) else { continue };
         let applied = match ident.full() {
-            Some(id) => store.apply_bundle(&bundle, id, st.network),
-            None => store.apply_bundle_watch(&bundle, &ident.output_x(), st.network),
+            Some(id) => store.apply_bundle(&bundle, id, st.network, &notebook_spks),
+            None => store.apply_bundle_watch(&bundle, &ident.output_x(), st.network, &notebook_spks),
         };
         if applied.is_ok() {
             if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == m.index) {
@@ -3685,11 +3689,17 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
                 let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
                 let output_x = st.ident.as_ref().unwrap().output_x();
                 let network = st.network;
+                let notebook_spks = notebook_spks_for(st);
                 let applied = match &keyed {
                     Some(identity) => {
-                        st.store.as_mut().unwrap().apply_bundle(&bundle, identity, network)
+                        st.store.as_mut().unwrap().apply_bundle(&bundle, identity, network, &notebook_spks)
                     }
-                    None => st.store.as_mut().unwrap().apply_bundle_watch(&bundle, &output_x, network),
+                    None => st.store.as_mut().unwrap().apply_bundle_watch(
+                        &bundle,
+                        &output_x,
+                        network,
+                        &notebook_spks,
+                    ),
                 };
                 match applied {
                     Ok(stats) => {
@@ -3761,9 +3771,14 @@ fn refresh(w: &AppWindow, st: &mut State) {
             let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
             let output_x = st.ident.as_ref().unwrap().output_x();
             let network = st.network;
+            let notebook_spks = notebook_spks_for(st);
             let applied = match &keyed {
-                Some(identity) => st.store.as_mut().unwrap().apply_bundle(&bundle, identity, network),
-                None => st.store.as_mut().unwrap().apply_bundle_watch(&bundle, &output_x, network),
+                Some(identity) => {
+                    st.store.as_mut().unwrap().apply_bundle(&bundle, identity, network, &notebook_spks)
+                }
+                None => {
+                    st.store.as_mut().unwrap().apply_bundle_watch(&bundle, &output_x, network, &notebook_spks)
+                }
             };
             match applied {
                 Ok(stats) => {
@@ -5780,6 +5795,24 @@ fn confirm_self_spks(st: &State) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let spending_spks = st.store.as_ref().map(|s| s.spending_self_spks()).unwrap_or_default();
     self_spks.extend(spending_spks.iter().cloned());
     (self_spks, spending_spks)
+}
+
+/// The DISPLAY-OWNER anchor set (notes-core rev 6e36a23) for the CURRENT
+/// identity's account — every ACTIVE notebook's own spk, in index order,
+/// fed to `Store::apply_bundle`/`apply_bundle_watch` alongside a scan.
+/// Mirrors `confirm_self_spks`'s notebook enumeration exactly (same
+/// `ix.active(account)` + `realize` walk via `active_notebook_spks`) but
+/// omits the spending wallet's addresses, which must never be in this
+/// set. Empty when there's no material/notebooks index yet (non-
+/// hierarchical key material, or before the first notebook loads) —
+/// `Store::apply_bundle*` treat an empty slice as a strict no-op.
+fn notebook_spks_for(st: &State) -> Vec<Vec<u8>> {
+    match (&st.notebooks, st.material.as_deref()) {
+        (Some(ix), Some(material_str)) => parse_key_material(material_str, st.network)
+            .map(|material| active_notebook_spks(&material, st.network, st.account, ix))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 /// The confirm screen's one-liner caption for any note-composing tx:
