@@ -124,6 +124,14 @@ struct State {
     /// keeps holding at the same figure (honest-fee-label feature,
     /// 2026-07-18).
     compose_fold_shown: u64,
+    /// Last-logged (dust_to_self, fee) pair from the MIXED compose preview
+    /// (`mixed_compose_ui`) — same last-value guard style as
+    /// `compose_fold_shown`, so `cb: compose-est shape=mixed dust=<n>
+    /// fee=<n>` prints once per distinct value instead of every keystroke.
+    /// The e2e asserts this line's fee equals the confirm screen's
+    /// byte-truth fee for the same compose (TestFlight build-20 fix,
+    /// 2026-07-18).
+    mixed_est_shown: Option<(u64, u64)>,
     /// External-funding session (screens 12–14). The parsed funding source,
     /// its scanned spendable coins + next change index, the built unsigned
     /// PSBT, its animated-UR export frames, and the imported signed PSBT.
@@ -4181,6 +4189,116 @@ fn mixed_sync_source(st: &mut State, source: &str, coins: &[(String, u32)]) {
     }
 }
 
+/// Everything [`app_core::mixed::assemble_mixed_note_psbt`] needs that comes
+/// from the CURRENT cross-wallet selection + change choice — built by the
+/// ONE args-builder ([`mixed_compose_args`]) shared by the compose preview
+/// (`mixed_compose_ui`) and the send path (`on_compose_send_mixed` stage A),
+/// so the two can structurally never disagree about what would be built
+/// (Sal's TestFlight build-20 bug, 2026-07-18: the preview dry-ran the
+/// spending-only builder — unconditional dust, spending-only weights —
+/// while Sign built the anchored mixed shape).
+struct MixedComposeArgs {
+    coins: Vec<app_core::mixed::MixedCoin>,
+    wallets_map: HashMap<String, FundingSource>,
+    change_default: app_core::mixed::ChangeDefault,
+    change_override: Option<Vec<u8>>,
+    change_index: u32,
+}
+
+/// Resolve the mixed-compose builder arguments from the live selection.
+/// `Err` only for a "custom" change choice whose typed address doesn't
+/// parse — the same (and only) validation failure `on_compose_send_mixed`'s
+/// inline version had.
+fn mixed_compose_args(w: &AppWindow, st: &State) -> Result<MixedComposeArgs, String> {
+    let net = st.network;
+
+    // Partition the cross-wallet selection into per-source coins.
+    let notebook_sel = mixed_coins_for(st, "notebook");
+    let spending_sel = mixed_coins_for(st, "spending");
+    let wallet_key = st
+        .mixed_selected
+        .iter()
+        .find_map(|(src, _, _)| src.strip_prefix("wallet:").map(|_| src.clone()));
+    let wallet_sel = wallet_key.as_deref().map(|k| mixed_coins_for(st, k)).unwrap_or_default();
+
+    let mut coins: Vec<app_core::mixed::MixedCoin> = Vec::new();
+    if let Some(store) = st.store.as_ref() {
+        for (txid, vout) in &notebook_sel {
+            if let Some(u) =
+                store.utxos.iter().find(|u| &u.txid == txid && u.vout == *vout && !u.pending_spend)
+            {
+                coins.push(app_core::mixed::MixedCoin {
+                    source: app_core::mixed::CoinSource::Notebook,
+                    txid: u.txid.clone(),
+                    vout: u.vout,
+                    value: u.value,
+                    chain: 0,
+                    index: 0,
+                });
+            }
+        }
+    }
+    for (txid, vout) in &spending_sel {
+        if let Some(c) = st.spending_coins.iter().find(|c| &c.txid == txid && c.vout == *vout) {
+            coins.push(app_core::mixed::MixedCoin {
+                source: app_core::mixed::CoinSource::Spending,
+                txid: c.txid.clone(),
+                vout: c.vout,
+                value: c.value,
+                chain: c.chain,
+                index: c.index,
+            });
+        }
+    }
+    let mut wallets_map: HashMap<String, FundingSource> = HashMap::new();
+    if let Some(wk) = wallet_key.as_deref() {
+        if let (Some(id), Some(src)) = (wk.strip_prefix("wallet:"), st.funding.clone()) {
+            for (txid, vout) in &wallet_sel {
+                if let Some(c) = st.funding_coins.iter().find(|c| &c.txid == txid && c.vout == *vout) {
+                    coins.push(app_core::mixed::MixedCoin {
+                        source: app_core::mixed::CoinSource::Wallet(id.to_string()),
+                        txid: c.txid.clone(),
+                        vout: c.vout,
+                        value: c.value,
+                        chain: c.chain,
+                        index: c.index,
+                    });
+                }
+            }
+            wallets_map.insert(id.to_string(), src);
+        }
+    }
+
+    // Change: an explicit "custom" pick overrides; otherwise the resolved
+    // default already reflected in `change-choice`.
+    let choice = w.get_change_choice().to_string();
+    let change_override = if choice == "custom" {
+        let addr = normalize_addr(w.get_change_address().as_str());
+        if addr.is_empty() {
+            None
+        } else {
+            match Recipient::parse(net, &addr) {
+                Ok(r) => Some(r.spk),
+                Err(_) => {
+                    return Err(format!("change address isn't a valid {} address", net.as_str()))
+                }
+            }
+        }
+    } else {
+        None
+    };
+    let change_default = match choice.as_str() {
+        "spending" => app_core::mixed::ChangeDefault::Spending,
+        c if c.starts_with("wallet:") => {
+            app_core::mixed::ChangeDefault::Wallet(c.trim_start_matches("wallet:").to_string())
+        }
+        _ => app_core::mixed::ChangeDefault::Notebook,
+    };
+    let change_index = st.store.as_ref().map(|s| s.spending.next_change).unwrap_or(0);
+
+    Ok(MixedComposeArgs { coins, wallets_map, change_default, change_override, change_index })
+}
+
 /// Build a source's OWN coin list + "N coins selected · X sats" caption for
 /// the Pay-from screen's independently-expandable sections (2026-07-18
 /// rework: every expanded section now renders its own data, so opening one
@@ -4948,6 +5066,33 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     // Keep the compact "Pay from" row's balance current regardless of which
     // branch below runs (notebook / spending / external).
     w.set_pay_from_balance(balance_text_for(st, w.get_pay_from().as_str()).into());
+    // MIXED selection (TestFlight build-20 fix, 2026-07-18): a selection
+    // spanning 2+ wallets dispatches Sign to `on_compose_send_mixed`
+    // (`assemble_mixed_note_psbt`), so its preview must dry-run THAT
+    // builder — routing by the last-active single-source flags rendered a
+    // different builder's card (spending's unconditional dust-to-self +
+    // spending-only input weights vs the anchored mixed build the confirm
+    // screen then truthfully decoded). Mirror the active source's scratch
+    // selection first (the same idempotent first step
+    // `sync_and_finalize_payfrom` performs) so the shape check sees the
+    // current selection, and refresh the resolved change default so the
+    // dry-run prices the same change destination Sign will use. Watch
+    // identities can't mix (no full key) — they fall through unchanged.
+    {
+        let active = st.payfrom_active_source.clone();
+        if active == "notebook" || active == "spending" {
+            let coins = st.selected_coins.clone();
+            mixed_sync_source(st, &active, &coins);
+        }
+    }
+    if st.ident.as_ref().and_then(|i| i.full()).is_some()
+        && payfrom_state(w, st).shape == PayfromShape::Mixed
+    {
+        update_change_label(w, st);
+        mixed_compose_ui(w, st, &text);
+        sync_and_finalize_payfrom(w, st);
+        return;
+    }
     // External-funding mode: the coin panel shows the funding wallet's coins,
     // not the self-funded store coins. Handled on its own isolated path.
     if w.get_fund_external() {
@@ -5438,7 +5583,11 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                 String::new(), // funded shape: no chunk/vsize estimate on this path
                 format!("~{} sats{usd}", commas(fee_shown)),
                 if recipient.is_some() { format!("+{} sats", commas(built.sent_to_recipient)) } else { String::new() },
-                format!("+{} sats", commas(built.dust_to_self)),
+                // Row hidden when the built tx carries no dust-to-self —
+                // always present on THIS (spending-only) shape today, but
+                // conditional so the card can never claim an output the
+                // build doesn't contain (TestFlight build-20 audit).
+                if built.dust_to_self > 0 { format!("+{} sats", commas(built.dust_to_self)) } else { String::new() },
                 // Total = the byte-true fee the tx pays (nominal + leftover).
                 fold.map(|(_, folded)| (folded, built.fee)),
             );
@@ -5454,6 +5603,160 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                 }
                 .into(),
             );
+        }
+        Err(e) => {
+            set_cost_status(w, String::new());
+            w.set_change_amount(format!("{e}").into());
+        }
+    }
+}
+
+/// MIXED-selection compose preview (TestFlight build-20 fix, 2026-07-18):
+/// when the cross-wallet selection spans 2+ sources, Sign dispatches to
+/// `on_compose_send_mixed` (`assemble_mixed_note_psbt`) — so the cost card
+/// must dry-run THAT builder with THE SAME arguments ([`mixed_compose_args`],
+/// the shared seam) instead of whichever single-source branch happened to be
+/// `payfrom_active_source` (Sal's report: a spending-active mixed selection
+/// rendered spending_compose_ui's card — unconditional dust-to-self,
+/// spending-only inputs — while the confirm screen showed the anchored mixed
+/// build with no dust output and a different fee). Rendering mirrors
+/// `spending_compose_ui`'s Ok arm: fee/fold via the anchored-aware
+/// estimators, dust row from `built.dust_to_self` (hidden when 0), Total =
+/// byte-true fee. Logs `cb: compose-est shape=mixed dust=<n> fee=<n>` per
+/// distinct value (same guard style as the fold line) — the e2e pins that
+/// fee to the confirm screen's `fee=` for the same compose.
+fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
+    let net = st.network;
+    let args = match mixed_compose_args(w, st) {
+        Ok(a) => a,
+        Err(_) => {
+            // Same invalid-custom-change rendering the other branches use.
+            set_cost_status(w, String::new());
+            w.set_change_amount("Change: ⚠ invalid".into());
+            w.set_change_error(format!("Not a valid {} address.", net.as_str()).into());
+            return;
+        }
+    };
+    w.set_change_error("".into());
+    let change_dest = if args.change_override.is_some() {
+        let t = w.get_change_address().trim().to_string();
+        format!("{}…", &t[..14.min(t.len())])
+    } else {
+        match &args.change_default {
+            app_core::mixed::ChangeDefault::Spending => "a fresh spending-wallet address".to_string(),
+            app_core::mixed::ChangeDefault::Notebook => "your notebook address".to_string(),
+            app_core::mixed::ChangeDefault::Wallet(_) => "the funding wallet".to_string(),
+        }
+    };
+    if text.is_empty() {
+        set_cost_status(w, String::new());
+        w.set_change_amount(format!("Change to {change_dest}").into());
+        return;
+    }
+    let Some(identity) = st.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+        set_cost_status(w, String::new());
+        return;
+    };
+    let recipient = st.to_address.as_deref().and_then(|a| Recipient::parse(net, a).ok());
+    let gift = if recipient.is_some() {
+        w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+    } else {
+        0
+    };
+    let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
+    let chunk = st.store.as_ref().map(|s| s.chunk_size).unwrap_or(DEFAULT_CHUNK);
+    // Preview note id is all-zero, like every other preview dry-run —
+    // payload LENGTHS (all the fee math consumes) don't depend on the id.
+    let sealed = app_core::notes_core::bundle::sealed_note_payloads(
+        &identity,
+        text,
+        w.get_compose_private(),
+        recipient.as_ref(),
+        [0u8, 0, 0, 0],
+        chunk,
+    );
+    let Ok((payloads, recipient_spk)) = sealed else {
+        set_cost_status(w, String::new());
+        return;
+    };
+    let recipient_spk_len =
+        recipient_spk.as_ref().map(|s| s.len()).or_else(|| recipient.as_ref().map(|r| r.spk.len()));
+    let recipient_amount = if recipient.is_some() { gift } else { 0 };
+    match app_core::mixed::assemble_mixed_note_psbt(
+        &args.coins,
+        p2tr_script_pubkey(&identity.output_x),
+        st.spending_source.as_ref(),
+        &args.wallets_map,
+        &payloads,
+        recipient_spk,
+        recipient_amount,
+        &args.change_default,
+        args.change_override.clone(),
+        args.change_index,
+        rate,
+    ) {
+        Ok(built) => {
+            // Sub-dust fold prediction — `built.change == 0` means the REAL
+            // build already chose the no-change shape; split its fee into
+            // the nominal figure and the folded leftover, exactly like the
+            // spending branch, but with per-coin input weights and the
+            // anchored-aware dust flag (`built.dust_to_self > 0`).
+            let fold = if built.change == 0 {
+                let weights: Vec<bitcoin::transaction::InputWeightPrediction> = args
+                    .coins
+                    .iter()
+                    .map(|c| match &c.source {
+                        app_core::mixed::CoinSource::Notebook => {
+                            bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH
+                        }
+                        app_core::mixed::CoinSource::Spending => {
+                            bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX
+                        }
+                        app_core::mixed::CoinSource::Wallet(id) => match args.wallets_map.get(id).map(|s| s.kind) {
+                            Some(app_core::funding::FundingKind::Wpkh) => {
+                                bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX
+                            }
+                            _ => bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH,
+                        },
+                    })
+                    .collect();
+                let nominal = app_core::mixed::estimate_funded_fee_no_change(
+                    &weights,
+                    &payloads,
+                    recipient_spk_len,
+                    built.dust_to_self > 0,
+                    rate,
+                );
+                Some((nominal, built.fee.saturating_sub(nominal))).filter(|(_, folded)| *folded > 0)
+            } else {
+                None
+            };
+            let fold_amount = fold.map(|(_, f)| f).unwrap_or(0);
+            if fold_amount != st.compose_fold_shown {
+                if fold_amount > 0 {
+                    println!("cb: compose-est fold={fold_amount}");
+                }
+                st.compose_fold_shown = fold_amount;
+            }
+            // The preview==confirm pin: `fee` here is the byte-true total
+            // fee the built tx pays — the confirm screen's `fee=` decodes
+            // the same figure from the raw tx, and the e2e asserts equality.
+            if st.mixed_est_shown != Some((built.dust_to_self, built.fee)) {
+                println!("cb: compose-est shape=mixed dust={} fee={}", built.dust_to_self, built.fee);
+                st.mixed_est_shown = Some((built.dust_to_self, built.fee));
+            }
+            let fee_shown = fold.map(|(nominal, _)| nominal).unwrap_or(built.fee);
+            let usd = st.usd.map(|p| format!(" (~${:.2})", fee_shown as f64 * p / 1e8)).unwrap_or_default();
+            set_cost_card(
+                w,
+                String::new(), // funded shape: no chunk/vsize estimate on this path
+                format!("~{} sats{usd}", commas(fee_shown)),
+                if recipient.is_some() { format!("+{} sats", commas(built.sent_to_recipient)) } else { String::new() },
+                // Anchored (a notebook coin spends) → no dust output → row hidden.
+                if built.dust_to_self > 0 { format!("+{} sats", commas(built.dust_to_self)) } else { String::new() },
+                fold.map(|(_, folded)| (folded, built.fee)),
+            );
+            w.set_change_amount(format!("Change to {change_dest} · ~{} sats", commas(built.change)).into());
         }
         Err(e) => {
             set_cost_status(w, String::new());
@@ -6886,6 +7189,7 @@ pub fn run() {
         quiz_indices: Vec::new(),
         compose_oversize: false,
         compose_fold_shown: 0,
+        mixed_est_shown: None,
         funding: None,
         funding_coins: Vec::new(),
         funding_change_index: 0,
@@ -10179,61 +10483,18 @@ pub fn run() {
         };
         let notebook_spk = p2tr_script_pubkey(&identity.output_x);
 
-        // Partition the cross-wallet selection into per-source coins.
-        let notebook_sel = mixed_coins_for(&s, "notebook");
-        let spending_sel = mixed_coins_for(&s, "spending");
-        let wallet_key = s.mixed_selected.iter().find_map(|(src, _, _)| {
-            src.strip_prefix("wallet:").map(|_| src.clone())
-        });
-        let wallet_sel = wallet_key.as_deref().map(|k| mixed_coins_for(&s, k)).unwrap_or_default();
-
-        let mut coins: Vec<app_core::mixed::MixedCoin> = Vec::new();
-        if let Some(store) = s.store.as_ref() {
-            for (txid, vout) in &notebook_sel {
-                if let Some(u) =
-                    store.utxos.iter().find(|u| &u.txid == txid && u.vout == *vout && !u.pending_spend)
-                {
-                    coins.push(app_core::mixed::MixedCoin {
-                        source: app_core::mixed::CoinSource::Notebook,
-                        txid: u.txid.clone(),
-                        vout: u.vout,
-                        value: u.value,
-                        chain: 0,
-                        index: 0,
-                    });
+        // Coins + wallets + change resolution come from the SAME args-builder
+        // the compose preview (`mixed_compose_ui`) dry-runs — the shared seam
+        // that makes preview and send structurally identical (TestFlight
+        // build-20 fix, 2026-07-18).
+        let MixedComposeArgs { coins, wallets_map, change_default, change_override, change_index } =
+            match mixed_compose_args(&w, &s) {
+                Ok(a) => a,
+                Err(e) => {
+                    w.set_status(e.into());
+                    return;
                 }
-            }
-        }
-        for (txid, vout) in &spending_sel {
-            if let Some(c) = s.spending_coins.iter().find(|c| &c.txid == txid && c.vout == *vout) {
-                coins.push(app_core::mixed::MixedCoin {
-                    source: app_core::mixed::CoinSource::Spending,
-                    txid: c.txid.clone(),
-                    vout: c.vout,
-                    value: c.value,
-                    chain: c.chain,
-                    index: c.index,
-                });
-            }
-        }
-        let mut wallets_map: std::collections::HashMap<String, FundingSource> = std::collections::HashMap::new();
-        if let Some(wk) = wallet_key.as_deref() {
-            if let (Some(id), Some(src)) = (wk.strip_prefix("wallet:"), s.funding.clone()) {
-                for (txid, vout) in &wallet_sel {
-                    if let Some(c) = s.funding_coins.iter().find(|c| &c.txid == txid && c.vout == *vout) {
-                        coins.push(app_core::mixed::MixedCoin {
-                            source: app_core::mixed::CoinSource::Wallet(id.to_string()),
-                            txid: c.txid.clone(),
-                            vout: c.vout,
-                            value: c.value,
-                            chain: c.chain,
-                            index: c.index,
-                        });
-                    }
-                }
-                wallets_map.insert(id.to_string(), src);
-            }
-        }
+            };
 
         if coins.is_empty() {
             println!("cb: compose-send bail=no-coins src=mixed");
@@ -10245,34 +10506,6 @@ pub fn run() {
             w.set_status("selection is single-source — use the Sign button on that source instead".into());
             return;
         }
-
-        // Change: an explicit "custom" pick overrides; otherwise the
-        // resolved default already reflected in `change-choice`.
-        let choice = w.get_change_choice().to_string();
-        let change_override = if choice == "custom" {
-            let addr = normalize_addr(w.get_change_address().as_str());
-            if addr.is_empty() {
-                None
-            } else {
-                match Recipient::parse(net, &addr) {
-                    Ok(r) => Some(r.spk),
-                    Err(_) => {
-                        w.set_status(format!("change address isn't a valid {} address", net.as_str()).into());
-                        return;
-                    }
-                }
-            }
-        } else {
-            None
-        };
-        let change_default = match choice.as_str() {
-            "spending" => app_core::mixed::ChangeDefault::Spending,
-            c if c.starts_with("wallet:") => {
-                app_core::mixed::ChangeDefault::Wallet(c.trim_start_matches("wallet:").to_string())
-            }
-            _ => app_core::mixed::ChangeDefault::Notebook,
-        };
-        let change_index = s.store.as_ref().map(|st| st.spending.next_change).unwrap_or(0);
         let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
 
         let mut note_id = [2u8, 0, 1, 6];
@@ -10459,6 +10692,7 @@ pub fn run() {
         // derived and not yet "used" bookkeeping, so — like the spending
         // path — it must be added on top of `confirm_self_spks`'s set. A
         // notebook-default change needs no augmentation (already covered).
+        let choice = w.get_change_choice().to_string();
         let expected_change = if choice == "custom" {
             Some(normalize_addr(w.get_change_address().as_str()))
         } else {
