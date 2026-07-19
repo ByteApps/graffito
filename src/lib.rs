@@ -1880,6 +1880,8 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
     // multi-select chips from a PRIOR compose must never leak into this
     // one (mirrors every other per-compose-session reset above).
     st.to_addresses_extra.clear();
+    st.picking_extra = false;
+    w.set_picking_extra(false);
     refresh_to_chips(w, st);
     resolve_payfrom_default(w, st);
     w.set_screen(6);
@@ -1951,6 +1953,7 @@ fn add_recipient_chip(w: &AppWindow, st: &mut State, addr: &str) {
     }
     let already = st.to_address.as_deref() == Some(a.as_str()) || st.to_addresses_extra.iter().any(|x| x == &a);
     st.picking_extra = false;
+    w.set_picking_extra(false);
     if already {
         println!("cb: add-chip dup");
         w.set_status("already added".into());
@@ -9036,6 +9039,7 @@ pub fn run() {
         }
         println!("cb: add-recipient-open");
         s.picking_extra = true;
+        w.set_picking_extra(true);
         w.set_contact_input("".into());
         w.set_status("".into());
         w.set_pick_mode("compose".into());
@@ -11298,6 +11302,7 @@ pub fn run() {
         s.to_address = None;
         s.to_addresses_extra.clear();
         s.picking_extra = false;
+        w.set_picking_extra(false);
         s.icloud_backup = false;
         w.set_icloud_backup(false);
         w.set_icloud_available(false);

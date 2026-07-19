@@ -118,7 +118,7 @@ impl NoteRecord {
     /// recipients) returns an empty list.
     pub fn reply_set(&self, my_address: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        let mut push = |addr: &str, out: &mut Vec<String>| {
+        let push = |addr: &str, out: &mut Vec<String>| {
             if addr != my_address && !out.iter().any(|a| a == addr) {
                 out.push(addr.to_string());
             }
