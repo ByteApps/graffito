@@ -304,6 +304,16 @@ struct State {
     /// `compose_busy`, kept separate since the two never overlap but
     /// represent different flows).
     wallet_tx_busy: bool,
+    /// Re-entrancy guard for `wallet_stores_refresh_async` — the Coins
+    /// screen's and notebook-list's ↻ (TODO(watchdog) fix, 2026-07-20: both
+    /// used to rescan every active notebook synchronously on the UI thread,
+    /// same freeze class the auto-refresh timer had before it moved to
+    /// `refresh_async`). True while a wallet-wide rescan is in flight on a
+    /// worker thread; a second tap is ignored rather than queued (simpler
+    /// than overlapping store-file writes) — see
+    /// `apply_wallet_stores_refresh_results`'s own (fp8, network, account)
+    /// staleness guard for the identity-switch-mid-scan case.
+    wallet_stores_busy: bool,
     /// The universal confirm screen (26) session in progress, if any — see
     /// [`PendingBroadcast`]. `show_confirm` sets it, `on_confirm_broadcast`
     /// consumes it, `on_confirm_cancel` drops it (leaving zero trace: stage
@@ -2575,41 +2585,36 @@ fn update_wallet_coins(w: &AppWindow, st: &State) {
     );
 }
 
-/// Rescan every ACTIVE notebook except the current one (the caller runs
-/// the full refresh() for that): bundle per address, apply, save. Used by
-/// the coins screen's ↻ so the wallet-wide view is live, not last-scan.
-fn refresh_wallet_stores(st: &State) -> usize {
-    let Some(base) = st.base_url() else { return 0 };
-    let Some(material_str) = st.material.as_deref() else { return 0 };
-    let Ok(material) = parse_key_material(material_str, st.network) else { return 0 };
-    let Some(ix) = &st.notebooks else { return 0 };
-    let client = ChainClient::new(HttpTransport::new(base), st.network);
-    let current = st.ident.as_ref().map(|i| i.index);
-    // DISPLAY-OWNER anchor set (notes-core rev 6e36a23): every ACTIVE
-    // notebook's own spk, computed once for the whole rescan loop —
-    // archived notebooks are excluded (see `active_notebook_spks`).
-    let notebook_spks = active_notebook_spks(&material, st.network, st.account, ix);
-    let mut scanned = 0;
-    for m in ix.active(st.account) {
-        if current == Some(m.index) {
-            continue;
+/// Apply one (already network-fetched) bundle to a NON-active notebook's
+/// store file on disk — the per-notebook body of a wallet-wide rescan for
+/// every notebook except the one currently open (see
+/// `wallet_stores_refresh_async`/`apply_wallet_stores_refresh_results`,
+/// and the doc comment on the old synchronous `refresh_wallet_stores` this
+/// replaced). `material` is parsed once by the caller for the whole batch.
+/// Best-effort: any failure (realize/apply) is silently skipped, exactly
+/// like the old loop's `continue`.
+fn apply_bundle_to_notebook_file(
+    st: &State,
+    material: &app_core::identity::KeyMaterial,
+    notebook_spks: &[Vec<u8>],
+    index: u32,
+    bundle: &app_core::notes_core::bundle::SyncBundle,
+) -> bool {
+    let Ok(ident) = realize(material, st.network, st.account, index) else { return false };
+    let mut store =
+        notebook_store(st, index).unwrap_or_else(|| Store::new(&ident.output_x(), st.network));
+    let applied = match ident.full() {
+        Some(id) => store.apply_bundle(bundle, id, st.network, notebook_spks),
+        None => store.apply_bundle_watch(bundle, &ident.output_x(), st.network, notebook_spks),
+    };
+    if applied.is_ok() {
+        if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == index) {
+            let _ = store.save(&st.store_path_for(fp8));
         }
-        let Ok(ident) = realize(&material, st.network, st.account, m.index) else { continue };
-        let mut store = notebook_store(st, m.index)
-            .unwrap_or_else(|| Store::new(&ident.output_x(), st.network));
-        let Ok(bundle) = client.build_bundle(&ident.address, None) else { continue };
-        let applied = match ident.full() {
-            Some(id) => store.apply_bundle(&bundle, id, st.network, &notebook_spks),
-            None => store.apply_bundle_watch(&bundle, &ident.output_x(), st.network, &notebook_spks),
-        };
-        if applied.is_ok() {
-            if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == m.index) {
-                let _ = store.save(&st.store_path_for(fp8));
-            }
-            scanned += 1;
-        }
+        true
+    } else {
+        false
     }
-    scanned
 }
 
 /// One finished background scan, waiting to be applied on the UI thread.
@@ -2710,6 +2715,168 @@ fn apply_dropped_checks(
     for txid in newly {
         println!("cb: tx-dropped txid={txid}");
     }
+}
+
+/// Which ↻ tap kicked off a [`wallet_stores_refresh_async`] scan — drives
+/// the final `cb: refresh-coins|refresh-notebooks notebooks=<n>` log label
+/// and each tap's own post-scan UI work in
+/// `apply_wallet_stores_refresh_results`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalletStoresPurpose {
+    Coins,
+    Notebooks,
+}
+
+impl WalletStoresPurpose {
+    fn label(self) -> &'static str {
+        match self {
+            WalletStoresPurpose::Coins => "refresh-coins",
+            WalletStoresPurpose::Notebooks => "refresh-notebooks",
+        }
+    }
+}
+
+/// One active notebook's bundle fetch, gathered on the worker thread —
+/// part of a [`WalletStoresRefreshResult`].
+struct NotebookBundleResult {
+    index: u32,
+    bundle: Result<app_core::notes_core::bundle::SyncBundle, String>,
+}
+
+/// A finished wallet-wide rescan (every ACTIVE notebook, kicked off by the
+/// Coins screen's or notebook-list's ↻), waiting to be applied on the UI
+/// thread — see `wallet_stores_refresh_async`/
+/// `apply_wallet_stores_refresh_results`. Coarse staleness guard: (fp8,
+/// network, account) — an identity/account switch mid-scan drops the whole
+/// result, same pattern as [`SpendingRefreshResult`]. `current_address`
+/// additionally guards just the snapshot-time-active notebook's slice: a
+/// mere notebook switch within the SAME account (fp8/network/account
+/// unchanged) must never apply a stale bundle onto whatever notebook is
+/// live in `State.store` now.
+struct WalletStoresRefreshResult {
+    purpose: WalletStoresPurpose,
+    fp8: String,
+    network: Network,
+    account: u32,
+    current_index: Option<u32>,
+    current_address: Option<String>,
+    /// (txid, confirmed?)/dropped-check results for the snapshot-time
+    /// active notebook only — same shape as [`RefreshResult`]'s fields,
+    /// gathered so applying its slice matches `refresh()`/
+    /// `apply_refresh_results` exactly.
+    current_statuses: Vec<(String, Option<bool>)>,
+    current_dropped_lookup: HashMap<String, TxLookupStatus>,
+    current_dropped_unspent: HashMap<(String, u32), bool>,
+    /// Every active notebook's bundle fetch, including the snapshot-time
+    /// active one.
+    results: Vec<NotebookBundleResult>,
+}
+
+static WALLET_STORES_REFRESH_RESULTS: std::sync::Mutex<Vec<WalletStoresRefreshResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Kick off a wallet-wide rescan — every ACTIVE notebook's bundle — for the
+/// Coins screen's and notebook-list's ↻ (TODO(watchdog) fix, 2026-07-20:
+/// these two used to call the old synchronous `refresh_wallet_stores` +
+/// `refresh` directly on the UI thread, which could freeze the app on a
+/// slow/hanging node — the same 0x8BADF00D class the auto-refresh timer
+/// used to hit before it moved to `refresh_async`). Same shape as
+/// `refresh_async`: snapshot everything the worker needs (base url, every
+/// active notebook's address, the snapshot-time-active notebook's
+/// pending-tx/dropped-check inputs), fetch every bundle on a worker
+/// thread, and apply through [`WALLET_STORES_REFRESH_RESULTS`] + the
+/// `apply-pending-wallet-stores-refresh` trampoline — never touching the
+/// UI thread with network I/O. A second tap while one is already in flight
+/// is ignored (simpler than overlapping store-file writes) rather than
+/// queued; see [`WalletStoresRefreshResult`]'s doc comment for the
+/// staleness guards applied when the result lands.
+fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletStoresPurpose) {
+    let label = purpose.label();
+    if st.wallet_stores_busy {
+        println!("cb: {label} busy");
+        return;
+    }
+    if st.ident.is_none() || st.store.is_none() {
+        return;
+    }
+    let Some(base) = st.base_url() else {
+        w.set_status("no Bitcoin node for this network — set one in Settings".into());
+        return;
+    };
+    let Some(fp8) = st.notebooks_fp8.clone() else { return };
+    let network = st.network;
+    let account = st.account;
+    let current_index = st.ident.as_ref().map(|i| i.index);
+    let current_address = st.ident.as_ref().map(|i| i.address.clone());
+    // Every ACTIVE notebook's (index, address) — mirrors the old
+    // `refresh_wallet_stores`'s `ix.active(account)` walk, plus a fallback
+    // push for the active notebook in the unlikely case it's missing from
+    // `nb_addrs` (never observed, but `refresh()` never depended on that
+    // invariant either — cheap to guard here too).
+    let mut all: Vec<(u32, String)> = st
+        .notebooks
+        .as_ref()
+        .map(|ix| {
+            ix.active(account)
+                .filter_map(|m| {
+                    st.nb_addrs.iter().find(|(a, ..)| *a == m.index).map(|(i, addr, _)| (*i, addr.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(idx) = current_index {
+        if !all.iter().any(|(i, _)| *i == idx) {
+            if let Some(addr) = &current_address {
+                all.push((idx, addr.clone()));
+            }
+        }
+    }
+    let pending_txids: Vec<String> = st
+        .store
+        .as_ref()
+        .unwrap()
+        .txs
+        .iter()
+        .filter(|t| t.status == NoteStatus::Pending)
+        .flat_map(|t| t.txids.iter().cloned())
+        .collect();
+    let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
+    st.wallet_stores_busy = true;
+    w.set_status("syncing…".into());
+    let weak = w.as_weak();
+    std::thread::spawn(move || {
+        let client = ChainClient::new(HttpTransport::new(base), network);
+        let results: Vec<NotebookBundleResult> = all
+            .into_iter()
+            .map(|(index, address)| NotebookBundleResult {
+                index,
+                bundle: client.build_bundle(&address, None).map_err(|e| format!("{e}")),
+            })
+            .collect();
+        let current_statuses =
+            pending_txids.iter().map(|t| (t.clone(), client.fetch_tx_status(t))).collect();
+        let (current_dropped_lookup, current_dropped_unspent) = fetch_dropped_checks(
+            &client,
+            current_address.as_deref().unwrap_or_default(),
+            &dropped_checks,
+        );
+        WALLET_STORES_REFRESH_RESULTS
+            .lock()
+            .expect("wallet stores refresh mutex")
+            .push(WalletStoresRefreshResult {
+                purpose,
+                fp8,
+                network,
+                account,
+                current_index,
+                current_address,
+                current_statuses,
+                current_dropped_lookup,
+                current_dropped_unspent,
+                results,
+            });
+        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_stores_refresh());
+    });
 }
 
 /// One finished notebook gap-discovery walk (worker thread), waiting to be
@@ -3904,6 +4071,77 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
     });
 }
 
+/// Apply one already-fetched bundle to the CURRENTLY ACTIVE notebook's live
+/// `State.store` — the shared core of [`apply_refresh_results`] (a single
+/// open-notebook scan) and [`apply_wallet_stores_refresh_results`]'s
+/// snapshot-time-active slice (a wallet-wide scan). Fees/usd, apply_bundle,
+/// resolved pending-spend statuses, dropped-pending detection, save, the
+/// `cb: refresh …` log line, and `update_home` — exactly what the
+/// synchronous [`refresh`] does for the active notebook. Callers are
+/// responsible for their own staleness guard before calling this (it
+/// assumes `st.ident`/`st.store` are the right ones for `bundle`).
+fn apply_active_bundle(
+    w: &AppWindow,
+    st: &mut State,
+    bundle: Result<app_core::notes_core::bundle::SyncBundle, String>,
+    statuses: &[(String, Option<bool>)],
+    dropped_lookup: &HashMap<String, TxLookupStatus>,
+    dropped_unspent: &HashMap<(String, u32), bool>,
+) {
+    match bundle {
+        Ok(bundle) => {
+            st.fees = Some(bundle.fee_rates.clone());
+            st.usd = bundle.btc_usd;
+            let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
+            let output_x = st.ident.as_ref().unwrap().output_x();
+            let network = st.network;
+            let notebook_spks = notebook_spks_for(st);
+            let applied = match &keyed {
+                Some(identity) => {
+                    st.store.as_mut().unwrap().apply_bundle(&bundle, identity, network, &notebook_spks)
+                }
+                None => st.store.as_mut().unwrap().apply_bundle_watch(
+                    &bundle,
+                    &output_x,
+                    network,
+                    &notebook_spks,
+                ),
+            };
+            match applied {
+                Ok(stats) => {
+                    let n = st
+                        .store
+                        .as_mut()
+                        .unwrap()
+                        .resolve_spend_statuses(|t| {
+                            statuses.iter().find(|(x, _)| x == t).and_then(|(_, s)| *s)
+                        });
+                    if n > 0 {
+                        println!("cb: spend-confirmed n={n}");
+                    }
+                    apply_dropped_checks(st.store.as_mut().unwrap(), dropped_lookup, dropped_unspent);
+                    println!(
+                        "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
+                        stats.notes_seen,
+                        stats.notes_new,
+                        stats.orphaned,
+                        st.store.as_ref().unwrap().balance(),
+                        st.store.as_ref().unwrap().tip_height
+                    );
+                    st.save_store();
+                    w.set_status(format!("synced · {} notes", stats.notes_seen).into());
+                }
+                Err(e) => w.set_status(format!("apply failed: {e}").into()),
+            }
+        }
+        Err(e) => {
+            println!("cb: refresh err={e}");
+            w.set_status("couldn't reach the network — tap refresh to retry".into());
+        }
+    }
+    update_home(w, st);
+}
+
 /// The UI-thread half of [`refresh_async`]: identical bookkeeping to the
 /// synchronous [`refresh`], fed from the worker's results.
 fn apply_refresh_results(w: &AppWindow, st: &mut State) {
@@ -3914,62 +4152,7 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
             println!("cb: refresh stale-drop address={}", &r.address[..12.min(r.address.len())]);
             continue;
         }
-        match r.bundle {
-            Ok(bundle) => {
-                st.fees = Some(bundle.fee_rates.clone());
-                st.usd = bundle.btc_usd;
-                let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
-                let output_x = st.ident.as_ref().unwrap().output_x();
-                let network = st.network;
-                let notebook_spks = notebook_spks_for(st);
-                let applied = match &keyed {
-                    Some(identity) => {
-                        st.store.as_mut().unwrap().apply_bundle(&bundle, identity, network, &notebook_spks)
-                    }
-                    None => st.store.as_mut().unwrap().apply_bundle_watch(
-                        &bundle,
-                        &output_x,
-                        network,
-                        &notebook_spks,
-                    ),
-                };
-                match applied {
-                    Ok(stats) => {
-                        let n = st
-                            .store
-                            .as_mut()
-                            .unwrap()
-                            .resolve_spend_statuses(|t| {
-                                r.statuses.iter().find(|(x, _)| x == t).and_then(|(_, s)| *s)
-                            });
-                        if n > 0 {
-                            println!("cb: spend-confirmed n={n}");
-                        }
-                        apply_dropped_checks(
-                            st.store.as_mut().unwrap(),
-                            &r.dropped_lookup,
-                            &r.dropped_unspent,
-                        );
-                        println!(
-                            "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
-                            stats.notes_seen,
-                            stats.notes_new,
-                            stats.orphaned,
-                            st.store.as_ref().unwrap().balance(),
-                            st.store.as_ref().unwrap().tip_height
-                        );
-                        st.save_store();
-                        w.set_status(format!("synced · {} notes", stats.notes_seen).into());
-                    }
-                    Err(e) => w.set_status(format!("apply failed: {e}").into()),
-                }
-            }
-            Err(e) => {
-                println!("cb: refresh err={e}");
-                w.set_status("couldn't reach the network — tap refresh to retry".into());
-            }
-        }
-        update_home(w, st);
+        apply_active_bundle(w, st, r.bundle, &r.statuses, &r.dropped_lookup, &r.dropped_unspent);
         if w.get_screen() == 20 {
             update_funding_screen_ui(w, st);
             log_funding_refresh(st);
@@ -3980,6 +4163,75 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
         }
         if w.get_screen() == 6 {
             w.set_pay_from_balance(balance_text_for(st, w.get_pay_from().as_str()).into());
+        }
+    }
+}
+
+/// The UI-thread half of [`wallet_stores_refresh_async`]: applies the
+/// snapshot-time-active notebook's slice via [`apply_active_bundle`] (same
+/// as a single-notebook `refresh_async`) and every OTHER active notebook's
+/// bundle via [`apply_bundle_to_notebook_file`] (disk-only, no live-view
+/// side effects — matches the old synchronous `refresh_wallet_stores`).
+/// The final `cb: refresh-coins|refresh-notebooks notebooks=<n>` count
+/// always adds 1 for the snapshot-time-active notebook, matching the old
+/// handlers' `scanned + 1` — unconditionally, even if its own fetch failed
+/// (that failure already surfaced via `apply_active_bundle`'s status/err
+/// line and the plain `cb: refresh err=…`).
+fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
+    let results: Vec<WalletStoresRefreshResult> =
+        WALLET_STORES_REFRESH_RESULTS.lock().expect("wallet stores refresh mutex").drain(..).collect();
+    for r in results {
+        st.wallet_stores_busy = false;
+        let label = r.purpose.label();
+        if st.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
+            || st.network != r.network
+            || st.account != r.account
+        {
+            println!("cb: {label} stale-drop");
+            w.set_status("".into());
+            continue;
+        }
+        let material =
+            st.material.as_deref().and_then(|m| parse_key_material(m, st.network).ok());
+        let notebook_spks = notebook_spks_for(st);
+        let now_active_addr = st.ident.as_ref().map(|i| i.address.clone());
+        let mut scanned = 0usize;
+        for nr in &r.results {
+            // The snapshot-time-active notebook applies to the LIVE store
+            // only if it's STILL the active one — a notebook switch mid-
+            // scan (same account, so the coarse guard above passed) must
+            // never misapply a stale bundle onto whatever's open now.
+            let is_live_current = r.current_index == Some(nr.index)
+                && r.current_address.is_some()
+                && now_active_addr.as_deref() == r.current_address.as_deref();
+            if is_live_current {
+                apply_active_bundle(
+                    w,
+                    st,
+                    nr.bundle.clone(),
+                    &r.current_statuses,
+                    &r.current_dropped_lookup,
+                    &r.current_dropped_unspent,
+                );
+            } else if let (Ok(bundle), Some(material)) = (&nr.bundle, &material) {
+                if apply_bundle_to_notebook_file(st, material, &notebook_spks, nr.index, bundle) {
+                    scanned += 1;
+                }
+            }
+        }
+        scanned += 1; // the snapshot-time-active notebook, unconditionally
+        println!("cb: {label} notebooks={scanned}");
+        w.set_status("".into());
+        match r.purpose {
+            WalletStoresPurpose::Coins => {
+                if st.spending_capable
+                    && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false)
+                {
+                    spending_refresh_async(w, st);
+                }
+                refresh_compose(w, st);
+            }
+            WalletStoresPurpose::Notebooks => update_notebook_list(w, st),
         }
     }
 }
@@ -7614,6 +7866,7 @@ pub fn run() {
         act_pending_ref: None,
         payfrom_manual: false,
         wallet_tx_busy: false,
+        wallet_stores_busy: false,
         pending_broadcast: None,
     }));
     let window = AppWindow::new().expect("window");
@@ -8238,6 +8491,13 @@ pub fn run() {
     // landed — same pattern as apply-pending-refresh.
     cb!(on_apply_pending_spending_refresh, |w, s| {
         apply_spending_refresh_results(&w, &mut s);
+    });
+
+    // Trampoline: a finished wallet-wide rescan (Coins screen / notebook-
+    // list ↻, watchdog fix 2026-07-20) landed — same pattern as
+    // apply-pending-refresh.
+    cb!(on_apply_pending_wallet_stores_refresh, |w, s| {
+        apply_wallet_stores_refresh_results(&w, &mut s);
     });
 
     // Trampoline: worker-thread used/new probes for the create-notebook
@@ -9498,31 +9758,19 @@ pub fn run() {
         refresh_compose(&w, &mut s);
     });
 
-    // TODO(watchdog): refresh_wallet_stores + the sync refresh below still
-    // block the main thread (user-triggered foreground taps — lower risk
-    // than the auto-refresh timer was, but the same 0x8BADF00D class on a
-    // slow node). Needs the wallet-stores async refactor (perf task).
+    // Watchdog fix (2026-07-20): both ↻ taps used to rescan every active
+    // notebook synchronously on the UI thread — see
+    // `wallet_stores_refresh_async`'s doc comment. The spending-wallet
+    // kickoff + notebook-list rebuild now happen in
+    // `apply_wallet_stores_refresh_results` once the scan actually lands.
     cb!(on_refresh_coins, |w, s| {
-        let scanned = refresh_wallet_stores(&s);
-        println!("cb: refresh-coins notebooks={}", scanned + 1);
-        refresh(&w, &mut s); // the active notebook + fees; rebuilds the view
-        w.set_status("".into());
-        if s.spending_capable
-            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
-        {
-            spending_refresh_async(&w, &mut s);
-        }
-        refresh_compose(&w, &mut s);
+        wallet_stores_refresh_async(&w, &mut s, WalletStoresPurpose::Coins);
     });
 
     // Notebook-list (main screen) header ↻: rescan every active notebook and
     // rebuild the list so balances / note counts / unread badges are current.
     cb!(on_refresh_notebooks, |w, s| {
-        let scanned = refresh_wallet_stores(&s);
-        refresh(&w, &mut s); // active notebook's live store (+ fees/view)
-        update_notebook_list(&w, &s);
-        println!("cb: refresh-notebooks notebooks={}", scanned + 1);
-        w.set_status("".into());
+        wallet_stores_refresh_async(&w, &mut s, WalletStoresPurpose::Notebooks);
     });
 
     // First-run disclaimer accepted → persist + reveal the real first screen.
