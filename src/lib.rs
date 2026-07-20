@@ -335,6 +335,16 @@ struct State {
     /// `load_or_migrate_contacts` (the one-time union-from-every-store
     /// migration for existing installs).
     contacts: Vec<app_core::store::Contact>,
+    /// Tombstones for `(address, network)` contacts DELETED on this or
+    /// another device (contacts-tombstones feature, 2026-07-20) — the
+    /// synced record of "this was removed", so a device that still has an
+    /// older copy of a deleted contact drops it on the next merge instead
+    /// of resurrecting it. Together with `contacts` this is exactly the
+    /// `app_core::contacts::ContactState` this device tracks; same
+    /// persistence (`contacts.json`) and iCloud KV sync path as
+    /// `contacts` — see that module's doc for the full merge design
+    /// (wall-clock assumption, 90-day GC).
+    tombstones: Vec<app_core::contacts::Tombstone>,
 }
 
 /// Cap for the device-level contacts list — mirrors
@@ -612,17 +622,29 @@ impl State {
         self.data_dir.join("contacts.json")
     }
 
-    /// Persist `contacts.json` and mirror the list into iCloud's KV store
-    /// (a no-op off Apple platforms, or when the OS entitlement/iCloud
-    /// account isn't available — see `icloud::save_blob`). Only WRITES the
-    /// KV blob when this device's serialized list actually differs from
-    /// what's already there, to avoid needless sync churn between two
-    /// devices that just merged the same result.
+    /// This device's full synced state (contacts + tombstones) — the
+    /// `app_core::contacts::ContactState` `save_contacts`/the merge paths
+    /// operate on.
+    fn contact_state(&self) -> app_core::contacts::ContactState {
+        app_core::contacts::ContactState {
+            contacts: self.contacts.clone(),
+            tombstones: self.tombstones.clone(),
+        }
+    }
+
+    /// Persist `contacts.json` (contacts + tombstones) and mirror it into
+    /// iCloud's KV store (a no-op off Apple platforms, or when the OS
+    /// entitlement/iCloud account isn't available — see
+    /// `icloud::save_blob`). Only WRITES the KV blob when this device's
+    /// serialized state actually differs from what's already there, to
+    /// avoid needless sync churn between two devices that just merged the
+    /// same result.
     fn save_contacts(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(&self.contacts) {
+        let state = self.contact_state();
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
             let _ = std::fs::write(self.contacts_path(), json);
         }
-        let blob = app_core::contacts::serialize_contacts_blob(&self.contacts);
+        let blob = app_core::contacts::serialize_contacts_blob(&state);
         if icloud::load_blob().as_deref() != Some(blob.as_str()) {
             icloud::save_blob(&blob);
             println!("cb: icloud-contacts synced n={}", self.contacts.len());
@@ -643,6 +665,12 @@ impl State {
     /// this field shipped) for the same address, so touching an old
     /// contact again upgrades it in place (tags it, keeps its name) rather
     /// than leaving a stale blank-tagged duplicate beside a new one.
+    ///
+    /// Contacts-tombstones (2026-07-20): stamps `updated_at = now_ms()`
+    /// and drops any tombstone for this `(address, network)` — re-adding/
+    /// touching a contact is an intentional resurrection, and its fresh
+    /// `updated_at` is by construction newer than any prior deletion, so
+    /// the stale tombstone must not survive to fight the next merge.
     fn touch_contact(&mut self, address: &str) {
         let net = self.network.as_str().to_string();
         let name = self
@@ -653,16 +681,24 @@ impl State {
             .unwrap_or_default();
         self.contacts.insert(
             0,
-            app_core::store::Contact { address: address.to_string(), name, network: net },
+            app_core::store::Contact {
+                address: address.to_string(),
+                name,
+                network: net.clone(),
+                updated_at: now_ms(),
+            },
         );
         self.contacts.truncate(CONTACTS_CAP);
+        self.tombstones
+            .retain(|t| !(t.address == address && (t.network == net || t.network.is_empty())));
     }
 
     /// Same (address, network-or-legacy-blank) match as `touch_contact` —
     /// the rename dialog always opens from a network-filtered picker row,
     /// so "the entry this address means on the active network" is
     /// unambiguous even if the same address string also exists as a
-    /// distinct contact on another network.
+    /// distinct contact on another network. Stamps `updated_at` and clears
+    /// any tombstone, same reasoning as `touch_contact`.
     fn name_contact(&mut self, address: &str, name: &str) {
         let net = self.network.as_str().to_string();
         if let Some(c) = self
@@ -671,16 +707,36 @@ impl State {
             .find(|c| c.address == address && (c.network == net || c.network.is_empty()))
         {
             c.name = name.to_string();
+            c.updated_at = now_ms();
         }
+        self.tombstones
+            .retain(|t| !(t.address == address && (t.network == net || t.network.is_empty())));
     }
 
     /// Same (address, network-or-legacy-blank) match as `touch_contact` —
     /// removes only the ACTIVE network's entry for this address, never a
     /// same-string contact that belongs to a different network.
+    ///
+    /// Contacts-tombstones (2026-07-20): deletion is now a first-class
+    /// synced event, not just an absence — records/refreshes a
+    /// `Tombstone { address, network: <active>, deleted_at: now_ms() }`
+    /// so the other device drops its own (older) copy of this contact on
+    /// the next merge instead of resurrecting it here. Re-deleting an
+    /// already-tombstoned contact just bumps the timestamp (harmless,
+    /// idempotent).
     fn remove_contact(&mut self, address: &str) {
         let net = self.network.as_str().to_string();
         self.contacts
             .retain(|c| !(c.address == address && (c.network == net || c.network.is_empty())));
+        let now = now_ms();
+        match self.tombstones.iter_mut().find(|t| t.address == address && t.network == net) {
+            Some(t) => t.deleted_at = now,
+            None => self.tombstones.push(app_core::contacts::Tombstone {
+                address: address.to_string(),
+                network: net,
+                deleted_at: now,
+            }),
+        }
     }
 
     fn save_config(&self) {
@@ -775,6 +831,20 @@ fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Unix MILLISECONDS — the clock for contacts-tombstones' `updated_at`/
+/// `deleted_at` timestamps (`app_core::contacts` needs finer resolution
+/// than `now()`'s seconds so two touches in the same second still order
+/// correctly). The only place this crate calls `SystemTime::now()` for
+/// that feature — every `app_core::contacts` function stays clock-free
+/// and takes timestamps as parameters (see that module's doc for the
+/// cross-device wall-clock assumption this relies on).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -2001,16 +2071,23 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
 /// access, same shape as every other `apply_*` trampoline target). Reads
 /// whatever's in the KV store RIGHT NOW (not what triggered the
 /// notification — there's no payload, just "something changed"), merges
-/// it into the live list, persists + re-syncs only if that actually
-/// changed anything, and refreshes the picker so a change made on the
-/// other device shows up here without a restart.
+/// it into the live state (tombstone-aware — see `app_core::contacts`),
+/// persists + re-syncs only if that actually changed anything, and
+/// refreshes the picker so a change made on the other device (including a
+/// DELETION) shows up here without a restart.
 fn apply_icloud_contacts_merge(w: &AppWindow, st: &mut State) {
+    let local = st.contact_state();
     let incoming =
         app_core::contacts::parse_contacts_blob(icloud::load_blob().as_deref().unwrap_or(""));
-    let merged = app_core::contacts::merge_contacts(&st.contacts, &incoming);
-    if merged != st.contacts {
-        st.contacts = merged;
-        println!("cb: icloud-contacts merged n={}", st.contacts.len());
+    let merged = app_core::contacts::merge_state(&local, &incoming, now_ms());
+    if merged.contacts != st.contacts || merged.tombstones != st.tombstones {
+        st.contacts = merged.contacts;
+        st.tombstones = merged.tombstones;
+        println!(
+            "cb: icloud-contacts merged n={} tombstones={}",
+            st.contacts.len(),
+            st.tombstones.len()
+        );
         st.save_contacts();
         refresh_contacts(w, st);
     }
@@ -6803,22 +6880,29 @@ fn load_funding_wallets(dir: &std::path::Path) -> Vec<FundingWallet> {
 }
 
 /// Boot-time source for the device-level contacts list (iCloud-contacts
-/// feature, 2026-07-20): if `contacts.json` already exists, it's
-/// authoritative — just load it (tolerant of a missing/garbage file, which
-/// comes back empty rather than erroring). Otherwise this is an existing
-/// install's FIRST boot on the new global-contacts scheme: union every
-/// per-notebook `store-*.json`'s `contacts` (by address, preferring
+/// feature, 2026-07-20; tombstone-aware since contacts-tombstones,
+/// 2026-07-20): if `contacts.json` already exists, it's authoritative —
+/// just load it via the same tolerant parse the iCloud blob uses
+/// (`app_core::contacts::parse_contacts_blob`, which accepts both the
+/// current v2 shape and a bare v1 array — every existing install's
+/// `contacts.json` on disk today is a bare array, predating tombstones
+/// entirely, so it loads with an empty tombstone list). Otherwise this is
+/// an existing install's FIRST boot on the global-contacts scheme: union
+/// every per-notebook `store-*.json`'s `contacts` (by address, preferring
 /// whichever copy has a non-empty name) so nobody's existing contacts
-/// vanish. `contacts.json` itself is written by the caller via
-/// `State::save_contacts` once the (possibly-migrated) list is in place —
-/// this function only READS.
-fn load_or_migrate_contacts(data_dir: &std::path::Path) -> Vec<app_core::store::Contact> {
+/// vanish — this migration path predates tombstones too, so it always
+/// produces an empty tombstone list. `contacts.json` itself is written by
+/// the caller via `State::save_contacts` once the (possibly-migrated)
+/// state is in place — this function only READS.
+fn load_or_migrate_contacts(data_dir: &std::path::Path) -> app_core::contacts::ContactState {
     let path = data_dir.join("contacts.json");
     if let Ok(text) = std::fs::read_to_string(&path) {
-        return serde_json::from_str(&text).unwrap_or_default();
+        return app_core::contacts::parse_contacts_blob(&text);
     }
     let mut merged: Vec<app_core::store::Contact> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(data_dir) else { return merged };
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return app_core::contacts::ContactState { contacts: merged, tombstones: Vec::new() };
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -6847,7 +6931,7 @@ fn load_or_migrate_contacts(data_dir: &std::path::Path) -> Vec<app_core::store::
             }
         }
     }
-    merged
+    app_core::contacts::ContactState { contacts: merged, tombstones: Vec::new() }
 }
 
 /// Import a signed PSBT (from file bytes, a base64/hex string, or a UR string),
@@ -7983,9 +8067,11 @@ pub fn run() {
     let funding_wallets = load_funding_wallets(&data_dir);
     // Device-level contacts (iCloud-contacts feature): load or, on an
     // existing install's first boot under this scheme, migrate from every
-    // per-notebook store — see `load_or_migrate_contacts`.
+    // per-notebook store — see `load_or_migrate_contacts`. Tombstone-aware
+    // (contacts-tombstones feature) since that function's tolerant parse
+    // handles both v1 (bare array, every existing install today) and v2.
     let contacts_json_existed = data_dir.join("contacts.json").exists();
-    let initial_contacts = load_or_migrate_contacts(&data_dir);
+    let initial_state = load_or_migrate_contacts(&data_dir);
 
     let st = Rc::new(RefCell::new(State {
         data_dir,
@@ -8051,25 +8137,34 @@ pub fn run() {
         wallet_tx_busy: false,
         wallet_stores_busy: false,
         pending_broadcast: None,
-        contacts: initial_contacts,
+        contacts: initial_state.contacts,
+        tombstones: initial_state.tombstones,
     }));
     // Contacts boot sequence (iCloud-contacts feature): persist a fresh
     // migration (so `contacts.json` exists from here on and the union is
     // never redone), then merge in whatever the OTHER device last synced to
     // iCloud — sync-on-boot, independent of the live observer below (which
     // covers a change that arrives WHILE this device is already running).
+    // Tombstone-aware (contacts-tombstones feature): a deletion synced from
+    // the other device while this one was closed is applied right here.
     {
         let mut s = st.borrow_mut();
         if !contacts_json_existed {
             s.save_contacts();
         }
+        let local = s.contact_state();
         let incoming = app_core::contacts::parse_contacts_blob(
             icloud::load_blob().as_deref().unwrap_or(""),
         );
-        let merged = app_core::contacts::merge_contacts(&s.contacts, &incoming);
-        if merged != s.contacts {
-            s.contacts = merged;
-            println!("cb: icloud-contacts merged n={}", s.contacts.len());
+        let merged = app_core::contacts::merge_state(&local, &incoming, now_ms());
+        if merged.contacts != s.contacts || merged.tombstones != s.tombstones {
+            s.contacts = merged.contacts;
+            s.tombstones = merged.tombstones;
+            println!(
+                "cb: icloud-contacts merged n={} tombstones={}",
+                s.contacts.len(),
+                s.tombstones.len()
+            );
             s.save_contacts();
         }
     }
