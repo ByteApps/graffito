@@ -238,6 +238,24 @@ pub struct Contact {
     /// are merged into the device-level list.
     #[serde(default)]
     pub network: String,
+    /// Unix MILLISECONDS the contact was last added/touched/renamed —
+    /// tombstone-based cross-device deletion's last-write-wins clock
+    /// (contacts-tombstones feature, 2026-07-20). `#[serde(default)]` = 0
+    /// for every contact that existed before this field shipped, which
+    /// makes a legacy entry lose any conflict against a genuinely-timed
+    /// one from either device (0 is always the oldest possible value) —
+    /// the desired behavior, since a legacy entry carries no real
+    /// evidence of when it was last touched. Produced ONLY by the impure
+    /// app crate (`std::time::SystemTime::now()`); every pure `app-core`
+    /// function here takes timestamps as parameters so merge stays
+    /// host-testable without a clock. Conflict resolution across devices
+    /// relies on their wall clocks being roughly NTP-synced — a device
+    /// with a badly skewed clock can lose a genuinely-later edit/deletion
+    /// to a genuinely-earlier one from another device (documented
+    /// tradeoff, not solved here; a vector clock would remove the
+    /// assumption but is overkill for a 2-device contacts list).
+    #[serde(default)]
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -933,7 +951,8 @@ impl Store {
     /// `contacts` is single-network by construction, so this always
     /// stamps `self.network` (no cross-network ambiguity within one
     /// store — the (address, network) identity only matters once merged
-    /// into the device-level list).
+    /// into the device-level list). Never participates in tombstone sync
+    /// (that's the device-level list's job) — `updated_at` is left 0 here.
     pub fn touch_contact(&mut self, address: &str) {
         let name = self
             .contacts
@@ -943,7 +962,7 @@ impl Store {
             .unwrap_or_default();
         self.contacts.insert(
             0,
-            Contact { address: address.to_string(), name, network: self.network.clone() },
+            Contact { address: address.to_string(), name, network: self.network.clone(), updated_at: 0 },
         );
         self.contacts.truncate(20);
     }
