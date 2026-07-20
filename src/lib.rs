@@ -8172,7 +8172,13 @@ pub fn run() {
                 n.txids.join(", "),
                 n.height.map(|h| h.to_string()).unwrap_or_else(|| "unconfirmed".into()),
                 n.sender.as_deref().map(|a| format!("from: {a}\n")).unwrap_or_default(),
-                n.recipient.as_deref().map(|a| format!("to: {a}\n")).unwrap_or_default(),
+                // Multi-recipient note: list EVERY recipient (one per line,
+                // output order); the singular field only names the first.
+                if n.recipients.is_empty() {
+                    n.recipient.as_deref().map(|a| format!("to: {a}\n")).unwrap_or_default()
+                } else {
+                    format!("to ({}): {}\n", n.recipients.len(), n.recipients.join("\n    "))
+                },
             );
             w.set_note_detail(detail.into());
             w.set_note_view_id(n.note_id.clone().into());
