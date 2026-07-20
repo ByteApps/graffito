@@ -1888,6 +1888,11 @@ export component AppWindow inherits Window {
     // finished on a worker thread — same trampoline pattern, one callback
     // draining all four result queues (mirrors apply-pending-compose).
     callback apply-pending-wallet-tx();
+    // iCloud-contacts feature (2026-07-20): the OTHER device just synced a
+    // contacts change in — same trampoline pattern as apply-pending-refresh,
+    // but the source event is an NSUbiquitousKeyValueStore notification
+    // (any thread) rather than a worker-thread scan.
+    callback apply-pending-icloud-contacts();
     // Where settings/activity return on back: the screen they were opened
     // from (the notebook list or a notebook's home). Set by their open
     // callbacks in Rust.

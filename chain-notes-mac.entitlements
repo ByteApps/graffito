@@ -12,7 +12,14 @@
        keychain-access-groups      — the notes key lives in the keychain under
                                       the team-prefixed group so it iCloud-Keychain
                                       syncs iPhone <-> Mac (Universal Purchase, same
-                                      bundle id → same default access group). -->
+                                      bundle id → same default access group).
+       ubiquity-kvstore-identifier — iCloud-contacts feature (2026-07-20):
+                                      NSUbiquitousKeyValueStore (src/icloud.rs)
+                                      needs this capability to sync the
+                                      device-level contacts list iPhone <-> Mac;
+                                      SAME identifier as the iOS target
+                                      (chain-notes-ios.entitlements) so both
+                                      platforms read/write the one KV store. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -28,5 +35,7 @@
 	<array>
 		<string>$(AppIdentifierPrefix)com.objsal.chainnotes</string>
 	</array>
+	<key>com.apple.developer.ubiquity-kvstore-identifier</key>
+	<string>$(TeamIdentifierPrefix)com.objsal.chainnotes</string>
 </dict>
 </plist>

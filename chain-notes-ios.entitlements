@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- iOS entitlements for chain-notes-app. Referenced by the iOS target's
+     CODE_SIGN_ENTITLEMENTS (project.yml). No secrets here —
+     $(TeamIdentifierPrefix) is resolved to the team prefix by the signing
+     toolchain at build time.
+
+     Capabilities the app actually uses:
+       ubiquity-kvstore-identifier — iCloud-contacts feature (2026-07-20):
+                                      NSUbiquitousKeyValueStore (src/icloud.rs)
+                                      syncs the device-level contacts list
+                                      Mac <-> iPhone. SAME identifier as the
+                                      macOS target (chain-notes-mac.entitlements)
+                                      so both platforms read/write the one KV
+                                      store — required for iCloud KV sync to
+                                      work at all; the iOS target previously
+                                      had no entitlements file. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.ubiquity-kvstore-identifier</key>
+	<string>$(TeamIdentifierPrefix)com.objsal.chainnotes</string>
+</dict>
+</plist>
