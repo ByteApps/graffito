@@ -1832,6 +1832,9 @@ export component AppWindow inherits Window {
     // Internal: a background spending-wallet scan finished — same
     // trampoline pattern as apply-pending-refresh.
     callback apply-pending-spending-refresh();
+    // Internal: a background wallet-wide rescan finished (Coins screen /
+    // notebook-list ↻, watchdog fix 2026-07-20) — same trampoline pattern.
+    callback apply-pending-wallet-stores-refresh();
     callback psbt-save();          // export the .psbt file
     callback psbt-copy();          // copy PSBT base64
     callback psbt-goto-import();   // export → import screen
