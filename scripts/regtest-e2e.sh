@@ -298,3 +298,52 @@ pass "fu leg3: words-only recovery (fresh store + fresh notebooks index, same mn
 
 echo
 pass "funding-unification M4: internal spending wallet e2e (funded self-note, funded directed-private, words-only recovery re-labeling, device-side interop, dust accumulation + consolidate) complete (work dir: $WORK)"
+
+# ---------------------------------------------------------------------------
+# multi-all-paths M0: multi-recipient directed notes through the SPENDING-
+# WALLET-funded path (`build_funding_psbt_multi` / `on_spending_compose_send`
+# in the app) — the CLI-level substitute the plan sanctioned for this leg
+# (driving the full simtap UI would additionally need enabling spending in
+# Settings + faucet-funding a derived spending address before compose even
+# starts; the notebook-funded multi-recipient path already has a full simtap
+# leg in ui-automation/tests/chain-notes-app-multi-recipient.sh). A FRESH
+# dedicated identity + store, exactly like the "fu" legs above, so this
+# never perturbs their exact balance/count assertions.
+echo "== multi leg: spending-wallet-funded note to 3 recipients =="
+MFU_KEY="legal winner thank year wave sausage worth useful legal winner thank yellow"
+MFU_STORE="$WORK/mfu-store.json"
+export APP_KEY="$MFU_KEY"
+"$APP" init "$MFU_STORE" regtest | grep -q "kind=mnemonic" || fail "multi-fu: init"
+MFU_SPEND_ADDR="$("$APP" spending-address "$MFU_STORE" regtest | tail -1)"
+[[ "$MFU_SPEND_ADDR" == bcrt1q* ]] || fail "multi-fu: spending address not segwit v0: $MFU_SPEND_ADDR"
+curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$MFU_SPEND_ADDR\",\"amount\":0.0006}" >/dev/null
+curl -sf -X POST "$BASE/mine?blocks=1" >/dev/null
+
+# Three throwaway taproot recipients (any valid 32-byte hex key — none of
+# them need to sign anything, just be valid taproot regtest addresses).
+M_R1="$(APP_KEY=1111111111111111111111111111111111111111111111111111111111111111 "$APP" address regtest)"
+M_R2="$(APP_KEY=2222222222222222222222222222222222222222222222222222222222222222 "$APP" address regtest)"
+M_R3="$(APP_KEY=3333333333333333333333333333333333333333333333333333333333333333 "$APP" address regtest)"
+export APP_KEY="$MFU_KEY"
+"$APP" note-spend-funded-multi "$MFU_STORE" "$BASE" public 2.0 500 "multi-recipient spending-wallet note" \
+    "$M_R1" "$M_R2" "$M_R3" \
+    | tee "$WORK/multi-fu-leg.log" | grep -q "recipients=3 sent_to_recipient=1500 .*broadcast=ok" \
+    || fail "multi leg: note-spend-funded-multi: $(cat "$WORK/multi-fu-leg.log")"
+pass "multi leg: 3-recipient spending-wallet-funded note (uniform 500-sat gift, 1500 sats total) composed + signed + broadcast entirely in-app"
+
+# Each recipient decrypts/decodes its own copy of the PUBLIC multi-recipient
+# note independently (FLAG_MULTI body is plaintext for a public note — any
+# holder of a recipient dust output can read it, same as any other public
+# note; the multi-recipient framing only changes ownership/addressing, not
+# visibility).
+for rk in 1111111111111111111111111111111111111111111111111111111111111111 \
+          2222222222222222222222222222222222222222222222222222222222222222 \
+          3333333333333333333333333333333333333333333333333333333333333333; do
+    R_STORE="$WORK/multi-recip-$rk.json"
+    APP_KEY="$rk" "$APP" init "$R_STORE" regtest >/dev/null
+    APP_KEY="$rk" "$APP" scan "$R_STORE" "$BASE" >/dev/null
+    APP_KEY="$rk" "$APP" notes "$R_STORE" | tee "$WORK/multi-recip-notes-$rk" \
+        | grep -q "received=true .*text=multi-recipient spending-wallet note" \
+        || fail "multi leg: recipient $rk did not receive the multi-recipient note: $(cat "$WORK/multi-recip-notes-$rk")"
+done
+pass "multi leg: all three recipients independently scan + read the multi-recipient public note"

@@ -21,11 +21,42 @@ use crate::Error;
 /// (notes-core's `multi_body` hybrid seal, dm.rs) — same one-shot,
 /// never-persisted handling as `note_id`/aux-rand: generated fresh per
 /// compose attempt, never stored, never logged, and zeroized by the caller
-/// immediately after the notes-core call returns.
-fn fresh_content_key() -> Result<[u8; 32], Error> {
+/// immediately after the notes-core call returns. `pub` (not just used
+/// internally by [`compose_note`]) — every externally-assembled
+/// multi-recipient path (mixed/spending/watch PSBT builders in
+/// `psbt_build.rs`/`mixed.rs`, and `on_compose_send_mixed` in the app's own
+/// `src/lib.rs`) needs the SAME fresh-per-attempt, zeroize-after convention
+/// when it calls notes-core's `sealed_note_payloads_multi` directly.
+pub fn fresh_content_key() -> Result<[u8; 32], Error> {
     let mut key = [0u8; 32];
     getrandom::getrandom(&mut key).map_err(|_| Error::Entropy)?;
     Ok(key)
+}
+
+/// Parse + dedupe a primary + extra recipient address list (first
+/// occurrence wins, order preserved) — the same convention notes-core's own
+/// internal `dedupe_recipients`/`sealed_note_payloads_multi` use, exposed
+/// here so every externally-assembled (mixed/spending/watch) compose path
+/// builds its recipient list identically to this module's own
+/// [`compose_note`] (whose inline dedupe loop mirrors this exactly).
+/// `primary: None` (a self-note) always returns an empty list — extras are
+/// only meaningful for a directed note.
+pub fn parse_dedupe_recipients(
+    network: Network,
+    primary: Option<&str>,
+    extra: &[&str],
+) -> Result<Vec<Recipient>, Error> {
+    let mut recipients: Vec<Recipient> = Vec::new();
+    if let Some(addr) = primary {
+        recipients.push(Recipient::parse(network, addr)?);
+        for e in extra {
+            let r = Recipient::parse(network, e)?;
+            if !recipients.iter().any(|existing| existing.address == r.address) {
+                recipients.push(r);
+            }
+        }
+    }
+    Ok(recipients)
 }
 
 pub struct ComposeRequest<'a> {

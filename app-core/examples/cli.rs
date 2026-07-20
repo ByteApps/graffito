@@ -747,6 +747,107 @@ fn main() {
                 private,
             );
         }
+        Some("note-spend-funded-multi") => {
+            // note-spend-funded-multi <store.json> <base-url> <public|private> <rate> <gift> <text> <to1> <to2> [to3...]
+            // Multi-all-paths e2e substitute (2026-07-19): the same fully
+            // in-app spending-wallet-funded shape as `note-spend-funded`,
+            // but to 2+ recipients via `build_funding_psbt_multi` — proves
+            // the app-core builder + in-app P2WPKH signer + broadcast for
+            // the exact path `on_spending_compose_send` drives, against a
+            // real regtest node. Sanctioned CLI substitute for a full
+            // simtap UI leg (chain-notes-app-multi-recipient.sh's staging
+            // recipe — enable spending in Settings, faucet-fund the derived
+            // spending address, drive the compose screen — is much heavier
+            // than the notebook-funded leg it already covers).
+            let store = load(&args[2]);
+            let net = network(&store.network.clone());
+            let ident = identity(net);
+            let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | master xprv");
+            let account: u32 =
+                std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
+            let material = parse_key_material(&key, net).expect("APP_KEY parse");
+            let private = match args[4].as_str() {
+                "private" => true,
+                "public" => false,
+                o => panic!("visibility must be public|private, got {o}"),
+            };
+            let fee_rate: f64 = args[5].parse().expect("fee rate");
+            let gift: u64 = args[6].parse().expect("gift sats");
+            let text = args[7].clone();
+            let to_addrs: Vec<&str> = args[8..].iter().map(String::as_str).collect();
+            assert!(to_addrs.len() >= 2, "note-spend-funded-multi needs at least 2 recipient addresses");
+            let recipients = app_core::compose::parse_dedupe_recipients(net, to_addrs.first().copied(), &to_addrs[1..])
+                .expect("recipients parse");
+            assert!(recipients.len() >= 2, "recipient addresses must be distinct to exercise the multi path");
+
+            let source = app_core::spending::funding_source(&material, net, account)
+                .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
+            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let gap: u32 =
+                std::env::var("CN_FUND_GAP").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+            let scan = client.scan_funding(&source, gap).expect("spending wallet scan");
+            if scan.utxos.is_empty() {
+                panic!("spending wallet has no spendable coins");
+            }
+
+            let r = app_core::notes_core::keys::generate_aux_rand().expect("rng");
+            let note_id = [r[0], r[1], r[2], r[3]];
+            let ix_path = spending_index_path(&args[2], net, &material);
+            let mut ix = NotebookIndex::load(&ix_path).unwrap_or_default();
+            let mut section = ix.spending_for(account);
+            let change_index = section.next_change;
+            let plan = FundingPlan {
+                source: &source,
+                coins: &scan.utxos,
+                change_index,
+                fee_rate,
+                change_override: None,
+            };
+            let np = NoteParams {
+                identity: ident.expect_full(),
+                text: &text,
+                private,
+                recipient: None, // ignored by the multi entry point — `recipients` replaces it
+                note_id,
+                max_op_return_bytes: store.chunk_size,
+                network: net,
+            };
+            let built = app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift)
+                .expect("build multi-recipient funded note psbt");
+            assert_eq!(built.sent_to_recipient, gift * recipients.len() as u64, "uniform gift x N recipients");
+            let mut psbt = built.psbt.clone();
+            let signed = app_core::psbt_build::sign_own_wpkh_inputs(
+                &mut psbt, &material, net, account, &scan.utxos,
+            )
+            .expect("sign spending-wallet inputs");
+            assert!(signed > 0, "no spending-wallet inputs signed");
+            let (raw, txid, vsize) = finalize_extract(psbt).expect("finalize");
+            assert_eq!(txid, built.txid, "finalize changed the txid");
+            let got = client.broadcast(&raw).expect("broadcast");
+            assert_eq!(got, txid, "endpoint echoed a different txid");
+
+            if built.change > 0 {
+                let change_addr = source.derive(1, change_index).expect("derive change address");
+                section.mark_used(SpendingAddr {
+                    chain: 1,
+                    index: change_index,
+                    address: change_addr.address,
+                    script_pubkey_hex: hex::encode(&change_addr.spk),
+                });
+                ix.set_spending(account, section);
+                ix.save(&ix_path).expect("save notebooks index");
+            }
+            println!(
+                "cli: compose id={} txid={} fee={} vsize={} recipients={} sent_to_recipient={} private={} broadcast=ok",
+                hex::encode(note_id),
+                txid,
+                built.fee,
+                vsize,
+                recipients.len(),
+                built.sent_to_recipient,
+                private,
+            );
+        }
         // ---- external funding (PSBT) — simulates a hardware/software signer ----
         Some("fund-keygen") => {
             // fund-keygen <network> <seed-hex> [tr|wpkh]

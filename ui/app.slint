@@ -1459,6 +1459,9 @@ export component AppWindow inherits Window {
     // whenever length <= 1 — nothing to add beyond what plain Reply covers.
     in property <[ContactItem]> note-reply-set;
 
+    // The primary recipient's contact name / address, or "Self (my
+    // notebook)" — NO "To: " prefix (Sal, 2026-07-19: the compose screen's
+    // "To" section caption carries that now; see the uniform To rows).
     in property <string> to-label;
     // Multi-recipient directed notes: removable To-chips beyond the
     // primary recipient (`to-label`) — the compose screen's "+ Add
@@ -2740,30 +2743,38 @@ export component AppWindow inherits Window {
             }
             compose-col := VerticalLayout {
                 spacing: 12px;
-        Rectangle {
-            border-radius: 10px;
-            background: Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            height: 34px;
-            Text {
-                x: 12px;
-                width: parent.width - 24px;
-                height: parent.height;
-                vertical-alignment: center;
-                text: root.to-label;
-                font-size: 12px;
-                color: Pal.muted;
-                overflow: elide;
-            }
-        }
-        // Multi-recipient: removable To-chips beyond the primary recipient
-        // — one row per extra address, "×" removes it (mirrors the
-        // contacts screen's recent-contact remove pattern). Notebook-
-        // funded compose only; hidden for watch-only (Rust never opens the
-        // add-recipient picker there, but the button below is also gated).
-        if root.to-chips.length > 0: VerticalLayout {
+        // Uniform To section (Sal, 2026-07-19): a "To" caption (same style
+        // as the "Note" caption below) over UNIFORM rows — the primary
+        // recipient row and every extra To-chip share ONE look (no "To: "
+        // prefix on the primary, no "+ " prefix on the chips); only the
+        // chips get a ✕ remove button (the primary is set back on the send-
+        // to picker, screen 7 — tapping it here is a no-op today, same as
+        // before this rework). Notebook-funded compose only for the chips
+        // (Rust never opens the add-recipient picker on other pay-from
+        // sources today, but the button below is also gated); the primary
+        // row always shows regardless of pay-from.
+        Text { text: "To"; font-size: 12px; color: Pal.muted; }
+        VerticalLayout {
             spacing: 6px;
+            Rectangle {
+                height: 30px;
+                border-radius: 8px;
+                background: Pal.card;
+                border-width: 1px;
+                border-color: Pal.line;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    Text {
+                        text: root.to-label;
+                        font-size: 11px;
+                        color: Pal.muted;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                }
+            }
             for c in root.to-chips: Rectangle {
                 height: 30px;
                 border-radius: 8px;
@@ -2775,7 +2786,7 @@ export component AppWindow inherits Window {
                     padding-right: 4px;
                     spacing: 4px;
                     Text {
-                        text: "+ " + (c.name == "" ? c.address : c.name);
+                        text: c.name == "" ? c.address : c.name;
                         font-size: 11px;
                         color: Pal.muted;
                         vertical-alignment: center;

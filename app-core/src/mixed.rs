@@ -200,11 +200,27 @@ pub fn estimate_funded_fee(
     dust_to_self: bool,
     fee_rate: f64,
 ) -> u64 {
+    let lens: Vec<usize> = recipient_spk_len.into_iter().collect();
+    estimate_funded_fee_multi(input_weights, payloads, &lens, change_spk_len, dust_to_self, fee_rate)
+}
+
+/// Multi-recipient generalization of [`estimate_funded_fee`]: `recipient_spk_lens`
+/// carries EVERY recipient output's spk length (uniform gift means only the
+/// LENGTH matters for sizing, not the amount) instead of at most one — empty
+/// = self-note, 2+ = a genuine multi-recipient note's real output-shape
+/// list. The old signature delegates here with a 0/1-element vec, so it
+/// stays byte-identical.
+pub fn estimate_funded_fee_multi(
+    input_weights: &[InputWeightPrediction],
+    payloads: &[Vec<u8>],
+    recipient_spk_lens: &[usize],
+    change_spk_len: usize,
+    dust_to_self: bool,
+    fee_rate: f64,
+) -> u64 {
     let mut lens: Vec<usize> =
         payloads.iter().map(|p| notes_core::tx::op_return_script(p).len()).collect();
-    if let Some(l) = recipient_spk_len {
-        lens.push(l);
-    }
+    lens.extend(recipient_spk_lens.iter().copied());
     if dust_to_self {
         lens.push(34); // our own P2TR notebook address, when present
     }
@@ -228,11 +244,22 @@ pub fn estimate_funded_fee_no_change(
     dust_to_self: bool,
     fee_rate: f64,
 ) -> u64 {
+    let lens: Vec<usize> = recipient_spk_len.into_iter().collect();
+    estimate_funded_fee_no_change_multi(input_weights, payloads, &lens, dust_to_self, fee_rate)
+}
+
+/// Multi-recipient generalization of [`estimate_funded_fee_no_change`] —
+/// see [`estimate_funded_fee_multi`]'s doc for the same convention.
+pub fn estimate_funded_fee_no_change_multi(
+    input_weights: &[InputWeightPrediction],
+    payloads: &[Vec<u8>],
+    recipient_spk_lens: &[usize],
+    dust_to_self: bool,
+    fee_rate: f64,
+) -> u64 {
     let mut lens: Vec<usize> =
         payloads.iter().map(|p| notes_core::tx::op_return_script(p).len()).collect();
-    if let Some(l) = recipient_spk_len {
-        lens.push(l);
-    }
+    lens.extend(recipient_spk_lens.iter().copied());
     if dust_to_self {
         lens.push(34); // present with or without change, unless anchored
     }
@@ -347,9 +374,28 @@ pub fn predict_funded_fold(
     fixed_out: u64,
     fee_rate: f64,
 ) -> Option<(u64, u64)> {
-    let fee_wc =
-        estimate_funded_fee(input_weights, payloads, recipient_spk_len, change_spk_len, dust_to_self, fee_rate);
-    let fee_nc = estimate_funded_fee_no_change(input_weights, payloads, recipient_spk_len, dust_to_self, fee_rate);
+    let lens: Vec<usize> = recipient_spk_len.into_iter().collect();
+    predict_funded_fold_multi(input_weights, payloads, &lens, change_spk_len, dust_to_self, in_value, fixed_out, fee_rate)
+}
+
+/// Multi-recipient generalization of [`predict_funded_fold`] — see
+/// [`estimate_funded_fee_multi`]'s doc for the same convention.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_funded_fold_multi(
+    input_weights: &[InputWeightPrediction],
+    payloads: &[Vec<u8>],
+    recipient_spk_lens: &[usize],
+    change_spk_len: usize,
+    dust_to_self: bool,
+    in_value: u64,
+    fixed_out: u64,
+    fee_rate: f64,
+) -> Option<(u64, u64)> {
+    let fee_wc = estimate_funded_fee_multi(
+        input_weights, payloads, recipient_spk_lens, change_spk_len, dust_to_self, fee_rate,
+    );
+    let fee_nc =
+        estimate_funded_fee_no_change_multi(input_weights, payloads, recipient_spk_lens, dust_to_self, fee_rate);
     predict_fold(in_value, fixed_out, fee_wc, fee_nc, false)
 }
 
@@ -406,6 +452,46 @@ pub fn assemble_mixed_note_psbt(
     change_index: u32,
     fee_rate: f64,
 ) -> Result<BuiltPsbt, Error> {
+    let recipients: Vec<(Vec<u8>, u64)> =
+        recipient_spk.map(|spk| vec![(spk, recipient_amount)]).unwrap_or_default();
+    assemble_mixed_note_psbt_multi(
+        coins,
+        notebook_spk,
+        spending_source,
+        wallets,
+        payloads,
+        &recipients,
+        change_default,
+        change_spk_override,
+        change_index,
+        fee_rate,
+    )
+}
+
+/// Multi-recipient generalization of [`assemble_mixed_note_psbt`]: `recipients`
+/// carries EVERY recipient output's (scriptPubKey, amount) pair, in the exact
+/// order the caller must have already resolved from
+/// `notes_core::bundle::sealed_note_payloads_multi`'s returned spk order (a
+/// FROZEN protocol rule — wrap order = output order). Empty = a self-note,
+/// one entry = an ordinary directed note (byte-identical to
+/// [`assemble_mixed_note_psbt`], which delegates here), 2+ = a genuine
+/// multi-recipient note — every recipient output lands where the single
+/// recipient output used to (after the OP_RETURNs, before dust-to-self/
+/// change), and the input-anchored dust-to-self skip is unaffected by
+/// recipient count (it only ever looks at the INPUT side).
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_mixed_note_psbt_multi(
+    coins: &[MixedCoin],
+    notebook_spk: Vec<u8>,
+    spending_source: Option<&FundingSource>,
+    wallets: &HashMap<String, FundingSource>,
+    payloads: &[Vec<u8>],
+    recipients: &[(Vec<u8>, u64)],
+    change_default: &ChangeDefault,
+    change_spk_override: Option<Vec<u8>>,
+    change_index: u32,
+    fee_rate: f64,
+) -> Result<BuiltPsbt, Error> {
     if coins.is_empty() {
         return Err(Error::Funding("no coins selected".into()));
     }
@@ -451,12 +537,12 @@ pub fn assemble_mixed_note_psbt(
         })
         .collect();
     let mut sent_to_recipient = 0u64;
-    if let Some(spk) = &recipient_spk {
+    for (spk, amount) in recipients {
         outputs.push(TxOut {
-            value: Amount::from_sat(recipient_amount),
+            value: Amount::from_sat(*amount),
             script_pubkey: ScriptBuf::from_bytes(spk.clone()),
         });
-        sent_to_recipient = recipient_amount;
+        sent_to_recipient += amount;
     }
     // Input-anchored skip (Sal's rule, funding-unification, 2026-07-18): a
     // notebook coin in this selection is always this identity's OWN
@@ -1272,5 +1358,159 @@ mod tests {
             Error::Funding(msg) => assert!(msg.contains("no coins to sweep"), "unexpected message: {msg}"),
             other => panic!("expected Error::Funding, got {other:?}"),
         }
+    }
+
+    // ---- multi-all-paths: assemble_mixed_note_psbt_multi ----
+
+    /// [`assemble_mixed_note_psbt`] with exactly one recipient must stay
+    /// byte-identical (same txid, same fee/change/dust accounting) to
+    /// [`assemble_mixed_note_psbt_multi`] called with the equivalent
+    /// one-element recipients slice — proves the old signature really is a
+    /// thin delegating wrapper, not a second implementation that could
+    /// drift.
+    #[test]
+    fn single_recipient_multi_is_byte_identical_to_old_signature() {
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let spending_src = crate::spending::funding_source(&material, net, 0).unwrap();
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let notebook_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let recipient_spk = notes_core::address::p2tr_script_pubkey(&bob.output_x);
+        let coins = vec![MixedCoin {
+            source: CoinSource::Spending, txid: "b".repeat(64), vout: 1, value: 100_000, chain: 0, index: 0,
+        }];
+        let payloads = notes_core::envelope::encode_chunks(
+            [1, 2, 3, 4], notes_core::envelope::FLAG_DIRECTED, b"single via multi", 80,
+        )
+        .unwrap();
+        let old = assemble_mixed_note_psbt(
+            &coins, notebook_spk.clone(), Some(&spending_src), &HashMap::new(), &payloads,
+            Some(recipient_spk.clone()), 330, &ChangeDefault::Spending, None, 0, 2.0,
+        )
+        .unwrap();
+        let new = assemble_mixed_note_psbt_multi(
+            &coins, notebook_spk, Some(&spending_src), &HashMap::new(), &payloads,
+            &[(recipient_spk, 330)], &ChangeDefault::Spending, None, 0, 2.0,
+        )
+        .unwrap();
+        assert_eq!(old.txid, new.txid);
+        assert_eq!(old.fee, new.fee);
+        assert_eq!(old.change, new.change);
+        assert_eq!(old.sent_to_recipient, new.sent_to_recipient);
+        assert_eq!(old.dust_to_self, new.dust_to_self);
+        assert_eq!(old.psbt.unsigned_tx.output.len(), new.psbt.unsigned_tx.output.len());
+    }
+
+    /// A THREE-recipient note funded by a notebook + spending coin: three
+    /// recipient outputs land in EXACTLY the caller-supplied order, each
+    /// carrying the uniform gift; the notebook input still anchors the tx,
+    /// so dust-to-self stays skipped (2026-07-18 rule, unaffected by
+    /// recipient count) — and every input still signs under both per-kind
+    /// signers.
+    #[test]
+    fn multi_recipient_anchored_by_notebook_input_has_no_dust_to_self() {
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let spending_src = crate::spending::funding_source(&material, net, 0).unwrap();
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let notebook_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let carol = Identity::from_app_seed(&[11u8; 32]).unwrap();
+        let dave = Identity::from_app_seed(&[13u8; 32]).unwrap();
+        let (bob_spk, carol_spk, dave_spk) = (
+            notes_core::address::p2tr_script_pubkey(&bob.output_x),
+            notes_core::address::p2tr_script_pubkey(&carol.output_x),
+            notes_core::address::p2tr_script_pubkey(&dave.output_x),
+        );
+        let coins = vec![
+            MixedCoin { source: CoinSource::Notebook, txid: "a".repeat(64), vout: 0, value: 60_000, chain: 0, index: 0 },
+            MixedCoin { source: CoinSource::Spending, txid: "b".repeat(64), vout: 1, value: 40_000, chain: 0, index: 0 },
+        ];
+        let payloads = notes_core::envelope::encode_chunks(
+            [2, 0, 1, 6],
+            notes_core::envelope::FLAG_DIRECTED | notes_core::envelope::FLAG_MULTI,
+            b"group note",
+            80,
+        )
+        .unwrap();
+        let recipients = vec![(bob_spk.clone(), 330u64), (carol_spk.clone(), 330u64), (dave_spk.clone(), 330u64)];
+        let built = assemble_mixed_note_psbt_multi(
+            &coins, notebook_spk.clone(), Some(&spending_src), &HashMap::new(), &payloads,
+            &recipients, &ChangeDefault::Spending, None, 0, 2.0,
+        )
+        .unwrap();
+
+        assert_eq!(built.dust_to_self, 0, "notebook input anchors — no dust-to-self regardless of recipient count");
+        assert_eq!(built.sent_to_recipient, 990, "3 x 330 uniform gift");
+        assert!(!built.psbt.unsigned_tx.output.iter().any(|o| o.script_pubkey.as_bytes() == notebook_spk));
+
+        // Recipient outputs land in EXACTLY the caller-supplied order,
+        // right after the OP_RETURNs (before change) — the FROZEN
+        // wrap-order-equals-output-order rule.
+        let op_returns = payloads.len();
+        let outs = &built.psbt.unsigned_tx.output;
+        assert_eq!(outs[op_returns].script_pubkey.as_bytes(), bob_spk.as_slice());
+        assert_eq!(outs[op_returns].value.to_sat(), 330);
+        assert_eq!(outs[op_returns + 1].script_pubkey.as_bytes(), carol_spk.as_slice());
+        assert_eq!(outs[op_returns + 1].value.to_sat(), 330);
+        assert_eq!(outs[op_returns + 2].script_pubkey.as_bytes(), dave_spk.as_slice());
+        assert_eq!(outs[op_returns + 2].value.to_sat(), 330);
+
+        // Both input kinds still sign and the tx finalizes.
+        let mut psbt = built.psbt.clone();
+        let n1 = sign_own_taproot_inputs(&mut psbt, &alice.output_x, &alice.tweaked_seckey).unwrap();
+        assert_eq!(n1, 1);
+        let spending_coins = spending_funding_utxos(&coins);
+        let n2 = sign_own_wpkh_inputs(&mut psbt, &material, net, 0, &spending_coins).unwrap();
+        assert_eq!(n2, 1);
+        validate_signed(&psbt, &built.txid).expect("both input kinds signed");
+        let (raw, txid, _) = finalize_extract(psbt).expect("finalize multi-recipient mixed tx");
+        assert_eq!(txid, built.txid);
+        assert!(!raw.is_empty());
+    }
+
+    /// The SAME three-recipient note, but funded ENTIRELY by the spending
+    /// wallet (no notebook coin) — the dust-to-self rule flips back on
+    /// (input side isn't anchored), landing AFTER the three recipient
+    /// outputs and BEFORE change.
+    #[test]
+    fn multi_recipient_without_notebook_input_keeps_dust_to_self() {
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let spending_src = crate::spending::funding_source(&material, net, 0).unwrap();
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let notebook_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let carol = Identity::from_app_seed(&[11u8; 32]).unwrap();
+        let (bob_spk, carol_spk) = (
+            notes_core::address::p2tr_script_pubkey(&bob.output_x),
+            notes_core::address::p2tr_script_pubkey(&carol.output_x),
+        );
+        let coins = vec![MixedCoin {
+            source: CoinSource::Spending, txid: "b".repeat(64), vout: 1, value: 100_000, chain: 0, index: 0,
+        }];
+        let payloads = notes_core::envelope::encode_chunks(
+            [3, 0, 1, 7],
+            notes_core::envelope::FLAG_DIRECTED | notes_core::envelope::FLAG_MULTI,
+            b"two recipients, spending only",
+            80,
+        )
+        .unwrap();
+        let recipients = vec![(bob_spk.clone(), 330u64), (carol_spk.clone(), 330u64)];
+        let built = assemble_mixed_note_psbt_multi(
+            &coins, notebook_spk.clone(), Some(&spending_src), &HashMap::new(), &payloads,
+            &recipients, &ChangeDefault::Spending, None, 0, 2.0,
+        )
+        .unwrap();
+
+        assert_eq!(built.dust_to_self, DUST_LIMIT, "no notebook input — dust-to-self stays unconditional");
+        assert_eq!(built.sent_to_recipient, 660);
+        let op_returns = payloads.len();
+        let outs = &built.psbt.unsigned_tx.output;
+        assert_eq!(outs[op_returns].script_pubkey.as_bytes(), bob_spk.as_slice());
+        assert_eq!(outs[op_returns + 1].script_pubkey.as_bytes(), carol_spk.as_slice());
+        assert_eq!(outs[op_returns + 2].script_pubkey.as_bytes(), notebook_spk.as_slice());
+        assert_eq!(outs[op_returns + 2].value.to_sat(), DUST_LIMIT);
     }
 }

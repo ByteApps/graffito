@@ -26,6 +26,7 @@ use notes_core::address::Recipient;
 use notes_core::bundle::{sealed_note_payloads, Identity};
 use notes_core::tx::op_return_script;
 use notes_core::{Network, DUST_LIMIT};
+use zeroize::Zeroize;
 
 use crate::funding::{FundingSource, FundingUtxo};
 use crate::identity::KeyMaterial;
@@ -222,6 +223,29 @@ pub fn build_watch_bump_psbt(
     })
 }
 
+/// Keyless PUBLIC multi-recipient note body: the exact `FLAG_DIRECTED |
+/// FLAG_MULTI` framing `notes_core::bundle::sealed_note_payloads_multi`
+/// produces for a PUBLIC (non-private) note — `count(u8) || utf8 text`,
+/// unsealed, since a public body needs no key at all (see notes-core's
+/// `multi_body`, the `!private` branch). Watch identities have no key
+/// material to hand notes-core's identity-keyed entry point, so this
+/// hand-frames the same bytes directly; `count` is `recipients.len()`
+/// (2..=255, enforced by the caller routing here only when `len() >= 2`).
+/// Byte-parity against a keyed `sealed_note_payloads_multi` call (same
+/// text/count/note_id) is asserted in this module's tests.
+fn public_multi_payloads(
+    text: &str,
+    recipient_count: usize,
+    note_id: [u8; 4],
+    max_op_return_bytes: usize,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let mut body = Vec::with_capacity(1 + text.len());
+    body.push(recipient_count as u8);
+    body.extend_from_slice(text.as_bytes());
+    let flags = notes_core::envelope::FLAG_DIRECTED | notes_core::envelope::FLAG_MULTI;
+    notes_core::envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes).map_err(Into::into)
+}
+
 /// A WATCH identity's self-funded PUBLIC note: OP_RETURN chunks + an
 /// optional directed-recipient output (`recipient_amount` ≥ dust, the
 /// gift) + change back to the notes address, spending the identity's own
@@ -239,15 +263,51 @@ pub fn build_watch_note_psbt(
     max_op_return_bytes: usize,
     fee_rate: f64,
 ) -> Result<BuiltPsbt, Error> {
+    let recipients: Vec<(Vec<u8>, u64)> =
+        recipient_spk.map(|spk| vec![(spk, recipient_amount)]).unwrap_or_default();
+    build_watch_note_psbt_multi(source, coins, text, &recipients, note_id, max_op_return_bytes, fee_rate)
+}
+
+/// Multi-recipient generalization of [`build_watch_note_psbt`]: `recipients`
+/// carries EVERY recipient's (scriptPubKey, amount) pair in output order.
+/// A watch identity has no key material, so a PUBLIC multi-recipient body
+/// can't go through notes-core's identity-keyed `sealed_note_payloads_multi`
+/// — [`public_multi_payloads`] hand-frames the SAME `FLAG_MULTI` body
+/// (`count(u8) || utf8 text`, unsealed since it's public) that function
+/// would produce for a public note, and byte-parity with a keyed call is
+/// asserted in this module's tests. 0 recipients = self-note, 1 = ordinary
+/// directed note (byte-identical to [`build_watch_note_psbt`], which
+/// delegates here), 2+ = genuine multi-recipient.
+#[allow(clippy::too_many_arguments)]
+pub fn build_watch_note_psbt_multi(
+    source: &FundingSource,
+    coins: &[WatchCoin],
+    text: &str,
+    recipients: &[(Vec<u8>, u64)],
+    note_id: [u8; 4],
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+) -> Result<BuiltPsbt, Error> {
     if coins.is_empty() {
         return Err(Error::Funding("no coins selected".into()));
     }
     if text.is_empty() {
         return Err(Error::Funding("empty note".into()));
     }
-    let flags = if recipient_spk.is_some() { notes_core::envelope::FLAG_DIRECTED } else { 0 };
-    let payloads =
-        notes_core::envelope::encode_chunks(note_id, flags, text.as_bytes(), max_op_return_bytes)?;
+    if recipients.len() > 255 {
+        return Err(Error::Funding("recipients: 1..=255".into()));
+    }
+    for (_, amount) in recipients {
+        if *amount < DUST_LIMIT {
+            return Err(Error::Funding(format!("gift below dust ({DUST_LIMIT} sats minimum)")));
+        }
+    }
+    let payloads = if recipients.len() >= 2 {
+        public_multi_payloads(text, recipients.len(), note_id, max_op_return_bytes)?
+    } else {
+        let flags = if !recipients.is_empty() { notes_core::envelope::FLAG_DIRECTED } else { 0 };
+        notes_core::envelope::encode_chunks(note_id, flags, text.as_bytes(), max_op_return_bytes)?
+    };
     let (inputs, prevouts, weights) = taproot_keyspend_inputs(source, coins)?;
     let self_spk = ScriptBuf::from_bytes(source.derive(0, 0)?.spk);
 
@@ -256,15 +316,12 @@ pub fn build_watch_note_psbt(
         .map(|p| TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(op_return_script(p)) })
         .collect();
     let mut sent_to_recipient = 0u64;
-    if let Some(spk) = &recipient_spk {
-        if recipient_amount < DUST_LIMIT {
-            return Err(Error::Funding(format!("gift below dust ({DUST_LIMIT} sats minimum)")));
-        }
+    for (spk, amount) in recipients {
         outputs.push(TxOut {
-            value: Amount::from_sat(recipient_amount),
+            value: Amount::from_sat(*amount),
             script_pubkey: ScriptBuf::from_bytes(spk.clone()),
         });
-        sent_to_recipient = recipient_amount;
+        sent_to_recipient += amount;
     }
 
     // Fee/change: prefer change back to self; a sub-dust remainder folds
@@ -599,7 +656,50 @@ pub fn build_funding_psbt_amount(
     )?;
     let self_spk = notes_core::address::p2tr_script_pubkey(&note.identity.output_x);
     let amount = if recipient_spk.is_some() { recipient_amount.max(DUST_LIMIT) } else { DUST_LIMIT };
-    assemble_funded_note_psbt(plan, &payloads, recipient_spk, amount, self_spk)
+    let recipients: Vec<(Vec<u8>, u64)> = recipient_spk.map(|spk| vec![(spk, amount)]).unwrap_or_default();
+    assemble_funded_note_psbt(plan, &payloads, &recipients, self_spk)
+}
+
+/// Multi-recipient generalization of [`build_funding_psbt_amount`]: a
+/// KEYED identity's spending-wallet/external-funding note to 2+ recipients
+/// (the internal spending-wallet compose path — funding-unification M3 —
+/// is the first caller; external-wallet-only funding for a keyed identity
+/// reuses it too). `note.recipient` is IGNORED here — `recipients` replaces
+/// it (0 = self-note, 1 = ordinary directed note byte-identical to
+/// [`build_funding_psbt_amount`], 2+ = genuine multi-recipient, each
+/// getting the same `gift_amount`). Private multi-recipient bodies need a
+/// fresh one-shot content key (notes-core's hybrid seal) — drawn from OS
+/// TRNG via [`crate::compose::fresh_content_key`] and zeroized immediately
+/// after use, same one-shot convention as `note_id`/aux-rand.
+pub fn build_funding_psbt_multi(
+    plan: &FundingPlan,
+    note: &NoteParams,
+    recipients: &[Recipient],
+    gift_amount: u64,
+) -> Result<BuiltPsbt, Error> {
+    let gift = gift_amount.max(DUST_LIMIT);
+    let (payloads, spks): (Vec<Vec<u8>>, Vec<Vec<u8>>) = if recipients.is_empty() {
+        let (p, spk) = sealed_note_payloads(
+            note.identity, note.text, note.private, None, note.note_id, note.max_op_return_bytes,
+        )?;
+        (p, spk.into_iter().collect())
+    } else {
+        let mut content_key = crate::compose::fresh_content_key()?;
+        let result = notes_core::bundle::sealed_note_payloads_multi(
+            note.identity,
+            note.text,
+            note.private,
+            recipients,
+            note.note_id,
+            content_key,
+            note.max_op_return_bytes,
+        );
+        content_key.zeroize();
+        result?
+    };
+    let self_spk = notes_core::address::p2tr_script_pubkey(&note.identity.output_x);
+    let out_recipients: Vec<(Vec<u8>, u64)> = spks.into_iter().map(|spk| (spk, gift)).collect();
+    assemble_funded_note_psbt(plan, &payloads, &out_recipients, self_spk)
 }
 
 /// A WATCH identity's externally funded PUBLIC note: the funding wallet's
@@ -618,17 +718,43 @@ pub fn build_watch_funded_note_psbt(
     note_id: [u8; 4],
     max_op_return_bytes: usize,
 ) -> Result<BuiltPsbt, Error> {
+    let recipients: Vec<(Vec<u8>, u64)> =
+        recipient_spk.map(|spk| vec![(spk, recipient_amount)]).unwrap_or_default();
+    build_watch_funded_note_psbt_multi(self_output_x, plan, text, &recipients, note_id, max_op_return_bytes)
+}
+
+/// Multi-recipient generalization of [`build_watch_funded_note_psbt`] — the
+/// watch-identity analog of [`build_funding_psbt_multi`]: PUBLIC only (no
+/// key to seal a private multi body), hand-framed via
+/// [`public_multi_payloads`] for 2+ recipients exactly like
+/// [`build_watch_note_psbt_multi`].
+pub fn build_watch_funded_note_psbt_multi(
+    self_output_x: &[u8; 32],
+    plan: &FundingPlan,
+    text: &str,
+    recipients: &[(Vec<u8>, u64)],
+    note_id: [u8; 4],
+    max_op_return_bytes: usize,
+) -> Result<BuiltPsbt, Error> {
     if text.is_empty() {
         return Err(Error::Funding("empty note".into()));
     }
-    if recipient_spk.is_some() && recipient_amount < DUST_LIMIT {
-        return Err(Error::Funding(format!("gift below dust ({DUST_LIMIT} sats minimum)")));
+    if recipients.len() > 255 {
+        return Err(Error::Funding("recipients: 1..=255".into()));
     }
-    let flags = if recipient_spk.is_some() { notes_core::envelope::FLAG_DIRECTED } else { 0 };
-    let payloads =
-        notes_core::envelope::encode_chunks(note_id, flags, text.as_bytes(), max_op_return_bytes)?;
+    for (_, amount) in recipients {
+        if *amount < DUST_LIMIT {
+            return Err(Error::Funding(format!("gift below dust ({DUST_LIMIT} sats minimum)")));
+        }
+    }
+    let payloads = if recipients.len() >= 2 {
+        public_multi_payloads(text, recipients.len(), note_id, max_op_return_bytes)?
+    } else {
+        let flags = if !recipients.is_empty() { notes_core::envelope::FLAG_DIRECTED } else { 0 };
+        notes_core::envelope::encode_chunks(note_id, flags, text.as_bytes(), max_op_return_bytes)?
+    };
     let self_spk = notes_core::address::p2tr_script_pubkey(self_output_x);
-    assemble_funded_note_psbt(plan, &payloads, recipient_spk, recipient_amount, self_spk)
+    assemble_funded_note_psbt(plan, &payloads, recipients, self_spk)
 }
 
 /// Shared tail of both funded-note builders: payloads → outputs (OP_RETURNs,
@@ -648,8 +774,7 @@ pub fn build_watch_funded_note_psbt(
 fn assemble_funded_note_psbt(
     plan: &FundingPlan,
     payloads: &[Vec<u8>],
-    recipient_spk: Option<Vec<u8>>,
-    recipient_amount: u64,
+    recipients: &[(Vec<u8>, u64)],
     self_spk: Vec<u8>,
 ) -> Result<BuiltPsbt, Error> {
     if plan.coins.is_empty() {
@@ -683,12 +808,12 @@ fn assemble_funded_note_psbt(
         .map(|p| TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(op_return_script(p)) })
         .collect();
     let mut sent_to_recipient = 0u64;
-    if let Some(spk) = &recipient_spk {
+    for (spk, amount) in recipients {
         outputs.push(TxOut {
-            value: Amount::from_sat(recipient_amount),
+            value: Amount::from_sat(*amount),
             script_pubkey: ScriptBuf::from_bytes(spk.clone()),
         });
-        sent_to_recipient = recipient_amount;
+        sent_to_recipient += amount;
     }
     outputs.push(TxOut { value: Amount::from_sat(DUST_LIMIT), script_pubkey: ScriptBuf::from_bytes(self_spk) });
     let dust_to_self = DUST_LIMIT;
@@ -1424,5 +1549,205 @@ mod tests {
         let notes_without = extract_notes_multi(&bundle, &alice, NET, &[notes_core::address::p2tr_script_pubkey(&alice.output_x)]);
         assert_eq!(notes_without.len(), 1);
         assert!(notes_without[0].received, "without the spk in the set it looks received");
+    }
+
+    // ---- multi-all-paths: build_funding_psbt_multi (keyed spending/
+    // external funding) + the watch keyless public-multi byte-parity ----
+
+    /// [`public_multi_payloads`] (the watch-identity keyless hand-framer)
+    /// must produce EXACTLY the bytes a KEYED identity's
+    /// `sealed_note_payloads_multi` produces for a public (non-private)
+    /// note with the same text/recipient-count/note_id/chunk — the public
+    /// multi body never touches key material (`count(u8) || utf8 text`,
+    /// see notes-core's `multi_body`), so the two must be byte-identical
+    /// regardless of which (or whose) recipients are named.
+    #[test]
+    fn public_multi_payloads_byte_parity_with_keyed_sealer() {
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let carol = Identity::from_app_seed(&[11u8; 32]).unwrap();
+        let recipients = vec![
+            Recipient::parse(NET, &bob.address(NET)).unwrap(),
+            Recipient::parse(NET, &carol.address(NET)).unwrap(),
+        ];
+        let note_id = [9u8, 8, 7, 6];
+        let text = "public group note from a watch device";
+        let content_key = [0u8; 32]; // unused for a public body — any value must give the same bytes
+
+        let (keyed_payloads, keyed_spks) = notes_core::bundle::sealed_note_payloads_multi(
+            &alice, text, false, &recipients, note_id, content_key, 80,
+        )
+        .unwrap();
+        let keyless_payloads = public_multi_payloads(text, recipients.len(), note_id, 80).unwrap();
+
+        assert_eq!(keyed_payloads, keyless_payloads, "hand-framed body must match the keyed sealer byte-for-byte");
+        assert_eq!(keyed_spks.len(), 2);
+
+        // Different content_key, different identity: still byte-identical
+        // (proves the public body genuinely ignores both).
+        let (keyed_payloads_2, _) = notes_core::bundle::sealed_note_payloads_multi(
+            &bob, text, false, &recipients, note_id, [0xffu8; 32], 80,
+        )
+        .unwrap();
+        assert_eq!(keyed_payloads, keyed_payloads_2);
+    }
+
+    /// A watch identity's SELF-funded public note to 3 recipients: output
+    /// order is OP_RETURNs → 3 recipient outputs (uniform gift, in the
+    /// caller-supplied order) → change; the tx still signs under the
+    /// identity's own descriptor and a key-less scan decodes the
+    /// `FLAG_MULTI` body (count byte matches the real recipient count).
+    #[test]
+    fn watch_note_psbt_multi_three_recipients() {
+        use crate::psbt_finalize::{finalize_extract, validate_signed};
+        use bitcoin::bip32::{Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+
+        let secp = Secp256k1::new();
+        let acct_path = [
+            bitcoin::bip32::ChildNumber::from_hardened_idx(86).unwrap(),
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+        ];
+        let master = Xpriv::new_master(bitcoin::Network::Bitcoin, &[0x77u8; 32]).unwrap();
+        let xpub = Xpub::from_priv(&secp, &master.derive_priv(&secp, &acct_path).unwrap());
+        let fp = master.fingerprint(&secp);
+        let src = FundingSource::parse(&format!("tr([{fp}/86'/0'/0']{xpub}/<0;1>/*)"), NET).unwrap();
+        let coins = vec![WatchCoin { txid: "9".repeat(64), vout: 0, value: 80_000, index: 0 }];
+
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let carol = Identity::from_app_seed(&[11u8; 32]).unwrap();
+        let dave = Identity::from_app_seed(&[13u8; 32]).unwrap();
+        let (bob_spk, carol_spk, dave_spk) = (
+            notes_core::address::p2tr_script_pubkey(&bob.output_x),
+            notes_core::address::p2tr_script_pubkey(&carol.output_x),
+            notes_core::address::p2tr_script_pubkey(&dave.output_x),
+        );
+        let recipients = vec![(bob_spk.clone(), 330u64), (carol_spk.clone(), 330u64), (dave_spk.clone(), 330u64)];
+
+        let built = build_watch_note_psbt_multi(&src, &coins, "group note from watch", &recipients, [1, 2, 3, 4], 80, 2.0)
+            .unwrap();
+        assert_eq!(built.sent_to_recipient, 990);
+        assert_eq!(80_000, built.fee + built.change + 990);
+
+        let tx = &built.psbt.unsigned_tx;
+        let op_returns = tx.output.iter().filter(|o| o.script_pubkey.is_op_return()).count();
+        assert_eq!(tx.output[op_returns].script_pubkey.as_bytes(), bob_spk.as_slice());
+        assert_eq!(tx.output[op_returns + 1].script_pubkey.as_bytes(), carol_spk.as_slice());
+        assert_eq!(tx.output[op_returns + 2].script_pubkey.as_bytes(), dave_spk.as_slice());
+
+        let mut psbt = built.psbt.clone();
+        let _ = psbt.sign(&master, &secp);
+        validate_signed(&psbt, &built.txid).expect("identity master signs");
+        let (_raw, txid, _) = finalize_extract(psbt).expect("finalize");
+        assert_eq!(txid, built.txid);
+
+        // Single/zero recipients must delegate byte-identically to the old
+        // signature (`build_watch_note_psbt`).
+        let one = build_watch_note_psbt(&src, &coins, "solo", Some(bob_spk.clone()), 500, [5, 5, 5, 5], 80, 2.0).unwrap();
+        let one_multi = build_watch_note_psbt_multi(&src, &coins, "solo", &[(bob_spk, 500)], [5, 5, 5, 5], 80, 2.0).unwrap();
+        assert_eq!(one.txid, one_multi.txid);
+        assert_eq!(one.fee, one_multi.fee);
+
+        // A sub-dust gift among the recipients is rejected before any
+        // signing happens.
+        assert!(build_watch_note_psbt_multi(
+            &src, &coins, "x", &[(carol_spk, 100), (dave_spk, 500)], [6, 6, 6, 6], 80, 2.0
+        )
+        .is_err());
+    }
+
+    /// A KEYED identity's spending-wallet-funded note to 3 recipients
+    /// (`build_funding_psbt_multi`): uniform gift on all three outputs, in
+    /// order, dust-to-self unconditional (this path never spends a
+    /// notebook coin), and the exactly-one-recipient case delegates
+    /// byte-identically to [`build_funding_psbt_amount`].
+    #[test]
+    fn funding_psbt_multi_three_recipients_uniform_gift() {
+        let src = source();
+        let coins = one_coin(&src);
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let carol = Identity::from_app_seed(&[11u8; 32]).unwrap();
+        let dave = Identity::from_app_seed(&[13u8; 32]).unwrap();
+        let recipients = vec![
+            Recipient::parse(NET, &bob.address(NET)).unwrap(),
+            Recipient::parse(NET, &carol.address(NET)).unwrap(),
+            Recipient::parse(NET, &dave.address(NET)).unwrap(),
+        ];
+        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 2.0, change_override: None };
+        let np = NoteParams {
+            identity: &alice,
+            text: "group note, spending-funded",
+            private: false,
+            recipient: None, // ignored by the multi entry point — `recipients` replaces it
+            note_id: [2, 0, 1, 6],
+            max_op_return_bytes: 80,
+            network: NET,
+        };
+        let built = build_funding_psbt_multi(&plan, &np, &recipients, 500).unwrap();
+        assert_eq!(built.sent_to_recipient, 1_500, "3 x 500 uniform gift");
+        assert_eq!(built.dust_to_self, DUST_LIMIT, "spending/external funding is never input-anchored");
+        assert_eq!(100_000, built.fee + built.change + built.dust_to_self + built.sent_to_recipient);
+
+        let tx = &built.psbt.unsigned_tx;
+        let op_returns = tx.output.iter().filter(|o| o.script_pubkey.is_op_return()).count();
+        for (i, r) in recipients.iter().enumerate() {
+            assert_eq!(tx.output[op_returns + i].script_pubkey.as_bytes(), r.spk.as_slice());
+            assert_eq!(tx.output[op_returns + i].value.to_sat(), 500);
+        }
+
+        // Exactly one recipient must be byte-identical to the pre-existing
+        // single-recipient entry point.
+        let single_np = NoteParams { recipient: Some(&recipients[0]), ..np };
+        let via_amount = build_funding_psbt_amount(&plan, &single_np, 500).unwrap();
+        let via_multi = build_funding_psbt_multi(&plan, &np, &recipients[..1], 500).unwrap();
+        assert_eq!(via_amount.txid, via_multi.txid);
+        assert_eq!(via_amount.fee, via_multi.fee);
+        assert_eq!(via_amount.sent_to_recipient, via_multi.sent_to_recipient);
+
+        // Zero recipients (self-note): dust-to-self only, no recipient outputs.
+        let self_built = build_funding_psbt_multi(&plan, &np, &[], 999).unwrap();
+        assert_eq!(self_built.sent_to_recipient, 0);
+        assert_eq!(self_built.dust_to_self, DUST_LIMIT);
+    }
+
+    /// A PRIVATE multi-recipient note through `build_funding_psbt_multi`:
+    /// the content-key seal must produce a body every recipient's directed-
+    /// private decode can open (sanity check that the fresh-TRNG
+    /// content_key path — [`crate::compose::fresh_content_key`], zeroized
+    /// after use — actually reaches notes-core's hybrid seal correctly).
+    #[test]
+    fn funding_psbt_multi_private_recipients_taproot_required() {
+        let src = source();
+        let coins = one_coin(&src);
+        let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let carol = Identity::from_app_seed(&[11u8; 32]).unwrap();
+        let recipients =
+            vec![Recipient::parse(NET, &bob.address(NET)).unwrap(), Recipient::parse(NET, &carol.address(NET)).unwrap()];
+        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 2.0, change_override: None };
+        let np = NoteParams {
+            identity: &alice,
+            text: "private group note",
+            private: true,
+            recipient: None,
+            note_id: [3, 3, 3, 3],
+            max_op_return_bytes: 80,
+            network: NET,
+        };
+        let built = build_funding_psbt_multi(&plan, &np, &recipients, DUST_LIMIT).unwrap();
+        assert_eq!(built.sent_to_recipient, DUST_LIMIT * 2);
+
+        // A non-taproot recipient among the extras is rejected before any
+        // signing — same `RecipientNotTaproot` notes-core raises for the
+        // single-recipient private path.
+        let non_taproot = Recipient::parse(NET, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+        let bad_recipients =
+            vec![Recipient::parse(NET, &bob.address(NET)).unwrap(), non_taproot];
+        match build_funding_psbt_multi(&plan, &np, &bad_recipients, DUST_LIMIT) {
+            Err(e) => assert!(format!("{e}").to_lowercase().contains("taproot"), "got: {e}"),
+            Ok(_) => panic!("expected a taproot-required error"),
+        }
     }
 }

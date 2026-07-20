@@ -28,7 +28,7 @@ use app_core::identity::{
 };
 use app_core::notebooks::{NotebookIndex, SpendingAddr};
 use app_core::psbt_build::{
-    build_funded_sweep_psbt, build_funding_psbt, build_watch_bump_psbt, build_watch_note_psbt,
+    build_funded_sweep_psbt, build_funding_psbt, build_watch_bump_psbt, build_watch_note_psbt_multi,
     build_watch_spend_psbt, predict_keyspend_vsize, sign_own_taproot_inputs, BuiltPsbt,
     FundingPlan, NoteParams, WatchCoin,
 };
@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use slint::{ComponentHandle, Model, SharedString, VecModel};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 slint::include_modules!();
 
@@ -371,6 +371,10 @@ enum PendingPayload {
         text: String,
         private: bool,
         to: Option<String>,
+        /// Multi-recipient (2+ only, empty for a self-note or an ordinary
+        /// single-recipient directed note — same "empty means single"
+        /// convention as `ComposedNote.recipients`/`NoteRecord.recipients`).
+        recipients: Vec<String>,
         gift: u64,
         built_fee: u64,
         built_change: u64,
@@ -388,6 +392,8 @@ enum PendingPayload {
         text: String,
         private: bool,
         to: Option<String>,
+        /// Multi-recipient (2+ only) — see `ComposeSpending.recipients`.
+        recipients: Vec<String>,
         gift: u64,
         built_fee: u64,
         built_change: u64,
@@ -395,7 +401,12 @@ enum PendingPayload {
         notebook_spent: Vec<app_core::store::OutPointRef>,
         spent_spending: Vec<(String, u32)>,
         payloads_len: usize,
-        recipient_present: bool,
+        /// Recipient OUTPUT count (0 = self-note, 1 = ordinary directed
+        /// note, 2+ = multi) — drives the change-vout arithmetic in
+        /// `apply_mixed_compose_result`; was a `bool` before multi-
+        /// recipient support, renamed since "present" no longer captures
+        /// how many slots the recipient outputs occupy.
+        recipient_count: usize,
         change_index: u32,
         spending_source: Option<FundingSource>,
     },
@@ -466,6 +477,13 @@ struct WatchNote {
     note_id: [u8; 4],
     text: String,
     recipient: Option<String>,
+    /// Multi-recipient (2+ only) — see `PendingPayload::ComposeSpending.
+    /// recipients`. Covers every path that ends up on the shared PSBT sign
+    /// screen with a note payload: `on_compose_send`'s watch branch
+    /// (self-funded), `on_fund_build`'s watch branch (externally funded),
+    /// and `on_compose_send_mixed`'s external-wallet branch (a keyed mixed
+    /// compose that routes through this same screen).
+    recipients: Vec<String>,
     gift: u64,
     chunks: usize,
     fee: u64,
@@ -739,7 +757,12 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
     // A mixed-source compose (funding-unification UI rework) always carries
     // a dust-to-self output BEFORE change; a genuine watch compose never
     // does (it already spends from self) — shifts the change vout by one.
-    let change_vout = wn.chunks + usize::from(wn.recipient.is_some()) + usize::from(wn.dust_to_self);
+    // Multi-recipient (2+): as many recipient outputs as `wn.recipients`
+    // carries, in place of the single 0/1 slot — everything else about the
+    // vout arithmetic (dust-to-self, then change) is unaffected by count.
+    let recipient_outputs =
+        if wn.recipients.len() >= 2 { wn.recipients.len() } else { usize::from(wn.recipient.is_some()) };
+    let change_vout = wn.chunks + recipient_outputs + usize::from(wn.dust_to_self);
     let change = (wn.change > 0).then(|| app_core::store::LedgerUtxo {
         txid: txid.to_string(),
         vout: change_vout as u32,
@@ -757,7 +780,7 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
             received: false,
             sender: None,
             recipient: wn.recipient.clone(),
-            recipients: Vec::new(),
+            recipients: wn.recipients.clone(),
             txids: vec![txid.to_string()],
             height: None,
             blocktime: None,
@@ -773,6 +796,21 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
         },
         change,
     );
+    // Touch every recipient (multi: all of them; single: just the one) —
+    // same "recents list reflects the whole To list" rule the notebook
+    // path's `record_composed_note` follows. The chip-add flow already
+    // touches contacts at PICK time (`on_add_recipient`), so this is a
+    // redundant (idempotent — `touch_contact` just bumps recency) safety
+    // net, not the only place it happens.
+    if wn.recipients.is_empty() {
+        if let Some(addr) = &wn.recipient {
+            store.touch_contact(addr);
+        }
+    } else {
+        for addr in &wn.recipients {
+            store.touch_contact(addr);
+        }
+    }
     st.save_store();
 }
 
@@ -1492,6 +1530,34 @@ fn commas(n: u64) -> String {
     out
 }
 
+/// The structured cost card's "To recipient" row value (Sal, 2026-07-19):
+/// "+G sats" for exactly one recipient (unchanged copy), "N × G = T sats"
+/// for 2+ (uniform gift × N) — shared by every compose preview that shows a
+/// gift row (notebook, mixed, spending) so the wording never drifts between
+/// paths. `total` is the byte-true sum the builder actually paid, not
+/// `gift * n_recipients` recomputed here (they're equal for a uniform gift,
+/// but passing it through keeps this a pure formatter).
+fn gift_row(n_recipients: usize, gift: u64, total: u64) -> String {
+    match n_recipients {
+        0 => String::new(),
+        1 => format!("+{} sats", commas(total)),
+        n => format!("{n} × {} = {} sats", commas(gift), commas(total)),
+    }
+}
+
+/// " · G sats to recipient" (single) or " · N × G = T sats to N recipients"
+/// (multi) — the ×N fee-copy rule (Sal, 2026-07-19) for the plain "sign
+/// with your external wallet" cost strings on the PSBT-sign screen (mixed/
+/// watch-note build paths, which don't use the structured cost card).
+/// Empty for a self-note (`n_recipients == 0`).
+fn gift_cost_suffix(n_recipients: usize, gift: u64) -> String {
+    match n_recipients {
+        0 => String::new(),
+        1 => format!(" · {gift} sats to recipient"),
+        n => format!(" · {n} × {gift} = {} sats to {n} recipients", gift * n as u64),
+    }
+}
+
 /// The bare host from a Bitcoin-node base URL, e.g.
 /// `https://mempool.space/testnet4/api` → `mempool.space`. Falls back to
 /// "your node" when `base_url` is empty/unparseable (no node configured, or
@@ -1818,7 +1884,10 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
 fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
     if addr == "self" {
         st.to_address = None;
-        w.set_to_label("To: Self (my notebook)".into());
+        // Uniform To section (Sal, 2026-07-19): the row shows just the
+        // name/address now — the "To" CAPTION above it carries that label,
+        // so the value itself drops the "To: " prefix.
+        w.set_to_label("Self (my notebook)".into());
         w.set_directed(false);
         println!("cb: pick-contact to=self");
     } else {
@@ -1851,7 +1920,7 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
             .and_then(|s| s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()))
             .map(|c| c.name.clone())
             .unwrap_or_else(|| a.clone());
-        w.set_to_label(format!("To: {display}").into());
+        w.set_to_label(display.into());
         st.to_address = Some(a);
         w.set_directed(true);
     }
@@ -3452,6 +3521,9 @@ struct SpendingComposeResult {
     text: String,
     private: bool,
     to: Option<String>,
+    /// Multi-recipient (2+ only) — see `PendingPayload::ComposeSpending.
+    /// recipients`.
+    recipients: Vec<String>,
     gift: u64,
     raw: String,
     txid: String,
@@ -3502,7 +3574,7 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
                         received: false,
                         sender: None,
                         recipient: r.to.clone(),
-                        recipients: Vec::new(),
+                        recipients: r.recipients.clone(),
                         txids: vec![r.txid.clone()],
                         height: None,
                         blocktime: None,
@@ -3518,12 +3590,25 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
                     },
                     None,
                 );
+                // Touch every recipient — see `record_composed_note`'s same
+                // rule on the notebook path. Redundant with the chip-add
+                // flow's pick-time touch (idempotent), not the only place.
+                if r.recipients.is_empty() {
+                    if let Some(addr) = &r.to {
+                        store.touch_contact(addr);
+                    }
+                } else {
+                    for addr in &r.recipients {
+                        store.touch_contact(addr);
+                    }
+                }
             }
             st.save_store();
             println!(
-                "cb: compose id={} txid={} fee={} vsize={} to={} private={} funded=spending broadcast=ok",
+                "cb: compose id={} txid={} fee={} vsize={} to={} private={} funded=spending{} broadcast=ok",
                 hex::encode(r.note_id), r.txid, r.built_fee, r.vsize,
-                r.to.as_deref().unwrap_or("self"), r.private
+                r.to.as_deref().unwrap_or("self"), r.private,
+                if r.recipients.len() > 1 { format!(" recipients={}", r.recipients.len()) } else { String::new() }
             );
             w.set_status(format!("broadcast {}…", &r.txid[..12.min(r.txid.len())]).into());
             w.set_compose_text("".into());
@@ -3560,6 +3645,9 @@ struct MixedComposeResult {
     text: String,
     private: bool,
     to: Option<String>,
+    /// Multi-recipient (2+ only) — see `PendingPayload::ComposeSpending.
+    /// recipients`.
+    recipients: Vec<String>,
     gift: u64,
     raw: String,
     txid: String,
@@ -3570,7 +3658,7 @@ struct MixedComposeResult {
     notebook_spent: Vec<app_core::store::OutPointRef>,
     spent_spending: Vec<(String, u32)>,
     payloads_len: usize,
-    recipient_present: bool,
+    recipient_count: usize,
     change_index: u32,
     spending_source: Option<FundingSource>,
     result: Result<String, String>,
@@ -3594,8 +3682,7 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                     && r.change_default == app_core::mixed::ChangeDefault::Notebook)
                     .then(|| app_core::store::LedgerUtxo {
                         txid: r.txid.clone(),
-                        vout: (r.payloads_len + usize::from(r.recipient_present) + usize::from(dust_included))
-                            as u32,
+                        vout: (r.payloads_len + r.recipient_count + usize::from(dust_included)) as u32,
                         value: r.built_change,
                         height: None,
                         pending_spend: false,
@@ -3610,7 +3697,7 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                         received: false,
                         sender: None,
                         recipient: r.to.clone(),
-                        recipients: Vec::new(),
+                        recipients: r.recipients.clone(),
                         txids: vec![r.txid.clone()],
                         height: None,
                         blocktime: None,
@@ -3626,6 +3713,17 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                     },
                     change_utxo,
                 );
+                // Touch every recipient — see `record_composed_note`'s same
+                // rule on the notebook path.
+                if r.recipients.is_empty() {
+                    if let Some(addr) = &r.to {
+                        store.touch_contact(addr);
+                    }
+                } else {
+                    for addr in &r.recipients {
+                        store.touch_contact(addr);
+                    }
+                }
             }
             st.save_store();
             if !r.spent_spending.is_empty() {
@@ -3653,9 +3751,10 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                 spending_refresh_async(w, st);
             }
             println!(
-                "cb: compose id={} txid={} fee={} vsize={} to={} private={} funded=mixed broadcast=ok",
+                "cb: compose id={} txid={} fee={} vsize={} to={} private={} funded=mixed{} broadcast=ok",
                 hex::encode(r.note_id), r.txid, r.built_fee, r.vsize,
-                r.to.as_deref().unwrap_or("self"), r.private
+                r.to.as_deref().unwrap_or("self"), r.private,
+                if r.recipients.len() > 1 { format!(" recipients={}", r.recipients.len()) } else { String::new() }
             );
             w.set_status(format!("broadcast {}…", &r.txid[..12.min(r.txid.len())]).into());
             w.set_compose_text("".into());
@@ -4822,18 +4921,31 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
     let funded_fee_pair = |input_weights: &[bitcoin::transaction::InputWeightPrediction], change_spk_len: usize, dust_to_self: bool| -> Option<(u64, u64)> {
         let identity = st.ident.as_ref().and_then(|i| i.full())?.clone_fields();
         let chunk = st.store.as_ref().map(|s| s.chunk_size).unwrap_or(DEFAULT_CHUNK);
-        let (payloads, recipient_spk) = app_core::notes_core::bundle::sealed_note_payloads(
-            &identity,
-            &text_for_est,
-            private,
-            recipient.as_ref(),
-            [0u8, 0, 0, 0],
-            chunk,
-        )
-        .ok()?;
-        let recipient_spk_len = recipient_spk.map(|s| s.len()).or_else(|| recipient.as_ref().map(|r| r.spk.len()));
-        let fee_wc = app_core::mixed::estimate_funded_fee(input_weights, &payloads, recipient_spk_len, change_spk_len, dust_to_self, rate);
-        let fee_nc = app_core::mixed::estimate_funded_fee_no_change(input_weights, &payloads, recipient_spk_len, dust_to_self, rate);
+        // Multi-recipient: `recipient_spk_lens` (computed above) already
+        // carries every chip's spk length — go through the multi sealer
+        // when there are 2+ distinct recipients so the payload/chunk count
+        // this estimate uses matches what the real multi build would emit
+        // (a FLAG_MULTI body is a different size than a single-recipient
+        // one for the same text).
+        let payloads = if recipient_spk_lens.len() >= 2 {
+            let extra_recipients: Vec<&str> = st.to_addresses_extra.iter().map(String::as_str).collect();
+            let recipients =
+                app_core::compose::parse_dedupe_recipients(net, st.to_address.as_deref(), &extra_recipients).ok()?;
+            let content_key = [0u8; 32]; // preview only — lengths don't depend on the seal
+            app_core::notes_core::bundle::sealed_note_payloads_multi(
+                &identity, &text_for_est, private, &recipients, [0u8, 0, 0, 0], content_key, chunk,
+            )
+            .ok()?
+            .0
+        } else {
+            app_core::notes_core::bundle::sealed_note_payloads(
+                &identity, &text_for_est, private, recipient.as_ref(), [0u8, 0, 0, 0], chunk,
+            )
+            .ok()?
+            .0
+        };
+        let fee_wc = app_core::mixed::estimate_funded_fee_multi(input_weights, &payloads, &recipient_spk_lens, change_spk_len, dust_to_self, rate);
+        let fee_nc = app_core::mixed::estimate_funded_fee_no_change_multi(input_weights, &payloads, &recipient_spk_lens, dust_to_self, rate);
         Some((fee_wc, fee_nc))
     };
 
@@ -4891,10 +5003,12 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         // nb_total == 0 by this branch's own guard) — dust-to-self always
         // rides, same as `assemble_funded_note_psbt`'s unconditional rule.
         let fees = funded_fee_pair(&weights, change_len, true);
-        let fixed_out = gift + DUST_SATS; // recipient (if any) + the ALWAYS dust-to-self output
+        // `total_sent` (not `gift`) is the fixed non-fee output total when
+        // 2+ recipients are chipped in — uniform gift × N (Sal, 2026-07-19).
+        let fixed_out = total_sent + DUST_SATS; // recipients + the ALWAYS dust-to-self output
         let fold = fees.and_then(|(fee_wc, fee_nc)| app_core::mixed::predict_fold(sp_total, fixed_out, fee_wc, fee_nc, false));
         let nominal = fold.map(|(n, _)| n).or_else(|| fees.map(|(wc, _)| wc));
-        required = nominal.map(|f| f + gift + DUST_SATS);
+        required = nominal.map(|f| f + total_sent + DUST_SATS);
         source_label = "Spending wallet".to_string();
         required_line = fold_required_line(required, fold);
         shape = PayfromShape::Spending;
@@ -4958,10 +5072,12 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         let has_notebook = nb_total > 0;
         let dust_sats = if has_notebook { 0 } else { DUST_SATS };
         let fees = funded_fee_pair(&weights, change_len, !has_notebook);
-        let fixed_out = gift + dust_sats; // recipient (if any) + dust-to-self, when present
+        // `total_sent` (not `gift`) is the fixed non-fee output total when
+        // 2+ recipients are chipped in — uniform gift × N (Sal, 2026-07-19).
+        let fixed_out = total_sent + dust_sats; // recipients (if any) + dust-to-self, when present
         let fold = fees.and_then(|(fee_wc, fee_nc)| app_core::mixed::predict_fold(selected, fixed_out, fee_wc, fee_nc, false));
         let nominal = fold.map(|(n, _)| n).or_else(|| fees.map(|(wc, _)| wc));
-        required = nominal.map(|f| f + gift + dust_sats);
+        required = nominal.map(|f| f + total_sent + dust_sats);
         source_label = format!("{groups} wallets");
         required_line = fold_required_line(required, fold);
         shape = PayfromShape::Mixed;
@@ -5469,17 +5585,10 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
                 }
                 st.compose_fold_shown = fold_amount;
             }
-            // "+330 sats to recipient" for one recipient (unchanged copy);
-            // "3 recipients · +990 sats total" for a multi-recipient note
-            // (uniform gift × N — consistent with the existing cost-line
-            // "key: value" style, just pluralized).
-            let gift_line = if n_recipients >= 2 {
-                format!("{n_recipients} recipients · +{} sats total", commas(sent))
-            } else if spk_len.is_some() {
-                format!("+{} sats", commas(sent))
-            } else {
-                String::new()
-            };
+            // "+330 sats" for one recipient (unchanged copy); "N × G = T
+            // sats" for a multi-recipient note (uniform gift × N — Sal,
+            // 2026-07-19) — shared formatter, see `gift_row`.
+            let gift_line = gift_row(n_recipients, gift, sent);
             set_cost_card(
                 w,
                 format!("{chunks} chunk{} · ~{vsize} vB", if chunks == 1 { "" } else { "s" }),
@@ -5747,6 +5856,12 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     } else {
         0
     };
+    // Multi-recipient: every chip's spk (uniform gift each) — mirrors the
+    // notebook path's preview (`refresh_compose`'s `recipient_spk_lens`).
+    let extra_recipients: Vec<&str> = st.to_addresses_extra.iter().map(String::as_str).collect();
+    let recipients = app_core::compose::parse_dedupe_recipients(net, st.to_address.as_deref(), &extra_recipients)
+        .unwrap_or_default();
+    let n_recipients = recipients.len();
     let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
     let change_index = store.spending.next_change;
     let has_custom_change = change_override_spk.is_some();
@@ -5774,7 +5889,12 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         max_op_return_bytes: store.chunk_size,
         network: net,
     };
-    match app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift) {
+    let build_result = if n_recipients >= 2 {
+        app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift)
+    } else {
+        app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift)
+    };
+    match build_result {
         Ok(built) => {
             // Sub-dust fold prediction (honest-fee-label, 2026-07-18):
             // `built.change == 0` means the REAL build already chose the
@@ -5786,25 +5906,34 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                 let weights: Vec<_> = std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX)
                     .take(selected_coins.len().max(1))
                     .collect();
-                app_core::notes_core::bundle::sealed_note_payloads(
-                    &identity,
-                    text,
-                    w.get_compose_private(),
-                    recipient.as_ref(),
-                    [0u8, 0, 0, 0],
-                    store.chunk_size,
-                )
-                .ok()
-                .map(|(payloads, recipient_spk)| {
-                    let recipient_spk_len =
-                        recipient_spk.map(|s| s.len()).or_else(|| recipient.as_ref().map(|r| r.spk.len()));
+                let payload_and_lens = if n_recipients >= 2 {
+                    let mut content_key = [0u8; 32]; // preview only — lengths don't depend on the seal
+                    app_core::notes_core::bundle::sealed_note_payloads_multi(
+                        &identity, text, w.get_compose_private(), &recipients, [0u8, 0, 0, 0], content_key,
+                        store.chunk_size,
+                    )
+                    .ok()
+                    .map(|(p, spks)| (p, spks.iter().map(|s| s.len()).collect::<Vec<usize>>()))
+                    .inspect(|_| content_key.zeroize())
+                } else {
+                    app_core::notes_core::bundle::sealed_note_payloads(
+                        &identity, text, w.get_compose_private(), recipient.as_ref(), [0u8, 0, 0, 0],
+                        store.chunk_size,
+                    )
+                    .ok()
+                    .map(|(p, spk)| {
+                        let lens = spk.map(|s| vec![s.len()]).unwrap_or_default();
+                        (p, lens)
+                    })
+                };
+                payload_and_lens.map(|(payloads, recipient_spk_lens)| {
                     // Spending-only path: never a notebook coin, so
                     // dust-to-self is always present (matches
                     // `build_funding_psbt_amount`'s unconditional rule).
-                    let nominal = app_core::mixed::estimate_funded_fee_no_change(
+                    let nominal = app_core::mixed::estimate_funded_fee_no_change_multi(
                         &weights,
                         &payloads,
-                        recipient_spk_len,
+                        &recipient_spk_lens,
                         true,
                         rate,
                     );
@@ -5827,7 +5956,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                 w,
                 String::new(), // funded shape: no chunk/vsize estimate on this path
                 format!("~{} sats{usd}", commas(fee_shown)),
-                if recipient.is_some() { format!("+{} sats", commas(built.sent_to_recipient)) } else { String::new() },
+                gift_row(n_recipients, gift, built.sent_to_recipient),
                 // Row hidden when the built tx carries no dust-to-self —
                 // always present on THIS (spending-only) shape today, but
                 // conditional so the card can never claim an output the
@@ -5908,33 +6037,40 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     } else {
         0
     };
+    // Multi-recipient: every chip's spk (uniform gift each) — mirrors
+    // `on_compose_send_mixed`'s send path.
+    let extra_recipients: Vec<&str> = st.to_addresses_extra.iter().map(String::as_str).collect();
+    let recipients = app_core::compose::parse_dedupe_recipients(net, st.to_address.as_deref(), &extra_recipients)
+        .unwrap_or_default();
+    let n_recipients = recipients.len();
     let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
     let chunk = st.store.as_ref().map(|s| s.chunk_size).unwrap_or(DEFAULT_CHUNK);
     // Preview note id is all-zero, like every other preview dry-run —
     // payload LENGTHS (all the fee math consumes) don't depend on the id.
-    let sealed = app_core::notes_core::bundle::sealed_note_payloads(
-        &identity,
-        text,
-        w.get_compose_private(),
-        recipient.as_ref(),
-        [0u8, 0, 0, 0],
-        chunk,
-    );
-    let Ok((payloads, recipient_spk)) = sealed else {
+    let sealed = if n_recipients >= 2 {
+        let content_key = [0u8; 32]; // preview only — lengths don't depend on the seal
+        app_core::notes_core::bundle::sealed_note_payloads_multi(
+            &identity, text, w.get_compose_private(), &recipients, [0u8, 0, 0, 0], content_key, chunk,
+        )
+    } else {
+        app_core::notes_core::bundle::sealed_note_payloads(
+            &identity, text, w.get_compose_private(), recipient.as_ref(), [0u8, 0, 0, 0], chunk,
+        )
+        .map(|(p, spk)| (p, spk.into_iter().collect::<Vec<Vec<u8>>>()))
+    };
+    let Ok((payloads, recipient_spks)) = sealed else {
         set_cost_status(w, String::new());
         return;
     };
-    let recipient_spk_len =
-        recipient_spk.as_ref().map(|s| s.len()).or_else(|| recipient.as_ref().map(|r| r.spk.len()));
-    let recipient_amount = if recipient.is_some() { gift } else { 0 };
-    match app_core::mixed::assemble_mixed_note_psbt(
+    let recipient_spk_lens: Vec<usize> = recipient_spks.iter().map(|s| s.len()).collect();
+    let recipients_out: Vec<(Vec<u8>, u64)> = recipient_spks.into_iter().map(|spk| (spk, gift)).collect();
+    match app_core::mixed::assemble_mixed_note_psbt_multi(
         &args.coins,
         p2tr_script_pubkey(&identity.output_x),
         st.spending_source.as_ref(),
         &args.wallets_map,
         &payloads,
-        recipient_spk,
-        recipient_amount,
+        &recipients_out,
         &args.change_default,
         args.change_override.clone(),
         args.change_index,
@@ -5965,10 +6101,10 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                         },
                     })
                     .collect();
-                let nominal = app_core::mixed::estimate_funded_fee_no_change(
+                let nominal = app_core::mixed::estimate_funded_fee_no_change_multi(
                     &weights,
                     &payloads,
-                    recipient_spk_len,
+                    &recipient_spk_lens,
                     built.dust_to_self > 0,
                     rate,
                 );
@@ -5996,7 +6132,7 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                 w,
                 String::new(), // funded shape: no chunk/vsize estimate on this path
                 format!("~{} sats{usd}", commas(fee_shown)),
-                if recipient.is_some() { format!("+{} sats", commas(built.sent_to_recipient)) } else { String::new() },
+                gift_row(n_recipients, gift, built.sent_to_recipient),
                 // Anchored (a notebook coin spends) → no dust output → row hidden.
                 if built.dust_to_self > 0 { format!("+{} sats", commas(built.dust_to_self)) } else { String::new() },
                 fold.map(|(_, folded)| (folded, built.fee)),
@@ -9791,15 +9927,22 @@ pub fn run() {
             } else {
                 0
             };
+            // Multi-recipient: the compose screen's extra To-chips — same
+            // treatment as `on_compose_send`'s watch branch.
+            let extra_recipients: Vec<&str> = s.to_addresses_extra.iter().map(String::as_str).collect();
+            let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
+                Ok(rc) => rc,
+                Err(e) => {
+                    w.set_status(format!("{e}").into());
+                    return;
+                }
+            };
+            let recipients_out: Vec<(Vec<u8>, u64)> = recipients.iter().map(|rc| (rc.spk.clone(), gift)).collect();
+            let recipient_addrs: Vec<String> =
+                if recipients.len() >= 2 { recipients.iter().map(|rc| rc.address.clone()).collect() } else { Vec::new() };
             let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
-            match app_core::psbt_build::build_watch_funded_note_psbt(
-                &output_x,
-                &plan,
-                &text,
-                recipient.as_ref().map(|rc| rc.spk.clone()),
-                gift,
-                r,
-                chunk,
+            match app_core::psbt_build::build_watch_funded_note_psbt_multi(
+                &output_x, &plan, &text, &recipients_out, r, chunk,
             ) {
                 Ok(built) => {
                     let payload_outputs = built
@@ -9814,6 +9957,7 @@ pub fn run() {
                         note_id: r,
                         text: text.clone(),
                         recipient: to.clone(),
+                        recipients: recipient_addrs,
                         gift,
                         chunks: payload_outputs,
                         fee: built.fee,
@@ -9825,17 +9969,19 @@ pub fn run() {
                         dust_to_self: false,
                     });
                     let n = coins.len();
+                    let nr = recipients.len();
                     let cost = format!(
                         "public note · fee {} sats · {n} funding input{} · sign with your external wallet{}",
                         built.fee,
                         if n == 1 { "" } else { "s" },
-                        if gift > 0 { format!(" · {gift} sats to recipient") } else { String::new() }
+                        gift_cost_suffix(nr, gift),
                     );
                     println!(
-                        "cb: watch-note-build id={} txid={} fee={} chunks={payload_outputs} funded=1",
+                        "cb: watch-note-build id={} txid={} fee={} chunks={payload_outputs} funded=1{}",
                         hex::encode(r),
                         built.txid,
-                        built.fee
+                        built.fee,
+                        if nr >= 2 { format!(" recipients={nr}") } else { String::new() }
                     );
                     show_psbt_sign_screen(&w, &mut s, built, cost);
                 }
@@ -10027,6 +10173,7 @@ pub fn run() {
                 text,
                 private,
                 to,
+                recipients,
                 gift,
                 built_fee,
                 built_change,
@@ -10056,6 +10203,7 @@ pub fn run() {
                             text,
                             private,
                             to,
+                            recipients,
                             gift,
                             raw,
                             txid,
@@ -10077,6 +10225,7 @@ pub fn run() {
                 text,
                 private,
                 to,
+                recipients,
                 gift,
                 built_fee,
                 built_change,
@@ -10084,7 +10233,7 @@ pub fn run() {
                 notebook_spent,
                 spent_spending,
                 payloads_len,
-                recipient_present,
+                recipient_count,
                 change_index,
                 spending_source,
             } => {
@@ -10109,6 +10258,7 @@ pub fn run() {
                             text,
                             private,
                             to,
+                            recipients,
                             gift,
                             raw,
                             txid,
@@ -10119,7 +10269,7 @@ pub fn run() {
                             notebook_spent,
                             spent_spending,
                             payloads_len,
-                            recipient_present,
+                            recipient_count,
                             change_index,
                             spending_source,
                             result,
@@ -10376,6 +10526,23 @@ pub fn run() {
             } else {
                 0
             };
+            // Multi-recipient: the compose screen's extra To-chips, exactly
+            // like the notebook path — a watch identity can't compose
+            // PRIVATE notes at all (checked above), so no content-key/ECDH
+            // concerns here; `public_multi_payloads`/`build_watch_note_psbt_
+            // multi` hand-frame the same FLAG_MULTI body a keyed identity's
+            // sealer would produce.
+            let extra_recipients: Vec<&str> = s.to_addresses_extra.iter().map(String::as_str).collect();
+            let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
+                Ok(r) => r,
+                Err(e) => {
+                    w.set_status(format!("{e}").into());
+                    return;
+                }
+            };
+            let recipients_out: Vec<(Vec<u8>, u64)> = recipients.iter().map(|r| (r.spk.clone(), gift)).collect();
+            let recipient_addrs: Vec<String> =
+                if recipients.len() >= 2 { recipients.iter().map(|r| r.address.clone()).collect() } else { Vec::new() };
             let Some(store) = s.store.as_ref() else { return };
             let sel: std::collections::HashSet<(String, u32)> =
                 s.selected_coins.iter().cloned().collect();
@@ -10402,16 +10569,7 @@ pub fn run() {
                 }
             }
             let chunk = store.chunk_size;
-            match build_watch_note_psbt(
-                &src,
-                &coins,
-                &text,
-                recipient.as_ref().map(|r| r.spk.clone()),
-                gift,
-                note_id,
-                chunk,
-                rate,
-            ) {
+            match build_watch_note_psbt_multi(&src, &coins, &text, &recipients_out, note_id, chunk, rate) {
                 Ok(built) => {
                     let payload_outputs = built
                         .psbt
@@ -10425,6 +10583,7 @@ pub fn run() {
                         note_id,
                         text: text.clone(),
                         recipient: to.clone(),
+                        recipients: recipient_addrs,
                         gift,
                         chunks: payload_outputs,
                         fee: built.fee,
@@ -10438,16 +10597,18 @@ pub fn run() {
                         private: false,
                         dust_to_self: false,
                     });
+                    let n = recipients.len();
                     let cost = format!(
                         "public note · fee {} sats{} · sign with your external wallet",
                         built.fee,
-                        if gift > 0 { format!(" · {gift} sats to recipient") } else { String::new() }
+                        gift_cost_suffix(n, gift)
                     );
                     println!(
-                        "cb: watch-note-build id={} txid={} fee={} chunks={payload_outputs}",
+                        "cb: watch-note-build id={} txid={} fee={} chunks={payload_outputs}{}",
                         hex::encode(note_id),
                         built.txid,
-                        built.fee
+                        built.fee,
+                        if n >= 2 { format!(" recipients={n}") } else { String::new() }
                     );
                     show_psbt_sign_screen(&w, &mut s, built, cost);
                 }
@@ -10589,6 +10750,19 @@ pub fn run() {
             },
             None => None,
         };
+        // Multi-recipient: the compose screen's extra To-chips — dropped
+        // silently on this path before (Sal's report); now built the SAME
+        // way the notebook path builds them (`compose::compose_note`).
+        let extra_recipients: Vec<&str> = s.to_addresses_extra.iter().map(String::as_str).collect();
+        let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
+            Ok(r) => r,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let recipient_addrs: Vec<String> =
+            if recipients.len() >= 2 { recipients.iter().map(|r| r.address.clone()).collect() } else { Vec::new() };
         let change_raw = normalize_addr(w.get_change_address().as_str());
         let change_override = if change_raw.is_empty() {
             None
@@ -10675,7 +10849,12 @@ pub fn run() {
             max_op_return_bytes: chunk,
             network: net,
         };
-        let built = match app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift) {
+        let built = if recipients.len() >= 2 {
+            app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift)
+        } else {
+            app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift)
+        };
+        let built = match built {
             Ok(b) => b,
             Err(e) => {
                 w.set_status(format!("{e}").into());
@@ -10756,6 +10935,13 @@ pub fn run() {
                 st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
             })
         });
+        let contact_name = |a: &str| -> Option<String> {
+            s.store.as_ref().and_then(|st| {
+                st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
+            })
+        };
+        let confirm_recipients: Vec<(String, Option<String>)> =
+            recipient_addrs.iter().map(|a| (a.clone(), contact_name(a))).collect();
         let ctx = app_core::confirm::ConfirmCtx {
             network: app_core::derive::btc_network(net),
             prevouts,
@@ -10764,7 +10950,7 @@ pub fn run() {
             expected_change,
             recipient: to.clone(),
             recipient_name,
-            recipients: Vec::new(),
+            recipients: confirm_recipients,
             note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
         };
         let pending = PendingBroadcast {
@@ -10779,6 +10965,7 @@ pub fn run() {
                 text: text.clone(),
                 private,
                 to: to.clone(),
+                recipients: recipient_addrs,
                 gift,
                 built_fee,
                 built_change,
@@ -10836,6 +11023,19 @@ pub fn run() {
         } else {
             0
         };
+        // Multi-recipient: the compose screen's extra To-chips — dropped
+        // silently on this path before (Sal's report); now built the SAME
+        // way the notebook path builds them.
+        let extra_recipients: Vec<&str> = s.to_addresses_extra.iter().map(String::as_str).collect();
+        let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
+            Ok(r) => r,
+            Err(e) => {
+                w.set_status(format!("{e}").into());
+                return;
+            }
+        };
+        let recipient_addrs: Vec<String> =
+            if recipients.len() >= 2 { recipients.iter().map(|r| r.address.clone()).collect() } else { Vec::new() };
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
             w.set_status("no identity".into());
             return;
@@ -10878,27 +11078,48 @@ pub fn run() {
             }
         }
 
-        let sealed = app_core::notes_core::bundle::sealed_note_payloads(
-            &identity, &text, private, recipient.as_ref(), note_id, chunk,
-        )
-        .map_err(app_core::Error::from);
-        let (payloads, recipient_spk) = match sealed {
+        // Fresh one-shot content key for a private multi-recipient body
+        // (notes-core's hybrid seal) — OS TRNG, never persisted/logged,
+        // zeroized immediately after use, same convention `compose_note`
+        // (the notebook path) follows. Unused (and not drawn) for 0/1
+        // recipients — `sealed_note_payloads_multi` ignores it there too.
+        let payloads_and_spks = if recipients.len() >= 2 {
+            let content_key = match app_core::compose::fresh_content_key() {
+                Ok(k) => k,
+                Err(e) => {
+                    w.set_status(format!("{e}").into());
+                    return;
+                }
+            };
+            let mut content_key = content_key;
+            let result = app_core::notes_core::bundle::sealed_note_payloads_multi(
+                &identity, &text, private, &recipients, note_id, content_key, chunk,
+            );
+            content_key.zeroize();
+            result.map_err(app_core::Error::from)
+        } else {
+            app_core::notes_core::bundle::sealed_note_payloads(
+                &identity, &text, private, recipient.as_ref(), note_id, chunk,
+            )
+            .map(|(p, spk)| (p, spk.into_iter().collect::<Vec<Vec<u8>>>()))
+            .map_err(app_core::Error::from)
+        };
+        let (payloads, recipient_spks) = match payloads_and_spks {
             Ok(p) => p,
             Err(e) => {
                 w.set_status(format!("{e}").into());
                 return;
             }
         };
-        let recipient_amount = if recipient.is_some() { gift } else { 0 };
+        let recipients_out: Vec<(Vec<u8>, u64)> = recipient_spks.into_iter().map(|spk| (spk, gift)).collect();
 
-        let mut built = match app_core::mixed::assemble_mixed_note_psbt(
+        let mut built = match app_core::mixed::assemble_mixed_note_psbt_multi(
             &coins,
             notebook_spk,
             s.spending_source.as_ref(),
             &wallets_map,
             &payloads,
-            recipient_spk,
-            recipient_amount,
+            &recipients_out,
             &change_default,
             change_override,
             change_index,
@@ -10957,6 +11178,7 @@ pub fn run() {
                 note_id,
                 text: text.clone(),
                 recipient: to.clone(),
+                recipients: recipient_addrs.clone(),
                 gift,
                 chunks: payloads.len(),
                 fee: built.fee,
@@ -10968,18 +11190,24 @@ pub fn run() {
                 dust_to_self: !has_notebook_input,
             });
             let n = coins.len();
+            let nr = recipients.len();
             let sources: std::collections::HashSet<&str> =
                 s.mixed_selected.iter().map(|(src, _, _)| src.as_str()).collect();
             println!(
-                "cb: compose-mixed build txid={} fee={} inputs={n} sources={} external=1",
+                "cb: compose-mixed build txid={} fee={} inputs={n} sources={} external=1{}",
                 built.txid,
                 built.fee,
-                sources.len()
+                sources.len(),
+                if nr >= 2 { format!(" recipients={nr}") } else { String::new() }
             );
+            // `today's copy` here never mentioned the gift at all (even for
+            // a single recipient) — preserved for nr <= 1; nr >= 2 appends
+            // the ×N total (Sal, 2026-07-19).
             let cost = format!(
-                "mixed source · fee {} sats · {n} input{} · sign with your external wallet",
+                "mixed source · fee {} sats · {n} input{}{} · sign with your external wallet",
                 built.fee,
-                if n == 1 { "" } else { "s" }
+                if n == 1 { "" } else { "s" },
+                if nr >= 2 { gift_cost_suffix(nr, gift) } else { String::new() }
             );
             show_psbt_sign_screen(&w, &mut s, built, cost);
             return;
@@ -11007,7 +11235,10 @@ pub fn run() {
         let built_fee = built.fee;
         let built_change = built.change;
         let payloads_len = payloads.len();
-        let recipient_present = recipient.is_some();
+        // `recipients` (the full parsed list, not the "empty means single"
+        // `recipient_addrs`) already carries the exact recipient OUTPUT
+        // count for every case (0 self-note / 1 ordinary / N multi).
+        let recipient_count = recipients.len();
 
         let identity_addr = s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
         let name = s.notebook_display_name(s.nb_index);
@@ -11070,6 +11301,13 @@ pub fn run() {
                 st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
             })
         });
+        let contact_name = |a: &str| -> Option<String> {
+            s.store.as_ref().and_then(|st| {
+                st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
+            })
+        };
+        let confirm_recipients: Vec<(String, Option<String>)> =
+            recipient_addrs.iter().map(|a| (a.clone(), contact_name(a))).collect();
         let ctx = app_core::confirm::ConfirmCtx {
             network: app_core::derive::btc_network(net),
             prevouts,
@@ -11078,7 +11316,7 @@ pub fn run() {
             expected_change,
             recipient: to.clone(),
             recipient_name,
-            recipients: Vec::new(),
+            recipients: confirm_recipients,
             note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
         };
         let pending = PendingBroadcast {
@@ -11093,6 +11331,7 @@ pub fn run() {
                 text: text.clone(),
                 private,
                 to: to.clone(),
+                recipients: recipient_addrs,
                 gift,
                 built_fee,
                 built_change,
@@ -11100,7 +11339,7 @@ pub fn run() {
                 notebook_spent,
                 spent_spending,
                 payloads_len,
-                recipient_present,
+                recipient_count,
                 change_index,
                 spending_source,
             },
@@ -11912,7 +12151,7 @@ fn preview_mock(w: &AppWindow) {
             .into(),
     );
     w.set_funding_valid(true);
-    w.set_to_label("To  bcrt1pxs94vakt8gnq…rqmeyu58".into());
+    w.set_to_label("bcrt1pxs94vakt8gnq…rqmeyu58".into());
     w.set_compose_text("Happy birthday! Paid from cold storage.".into());
     w.set_rate_text("2".into());
     // Worst case on purpose: EVERY row of the structured cost card
