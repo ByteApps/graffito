@@ -25,6 +25,11 @@ targets:
         # rendered from the full-bleed variant of assets/icon/icon.svg
         # (iOS applies its own corner mask).
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # iCloud-contacts feature (2026-07-20): NSUbiquitousKeyValueStore
+        # needs the ubiquity-kvstore-identifier capability — same identifier
+        # as the macOS target (chain-notes-mac.entitlements) so the two
+        # platforms share one KV store.
+        CODE_SIGN_ENTITLEMENTS: chain-notes-ios.entitlements
     info:
       path: Info.plist
       properties:

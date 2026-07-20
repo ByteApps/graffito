@@ -6,6 +6,7 @@
 //! APP_NETWORK.
 
 mod camera;
+mod icloud;
 mod keychain;
 mod platform;
 mod qr;
@@ -319,7 +320,28 @@ struct State {
     /// consumes it, `on_confirm_cancel` drops it (leaving zero trace: stage
     /// A never mutates the store, so cancel is just a navigation).
     pending_broadcast: Option<PendingBroadcast>,
+    /// DEVICE-LEVEL contacts (iCloud-contacts feature, 2026-07-20): ONE
+    /// address book shared across every notebook/identity/network on this
+    /// device — superseding the old per-notebook `Store.contacts` as the
+    /// source of truth (that field stays on `Store` only for serde back-
+    /// compat with existing store files; nothing reads it anymore).
+    /// Persisted to `data_dir/contacts.json` (`save_contacts`) and mirrored
+    /// to iCloud's `NSUbiquitousKeyValueStore` (`icloud.rs`) so it survives
+    /// uninstall/reinstall and stays live across the user's iOS + Mac. Same
+    /// recents rule as the old per-notebook list (front = latest use,
+    /// dedupe by address) but a bigger cap (100) since this is now one
+    /// list for the whole device. See `State::touch_contact`/
+    /// `name_contact`/`remove_contact`/`save_contacts` and
+    /// `load_or_migrate_contacts` (the one-time union-from-every-store
+    /// migration for existing installs).
+    contacts: Vec<app_core::store::Contact>,
 }
+
+/// Cap for the device-level contacts list — mirrors
+/// `app_core::contacts::MERGE_CAP` (the iCloud merge cap); kept as its own
+/// constant here since local mutations (touch/name) don't go through the
+/// merge function.
+const CONTACTS_CAP: usize = 100;
 
 /// A build+sign result awaiting the user's explicit "Broadcast" tap on the
 /// universal confirm screen (26). `raw_hex`/`txid` are the byte-truth of
@@ -585,6 +607,82 @@ impl State {
         }
     }
 
+    /// Device-level contacts file (NOT per-identity — see `State.contacts`).
+    fn contacts_path(&self) -> PathBuf {
+        self.data_dir.join("contacts.json")
+    }
+
+    /// Persist `contacts.json` and mirror the list into iCloud's KV store
+    /// (a no-op off Apple platforms, or when the OS entitlement/iCloud
+    /// account isn't available — see `icloud::save_blob`). Only WRITES the
+    /// KV blob when this device's serialized list actually differs from
+    /// what's already there, to avoid needless sync churn between two
+    /// devices that just merged the same result.
+    fn save_contacts(&self) {
+        if let Ok(json) = serde_json::to_string_pretty(&self.contacts) {
+            let _ = std::fs::write(self.contacts_path(), json);
+        }
+        let blob = app_core::contacts::serialize_contacts_blob(&self.contacts);
+        if icloud::load_blob().as_deref() != Some(blob.as_str()) {
+            icloud::save_blob(&blob);
+            println!("cb: icloud-contacts synced n={}", self.contacts.len());
+        }
+    }
+
+    /// Device-level contacts, Prime rules: front = latest use, dedupe by
+    /// (address, network), cap [`CONTACTS_CAP`]; naming does not bump
+    /// recency. Same shape as the old per-notebook `Store::touch_contact`,
+    /// just scoped to the whole device (and every network on it) now.
+    ///
+    /// Identity is (address, network), NOT address alone — testnet4 and
+    /// signet share the `tb1…` HRP, so the same address string can be two
+    /// genuinely different contacts. This always stamps the address with
+    /// the ACTIVE network (`self.network`) at touch time. The existing-
+    /// entry match is a bit looser than a strict tuple match, though: it
+    /// also matches a LEGACY untagged entry (`network == ""`, from before
+    /// this field shipped) for the same address, so touching an old
+    /// contact again upgrades it in place (tags it, keeps its name) rather
+    /// than leaving a stale blank-tagged duplicate beside a new one.
+    fn touch_contact(&mut self, address: &str) {
+        let net = self.network.as_str().to_string();
+        let name = self
+            .contacts
+            .iter()
+            .position(|c| c.address == address && (c.network == net || c.network.is_empty()))
+            .map(|i| self.contacts.remove(i).name)
+            .unwrap_or_default();
+        self.contacts.insert(
+            0,
+            app_core::store::Contact { address: address.to_string(), name, network: net },
+        );
+        self.contacts.truncate(CONTACTS_CAP);
+    }
+
+    /// Same (address, network-or-legacy-blank) match as `touch_contact` —
+    /// the rename dialog always opens from a network-filtered picker row,
+    /// so "the entry this address means on the active network" is
+    /// unambiguous even if the same address string also exists as a
+    /// distinct contact on another network.
+    fn name_contact(&mut self, address: &str, name: &str) {
+        let net = self.network.as_str().to_string();
+        if let Some(c) = self
+            .contacts
+            .iter_mut()
+            .find(|c| c.address == address && (c.network == net || c.network.is_empty()))
+        {
+            c.name = name.to_string();
+        }
+    }
+
+    /// Same (address, network-or-legacy-blank) match as `touch_contact` —
+    /// removes only the ACTIVE network's entry for this address, never a
+    /// same-string contact that belongs to a different network.
+    fn remove_contact(&mut self, address: &str) {
+        let net = self.network.as_str().to_string();
+        self.contacts
+            .retain(|c| !(c.address == address && (c.network == net || c.network.is_empty())));
+    }
+
     fn save_config(&self) {
         let _ = std::fs::write(
             self.data_dir.join("config.json"),
@@ -814,14 +912,15 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
     // net, not the only place it happens.
     if wn.recipients.is_empty() {
         if let Some(addr) = &wn.recipient {
-            store.touch_contact(addr);
+            st.touch_contact(addr);
         }
     } else {
         for addr in &wn.recipients {
-            store.touch_contact(addr);
+            st.touch_contact(addr);
         }
     }
     st.save_store();
+    st.save_contacts();
 }
 
 /// Post-broadcast bookkeeping for a watch-mode external-sign spend: sweep/
@@ -1870,18 +1969,51 @@ fn show_account_picker(w: &AppWindow, material: &str, network: Network, page: u3
     w.set_screen(9);
 }
 
-/// Push the store's saved recipients into the "Send to" recents list. Kept
-/// separate from `update_home` so it can be called the moment a contact is
-/// added (pick-contact) — otherwise a freshly-used address only appears after
-/// the next full home refresh, not when you press Back from compose.
+/// Push the device-level contacts list into the "Send to" recents list.
+/// Kept separate from `update_home` so it can be called the moment a
+/// contact is added (pick-contact) — otherwise a freshly-used address only
+/// appears after the next full home refresh, not when you press Back from
+/// compose.
+///
+/// Storage/sync is fully GLOBAL (`State.contacts` spans every notebook/
+/// identity/network on this device — iCloud-contacts feature, 2026-07-20),
+/// but the PICKER only SHOWS contacts TAGGED for the ACTIVE network (or
+/// left untagged by legacy data) — so a testnet4 contact doesn't clutter a
+/// mainnet compose, and critically a testnet4 contact never bleeds into a
+/// signet compose either, since the two networks share the same `tb1…`
+/// address prefix and an address-parse filter can't tell them apart (only
+/// the explicit `Contact::network` tag can) — while the underlying synced
+/// list still carries every network's contacts together.
 fn refresh_contacts(w: &AppWindow, st: &State) {
-    let Some(store) = &st.store else { return };
-    let contacts: Vec<ContactItem> = store
+    let net = st.network.as_str();
+    let contacts: Vec<ContactItem> = st
         .contacts
         .iter()
+        .filter(|c| c.network == net || c.network.is_empty())
         .map(|c| ContactItem { address: c.address.clone().into(), name: c.name.clone().into() })
         .collect();
     w.set_contacts(VecModel::from_slice(&contacts));
+}
+
+/// Apply an iCloud KV change that synced in from the user's OTHER device
+/// (`icloud::start_observer`'s callback, via the `apply-pending-icloud-
+/// contacts` trampoline — this runs on the UI thread with full `State`
+/// access, same shape as every other `apply_*` trampoline target). Reads
+/// whatever's in the KV store RIGHT NOW (not what triggered the
+/// notification — there's no payload, just "something changed"), merges
+/// it into the live list, persists + re-syncs only if that actually
+/// changed anything, and refreshes the picker so a change made on the
+/// other device shows up here without a restart.
+fn apply_icloud_contacts_merge(w: &AppWindow, st: &mut State) {
+    let incoming =
+        app_core::contacts::parse_contacts_blob(icloud::load_blob().as_deref().unwrap_or(""));
+    let merged = app_core::contacts::merge_contacts(&st.contacts, &incoming);
+    if merged != st.contacts {
+        st.contacts = merged;
+        println!("cb: icloud-contacts merged n={}", st.contacts.len());
+        st.save_contacts();
+        refresh_contacts(w, st);
+    }
 }
 
 /// The ONE sanctioned recipient-setting path for normal (non-sweep) compose:
@@ -1913,10 +2045,8 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
             }
         }
         println!("cb: pick-contact to={a}");
-        if let Some(store) = &mut st.store {
-            store.touch_contact(&a);
-        }
-        st.save_store();
+        st.touch_contact(&a);
+        st.save_contacts();
         // Rebuild the recents now so the address is in the list when the
         // user presses Back from compose.
         refresh_contacts(w, st);
@@ -1925,9 +2055,9 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
         // read as inconsistent; Sal 2026-07-19). The address stays
         // verifiable on the byte-truth confirm screen.
         let display = st
-            .store
-            .as_ref()
-            .and_then(|s| s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()))
+            .contacts
+            .iter()
+            .find(|c| c.address == a && !c.name.is_empty())
             .map(|c| c.name.clone())
             .unwrap_or_else(|| a.clone());
         w.set_to_label(display.into());
@@ -1989,9 +2119,9 @@ fn refresh_to_chips(w: &AppWindow, st: &State) {
         .iter()
         .map(|a| {
             let name = st
-                .store
-                .as_ref()
-                .and_then(|s| s.contacts.iter().find(|c| &c.address == a && !c.name.is_empty()))
+                .contacts
+                .iter()
+                .find(|c| &c.address == a && !c.name.is_empty())
                 .map(|c| c.name.clone())
                 .unwrap_or_default();
             ContactItem { address: a.clone().into(), name: name.into() }
@@ -2056,10 +2186,8 @@ fn add_recipient_chip(w: &AppWindow, st: &mut State, addr: &str) {
         w.set_screen(6);
         return;
     }
-    if let Some(store) = &mut st.store {
-        store.touch_contact(&a);
-    }
-    st.save_store();
+    st.touch_contact(&a);
+    st.save_contacts();
     refresh_contacts(w, st);
     st.to_addresses_extra.push(a.clone());
     println!("cb: add-chip n={}", st.to_addresses_extra.len() + 1);
@@ -2232,15 +2360,13 @@ fn set_sweep_dest(w: &AppWindow, st: &mut State, a: String) {
         }
         None => {
             println!("cb: sweep-pick to={a}");
-            if let Some(store) = &mut st.store {
-                store.touch_contact(&a);
-            }
-            st.save_store();
+            st.touch_contact(&a);
+            st.save_contacts();
             refresh_contacts(w, st);
             let name = st
-                .store
-                .as_ref()
-                .and_then(|s| s.contacts.iter().find(|c| c.address == a))
+                .contacts
+                .iter()
+                .find(|c| c.address == a)
                 .map(|c| c.name.clone())
                 .filter(|n| !n.is_empty());
             w.set_sweep_to_label(
@@ -2317,14 +2443,14 @@ fn notebook_store(st: &State, index: u32) -> Option<Store> {
 /// "Self · account N" when it belongs to another of our accounts (rev-3
 /// follow-up 3 — accounts are separate wallets, but the sender is still
 /// us), the contact name when known, else the short address form.
-fn sender_label(st: &State, store: &Store, key: &str) -> String {
+fn sender_label(st: &State, key: &str) -> String {
     if let Some((index, ..)) = st.nb_addrs.iter().find(|(_, a, _)| a == key) {
         return format!("Self · {}", st.notebook_display_name(*index));
     }
     if let Some((acct, _)) = st.xacct_addrs.iter().find(|(_, a)| a == key) {
         return format!("Self · account {acct}");
     }
-    if let Some(c) = store.contacts.iter().find(|c| c.address == key && !c.name.is_empty()) {
+    if let Some(c) = st.contacts.iter().find(|c| c.address == key && !c.name.is_empty()) {
         return c.name.clone();
     }
     addr_short(key)
@@ -2428,7 +2554,7 @@ fn update_home(w: &AppWindow, st: &State) {
         .senders()
         .into_iter()
         .map(|(key, count)| SenderItem {
-            label: sender_label(st, store, &key).into(),
+            label: sender_label(st, &key).into(),
             sub: format!("{count} note{}", if count == 1 { "" } else { "s" }).into(),
             excluded: store.is_excluded(&key),
             key: key.into(),
@@ -3757,20 +3883,22 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
                     },
                     None,
                 );
-                // Touch every recipient — see `record_composed_note`'s same
-                // rule on the notebook path. Redundant with the chip-add
-                // flow's pick-time touch (idempotent), not the only place.
-                if r.recipients.is_empty() {
-                    if let Some(addr) = &r.to {
-                        store.touch_contact(addr);
-                    }
-                } else {
-                    for addr in &r.recipients {
-                        store.touch_contact(addr);
-                    }
+            }
+            // Touch every recipient — see `record_composed_note`'s same
+            // rule on the notebook path. Redundant with the chip-add
+            // flow's pick-time touch (idempotent), not the only place.
+            // Device-level now (iCloud-contacts feature) — not on `store`.
+            if r.recipients.is_empty() {
+                if let Some(addr) = &r.to {
+                    st.touch_contact(addr);
+                }
+            } else {
+                for addr in &r.recipients {
+                    st.touch_contact(addr);
                 }
             }
             st.save_store();
+            st.save_contacts();
             println!(
                 "cb: compose id={} txid={} fee={} vsize={} to={} private={} funded=spending{} broadcast=ok",
                 hex::encode(r.note_id), r.txid, r.built_fee, r.vsize,
@@ -3880,19 +4008,21 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                     },
                     change_utxo,
                 );
-                // Touch every recipient — see `record_composed_note`'s same
-                // rule on the notebook path.
-                if r.recipients.is_empty() {
-                    if let Some(addr) = &r.to {
-                        store.touch_contact(addr);
-                    }
-                } else {
-                    for addr in &r.recipients {
-                        store.touch_contact(addr);
-                    }
+            }
+            // Touch every recipient — see `record_composed_note`'s same
+            // rule on the notebook path. Device-level now (iCloud-contacts
+            // feature) — not on `store`.
+            if r.recipients.is_empty() {
+                if let Some(addr) = &r.to {
+                    st.touch_contact(addr);
+                }
+            } else {
+                for addr in &r.recipients {
+                    st.touch_contact(addr);
                 }
             }
             st.save_store();
+            st.save_contacts();
             if !r.spent_spending.is_empty() {
                 st.spending_coins.retain(|c| {
                     !r.spent_spending.iter().any(|(t, v)| t == &c.txid && *v == c.vout)
@@ -6672,6 +6802,54 @@ fn load_funding_wallets(dir: &std::path::Path) -> Vec<FundingWallet> {
         .unwrap_or_default()
 }
 
+/// Boot-time source for the device-level contacts list (iCloud-contacts
+/// feature, 2026-07-20): if `contacts.json` already exists, it's
+/// authoritative — just load it (tolerant of a missing/garbage file, which
+/// comes back empty rather than erroring). Otherwise this is an existing
+/// install's FIRST boot on the new global-contacts scheme: union every
+/// per-notebook `store-*.json`'s `contacts` (by address, preferring
+/// whichever copy has a non-empty name) so nobody's existing contacts
+/// vanish. `contacts.json` itself is written by the caller via
+/// `State::save_contacts` once the (possibly-migrated) list is in place —
+/// this function only READS.
+fn load_or_migrate_contacts(data_dir: &std::path::Path) -> Vec<app_core::store::Contact> {
+    let path = data_dir.join("contacts.json");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        return serde_json::from_str(&text).unwrap_or_default();
+    }
+    let mut merged: Vec<app_core::store::Contact> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(data_dir) else { return merged };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("store-") && name.ends_with(".json")) {
+            continue;
+        }
+        let Ok(store) = Store::load(&entry.path()) else { continue };
+        // Every pre-existing store's `contacts` predates the network tag,
+        // so `c.network` deserializes as "" via serde-default no matter
+        // which network the store is actually for — stamp the STORE's own
+        // `network` field here instead of trusting the (always-blank)
+        // per-contact tag, so migrated contacts land correctly tagged
+        // rather than as untagged wildcards. Dedup key is (address,
+        // network): a testnet4 store and a signet store both listing the
+        // same `tb1…` string must stay two distinct migrated contacts.
+        let net = store.network.clone();
+        for mut c in store.contacts {
+            c.network = net.clone();
+            match merged.iter_mut().find(|m| m.address == c.address && m.network == c.network) {
+                Some(existing) => {
+                    if existing.name.is_empty() && !c.name.is_empty() {
+                        existing.name = c.name;
+                    }
+                }
+                None => merged.push(c),
+            }
+        }
+    }
+    merged
+}
+
 /// Import a signed PSBT (from file bytes, a base64/hex string, or a UR string),
 /// validate it against the tx we built, render the Sparrow-style confirmation,
 /// and advance to the review screen.
@@ -7666,7 +7844,7 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
 
     let (self_spks, spending_spks) = confirm_self_spks(st);
     let recipient_name = recipient_addr.as_deref().and_then(|a| {
-        st.store.as_ref().and_then(|s| s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone()))
+        st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
     });
     let confirm_ctx = app_core::confirm::ConfirmCtx {
         network: btc_net,
@@ -7803,6 +7981,11 @@ pub fn run() {
     let node_urls = str_map("nodes");
     let explorers = str_map("explorers");
     let funding_wallets = load_funding_wallets(&data_dir);
+    // Device-level contacts (iCloud-contacts feature): load or, on an
+    // existing install's first boot under this scheme, migrate from every
+    // per-notebook store — see `load_or_migrate_contacts`.
+    let contacts_json_existed = data_dir.join("contacts.json").exists();
+    let initial_contacts = load_or_migrate_contacts(&data_dir);
 
     let st = Rc::new(RefCell::new(State {
         data_dir,
@@ -7868,7 +8051,28 @@ pub fn run() {
         wallet_tx_busy: false,
         wallet_stores_busy: false,
         pending_broadcast: None,
+        contacts: initial_contacts,
     }));
+    // Contacts boot sequence (iCloud-contacts feature): persist a fresh
+    // migration (so `contacts.json` exists from here on and the union is
+    // never redone), then merge in whatever the OTHER device last synced to
+    // iCloud — sync-on-boot, independent of the live observer below (which
+    // covers a change that arrives WHILE this device is already running).
+    {
+        let mut s = st.borrow_mut();
+        if !contacts_json_existed {
+            s.save_contacts();
+        }
+        let incoming = app_core::contacts::parse_contacts_blob(
+            icloud::load_blob().as_deref().unwrap_or(""),
+        );
+        let merged = app_core::contacts::merge_contacts(&s.contacts, &incoming);
+        if merged != s.contacts {
+            s.contacts = merged;
+            println!("cb: icloud-contacts merged n={}", s.contacts.len());
+            s.save_contacts();
+        }
+    }
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
     window.set_apple_platform(cfg!(target_vendor = "apple"));
@@ -8500,6 +8704,14 @@ pub fn run() {
         apply_wallet_stores_refresh_results(&w, &mut s);
     });
 
+    // Trampoline: an iCloud KV notification (a contacts change synced in
+    // from the user's OTHER device) landed — re-merge the freshly-synced
+    // blob into the live device-level contacts list and refresh the
+    // picker so the change appears without restarting the app.
+    cb!(on_apply_pending_icloud_contacts, |w, s| {
+        apply_icloud_contacts_merge(&w, &mut s);
+    });
+
     // Trampoline: worker-thread used/new probes for the create-notebook
     // picker landed — fill in the pills/balances without having blocked the
     // tap. Guarded by account/page/screen so a stale probe (user paged or
@@ -8611,7 +8823,7 @@ pub fn run() {
             let reply_rows: Vec<ContactItem> = full_set
                 .iter()
                 .map(|a| {
-                    let name = store
+                    let name = s
                         .contacts
                         .iter()
                         .find(|c| &c.address == a && !c.name.is_empty())
@@ -9659,10 +9871,8 @@ pub fn run() {
 
     cb!(on_save_rename, |w, s, name: SharedString| {
         let addr = w.get_rename_address().to_string();
-        if let Some(store) = &mut s.store {
-            store.name_contact(&addr, name.trim());
-        }
-        s.save_store();
+        s.name_contact(&addr, name.trim());
+        s.save_contacts();
         println!("cb: save-contact addr={addr} name-len={}", name.trim().len());
         w.set_status("".into());
         w.set_rename_address("".into());
@@ -9689,10 +9899,8 @@ pub fn run() {
     });
 
     cb!(on_remove_contact, |w, s, addr: SharedString| {
-        if let Some(store) = &mut s.store {
-            store.remove_contact(addr.as_str());
-        }
-        s.save_store();
+        s.remove_contact(addr.as_str());
+        s.save_contacts();
         println!("cb: remove-contact addr={addr}");
         w.set_status("".into());
         w.set_confirm_remove_address("".into());
@@ -10399,6 +10607,22 @@ pub fn run() {
                     );
                 }
                 s.save_store();
+                // Device-level contacts (iCloud-contacts feature): touch
+                // every recipient here too — `record_composed_note` still
+                // touches the per-notebook `Store.contacts` internally (kept
+                // for serde back-compat; no longer read anywhere), but the
+                // recents list the picker actually shows now lives on
+                // `State.contacts`.
+                if composed.recipients.is_empty() {
+                    if let Some(addr) = &to {
+                        s.touch_contact(addr);
+                    }
+                } else {
+                    for addr in &composed.recipients {
+                        s.touch_contact(addr);
+                    }
+                }
+                s.save_contacts();
                 s.pending_broadcast = None;
                 s.wallet_tx_busy = true;
                 w.set_wallet_tx_busy(true);
@@ -10915,9 +11139,7 @@ pub fn run() {
                 );
                 let (self_spks, spending_spks) = confirm_self_spks(&s);
                 let contact_name = |a: &str| -> Option<String> {
-                    s.store.as_ref().and_then(|st| {
-                        st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
-                    })
+                    s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
                 };
                 let recipient_name = to.as_deref().and_then(contact_name);
                 // Multi-recipient: `composed.recipients` is only populated
@@ -11179,14 +11401,10 @@ pub fn run() {
             );
         }
         let recipient_name = to.as_deref().and_then(|a| {
-            s.store.as_ref().and_then(|st| {
-                st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
-            })
+            s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
         });
         let contact_name = |a: &str| -> Option<String> {
-            s.store.as_ref().and_then(|st| {
-                st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
-            })
+            s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
         };
         let confirm_recipients: Vec<(String, Option<String>)> =
             recipient_addrs.iter().map(|a| (a.clone(), contact_name(a))).collect();
@@ -11545,14 +11763,10 @@ pub fn run() {
             None
         };
         let recipient_name = to.as_deref().and_then(|a| {
-            s.store.as_ref().and_then(|st| {
-                st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
-            })
+            s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
         });
         let contact_name = |a: &str| -> Option<String> {
-            s.store.as_ref().and_then(|st| {
-                st.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
-            })
+            s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
         };
         let confirm_recipients: Vec<(String, Option<String>)> =
             recipient_addrs.iter().map(|a| (a.clone(), contact_name(a))).collect();
@@ -12374,6 +12588,20 @@ pub fn run() {
                 }
             },
         );
+    }
+
+    // iCloud-contacts feature: live cross-device sync while this device is
+    // already running (boot-time sync happened above, before the window
+    // existed). A no-op registration off Apple platforms, or when the OS
+    // has no entitlement/iCloud account (see icloud.rs) — the callback can
+    // fire on any thread, so it only ever schedules the real work back onto
+    // the UI thread via the same upgrade_in_event_loop trampoline every
+    // other async result uses.
+    {
+        let weak = window.as_weak();
+        icloud::start_observer(move || {
+            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_icloud_contacts());
+        });
     }
 
     window.run().expect("event loop");

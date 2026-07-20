@@ -216,11 +216,28 @@ pub struct LedgerUtxo {
     pub pending_spend: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contact {
     pub address: String,
     #[serde(default)]
     pub name: String,
+    /// Which network this address belongs to (`Network::as_str()` —
+    /// "mainnet"/"testnet4"/"signet"/"regtest"). Needed because testnet4
+    /// and signet addresses share the SAME `tb1…` HRP, so the address
+    /// string alone can't distinguish them — this tag is the disambiguator
+    /// for the device-level global contacts list (iCloud-contacts feature,
+    /// 2026-07-20), which spans every network on the device.
+    /// `#[serde(default)]` = "" for every contact that existed before this
+    /// field shipped; an empty tag is treated as a wildcard (matches any
+    /// network) everywhere it's read, until the contact is next
+    /// touched/renamed, which stamps it with a real network and ends the
+    /// wildcard treatment for that entry. A `Store`'s own `contacts` field
+    /// is single-network by construction (one store = one network), so
+    /// `Store::touch_contact` always stamps `self.network` here — the
+    /// (address, network) identity distinction only matters once contacts
+    /// are merged into the device-level list.
+    #[serde(default)]
+    pub network: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -909,7 +926,14 @@ impl Store {
     }
 
     /// Contacts, Prime rules: front = latest use, dedupe by address,
-    /// cap 20; naming does not bump recency.
+    /// cap 20; naming does not bump recency. LEGACY / no longer the source
+    /// of truth for the app (see `Contact::network`'s doc comment) — kept
+    /// only so old `store-*.json` files still round-trip and can still
+    /// feed the device-level contacts migration. A `Store`'s own
+    /// `contacts` is single-network by construction, so this always
+    /// stamps `self.network` (no cross-network ambiguity within one
+    /// store — the (address, network) identity only matters once merged
+    /// into the device-level list).
     pub fn touch_contact(&mut self, address: &str) {
         let name = self
             .contacts
@@ -917,7 +941,10 @@ impl Store {
             .position(|c| c.address == address)
             .map(|i| self.contacts.remove(i).name)
             .unwrap_or_default();
-        self.contacts.insert(0, Contact { address: address.to_string(), name });
+        self.contacts.insert(
+            0,
+            Contact { address: address.to_string(), name, network: self.network.clone() },
+        );
         self.contacts.truncate(20);
     }
 
