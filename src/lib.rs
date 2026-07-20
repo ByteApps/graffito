@@ -1841,7 +1841,17 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
         // Rebuild the recents now so the address is in the list when the
         // user presses Back from compose.
         refresh_contacts(w, st);
-        w.set_to_label(format!("To: {a}").into());
+        // Show the contact's name when it has one — same resolution the
+        // extra-recipient chips use (a raw address next to a named chip
+        // read as inconsistent; Sal 2026-07-19). The address stays
+        // verifiable on the byte-truth confirm screen.
+        let display = st
+            .store
+            .as_ref()
+            .and_then(|s| s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()))
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| a.clone());
+        w.set_to_label(format!("To: {display}").into());
         st.to_address = Some(a);
         w.set_directed(true);
     }
