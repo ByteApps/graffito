@@ -73,6 +73,17 @@ xcodebuild \
   archive 2>&1 | tee "$LOG"
 grep -q "ARCHIVE SUCCEEDED" "$LOG" || { echo "ARCHIVE FAILED — see $LOG" >&2; exit 1; }
 
+# File the archive (dSYM included) into Xcode's Organizer folder before the
+# next run overwrites $ARCHIVE — same rationale as ios-archive-upload.sh:
+# the local archive is the only symbolication source for old builds.
+BUILD_NUM="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleVersion' "$ARCHIVE/Info.plist" 2>/dev/null || echo unknown)"
+ORG_DIR="$HOME/Library/Developer/Xcode/Archives/$(date +%Y-%m-%d)"
+ORG_ARCHIVE="$ORG_DIR/chain-notes-app macOS build $BUILD_NUM.xcarchive"
+mkdir -p "$ORG_DIR"
+rm -rf "$ORG_ARCHIVE"
+cp -R "$ARCHIVE" "$ORG_ARCHIVE"
+echo "==> archive filed for Organizer at $ORG_ARCHIVE"
+
 if [ "${1:-}" = "--archive-only" ]; then
   echo "✅ Archived at $ARCHIVE (upload skipped: --archive-only)"; exit 0
 fi

@@ -82,16 +82,21 @@ if ! archive; then
   fi
 fi
 
-# Stash this build's dSYM under build/dsyms/ios-<build> BEFORE anything can
-# overwrite the archive — TestFlight crash feedback does NOT retain log
-# payloads server-side and the ASC key can't re-download dSYMs (403), so a
-# local copy is the only way to symbolicate an old build's device .ips
-# later (learned inspecting the build-9 crashes, 2026-07-19).
+# File this build's archive (dSYM included) into Xcode's Organizer folder
+# BEFORE anything can overwrite it — our -archivePath lives under build/
+# and gets wiped by the next run, so Organizer never saw any archive and
+# no local copy survived for symbolicating an old build's device .ips.
+# (TestFlight crash feedback does NOT retain log payloads server-side and
+# the ASC key can't re-download dSYMs (403) — the local archive is the
+# only symbolication source. Learned inspecting the build-9 crashes,
+# 2026-07-19.)
 BUILD_NUM="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleVersion' "$ARCHIVE/Info.plist" 2>/dev/null || echo unknown)"
-DSYM_KEEP="$REPO/build/dsyms/ios-$BUILD_NUM"
-rm -rf "$DSYM_KEEP"; mkdir -p "$DSYM_KEEP"
-cp -R "$ARCHIVE/dSYMs/." "$DSYM_KEEP/"
-echo "==> dSYM stashed at $DSYM_KEEP"
+ORG_DIR="$HOME/Library/Developer/Xcode/Archives/$(date +%Y-%m-%d)"
+ORG_ARCHIVE="$ORG_DIR/chain-notes-app iOS build $BUILD_NUM.xcarchive"
+mkdir -p "$ORG_DIR"
+rm -rf "$ORG_ARCHIVE"
+cp -R "$ARCHIVE" "$ORG_ARCHIVE"
+echo "==> archive filed for Organizer at $ORG_ARCHIVE"
 
 if [ "${1:-}" = "--archive-only" ]; then
   echo "✅ Archived at $ARCHIVE (upload skipped: --archive-only)"; exit 0
