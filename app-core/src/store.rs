@@ -653,7 +653,14 @@ impl Store {
                     n.blocktime = note.blocktime;
                     n.raw_hex = None;
                 }
-                if n.text.is_none() {
+                // A FRESH successful decode wins over a stale cache — a
+                // failed one (None) never clobbers a good cache. Fill-if-
+                // empty alone left poisoned text stuck forever: a scan run
+                // by an older binary (e.g. pre-FLAG_MULTI, which kept the
+                // raw count-prefixed body as "text") cached its bad decode,
+                // and no later, smarter rescan could ever correct it (Sal's
+                // "␂public note…" artifact, 2026-07-19).
+                if note.text.is_some() && n.text != note.text {
                     n.text = note.text.clone();
                 }
                 if n.recipient.is_none() {
@@ -1353,6 +1360,39 @@ mod tests {
         // Reappears — cleared.
         store.resolve_dropped_notes(|_| TxLookupStatus::Found(true), |_, _, _| None);
         assert!(!store.notes[0].dropped);
+    }
+
+    /// A rescan whose decoder improved must CORRECT a poisoned text cache
+    /// (an older binary cached a raw count-prefixed multi body as "text"),
+    /// while a failed decode (None) must never clobber a good cache.
+    #[test]
+    fn fresh_decode_corrects_stale_text_cache() {
+        let mut store = Store::new(&[7u8; 32], Network::Testnet4);
+        let mut poisoned = note("aaaa1111", true, Some("tb1p-sender"));
+        poisoned.text = Some("\u{2}public note to many".into());
+        store.notes.push(poisoned);
+
+        let mut rec = RecoveredNote {
+            note_id: [0xaa, 0xaa, 0x11, 0x11],
+            txids: vec!["t1".into()],
+            height: None,
+            blocktime: None,
+            private: false,
+            directed: true,
+            received: true,
+            sender: Some("tb1p-sender".into()),
+            recipient: None,
+            recipients: vec![],
+            text: Some("public note to many".into()),
+        };
+        // Fresh scan decodes correctly -> cache corrected.
+        store.upsert_note(&rec);
+        assert_eq!(store.notes[0].text.as_deref(), Some("public note to many"));
+
+        // A later failed decode (None) never clobbers the good cache.
+        rec.text = None;
+        store.upsert_note(&rec);
+        assert_eq!(store.notes[0].text.as_deref(), Some("public note to many"));
     }
 
     /// `NoteRecord::reply_set` mirrors notes-core's `bundle::reply_set`:
