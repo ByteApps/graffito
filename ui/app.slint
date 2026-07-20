@@ -1453,7 +1453,7 @@ export component AppWindow inherits Window {
     in-out property <string> note-view-id;
     in property <bool> note-pending;
     in property <string> note-txid;
-    in property <string> note-reply-address;   // sender address, only when this note is RECEIVED with a known sender; "" hides Reply
+    in property <string> note-reply-address;   // the note's single counterparty (received: the sender; own directed: its sole recipient); "" hides Reply
     // Reply-all (multi-recipient): {sender} ∪ recipients minus me, sender
     // first (notes-core's `reply_set`), contact names resolved. Hidden
     // whenever length <= 1 — nothing to add beyond what plain Reply covers.

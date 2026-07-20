@@ -8184,14 +8184,25 @@ pub fn run() {
             w.set_note_view_id(n.note_id.clone().into());
             w.set_note_pending(n.status == NoteStatus::Pending && n.raw_hex.is_some());
             w.set_note_txid(n.txids.last().cloned().unwrap_or_default().into());
-            let reply_addr = if n.received { n.sender.clone().unwrap_or_default() } else { String::new() };
-            w.set_note_reply_address(reply_addr.into());
             // Reply-all set ({sender} ∪ recipients minus me) — meaningful
             // for both a received note (sender + other recipients) and an
-            // OWN multi-recipient note (reply to everyone else on it).
+            // OWN directed note (a shortcut to write the same people again;
+            // Sal 2026-07-19). Self-notes have an empty set → no buttons.
             let my_addr = s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
-            let reply_rows: Vec<ContactItem> = n
-                .reply_set(&my_addr)
+            let full_set = n.reply_set(&my_addr);
+            // Reply = the single counterparty: the sender of a received note,
+            // or the sole recipient of an own single-recipient directed note.
+            // An own multi-recipient note has no single counterparty — it
+            // gets Reply all only.
+            let reply_addr = if n.received {
+                n.sender.clone().unwrap_or_default()
+            } else if full_set.len() == 1 {
+                full_set[0].clone()
+            } else {
+                String::new()
+            };
+            w.set_note_reply_address(reply_addr.into());
+            let reply_rows: Vec<ContactItem> = full_set
                 .iter()
                 .map(|a| {
                     let name = store
