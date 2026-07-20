@@ -7952,7 +7952,7 @@ pub fn run() {
                 w.set_import_text("".into());
                 w.set_screen(4);
                 update_home(&w, &s);
-                refresh(&w, &mut s);
+                refresh_async(&w, &mut s);
             }
             Err(e) => {
                 println!("cb: import err={e}");
@@ -9362,6 +9362,10 @@ pub fn run() {
         refresh_compose(&w, &mut s);
     });
 
+    // TODO(watchdog): refresh_wallet_stores + the sync refresh below still
+    // block the main thread (user-triggered foreground taps — lower risk
+    // than the auto-refresh timer was, but the same 0x8BADF00D class on a
+    // slow node). Needs the wallet-stores async refactor (perf task).
     cb!(on_refresh_coins, |w, s| {
         let scanned = refresh_wallet_stores(&s);
         println!("cb: refresh-coins notebooks={}", scanned + 1);
@@ -11819,7 +11823,16 @@ pub fn run() {
                     if w.get_screen() == 4 {
                         let mut s = st.borrow_mut();
                         if s.ident.is_some() {
-                            refresh(&w, &mut s);
+                            // MUST be the async refresh: slint timers keep
+                            // firing while the app is BACKGROUNDED, and a
+                            // blocking chain call here parks the main thread
+                            // inside a timer callback — iOS's scene-update
+                            // watchdog then kills the app (0x8BADF00D, the
+                            // builds 3–9 "crashed in the background /
+                            // after resuming" reports; root-caused from
+                            // device .ips logs 2026-07-19).
+                            println!("cb: auto-refresh");
+                            refresh_async(&w, &mut s);
                         }
                     }
                 }
