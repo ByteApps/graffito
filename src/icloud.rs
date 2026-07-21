@@ -19,7 +19,7 @@ const CONTACTS_KEY: &str = "contacts-v1";
 mod apple {
     use super::CONTACTS_KEY;
     use objc2_foundation::{
-        NSNotificationCenter, NSString, NSUbiquitousKeyValueStore,
+        NSFileManager, NSNotificationCenter, NSString, NSUbiquitousKeyValueStore,
         NSUbiquitousKeyValueStoreDidChangeExternallyNotification,
     };
 
@@ -41,12 +41,32 @@ mod apple {
     /// (silently) when the OS has nowhere to put it (no iCloud account /
     /// missing entitlement) — `setString:forKey:` on
     /// `NSUbiquitousKeyValueStore` never throws or crashes in that case.
-    pub fn save_blob(s: &str) {
+    ///
+    /// Returns `synchronize()`'s own `BOOL` — Apple's docs: `false` means
+    /// the store couldn't write (no iCloud account, missing entitlement, or
+    /// too many recent writes), `true` means the write was accepted and
+    /// queued for upload. This is the ONLY reliable signal the OS gives us
+    /// that a contacts push actually reached iCloud — see the sync-status
+    /// UI in `lib.rs`'s `State::save_contacts`.
+    pub fn save_blob(s: &str) -> bool {
         let store = NSUbiquitousKeyValueStore::defaultStore();
         let key = NSString::from_str(CONTACTS_KEY);
         let value = NSString::from_str(s);
         store.setString_forKey(Some(&value), &key);
-        store.synchronize();
+        store.synchronize()
+    }
+
+    /// Is this device signed into iCloud at all? Proxy:
+    /// `NSFileManager.ubiquityIdentityToken` is non-nil — same check
+    /// `keychain::apple::icloud_available` uses for the key-backup toggle,
+    /// duplicated here (rather than shared) so this module stays a
+    /// self-contained thin wrapper around exactly one Apple subsystem, same
+    /// shape as `keychain/apple.rs`'s own doc comment describes. Used to
+    /// tell a genuine "no iCloud account" failure apart from "this device IS
+    /// signed in but the write is still in flight" — see `available()`'s
+    /// callers.
+    pub fn available() -> bool {
+        NSFileManager::defaultManager().ubiquityIdentityToken().is_some()
     }
 
     /// Register for `NSUbiquitousKeyValueStoreDidChangeExternallyNotification`
@@ -86,7 +106,7 @@ mod apple {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub use apple::{load_blob, save_blob, start_observer};
+pub use apple::{available, load_blob, save_blob, start_observer};
 
 // All other targets (Android included): no NSUbiquitousKeyValueStore.
 // TODO(android): Google backup / Drive — out of scope for this feature;
@@ -99,10 +119,18 @@ mod noop {
         None
     }
 
-    pub fn save_blob(_s: &str) {}
+    pub fn save_blob(_s: &str) -> bool {
+        false
+    }
+
+    /// No `NSUbiquitousKeyValueStore` equivalent wired up on this target —
+    /// see the module doc's Android TODO. Always unavailable.
+    pub fn available() -> bool {
+        false
+    }
 
     pub fn start_observer(_cb: impl Fn() + 'static) {}
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-pub use noop::{load_blob, save_blob, start_observer};
+pub use noop::{available, load_blob, save_blob, start_observer};

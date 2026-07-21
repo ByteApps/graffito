@@ -79,6 +79,22 @@ const HELP: &str = "Getting started\n\n1. Create a new key (12/18/24 words) or i
 
 const FAQ: &str = "Q.  What is Chain Notes?\nA.  A way to write short personal notes onto the Bitcoin blockchain, signed by keys that stay on your device. A note can be public (anyone can read it) or private (encrypted for you or a chosen recipient).\n\nQ.  Is my money safe here?\nA.  This is a hot wallet — its keys live on an online device. Keep only small, note-fee amounts here; hold savings on a hardware wallet and import it as watch-only.\n\nQ.  Can I recover my notes and funds?\nA.  Yes. Your recovery phrase is a standard BIP-39 seed — re-import it (or restore from iCloud backup) in Chain Notes to bring back your notes and funds. Your funds sit at taproot addresses, so any taproot-capable wallet can recover the funds too; but only Chain Notes (or a compatible app) can decrypt and read your private notes.\n\nQ.  Are my private notes really private?\nA.  Yes — a private note's contents are encrypted so only you or the intended recipient can read them (public notes are readable by anyone). Either way, the transaction itself — that it happened, when, and for how much — is public and permanent.\n\nQ.  Who can see my activity?\nA.  Anyone who has your address or public keys can see this notebook's balance and full transaction history. The block explorer you pick also sees your IP. Share your public keys only with people you trust.";
 
+/// The last OBSERVED outcome of pushing `State.contacts` to iCloud's KV
+/// store (contacts sync-status UI, 2026-07-20). Global, not per-contact —
+/// `NSUbiquitousKeyValueStore.synchronize()` covers the whole blob in one
+/// call, so every synced contact necessarily shares one status; the
+/// picker just maps it onto each `synced` row (`refresh_contacts`).
+/// `Unknown` only appears before the first `save_contacts`/boot-init call
+/// ever runs — in practice `run()` stamps a real value before the window
+/// is even shown, so the UI should never actually render it, but it's the
+/// harmless neutral default for `Cell::new`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SyncStatus {
+    Unknown,
+    Ok,
+    Failed,
+}
+
 struct State {
     data_dir: PathBuf,
     network: Network,
@@ -353,6 +369,15 @@ struct State {
     /// `contacts` — see that module's doc for the full merge design
     /// (wall-clock assumption, 90-day GC).
     tombstones: Vec<app_core::contacts::Tombstone>,
+    /// Last-observed outcome of an iCloud contacts push (sync-status UI,
+    /// 2026-07-20) — see `SyncStatus`. Interior mutability because
+    /// `save_contacts` is `&self` (called from dozens of sites that only
+    /// hold a shared borrow) but still needs to record the write's
+    /// outcome; `Cell` is enough since `SyncStatus` is a plain `Copy` enum,
+    /// no need for `RefCell`'s borrow machinery. Runtime-only: NOT
+    /// serialized to `contacts.json` (a fresh boot always re-derives it —
+    /// see `run()`'s init and `icloud::available()`).
+    last_sync: std::cell::Cell<SyncStatus>,
 }
 
 /// Cap for the device-level contacts list — mirrors
@@ -647,6 +672,17 @@ impl State {
     /// serialized state actually differs from what's already there, to
     /// avoid needless sync churn between two devices that just merged the
     /// same result.
+    ///
+    /// Sync-status UI (2026-07-20): every call stamps `self.last_sync` with
+    /// what actually happened, since `synchronize()`'s `BOOL` is the only
+    /// ground truth the OS gives us that a push reached iCloud (see
+    /// `icloud::save_blob`'s doc). Three cases: (1) the blob changed and
+    /// `save_blob` ran — its return value IS the verdict; (2) the blob
+    /// changed but iCloud is simply unavailable (never reaches `save_blob`
+    /// at all, same verdict either way); (3) the blob was UNCHANGED, so no
+    /// write happens here at all — that's still a legitimate "in sync"
+    /// state as long as iCloud is available, not an error, so it maps to
+    /// `Ok`/`Failed` purely off `icloud::available()`.
     fn save_contacts(&self) {
         let state = self.contact_state();
         // LOCAL file keeps the FULL state (unchanged) — every contact, synced flag included.
@@ -656,10 +692,14 @@ impl State {
         // iCloud gets ONLY the opt-in subset (synced==true contacts + all tombstones).
         let synced = state.synced_only();
         let blob = app_core::contacts::serialize_contacts_blob(&synced);
-        if icloud::load_blob().as_deref() != Some(blob.as_str()) {
-            icloud::save_blob(&blob);
+        let status = if icloud::load_blob().as_deref() != Some(blob.as_str()) {
+            let accepted = icloud::save_blob(&blob);
             println!("cb: icloud-contacts synced n={}", synced.contacts.len());
-        }
+            accepted || icloud::available()
+        } else {
+            icloud::available()
+        };
+        self.last_sync.set(if status { SyncStatus::Ok } else { SyncStatus::Failed });
     }
 
     /// Device-level contacts, Prime rules: front = latest use, dedupe by
@@ -2073,6 +2113,13 @@ fn show_account_picker(w: &AppWindow, material: &str, network: Network, page: u3
 /// list still carries every network's contacts together.
 fn refresh_contacts(w: &AppWindow, st: &State) {
     let net = st.network.as_str();
+    // Global (not per-contact): one `synchronize()` call covers the whole
+    // blob, so every synced row shares the same last-observed outcome.
+    let sync_status = match st.last_sync.get() {
+        SyncStatus::Unknown => 1,
+        SyncStatus::Ok => 2,
+        SyncStatus::Failed => 3,
+    };
     let contacts: Vec<ContactItem> = st
         .contacts
         .iter()
@@ -2081,6 +2128,7 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
             address: c.address.clone().into(),
             name: c.name.clone().into(),
             synced: c.synced,
+            sync_status: if c.synced { sync_status } else { 0 },
         })
         .collect();
     w.set_contacts(VecModel::from_slice(&contacts));
@@ -2149,6 +2197,44 @@ fn pull_icloud_contacts_on_open(w: &AppWindow, st: &mut State) {
         );
         st.save_contacts();
     }
+    refresh_contacts(w, st);
+}
+
+/// Manual "Sync now" — the send-to picker header button (sync-status UI,
+/// 2026-07-20). Same re-merge `pull_icloud_contacts_on_open` does, but
+/// then FORCES a push regardless of whether the local blob already
+/// matches what's in the cloud: the whole point of a manual tap is to
+/// reassure the user their contacts really did (or didn't) reach iCloud
+/// right now, so a silent no-op here would defeat the feature — unlike
+/// `save_contacts`'s normal change-gated push, used everywhere else to
+/// avoid needless sync churn between two devices that just merged the
+/// same result. Stamps `last_sync` from the push's own outcome (falling
+/// back to `icloud::available()`, same rule `save_contacts` uses) and
+/// refreshes the picker so every synced row's icon updates immediately.
+fn sync_contacts_now(w: &AppWindow, st: &mut State) {
+    let local = st.contact_state();
+    let mut incoming =
+        app_core::contacts::parse_contacts_blob(icloud::load_blob().as_deref().unwrap_or(""));
+    mark_incoming_synced(&mut incoming);
+    let merged = app_core::contacts::merge_state(&local, &incoming, now_ms());
+    if merged.contacts != st.contacts || merged.tombstones != st.tombstones {
+        st.contacts = merged.contacts;
+        st.tombstones = merged.tombstones;
+    }
+    let state = st.contact_state();
+    if let Ok(json) = serde_json::to_string_pretty(&state) {
+        let _ = std::fs::write(st.contacts_path(), json);
+    }
+    let synced = state.synced_only();
+    let blob = app_core::contacts::serialize_contacts_blob(&synced);
+    let accepted = icloud::save_blob(&blob);
+    let ok = accepted || icloud::available();
+    st.last_sync.set(if ok { SyncStatus::Ok } else { SyncStatus::Failed });
+    println!(
+        "cb: icloud-contacts sync-now status={} n={}",
+        if ok { "ok" } else { "failed" },
+        synced.contacts.len()
+    );
     refresh_contacts(w, st);
 }
 
@@ -2260,7 +2346,7 @@ fn refresh_to_chips(w: &AppWindow, st: &State) {
                 .find(|c| &c.address == a && !c.name.is_empty())
                 .map(|c| c.name.clone())
                 .unwrap_or_default();
-            ContactItem { address: a.clone().into(), name: name.into(), synced: false }
+            ContactItem { address: a.clone().into(), name: name.into(), synced: false, sync_status: 0 }
         })
         .collect();
     w.set_to_chips(VecModel::from_slice(&rows));
@@ -8198,6 +8284,9 @@ pub fn run() {
         pending_broadcast: None,
         contacts: initial_state.contacts,
         tombstones: initial_state.tombstones,
+        // Real value stamped right below, before the window is shown —
+        // see the sync-status init just after this block.
+        last_sync: std::cell::Cell::new(SyncStatus::Unknown),
     }));
     // Contacts boot sequence (iCloud-contacts feature): persist a fresh
     // migration (so `contacts.json` exists from here on and the union is
@@ -8237,6 +8326,13 @@ pub fn run() {
         if changed || !contacts_json_existed {
             s.save_contacts();
         }
+        // Sync-status UI (2026-07-20): stamp a real status from
+        // `icloud::available()` before the window ever shows, so a synced
+        // contact's row always has a status icon at first paint — not just
+        // the `Unknown` `Cell` default. `save_contacts` above already set a
+        // (numerically identical) value when it ran, but this covers the
+        // "nothing changed, no write happened" boot path too.
+        s.last_sync.set(if icloud::available() { SyncStatus::Ok } else { SyncStatus::Failed });
     }
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
@@ -8994,7 +9090,7 @@ pub fn run() {
                         .find(|c| &c.address == a && !c.name.is_empty())
                         .map(|c| c.name.clone())
                         .unwrap_or_default();
-                    ContactItem { address: a.clone().into(), name: name.into(), synced: false }
+                    ContactItem { address: a.clone().into(), name: name.into(), synced: false, sync_status: 0 }
                 })
                 .collect();
             w.set_note_reply_set(VecModel::from_slice(&reply_rows));
@@ -9414,6 +9510,11 @@ pub fn run() {
         w.set_contact_input("".into());
         w.set_status("".into());
         w.set_screen(7);
+    });
+
+    // Send-to picker header "Sync now" (sync-status UI, 2026-07-20).
+    cb!(on_sync_contacts_now, |w, s| {
+        sync_contacts_now(&w, &mut s);
     });
 
     cb!(on_sweep_open, |w, s| {
