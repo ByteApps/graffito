@@ -88,6 +88,29 @@ pub struct ContactState {
     pub tombstones: Vec<Tombstone>,
 }
 
+impl ContactState {
+    /// The subset of this state that's allowed to leave the device: only
+    /// contacts with `synced == true`, plus tombstones. Used to build the
+    /// iCloud KV blob (`save_blob`'s payload) — the LOCAL `contacts.json`
+    /// keeps serializing the FULL state (this method is never used for
+    /// that file). See the module doc for the opt-in-sync rule.
+    ///
+    /// Tombstones are NOT filtered by anything — ALL of them are included.
+    /// A tombstone means "this contact was deleted," and we can't always
+    /// tell in hindsight whether the deleted contact used to be synced, so
+    /// the pragmatic and simplest-to-reason-about rule is to include every
+    /// tombstone: a stray tombstone for a never-synced contact is harmless
+    /// noise in the cloud blob, whereas dropping a tombstone that WAS
+    /// needed would cause a deleted-but-still-synced contact to resurrect
+    /// on another device.
+    pub fn synced_only(&self) -> ContactState {
+        ContactState {
+            contacts: self.contacts.iter().filter(|c| c.synced).cloned().collect(),
+            tombstones: self.tombstones.clone(),
+        }
+    }
+}
+
 /// The v2 blob shape (`{"v":2,"contacts":[...],"tombstones":[...]}`) —
 /// only used for (de)serialization, not held anywhere as app state.
 #[derive(Serialize)]
@@ -120,6 +143,17 @@ struct BlobV2Owned {
 ///    the greater `updated_at` wins outright (name included); on a tie,
 ///    local wins, except a non-empty incoming name is adopted over an
 ///    empty local one (never let a tie-break blank out a name).
+///    `synced` rides along with whichever side's `Contact` value wins a
+///    given key — there is no separate merge for it. In particular, when
+///    a contact arrives from the iCloud blob and its caller has stamped
+///    it `synced = true` before calling `merge_state` (the app's own
+///    responsibility — every contact that reached the KV blob is synced
+///    BY DEFINITION), that flag is preserved if `incoming` wins the
+///    tie/greater-timestamp check, or if `incoming` is a brand-new entry
+///    not present locally. If the caller does NOT pre-stamp incoming
+///    contacts as synced before merging, a previously-synced contact's
+///    flag could be lost across devices — pre-stamping is a caller
+///    invariant, not something `merge_state` enforces itself.
 /// 2. **Union tombstones** by `(address, network)`: same shape, keeping
 ///    whichever side's `deleted_at` is greater for a shared key.
 /// 3. **Resolve contact-vs-tombstone conflicts**: for any `(address,
@@ -254,21 +288,23 @@ mod tests {
 
     /// Helper for tests that don't care about the network tag — both
     /// sides get the same (empty) tag, so tuple equality behaves exactly
-    /// like the old address-only key. `updated_at` defaults to 0.
+    /// like the old address-only key. `updated_at` defaults to 0,
+    /// `synced` defaults to false.
     fn c(address: &str, name: &str) -> Contact {
-        cnt(address, name, "", 0)
+        cnt(address, name, "", 0, false)
     }
 
     fn cn(address: &str, name: &str, network: &str) -> Contact {
-        cnt(address, name, network, 0)
+        cnt(address, name, network, 0, false)
     }
 
-    fn cnt(address: &str, name: &str, network: &str, updated_at: u64) -> Contact {
+    fn cnt(address: &str, name: &str, network: &str, updated_at: u64, synced: bool) -> Contact {
         Contact {
             address: address.to_string(),
             name: name.to_string(),
             network: network.to_string(),
             updated_at,
+            synced,
         }
     }
 
@@ -294,25 +330,40 @@ mod tests {
 
     #[test]
     fn merge_prefers_greater_updated_at_regardless_of_side() {
-        let local = state(vec![cnt("addr-a", "Alice (mine, stale)", "", 100)], vec![]);
-        let incoming = state(vec![cnt("addr-a", "Alice (theirs, fresh)", "", 200)], vec![]);
+        let local = state(vec![cnt("addr-a", "Alice (mine, stale)", "", 100, false)], vec![]);
+        let incoming = state(vec![cnt("addr-a", "Alice (theirs, fresh)", "", 200, false)], vec![]);
         let merged = merge_state(&local, &incoming, 0);
-        assert_eq!(merged.contacts, vec![cnt("addr-a", "Alice (theirs, fresh)", "", 200)]);
+        assert_eq!(merged.contacts, vec![cnt("addr-a", "Alice (theirs, fresh)", "", 200, false)]);
+    }
+
+    /// A rename propagates across devices by last-write-wins on
+    /// `updated_at`: device 1 named a contact "A" at t1; device 2 renamed
+    /// the same (address, network) to "B" at a later t2 and synced it up.
+    /// Merging device-2's fresher copy into device-1's local state must
+    /// adopt "B" (the newer name wins). This is exactly what
+    /// `name_contact`'s `updated_at = now_ms()` bump buys the rename flow.
+    #[test]
+    fn rename_propagates_by_updated_at() {
+        let device1 = state(vec![cnt("addr-a", "A", "", 1_000, false)], vec![]);
+        let device2 = state(vec![cnt("addr-a", "B", "", 2_000, false)], vec![]);
+        let merged = merge_state(&device1, &device2, 0);
+        assert_eq!(merged.contacts.len(), 1);
+        assert_eq!(merged.contacts[0].name, "B", "the newer rename must win");
     }
 
     #[test]
     fn merge_tie_prefers_local_but_keeps_nonempty_name_over_empty() {
         // Same updated_at on both sides: local wins outright...
-        let local = state(vec![cnt("addr-a", "Alice (mine)", "", 100)], vec![]);
-        let incoming = state(vec![cnt("addr-a", "Alice (theirs)", "", 100)], vec![]);
+        let local = state(vec![cnt("addr-a", "Alice (mine)", "", 100, false)], vec![]);
+        let incoming = state(vec![cnt("addr-a", "Alice (theirs)", "", 100, false)], vec![]);
         let merged = merge_state(&local, &incoming, 0);
-        assert_eq!(merged.contacts, vec![cnt("addr-a", "Alice (mine)", "", 100)]);
+        assert_eq!(merged.contacts, vec![cnt("addr-a", "Alice (mine)", "", 100, false)]);
 
         // ...unless local's name is empty and incoming's isn't.
-        let local2 = state(vec![cnt("addr-a", "", "", 100)], vec![]);
-        let incoming2 = state(vec![cnt("addr-a", "Alice", "", 100)], vec![]);
+        let local2 = state(vec![cnt("addr-a", "", "", 100, false)], vec![]);
+        let incoming2 = state(vec![cnt("addr-a", "Alice", "", 100, false)], vec![]);
         let merged2 = merge_state(&local2, &incoming2, 0);
-        assert_eq!(merged2.contacts, vec![cnt("addr-a", "Alice", "", 100)]);
+        assert_eq!(merged2.contacts, vec![cnt("addr-a", "Alice", "", 100, false)]);
     }
 
     #[test]
@@ -428,7 +479,7 @@ mod tests {
     #[test]
     fn delete_on_a_propagates_to_b_older_contact_loses() {
         let device_a = state(vec![], vec![ts("tb1p-alice", "testnet4", 2_000)]);
-        let device_b = state(vec![cnt("tb1p-alice", "Alice", "testnet4", 1_000)], vec![]);
+        let device_b = state(vec![cnt("tb1p-alice", "Alice", "testnet4", 1_000, false)], vec![]);
         let merged = merge_state(&device_b, &device_a, 5_000);
         assert!(merged.contacts.is_empty(), "B's older contact must lose to A's newer tombstone");
         assert_eq!(merged.tombstones, vec![ts("tb1p-alice", "testnet4", 2_000)]);
@@ -441,9 +492,9 @@ mod tests {
     #[test]
     fn intentional_readd_after_deletion_resurrects() {
         let deleted_elsewhere = state(vec![], vec![ts("tb1p-alice", "testnet4", 1_000)]);
-        let readded_here = state(vec![cnt("tb1p-alice", "Alice", "testnet4", 2_000)], vec![]);
+        let readded_here = state(vec![cnt("tb1p-alice", "Alice", "testnet4", 2_000, false)], vec![]);
         let merged = merge_state(&readded_here, &deleted_elsewhere, 5_000);
-        assert_eq!(merged.contacts, vec![cnt("tb1p-alice", "Alice", "testnet4", 2_000)]);
+        assert_eq!(merged.contacts, vec![cnt("tb1p-alice", "Alice", "testnet4", 2_000, false)]);
         assert!(merged.tombstones.is_empty(), "the stale tombstone must be dropped once the contact wins");
     }
 
@@ -471,8 +522,8 @@ mod tests {
     fn deletion_key_keeps_testnet4_and_signet_independent() {
         let local = state(
             vec![
-                cnt("tb1pSHARED", "Testnet Alice", "testnet4", 1_000),
-                cnt("tb1pSHARED", "Signet Alice", "signet", 1_000),
+                cnt("tb1pSHARED", "Testnet Alice", "testnet4", 1_000, false),
+                cnt("tb1pSHARED", "Signet Alice", "signet", 1_000, false),
             ],
             vec![],
         );
@@ -480,7 +531,7 @@ mod tests {
         // signet was never touched there.
         let incoming = state(vec![], vec![ts("tb1pSHARED", "testnet4", 2_000)]);
         let merged = merge_state(&local, &incoming, 5_000);
-        assert_eq!(merged.contacts, vec![cnt("tb1pSHARED", "Signet Alice", "signet", 1_000)]);
+        assert_eq!(merged.contacts, vec![cnt("tb1pSHARED", "Signet Alice", "signet", 1_000, false)]);
         assert_eq!(merged.tombstones, vec![ts("tb1pSHARED", "testnet4", 2_000)]);
     }
 
@@ -490,9 +541,9 @@ mod tests {
     #[test]
     fn cap_still_holds_after_tombstone_resolution() {
         let local: Vec<Contact> =
-            (0..60).map(|i| cnt(&format!("local-{i}"), "", "", 0)).collect();
+            (0..60).map(|i| cnt(&format!("local-{i}"), "", "", 0, false)).collect();
         let incoming_contacts: Vec<Contact> =
-            (0..60).map(|i| cnt(&format!("incoming-{i}"), "", "", 0)).collect();
+            (0..60).map(|i| cnt(&format!("incoming-{i}"), "", "", 0, false)).collect();
         // A handful of tombstones among the incoming contacts too, just to
         // prove resolution + cap compose correctly.
         let incoming_tombstones = vec![ts("local-0", "", 10), ts("local-1", "", 10)];
@@ -503,5 +554,74 @@ mod tests {
         );
         assert!(merged.contacts.len() <= MERGE_CAP);
         assert_eq!(merged.contacts.len(), MERGE_CAP);
+    }
+
+    // ---- Per-contact opt-in sync (`synced`, 2026-07-20) ----
+
+    /// Simulates a contact arriving from the iCloud blob: the caller
+    /// pre-stamps it `synced = true` before calling `merge_state` (per the
+    /// module doc's caller invariant). It has a newer `updated_at` than the
+    /// local (unsynced) copy, so it wins the union outright — and its
+    /// `synced` flag rides along with it, since the whole `Contact` value
+    /// is adopted on that branch.
+    #[test]
+    fn synced_flag_survives_merge_when_incoming_wins() {
+        let local = state(vec![cnt("addr-a", "Alice (local, stale)", "", 100, false)], vec![]);
+        let incoming = state(vec![cnt("addr-a", "Alice (from icloud)", "", 200, true)], vec![]);
+        let merged = merge_state(&local, &incoming, 0);
+        assert_eq!(merged.contacts.len(), 1);
+        assert!(merged.contacts[0].synced, "incoming won the tie and must bring its synced=true along");
+    }
+
+    /// The reverse: local is already synced and newer, incoming is a stale
+    /// unsynced copy (older `updated_at`). Local wins outright, keeping its
+    /// own `synced = true` — merge must never flip a contact's synced
+    /// status to false just because a stale incoming copy said so.
+    #[test]
+    fn synced_flag_preserved_when_local_wins() {
+        let local = state(vec![cnt("addr-a", "Alice (synced)", "", 200, true)], vec![]);
+        let incoming = state(vec![cnt("addr-a", "Alice (stale, unsynced)", "", 100, false)], vec![]);
+        let merged = merge_state(&local, &incoming, 0);
+        assert_eq!(merged.contacts.len(), 1);
+        assert!(merged.contacts[0].synced, "local won and must keep its own synced=true");
+    }
+
+    /// `synced_only()` keeps only synced contacts, includes ALL tombstones
+    /// unconditionally, and preserves original order.
+    #[test]
+    fn synced_only_excludes_unsynced_contacts() {
+        let s = state(
+            vec![
+                cnt("addr-a", "Synced Alice", "", 1, true),
+                cnt("addr-b", "Unsynced Bob", "", 1, false),
+                cnt("addr-c", "Synced Carol", "", 1, true),
+            ],
+            vec![ts("addr-x", "testnet4", 5), ts("addr-b", "", 6)],
+        );
+        let filtered = s.synced_only();
+        assert_eq!(
+            filtered.contacts,
+            vec![cnt("addr-a", "Synced Alice", "", 1, true), cnt("addr-c", "Synced Carol", "", 1, true)]
+        );
+        // ALL tombstones included, regardless of whether their contact was
+        // ever synced (addr-b's tombstone survives even though addr-b
+        // itself was unsynced and filtered out above).
+        assert_eq!(filtered.tombstones, s.tombstones);
+    }
+
+    /// `synced_only()`'s output is just a `ContactState`, so it round-trips
+    /// through the same blob (de)serialization as any other state.
+    #[test]
+    fn synced_only_output_round_trips_through_blob() {
+        let s = state(
+            vec![cnt("addr-a", "Synced Alice", "", 1, true), cnt("addr-b", "Unsynced Bob", "", 1, false)],
+            vec![ts("addr-old", "mainnet", 42)],
+        );
+        let filtered = s.synced_only();
+        let blob = serialize_contacts_blob(&filtered);
+        let back = parse_contacts_blob(&blob);
+        assert_eq!(back, filtered);
+        assert_eq!(back.contacts.len(), 1);
+        assert!(back.contacts[0].synced);
     }
 }
