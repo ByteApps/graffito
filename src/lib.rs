@@ -649,13 +649,16 @@ impl State {
     /// same result.
     fn save_contacts(&self) {
         let state = self.contact_state();
+        // LOCAL file keeps the FULL state (unchanged) — every contact, synced flag included.
         if let Ok(json) = serde_json::to_string_pretty(&state) {
             let _ = std::fs::write(self.contacts_path(), json);
         }
-        let blob = app_core::contacts::serialize_contacts_blob(&state);
+        // iCloud gets ONLY the opt-in subset (synced==true contacts + all tombstones).
+        let synced = state.synced_only();
+        let blob = app_core::contacts::serialize_contacts_blob(&synced);
         if icloud::load_blob().as_deref() != Some(blob.as_str()) {
             icloud::save_blob(&blob);
-            println!("cb: icloud-contacts synced n={}", self.contacts.len());
+            println!("cb: icloud-contacts synced n={}", synced.contacts.len());
         }
     }
 
@@ -681,12 +684,16 @@ impl State {
     /// the stale tombstone must not survive to fight the next merge.
     fn touch_contact(&mut self, address: &str) {
         let net = self.network.as_str().to_string();
-        let name = self
+        let existing = self
             .contacts
             .iter()
             .position(|c| c.address == address && (c.network == net || c.network.is_empty()))
-            .map(|i| self.contacts.remove(i).name)
-            .unwrap_or_default();
+            .map(|i| self.contacts.remove(i));
+        let name = existing.as_ref().map(|c| c.name.clone()).unwrap_or_default();
+        // Preserve the opt-in sync flag across a re-touch — recency bumps
+        // must never silently flip a contact's iCloud-sync opt-in either
+        // way. A brand-new contact defaults unsynced (serde-default).
+        let synced = existing.as_ref().map(|c| c.synced).unwrap_or(false);
         self.contacts.insert(
             0,
             app_core::store::Contact {
@@ -694,6 +701,7 @@ impl State {
                 name,
                 network: net.clone(),
                 updated_at: now_ms(),
+                synced,
             },
         );
         self.contacts.truncate(CONTACTS_CAP);
@@ -707,7 +715,7 @@ impl State {
     /// unambiguous even if the same address string also exists as a
     /// distinct contact on another network. Stamps `updated_at` and clears
     /// any tombstone, same reasoning as `touch_contact`.
-    fn name_contact(&mut self, address: &str, name: &str) {
+    fn name_contact(&mut self, address: &str, name: &str, synced: bool) {
         let net = self.network.as_str().to_string();
         if let Some(c) = self
             .contacts
@@ -716,6 +724,7 @@ impl State {
         {
             c.name = name.to_string();
             c.updated_at = now_ms();
+            c.synced = synced;
         }
         self.tombstones
             .retain(|t| !(t.address == address && (t.network == net || t.network.is_empty())));
@@ -2068,9 +2077,24 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
         .contacts
         .iter()
         .filter(|c| c.network == net || c.network.is_empty())
-        .map(|c| ContactItem { address: c.address.clone().into(), name: c.name.clone().into() })
+        .map(|c| ContactItem {
+            address: c.address.clone().into(),
+            name: c.name.clone().into(),
+            synced: c.synced,
+        })
         .collect();
     w.set_contacts(VecModel::from_slice(&contacts));
+}
+
+/// Every contact in the iCloud KV blob is there BECAUSE it's synced —
+/// stamp `synced = true` on each incoming contact before merging, so a
+/// contact that lives in the cloud stays flagged synced locally (and
+/// `merge_state` carries that flag through when incoming wins). See the
+/// opt-in-sync rule in `app_core::contacts`.
+fn mark_incoming_synced(state: &mut app_core::contacts::ContactState) {
+    for c in &mut state.contacts {
+        c.synced = true;
+    }
 }
 
 /// Apply an iCloud KV change that synced in from the user's OTHER device
@@ -2085,8 +2109,9 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
 /// DELETION) shows up here without a restart.
 fn apply_icloud_contacts_merge(w: &AppWindow, st: &mut State) {
     let local = st.contact_state();
-    let incoming =
+    let mut incoming =
         app_core::contacts::parse_contacts_blob(icloud::load_blob().as_deref().unwrap_or(""));
+    mark_incoming_synced(&mut incoming);
     let merged = app_core::contacts::merge_state(&local, &incoming, now_ms());
     if merged.contacts != st.contacts || merged.tombstones != st.tombstones {
         st.contacts = merged.contacts;
@@ -2099,6 +2124,32 @@ fn apply_icloud_contacts_merge(w: &AppWindow, st: &mut State) {
         st.save_contacts();
         refresh_contacts(w, st);
     }
+}
+
+/// Pull the latest contacts from iCloud and merge them in before showing
+/// the send-to picker (screen 7), so a contact named/synced on the user's
+/// OTHER device appears the moment they open the picker — not only after a
+/// restart or a live observer notification. `icloud::load_blob` calls
+/// `synchronize()` (a local-cache sync, not a blocking network round trip),
+/// so this is cheap enough to call directly on the UI thread. Every
+/// incoming contact is synced by definition — mark it before merging.
+fn pull_icloud_contacts_on_open(w: &AppWindow, st: &mut State) {
+    let local = st.contact_state();
+    let mut incoming =
+        app_core::contacts::parse_contacts_blob(icloud::load_blob().as_deref().unwrap_or(""));
+    mark_incoming_synced(&mut incoming);
+    let merged = app_core::contacts::merge_state(&local, &incoming, now_ms());
+    if merged.contacts != st.contacts || merged.tombstones != st.tombstones {
+        st.contacts = merged.contacts;
+        st.tombstones = merged.tombstones;
+        println!(
+            "cb: icloud-contacts pull-on-open merged n={} tombstones={}",
+            st.contacts.len(),
+            st.tombstones.len()
+        );
+        st.save_contacts();
+    }
+    refresh_contacts(w, st);
 }
 
 /// The ONE sanctioned recipient-setting path for normal (non-sweep) compose:
@@ -2209,7 +2260,7 @@ fn refresh_to_chips(w: &AppWindow, st: &State) {
                 .find(|c| &c.address == a && !c.name.is_empty())
                 .map(|c| c.name.clone())
                 .unwrap_or_default();
-            ContactItem { address: a.clone().into(), name: name.into() }
+            ContactItem { address: a.clone().into(), name: name.into(), synced: false }
         })
         .collect();
     w.set_to_chips(VecModel::from_slice(&rows));
@@ -8157,15 +8208,19 @@ pub fn run() {
     // the other device while this one was closed is applied right here.
     {
         let mut s = st.borrow_mut();
-        if !contacts_json_existed {
-            s.save_contacts();
-        }
+        // Read the OTHER device's blob and merge BEFORE any save, so a fresh
+        // migration's (all-unsynced) synced_only push can never clobber an
+        // existing cloud blob before we've merged it in. Every incoming
+        // contact is synced by definition (opt-in-sync): mark it so it stays
+        // flagged synced locally after the merge.
         let local = s.contact_state();
-        let incoming = app_core::contacts::parse_contacts_blob(
+        let mut incoming = app_core::contacts::parse_contacts_blob(
             icloud::load_blob().as_deref().unwrap_or(""),
         );
+        mark_incoming_synced(&mut incoming);
         let merged = app_core::contacts::merge_state(&local, &incoming, now_ms());
-        if merged.contacts != s.contacts || merged.tombstones != s.tombstones {
+        let changed = merged.contacts != s.contacts || merged.tombstones != s.tombstones;
+        if changed {
             s.contacts = merged.contacts;
             s.tombstones = merged.tombstones;
             println!(
@@ -8173,6 +8228,13 @@ pub fn run() {
                 s.contacts.len(),
                 s.tombstones.len()
             );
+        }
+        // Persist if we changed anything OR this is the first boot on the
+        // global-contacts scheme (so contacts.json exists from here on and the
+        // one-time store migration is never redone). save_contacts pushes the
+        // synced-only subset — after the merge above, an existing cloud blob is
+        // already reflected locally, so this push is safe.
+        if changed || !contacts_json_existed {
             s.save_contacts();
         }
     }
@@ -8932,7 +8994,7 @@ pub fn run() {
                         .find(|c| &c.address == a && !c.name.is_empty())
                         .map(|c| c.name.clone())
                         .unwrap_or_default();
-                    ContactItem { address: a.clone().into(), name: name.into() }
+                    ContactItem { address: a.clone().into(), name: name.into(), synced: false }
                 })
                 .collect();
             w.set_note_reply_set(VecModel::from_slice(&reply_rows));
@@ -9348,7 +9410,7 @@ pub fn run() {
     cb!(on_compose_open, |w, s| {
         println!("cb: compose-open");
         w.set_pick_mode("compose".into());
-        refresh_contacts(&w, &s);
+        pull_icloud_contacts_on_open(&w, &mut s);
         w.set_contact_input("".into());
         w.set_status("".into());
         w.set_screen(7);
@@ -9369,7 +9431,7 @@ pub fn run() {
         }
         w.set_sweep_kind("sweep".into());
         w.set_pick_mode("sweep".into());
-        refresh_contacts(&w, &s);
+        pull_icloud_contacts_on_open(&w, &mut s);
         w.set_contact_input("".into());
         w.set_status("".into());
         w.set_screen(7);
@@ -9781,7 +9843,7 @@ pub fn run() {
         w.set_contact_input("".into());
         w.set_status("".into());
         w.set_pick_mode("compose".into());
-        refresh_contacts(&w, &s);
+        pull_icloud_contacts_on_open(&w, &mut s);
         w.set_screen(7);
     });
 
@@ -9964,22 +10026,25 @@ pub fn run() {
         });
     }
 
-    cb!(on_start_rename, |w, s, addr: SharedString, name: SharedString| {
+    cb!(on_start_rename, |w, s, addr: SharedString, name: SharedString, synced: bool| {
         let _ = &mut s;
         println!("cb: rename-start addr={addr}");
         w.set_status("".into());
         w.set_rename_address(addr);
         w.set_rename_input(name);
+        w.set_rename_synced(synced);
     });
 
     cb!(on_save_rename, |w, s, name: SharedString| {
         let addr = w.get_rename_address().to_string();
-        s.name_contact(&addr, name.trim());
+        let synced = w.get_rename_synced();
+        s.name_contact(&addr, name.trim(), synced);
         s.save_contacts();
         println!("cb: save-contact addr={addr} name-len={}", name.trim().len());
         w.set_status("".into());
         w.set_rename_address("".into());
         w.set_rename_input("".into());
+        w.set_rename_synced(false);
         update_home(&w, &s);
     });
 
@@ -9987,6 +10052,7 @@ pub fn run() {
         let _ = &mut s;
         w.set_rename_address("".into());
         w.set_rename_input("".into());
+        w.set_rename_synced(false);
     });
 
     cb!(on_confirm_remove, |w, s, addr: SharedString, name: SharedString| {
