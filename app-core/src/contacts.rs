@@ -336,6 +336,21 @@ mod tests {
         assert_eq!(merged.contacts, vec![cnt("addr-a", "Alice (theirs, fresh)", "", 200, false)]);
     }
 
+    /// A rename propagates across devices by last-write-wins on
+    /// `updated_at`: device 1 named a contact "A" at t1; device 2 renamed
+    /// the same (address, network) to "B" at a later t2 and synced it up.
+    /// Merging device-2's fresher copy into device-1's local state must
+    /// adopt "B" (the newer name wins). This is exactly what
+    /// `name_contact`'s `updated_at = now_ms()` bump buys the rename flow.
+    #[test]
+    fn rename_propagates_by_updated_at() {
+        let device1 = state(vec![cnt("addr-a", "A", "", 1_000, false)], vec![]);
+        let device2 = state(vec![cnt("addr-a", "B", "", 2_000, false)], vec![]);
+        let merged = merge_state(&device1, &device2, 0);
+        assert_eq!(merged.contacts.len(), 1);
+        assert_eq!(merged.contacts[0].name, "B", "the newer rename must win");
+    }
+
     #[test]
     fn merge_tie_prefers_local_but_keeps_nonempty_name_over_empty() {
         // Same updated_at on both sides: local wins outright...
