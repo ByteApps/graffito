@@ -59,11 +59,19 @@ const DUST_SATS: u64 = app_core::notes_core::DUST_LIMIT;
 
 const DISCLAIMER: &str = "Chain Notes is free software provided \"as is\", without warranty of any kind. You alone control your keys and funds. The authors accept no liability for any loss of funds or data — from lost or leaked keys, fees, failed or malformed transactions, or bugs. Bitcoin transactions are irreversible and on-chain data is public and permanent. This is a hot wallet: keep only small, note-fee amounts here and use it at your own risk.";
 
-const ABOUT: &str = concat!(
-    "Chain Notes writes short personal notes onto the Bitcoin blockchain, signed by keys that never leave your device. Notes can be public, or private — encrypted so only you (or a chosen recipient) can read them. Read them back on any device from your key alone.\n\n",
-    "Version ", env!("CARGO_PKG_VERSION"), "\n\n",
-    "Companion & viewer:\nobjsal.github.io/chain-notes-companion"
-);
+const ABOUT_INTRO: &str = "Chain Notes writes short personal notes onto the Bitcoin blockchain, signed by keys that never leave your device. Notes can be public, or private — encrypted so only you (or a chosen recipient) can read them. Read them back on any device from your key alone.";
+const ABOUT_FOOTER: &str = "Companion & viewer:\nobjsal.github.io/chain-notes-companion";
+
+/// About-screen body, built at runtime so the version line can carry the
+/// bundle's build number (`platform::build_number`) — "Version 0.1.0 (30)"
+/// on a real build, "Version 0.1.0" on a host/dev binary with no bundle.
+fn about_body() -> String {
+    let version = match platform::build_number() {
+        Some(build) => format!("Version {} ({build})", env!("CARGO_PKG_VERSION")),
+        None => format!("Version {}", env!("CARGO_PKG_VERSION")),
+    };
+    format!("{ABOUT_INTRO}\n\n{version}\n\n{ABOUT_FOOTER}")
+}
 
 const PRIVACY: &str = "Chain Notes collects no personal data, has no accounts, and runs no servers of its own.\n\nYour keys stay in your device's secure keychain — and in iCloud Keychain only if you turn on iCloud backup.\n\nTo read the chain and broadcast, the app talks to the Bitcoin node / block explorer you choose in Settings. That server sees the addresses you look up and your IP address.\n\nNotes you publish are stored on the public Bitcoin blockchain. Private-note contents are encrypted so only you (or a note's intended recipient) can read them, but the fact that a transaction exists, its timing, and its amounts are public and permanent.";
 
@@ -10089,19 +10097,19 @@ pub fn run() {
     // About / Privacy / Help / Q&A — one info screen, content set per button.
     cb!(on_open_info, |w, s, kind: slint::SharedString| {
         let _ = &mut s;
-        let (title, body) = match kind.as_str() {
-            "about" => ("About", ABOUT),
-            "privacy" => ("Privacy", PRIVACY),
-            "help" => ("Help", HELP),
-            "faq" => ("Q & A", FAQ),
+        let (title, body): (&str, String) = match kind.as_str() {
+            "about" => ("About", about_body()),
+            "privacy" => ("Privacy", PRIVACY.to_string()),
+            "help" => ("Help", HELP.to_string()),
+            "faq" => ("Q & A", FAQ.to_string()),
             // Terms & disclaimer re-views through the SAME info screen (25) as
             // the others, so Settings sub-screens share one scroll-top UX. The
             // centered screen 24 is now purely the first-run accept gate.
-            "terms" => ("Terms & disclaimer", DISCLAIMER),
+            "terms" => ("Terms & disclaimer", DISCLAIMER.to_string()),
             _ => return,
         };
         w.set_info_title(title.into());
-        w.set_info_body(body.into());
+        w.set_info_body(body.as_str().into());
         w.set_screen(25);
         println!("cb: open-info {kind}");
     });

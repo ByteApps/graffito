@@ -184,6 +184,31 @@ pub fn open_url(url: &str) -> bool {
     android_jni::open_url(url).map_err(|e| eprintln!("open-url: {e}")).is_ok()
 }
 
+/// The app bundle's build number — `CFBundleVersion` on Apple platforms —
+/// shown in About next to the marketing version. `None` on a plain host/dev
+/// binary (no app bundle), where About just shows the version. Read at
+/// RUNTIME on purpose: iOS pins its build number at compile time, but the
+/// macOS build number is assigned at upload (`manageAppVersionAndBuildNumber`
+/// rewrites the bundle's CFBundleVersion), so no single compile-time value is
+/// correct for both — the bundle is the source of truth.
+#[cfg(target_vendor = "apple")]
+pub fn build_number() -> Option<String> {
+    use objc2_foundation::{NSBundle, NSString};
+    let bundle = NSBundle::mainBundle();
+    let key = NSString::from_str("CFBundleVersion");
+    let val = unsafe { bundle.objectForInfoDictionaryKey(&key) }?;
+    let s = val.downcast::<NSString>().ok()?.to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+// Android build number would come from PackageInfo.versionCode over JNI —
+// not wired up yet; About shows the marketing version alone there.
+// TODO(android): PackageManager.getPackageInfo(...).versionCode.
+#[cfg(not(target_vendor = "apple"))]
+pub fn build_number() -> Option<String> {
+    None
+}
+
 /// Android framework calls used by the shims above — same JNI plumbing as
 /// the Keystore backend (JavaVM + Activity context via ndk_context).
 #[cfg(target_os = "android")]
