@@ -11,7 +11,12 @@ export struct NotebookItem { index: int, name: string, snippet: string, meta: st
 // One sender-filter row: `key` is the raw sender address (the exclusion-set
 // entry), `label` the resolved display name, `sub` the note count line.
 export struct SenderItem { key: string, label: string, sub: string, excluded: bool }
-export struct ContactItem { address: string, name: string, synced: bool }
+// sync-status: 0 = not opted into iCloud sync (no icon), 1 = opted in but
+// the outcome of the last push is still unknown (plain cloud), 2 = opted
+// in and the last push reached iCloud (cloud-check), 3 = opted in but
+// iCloud is unavailable / the last push failed (cloud-alert). Only
+// meaningful when `synced` is true — see `refresh_contacts` in lib.rs.
+export struct ContactItem { address: string, name: string, synced: bool, sync-status: int }
 // One revealed key-export format (Public keys screen — the ONLY reveal
 // surface that shows several rows at once; Private keys is progressive-
 // disclosure, one format at a time, via scalar reveal-private-* props).
@@ -1749,6 +1754,11 @@ export component AppWindow inherits Window {
     callback regenerate-words();
     callback set-icloud-backup(bool);
     callback restore-icloud();
+    // Contacts sync-status UI (2026-07-20): send-to picker header button —
+    // force a re-merge + push right now (see `sync_contacts_now` in
+    // lib.rs), so the user can confirm/retry sync without waiting for the
+    // next contact edit or app restart.
+    callback sync-contacts-now();
     callback refresh();
     callback refresh-notebooks();   // notebook-list header: rescan every notebook
     callback accept-terms();        // first-run disclaimer gate → proceed
@@ -3063,6 +3073,36 @@ export component AppWindow inherits Window {
         Header {
             title: root.picking-extra ? "Add recipient" : (root.pick-mode == "sweep" ? "Sweep to" : "Send to");
             back => { root.nav-back(); }
+            // Sync-status UI (2026-07-20): iCloud contact sync is Apple-only
+            // (icloud.rs has no Android backend yet) — force a re-merge +
+            // push right now so a row's cloud icon updates without waiting
+            // for the next edit or a restart.
+            if root.apple-platform: Rectangle {
+                height: 32px;
+                width: sync-now-row.preferred-width + 16px;
+                border-radius: 8px;
+                background: sync-now-ta.has-hover ? Pal.card-hover : transparent;
+                sync-now-ta := TouchArea { clicked => { root.sync-contacts-now(); } }
+                sync-now-row := HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 5px;
+                    alignment: center;
+                    Image {
+                        source: @image-url("icons/refresh.svg");
+                        colorize: Pal.muted;
+                        width: 14px;
+                        height: 14px;
+                        y: (parent.height - 14px) / 2;
+                    }
+                    Text {
+                        text: "Sync now";
+                        font-size: 12px;
+                        color: Pal.muted;
+                        vertical-alignment: center;
+                    }
+                }
+            }
         }
         // Self can't be an EXTRA recipient on a multi-recipient note (it's
         // already the notebook composing the tx) — hidden while adding.
@@ -3112,9 +3152,28 @@ export component AppWindow inherits Window {
                             padding-left: 10px;
                             padding-right: 6px;
                             spacing: 2px;
-                            if c.synced: Image {
+                            // Sync-status UI (2026-07-20): 1 = outcome not
+                            // yet known (plain cloud), 2 = last push
+                            // reached iCloud (check), 3 = iCloud
+                            // unavailable / push failed (alert); 0 (not
+                            // opted in) renders nothing.
+                            if c.sync-status == 1: Image {
                                 source: @image-url("icons/cloud.svg");
                                 colorize: Pal.muted;
+                                width: 15px;
+                                height: 15px;
+                                y: (parent.height - 15px) / 2;
+                            }
+                            if c.sync-status == 2: Image {
+                                source: @image-url("icons/cloud-check.svg");
+                                colorize: Pal.good;
+                                width: 15px;
+                                height: 15px;
+                                y: (parent.height - 15px) / 2;
+                            }
+                            if c.sync-status == 3: Image {
+                                source: @image-url("icons/cloud-alert.svg");
+                                colorize: Pal.warn;
                                 width: 15px;
                                 height: 15px;
                                 y: (parent.height - 15px) / 2;
