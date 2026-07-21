@@ -9520,13 +9520,15 @@ pub fn run() {
     cb!(on_sweep_open, |w, s| {
         println!("cb: sweep-open");
         s.pending_spending_sweep_index = None; // a fresh manual pick, not the spending-wallet shortcut
-        // A wallet sweep's inputs include spending-wallet coins, but on a
-        // fresh session (list → Settings → Sweep, no notebook opened) the
-        // runtime spending cache is empty — kick the scan now so the
-        // preview on screen 16 includes them (the apply repaints it there).
+        // A wallet sweep's inputs include spending-wallet coins — ALWAYS kick
+        // a fresh scan here (not just when never-scanned). A prior scan can be
+        // stale: coins may have arrived since, or gap-discovery may not have
+        // reached the funded index yet, which showed ONLY notebook coins in
+        // the sweep preview until the user backed out and re-entered. The scan
+        // runs while the user is on the picker; apply_spending_refresh_results
+        // repaints screen 16 with the spending coins when it lands.
         if s.spending_capable
             && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
-            && !s.spending_scanned
         {
             spending_refresh_async(&w, &mut s);
         }
