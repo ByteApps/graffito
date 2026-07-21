@@ -7,6 +7,7 @@ Compose a short note, encrypt it, sign it with a key that never leaves your devi
 - Private by design. Bodies are encrypted; only you (or your chosen recipients) can read them. No account, no sign-up, no tracking server.
 - Send to people. Direct a note to any taproot address — or several at once — and optionally tuck in a gift of sats. Reply and reply-all keep the thread going.
 - Filter unwanted senders. Anyone can send you a note, so you decide who shows up — mute a sender and their notes drop out of your view.
+- Contacts on every device. Save the people you write to as named contacts; your address book syncs privately over iCloud, so it's there on your iPhone and your Mac alike.
 - Read it anywhere. Your notes live on the most durable ledger there is — recover them on a new device from your key alone.
 - Full control. Choose fees, pick which coins you spend, sweep or consolidate your wallet, and manage your addresses. Import a watch-only key to read and spend with an external signer.
 
