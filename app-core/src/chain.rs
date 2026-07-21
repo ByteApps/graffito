@@ -10,12 +10,22 @@
 //! preferred). Payload extraction reuses notes-core's own script parser.
 //!
 //! The `Transport` trait isolates HTTP so tests inject canned JSON.
+//!
+//! `HttpTransport` also owns two request-shaping behaviors that only make
+//! sense against a real server, never against the canned-transport tests:
+//! a global inter-request pacer (throttles bursty scans so mempool.space
+//! stops handing back 429s in the first place) and a bounded 429
+//! retry-with-backoff (for the 429s that get through anyway). See the
+//! comment on `Transport for HttpTransport` below for the exact rules.
+
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use notes_core::address::address_to_script_pubkey;
 use notes_core::bundle::{BundleUtxo, FeeRates, OnchainTx, SyncBundle};
 use notes_core::tx::op_return_payload;
 use notes_core::Network;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
@@ -111,17 +121,136 @@ pub fn explorer_tx_url(explorer: Option<&str>, network: Network, txid: &str) -> 
 pub struct HttpTransport {
     base: String,
     client: reqwest::blocking::Client,
+    /// Whether requests through this transport go through the global
+    /// inter-request pacer. The pacer exists to be polite to SHARED public
+    /// infrastructure (mempool.space's per-IP 429 limits) — a loopback
+    /// server (regtest server.py, a local node) needs no such courtesy,
+    /// and pacing it would only slow the e2e suites and shift their
+    /// timing calibrations.
+    paced: bool,
+}
+
+/// True for bases whose host is loopback — the pacer/politeness exemption.
+/// Deliberately narrow: a LAN node (`umbrel.local`, `192.168.…`) stays
+/// paced, which is harmless at 5 req/s.
+fn is_loopback_base(base: &str) -> bool {
+    let host = base
+        .split("://")
+        .nth(1)
+        .unwrap_or(base)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    let host = host.strip_prefix('[').map(|h| h.split(']').next().unwrap_or(h)).unwrap_or_else(|| {
+        // Not bracketed IPv6 — strip an optional :port.
+        host.split(':').next().unwrap_or(host)
+    });
+    host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
 impl HttpTransport {
     pub fn new(base: impl Into<String>) -> Self {
+        let base = base.into();
+        let paced = !is_loopback_base(&base);
         HttpTransport {
-            base: base.into(),
+            base,
             client: reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("client config is static"),
+            paced,
         }
+    }
+}
+
+/// Process-global request pacer: `HttpTransport`s are constructed ad-hoc per
+/// operation (a scan spins up several in a row), so nothing on `self` can
+/// hold the "last request" timestamp — it has to be a process-wide static.
+/// Holds the `Instant` of the most recently RESERVED slot (not necessarily
+/// already elapsed).
+static LAST_REQUEST_SLOT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Minimum spacing between the start of consecutive requests, across every
+/// `HttpTransport` instance and every worker thread.
+const MIN_REQUEST_SPACING: Duration = Duration::from_millis(200);
+
+/// Block the calling thread until at least [`MIN_REQUEST_SPACING`] has
+/// passed since the previous request STARTED. Concurrent callers each
+/// reserve their own slot under the lock (compute + stamp only — the
+/// actual sleep happens after unlocking) so they serialize onto distinct
+/// 200ms-apart slots instead of racing to stamp "now" and all sleeping the
+/// same short amount.
+fn pace() {
+    let wait = {
+        let mut slot = LAST_REQUEST_SLOT.lock().expect("request pacer mutex poisoned");
+        let now = Instant::now();
+        let next_slot = match *slot {
+            Some(prev) if prev + MIN_REQUEST_SPACING > now => prev + MIN_REQUEST_SPACING,
+            _ => now,
+        };
+        *slot = Some(next_slot);
+        next_slot.saturating_duration_since(now)
+    };
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
+    }
+}
+
+/// 429 retry-with-backoff delay for a given attempt (1-based: the delay
+/// before retry #1, #2, #3). `retry_after_secs` is the server's
+/// `Retry-After` header, if present and parseable as a plain integer
+/// second count — it wins over the exponential fallback (1s / 2s / 4s for
+/// attempts 1/2/3), and either way the result is capped at 10s so a
+/// misbehaving/huge header value can't stall a scan indefinitely. Pure —
+/// no I/O — so it's covered by a direct unit test rather than exercised
+/// through real HTTP/real sleeps.
+fn retry_delay(attempt: u32, retry_after_secs: Option<u64>) -> Duration {
+    let secs = retry_after_secs.unwrap_or(match attempt {
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    });
+    Duration::from_secs(secs.min(10))
+}
+
+/// Parses a `Retry-After` header value as a plain integer second count
+/// (mempool.space's own shape). The HTTP-date form is not handled — a
+/// header we can't parse this way just falls back to the exponential
+/// schedule in [`retry_delay`].
+fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+    value?.to_str().ok()?.trim().parse().ok()
+}
+
+/// Trims a response body down to something fit for a UI status line: an
+/// HTML error page (mempool.space's 429 body is one) gets its markup
+/// stripped, everything is whitespace-collapsed, and the whole thing is
+/// capped at ~120 chars — with the numeric status ALWAYS first, so
+/// existing callers that sniff the front of an `Error::Http` message (e.g.
+/// [`ChainClient::tx_lookup_status`]'s "starts with 404" check) keep
+/// working unchanged. Pure — direct unit test, no HTTP involved.
+fn trim_error_body(status: u16, body: &str) -> String {
+    const MAX_LEN: usize = 120;
+    // Drop anything from the first tag-opening '<' onward (`<html`, `</`,
+    // `<!DOCTYPE`) — good enough to strip an HTML document without a real
+    // HTML parser, while a bare comparison in a rejection body ("min relay
+    // fee not met, 429 < 1000") passes through untouched.
+    let tag_start = body.match_indices('<').find_map(|(i, _)| {
+        let next = body[i + 1..].chars().next()?;
+        (next.is_ascii_alphabetic() || next == '/' || next == '!').then_some(i)
+    });
+    let text_only = match tag_start {
+        Some(i) => &body[..i],
+        None => body,
+    };
+    let collapsed = text_only.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed: String = collapsed.chars().take(MAX_LEN).collect();
+    if trimmed.is_empty() {
+        format!("{status}")
+    } else {
+        format!("{status}: {trimmed}")
     }
 }
 
@@ -134,34 +263,66 @@ impl Transport for HttpTransport {
     // "no usable server response" shape, so it's tagged `Transport` too.
     // Only a cleanly-received non-2xx status (a real response, just an
     // error one) is `Error::Http` — never retried, since retrying a
-    // rejected request can't help.
+    // rejected request can't help... with ONE exception: a clean 429 is
+    // retried up to 3 times (delay from `Retry-After` if the server sent
+    // one, else 1s/2s/4s), since a 429'd request was never accepted by the
+    // server in the first place — retrying it is exactly as safe as the
+    // first attempt (including the broadcast POST: a 429'd tx was never
+    // accepted, and rebroadcasting an already-accepted tx is a harmless
+    // no-op anyway, see `ChainClient::broadcast`'s own doc comment). Every
+    // attempt, including retries, goes through the global pacer
+    // (`pace()`) so a burst of scan requests can't 429 itself in the first
+    // place. Retries exhausted ⇒ falls through to the normal non-2xx
+    // handling below, same as any other error status.
     fn get_text(&self, path: &str) -> Result<String, Error> {
-        let resp = self
-            .client
-            .get(format!("{}{}", self.base, path))
-            .send()
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        let status = resp.status();
-        let text = resp.text().map_err(|e| Error::Transport(e.to_string()))?;
-        if !status.is_success() {
-            return Err(Error::Http(format!("{status}: {text}")));
+        let url = format!("{}{}", self.base, path);
+        let mut attempt = 0u32;
+        loop {
+            if self.paced {
+                pace();
+            }
+            let resp = self.client.get(&url).send().map_err(|e| Error::Transport(e.to_string()))?;
+            let status = resp.status();
+            let retry_after = parse_retry_after(resp.headers().get(reqwest::header::RETRY_AFTER));
+            let text = resp.text().map_err(|e| Error::Transport(e.to_string()))?;
+            if status.is_success() {
+                return Ok(text);
+            }
+            if status.as_u16() == 429 && attempt < 3 {
+                attempt += 1;
+                std::thread::sleep(retry_delay(attempt, retry_after));
+                continue;
+            }
+            return Err(Error::Http(trim_error_body(status.as_u16(), &text)));
         }
-        Ok(text)
     }
 
     fn post_text(&self, path: &str, body: String) -> Result<String, Error> {
-        let resp = self
-            .client
-            .post(format!("{}{}", self.base, path))
-            .body(body)
-            .send()
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        let status = resp.status();
-        let text = resp.text().map_err(|e| Error::Transport(e.to_string()))?;
-        if !status.is_success() {
-            return Err(Error::Http(format!("{status}: {text}")));
+        let url = format!("{}{}", self.base, path);
+        let mut attempt = 0u32;
+        loop {
+            if self.paced {
+                pace();
+            }
+            let resp = self
+                .client
+                .post(&url)
+                .body(body.clone())
+                .send()
+                .map_err(|e| Error::Transport(e.to_string()))?;
+            let status = resp.status();
+            let retry_after = parse_retry_after(resp.headers().get(reqwest::header::RETRY_AFTER));
+            let text = resp.text().map_err(|e| Error::Transport(e.to_string()))?;
+            if status.is_success() {
+                return Ok(text);
+            }
+            if status.as_u16() == 429 && attempt < 3 {
+                attempt += 1;
+                std::thread::sleep(retry_delay(attempt, retry_after));
+                continue;
+            }
+            return Err(Error::Http(trim_error_body(status.as_u16(), &text)));
         }
-        Ok(text)
     }
 }
 
@@ -221,6 +382,49 @@ pub struct EsploraUtxo {
     pub vout: u32,
     pub value: u64,
     pub status: EsploraStatus,
+}
+
+/// Private mirror of esplora's `{chain_stats, mempool_stats}` nesting for
+/// `GET /address/:a` — flattened into [`AddrStats`] on the way out so
+/// callers don't have to reach through two levels for the fields they
+/// need. All fields `#[serde(default)]`-tolerant like every other esplora
+/// shape in this file.
+#[derive(Debug, Clone, Deserialize)]
+struct EsploraAddrStatsGroup {
+    #[serde(default)]
+    tx_count: u64,
+    #[serde(default)]
+    funded_txo_sum: u64,
+    #[serde(default)]
+    spent_txo_sum: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EsploraAddrStats {
+    #[serde(default)]
+    chain_stats: EsploraAddrStatsGroup,
+    #[serde(default)]
+    mempool_stats: EsploraAddrStatsGroup,
+}
+
+impl Default for EsploraAddrStatsGroup {
+    fn default() -> Self {
+        EsploraAddrStatsGroup { tx_count: 0, funded_txo_sum: 0, spent_txo_sum: 0 }
+    }
+}
+
+/// Flat "did anything change since last scan" fingerprint for one address —
+/// esplora's `GET /address/:a` chain + mempool stats, flattened. A later
+/// wiring pass compares this against the last-persisted value ([`Store`]'s
+/// `addr_stats` field) to short-circuit a refresh when nothing moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddrStats {
+    pub chain_tx_count: u64,
+    pub chain_funded: u64,
+    pub chain_spent: u64,
+    pub mempool_tx_count: u64,
+    pub mempool_funded: u64,
+    pub mempool_spent: u64,
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, Error> {
@@ -376,6 +580,23 @@ impl<T: Transport> ChainClient<T> {
             parse_json(&self.transport.get_text(&format!("/address/{address}/txs"))?)?;
         let balance = self.utxos(address)?.iter().map(|u| u.value).sum();
         Ok((!txs.is_empty(), balance))
+    }
+
+    /// `GET /address/:a` — esplora's per-address chain + mempool stats,
+    /// flattened into [`AddrStats`]. The "did anything change since last
+    /// scan" fingerprint: a later wiring pass compares this against the
+    /// last-persisted value to short-circuit a refresh when nothing moved.
+    pub fn address_stats(&self, address: &str) -> Result<AddrStats, Error> {
+        let raw: EsploraAddrStats =
+            parse_json(&self.transport.get_text(&format!("/address/{address}"))?)?;
+        Ok(AddrStats {
+            chain_tx_count: raw.chain_stats.tx_count,
+            chain_funded: raw.chain_stats.funded_txo_sum,
+            chain_spent: raw.chain_stats.spent_txo_sum,
+            mempool_tx_count: raw.mempool_stats.tx_count,
+            mempool_funded: raw.mempool_stats.funded_txo_sum,
+            mempool_spent: raw.mempool_stats.spent_txo_sum,
+        })
     }
 
     /// Broadcast raw tx hex; returns the txid mempool.space echoes back.
@@ -1127,6 +1348,149 @@ mod tests {
             client.transport.attempts.get(),
             1,
             "a real server response (even an error one) is reported immediately"
+        );
+    }
+
+    // ---- 429 handling: pure backoff schedule, body trimming, is_rate_limited ----
+
+    #[test]
+    fn retry_delay_uses_retry_after_when_present_and_caps_at_10s() {
+        assert_eq!(retry_delay(1, Some(3)), Duration::from_secs(3));
+        assert_eq!(retry_delay(2, Some(3)), Duration::from_secs(3));
+        // A server sending an outrageous Retry-After must not stall a scan.
+        assert_eq!(retry_delay(1, Some(9_999)), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn retry_delay_falls_back_to_exponential_schedule_without_retry_after() {
+        assert_eq!(retry_delay(1, None), Duration::from_secs(1));
+        assert_eq!(retry_delay(2, None), Duration::from_secs(2));
+        assert_eq!(retry_delay(3, None), Duration::from_secs(4));
+        // Any attempt beyond 3 still saturates at the attempt-3 delay —
+        // callers never actually retry past 3, but the function itself
+        // doesn't need its own extra cap for that.
+        assert_eq!(retry_delay(4, None), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn trim_error_body_strips_html_and_keeps_status_first() {
+        let html = "<html><head><title>429 Too Many Requests</title></head>\
+                     <body>You have been rate limited</body></html>";
+        let trimmed = trim_error_body(429, html);
+        assert!(trimmed.starts_with("429"));
+        assert!(!trimmed.contains('<'));
+        assert!(trimmed.len() < html.len());
+    }
+
+    #[test]
+    fn trim_error_body_caps_long_plain_bodies() {
+        let long = "x".repeat(500);
+        let trimmed = trim_error_body(500, &long);
+        assert!(trimmed.starts_with("500:"));
+        // 120 chars of body plus the "500: " prefix.
+        assert!(trimmed.len() <= 120 + "500: ".len());
+    }
+
+    #[test]
+    fn trim_error_body_preserves_short_plain_bodies() {
+        assert_eq!(trim_error_body(404, "Transaction not found"), "404: Transaction not found");
+        // No body at all still carries the status.
+        assert_eq!(trim_error_body(503, ""), "503");
+    }
+
+    #[test]
+    fn loopback_bases_are_exempt_from_pacing() {
+        assert!(is_loopback_base("http://127.0.0.1:18797/regtest/api"));
+        assert!(is_loopback_base("http://localhost:3000/api"));
+        assert!(is_loopback_base("http://[::1]:3000/api"));
+        // Public and LAN hosts stay paced.
+        assert!(!is_loopback_base("https://mempool.space/api"));
+        assert!(!is_loopback_base("https://mempool.space/testnet4/api"));
+        assert!(!is_loopback_base("http://umbrel.local:3006/api"));
+        assert!(!is_loopback_base("http://192.168.1.10:3000/api"));
+    }
+
+    #[test]
+    fn trim_error_body_keeps_plain_text_comparisons() {
+        // bitcoind rejection bodies carry bare '<' comparisons — only a
+        // tag-opening '<' starts the strip.
+        assert_eq!(
+            trim_error_body(400, "sendrawtransaction min relay fee not met, 429 < 1000"),
+            "400: sendrawtransaction min relay fee not met, 429 < 1000"
+        );
+        assert_eq!(trim_error_body(400, "fee too low, 100 < 110 <html>junk</html>"), "400: fee too low, 100 < 110");
+    }
+
+    #[test]
+    fn is_rate_limited_true_only_for_a_429_http_error() {
+        assert!(Error::Http(trim_error_body(429, "rate limited")).is_rate_limited());
+        assert!(!Error::Http(trim_error_body(404, "not found")).is_rate_limited());
+        assert!(!Error::Transport("connection reset".into()).is_rate_limited());
+    }
+
+    // ---- address_stats: flattens esplora's nested chain/mempool shape ----
+
+    struct AddrStatsTransport(&'static str);
+    impl Transport for AddrStatsTransport {
+        fn get_text(&self, path: &str) -> Result<String, Error> {
+            assert!(path.starts_with("/address/"), "unexpected fetch: {path}");
+            Ok(self.0.to_string())
+        }
+        fn post_text(&self, _path: &str, _body: String) -> Result<String, Error> {
+            unreachable!("address_stats never POSTs")
+        }
+    }
+
+    #[test]
+    fn address_stats_parses_nested_esplora_shape() {
+        // Real-shaped esplora /address/:a response (extra fields present on
+        // the wire — e.g. `address` itself — are ignored, not just absent).
+        let json = r#"{
+            "address": "tb1qdummy",
+            "chain_stats": {
+                "funded_txo_count": 3,
+                "funded_txo_sum": 150000,
+                "spent_txo_count": 1,
+                "spent_txo_sum": 50000,
+                "tx_count": 4
+            },
+            "mempool_stats": {
+                "funded_txo_count": 1,
+                "funded_txo_sum": 900,
+                "spent_txo_count": 0,
+                "spent_txo_sum": 0,
+                "tx_count": 1
+            }
+        }"#;
+        let client = ChainClient::new(AddrStatsTransport(json), Network::Testnet4);
+        let stats = client.address_stats("tb1qdummy").unwrap();
+        assert_eq!(
+            stats,
+            AddrStats {
+                chain_tx_count: 4,
+                chain_funded: 150000,
+                chain_spent: 50000,
+                mempool_tx_count: 1,
+                mempool_funded: 900,
+                mempool_spent: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn address_stats_tolerates_missing_stat_groups() {
+        let client = ChainClient::new(AddrStatsTransport("{}"), Network::Testnet4);
+        let stats = client.address_stats("tb1qdummy").unwrap();
+        assert_eq!(
+            stats,
+            AddrStats {
+                chain_tx_count: 0,
+                chain_funded: 0,
+                chain_spent: 0,
+                mempool_tx_count: 0,
+                mempool_funded: 0,
+                mempool_spent: 0,
+            }
         );
     }
 }

@@ -288,6 +288,14 @@ pub struct Store {
     pub tip_height: u64,
     #[serde(default)]
     pub last_scan_time: u64,
+    /// "Did anything change since last scan" fingerprint (task: 429
+    /// throttling) — the address's chain+mempool stats as of the last
+    /// successful scan. `#[serde(default)]` so existing store files
+    /// (which predate this field) load with `None`, tolerantly, and a
+    /// later wiring pass short-circuits a refresh when a fresh
+    /// `ChainClient::address_stats` call comes back unchanged.
+    #[serde(default)]
+    pub addr_stats: Option<crate::chain::AddrStats>,
     #[serde(default = "default_chunk")]
     pub chunk_size: usize,
     /// Legacy per-identity Bitcoin-node URL (shipped as `esplora`). The node
@@ -373,6 +381,7 @@ impl Store {
             txs: Vec::new(),
             tip_height: 0,
             last_scan_time: 0,
+            addr_stats: None,
             chunk_size: DEFAULT_CHUNK,
             node_url: None,
             excluded_senders: Vec::new(),
@@ -1487,5 +1496,62 @@ mod tests {
         // A self-note (no sender, no recipients) has nothing to reply to.
         let n = note("dd", false, None);
         assert!(n.reply_set(me).is_empty());
+    }
+
+    // ---- addr_stats: the 429-throttling task's scan-fingerprint field ----
+
+    #[test]
+    fn addr_stats_round_trips_through_save_and_load() {
+        use crate::chain::AddrStats;
+
+        let dir = std::env::temp_dir().join(format!("cn-store-addrstats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store-regtest-addrstats.json");
+
+        let mut s = Store::new(&[7u8; 32], Network::Regtest);
+        assert!(s.addr_stats.is_none(), "a fresh store has no stamped fingerprint yet");
+        s.addr_stats = Some(AddrStats {
+            chain_tx_count: 4,
+            chain_funded: 150000,
+            chain_spent: 50000,
+            mempool_tx_count: 1,
+            mempool_funded: 900,
+            mempool_spent: 0,
+        });
+        s.save(&path).unwrap();
+
+        let back = Store::load(&path).unwrap();
+        assert_eq!(back.addr_stats, s.addr_stats);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn addr_stats_absent_field_loads_as_none() {
+        // A store file saved before this field existed must still load —
+        // `#[serde(default)]` tolerance, not a hard error.
+        let dir =
+            std::env::temp_dir().join(format!("cn-store-addrstats-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store-regtest-legacy-addrstats.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "network": "regtest",
+                "identity_fingerprint": "aa",
+                "address": "bcrt1paaaa",
+                "notes": [],
+                "utxos": [],
+                "contacts": [],
+                "txs": []
+            }"#,
+        )
+        .unwrap();
+
+        let s = Store::load(&path).unwrap();
+        assert!(s.addr_stats.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -123,6 +123,21 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// True iff this is an HTTP error carrying a 429 (Too Many Requests)
+    /// status — i.e. every 429 retry in `chain::HttpTransport` was
+    /// exhausted and the caller is seeing the rate-limit itself, not a
+    /// synthesized message. Relies on `Error::Http`'s message always
+    /// starting with the numeric status code followed by `:` (the format
+    /// `chain::trim_error_body` builds and the only place `Error::Http` is
+    /// constructed from a real HTTP response) — kept reliable by that
+    /// invariant rather than carrying the status code as a separate field,
+    /// so existing `Error::Http(String)` matchers/tests are untouched.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, Error::Http(m) if m.starts_with("429:") || m == "429")
+    }
+}
+
 impl From<notes_core::Error> for Error {
     fn from(e: notes_core::Error) -> Self {
         Error::Notes(e)

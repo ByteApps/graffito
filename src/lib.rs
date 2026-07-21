@@ -18,8 +18,8 @@ use std::rc::Rc;
 
 use app_core::bitcoin;
 use app_core::chain::{
-    default_base, explorer_presets, explorer_tx_url, node_presets, ChainClient, HttpTransport,
-    TxLookupStatus,
+    default_base, explorer_presets, explorer_tx_url, node_presets, AddrStats, ChainClient,
+    HttpTransport, TxLookupStatus,
 };
 use app_core::compose::ComposeRequest;
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
@@ -40,7 +40,7 @@ use app_core::notes_core::address::{p2tr_script_pubkey, Recipient};
 use app_core::notes_core::bundle::{estimate_note_cost, FeeRates};
 use app_core::notes_core::Network;
 use app_core::store::{NoteStatus, Store, DEFAULT_CHUNK};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use slint::{ComponentHandle, Model, SharedString, VecModel};
@@ -78,6 +78,49 @@ const PRIVACY: &str = "Chain Notes collects no personal data, has no accounts, a
 const HELP: &str = "Getting started\n\n1. Create a new key (12/18/24 words) or import one — a BIP-39 phrase, xprv, WIF, or hex — by typing it, scanning a QR, or loading a file. You can also import an account xpub as a watch-only notebook.\n\n2. Fund your notebook's address with a small amount for fees. This is a hot wallet — keep only note-fee amounts here.\n\n3. Write a note, pick a fee, and broadcast. Notes can be public, private to you, or directed to another address.\n\n4. Read your notes back any time — they live on-chain. Recover everything on a new device from your recovery phrase or iCloud backup.\n\nTip: for real savings, keep your bitcoin on a hardware wallet and import it here as watch-only.";
 
 const FAQ: &str = "Q.  What is Chain Notes?\nA.  A way to write short personal notes onto the Bitcoin blockchain, signed by keys that stay on your device. A note can be public (anyone can read it) or private (encrypted for you or a chosen recipient).\n\nQ.  Is my money safe here?\nA.  This is a hot wallet — its keys live on an online device. Keep only small, note-fee amounts here; hold savings on a hardware wallet and import it as watch-only.\n\nQ.  Can I recover my notes and funds?\nA.  Yes. Your recovery phrase is a standard BIP-39 seed — re-import it (or restore from iCloud backup) in Chain Notes to bring back your notes and funds. Your funds sit at taproot addresses, so any taproot-capable wallet can recover the funds too; but only Chain Notes (or a compatible app) can decrypt and read your private notes.\n\nQ.  Are my private notes really private?\nA.  Yes — a private note's contents are encrypted so only you or the intended recipient can read them (public notes are readable by anyone). Either way, the transaction itself — that it happened, when, and for how much — is public and permanent.\n\nQ.  Who can see my activity?\nA.  Anyone who has your address or public keys can see this notebook's balance and full transaction history. The block explorer you pick also sees your IP. Share your public keys only with people you trust.";
+
+/// Process-global "how many logical network operations are in flight"
+/// counter, driving the ambient `net-busy` dot beside a screen's title
+/// (`NetDot` in app.slint). Every worker thread that touches
+/// `ChainClient`/transport constructs a [`NetOpGuard`] as its first line —
+/// it increments on creation and decrements on `Drop`, so every early
+/// return/error path still clears it. Counts LOGICAL operations, not
+/// individual HTTP requests (a single refresh/broadcast issues several —
+/// per-request toggling would flicker as requests are paced/slower).
+static NET_OPS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard for one logical network operation — see [`NET_OPS`]. Push
+/// the new busy state to the UI thread via the same `slint::Weak` +
+/// `upgrade_in_event_loop` trampoline every async worker already uses
+/// (`REFRESH_RESULTS` et al.); logs `cb: net-ops n=<count>` ONLY on the
+/// 0→1 and →0 transitions (counts only, matching the `cb:` log contract —
+/// never per-request).
+struct NetOpGuard {
+    weak: slint::Weak<AppWindow>,
+}
+
+impl NetOpGuard {
+    fn new(weak: slint::Weak<AppWindow>) -> Self {
+        let prev = NET_OPS.fetch_add(1, Ordering::SeqCst);
+        if prev == 0 {
+            println!("cb: net-ops n=1");
+            let w = weak.clone();
+            let _ = w.upgrade_in_event_loop(|w| w.set_net_busy(true));
+        }
+        NetOpGuard { weak }
+    }
+}
+
+impl Drop for NetOpGuard {
+    fn drop(&mut self) {
+        let prev = NET_OPS.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            println!("cb: net-ops n=0");
+            let weak = self.weak.clone();
+            let _ = weak.upgrade_in_event_loop(|w| w.set_net_busy(false));
+        }
+    }
+}
 
 /// The last OBSERVED outcome of pushing `State.contacts` to iCloud's KV
 /// store (contacts sync-status UI, 2026-07-20). Global, not per-contact —
@@ -1325,7 +1368,7 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
             st.watch_bump = Some(WatchBump { ref_id, is_note, txid, coins, outputs, old_fee, vsize });
             w.set_show_bump_dialog(true);
         }
-        Err(e) => w.set_status(format!("can't fetch the pending tx: {e}").into()),
+        Err(e) => w.set_status(format!("can't fetch the pending tx: {}", friendly_net_err(&e.to_string())).into()),
     }
 }
 
@@ -1806,6 +1849,99 @@ fn host_of(base_url: &str) -> String {
     }
 }
 
+/// Turn a raw HTTP-error-class message into a short, calm, user-safe status
+/// line. A rate-limited esplora/mempool.space answers `429 Too Many
+/// Requests` with an HTML body — before this helper, that landed verbatim
+/// on screen ("spending wallet scan failed: http: 429 Too Many Requests:
+/// <html>..."). Two rules: a 429 anywhere in the raw text becomes a calm
+/// retry message (no status-code jargon); anything else has everything
+/// from the first `<` onward stripped (so no future HTML error page can
+/// ever reach the screen), its whitespace collapsed, and is capped at
+/// ~120 chars — a defensive fallback, not just for HTML, in case a server
+/// ever answers with an unexpectedly large body.
+///
+/// Pure and UI-independent (host-tested below); every call site keeps the
+/// FULL raw error in its `cb:`/println! debug log and only feeds the
+/// user-visible `set_status` text through this.
+/// Byte offset of the first `<` that opens an HTML tag (`<html`, `</body`,
+/// `<!DOCTYPE`) — `None` when every `<` is plain text (a comparison in a
+/// rejection body). Shared rule with app-core's `trim_error_body`.
+fn html_tag_start(s: &str) -> Option<usize> {
+    s.match_indices('<').find_map(|(i, _)| {
+        let next = s[i + 1..].chars().next()?;
+        (next.is_ascii_alphabetic() || next == '/' || next == '!').then_some(i)
+    })
+}
+
+fn friendly_net_err(raw: &str) -> String {
+    // Anchored to the Error formats, NOT a bare `contains("429")` — server
+    // rejection bodies embed literal sat amounts ("min relay fee not met,
+    // 429 < 1000") that must never masquerade as a rate limit. app-core's
+    // `trim_error_body` guarantees an HTTP-status message starts with the
+    // numeric code (`429: …`), and `Error::Http`'s Display prefixes
+    // `http: ` — so a real rate limit is only ever `429…` or `http: 429…`.
+    if raw.starts_with("429") || raw.starts_with("http: 429") {
+        return "server is busy — retrying shortly".to_string();
+    }
+    // Strip from the first '<' that actually opens a tag (`<html`, `</`,
+    // `<!DOCTYPE`) — a bare comparison in a rejection body ("min relay fee
+    // not met, 429 < 1000") must survive intact.
+    let stripped = match html_tag_start(raw) {
+        Some(i) => &raw[..i],
+        None => raw,
+    };
+    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "server error — try again shortly".to_string();
+    }
+    if collapsed.chars().count() > 120 {
+        collapsed.chars().take(120).collect::<String>() + "..."
+    } else {
+        collapsed
+    }
+}
+
+#[cfg(test)]
+mod net_err_tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_becomes_a_calm_retry_message() {
+        let raw = "http: 429 Too Many Requests: <html><body>rate limited</body></html>";
+        assert_eq!(friendly_net_err(raw), "server is busy — retrying shortly");
+        // app-core's trim_error_body format (no reason phrase) matches too.
+        assert_eq!(friendly_net_err("http: 429: Too Many Requests"), "server is busy — retrying shortly");
+        assert_eq!(friendly_net_err("429: Too Many Requests"), "server is busy — retrying shortly");
+    }
+
+    #[test]
+    fn a_429_sat_amount_in_a_rejection_is_not_a_rate_limit() {
+        // "429" as a literal fee value must pass through as the real
+        // rejection, not become a misleading "server is busy".
+        let raw = "http: 400: sendrawtransaction min relay fee not met, 429 < 1000";
+        assert_eq!(friendly_net_err(raw), raw);
+    }
+
+    #[test]
+    fn html_bodies_are_stripped_and_whitespace_collapsed() {
+        let raw = "http: 500 Internal Server Error:  \n  <html>\n<body>boom</body></html>";
+        assert_eq!(friendly_net_err(raw), "http: 500 Internal Server Error:");
+    }
+
+    #[test]
+    fn short_plain_errors_pass_through_untouched() {
+        assert_eq!(friendly_net_err("connection reset"), "connection reset");
+    }
+
+    #[test]
+    fn very_long_errors_are_capped() {
+        let raw = "e".repeat(200);
+        let out = friendly_net_err(&raw);
+        assert_eq!(out.chars().count(), 123); // 120 + "..."
+        assert!(out.ends_with("..."));
+    }
+}
+
 /// Broadcast-failure sites see a stringified `app_core::Error` (workers
 /// already `.map_err(|e| format!("{e}"))` before crossing the thread
 /// boundary — see the `client.broadcast()` call sites). A TRANSPORT-class
@@ -1815,9 +1951,10 @@ fn host_of(base_url: &str) -> String {
 /// request for url (...)`, which is Greek to a user on a weak connection;
 /// swap it for a plain-language message naming the node host instead.
 /// Anything else — a real server rejection (`Error::Http`, e.g. "400 Bad
-/// Request: ..."), a local build/sign error, ... — passes through untouched:
-/// those messages are already meaningful (or at least not a networking red
-/// herring) and mapping them further risks hiding the actual cause.
+/// Request: ..."), a local build/sign error, ... — goes through
+/// [`friendly_net_err`] (a plain rejection like "400 Bad Request: foo"
+/// passes through that untouched too; it only bites on a 429 or a stray
+/// HTML body).
 ///
 /// Applied ONLY at user-facing `set_status`/toast broadcast-failure sites;
 /// every `cb:`/println! log line keeps the raw error verbatim (the
@@ -1825,7 +1962,7 @@ fn host_of(base_url: &str) -> String {
 fn friendly_broadcast_err(e: &str, base_url: &str) -> String {
     match e.strip_prefix("transport: ") {
         Some(_raw) => format!("network error reaching {} — check your connection", host_of(base_url)),
-        None => e.to_string(),
+        None => friendly_net_err(e),
     }
 }
 
@@ -2073,6 +2210,7 @@ fn show_notebook_picker(w: &AppWindow, st: &State, page: u32, mode: &str) {
     let account = st.account;
     let weak = w.as_weak();
     std::thread::spawn(move || {
+        let _net_guard = NetOpGuard::new(weak.clone());
         let client = ChainClient::new(HttpTransport::new(base), network);
         let mut results: Vec<(u32, &'static str, String)> = Vec::new();
         for (index, addr) in &to_probe {
@@ -2971,7 +3109,20 @@ fn apply_bundle_to_notebook_file(
 /// this just keeps the failure silent and correct).
 struct RefreshResult {
     address: String,
-    bundle: Result<app_core::notes_core::bundle::SyncBundle, String>,
+    /// `None` = the `/address/:a` stats pre-check short-circuited: nothing
+    /// moved since the store's stamped fingerprint, so no bundle (or
+    /// pending/dropped checks) was ever fetched — the apply half just
+    /// stamps fresh fees and reports "up to date" (429 politeness,
+    /// 2026-07-20).
+    bundle: Option<Result<app_core::notes_core::bundle::SyncBundle, String>>,
+    /// Fresh fee tiers, fetched on the short-circuit path ONLY so compose
+    /// estimates never go stale (the full path's bundle already carries
+    /// its own).
+    fees: Option<FeeRates>,
+    /// Fresh `/address/:a` stats to stamp into the store after a successful
+    /// full apply — `None` when the pre-check endpoint failed or is
+    /// unsupported (regtest server.py), which never blocks the scan itself.
+    new_stats: Option<AddrStats>,
     /// (txid, confirmed?) for the pending sweep/consolidate records that
     /// existed at snapshot time — fetched on the worker so
     /// resolve_spend_statuses never blocks the UI thread.
@@ -3193,6 +3344,7 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
     w.set_status("syncing…".into());
     let weak = w.as_weak();
     std::thread::spawn(move || {
+        let _net_guard = NetOpGuard::new(weak.clone());
         let client = ChainClient::new(HttpTransport::new(base), network);
         let results: Vec<NotebookBundleResult> = all
             .into_iter()
@@ -3275,7 +3427,7 @@ fn apply_pending_rebroadcast_fetch_results(w: &AppWindow, st: &mut State) {
             }
             Err(e) => {
                 println!("cb: act-retry ref={} err={e}", r.ref_id);
-                w.set_status(format!("couldn't rebroadcast: {e}").into());
+                w.set_status(format!("couldn't rebroadcast: {}", friendly_net_err(&e)).into());
             }
         }
     }
@@ -4361,6 +4513,7 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
     let account = st.account;
     let weak = w.as_weak();
     std::thread::spawn(move || {
+        let _net_guard = NetOpGuard::new(weak.clone());
         let found = parse_key_material(&material_str, network)
             .map(|material| {
                 let client = ChainClient::new(HttpTransport::new(base), network);
@@ -4405,20 +4558,51 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
         .flat_map(|t| t.txids.iter().cloned())
         .collect();
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
+    let prev_stats = st.store.as_ref().unwrap().addr_stats.clone();
     w.set_status("syncing…".into());
     let weak = w.as_weak();
     std::thread::spawn(move || {
+        let _net_guard = NetOpGuard::new(weak.clone());
         let client = ChainClient::new(HttpTransport::new(base), network);
+        // 429 politeness (2026-07-20): ONE cheap `/address/:a` fingerprint
+        // first — if nothing moved since the last applied scan (chain AND
+        // mempool stats identical, so a pending tx confirming/dropping
+        // always registers), skip the whole txs/utxo/pending/dropped fetch
+        // burst. A stats error (regtest server.py has no bare /address
+        // endpoint) falls through to the full scan — the pre-check is an
+        // optimization, never a gate.
+        let new_stats = client.address_stats(&address).ok();
+        if prev_stats.is_some() && new_stats == prev_stats {
+            // Fees still refresh (one request) so compose estimates never
+            // go stale behind the short-circuit.
+            let fees = client.fee_rates().ok();
+            REFRESH_RESULTS.lock().expect("refresh results mutex").push(RefreshResult {
+                address,
+                bundle: None,
+                fees,
+                new_stats: None,
+                statuses: Vec::new(),
+                dropped_lookup: HashMap::new(),
+                dropped_unspent: HashMap::new(),
+            });
+            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_refresh());
+            return;
+        }
         let bundle = client.build_bundle(&address, None).map_err(|e| format!("{e}"));
         let statuses = pending_txids
             .iter()
             .map(|t| (t.clone(), client.fetch_tx_status(t)))
             .collect();
         let (dropped_lookup, dropped_unspent) = fetch_dropped_checks(&client, &address, &dropped_checks);
-        REFRESH_RESULTS
-            .lock()
-            .expect("refresh results mutex")
-            .push(RefreshResult { address, bundle, statuses, dropped_lookup, dropped_unspent });
+        REFRESH_RESULTS.lock().expect("refresh results mutex").push(RefreshResult {
+            address,
+            bundle: Some(bundle),
+            fees: None,
+            new_stats,
+            statuses,
+            dropped_lookup,
+            dropped_unspent,
+        });
         let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_refresh());
     });
 }
@@ -4439,6 +4623,11 @@ fn apply_active_bundle(
     statuses: &[(String, Option<bool>)],
     dropped_lookup: &HashMap<String, TxLookupStatus>,
     dropped_unspent: &HashMap<(String, u32), bool>,
+    // Fresh `/address/:a` stats to stamp as the store's scan fingerprint on
+    // a successful apply (429-politeness short-circuit, 2026-07-20).
+    // `None` = leave the existing stamp alone (stats endpoint failed, or a
+    // path that doesn't pre-check yet — the wallet-wide refresh).
+    new_stats: Option<AddrStats>,
 ) {
     match bundle {
         Ok(bundle) => {
@@ -4472,6 +4661,14 @@ fn apply_active_bundle(
                         println!("cb: spend-confirmed n={n}");
                     }
                     apply_dropped_checks(st.store.as_mut().unwrap(), dropped_lookup, dropped_unspent);
+                    if let Some(ns) = new_stats {
+                        // Stamped only AFTER a successful apply, and the
+                        // stats were fetched BEFORE the bundle — so a tx
+                        // landing in between leaves a stale-low stamp and
+                        // the next refresh does a full scan. Errs toward
+                        // rescanning, never toward skipping real changes.
+                        st.store.as_mut().unwrap().addr_stats = Some(ns);
+                    }
                     println!(
                         "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
                         stats.notes_seen,
@@ -4504,7 +4701,20 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
             println!("cb: refresh stale-drop address={}", &r.address[..12.min(r.address.len())]);
             continue;
         }
-        apply_active_bundle(w, st, r.bundle, &r.statuses, &r.dropped_lookup, &r.dropped_unspent);
+        let Some(bundle) = r.bundle else {
+            // Stats pre-check short-circuit: nothing moved on-chain or in
+            // the mempool since the stamped fingerprint — no bundle was
+            // fetched, the store is already current. Fees still land so
+            // compose estimates stay fresh.
+            if let Some(f) = r.fees {
+                st.fees = Some(f);
+            }
+            println!("cb: refresh unchanged");
+            w.set_status("up to date".into());
+            update_home(w, st);
+            continue;
+        };
+        apply_active_bundle(w, st, bundle, &r.statuses, &r.dropped_lookup, &r.dropped_unspent, r.new_stats);
         if w.get_screen() == 20 {
             update_funding_screen_ui(w, st);
             log_funding_refresh(st);
@@ -4564,6 +4774,9 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
                     &r.current_statuses,
                     &r.current_dropped_lookup,
                     &r.current_dropped_unspent,
+                    // The wallet-wide refresh doesn't stats-pre-check (yet)
+                    // — leave the store's fingerprint stamp alone.
+                    None,
                 );
             } else if let (Ok(bundle), Some(material)) = (&nr.bundle, &material) {
                 if apply_bundle_to_notebook_file(st, material, &notebook_spks, nr.index, bundle) {
@@ -4693,6 +4906,7 @@ fn spending_refresh_async(w: &AppWindow, st: &mut State) {
     w.set_status("scanning spending wallet…".into());
     let weak = w.as_weak();
     std::thread::spawn(move || {
+        let _net_guard = NetOpGuard::new(weak.clone());
         let material_parsed = parse_key_material(&material, network);
         let source = material_parsed
             .as_ref()
@@ -4768,7 +4982,7 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
             }
             Err(e) => {
                 println!("cb: spending-refresh err={e}");
-                w.set_status(format!("spending wallet scan failed: {e}").into());
+                w.set_status(format!("spending wallet scan failed: {}", friendly_net_err(&e)).into());
             }
         }
         update_spending_ui(w, st);
@@ -6896,7 +7110,10 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
                 refresh_compose(w, st);
             }
         }
-        Err(e) => w.set_status(format!("scan failed: {e}").into()),
+        Err(e) => {
+            println!("cb: funding-wallet scan err={e}");
+            w.set_status(format!("scan failed: {}", friendly_net_err(&e.to_string())).into());
+        }
     }
 }
 
@@ -9233,6 +9450,7 @@ pub fn run() {
         update_activity(&w, &s);
         let weak = w.as_weak();
         std::thread::spawn(move || {
+            let _net_guard = NetOpGuard::new(weak.clone());
             let client = ChainClient::new(HttpTransport::new(base), net);
             let result = last_txid
                 .ok_or_else(|| "nothing to rebroadcast".to_string())
@@ -10816,6 +11034,7 @@ pub fn run() {
         w.set_wallet_tx_busy(true);
         let weak = w.as_weak();
         std::thread::spawn(move || {
+            let _net_guard = NetOpGuard::new(weak.clone());
             let client = ChainClient::new(HttpTransport::new(&base), net);
             let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
             PSBT_BROADCAST_RESULTS
@@ -10904,6 +11123,7 @@ pub fn run() {
                 let raw = pending.raw_hex.clone();
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
                     let client = ChainClient::new(HttpTransport::new(&base), net);
                     let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
                     NOTEBOOK_COMPOSE_RESULTS.lock().expect("notebook compose results mutex").push(
@@ -10939,6 +11159,7 @@ pub fn run() {
                 let vsize = pending.vsize;
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
                     let client = ChainClient::new(HttpTransport::new(&base), net);
                     let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
                     SPENDING_COMPOSE_RESULTS.lock().expect("spending compose results mutex").push(
@@ -10994,6 +11215,7 @@ pub fn run() {
                 let vsize = pending.vsize;
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
                     let client = ChainClient::new(HttpTransport::new(&base), net);
                     let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
                     MIXED_COMPOSE_RESULTS.lock().expect("mixed compose results mutex").push(
@@ -11044,6 +11266,7 @@ pub fn run() {
                 let raw = pending.raw_hex.clone();
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
                     let client = ChainClient::new(HttpTransport::new(&base), net);
                     let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
                     SWEEP_BROADCAST_RESULTS
@@ -11066,6 +11289,7 @@ pub fn run() {
                 let raw = pending.raw_hex.clone();
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
                     let client = ChainClient::new(HttpTransport::new(&base), net);
                     let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
                     CONSOLIDATE_BROADCAST_RESULTS
@@ -11088,6 +11312,7 @@ pub fn run() {
                 let raw = pending.raw_hex.clone();
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
                     let client = ChainClient::new(HttpTransport::new(&base), net);
                     let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
                     WCONSOL_BROADCAST_RESULTS
@@ -11110,6 +11335,7 @@ pub fn run() {
                 let raw = pending.raw_hex.clone();
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
                     let client = ChainClient::new(HttpTransport::new(&base), net);
                     let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
                     SPENDING_CONSOLIDATE_RESULTS
@@ -11154,6 +11380,7 @@ pub fn run() {
                 let txid = pending.txid.clone();
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
                     let client = ChainClient::new(HttpTransport::new(&base), net);
                     let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
                     ACT_BUMP_RESULTS
@@ -11176,6 +11403,7 @@ pub fn run() {
                 let raw = pending.raw_hex.clone();
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
                     let client = ChainClient::new(HttpTransport::new(&base), net);
                     let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
                     ACT_RETRY_RESULTS

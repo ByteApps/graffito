@@ -790,9 +790,29 @@ component BackButton inherits Rectangle {
     }
 }
 
+// Ambient "network operation in flight" indicator: an ~8px accent-color
+// dot with a gentle opacity pulse, placed beside a screen's title. Space
+// is ALWAYS reserved (opacity, never `if`/layout-collapse) so a header's
+// layout never shifts as `busy` flips — the spinner-base.slint fluent
+// widget's animation-tick() pattern (no explicit `animate`: the engine
+// already re-evaluates a tick-dependent expression every frame). Subtle
+// on purpose — this is calm status, not an alert.
+component NetDot inherits Rectangle {
+    in property <bool> busy: false;
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: Pal.accent;
+    opacity: root.busy ? (0.35 + 0.45 * abs(sin(360deg * animation-tick() / 1.2s))) : 0;
+}
+
 component Header inherits HorizontalLayout {
     in property <string> title;
     in property <bool> show-back: true;
+    // Bound to `root.net-busy` only on the screens that show it (see
+    // per-screen Header{} instantiations below); every other Header stays
+    // at its default `false` — the dot never renders there.
+    in property <bool> net-busy: false;
     callback back;
     spacing: 8px;
     height: 40px;
@@ -805,6 +825,10 @@ component Header inherits HorizontalLayout {
         font-weight: 700;
         color: Pal.text;
         vertical-alignment: center;
+    }
+    VerticalLayout {
+        alignment: center;
+        NetDot { busy: root.net-busy; }
     }
     Rectangle { }
     @children
@@ -1381,6 +1405,12 @@ export component AppWindow inherits Window {
     // 6 compose · 7 contacts · 8 settings
     in-out property <int> screen: 0;
     in-out property <string> status; // in-out: back buttons clear stale messages
+
+    // Ambient "a network operation is in flight" signal — Rust flips this
+    // from a process-global op counter (NetOpGuard) around every worker
+    // thread that touches ChainClient/transport. Consumed by `NetDot` next
+    // to a screen's title; calm status, not an alert.
+    in-out property <bool> net-busy: false;
 
     // Transient "Copied" toast (auto-dismisses ~1.5s after the LAST copy).
     // Every copy affordance (copy-text/copy-value/psbt-copy) funnels here from
@@ -2333,6 +2363,10 @@ export component AppWindow inherits Window {
                 vertical-alignment: center;
                 overflow: elide;
             }
+            VerticalLayout {
+                alignment: center;
+                NetDot { busy: root.net-busy; }
+            }
             Rectangle { }
             SvgIconButton { icon: "refresh"; clicked => { root.refresh(); } }
             SvgIconButton { icon: "activity"; clicked => { root.open-activity(); } }
@@ -2557,6 +2591,10 @@ export component AppWindow inherits Window {
                 color: Pal.text;
                 vertical-alignment: center;
             }
+            VerticalLayout {
+                alignment: center;
+                NetDot { busy: root.net-busy; }
+            }
             Rectangle { }
             SvgIconButton { icon: "refresh"; clicked => { root.refresh-notebooks(); } }
             SvgIconButton { icon: "activity"; clicked => { root.open-activity(); } }
@@ -2694,6 +2732,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Note";
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
         }
         Card {
@@ -2750,6 +2789,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Compose";
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
         }
         Flickable {
@@ -3218,6 +3258,7 @@ export component AppWindow inherits Window {
         spacing: 12px;
         Header {
             title: "Settings";
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
         }
         Flickable {
@@ -3570,6 +3611,7 @@ export component AppWindow inherits Window {
         spacing: 12px;
         Header {
             title: "Coins";
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
             SvgIconButton { icon: "refresh"; clicked => { root.refresh-coins(); } }
         }
@@ -3689,6 +3731,7 @@ export component AppWindow inherits Window {
         spacing: 12px;
         Header {
             title: "Activity";
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
         }
         Caption { text: root.activity-summary; }
@@ -4001,6 +4044,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: root.sweep-kind == "consolidate" ? "Consolidate" : "Sweep";
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
         }
         Flickable {
