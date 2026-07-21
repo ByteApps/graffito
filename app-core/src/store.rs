@@ -256,6 +256,14 @@ pub struct Contact {
     /// assumption but is overkill for a 2-device contacts list).
     #[serde(default)]
     pub updated_at: u64,
+    /// Whether this contact is pushed to iCloud — per-contact opt-in
+    /// (2026-07-20), replacing the old all-contacts-sync behavior.
+    /// `#[serde(default)] = false` so every contact created before this
+    /// field shipped, and any brand-new contact, starts UNSYNCED (opt-in,
+    /// not opt-out) until the user explicitly checks "Save to iCloud" when
+    /// naming it.
+    #[serde(default)]
+    pub synced: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -962,7 +970,18 @@ impl Store {
             .unwrap_or_default();
         self.contacts.insert(
             0,
-            Contact { address: address.to_string(), name, network: self.network.clone(), updated_at: 0 },
+            Contact {
+                address: address.to_string(),
+                name,
+                network: self.network.clone(),
+                updated_at: 0,
+                // Device-local legacy contact creation never talks to
+                // iCloud — this list is no longer the device-level source
+                // of truth (see `Contact::network`'s doc comment), so a
+                // touched entry here starts unsynced like every other
+                // fresh contact.
+                synced: false,
+            },
         );
         self.contacts.truncate(20);
     }
