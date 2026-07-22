@@ -122,6 +122,23 @@ impl Drop for NetOpGuard {
     }
 }
 
+/// Push the scan-freshness gate to the UI: `wallet-scan-busy` is true while
+/// ANY scan that feeds a money-flow's coin cache is in flight (notebook
+/// refresh, spending-wallet scan, or the wallet-wide stores refresh). The
+/// Sign buttons on compose and screen 16 read it — see the field docs on
+/// `State.notebook_scan_busy`. Call after every counter/flag change.
+fn update_scan_gate(w: &AppWindow, st: &State) {
+    let busy = st.notebook_scan_busy > 0 || st.spending_scan_busy > 0 || st.wallet_stores_busy;
+    if busy != w.get_wallet_scan_busy() {
+        // Transition-only, like `cb: net-ops` — and a log contract: the UI
+        // e2e suites wait for `busy=false` before tapping a money-flow
+        // Sign (rapid ↻ retaps can queue several scans on a slow server;
+        // the gate stays closed until EVERY one lands).
+        println!("cb: scan-gate busy={busy}");
+    }
+    w.set_wallet_scan_busy(busy);
+}
+
 /// The last OBSERVED outcome of pushing `State.contacts` to iCloud's KV
 /// store (contacts sync-status UI, 2026-07-20). Global, not per-contact —
 /// `NSUbiquitousKeyValueStore.synchronize()` covers the whole blob in one
@@ -382,6 +399,22 @@ struct State {
     /// `apply_wallet_stores_refresh_results`'s own (fp8, network, account)
     /// staleness guard for the identity-switch-mid-scan case.
     wallet_stores_busy: bool,
+    /// Scan-freshness gate (2026-07-21, the stale-sign-window follow-up to
+    /// the 429-politeness work): COUNTS of in-flight notebook refreshes
+    /// (`refresh_async`) and spending-wallet scans
+    /// (`spending_refresh_async`). Counters, not bools — two overlapping
+    /// kicks must keep the gate closed until BOTH land. Incremented on the
+    /// UI thread right before each worker spawn; decremented once per
+    /// drained result in the apply half (BEFORE its staleness guard, so a
+    /// stale-dropped result still releases its slot). Money-flow Sign
+    /// buttons (compose + sweep/consolidate, screen 16) disable while
+    /// `wallet-scan-busy` — signing against a mid-scan coin cache builds a
+    /// tx that broadcasts into missing-inputs (loud + fund-safe, but
+    /// user-hostile; the window grows as public-host pacing slows scans).
+    /// Full serialization is the deferred network-operation-queue item in
+    /// PLAN-chain-notes-app.md.
+    notebook_scan_busy: u32,
+    spending_scan_busy: u32,
     /// The universal confirm screen (26) session in progress, if any — see
     /// [`PendingBroadcast`]. `show_confirm` sets it, `on_confirm_broadcast`
     /// consumes it, `on_confirm_cancel` drops it (leaving zero trace: stage
@@ -3341,6 +3374,7 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
         .collect();
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
     st.wallet_stores_busy = true;
+    update_scan_gate(w, st);
     w.set_status("syncing…".into());
     let weak = w.as_weak();
     std::thread::spawn(move || {
@@ -4560,6 +4594,8 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
     let prev_stats = st.store.as_ref().unwrap().addr_stats.clone();
     w.set_status("syncing…".into());
+    st.notebook_scan_busy += 1;
+    update_scan_gate(w, st);
     let weak = w.as_weak();
     std::thread::spawn(move || {
         let _net_guard = NetOpGuard::new(weak.clone());
@@ -4697,6 +4733,10 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
     let results: Vec<RefreshResult> =
         REFRESH_RESULTS.lock().expect("refresh results mutex").drain(..).collect();
     for r in results {
+        // Every drained result releases its scan-gate slot — BEFORE the
+        // staleness guard, or a stale-dropped scan would wedge the gate.
+        st.notebook_scan_busy = st.notebook_scan_busy.saturating_sub(1);
+        update_scan_gate(w, st);
         if st.ident.as_ref().map(|i| i.address.as_str()) != Some(r.address.as_str()) {
             println!("cb: refresh stale-drop address={}", &r.address[..12.min(r.address.len())]);
             continue;
@@ -4744,6 +4784,7 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
         WALLET_STORES_REFRESH_RESULTS.lock().expect("wallet stores refresh mutex").drain(..).collect();
     for r in results {
         st.wallet_stores_busy = false;
+        update_scan_gate(w, st);
         let label = r.purpose.label();
         if st.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
             || st.network != r.network
@@ -4898,12 +4939,27 @@ fn spending_refresh_async(w: &AppWindow, st: &mut State) {
     if !st.spending_capable {
         return;
     }
+    // Coalesce (2026-07-21, first slice of the deferred operation queue):
+    // the spending wallet is ONE tree per (identity, network, account) — a
+    // second concurrent scan of it can only return the same view, and the
+    // kick sources compound (↻ refreshes, sweep-open, compose CHANGE 5,
+    // the wallet-stores apply): without this, a burst queued DOZENS of
+    // identical ~80-request walks on a slow node and held the scan gate
+    // closed for minutes. If a kick races an identity/account switch, the
+    // in-flight scan stale-drops on apply and the next natural kick (boot
+    // refresh, ↻, sweep-open) rescans the new context.
+    if st.spending_scan_busy > 0 {
+        println!("cb: spending-refresh coalesced");
+        return;
+    }
     let Some(material) = st.material.clone() else { return };
     let Some(base) = st.base_url() else { return };
     let network = st.network;
     let account = st.account;
     let Some(fp8) = st.notebooks_fp8.clone() else { return };
     w.set_status("scanning spending wallet…".into());
+    st.spending_scan_busy += 1;
+    update_scan_gate(w, st);
     let weak = w.as_weak();
     std::thread::spawn(move || {
         let _net_guard = NetOpGuard::new(weak.clone());
@@ -4953,6 +5009,10 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
     let results: Vec<SpendingRefreshResult> =
         SPENDING_REFRESH_RESULTS.lock().expect("spending refresh mutex").drain(..).collect();
     for r in results {
+        // Release the scan-gate slot BEFORE the staleness guard — a
+        // stale-dropped scan must not wedge the gate closed.
+        st.spending_scan_busy = st.spending_scan_busy.saturating_sub(1);
+        update_scan_gate(w, st);
         if st.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
             || st.network != r.network
             || st.account != r.account
@@ -8498,6 +8558,8 @@ pub fn run() {
         payfrom_manual: false,
         wallet_tx_busy: false,
         wallet_stores_busy: false,
+        notebook_scan_busy: 0,
+        spending_scan_busy: 0,
         pending_broadcast: None,
         contacts: initial_state.contacts,
         tombstones: initial_state.tombstones,
@@ -9956,6 +10018,14 @@ pub fn run() {
     });
 
     cb!(on_sweep_send, |w, s| {
+        // Scan-freshness gate (belt to the UI button's braces — an e2e tap
+        // or a race can land on a just-disabled button): never build a
+        // sweep/consolidate off a coin cache a scan is about to replace.
+        if w.get_wallet_scan_busy() {
+            println!("cb: sign-gate busy kind=sweep");
+            w.set_status("still syncing — one moment".into());
+            return;
+        }
         let dest = w.get_sweep_dest().to_string();
         let net = s.network;
         let Ok(recipient) = Recipient::parse(net, &dest) else {
@@ -11452,6 +11522,12 @@ pub fn run() {
         if s.compose_busy {
             return;
         }
+        // Scan-freshness gate — see on_sweep_send.
+        if w.get_wallet_scan_busy() {
+            println!("cb: sign-gate busy kind=compose");
+            w.set_status("still syncing — one moment".into());
+            return;
+        }
         let text = w.get_compose_text().to_string();
         let private = w.get_compose_private();
         let rate: f64 = w.get_rate_text().parse().unwrap_or(0.0);
@@ -11695,6 +11771,12 @@ pub fn run() {
     // recipe exactly.
     cb!(on_spending_compose_send, |w, s| {
         if s.compose_busy {
+            return;
+        }
+        // Scan-freshness gate — see on_sweep_send.
+        if w.get_wallet_scan_busy() {
+            println!("cb: sign-gate busy kind=spending-compose");
+            w.set_status("still syncing — one moment".into());
             return;
         }
         let text = w.get_compose_text().to_string();
@@ -11955,6 +12037,12 @@ pub fn run() {
     // signatures plus an external signer's, on one PSBT).
     cb!(on_compose_send_mixed, |w, s| {
         if s.compose_busy {
+            return;
+        }
+        // Scan-freshness gate — see on_sweep_send.
+        if w.get_wallet_scan_busy() {
+            println!("cb: sign-gate busy kind=mixed-compose");
+            w.set_status("still syncing — one moment".into());
             return;
         }
         let text = w.get_compose_text().to_string();

@@ -1412,6 +1412,14 @@ export component AppWindow inherits Window {
     // to a screen's title; calm status, not an alert.
     in-out property <bool> net-busy: false;
 
+    // Scan-freshness gate (update_scan_gate in Rust): true while any scan
+    // that feeds a money-flow's coin cache is in flight (notebook refresh /
+    // spending scan / wallet-wide stores refresh). Money-flow Sign buttons
+    // disable on it — signing a mid-scan coin cache builds a tx that can
+    // only fail loudly on broadcast (missing-inputs). Distinct from
+    // net-busy, which also covers broadcasts and probes.
+    in-out property <bool> wallet-scan-busy: false;
+
     // Transient "Copied" toast (auto-dismisses ~1.5s after the LAST copy).
     // Every copy affordance (copy-text/copy-value/psbt-copy) funnels here from
     // Rust; toast-nonce bumps on each show. toast-ticks is a countdown (in
@@ -3070,22 +3078,25 @@ export component AppWindow inherits Window {
                 : "⚠  Public notes are world-readable, forever.";
         }
         if root.mixed-linkage-hint: PrimaryButton {
-            text: root.compose-sending ? root.compose-progress-label : "Sign + review…";
-            tint: (root.spend-enough && !root.compose-sending) ? Pal.accent : Pal.faint;
-            tint-hover: (root.spend-enough && !root.compose-sending) ? Pal.accent-hover : Pal.faint;
-            clicked => { if (root.spend-enough && !root.compose-sending) { root.compose-send-mixed(); } }
+            text: root.compose-sending ? root.compose-progress-label
+                : root.wallet-scan-busy ? "Syncing…" : "Sign + review…";
+            tint: (root.spend-enough && !root.compose-sending && !root.wallet-scan-busy) ? Pal.accent : Pal.faint;
+            tint-hover: (root.spend-enough && !root.compose-sending && !root.wallet-scan-busy) ? Pal.accent-hover : Pal.faint;
+            clicked => { if (root.spend-enough && !root.compose-sending && !root.wallet-scan-busy) { root.compose-send-mixed(); } }
         }
         if !root.mixed-linkage-hint && root.pay-from == "notebook": PrimaryButton {
-            text: root.compose-sending ? root.compose-progress-label : (root.watch-only ? "Build transaction to sign" : "Sign + review…");
-            tint: (root.spend-enough && !root.compose-sending) ? Pal.accent : Pal.faint;
-            tint-hover: (root.spend-enough && !root.compose-sending) ? Pal.accent-hover : Pal.faint;
-            clicked => { if (root.spend-enough && !root.compose-sending) { root.compose-send(); } }
+            text: root.compose-sending ? root.compose-progress-label
+                : root.wallet-scan-busy ? "Syncing…" : (root.watch-only ? "Build transaction to sign" : "Sign + review…");
+            tint: (root.spend-enough && !root.compose-sending && !root.wallet-scan-busy) ? Pal.accent : Pal.faint;
+            tint-hover: (root.spend-enough && !root.compose-sending && !root.wallet-scan-busy) ? Pal.accent-hover : Pal.faint;
+            clicked => { if (root.spend-enough && !root.compose-sending && !root.wallet-scan-busy) { root.compose-send(); } }
         }
         if !root.mixed-linkage-hint && root.pay-from == "spending": PrimaryButton {
-            text: root.compose-sending ? root.compose-progress-label : "Sign + review…";
-            tint: (root.spend-enough && !root.compose-sending) ? Pal.accent : Pal.faint;
-            tint-hover: (root.spend-enough && !root.compose-sending) ? Pal.accent-hover : Pal.faint;
-            clicked => { if (root.spend-enough && !root.compose-sending) { root.spending-compose-send(); } }
+            text: root.compose-sending ? root.compose-progress-label
+                : root.wallet-scan-busy ? "Syncing…" : "Sign + review…";
+            tint: (root.spend-enough && !root.compose-sending && !root.wallet-scan-busy) ? Pal.accent : Pal.faint;
+            tint-hover: (root.spend-enough && !root.compose-sending && !root.wallet-scan-busy) ? Pal.accent-hover : Pal.faint;
+            clicked => { if (root.spend-enough && !root.compose-sending && !root.wallet-scan-busy) { root.spending-compose-send(); } }
         }
         if !root.mixed-linkage-hint && root.fund-external: PrimaryButton {
             text: root.funding-ready ? "Build transaction to sign" : "Set a funding wallet first";
@@ -4231,20 +4242,28 @@ export component AppWindow inherits Window {
                     }
                 }
                 if !root.sweep-fund-external && !root.watch-only: PrimaryButton {
-                    text: root.sweep-kind == "consolidate" ? "Consolidate — sign + review…" : "Sweep — sign + review…";
-                    clicked => { root.sweep-send(); }
+                    text: root.wallet-scan-busy ? "Syncing…"
+                        : root.sweep-kind == "consolidate" ? "Consolidate — sign + review…" : "Sweep — sign + review…";
+                    tint: root.wallet-scan-busy ? Pal.faint : Pal.accent;
+                    tint-hover: root.wallet-scan-busy ? Pal.faint : Pal.accent-hover;
+                    clicked => { if (!root.wallet-scan-busy) { root.sweep-send(); } }
                 }
                 if !root.sweep-fund-external && root.watch-only: PrimaryButton {
-                    text: "Build transaction to sign";
-                    clicked => { root.sweep-send(); }
+                    text: root.wallet-scan-busy ? "Syncing…" : "Build transaction to sign";
+                    tint: root.wallet-scan-busy ? Pal.faint : Pal.accent;
+                    tint-hover: root.wallet-scan-busy ? Pal.faint : Pal.accent-hover;
+                    clicked => { if (!root.wallet-scan-busy) { root.sweep-send(); } }
                 }
                 if root.sweep-fund-external: PrimaryButton {
-                    text: root.funding-ready ? "Build transaction to sign" : "Set a funding wallet first";
+                    text: !root.funding-ready ? "Set a funding wallet first"
+                        : root.wallet-scan-busy ? "Syncing…" : "Build transaction to sign";
+                    tint: (root.funding-ready && root.wallet-scan-busy) ? Pal.faint : Pal.accent;
+                    tint-hover: (root.funding-ready && root.wallet-scan-busy) ? Pal.faint : Pal.accent-hover;
                     clicked => {
                         if (!root.funding-ready) {
                             root.funding-return = 16;
                             root.open-funding();
-                        } else {
+                        } else if (!root.wallet-scan-busy) {
                             root.sweep-send();
                         }
                     }
