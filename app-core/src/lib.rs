@@ -21,6 +21,7 @@ pub mod netq;
 pub mod notebooks;
 pub mod psbt_build;
 pub mod psbt_finalize;
+pub mod scan_gate;
 pub mod spending;
 pub mod ur;
 pub mod ur_account;

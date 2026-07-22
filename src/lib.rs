@@ -224,9 +224,9 @@ fn spawn_scan_lane_worker(id: app_core::netq::JobId, key: String, job: Box<dyn F
 /// ANY scan that feeds a money-flow's coin cache is in flight (notebook
 /// refresh, spending-wallet scan, or the wallet-wide stores refresh). The
 /// Sign buttons on compose and screen 16 read it — see the field docs on
-/// `State.notebook_scan_busy`. Call after every counter/flag change.
+/// `State.scan_gate`. Call after every counter/flag change.
 fn update_scan_gate(w: &AppWindow, st: &State) {
-    let busy = st.notebook_scan_busy > 0 || st.spending_scan_busy > 0 || st.wallet_stores_busy;
+    let busy = st.scan_gate.busy();
     if busy != w.get_wallet_scan_busy() {
         // Transition-only, like `cb: net-ops` — and a log contract: the UI
         // e2e suites wait for `busy=false` before tapping a money-flow
@@ -496,14 +496,15 @@ struct State {
     /// than overlapping store-file writes) — see
     /// `apply_wallet_stores_refresh_results`'s own (fp8, network, account)
     /// staleness guard for the identity-switch-mid-scan case.
-    wallet_stores_busy: bool,
     /// Scan-freshness gate (2026-07-21, the stale-sign-window follow-up to
-    /// the 429-politeness work): COUNTS of in-flight notebook refreshes
-    /// (`refresh_async`) and spending-wallet scans
-    /// (`spending_refresh_async`). Counters, not bools — two overlapping
-    /// kicks must keep the gate closed until BOTH land. Incremented on the
-    /// UI thread right before each worker spawn; decremented once per
-    /// drained result in the apply half (BEFORE its staleness guard, so a
+    /// the 429-politeness work): tracks in-flight notebook refreshes
+    /// (`refresh_async`), spending-wallet scans (`spending_refresh_async`),
+    /// and a wallet-wide stores refresh (`wallet_stores_refresh_async`) —
+    /// the pure counter/flag bookkeeping lives in
+    /// `app_core::scan_gate::ScanGate` (host-tested there), this field is
+    /// just where `State` holds one. Incremented/set on the UI thread right
+    /// before each worker spawn; decremented/cleared once per drained
+    /// result in the apply half (BEFORE its staleness guard, so a
     /// stale-dropped result still releases its slot). Money-flow Sign
     /// buttons (compose + sweep/consolidate, screen 16) disable while
     /// `wallet-scan-busy` — signing against a mid-scan coin cache builds a
@@ -511,8 +512,7 @@ struct State {
     /// user-hostile; the window grows as public-host pacing slows scans).
     /// Full serialization is the deferred network-operation-queue item in
     /// PLAN-chain-notes-app.md.
-    notebook_scan_busy: u32,
-    spending_scan_busy: u32,
+    scan_gate: app_core::scan_gate::ScanGate,
     /// The universal confirm screen (26) session in progress, if any — see
     /// [`PendingBroadcast`]. `show_confirm` sets it, `on_confirm_broadcast`
     /// consumes it, `on_confirm_cancel` drops it (leaving zero trace: stage
@@ -3426,11 +3426,11 @@ static WALLET_STORES_REFRESH_RESULTS: std::sync::Mutex<Vec<WalletStoresRefreshRe
 ///
 /// Goes through the [`SCAN_LANE`] queue (2026-07-21) keyed
 /// `wstores/<fp8>/<network>/<account>`, behind the existing
-/// `wallet_stores_busy` early-return above (kept as-is). Gate-flag +
-/// status only set when [`scan_lane_submit`] returns `true`.
+/// `scan_gate.wallet_stores_busy()` early-return above (kept as-is).
+/// Gate-flag + status only set when [`scan_lane_submit`] returns `true`.
 fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletStoresPurpose) {
     let label = purpose.label();
-    if st.wallet_stores_busy {
+    if st.scan_gate.wallet_stores_busy() {
         println!("cb: {label} busy");
         return;
     }
@@ -3516,7 +3516,7 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
         let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_stores_refresh());
     };
     if scan_lane_submit(key, job) {
-        st.wallet_stores_busy = true;
+        st.scan_gate.set_wallet_stores(true);
         update_scan_gate(w, st);
         w.set_status("syncing…".into());
     }
@@ -4772,7 +4772,7 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
     };
     if scan_lane_submit(key, job) {
         w.set_status("syncing…".into());
-        st.notebook_scan_busy += 1;
+        st.scan_gate.admit_notebook();
         update_scan_gate(w, st);
     }
 }
@@ -4869,7 +4869,7 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
     for r in results {
         // Every drained result releases its scan-gate slot — BEFORE the
         // staleness guard, or a stale-dropped scan would wedge the gate.
-        st.notebook_scan_busy = st.notebook_scan_busy.saturating_sub(1);
+        st.scan_gate.drain_notebook();
         update_scan_gate(w, st);
         if st.ident.as_ref().map(|i| i.address.as_str()) != Some(r.address.as_str()) {
             println!("cb: refresh stale-drop address={}", &r.address[..12.min(r.address.len())]);
@@ -4917,7 +4917,7 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
     let results: Vec<WalletStoresRefreshResult> =
         WALLET_STORES_REFRESH_RESULTS.lock().expect("wallet stores refresh mutex").drain(..).collect();
     for r in results {
-        st.wallet_stores_busy = false;
+        st.scan_gate.set_wallet_stores(false);
         update_scan_gate(w, st);
         let label = r.purpose.label();
         if st.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
@@ -5072,7 +5072,7 @@ static SPENDING_REFRESH_RESULTS: std::sync::Mutex<Vec<SpendingRefreshResult>> =
 ///
 /// Also goes through the [`SCAN_LANE`] queue (2026-07-21) keyed
 /// `spscan/<fp8>/<network>/<account>` — a SECOND, general layer behind
-/// the `spending_scan_busy > 0` early-return above. That early-return
+/// the `scan_gate.spending_busy()` early-return above. That early-return
 /// stays because it covers the wider enqueue→apply window (a scan that
 /// already landed on the worker thread but hasn't finished applying on
 /// the UI thread yet); the lane additionally serializes/coalesces at
@@ -5091,7 +5091,7 @@ fn spending_refresh_async(w: &AppWindow, st: &mut State) {
     // closed for minutes. If a kick races an identity/account switch, the
     // in-flight scan stale-drops on apply and the next natural kick (boot
     // refresh, ↻, sweep-open) rescans the new context.
-    if st.spending_scan_busy > 0 {
+    if st.scan_gate.spending_busy() {
         println!("cb: spending-refresh coalesced");
         return;
     }
@@ -5126,7 +5126,7 @@ fn spending_refresh_async(w: &AppWindow, st: &mut State) {
     };
     if scan_lane_submit(key, job) {
         w.set_status("scanning spending wallet…".into());
-        st.spending_scan_busy += 1;
+        st.scan_gate.admit_spending();
         update_scan_gate(w, st);
     }
 }
@@ -5157,7 +5157,7 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
     for r in results {
         // Release the scan-gate slot BEFORE the staleness guard — a
         // stale-dropped scan must not wedge the gate closed.
-        st.spending_scan_busy = st.spending_scan_busy.saturating_sub(1);
+        st.scan_gate.drain_spending();
         update_scan_gate(w, st);
         if st.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
             || st.network != r.network
@@ -8703,9 +8703,7 @@ pub fn run() {
         act_pending_ref: None,
         payfrom_manual: false,
         wallet_tx_busy: false,
-        wallet_stores_busy: false,
-        notebook_scan_busy: 0,
-        spending_scan_busy: 0,
+        scan_gate: app_core::scan_gate::ScanGate::new(),
         pending_broadcast: None,
         contacts: initial_state.contacts,
         tombstones: initial_state.tombstones,
