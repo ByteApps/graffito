@@ -790,32 +790,32 @@ component BackButton inherits Rectangle {
     }
 }
 
-// Ambient "wallet sync in flight" indicator: an ~8px accent-color dot
-// beside a screen's title. Space is ALWAYS reserved (opacity, never
-// `if`/layout-collapse) so a header's layout never shifts as `busy`
-// flips. STATIC on purpose — the original opacity pulse read as
-// perpetual blinking (Sal, 2026-07-21): with paced public-host scans a
-// sync legitimately runs for tens of seconds, and an animated dot that
-// long is an irritant, not information. Bound to the scan gate
-// (`wallet-scan-busy`, i.e. "syncing wallet data"), NOT the all-ops
-// `net-busy` counter — broadcasts are brief and already have explicit
-// button progress labels.
+// Ambient "network operation in flight" indicator: an ~8px accent-color
+// dot with a gentle opacity pulse, placed beside a screen's title. Space
+// is ALWAYS reserved (opacity, never `if`/layout-collapse) so a header's
+// layout never shifts as `busy` flips — animation-tick() is only read in
+// the busy branch, so an idle dot costs no per-frame repaints. Pulsing
+// while active is DELIBERATE (Sal, 2026-07-21: wants the blink for real
+// activity — the earlier complaint was that pre-queue scan storms + 429
+// retry stacking made it look never-ending/stuck; the operation queue's
+// coalescing + serial lane bounds that at the source, so the dot's
+// on-time now honestly tracks one operation's duration).
 component NetDot inherits Rectangle {
     in property <bool> busy: false;
     width: 8px;
     height: 8px;
     border-radius: 4px;
     background: Pal.accent;
-    opacity: root.busy ? 0.55 : 0;
+    opacity: root.busy ? (0.35 + 0.45 * abs(sin(360deg * animation-tick() / 1.2s))) : 0;
 }
 
 component Header inherits HorizontalLayout {
     in property <string> title;
     in property <bool> show-back: true;
-    // Bound to `root.wallet-scan-busy` only on the screens that show it
-    // (see per-screen Header{} instantiations below); every other Header
-    // stays at its default `false` — the dot never renders there.
-    in property <bool> sync-busy: false;
+    // Bound to `root.net-busy` only on the screens that show it (see
+    // per-screen Header{} instantiations below); every other Header stays
+    // at its default `false` — the dot never renders there.
+    in property <bool> net-busy: false;
     callback back;
     spacing: 8px;
     height: 40px;
@@ -831,7 +831,7 @@ component Header inherits HorizontalLayout {
     }
     VerticalLayout {
         alignment: center;
-        NetDot { busy: root.sync-busy; }
+        NetDot { busy: root.net-busy; }
     }
     Rectangle { }
     @children
@@ -1411,10 +1411,10 @@ export component AppWindow inherits Window {
 
     // Ambient "a network operation is in flight" signal — Rust flips this
     // from a process-global op counter (NetOpGuard) around every worker
-    // thread that touches ChainClient/transport. No UI consumes it since
-    // 2026-07-21 (the title dot moved to `wallet-scan-busy` below — the
-    // all-ops signal made the dot near-permanent on slow networks); kept
-    // maintained for future use (e.g. a debug/diagnostics surface).
+    // thread that touches ChainClient/transport. Consumed by `NetDot` next
+    // to a screen's title (pulse while active — Sal wants the blink; the
+    // operation queue's coalescing + serial scan lane is what keeps the
+    // on-time honest, see NetDot's own comment).
     in-out property <bool> net-busy: false;
 
     // Scan-freshness gate (update_scan_gate in Rust): true while any scan
@@ -2378,7 +2378,7 @@ export component AppWindow inherits Window {
             }
             VerticalLayout {
                 alignment: center;
-                NetDot { busy: root.wallet-scan-busy; }
+                NetDot { busy: root.net-busy; }
             }
             Rectangle { }
             SvgIconButton { icon: "refresh"; clicked => { root.refresh(); } }
@@ -2606,7 +2606,7 @@ export component AppWindow inherits Window {
             }
             VerticalLayout {
                 alignment: center;
-                NetDot { busy: root.wallet-scan-busy; }
+                NetDot { busy: root.net-busy; }
             }
             Rectangle { }
             SvgIconButton { icon: "refresh"; clicked => { root.refresh-notebooks(); } }
@@ -2745,7 +2745,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Note";
-            sync-busy: root.wallet-scan-busy;
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
         }
         Card {
@@ -2802,7 +2802,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: "Compose";
-            sync-busy: root.wallet-scan-busy;
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
         }
         Flickable {
@@ -3274,7 +3274,7 @@ export component AppWindow inherits Window {
         spacing: 12px;
         Header {
             title: "Settings";
-            sync-busy: root.wallet-scan-busy;
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
         }
         Flickable {
@@ -3627,7 +3627,7 @@ export component AppWindow inherits Window {
         spacing: 12px;
         Header {
             title: "Coins";
-            sync-busy: root.wallet-scan-busy;
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
             SvgIconButton { icon: "refresh"; clicked => { root.refresh-coins(); } }
         }
@@ -3747,7 +3747,7 @@ export component AppWindow inherits Window {
         spacing: 12px;
         Header {
             title: "Activity";
-            sync-busy: root.wallet-scan-busy;
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
         }
         Caption { text: root.activity-summary; }
@@ -4060,7 +4060,7 @@ export component AppWindow inherits Window {
         alignment: start;
         Header {
             title: root.sweep-kind == "consolidate" ? "Consolidate" : "Sweep";
-            sync-busy: root.wallet-scan-busy;
+            net-busy: root.net-busy;
             back => { root.nav-back(); }
         }
         Flickable {
