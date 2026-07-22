@@ -2736,9 +2736,12 @@ fn ensure_notebook(st: &mut State, index: u32) {
 }
 
 /// "Home" for flows that end at the active notebook — unless the active
-/// account has no notebook entry (create-seed just finished, an iCloud
-/// restore onto a fresh install), in which case home would be a trap only
-/// reachable by accident: land on the notebook list instead.
+/// account has no notebook entry, in which case home would be a trap only
+/// reachable by accident: land on the notebook list instead. Since the
+/// onboarding unification (Sal 2026-07-21: create/import/restore all
+/// ensure notebook 0 and open its home) the unlisted case is rare —
+/// e.g. an account whose every notebook was archived — but the guard
+/// stays for exactly those.
 /// Wipe any revealed key-export material from the UI (nav away / reset /
 /// hide) AND drop the cached private-reveal formats (`State.reveal_formats`
 /// — the only place a freshly-authenticated secret is held; dropping it
@@ -9095,10 +9098,14 @@ pub fn run() {
                     Ok(()) => {
                         println!("cb: restore-icloud ok");
                         w.set_icloud_backup(true);
-                        // A fresh install restoring a hierarchical key has no
-                        // notebook index yet — land on the (empty) list, not
-                        // an unlisted account's home.
-                        go_home_or_list(&w, &s);
+                        // Onboarding unification (Sal 2026-07-21): a restore
+                        // behaves like an import — the account's notebook 0
+                        // exists (idempotent for a same-device restore that
+                        // still has its index file) and its home opens; gap
+                        // discovery re-adds funded notebooks behind it.
+                        ensure_notebook(&mut s, 0);
+                        w.set_screen(4);
+                        update_home(&w, &s);
                         refresh_async(&w, &mut s);
                         spending_refresh_async(&w, &mut s); // CHANGE 5
                     }
@@ -9156,10 +9163,16 @@ pub fn run() {
             Ok(()) => {
                 s.pending_mnemonic = None;
                 w.set_status("".into());
-                // A brand-new seed has NO notebooks (Sal 2026-07-11:
-                // onboarding must not auto-create one) — land on the empty
-                // list; the first notebook is created deliberately there.
-                go_home_or_list(&w, &s);
+                // Onboarding unification (Sal 2026-07-21, superseding the
+                // 2026-07-11 empty-list rule): creating a seed behaves
+                // exactly like importing one — the account's notebook 0
+                // (the FIRST receive address) is created and its home
+                // opens. More notebooks are added from the list later;
+                // unwanted ones archive. An empty list straight after
+                // onboarding read as a dead end.
+                ensure_notebook(&mut s, 0);
+                w.set_screen(4);
+                update_home(&w, &s);
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s); // CHANGE 5
             }
