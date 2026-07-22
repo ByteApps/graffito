@@ -122,6 +122,104 @@ impl Drop for NetOpGuard {
     }
 }
 
+/// The deferred network-operation queue's SCAN lane (design:
+/// `../PLAN-chain-notes-app.md` "Deferred: network operation queue" — the
+/// scan-freshness gate counters and `spending_refresh_async`'s
+/// coalescing early-return shipped as earlier slices; this is the general
+/// scheduling mechanism behind them). `app_core::netq::Lane` is the pure
+/// admit/complete state machine; this Mutex pairs it with the boxed job
+/// closures for whatever is currently RUNNING or QUEUED (the pure Lane
+/// only ever tracks keys/ids, never the work itself). `HashMap::new` isn't
+/// `const`, hence `LazyLock` rather than a plain `Mutex::new(..)` static
+/// like the `*_RESULTS` ones below.
+///
+/// **Deliberate priority bypass**: ONLY the four scan-class spawn sites
+/// migrated to this lane (`refresh_async`, `spending_refresh_async`,
+/// `wallet_stores_refresh_async`, `maybe_start_discovery`'s worker).
+/// EVERYTHING ELSE — all nine broadcast paths, act-retry/bump fetches,
+/// the account-picker probe (`show_notebook_picker`), iCloud ops — stays
+/// a plain `std::thread::spawn`: money movements and user-facing probes
+/// must never wait behind a queued scan.
+static SCAN_LANE: std::sync::LazyLock<
+    std::sync::Mutex<(app_core::netq::Lane, HashMap<app_core::netq::JobId, Box<dyn FnOnce() + Send>>)>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new((app_core::netq::Lane::new(), HashMap::new())));
+
+/// Submit a scan-class job to [`SCAN_LANE`] — the impure half of
+/// `app_core::netq::Lane`'s pure admission rules. `key` identifies the
+/// operation class + identity/network/account it scans (e.g.
+/// `format!("nbscan/{address}")`); `job` is the SAME worker-thread body a
+/// call site used to hand straight to `std::thread::spawn` (unchanged —
+/// its `NetOpGuard`, result push, and `upgrade_in_event_loop` trampoline
+/// all stay exactly as they were).
+///
+/// Returns `false` when the lane coalesced this submission (a job with
+/// the same key was already queued) — the caller must then skip its own
+/// gate-counter increment and status line, since no work was actually
+/// scheduled; the `cb: netq coalesced …` line below is the only trace.
+/// Returns `true` when the job either started running immediately or was
+/// queued behind another already-running job for a different (or the
+/// same, mid-scan) key.
+fn scan_lane_submit(key: String, job: impl FnOnce() + Send + 'static) -> bool {
+    let short = key[..24.min(key.len())].to_string();
+    let mut guard = SCAN_LANE.lock().expect("scan lane mutex");
+    let (lane, jobs) = &mut *guard;
+    match lane.admit(&key) {
+        app_core::netq::Admit::Coalesced => {
+            println!("cb: netq coalesced key={short}");
+            false
+        }
+        app_core::netq::Admit::Queued(id) => {
+            jobs.insert(id, Box::new(job));
+            println!("cb: netq queued key={short} depth={}", lane.depth());
+            true
+        }
+        app_core::netq::Admit::Run(id) => {
+            drop(guard);
+            spawn_scan_lane_worker(id, key, Box::new(job));
+            true
+        }
+    }
+}
+
+/// Runs one already-admitted (`Admit::Run`) scan-class job on a fresh
+/// worker thread, then drains [`SCAN_LANE`]'s queue behind it: on
+/// completion it re-locks the lane, calls `Lane::complete`, and if that
+/// promotes a queued job, takes its boxed closure out of the job map and
+/// runs it next — looping until `complete` returns `None` (nothing left
+/// queued). The lane lock is held only for the quick admit/complete/
+/// lookup bookkeeping between jobs, never while a job itself runs.
+///
+/// Each job runs inside `catch_unwind` so a panicking scan logs
+/// `cb: netq panic key=<trunc>` and the drain CONTINUES — a panicking
+/// scan must not wedge the lane for every job queued behind it. Gate
+/// counters are NOT repaired on a panic (a pre-existing risk this queue
+/// doesn't change).
+fn spawn_scan_lane_worker(id: app_core::netq::JobId, key: String, job: Box<dyn FnOnce() + Send>) {
+    std::thread::spawn(move || {
+        let mut id = id;
+        let mut key = key;
+        let mut job = job;
+        loop {
+            let short = key[..24.min(key.len())].to_string();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                println!("cb: netq panic key={short}");
+            }
+            let mut guard = SCAN_LANE.lock().expect("scan lane mutex");
+            let (lane, jobs) = &mut *guard;
+            let Some((next_id, next_key)) = lane.complete(id) else {
+                break;
+            };
+            let Some(next_job) = jobs.remove(&next_id) else {
+                break; // never observed: complete() only promotes a job this lane itself queued
+            };
+            drop(guard);
+            id = next_id;
+            key = next_key;
+            job = next_job;
+        }
+    });
+}
+
 /// Push the scan-freshness gate to the UI: `wallet-scan-busy` is true while
 /// ANY scan that feeds a money-flow's coin cache is in flight (notebook
 /// refresh, spending-wallet scan, or the wallet-wide stores refresh). The
@@ -3322,6 +3420,11 @@ static WALLET_STORES_REFRESH_RESULTS: std::sync::Mutex<Vec<WalletStoresRefreshRe
 /// is ignored (simpler than overlapping store-file writes) rather than
 /// queued; see [`WalletStoresRefreshResult`]'s doc comment for the
 /// staleness guards applied when the result lands.
+///
+/// Goes through the [`SCAN_LANE`] queue (2026-07-21) keyed
+/// `wstores/<fp8>/<network>/<account>`, behind the existing
+/// `wallet_stores_busy` early-return above (kept as-is). Gate-flag +
+/// status only set when [`scan_lane_submit`] returns `true`.
 fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletStoresPurpose) {
     let label = purpose.label();
     if st.wallet_stores_busy {
@@ -3373,11 +3476,9 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
         .flat_map(|t| t.txids.iter().cloned())
         .collect();
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
-    st.wallet_stores_busy = true;
-    update_scan_gate(w, st);
-    w.set_status("syncing…".into());
+    let key = format!("wstores/{fp8}/{}/{account}", network.as_str());
     let weak = w.as_weak();
-    std::thread::spawn(move || {
+    let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
         let client = ChainClient::new(HttpTransport::new(base), network);
         let results: Vec<NotebookBundleResult> = all
@@ -3410,7 +3511,12 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
                 results,
             });
         let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_stores_refresh());
-    });
+    };
+    if scan_lane_submit(key, job) {
+        st.wallet_stores_busy = true;
+        update_scan_gate(w, st);
+        w.set_status("syncing…".into());
+    }
 }
 
 /// One finished notebook gap-discovery walk (worker thread), waiting to be
@@ -4535,6 +4641,14 @@ static PICKER_PROBE_RESULTS: std::sync::Mutex<Vec<PickerProbeResult>> =
 /// pending, so setting a node later (any refresh) retries. Results land
 /// through [`DISCOVERY_RESULTS`] + the `apply-pending-discovery`
 /// trampoline; callers are all post-first-frame (iOS launch rule).
+///
+/// Goes through the [`SCAN_LANE`] queue (2026-07-21) keyed
+/// `discovery/<fp8>/<account>` — no gate counter here (discovery has
+/// none), so this is just a submit: `discovery_pending` only clears when
+/// [`scan_lane_submit`] returns `true` (admitted to run or queued); a
+/// coalesced submission leaves the flag set so the NEXT natural kick
+/// (another refresh) retries — matching the pre-queue "no node configured
+/// → stays pending" behavior above.
 fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
     if !st.discovery_pending {
         return;
@@ -4542,11 +4656,11 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
     let Some(base) = st.base_url() else { return };
     let Some(material_str) = st.material.clone() else { return };
     let Some(fp8) = st.notebooks_fp8.clone() else { return };
-    st.discovery_pending = false;
     let network = st.network;
     let account = st.account;
+    let key = format!("discovery/{fp8}/{account}");
     let weak = w.as_weak();
-    std::thread::spawn(move || {
+    let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
         let found = parse_key_material(&material_str, network)
             .map(|material| {
@@ -4560,7 +4674,10 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
             .expect("discovery results mutex")
             .push(DiscoveryResult { fp8, network, account, found });
         let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_discovery());
-    });
+    };
+    if scan_lane_submit(key, job) {
+        st.discovery_pending = false;
+    }
 }
 
 /// [`refresh`] with the network half on a worker thread (Sal 2026-07-11:
@@ -4571,6 +4688,17 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
 /// [`REFRESH_RESULTS`] + the `apply-pending-refresh` trampoline callback
 /// (the UI thread applies it with full State access, exactly like the
 /// synchronous refresh did).
+///
+/// Goes through the [`SCAN_LANE`] operation queue (2026-07-21) keyed
+/// `nbscan/<address>`: the gate-counter increment + "syncing…" status
+/// only fire when [`scan_lane_submit`] returns `true` (job admitted to
+/// run or queued) — a coalesced submission (same address already
+/// queued) skips both, since no scan will actually run on its behalf and
+/// the executor's own `cb: netq coalesced …` line already logged it.
+/// Building the job closure first and submitting before touching any
+/// counter is safe because we're on the UI thread and the eventual
+/// result apply only ever runs as a LATER event-loop callback — the
+/// increment always precedes whatever decrement it pairs with.
 fn refresh_async(w: &AppWindow, st: &mut State) {
     if st.ident.is_none() || st.store.is_none() {
         return;
@@ -4593,11 +4721,9 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
         .collect();
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
     let prev_stats = st.store.as_ref().unwrap().addr_stats.clone();
-    w.set_status("syncing…".into());
-    st.notebook_scan_busy += 1;
-    update_scan_gate(w, st);
+    let key = format!("nbscan/{address}");
     let weak = w.as_weak();
-    std::thread::spawn(move || {
+    let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
         let client = ChainClient::new(HttpTransport::new(base), network);
         // 429 politeness (2026-07-20): ONE cheap `/address/:a` fingerprint
@@ -4640,7 +4766,12 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
             dropped_unspent,
         });
         let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_refresh());
-    });
+    };
+    if scan_lane_submit(key, job) {
+        w.set_status("syncing…".into());
+        st.notebook_scan_busy += 1;
+        update_scan_gate(w, st);
+    }
 }
 
 /// Apply one already-fetched bundle to the CURRENTLY ACTIVE notebook's live
@@ -4935,6 +5066,15 @@ static SPENDING_REFRESH_RESULTS: std::sync::Mutex<Vec<SpendingRefreshResult>> =
 /// configured (no node). Results land through [`SPENDING_REFRESH_RESULTS`]
 /// + the `apply-pending-spending-refresh` trampoline, exactly like
 /// [`refresh_async`].
+///
+/// Also goes through the [`SCAN_LANE`] queue (2026-07-21) keyed
+/// `spscan/<fp8>/<network>/<account>` — a SECOND, general layer behind
+/// the `spending_scan_busy > 0` early-return above. That early-return
+/// stays because it covers the wider enqueue→apply window (a scan that
+/// already landed on the worker thread but hasn't finished applying on
+/// the UI thread yet); the lane additionally serializes/coalesces at
+/// admission time the same way every other scan class does. Gate-counter
+/// increment + status only fire when [`scan_lane_submit`] returns `true`.
 fn spending_refresh_async(w: &AppWindow, st: &mut State) {
     if !st.spending_capable {
         return;
@@ -4957,11 +5097,9 @@ fn spending_refresh_async(w: &AppWindow, st: &mut State) {
     let network = st.network;
     let account = st.account;
     let Some(fp8) = st.notebooks_fp8.clone() else { return };
-    w.set_status("scanning spending wallet…".into());
-    st.spending_scan_busy += 1;
-    update_scan_gate(w, st);
+    let key = format!("spscan/{fp8}/{}/{account}", network.as_str());
     let weak = w.as_weak();
-    std::thread::spawn(move || {
+    let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
         let material_parsed = parse_key_material(&material, network);
         let source = material_parsed
@@ -4982,7 +5120,12 @@ fn spending_refresh_async(w: &AppWindow, st: &mut State) {
             .expect("spending refresh mutex")
             .push(SpendingRefreshResult { fp8, network, account, discovery, scan });
         let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_spending_refresh());
-    });
+    };
+    if scan_lane_submit(key, job) {
+        w.set_status("scanning spending wallet…".into());
+        st.spending_scan_busy += 1;
+        update_scan_gate(w, st);
+    }
 }
 
 /// Derive `spending_source` on demand from the session key material. The
