@@ -2735,6 +2735,28 @@ fn ensure_notebook(st: &mut State, index: u32) {
     }
 }
 
+/// The display name auto-assigned to the very first notebook created during
+/// onboarding (create/import/restore). Sal 2026-07-21: onboarding lands on
+/// the notebook LIST with this first row already named, rather than opening
+/// the notebook's home. (The pre-notebooks migration path names its first
+/// notebook "Main" — see notebooks::FIRST_NOTEBOOK_NAME — that path is
+/// untouched; this is only for new onboarding.)
+const ONBOARDING_FIRST_NOTEBOOK_NAME: &str = "Notebook 1";
+
+/// Ensure the account's notebook 0 exists (first receive address) and, if it
+/// has no name yet, auto-name it for the onboarding list view.
+fn ensure_first_onboarded_notebook(s: &mut State) {
+    ensure_notebook(s, 0);
+    let account = s.account;
+    if let Some(ix) = s.notebooks.as_mut() {
+        let unnamed = ix.get(account, 0).map(|m| m.name.is_empty()).unwrap_or(true);
+        if unnamed {
+            ix.rename(account, 0, ONBOARDING_FIRST_NOTEBOOK_NAME);
+        }
+    }
+    s.save_notebooks();
+}
+
 /// "Home" for flows that end at the active notebook — unless the active
 /// account has no notebook entry, in which case home would be a trap only
 /// reachable by accident: land on the notebook list instead. Since the
@@ -3024,6 +3046,57 @@ fn update_notebook_list(w: &AppWindow, st: &State) {
     );
 }
 
+/// Populate the Settings screen's identity/network/note-size fields from
+/// current state. Called by `update_home` (fresh whenever a notebook home
+/// renders) AND by `on_settings_open` — so Settings is correct even when the
+/// user reaches it WITHOUT first visiting a notebook's home. Onboarding now
+/// lands on the notebook LIST (Sal 2026-07-21), not a home; before this,
+/// `settings-hierarchical` (which gates the "Change account…" row) and the
+/// note-size field were only ever set by `update_home`, so a fresh
+/// hierarchical import that never opened a home showed no "Change account…"
+/// row and a stale chunk value.
+fn update_settings_identity(w: &AppWindow, st: &State) {
+    w.set_settings_network(st.network.as_str().into());
+    w.set_settings_hierarchical(
+        st.material
+            .as_deref()
+            .map(|m| is_hierarchical(m, st.network))
+            .unwrap_or(false),
+    );
+    if let Some(i) = &st.ident {
+        let (active_n, archived_n) = st
+            .notebooks
+            .as_ref()
+            .map(|ix| (ix.active(st.account).count(), ix.archived_count(st.account)))
+            .unwrap_or((0, 0));
+        let acct_part = if st
+            .material
+            .as_deref()
+            .map(|m| is_hierarchical(m, st.network))
+            .unwrap_or(false)
+        {
+            format!(" · account {}", st.account)
+        } else {
+            String::new()
+        };
+        w.set_settings_identity(
+            format!(
+                "{}{} · {}{acct_part} · {} notebook{}{}",
+                i.kind,
+                if i.is_watch() { " · watch-only" } else { "" },
+                st.network.as_str(),
+                active_n,
+                if active_n == 1 { "" } else { "s" },
+                if archived_n > 0 { format!(" ({archived_n} archived)") } else { String::new() }
+            )
+            .into(),
+        );
+    }
+    if let Some(store) = &st.store {
+        w.set_chunk_text(store.chunk_size.to_string().into());
+    }
+}
+
 fn update_home(w: &AppWindow, st: &State) {
     let Some(ident) = &st.ident else { return };
     let Some(store) = &st.store else { return };
@@ -3112,43 +3185,7 @@ fn update_home(w: &AppWindow, st: &State) {
     items.sort_by_key(|i| i.badge == "confirmed");
     w.set_notes(VecModel::from_slice(&items));
     refresh_contacts(w, st);
-    w.set_settings_network(st.network.as_str().into());
-    w.set_settings_hierarchical(
-        st.material
-            .as_deref()
-            .map(|m| is_hierarchical(m, st.network))
-            .unwrap_or(false),
-    );
-    if let Some(i) = &st.ident {
-        let (active_n, archived_n) = st
-            .notebooks
-            .as_ref()
-            .map(|ix| (ix.active(st.account).count(), ix.archived_count(st.account)))
-            .unwrap_or((0, 0));
-        let acct_part = if st
-            .material
-            .as_deref()
-            .map(|m| is_hierarchical(m, st.network))
-            .unwrap_or(false)
-        {
-            format!(" · account {}", st.account)
-        } else {
-            String::new()
-        };
-        w.set_settings_identity(
-            format!(
-                "{}{} · {}{acct_part} · {} notebook{}{}",
-                i.kind,
-                if i.is_watch() { " · watch-only" } else { "" },
-                st.network.as_str(),
-                active_n,
-                if active_n == 1 { "" } else { "s" },
-                if archived_n > 0 { format!(" ({archived_n} archived)") } else { String::new() }
-            )
-            .into(),
-        );
-    }
-    w.set_chunk_text(store.chunk_size.to_string().into());
+    update_settings_identity(w, st);
     load_backend_settings(w, st);
     update_wallet_coins(w, st);
     update_spending_ui(w, st);
@@ -9099,11 +9136,12 @@ pub fn run() {
                         // Onboarding unification (Sal 2026-07-21): a restore
                         // behaves like an import — the account's notebook 0
                         // exists (idempotent for a same-device restore that
-                        // still has its index file) and its home opens; gap
-                        // discovery re-adds funded notebooks behind it.
-                        ensure_notebook(&mut s, 0);
-                        w.set_screen(4);
-                        update_home(&w, &s);
+                        // still has its index file), auto-named for the list
+                        // view, and the notebook LIST opens; gap discovery
+                        // re-adds funded notebooks behind it.
+                        ensure_first_onboarded_notebook(&mut s);
+                        update_notebook_list(&w, &s);
+                        w.set_screen(17);
                         refresh_async(&w, &mut s);
                         spending_refresh_async(&w, &mut s); // CHANGE 5
                     }
@@ -9164,13 +9202,13 @@ pub fn run() {
                 // Onboarding unification (Sal 2026-07-21, superseding the
                 // 2026-07-11 empty-list rule): creating a seed behaves
                 // exactly like importing one — the account's notebook 0
-                // (the FIRST receive address) is created and its home
-                // opens. More notebooks are added from the list later;
-                // unwanted ones archive. An empty list straight after
-                // onboarding read as a dead end.
-                ensure_notebook(&mut s, 0);
-                w.set_screen(4);
-                update_home(&w, &s);
+                // (the FIRST receive address) is created, auto-named
+                // "Notebook 1", and the notebook LIST opens. More
+                // notebooks are added from the list later; unwanted ones
+                // archive.
+                ensure_first_onboarded_notebook(&mut s);
+                update_notebook_list(&w, &s);
+                w.set_screen(17);
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s); // CHANGE 5
             }
@@ -12559,6 +12597,11 @@ pub fn run() {
         w.set_status("".into());
         w.set_chunk_custom(false);
         load_backend_settings(&w, &s);
+        // Settings shows identity/network/note-size fields that used to be set
+        // only by update_home; onboarding now lands on the list (not a home),
+        // so populate them here too or the "Change account…" row (gated on
+        // settings-hierarchical) is missing on the first Settings visit.
+        update_settings_identity(&w, &s);
         update_spending_ui(&w, &s);
         if s.spending_capable
             && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
@@ -12700,13 +12743,14 @@ pub fn run() {
             Ok(()) => {
                 if first_import {
                     // An import's account pick IS deliberate — the account's
-                    // notebook 0 is created (unnamed; renameable from the
-                    // list) and its home opens.
-                    ensure_notebook(&mut s, 0);
+                    // notebook 0 is created, auto-named "Notebook 1"
+                    // (renameable from the list), and the notebook LIST
+                    // opens.
+                    ensure_first_onboarded_notebook(&mut s);
                     w.set_import_text("".into());
                     w.set_status("".into());
-                    w.set_screen(4);
-                    update_home(&w, &s);
+                    update_notebook_list(&w, &s);
+                    w.set_screen(17);
                     refresh_async(&w, &mut s);
                     spending_refresh_async(&w, &mut s); // CHANGE 5
                 } else {
