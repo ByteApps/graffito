@@ -3046,6 +3046,57 @@ fn update_notebook_list(w: &AppWindow, st: &State) {
     );
 }
 
+/// Populate the Settings screen's identity/network/note-size fields from
+/// current state. Called by `update_home` (fresh whenever a notebook home
+/// renders) AND by `on_settings_open` — so Settings is correct even when the
+/// user reaches it WITHOUT first visiting a notebook's home. Onboarding now
+/// lands on the notebook LIST (Sal 2026-07-21), not a home; before this,
+/// `settings-hierarchical` (which gates the "Change account…" row) and the
+/// note-size field were only ever set by `update_home`, so a fresh
+/// hierarchical import that never opened a home showed no "Change account…"
+/// row and a stale chunk value.
+fn update_settings_identity(w: &AppWindow, st: &State) {
+    w.set_settings_network(st.network.as_str().into());
+    w.set_settings_hierarchical(
+        st.material
+            .as_deref()
+            .map(|m| is_hierarchical(m, st.network))
+            .unwrap_or(false),
+    );
+    if let Some(i) = &st.ident {
+        let (active_n, archived_n) = st
+            .notebooks
+            .as_ref()
+            .map(|ix| (ix.active(st.account).count(), ix.archived_count(st.account)))
+            .unwrap_or((0, 0));
+        let acct_part = if st
+            .material
+            .as_deref()
+            .map(|m| is_hierarchical(m, st.network))
+            .unwrap_or(false)
+        {
+            format!(" · account {}", st.account)
+        } else {
+            String::new()
+        };
+        w.set_settings_identity(
+            format!(
+                "{}{} · {}{acct_part} · {} notebook{}{}",
+                i.kind,
+                if i.is_watch() { " · watch-only" } else { "" },
+                st.network.as_str(),
+                active_n,
+                if active_n == 1 { "" } else { "s" },
+                if archived_n > 0 { format!(" ({archived_n} archived)") } else { String::new() }
+            )
+            .into(),
+        );
+    }
+    if let Some(store) = &st.store {
+        w.set_chunk_text(store.chunk_size.to_string().into());
+    }
+}
+
 fn update_home(w: &AppWindow, st: &State) {
     let Some(ident) = &st.ident else { return };
     let Some(store) = &st.store else { return };
@@ -3134,43 +3185,7 @@ fn update_home(w: &AppWindow, st: &State) {
     items.sort_by_key(|i| i.badge == "confirmed");
     w.set_notes(VecModel::from_slice(&items));
     refresh_contacts(w, st);
-    w.set_settings_network(st.network.as_str().into());
-    w.set_settings_hierarchical(
-        st.material
-            .as_deref()
-            .map(|m| is_hierarchical(m, st.network))
-            .unwrap_or(false),
-    );
-    if let Some(i) = &st.ident {
-        let (active_n, archived_n) = st
-            .notebooks
-            .as_ref()
-            .map(|ix| (ix.active(st.account).count(), ix.archived_count(st.account)))
-            .unwrap_or((0, 0));
-        let acct_part = if st
-            .material
-            .as_deref()
-            .map(|m| is_hierarchical(m, st.network))
-            .unwrap_or(false)
-        {
-            format!(" · account {}", st.account)
-        } else {
-            String::new()
-        };
-        w.set_settings_identity(
-            format!(
-                "{}{} · {}{acct_part} · {} notebook{}{}",
-                i.kind,
-                if i.is_watch() { " · watch-only" } else { "" },
-                st.network.as_str(),
-                active_n,
-                if active_n == 1 { "" } else { "s" },
-                if archived_n > 0 { format!(" ({archived_n} archived)") } else { String::new() }
-            )
-            .into(),
-        );
-    }
-    w.set_chunk_text(store.chunk_size.to_string().into());
+    update_settings_identity(w, st);
     load_backend_settings(w, st);
     update_wallet_coins(w, st);
     update_spending_ui(w, st);
@@ -12584,6 +12599,11 @@ pub fn run() {
         w.set_status("".into());
         w.set_chunk_custom(false);
         load_backend_settings(&w, &s);
+        // Settings shows identity/network/note-size fields that used to be set
+        // only by update_home; onboarding now lands on the list (not a home),
+        // so populate them here too or the "Change account…" row (gated on
+        // settings-hierarchical) is missing on the first Settings visit.
+        update_settings_identity(&w, &s);
         update_spending_ui(&w, &s);
         if s.spending_capable
             && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
