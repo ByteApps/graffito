@@ -40,6 +40,18 @@
 
 use std::collections::VecDeque;
 
+/// Runs `run` under `catch_unwind`, returning `true` iff it panicked. Pulled
+/// out of the app crate's `spawn_scan_lane_worker` drain loop so the
+/// "run one job, swallow a panic, keep going" step is host-testable here —
+/// the caller (lib.rs) still does its own logging/locking around this; this
+/// function only isolates the unwind-catching mechanics. No behavior change:
+/// `spawn_scan_lane_worker` calls this instead of inlining the same
+/// `std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err()`
+/// expression it used before.
+pub fn run_catching(run: impl FnOnce()) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).is_err()
+}
+
 /// Opaque job identifier, unique within a [`Lane`] — a monotonically
 /// increasing counter, never reused.
 pub type JobId = u64;
@@ -250,5 +262,90 @@ mod tests {
         let promoted2 = lane.complete(promoted.unwrap().0);
         assert_eq!(promoted2, None);
         assert!(lane.is_idle());
+    }
+
+    /// Reconstructs the shape of the app crate's `spawn_scan_lane_worker`
+    /// drain loop (lib.rs) over a `Lane` + a `HashMap<JobId, Box<dyn
+    /// FnOnce()>>` job store, driven purely on the test thread (no real
+    /// threads/mutex — this is testing the STEP logic, not the concurrency).
+    /// Mirrors the real loop precisely: run the current job via
+    /// `run_catching`, then `complete` it and, if that promotes a queued
+    /// job, pull its closure and run it next — looping until `complete`
+    /// returns `None`.
+    fn drain_all(lane: &mut Lane, jobs: &mut std::collections::HashMap<JobId, Box<dyn FnOnce()>>, mut id: JobId) {
+        loop {
+            let job = jobs.remove(&id).expect("every id driven here must have a stored job");
+            run_catching(job);
+            let Some((next_id, _next_key)) = lane.complete(id) else { break };
+            id = next_id;
+        }
+    }
+
+    /// Submitting keyA (runs), keyB (queues), keyB again (coalesces to
+    /// exactly one queued job), then completing keyA promotes exactly ONE
+    /// keyB run — not zero, not two.
+    #[test]
+    fn drain_promotes_exactly_one_coalesced_follow_up() {
+        let mut lane = Lane::new();
+        let mut jobs: std::collections::HashMap<JobId, Box<dyn FnOnce()>> = std::collections::HashMap::new();
+        let b_runs = std::rc::Rc::new(std::cell::Cell::new(0u32));
+
+        let Admit::Run(a_id) = lane.admit("keyA") else { unreachable!() };
+        jobs.insert(a_id, Box::new(|| {}));
+
+        let Admit::Queued(b_id) = lane.admit("keyB") else { unreachable!() };
+        {
+            let b_runs = b_runs.clone();
+            jobs.insert(b_id, Box::new(move || b_runs.set(b_runs.get() + 1)));
+        }
+
+        // A second kick for keyB while it's already queued (not running)
+        // coalesces — dropped, no second job stored for it.
+        let coalesced = lane.admit("keyB");
+        assert_eq!(coalesced, Admit::Coalesced);
+        assert_eq!(lane.depth(), 1, "the coalesced kick must not grow the queue");
+
+        drain_all(&mut lane, &mut jobs, a_id);
+
+        assert_eq!(b_runs.get(), 1, "keyB's job must have run exactly once");
+        assert!(lane.is_idle());
+        assert_eq!(lane.depth(), 0);
+    }
+
+    /// A panicking job must NOT wedge the lane — `run_catching` swallows the
+    /// panic, `complete` still fires, and the queued follow-up still runs.
+    /// Property mirrors `spawn_scan_lane_worker`'s `catch_unwind` +
+    /// `cb: netq panic` handling: the drain continues past a panic.
+    #[test]
+    fn panicking_job_does_not_wedge_the_lane() {
+        let mut lane = Lane::new();
+        let mut jobs: std::collections::HashMap<JobId, Box<dyn FnOnce()>> = std::collections::HashMap::new();
+        let follow_up_ran = std::rc::Rc::new(std::cell::Cell::new(false));
+
+        let Admit::Run(a_id) = lane.admit("keyA") else { unreachable!() };
+        jobs.insert(a_id, Box::new(|| panic!("simulated scan-job panic")));
+
+        let Admit::Queued(b_id) = lane.admit("keyB") else { unreachable!() };
+        {
+            let follow_up_ran = follow_up_ran.clone();
+            jobs.insert(b_id, Box::new(move || follow_up_ran.set(true)));
+        }
+
+        // Drive it exactly like `drain_all`, but assert the panic is caught
+        // (not merely swallowed by an uncaught unwind aborting the test).
+        let job = jobs.remove(&a_id).unwrap();
+        let panicked = run_catching(job);
+        assert!(panicked, "run_catching must report the panic");
+        let promoted = lane.complete(a_id);
+        assert_eq!(promoted, Some((b_id, "keyB".to_string())), "complete must still promote keyB after a panic");
+
+        let job = jobs.remove(&b_id).unwrap();
+        assert!(!run_catching(job), "the follow-up job itself must not panic");
+        assert!(follow_up_ran.get(), "the queued follow-up must still run after the panic");
+
+        let promoted2 = lane.complete(b_id);
+        assert_eq!(promoted2, None);
+        assert!(lane.is_idle(), "the lane must end idle, not wedged, after a panic mid-drain");
+        assert_eq!(lane.depth(), 0);
     }
 }

@@ -201,7 +201,7 @@ fn spawn_scan_lane_worker(id: app_core::netq::JobId, key: String, job: Box<dyn F
         let mut job = job;
         loop {
             let short = key[..24.min(key.len())].to_string();
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+            if app_core::netq::run_catching(job) {
                 println!("cb: netq panic key={short}");
             }
             let mut guard = SCAN_LANE.lock().expect("scan lane mutex");
