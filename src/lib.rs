@@ -2735,6 +2735,28 @@ fn ensure_notebook(st: &mut State, index: u32) {
     }
 }
 
+/// The display name auto-assigned to the very first notebook created during
+/// onboarding (create/import/restore). Sal 2026-07-21: onboarding lands on
+/// the notebook LIST with this first row already named, rather than opening
+/// the notebook's home. (The pre-notebooks migration path names its first
+/// notebook "Main" — see notebooks::FIRST_NOTEBOOK_NAME — that path is
+/// untouched; this is only for new onboarding.)
+const ONBOARDING_FIRST_NOTEBOOK_NAME: &str = "Notebook 1";
+
+/// Ensure the account's notebook 0 exists (first receive address) and, if it
+/// has no name yet, auto-name it for the onboarding list view.
+fn ensure_first_onboarded_notebook(s: &mut State) {
+    ensure_notebook(s, 0);
+    let account = s.account;
+    if let Some(ix) = s.notebooks.as_mut() {
+        let unnamed = ix.get(account, 0).map(|m| m.name.is_empty()).unwrap_or(true);
+        if unnamed {
+            ix.rename(account, 0, ONBOARDING_FIRST_NOTEBOOK_NAME);
+        }
+    }
+    s.save_notebooks();
+}
+
 /// "Home" for flows that end at the active notebook — unless the active
 /// account has no notebook entry, in which case home would be a trap only
 /// reachable by accident: land on the notebook list instead. Since the
@@ -9101,11 +9123,12 @@ pub fn run() {
                         // Onboarding unification (Sal 2026-07-21): a restore
                         // behaves like an import — the account's notebook 0
                         // exists (idempotent for a same-device restore that
-                        // still has its index file) and its home opens; gap
-                        // discovery re-adds funded notebooks behind it.
-                        ensure_notebook(&mut s, 0);
-                        w.set_screen(4);
-                        update_home(&w, &s);
+                        // still has its index file), auto-named for the list
+                        // view, and the notebook LIST opens; gap discovery
+                        // re-adds funded notebooks behind it.
+                        ensure_first_onboarded_notebook(&mut s);
+                        update_notebook_list(&w, &s);
+                        w.set_screen(17);
                         refresh_async(&w, &mut s);
                         spending_refresh_async(&w, &mut s); // CHANGE 5
                     }
@@ -9166,13 +9189,13 @@ pub fn run() {
                 // Onboarding unification (Sal 2026-07-21, superseding the
                 // 2026-07-11 empty-list rule): creating a seed behaves
                 // exactly like importing one — the account's notebook 0
-                // (the FIRST receive address) is created and its home
-                // opens. More notebooks are added from the list later;
-                // unwanted ones archive. An empty list straight after
-                // onboarding read as a dead end.
-                ensure_notebook(&mut s, 0);
-                w.set_screen(4);
-                update_home(&w, &s);
+                // (the FIRST receive address) is created, auto-named
+                // "Notebook 1", and the notebook LIST opens. More
+                // notebooks are added from the list later; unwanted ones
+                // archive.
+                ensure_first_onboarded_notebook(&mut s);
+                update_notebook_list(&w, &s);
+                w.set_screen(17);
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s); // CHANGE 5
             }
@@ -12702,13 +12725,14 @@ pub fn run() {
             Ok(()) => {
                 if first_import {
                     // An import's account pick IS deliberate — the account's
-                    // notebook 0 is created (unnamed; renameable from the
-                    // list) and its home opens.
-                    ensure_notebook(&mut s, 0);
+                    // notebook 0 is created, auto-named "Notebook 1"
+                    // (renameable from the list), and the notebook LIST
+                    // opens.
+                    ensure_first_onboarded_notebook(&mut s);
                     w.set_import_text("".into());
                     w.set_status("".into());
-                    w.set_screen(4);
-                    update_home(&w, &s);
+                    update_notebook_list(&w, &s);
+                    w.set_screen(17);
                     refresh_async(&w, &mut s);
                     spending_refresh_async(&w, &mut s); // CHANGE 5
                 } else {
