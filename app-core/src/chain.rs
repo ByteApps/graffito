@@ -842,8 +842,13 @@ pub fn discover_indexes<T: Transport>(
     let mut index = 0u32;
     while consecutive_unused < gap {
         if known.contains(&index) {
-            // Already a confirmed notebook — present by construction, no
-            // request needed, and not re-added to `found`.
+            // Already a confirmed notebook — present by construction, so no
+            // request is needed. It IS still counted in `found` (it's a used
+            // index): callers report `found=<total used> added=<newly created>`
+            // and re-`ensure_notebook` idempotently, so a known index must
+            // appear in `found` or the total under-counts (broke S5's
+            // `found=3 added=2` when index 0 was skipped AND dropped).
+            found.push(index);
             consecutive_unused = 0;
         } else {
             // A fixed (non-ranged) watch descriptor only derives index 0 —
@@ -1185,7 +1190,10 @@ mod tests {
             LoggingProbeTransport { used: vec![addr(2)], log: std::cell::RefCell::new(Vec::new()) };
         let client = ChainClient::new(transport, Network::Mainnet);
         let found = discover_indexes(&client, &material(), Network::Mainnet, 0, &[0], 5);
-        assert_eq!(found, vec![2]);
+        // found INCLUDES the known index 0 (a used notebook — counted so the
+        // caller's found=total/added=new stays right) plus the discovered 2 —
+        // but index 0 was NOT probed (asserted below).
+        assert_eq!(found, vec![0, 2]);
         let log = client.transport.log.borrow();
         assert!(
             !log.iter().any(|p| p.contains(&a0)),
@@ -1203,7 +1211,9 @@ mod tests {
             LoggingProbeTransport { used: vec![], log: std::cell::RefCell::new(Vec::new()) };
         let client = ChainClient::new(transport, Network::Mainnet);
         let found = discover_indexes(&client, &material(), Network::Mainnet, 0, &[0], 5);
-        assert!(found.is_empty());
+        // Only the known index 0 is in `found` (counted, not probed); nothing
+        // else on-chain, so no higher index is discovered.
+        assert_eq!(found, vec![0]);
         let a0 = addr(0);
         let log = client.transport.log.borrow();
         assert!(!log.iter().any(|p| p.contains(&a0)), "index 0 must never be requested: {log:?}");
