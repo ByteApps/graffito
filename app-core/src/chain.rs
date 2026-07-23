@@ -276,6 +276,11 @@ impl Transport for HttpTransport {
     // handling below, same as any other error status.
     fn get_text(&self, path: &str) -> Result<String, Error> {
         let url = format!("{}{}", self.base, path);
+        // Per-request instrumentation for the networking-efficiency work
+        // (2026-07-22) — debug builds only, so release/App Store builds never
+        // log request paths. Suites/repros run the debug binary and grep these.
+        #[cfg(debug_assertions)]
+        println!("cb: http GET {path}");
         let mut attempt = 0u32;
         loop {
             if self.paced {
@@ -299,6 +304,8 @@ impl Transport for HttpTransport {
 
     fn post_text(&self, path: &str, body: String) -> Result<String, Error> {
         let url = format!("{}{}", self.base, path);
+        #[cfg(debug_assertions)]
+        println!("cb: http POST {path}");
         let mut attempt = 0u32;
         loop {
             if self.paced {

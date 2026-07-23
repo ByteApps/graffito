@@ -5119,6 +5119,18 @@ fn spending_refresh_async(w: &AppWindow, st: &mut State) {
     if !st.spending_capable {
         return;
     }
+    // Never scan the spending wallet while it's DISABLED (Sal 2026-07-22). It's
+    // opt-in (default OFF) and its coins are never shown when off, so scanning
+    // it is pure waste — and on mainnet the gap-walk + coin scan against the
+    // public esplora is a ~120-request burst that throttles and fails ("spending
+    // wallet scan failed" on a fresh mainnet import). The enable toggle
+    // (`on_set_spending`) flips `enabled` BEFORE its own kick, and every other
+    // caller that should scan (sweep-open, spending ↻) already runs only when
+    // enabled, so the enable→scan path is unaffected.
+    if !st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false) {
+        println!("cb: spending-refresh skipped=disabled");
+        return;
+    }
     // Coalesce (2026-07-21, first slice of the deferred operation queue):
     // the spending wallet is ONE tree per (identity, network, account) — a
     // second concurrent scan of it can only return the same view, and the
