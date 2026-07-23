@@ -761,7 +761,12 @@ impl<T: Transport> ChainClient<T> {
     ) -> Result<SyncBundle, Error> {
         let tip_height = self.tip_height()?;
         let fee_rates = self.fee_rates()?;
-        let btc_usd = self.btc_usd().unwrap_or(None);
+        // Network-efficiency (2026-07-23): btc_usd was fetched on every scan
+        // but only ever READ by the fee-showing screens (compose/sweep/
+        // consolidate/bump) — those now fetch it lazily themselves
+        // (`refresh_fees_price`, session-cached). The field stays for serde
+        // compat; a scan never populates it.
+        let btc_usd = None;
         let utxos = self.utxos(address)?;
         let history = self.full_history(address)?;
 

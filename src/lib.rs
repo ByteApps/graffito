@@ -277,6 +277,13 @@ struct State {
     store: Option<Store>,
     fees: Option<FeeRates>,
     usd: Option<f64>,
+    /// Session cache stamp for [`refresh_fees_price`] (network-efficiency,
+    /// 2026-07-23): `fees`/`usd` are only read by the fee-showing screens
+    /// (compose/sweep/consolidate/pay-from/bump), not the scan path, so
+    /// they're fetched lazily on those screens' open — this stamps WHEN,
+    /// so a repeat open within ~60s is a free cache hit instead of another
+    /// pair of requests. `None` = never fetched this session.
+    fees_fetched_at: Option<std::time::Instant>,
     to_address: Option<String>, // None = self-note
     /// Multi-recipient directed notes: EXTRA recipient addresses beyond
     /// `to_address` (the compose screen's removable To-chips). Empty =
@@ -1447,6 +1454,9 @@ fn watch_spend_build(
 /// Watch mode bump, step 1: fetch the pending tx from the node (chain-
 /// recovered records carry no fee/vsize/raw hex), price it, open the dialog.
 fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool) {
+    // The bump dialog prices the replacement off `st.fees.fastest` below —
+    // lazily (re)fetch first (network-efficiency, 2026-07-23).
+    refresh_fees_price(w, st);
     let Some(base) = st.base_url() else {
         w.set_status("no Bitcoin node — set one in Settings".into());
         return;
@@ -2515,6 +2525,10 @@ fn sync_contacts_now(w: &AppWindow, st: &mut State) {
 /// screen 6. Shared by the normal contact picker (`on_pick_contact`) and
 /// Reply (`on_reply_to_note`) so both go through identical logic.
 fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
+    // Lands on compose (screen 6), which shows fee tiers + the USD cost
+    // line — lazily (re)fetch before the cost-line math below reads
+    // `st.fees`/`st.usd` (network-efficiency, 2026-07-23).
+    refresh_fees_price(w, st);
     if addr == "self" {
         st.to_address = None;
         // Uniform To section (Sal, 2026-07-19): the row shows just the
@@ -2858,6 +2872,10 @@ fn go_home_or_list(w: &AppWindow, st: &State) {
 /// linkage caveat when the destination is one of OUR notebooks (and no
 /// contacts pollution for those), fee tier defaults, screen 16.
 fn set_sweep_dest(w: &AppWindow, st: &mut State, a: String) {
+    // Lands on the sweep/consolidate screen (16), which shows fee tiers —
+    // lazily (re)fetch before `update_sweep_screen` below reads `st.fees`
+    // (network-efficiency, 2026-07-23).
+    refresh_fees_price(w, st);
     let own_index = st.nb_addrs.iter().find(|(_, ad, _)| *ad == a).map(|(idx, ..)| *idx);
     match own_index {
         Some(acct) => {
@@ -2910,6 +2928,9 @@ fn set_sweep_dest(w: &AppWindow, st: &mut State, a: String) {
 /// "consolidate") — still the watch-only path, where signing happens on
 /// an external wallet and one notebook is all there is.
 fn open_notebook_consolidate(w: &AppWindow, st: &mut State) {
+    // Lands on screen 16 (fee tiers shown) — see the matching comment in
+    // `set_sweep_dest` (network-efficiency, 2026-07-23).
+    refresh_fees_price(w, st);
     let spendable = st
         .store
         .as_ref()
@@ -3286,10 +3307,6 @@ struct RefreshResult {
     /// stamps fresh fees and reports "up to date" (429 politeness,
     /// 2026-07-20).
     bundle: Option<Result<app_core::notes_core::bundle::SyncBundle, String>>,
-    /// Fresh fee tiers, fetched on the short-circuit path ONLY so compose
-    /// estimates never go stale (the full path's bundle already carries
-    /// its own).
-    fees: Option<FeeRates>,
     /// Fresh `/address/:a` stats to stamp into the store after a successful
     /// full apply — `None` when the pre-check endpoint failed or is
     /// unsupported (regtest server.py), which never blocks the scan itself.
@@ -4775,13 +4792,15 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
         // optimization, never a gate.
         let new_stats = client.address_stats(&address).ok();
         if prev_stats.is_some() && new_stats == prev_stats {
-            // Fees still refresh (one request) so compose estimates never
-            // go stale behind the short-circuit.
-            let fees = client.fee_rates().ok();
+            // Network-efficiency (2026-07-23): fees used to refresh here
+            // (one request) so compose estimates never went stale behind
+            // the short-circuit — but fees/USD are only READ by the
+            // fee-showing screens now, which fetch them lazily themselves
+            // (`refresh_fees_price`), so the short-circuit fetches nothing
+            // at all.
             REFRESH_RESULTS.lock().expect("refresh results mutex").push(RefreshResult {
                 address,
                 bundle: None,
-                fees,
                 new_stats: None,
                 statuses: Vec::new(),
                 dropped_lookup: HashMap::new(),
@@ -4799,7 +4818,6 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
         REFRESH_RESULTS.lock().expect("refresh results mutex").push(RefreshResult {
             address,
             bundle: Some(bundle),
-            fees: None,
             new_stats,
             statuses,
             dropped_lookup,
@@ -4839,7 +4857,13 @@ fn apply_active_bundle(
     match bundle {
         Ok(bundle) => {
             st.fees = Some(bundle.fee_rates.clone());
-            st.usd = bundle.btc_usd;
+            // st.usd is NOT stamped from a scan (network-efficiency,
+            // 2026-07-23): build_bundle no longer fetches btc_usd — it's
+            // always None here now — so assigning it would clobber whatever
+            // `refresh_fees_price` lazily fetched for the fee-showing
+            // screens. st.fees still comes from the bundle: build_bundle's
+            // fee_rates fetch wasn't removed (SyncBundle.fee_rates is
+            // non-optional), so a real scan's fee tiers stay fresh too.
             let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
             let output_x = st.ident.as_ref().unwrap().output_x();
             let network = st.network;
@@ -4915,11 +4939,9 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
         let Some(bundle) = r.bundle else {
             // Stats pre-check short-circuit: nothing moved on-chain or in
             // the mempool since the stamped fingerprint — no bundle was
-            // fetched, the store is already current. Fees still land so
-            // compose estimates stay fresh.
-            if let Some(f) = r.fees {
-                st.fees = Some(f);
-            }
+            // fetched, the store is already current. Fees/USD are no
+            // longer fetched here at all (network-efficiency, 2026-07-23)
+            // — the fee-showing screens fetch them lazily on open.
             println!("cb: refresh unchanged");
             w.set_status("up to date".into());
             update_home(w, st);
@@ -5028,7 +5050,8 @@ fn refresh(w: &AppWindow, st: &mut State) {
     match client.build_bundle(&address, None) {
         Ok(bundle) => {
             st.fees = Some(bundle.fee_rates.clone());
-            st.usd = bundle.btc_usd;
+            // st.usd left alone here too — see the matching comment in
+            // `apply_active_bundle` (network-efficiency, 2026-07-23).
             let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
             let output_x = st.ident.as_ref().unwrap().output_x();
             let network = st.network;
@@ -5078,6 +5101,45 @@ fn refresh(w: &AppWindow, st: &mut State) {
         }
     }
     update_home(w, st);
+}
+
+/// Network-efficiency (2026-07-23): `st.fees`/`st.usd` are read ONLY by the
+/// fee-showing screens — compose (6), sweep/consolidate (16), pay-from
+/// (20), and the Speed-up/bump dialogs — never by the notebook/spending
+/// scan path, so they no longer ride along with every scan (see
+/// `refresh_async`'s short-circuit branch and `chain::build_bundle`'s
+/// dropped `btc_usd()` call). Call this at the START of every callback that
+/// opens one of those screens; a call within ~60s of the last one is a free
+/// cache hit (`fees_fetched_at`), so it's fine to call it more than
+/// strictly needed. Synchronous, matching how these screen-open handlers
+/// already run (no async worker/trampoline for a couple of GET requests —
+/// same shape as the synchronous [`refresh`] above, which also has no
+/// `NetOpGuard`). A failed/offline fetch just leaves `st.fees`/`st.usd`
+/// whatever they were (the cost lines already `unwrap_or` a default rate /
+/// hide the USD suffix) — never errors the screen.
+fn refresh_fees_price(_w: &AppWindow, st: &mut State) {
+    if let Some(t) = st.fees_fetched_at {
+        if t.elapsed() < std::time::Duration::from_secs(60) {
+            return;
+        }
+    }
+    let Some(base) = st.base_url() else { return };
+    let client = ChainClient::new(HttpTransport::new(base), st.network);
+    let mut fetched = false;
+    if let Ok(fees) = client.fee_rates() {
+        st.fees = Some(fees);
+        fetched = true;
+    }
+    if let Ok(usd) = client.btc_usd() {
+        st.usd = usd;
+        fetched = true;
+    }
+    // No repaint here — this is synchronous, and every call site runs it
+    // BEFORE its own screen-paint call (refresh_compose/update_sweep_screen/
+    // etc.), which reads the now-current st.fees/st.usd for free.
+    if fetched {
+        st.fees_fetched_at = Some(std::time::Instant::now());
+    }
 }
 
 /// Automatic (non-deep) spending-wallet scan gap: the app hands out
@@ -8743,6 +8805,7 @@ pub fn run() {
         store: None,
         fees: None,
         usd: None,
+        fees_fetched_at: None,
         to_address: None,
         to_addresses_extra: Vec::new(),
         picking_extra: false,
@@ -9795,6 +9858,11 @@ pub fn run() {
     });
 
     cb!(on_act_bump_open, |w, s, ref_id: SharedString, is_note: bool| {
+        // The bump dialog prices off `st.fees.fastest` — lazily (re)fetch
+        // before either branch below reads it (network-efficiency,
+        // 2026-07-23). `watch_bump_open` also calls this — the 60s cache
+        // makes the second call here-or-there free either way.
+        refresh_fees_price(&w, &mut s);
         if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
             watch_bump_open(&w, &mut s, ref_id.to_string(), is_note);
             return;
@@ -10069,6 +10137,10 @@ pub fn run() {
 
     cb!(on_sweep_open, |w, s| {
         println!("cb: sweep-open");
+        // The send-to picker's sweep entry lands on screen 16 (fee tiers
+        // shown) once a destination is picked — lazily (re)fetch here so
+        // it's ready by then (network-efficiency, 2026-07-23).
+        refresh_fees_price(&w, &mut s);
         s.pending_spending_sweep_index = None; // a fresh manual pick, not the spending-wallet shortcut
         // A wallet sweep's inputs include spending-wallet coins — ALWAYS kick
         // a fresh scan here (not just when never-scanned). A prior scan can be
@@ -10121,6 +10193,9 @@ pub fn run() {
         if s.wallet_tx_busy || s.pending_broadcast.is_some() {
             return;
         }
+        // The fee rate used to build this tx comes from `s.fees.hour`
+        // below — lazily (re)fetch first (network-efficiency, 2026-07-23).
+        refresh_fees_price(&w, &mut s);
         ensure_spending_source(&mut s);
         let Some(src) = s.spending_source.clone() else {
             w.set_status("spending wallet unavailable for this identity".into());
@@ -10217,6 +10292,10 @@ pub fn run() {
     });
 
     cb!(on_consolidate_wallet_open, |w, s| {
+        // The destination-pick handler prices the tx off `s.fees.hour`
+        // shortly after this opens the account picker — lazily (re)fetch
+        // now so it's ready (network-efficiency, 2026-07-23).
+        refresh_fees_price(&w, &mut s);
         // Keyed AND watch identities take the same wallet-level flow
         // (rev-3 follow-up 1): snapshot every active notebook's coins,
         // pick the destination notebook, confirm. Watch identities sign
@@ -10884,6 +10963,9 @@ pub fn run() {
     // happens; a header tap thereafter only shows/hides (`on_payfrom_expand`).
     cb!(on_open_funding_screen, |w, s| {
         println!("cb: funding-open");
+        // Screen 20 (pay-from) shows fee tiers via the compose cost line —
+        // lazily (re)fetch (network-efficiency, 2026-07-23).
+        refresh_fees_price(&w, &mut s);
         w.set_status("".into());
         s.nb_expanded = !mixed_coins_for(&s, "notebook").is_empty();
         s.sp_expanded = !mixed_coins_for(&s, "spending").is_empty();
