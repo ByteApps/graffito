@@ -5080,20 +5080,38 @@ fn refresh(w: &AppWindow, st: &mut State) {
     update_home(w, st);
 }
 
+/// Automatic (non-deep) spending-wallet scan gap: the app hands out
+/// spending addresses itself, sequentially, so its own usage has no gaps —
+/// a small look-ahead past the last handed-out index is enough. See
+/// [`SPENDING_GAP_DEEP`] for the manual fallback covering a seed that was
+/// heavily used in ANOTHER BIP-84 wallet (gappy external usage a shallow
+/// walk can't see).
+const SPENDING_GAP_SHALLOW: u32 = 3;
+
+/// Manual "Scan for existing funds…" deep scan gap — the same gap
+/// `discover_indexes`/full notebook discovery use elsewhere in this file.
+const SPENDING_GAP_DEEP: u32 = 20;
+
 /// One finished spending-wallet scan (worker thread), waiting to be applied
 /// on the UI thread. (fp8, network, account) guards staleness — switching
 /// identity/network/account mid-scan drops the result, same pattern as
-/// [`RefreshResult`]/[`DiscoveryResult`]. Carries BOTH a `discover_spending`
-/// gap-walk (which addresses have history — merged into `store.spending.
-/// used` so the self-spk SET recognizes a spending-wallet-funded note as
-/// OWN on the next rescan; a plain `scan_funding` alone finds spendable
-/// coins but never marks their addresses "used") and a `scan_funding` call
-/// (the coins themselves, with values — what the funded-note builder needs).
+/// [`RefreshResult`]/[`DiscoveryResult`].
+///
+/// Network-efficiency merge (2026-07-23): ONE `scan_funding` call now
+/// carries everything a separate `discover_spending` gap-walk USED to
+/// report (which addresses have history — merged into `store.spending.used`
+/// so the self-spk SET recognizes a spending-wallet-funded note as OWN on
+/// the next rescan, via `FundingScan::used`/`next_receive_index`) alongside
+/// the coins themselves (`FundingScan::utxos`, with values — what the
+/// funded-note builder needs) and the next change index
+/// (`next_change_index`) — see `ChainClient::scan_funding`'s doc comment.
+/// This halves the automatic scan's request count outright, and the gap
+/// dropping from 20 to 3 (see [`SPENDING_GAP_SHALLOW`]) cuts it further —
+/// the tradeoff [`SPENDING_GAP_DEEP`]'s manual scan exists to cover.
 struct SpendingRefreshResult {
     fp8: String,
     network: Network,
     account: u32,
-    discovery: Option<(Vec<SpendingAddr>, u32, u32)>,
     scan: Result<app_core::funding::FundingScan, String>,
 }
 
@@ -5116,6 +5134,23 @@ static SPENDING_REFRESH_RESULTS: std::sync::Mutex<Vec<SpendingRefreshResult>> =
 /// admission time the same way every other scan class does. Gate-counter
 /// increment + status only fire when [`scan_lane_submit`] returns `true`.
 fn spending_refresh_async(w: &AppWindow, st: &mut State) {
+    spending_scan_async(w, st, SPENDING_GAP_SHALLOW);
+}
+
+/// Manual "Scan for existing funds…" deep scan (network-efficiency
+/// follow-up, 2026-07-23): the automatic scan above now walks a SHALLOW
+/// gap-3 range (the app's own usage is sequential, so a small look-ahead
+/// past the last handed-out index is enough) — but a seed that was heavily
+/// used in ANOTHER BIP-84 wallet before this app ever touched it could have
+/// funds sitting beyond that reach. This is the on-demand full gap-20
+/// discovery pass for that case: same worker-thread / scan-lane / gate /
+/// apply path as [`spending_refresh_async`], only the gap differs.
+fn spending_scan_deep_async(w: &AppWindow, st: &mut State) {
+    println!("cb: spending-scan-deep");
+    spending_scan_async(w, st, SPENDING_GAP_DEEP);
+}
+
+fn spending_scan_async(w: &AppWindow, st: &mut State, gap: u32) {
     if !st.spending_capable {
         return;
     }
@@ -5159,18 +5194,19 @@ fn spending_refresh_async(w: &AppWindow, st: &mut State) {
             .map_err(|e| e.to_string())
             .and_then(|m| app_core::spending::funding_source(m, network, account).map_err(|e| e.to_string()));
         let client = ChainClient::new(HttpTransport::new(base), network);
-        // Gap-walk first (marks every used address, receive AND change, so
-        // OWN-detection on rescan covers coins this app never explicitly
-        // "handed out" — e.g. an address funded before the app ever showed
-        // it), then the plain coin scan for spendable values.
-        let discovery =
-            source.as_ref().ok().map(|src| app_core::chain::discover_spending(&client, src, 20));
-        let scan = source.and_then(|src| client.scan_funding(&src, 20).map_err(|e| e.to_string()));
+        // ONE merged walk (network-efficiency, 2026-07-23): `scan_funding`
+        // now reports used addresses (receive AND change — so OWN-detection
+        // on rescan covers coins this app never explicitly "handed out",
+        // e.g. an address funded before the app ever showed it) AND
+        // spendable coins in the same pass — no separate `discover_spending`
+        // gap-walk needed. `gap` is SPENDING_GAP_SHALLOW for the automatic
+        // scan or SPENDING_GAP_DEEP for the manual deep scan.
+        let scan = source.and_then(|src| client.scan_funding(&src, gap).map_err(|e| e.to_string()));
         drop(material); // Zeroizing — wiped as soon as the scan is done
         SPENDING_REFRESH_RESULTS
             .lock()
             .expect("spending refresh mutex")
-            .push(SpendingRefreshResult { fp8, network, account, discovery, scan });
+            .push(SpendingRefreshResult { fp8, network, account, scan });
         let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_spending_refresh());
     };
     if scan_lane_submit(key, job) {
@@ -5215,14 +5251,20 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
             println!("cb: spending-refresh stale-drop");
             continue;
         }
-        if let Some((used, next_receive, next_change)) = r.discovery {
-            if let Some(store) = st.store.as_mut() {
-                store.spending_apply_discovery(used, next_receive, next_change);
-            }
-            st.save_spending();
-        }
         match r.scan {
             Ok(scan) => {
+                // Discovery bookkeeping (used addresses + next indexes) comes
+                // from the SAME merged scan now (network-efficiency merge,
+                // 2026-07-23) — apply it before the coins, same order the old
+                // separate discovery step ran in.
+                if let Some(store) = st.store.as_mut() {
+                    store.spending_apply_discovery(
+                        scan.used.clone(),
+                        scan.next_receive_index,
+                        scan.next_change_index,
+                    );
+                }
+                st.save_spending();
                 st.spending_coins = scan.utxos;
                 if let Some(material) = st.material.as_ref() {
                     if let Ok(m) = parse_key_material(material.as_str(), st.network) {
@@ -9133,6 +9175,13 @@ pub fn run() {
 
     cb!(on_spending_refresh, |w, s| {
         spending_refresh_async(&w, &mut s);
+    });
+
+    // "Scan for existing funds…" manual deep scan (network-efficiency
+    // follow-up): gap-20 full discovery for a seed used elsewhere with gaps
+    // the shallow automatic scan wouldn't reach.
+    cb!(on_spending_scan_deep, |w, s| {
+        spending_scan_deep_async(&w, &mut s);
     });
 
     // Restore from an existing iCloud-synced key (onboarding, after reinstall

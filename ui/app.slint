@@ -1913,6 +1913,7 @@ export component AppWindow inherits Window {
     // internal spending wallet (funding-unification M3)
     callback set-spending-enabled(bool);   // Settings toggle
     callback spending-refresh();           // manual refresh (Settings card + Coins segment)
+    callback spending-scan-deep();         // manual gap-20 deep scan (existing-funds discovery)
     callback spending-sweep-here();        // Settings card "Sweep notebook funds here"
     callback set-pay-from(string);         // compose picker: "notebook" | "spending"
     callback set-coins-segment(string);    // Coins screen: "notebook" | "spending"
@@ -3529,6 +3530,15 @@ export component AppWindow inherits Window {
                         // cache is cold (first-time View-in-Coins showed an
                         // empty spending list otherwise).
                         clicked => { root.set-coins-segment("spending"); root.open-coins(); }
+                    }
+                    // Network-efficiency follow-up: the automatic scan above
+                    // only walks a shallow gap-3 range now (the app's own
+                    // usage is sequential) — this covers a seed heavily used
+                    // in ANOTHER BIP-84 wallet before this app ever touched
+                    // it, whose funds could sit beyond that reach.
+                    GhostButton {
+                        text: "Scan for existing funds…";
+                        clicked => { root.spending-scan-deep(); }
                     }
                 }
             }

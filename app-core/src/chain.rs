@@ -516,21 +516,34 @@ impl<T: Transport> ChainClient<T> {
     /// (so a spent-then-empty address doesn't prematurely end the gap walk);
     /// UTXOs are collected for used addresses. Also reports the first unused
     /// change index for a new change output.
+    ///
+    /// Network-efficiency merge (2026-07-23): this single walk ALSO collects
+    /// every used address (either chain) plus the first unused RECEIVE index
+    /// — exactly what a separate `chain::discover_spending` gap walk used to
+    /// report, at zero extra request cost (this loop already visits every
+    /// address and already calls `full_history` to decide "used"). Callers
+    /// that only need coins (the external funding-wallet paths) simply don't
+    /// read the new fields; the spending-wallet refresh path
+    /// (`spending_refresh_async`) now needs only ONE `scan_funding` call
+    /// instead of `discover_spending` + `scan_funding`.
     pub fn scan_funding(
         &self,
         src: &crate::funding::FundingSource,
         gap: u32,
     ) -> Result<crate::funding::FundingScan, Error> {
         use crate::funding::{FundingScan, FundingUtxo};
+        use crate::notebooks::SpendingAddr;
         let mut utxos = Vec::new();
+        let mut used = Vec::new();
         let mut seen_addr = std::collections::HashSet::new();
         let mut next_change_index = 0u32;
+        let mut next_receive_index = 0u32;
         let ranged = src.is_ranged();
 
         for chain in [0usize, 1usize] {
             let mut consecutive_unused = 0u32;
             let mut index = 0u32;
-            let mut first_unused_change: Option<u32> = None;
+            let mut first_unused: Option<u32> = None;
             loop {
                 let d = src.derive(chain, index)?;
                 // Fixed (non-multipath) descriptors can share an address
@@ -538,9 +551,15 @@ impl<T: Transport> ChainClient<T> {
                 if !seen_addr.insert(d.address.clone()) {
                     break;
                 }
-                let used = !self.full_history(&d.address)?.is_empty();
-                if used {
+                let is_used = !self.full_history(&d.address)?.is_empty();
+                if is_used {
                     consecutive_unused = 0;
+                    used.push(SpendingAddr {
+                        chain: chain as u32,
+                        index,
+                        address: d.address.clone(),
+                        script_pubkey_hex: hex::encode(&d.spk),
+                    });
                     for u in self.utxos(&d.address)? {
                         utxos.push(FundingUtxo {
                             txid: u.txid,
@@ -553,8 +572,8 @@ impl<T: Transport> ChainClient<T> {
                         });
                     }
                 } else {
-                    if chain == 1 && first_unused_change.is_none() {
-                        first_unused_change = Some(index);
+                    if first_unused.is_none() {
+                        first_unused = Some(index);
                     }
                     consecutive_unused += 1;
                 }
@@ -571,11 +590,14 @@ impl<T: Transport> ChainClient<T> {
                     ));
                 }
             }
+            let next = first_unused.unwrap_or(0);
             if chain == 1 {
-                next_change_index = first_unused_change.unwrap_or(0);
+                next_change_index = next;
+            } else {
+                next_receive_index = next;
             }
         }
-        Ok(FundingScan { utxos, next_change_index })
+        Ok(FundingScan { utxos, next_change_index, used, next_receive_index })
     }
 
     /// One-page probe for the notebook picker: has this address ANY
@@ -1168,6 +1190,100 @@ mod tests {
         let (used, next_receive, next_change) = discover_spending(&client, &src, 5);
         assert!(used.is_empty());
         assert_eq!((next_receive, next_change), (0, 0));
+    }
+
+    /// Network-efficiency merge (2026-07-23), correctness proof #1: the
+    /// extended `scan_funding`'s single walk must report the SAME used-
+    /// address list + next-receive/next-change indexes that the OLD two-call
+    /// shape (`discover_spending` + a plain `scan_funding`) produced — plus
+    /// the same coins, since a missed coin is lost-funds visibility. Used at
+    /// receive indexes {0,1} (a hole at neither) and change index 0.
+    #[test]
+    fn scan_funding_merge_matches_discover_spending() {
+        let m = parse_key_material(SPENDING_MNEMONIC, Network::Mainnet).unwrap();
+        let src = crate::spending::funding_source(&m, Network::Mainnet, 0).unwrap();
+        let r0 = src.derive(0, 0).unwrap().address;
+        let r1 = src.derive(0, 1).unwrap().address;
+        let c0 = src.derive(1, 0).unwrap().address;
+        let client = ChainClient::new(
+            ProbeTransport { used: vec![r0.clone(), r1.clone(), c0.clone()], fail: false },
+            Network::Mainnet,
+        );
+
+        let (disc_used, disc_next_receive, disc_next_change) = discover_spending(&client, &src, 20);
+        let scan = client.scan_funding(&src, 20).unwrap();
+
+        // Same used-address SET (chain, index, address, spk), order aside.
+        let mut disc_keys: Vec<(u32, u32)> = disc_used.iter().map(|a| (a.chain, a.index)).collect();
+        let mut scan_keys: Vec<(u32, u32)> = scan.used.iter().map(|a| (a.chain, a.index)).collect();
+        disc_keys.sort();
+        scan_keys.sort();
+        assert_eq!(disc_keys, scan_keys, "used-address (chain,index) set must match exactly");
+        for d in &disc_used {
+            let s = scan
+                .used
+                .iter()
+                .find(|a| a.chain == d.chain && a.index == d.index)
+                .expect("every discover_spending hit must appear in the merged scan");
+            assert_eq!(s.address, d.address);
+            assert_eq!(s.script_pubkey_hex, d.script_pubkey_hex);
+        }
+
+        // Same next-unused indexes on both chains.
+        assert_eq!(disc_next_receive, scan.next_receive_index);
+        assert_eq!(disc_next_change, scan.next_change_index);
+
+        // Same coins: one UTXO per used address (the ProbeTransport fixture's
+        // fixed 700-sat coin), none missing/extra.
+        assert_eq!(scan.utxos.len(), disc_used.len());
+        for u in &scan.utxos {
+            assert_eq!(u.value, 700);
+        }
+    }
+
+    /// Correctness proof #2: the "shallow" gap the app's automatic scan now
+    /// uses (3) catches sequential usage — indexes 0,1,2 used back-to-back,
+    /// with three consecutive unused indexes after (3,4,5) ending the walk.
+    #[test]
+    fn scan_funding_shallow_gap3_catches_sequential_usage() {
+        let m = parse_key_material(SPENDING_MNEMONIC, Network::Mainnet).unwrap();
+        let src = crate::spending::funding_source(&m, Network::Mainnet, 0).unwrap();
+        let r0 = src.derive(0, 0).unwrap().address;
+        let r1 = src.derive(0, 1).unwrap().address;
+        let r2 = src.derive(0, 2).unwrap().address;
+        let client = ChainClient::new(
+            ProbeTransport { used: vec![r0.clone(), r1.clone(), r2.clone()], fail: false },
+            Network::Mainnet,
+        );
+        let scan = client.scan_funding(&src, 3).unwrap();
+        let mut receive_used: Vec<u32> =
+            scan.used.iter().filter(|a| a.chain == 0).map(|a| a.index).collect();
+        receive_used.sort();
+        assert_eq!(receive_used, vec![0, 1, 2]);
+        assert_eq!(scan.utxos.iter().filter(|u| u.chain == 0).count(), 3);
+    }
+
+    /// Correctness proof #3 (documents the shallow/deep tradeoff): usage at
+    /// index 5 ONLY (0–4 all empty) is beyond a gap-3 walk's reach — it stops
+    /// after 3 consecutive unused indexes (2,3,4) without ever reaching 5 —
+    /// but a gap-20 walk (the manual "Scan for existing funds…" deep scan)
+    /// finds it. This is exactly the gappy-externally-used-seed case the deep
+    /// scan exists to cover.
+    #[test]
+    fn scan_funding_deep_gap20_catches_what_shallow_gap3_misses() {
+        let m = parse_key_material(SPENDING_MNEMONIC, Network::Mainnet).unwrap();
+        let src = crate::spending::funding_source(&m, Network::Mainnet, 0).unwrap();
+        let r5 = src.derive(0, 5).unwrap().address;
+        let client =
+            ChainClient::new(ProbeTransport { used: vec![r5.clone()], fail: false }, Network::Mainnet);
+
+        let shallow = client.scan_funding(&src, 3).unwrap();
+        assert!(shallow.used.is_empty(), "gap-3 must not reach index 5");
+        assert!(shallow.utxos.is_empty());
+
+        let deep = client.scan_funding(&src, 20).unwrap();
+        assert!(deep.used.iter().any(|a| a.chain == 0 && a.index == 5 && a.address == r5));
+        assert_eq!(deep.utxos.iter().filter(|u| u.chain == 0 && u.index == 5).count(), 1);
     }
 
     #[test]
