@@ -4715,6 +4715,12 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
     let Some(fp8) = st.notebooks_fp8.clone() else { return };
     let network = st.network;
     let account = st.account;
+    // Network-efficiency (build-39): snapshot the account's already-known
+    // active notebook indexes on the UI thread — the worker below skips
+    // probing these entirely (the "notebook-0 double-scan" fix; a fresh
+    // seed re-import's notebook 0 was just scanned by refresh_async).
+    let known: Vec<u32> =
+        st.notebooks.as_ref().map(|ix| ix.active(account).map(|m| m.index).collect()).unwrap_or_default();
     let key = format!("discovery/{fp8}/{account}");
     let weak = w.as_weak();
     let job = move || {
@@ -4722,7 +4728,7 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
         let found = parse_key_material(&material_str, network)
             .map(|material| {
                 let client = ChainClient::new(HttpTransport::new(base), network);
-                app_core::chain::discover_indexes(&client, &material, network, account, 5)
+                app_core::chain::discover_indexes(&client, &material, network, account, &known, 5)
             })
             .unwrap_or_default();
         drop(material_str); // Zeroizing — wiped as soon as the walk is done
