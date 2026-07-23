@@ -101,11 +101,15 @@ fn sim_identity_private_note_surfaces_undecrypted() {
     assert!(bundle.full);
     assert_eq!(bundle.network, "testnet4");
     assert_eq!(bundle.tip_height, 143129);
-    assert_eq!(bundle.fee_rates.fastest, 1.0);
     // Network-efficiency (2026-07-23): build_bundle no longer fetches
-    // btc_usd (it was only read by the fee-showing UI screens, never the
-    // scan path) — see `refresh_fees_price` in the app's src/lib.rs, which
-    // fetches it lazily on those screens' open instead.
+    // fee_rates OR btc_usd — both were only read by the fee-showing UI
+    // screens (compose/sweep/consolidate/bump), never the scan path, and are
+    // now fetched lazily there (`refresh_fees_price` in the app's src/lib.rs).
+    // The required notes-core fields are filled with defaults the app ignores.
+    assert_eq!(
+        bundle.fee_rates.fastest,
+        notes_core::bundle::FeeRates::default().fastest
+    );
     assert!(bundle.btc_usd.is_none());
     assert!(bundle.utxos.is_empty(), "sim funds were swept");
 
