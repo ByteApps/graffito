@@ -9129,6 +9129,11 @@ pub fn run() {
         match keychain::load_secret_protected(KEYCHAIN_ACCOUNT, "restore your Chain Notes identity") {
             Ok(Some(material)) => {
                 s.icloud_backup = true;
+                // Restore starts at account 0 like a fresh import — the account
+                // is device-config, not part of the restored key; gap discovery
+                // re-adds account 0's funded notebooks (Sal 2026-07-22).
+                s.account = 0;
+                s.nb_index = 0;
                 match activate(&mut s, &material, false) {
                     Ok(()) => {
                         println!("cb: restore-icloud ok");
@@ -9195,6 +9200,11 @@ pub fn run() {
             w.set_status("mismatch — check your written words and try again".into());
             return;
         }
+        // A freshly created seed is a NEW identity — start at account 0, never
+        // inheriting a persisted account from a previous identity (Sal
+        // 2026-07-22; config.account survives an identity reset).
+        s.account = 0;
+        s.nb_index = 0;
         match activate(&mut s, &phrase, true) {
             Ok(()) => {
                 s.pending_mnemonic = None;
@@ -9261,20 +9271,30 @@ pub fn run() {
     });
 
     cb!(on_import_confirm, |w, s, text: SharedString| {
-        // Sal 2026-07-22: hierarchical imports no longer branch into the
-        // account picker — every import (mnemonic/xprv/WIF/hex) activates
-        // directly at account 0 and lands on the notebook list below.
+        // Sal 2026-07-22: a SEED (hierarchical: mnemonic/xprv) no longer
+        // branches into the account picker — it activates account 0 directly,
+        // auto-creates its first notebook, and lands on the notebook LIST.
+        // Single-key imports (WIF/hex) are unchanged: activate() adds their one
+        // intrinsic notebook and they land on its home.
+        let hierarchical = parse_key_material(text.trim(), s.network).is_ok()
+            && is_hierarchical(text.trim(), s.network);
         s.account = 0;
         s.nb_index = 0;
         match activate(&mut s, text.trim(), true) {
             Ok(()) => {
                 println!("cb: import ok");
-                ensure_first_onboarded_notebook(&mut s);
                 w.set_import_text("".into());
-                update_notebook_list(&w, &s);
-                w.set_screen(17);
-                refresh_async(&w, &mut s);
-                spending_refresh_async(&w, &mut s);
+                if hierarchical {
+                    ensure_first_onboarded_notebook(&mut s);
+                    update_notebook_list(&w, &s);
+                    w.set_screen(17);
+                    refresh_async(&w, &mut s);
+                    spending_refresh_async(&w, &mut s);
+                } else {
+                    w.set_screen(4);
+                    update_home(&w, &s);
+                    refresh_async(&w, &mut s);
+                }
             }
             Err(e) => {
                 println!("cb: import err={e}");
