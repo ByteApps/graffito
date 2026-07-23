@@ -9261,23 +9261,20 @@ pub fn run() {
     });
 
     cb!(on_import_confirm, |w, s, text: SharedString| {
-        let t = text.trim().to_string();
-        if parse_key_material(&t, s.network).is_ok() && is_hierarchical(&t, s.network) {
-            println!("cb: import hierarchical → account picker");
-            s.pending_import = Some(Zeroizing::new(t.clone()));
-            w.set_account_pick_mode("switch".into());
-            show_account_picker(&w, &t, s.network, 0, None);
-            return;
-        }
+        // Sal 2026-07-22: hierarchical imports no longer branch into the
+        // account picker — every import (mnemonic/xprv/WIF/hex) activates
+        // directly at account 0 and lands on the notebook list below.
         s.account = 0;
         s.nb_index = 0;
         match activate(&mut s, text.trim(), true) {
             Ok(()) => {
                 println!("cb: import ok");
+                ensure_first_onboarded_notebook(&mut s);
                 w.set_import_text("".into());
-                w.set_screen(4);
-                update_home(&w, &s);
+                update_notebook_list(&w, &s);
+                w.set_screen(17);
                 refresh_async(&w, &mut s);
+                spending_refresh_async(&w, &mut s);
             }
             Err(e) => {
                 println!("cb: import err={e}");
@@ -12727,7 +12724,9 @@ pub fn run() {
             }
             return;
         }
-        let first_import = s.pending_import.is_some();
+        // Sal 2026-07-22: this picker mode is now switch-only — imports
+        // never set `pending_import` any more (removed in on_import_confirm),
+        // so this always falls back to the current identity's material.
         let Some(material) = s
             .pending_import
             .take()
@@ -12739,28 +12738,23 @@ pub fn run() {
         s.account = idx.max(0) as u32;
         s.nb_index = 0;
         println!("cb: pick-account {}", s.account);
-        match activate(&mut s, &material, first_import) {
+        match activate(&mut s, &material, false) {
             Ok(()) => {
-                if first_import {
-                    // An import's account pick IS deliberate — the account's
-                    // notebook 0 is created, auto-named "Notebook 1"
-                    // (renameable from the list), and the notebook LIST
-                    // opens.
+                // Settings account switch: the account is a wallet — land on
+                // ITS notebook list. A fresh/empty account (no notebooks at
+                // all) auto-creates its first one so the switch never lands
+                // on an empty list (Sal 2026-07-22); an account that already
+                // has notebooks (even if all archived) is left untouched.
+                let empty =
+                    s.notebooks.as_ref().map(|ix| ix.active(s.account).count() == 0).unwrap_or(true);
+                if empty {
                     ensure_first_onboarded_notebook(&mut s);
-                    w.set_import_text("".into());
-                    w.set_status("".into());
-                    update_notebook_list(&w, &s);
-                    w.set_screen(17);
-                    refresh_async(&w, &mut s);
-                    spending_refresh_async(&w, &mut s); // CHANGE 5
-                } else {
-                    // Settings account switch: the account is a wallet —
-                    // land on ITS notebook list (possibly empty; creation
-                    // stays deliberate).
-                    w.set_status("".into());
-                    update_notebook_list(&w, &s);
-                    w.set_screen(17);
                 }
+                w.set_status("".into());
+                update_notebook_list(&w, &s);
+                w.set_screen(17);
+                refresh_async(&w, &mut s);
+                spending_refresh_async(&w, &mut s);
             }
             Err(e) => w.set_status(format!("{e}").into()),
         }
