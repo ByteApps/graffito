@@ -131,10 +131,24 @@ pub struct FundingUtxo {
 
 /// Result of scanning a funding source: its spendable coins plus the first
 /// unused change index (where a new change output should go).
+///
+/// Network-efficiency merge (2026-07-23): `used` + `next_change_index` used
+/// to require a SEPARATE `chain::discover_spending` gap walk of the same two
+/// chains — this single walk now reports everything both calls produced.
+/// `used` is every address (either chain) this walk found with ANY history
+/// (same "used" test `utxos`/`next_change_index` already applied — a
+/// spent-then-empty address still counts, so a hole doesn't end the walk
+/// early); `next_receive_index` is its chain-0 analog of `next_change_index`
+/// (chain 1) — the first unused index on the receive chain, holes not
+/// counted as the frontier, matching `chain::discover_spending`'s rule
+/// exactly. Existing callers that only read `utxos`/`next_change_index`
+/// (external funding wallets) are unaffected.
 #[derive(Debug, Clone)]
 pub struct FundingScan {
     pub utxos: Vec<FundingUtxo>,
     pub next_change_index: u32,
+    pub used: Vec<crate::notebooks::SpendingAddr>,
+    pub next_receive_index: u32,
 }
 
 impl FundingSource {
@@ -319,5 +333,11 @@ mod tests {
         assert_eq!(scan.utxos[0].index, 0);
         assert!(scan.utxos[0].confirmed);
         assert_eq!(scan.next_change_index, 0);
+        // Network-efficiency merge: the same walk also reports the used-address
+        // list + next receive index (used to need a separate discover_spending
+        // call).
+        assert_eq!(scan.used.len(), 1);
+        assert_eq!((scan.used[0].chain, scan.used[0].index), (0, 0));
+        assert_eq!(scan.next_receive_index, 1);
     }
 }

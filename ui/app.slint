@@ -1913,6 +1913,7 @@ export component AppWindow inherits Window {
     // internal spending wallet (funding-unification M3)
     callback set-spending-enabled(bool);   // Settings toggle
     callback spending-refresh();           // manual refresh (Settings card + Coins segment)
+    callback spending-scan-deep();         // manual gap-20 deep scan (existing-funds discovery)
     callback spending-sweep-here();        // Settings card "Sweep notebook funds here"
     callback set-pay-from(string);         // compose picker: "notebook" | "spending"
     callback set-coins-segment(string);    // Coins screen: "notebook" | "spending"
@@ -3712,6 +3713,13 @@ export component AppWindow inherits Window {
             text: "Consolidate spending coins…";
             opacity: root.spending-coins-list.length >= 2 ? 1.0 : 0.4;
             clicked => { if (root.spending-coins-list.length >= 2) { root.spending-consolidate-open(); } }
+        }
+        // Deep gap-20 rescan for a seed used in ANOTHER BIP-84 wallet beyond the
+        // shallow gap-3 the automatic scan walks (2026-07-23). Placed here (not
+        // Settings) so it doesn't shift the Settings sweep/consolidate cards.
+        if root.coins-segment == "spending": GhostButton {
+            text: "Scan for existing funds…";
+            clicked => { root.spending-scan-deep(); }
         }
         if root.coins-segment == "notebook": Body { text: root.coins-summary; font-size: 12px; }
         if root.coins-segment == "spending": Body { text: root.spending-balance-line; font-size: 12px; }
