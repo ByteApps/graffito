@@ -3531,15 +3531,6 @@ export component AppWindow inherits Window {
                         // empty spending list otherwise).
                         clicked => { root.set-coins-segment("spending"); root.open-coins(); }
                     }
-                    // Network-efficiency follow-up: the automatic scan above
-                    // only walks a shallow gap-3 range now (the app's own
-                    // usage is sequential) — this covers a seed heavily used
-                    // in ANOTHER BIP-84 wallet before this app ever touched
-                    // it, whose funds could sit beyond that reach.
-                    GhostButton {
-                        text: "Scan for existing funds…";
-                        clicked => { root.spending-scan-deep(); }
-                    }
                 }
             }
         }
@@ -3722,6 +3713,13 @@ export component AppWindow inherits Window {
             text: "Consolidate spending coins…";
             opacity: root.spending-coins-list.length >= 2 ? 1.0 : 0.4;
             clicked => { if (root.spending-coins-list.length >= 2) { root.spending-consolidate-open(); } }
+        }
+        // Deep gap-20 rescan for a seed used in ANOTHER BIP-84 wallet beyond the
+        // shallow gap-3 the automatic scan walks (2026-07-23). Placed here (not
+        // Settings) so it doesn't shift the Settings sweep/consolidate cards.
+        if root.coins-segment == "spending": GhostButton {
+            text: "Scan for existing funds…";
+            clicked => { root.spending-scan-deep(); }
         }
         if root.coins-segment == "notebook": Body { text: root.coins-summary; font-size: 12px; }
         if root.coins-segment == "spending": Body { text: root.spending-balance-line; font-size: 12px; }

@@ -4856,14 +4856,13 @@ fn apply_active_bundle(
 ) {
     match bundle {
         Ok(bundle) => {
-            st.fees = Some(bundle.fee_rates.clone());
-            // st.usd is NOT stamped from a scan (network-efficiency,
-            // 2026-07-23): build_bundle no longer fetches btc_usd — it's
-            // always None here now — so assigning it would clobber whatever
-            // `refresh_fees_price` lazily fetched for the fee-showing
-            // screens. st.fees still comes from the bundle: build_bundle's
-            // fee_rates fetch wasn't removed (SyncBundle.fee_rates is
-            // non-optional), so a real scan's fee tiers stay fresh too.
+            // Neither st.fees nor st.usd is stamped from a scan
+            // (network-efficiency, 2026-07-23): build_bundle no longer fetches
+            // fee_rates OR btc_usd (both are default/None in the bundle now).
+            // The fee-showing screens (compose/sweep/consolidate/bump) fetch
+            // both lazily via `refresh_fees_price` (session-cached), and they
+            // are the ONLY readers of st.fees/st.usd — so a scan touching
+            // them would just clobber the lazily-fetched values.
             let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
             let output_x = st.ident.as_ref().unwrap().output_x();
             let network = st.network;
@@ -5049,9 +5048,9 @@ fn refresh(w: &AppWindow, st: &mut State) {
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
     match client.build_bundle(&address, None) {
         Ok(bundle) => {
-            st.fees = Some(bundle.fee_rates.clone());
-            // st.usd left alone here too — see the matching comment in
-            // `apply_active_bundle` (network-efficiency, 2026-07-23).
+            // st.fees/st.usd NOT stamped from a scan — see the matching
+            // comment in `apply_active_bundle` (network-efficiency,
+            // 2026-07-23); the fee-showing screens fetch both lazily.
             let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
             let output_x = st.ident.as_ref().unwrap().output_x();
             let network = st.network;

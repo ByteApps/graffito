@@ -760,7 +760,12 @@ impl<T: Transport> ChainClient<T> {
         since_height: Option<u64>,
     ) -> Result<SyncBundle, Error> {
         let tip_height = self.tip_height()?;
-        let fee_rates = self.fee_rates()?;
+        // Network-efficiency (2026-07-23): fee_rates + btc_usd are only READ by
+        // the fee-showing screens (compose/sweep/consolidate/bump), which now
+        // fetch them lazily (`refresh_fees_price`, session-cached). A scan no
+        // longer fetches either — the notes-core SyncBundle fields are required,
+        // so they're filled with defaults the app's apply path ignores.
+        let fee_rates = FeeRates::default();
         // Network-efficiency (2026-07-23): btc_usd was fetched on every scan
         // but only ever READ by the fee-showing screens (compose/sweep/
         // consolidate/bump) — those now fetch it lazily themselves
