@@ -628,6 +628,17 @@ impl<T: Transport> ChainClient<T> {
         })
     }
 
+    /// Network-efficiency (build-39): a ONE-request "does this address have
+    /// ANY on-chain history" check for [`discover_indexes`]'s gap walk —
+    /// cheaper than [`Self::address_probe`], which costs two requests
+    /// (`/txs` + `/utxo`) to also compute a balance discovery never needs.
+    /// Reuses [`Self::address_stats`]'s single `/address/:a` fetch; "used"
+    /// means any tx at all, confirmed or still sitting in the mempool.
+    pub fn address_used(&self, address: &str) -> Result<bool, Error> {
+        let stats = self.address_stats(address)?;
+        Ok(stats.chain_tx_count > 0 || stats.mempool_tx_count > 0)
+    }
+
     /// Broadcast raw tx hex; returns the txid mempool.space echoes back.
     ///
     /// One automatic retry, TRANSPORT-class failures only (`Error::Transport`
@@ -809,32 +820,45 @@ impl<T: Transport> ChainClient<T> {
 /// the walk and returns what was found so far, so a re-import without a
 /// node simply discovers nothing. The caller `ensure_notebook`s each hit;
 /// this function only reads the chain.
+///
+/// Network-efficiency (build-39): `known` lists receive indexes already
+/// confirmed to be notebooks (e.g. the freshly-ensured notebook 0 on a seed
+/// re-import) — the walk treats each as PRESENT with NO network request at
+/// all (the "notebook-0 double-scan" fix; `refresh_async` already scanned
+/// it moments earlier) and resets the gap counter, since a present notebook
+/// is never a gap. Every other index costs exactly one request via
+/// [`ChainClient::address_used`] instead of the old two-request
+/// [`ChainClient::address_probe`].
 pub fn discover_indexes<T: Transport>(
     client: &ChainClient<T>,
     material: &crate::identity::KeyMaterial,
     network: Network,
     account: u32,
+    known: &[u32],
     gap: u32,
 ) -> Vec<u32> {
     let mut found = Vec::new();
     let mut consecutive_unused = 0u32;
     let mut index = 0u32;
     while consecutive_unused < gap {
-        // A fixed (non-ranged) watch descriptor only derives index 0 — the
-        // realize error ends the walk cleanly after that one probe.
-        let Ok(ident) = crate::identity::realize(material, network, account, index) else {
-            break;
-        };
-        match client.address_probe(&ident.address) {
-            Ok((used, _)) => {
-                if used {
+        if known.contains(&index) {
+            // Already a confirmed notebook — present by construction, no
+            // request needed, and not re-added to `found`.
+            consecutive_unused = 0;
+        } else {
+            // A fixed (non-ranged) watch descriptor only derives index 0 —
+            // the realize error ends the walk cleanly after that one probe.
+            let Ok(ident) = crate::identity::realize(material, network, account, index) else {
+                break;
+            };
+            match client.address_used(&ident.address) {
+                Ok(true) => {
                     found.push(index);
                     consecutive_unused = 0;
-                } else {
-                    consecutive_unused += 1;
                 }
+                Ok(false) => consecutive_unused += 1,
+                Err(_) => break,
             }
-            Err(_) => break,
         }
         index += 1;
         // Same runaway backstop as scan_funding: no sane wallet needs more.
@@ -1062,7 +1086,11 @@ mod tests {
     }
 
     /// Canned esplora for address probes: history/utxos only at the listed
-    /// addresses; `fail` simulates an offline backend.
+    /// addresses; `fail` simulates an offline backend. Also answers the
+    /// plain `/address/:a` stats endpoint (`address_used`/`address_stats`)
+    /// with a one-tx-or-zero chain_stats shape, matching the same `used`
+    /// list — so `discover_indexes`'s one-request check exercises the same
+    /// fixtures the old two-request `address_probe` tests did.
     struct ProbeTransport {
         used: Vec<String>,
         fail: bool,
@@ -1086,7 +1114,11 @@ mod tests {
                     "[]".into()
                 })
             } else {
-                Ok(String::new())
+                // Plain `/address/:a` stats endpoint.
+                Ok(format!(
+                    r#"{{"chain_stats":{{"tx_count":{},"funded_txo_sum":0,"spent_txo_sum":0}},"mempool_stats":{{"tx_count":0,"funded_txo_sum":0,"spent_txo_sum":0}}}}"#,
+                    if used { 1 } else { 0 }
+                ))
             }
         }
         fn post_text(&self, _path: &str, _body: String) -> Result<String, Error> {
@@ -1098,25 +1130,85 @@ mod tests {
     fn discovery_finds_used_indexes_past_holes() {
         // Indexes 0 and 2 used, 1 is a hole — the gap walk must continue
         // past it and only stop after `gap` consecutive unused indexes.
+        // known=&[] here: same result the old two-request address_probe
+        // walk produced, now via the one-request address_used check.
         let client = ChainClient::new(
             ProbeTransport { used: vec![addr(0), addr(2)], fail: false },
             Network::Mainnet,
         );
-        assert_eq!(discover_indexes(&client, &material(), Network::Mainnet, 0, 5), vec![0, 2]);
+        assert_eq!(discover_indexes(&client, &material(), Network::Mainnet, 0, &[], 5), vec![0, 2]);
     }
 
     #[test]
     fn discovery_on_fresh_seed_is_empty() {
         let client =
             ChainClient::new(ProbeTransport { used: vec![], fail: false }, Network::Mainnet);
-        assert!(discover_indexes(&client, &material(), Network::Mainnet, 0, 5).is_empty());
+        assert!(discover_indexes(&client, &material(), Network::Mainnet, 0, &[], 5).is_empty());
     }
 
     #[test]
     fn discovery_offline_is_best_effort_empty() {
         let client =
             ChainClient::new(ProbeTransport { used: vec![addr(0)], fail: true }, Network::Mainnet);
-        assert!(discover_indexes(&client, &material(), Network::Mainnet, 0, 5).is_empty());
+        assert!(discover_indexes(&client, &material(), Network::Mainnet, 0, &[], 5).is_empty());
+    }
+
+    /// Same as `ProbeTransport` but records every path fetched, so a test
+    /// can prove `known` indexes are skipped with NO request at all — the
+    /// "notebook-0 double-scan" fix's core guarantee.
+    struct LoggingProbeTransport {
+        used: Vec<String>,
+        log: std::cell::RefCell<Vec<String>>,
+    }
+    impl Transport for LoggingProbeTransport {
+        fn get_text(&self, path: &str) -> Result<String, Error> {
+            self.log.borrow_mut().push(path.to_string());
+            let used = self.used.iter().any(|a| path.contains(a.as_str()));
+            Ok(format!(
+                r#"{{"chain_stats":{{"tx_count":{},"funded_txo_sum":0,"spent_txo_sum":0}},"mempool_stats":{{"tx_count":0,"funded_txo_sum":0,"spent_txo_sum":0}}}}"#,
+                if used { 1 } else { 0 }
+            ))
+        }
+        fn post_text(&self, _path: &str, _body: String) -> Result<String, Error> {
+            unreachable!("probes never POST")
+        }
+    }
+
+    #[test]
+    fn discovery_skips_known_index_with_no_request() {
+        // known=&[0]: index 0 must NOT be probed at all — yet the walk
+        // still finds the higher used index (2) and the gap still
+        // terminates correctly (index 0 being "present" resets the gap
+        // counter, same as if it had been probed and found used).
+        let a0 = addr(0);
+        let transport =
+            LoggingProbeTransport { used: vec![addr(2)], log: std::cell::RefCell::new(Vec::new()) };
+        let client = ChainClient::new(transport, Network::Mainnet);
+        let found = discover_indexes(&client, &material(), Network::Mainnet, 0, &[0], 5);
+        assert_eq!(found, vec![2]);
+        let log = client.transport.log.borrow();
+        assert!(
+            !log.iter().any(|p| p.contains(&a0)),
+            "index 0 must never be requested when it's already `known`: {log:?}"
+        );
+    }
+
+    #[test]
+    fn discovery_fresh_wallet_with_known_zero_terminates_empty() {
+        // A fully-fresh wallet (nothing used anywhere) with known=&[0]:
+        // index 0 is skipped (no request, but doesn't count toward the
+        // gap), then the walk probes 1..=gap and finds nothing used —
+        // `found` stays empty since a known index is never added to it.
+        let transport =
+            LoggingProbeTransport { used: vec![], log: std::cell::RefCell::new(Vec::new()) };
+        let client = ChainClient::new(transport, Network::Mainnet);
+        let found = discover_indexes(&client, &material(), Network::Mainnet, 0, &[0], 5);
+        assert!(found.is_empty());
+        let a0 = addr(0);
+        let log = client.transport.log.borrow();
+        assert!(!log.iter().any(|p| p.contains(&a0)), "index 0 must never be requested: {log:?}");
+        // Exactly `gap` (5) requests — indexes 1..=5 — one per unused probe.
+        assert_eq!(log.len(), 5);
     }
 
     /// Canned /tx/{txid}: two inputs with prevout addresses, one output.
