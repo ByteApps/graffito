@@ -749,7 +749,10 @@ impl<T: Transport> ChainClient<T> {
                 }
             };
             let index = address.as_deref().and_then(&index_of).unwrap_or(0);
-            coins.push(crate::psbt_build::WatchCoin { txid: ptxid, vout: pvout, value, index });
+            // `index_of` only resolves NOTEBOOK (chain-0) addresses — a
+            // change-including watch spend is non-bumpable by design (unit
+            // 6), so this reconstruction never needs to represent chain 1.
+            coins.push(crate::psbt_build::WatchCoin { txid: ptxid, vout: pvout, value, chain: 0, index });
         }
         let mut outputs = Vec::with_capacity(t.vout.len());
         for o in &t.vout {
@@ -954,6 +957,63 @@ pub fn scan_change_chain<T: Transport>(
         }
         // Same runaway backstop as scan_funding/discover_indexes: no sane
         // wallet needs more indexes than this.
+        if index >= 10_000 {
+            break;
+        }
+    }
+    Ok(coins)
+}
+
+/// Watch-only sibling of [`scan_change_chain`] (taproot change-chain unit
+/// 6): gap-walk a WATCH identity's account's taproot CHANGE chain (chain 1
+/// of its `tr(.../<0;1>/*)` descriptor, [`crate::funding::FundingSource::derive`])
+/// for spendable coins — `realize_change` (unit 1) errors on Xpub material,
+/// so a watch identity's change chain must come from the descriptor's own
+/// ranged `<0;1>` multipath instead. Same "used" test
+/// ([`ChainClient::address_used`], one request), same gap-stop shape, and
+/// the SAME `ChangeCoin` return type as `scan_change_chain` — folding these
+/// into `State.change_coins` is identical for both identity kinds.
+///
+/// A FIXED (non-ranged) descriptor — a bare single key with no `*`
+/// wildcard, which only derives index 0 — has no change chain either:
+/// [`crate::funding::FundingSource::is_ranged`] gates the walk, so it
+/// returns an empty `Vec` immediately, matching `scan_change_chain`'s own
+/// "nothing to walk" shape for non-hierarchical keyed material rather than
+/// treating it as a scan failure.
+pub fn scan_change_chain_watch<T: Transport>(
+    client: &ChainClient<T>,
+    source: &crate::funding::FundingSource,
+    gap: u32,
+) -> Result<Vec<ChangeCoin>, Error> {
+    let mut coins = Vec::new();
+    if !source.is_ranged() {
+        return Ok(coins);
+    }
+    let mut consecutive_unused = 0u32;
+    let mut index = 0u32;
+    loop {
+        let d = source.derive(1, index)?;
+        if client.address_used(&d.address)? {
+            consecutive_unused = 0;
+            for u in client.utxos(&d.address)? {
+                coins.push(ChangeCoin {
+                    index,
+                    address: d.address.clone(),
+                    script_pubkey_hex: hex::encode(&d.spk),
+                    txid: u.txid,
+                    vout: u.vout,
+                    value: u.value,
+                    confirmed: u.height.is_some(),
+                });
+            }
+        } else {
+            consecutive_unused += 1;
+        }
+        index += 1;
+        if consecutive_unused >= gap {
+            break;
+        }
+        // Same runaway backstop as scan_change_chain/scan_funding.
         if index >= 10_000 {
             break;
         }
@@ -1587,6 +1647,110 @@ mod tests {
         let m = KeyMaterial::Hex([7u8; 32]);
         let client = ChainClient::new(ProbeTransport { used: vec![], fail: true }, Network::Mainnet);
         let coins = scan_change_chain(&client, &m, Network::Mainnet, 0, 5).unwrap();
+        assert!(coins.is_empty());
+    }
+
+    // --- scan_change_chain_watch (taproot change-chain unit 6) ----------
+
+    /// The account-level `tr([fp/86'/{coin}'/{account}']xpub/<0;1>/*)`
+    /// descriptor for `CHANGE_MNEMONIC`'s seed — the SAME seed/network/
+    /// account [`change_addr`] (above) uses, so a watch-only import of this
+    /// seed sees the SAME chain-1 addresses as the keyed import.
+    fn change_watch_source(network: Network, account: u32) -> crate::funding::FundingSource {
+        use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+        let mnemonic =
+            bip39::Mnemonic::parse_in_normalized(bip39::Language::English, CHANGE_MNEMONIC).unwrap();
+        let seed = mnemonic.to_seed("");
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(crate::derive::btc_network(network), &seed).unwrap();
+        let coin = crate::derive::coin_type(network);
+        let account_xpriv = master
+            .derive_priv(
+                &secp,
+                &[
+                    ChildNumber::from_hardened_idx(86).unwrap(),
+                    ChildNumber::from_hardened_idx(coin).unwrap(),
+                    ChildNumber::from_hardened_idx(account).unwrap(),
+                ],
+            )
+            .unwrap();
+        let xpub = Xpub::from_priv(&secp, &account_xpriv);
+        let fp = master.fingerprint(&secp);
+        crate::funding::FundingSource::parse(
+            &format!("tr([{fp}/86'/{coin}'/{account}']{xpub}/<0;1>/*)"),
+            network,
+        )
+        .unwrap()
+    }
+
+    /// Money-critical parity (unit 6): a watch-only import of the SAME seed
+    /// must see the SAME chain-1 change addresses a keyed import does — the
+    /// descriptor's `<0;1>` multipath derivation and `realize_change`'s
+    /// leaf derivation are two independent code paths that must agree, or a
+    /// watch-only user's change coins would be invisible (or worse, an
+    /// external signer would be handed the wrong key origin for them).
+    #[test]
+    fn watch_change_addr_matches_keyed_realize_change() {
+        let src = change_watch_source(Network::Mainnet, 0);
+        let m = parse_key_material(CHANGE_MNEMONIC, Network::Mainnet).unwrap();
+        for j in [0u32, 1, 5, 41] {
+            let watch = src.derive(1, j).unwrap();
+            let keyed = crate::identity::realize_change(&m, Network::Mainnet, 0, j).unwrap();
+            assert_eq!(watch.address, keyed.address, "index {j}: watch vs keyed address mismatch");
+        }
+    }
+
+    /// [`scan_change_chain_watch`] finds the same coins [`scan_change_chain`]
+    /// (the keyed walk) does, for the SAME seed/addresses — the watch-only
+    /// scan sibling proven against the same `ProbeTransport` fixture unit 2
+    /// already uses.
+    #[test]
+    fn scan_change_chain_watch_finds_coins() {
+        let src = change_watch_source(Network::Mainnet, 0);
+        let client = ChainClient::new(
+            ProbeTransport { used: vec![change_addr(0), change_addr(1)], fail: false },
+            Network::Mainnet,
+        );
+        let coins = scan_change_chain_watch(&client, &src, 5).unwrap();
+        assert_eq!(coins.len(), 2, "one coin per used change index");
+        let mut indexes: Vec<u32> = coins.iter().map(|c| c.index).collect();
+        indexes.sort();
+        assert_eq!(indexes, vec![0, 1]);
+        for c in &coins {
+            assert_eq!(c.value, 700);
+            assert!(c.confirmed);
+            assert!(hex::decode(&c.script_pubkey_hex).is_ok(), "spk must be valid hex");
+            assert_eq!(c.address, change_addr(c.index));
+        }
+    }
+
+    /// A fresh watch wallet (nothing used) stops after `gap` probes with an
+    /// empty result — same shape as [`scan_change_chain_stops_after_gap_on_fresh_wallet`].
+    #[test]
+    fn scan_change_chain_watch_stops_after_gap_on_fresh_wallet() {
+        let src = change_watch_source(Network::Mainnet, 0);
+        let client =
+            ChainClient::new(ProbeTransport { used: vec![], fail: false }, Network::Mainnet);
+        let coins = scan_change_chain_watch(&client, &src, 3).unwrap();
+        assert!(coins.is_empty());
+    }
+
+    /// A FIXED (non-ranged, no `*` wildcard) descriptor has no change chain
+    /// to walk — the same "nothing to walk" shape `scan_change_chain`
+    /// returns for non-hierarchical keyed material, proven here with
+    /// `fail: true` to confirm no request is even attempted.
+    #[test]
+    fn scan_change_chain_watch_fixed_descriptor_is_empty() {
+        let src = change_watch_source(Network::Mainnet, 0);
+        // A definite (index-fixed) descriptor is already a plain `tr(key)`
+        // with no wildcard — re-parsing its own string form gives a FIXED
+        // FundingSource (single key, `is_ranged() == false`).
+        let fixed_desc = src.definite(0, 0).unwrap().to_string();
+        let fixed_src = crate::funding::FundingSource::parse(&fixed_desc, Network::Mainnet).unwrap();
+        assert!(!fixed_src.is_ranged());
+        let client = ChainClient::new(ProbeTransport { used: vec![], fail: true }, Network::Mainnet);
+        let coins = scan_change_chain_watch(&client, &fixed_src, 5).unwrap();
         assert!(coins.is_empty());
     }
 

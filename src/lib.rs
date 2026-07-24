@@ -18,8 +18,8 @@ use std::rc::Rc;
 
 use app_core::bitcoin;
 use app_core::chain::{
-    default_base, explorer_presets, explorer_tx_url, node_presets, scan_change_chain, AddrStats,
-    ChainClient, ChangeCoin, HttpTransport, TxLookupStatus,
+    default_base, explorer_presets, explorer_tx_url, node_presets, scan_change_chain,
+    scan_change_chain_watch, AddrStats, ChainClient, ChangeCoin, HttpTransport, TxLookupStatus,
 };
 use app_core::compose::ComposeRequest;
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
@@ -821,6 +821,15 @@ struct WatchSpend {
     dest_index: Option<u32>,
     /// (ref_id, is_note) of the record being replaced when kind == "bump".
     bump_ref: Option<(String, bool)>,
+    /// (txid, vout) of any taproot CHANGE-chain (chain 1) coins riding as
+    /// inputs (unit 6, see `../PLAN-chain-notes-app-taproot-change.md`) —
+    /// pruned from `State.change_coins` on broadcast success, same
+    /// treatment `SweepSnapshot.change_spent` gives the keyed sweep.
+    /// Non-empty makes the record non-bumpable (mirrors keyed CHANGE 2's
+    /// `mixed_inputs`): the bump reconstruction (`fetch_tx_io`'s
+    /// address→index resolver) only knows NOTEBOOK addresses, so it can't
+    /// safely re-derive a chain-1 leaf — see `watch_bump_open`.
+    change_spent: Vec<(String, u32)>,
 }
 
 struct WatchBump {
@@ -1350,6 +1359,12 @@ fn record_watch_spend(st: &mut State, ws: &WatchSpend, txid: &str, raw: &str, vs
                 );
                 if let Some(rec) = store.txs.last_mut() {
                     rec.input_indexes = ws.input_indexes.clone();
+                    // Unit 6: a change-including watch spend is non-bumpable
+                    // (see `WatchSpend.change_spent`'s doc comment) — same
+                    // `mixed_inputs` flag keyed CHANGE 2 sweeps use, so the
+                    // Activity screen's Speed-up affordance hides itself the
+                    // same way (`ActivityItem.bumpable = !t.mixed_inputs`).
+                    rec.mixed_inputs = !ws.change_spent.is_empty();
                 }
             };
             match ws.dest_index {
@@ -1387,16 +1402,31 @@ fn record_watch_spend(st: &mut State, ws: &WatchSpend, txid: &str, raw: &str, vs
                     }
                 }
             }
+            // Taproot CHANGE-chain coins (unit 6): pruned from the runtime
+            // cache so they're not re-offered before the next wallet-stores
+            // refresh re-scans chain 1 and finds them gone — same treatment
+            // as the keyed sweep's `SweepSnapshot.change_spent`.
+            if !ws.change_spent.is_empty() {
+                st.change_coins.retain(|c| {
+                    !ws.change_spent.iter().any(|(t, v)| t == &c.txid && *v == c.vout)
+                });
+            }
         }
     }
     st.save_store();
 }
 
-/// Every ACTIVE notebook's spendable coins as WatchCoins stamped with
-/// their owning receive index — the gather behind the watch wallet-level
-/// flows (rev-3 follow-up 1: sweep/consolidate span notebooks in ONE
-/// externally-signed PSBT). Falls back to the active store alone when no
-/// index is loaded.
+/// Every ACTIVE notebook's spendable coins (chain 0) PLUS the account's
+/// taproot CHANGE-chain coins (chain 1, `State.change_coins`, unit 6) as
+/// WatchCoins stamped with their owning chain+index — the gather behind
+/// the watch wallet-level flows (rev-3 follow-up 1: sweep/consolidate span
+/// notebooks in ONE externally-signed PSBT; unit 6 extends that ONE PSBT
+/// to the account's own change coins too, so a hardware signer recognizes
+/// them via their `.../1/{index}` key origin). Falls back to the active
+/// store alone when no index is loaded. `State.change_coins` is empty for
+/// any identity that hasn't scanned chain 1 yet (or a keyed identity — this
+/// function is only ever called for watch), so appending it is a no-op
+/// until unit 6's watch scan (`wallet_stores_refresh_async`) populates it.
 fn watch_wallet_coins(st: &State) -> Vec<WatchCoin> {
     let mut coins = Vec::new();
     if let Some(ix) = &st.notebooks {
@@ -1406,6 +1436,7 @@ fn watch_wallet_coins(st: &State) -> Vec<WatchCoin> {
                 txid: u.txid.clone(),
                 vout: u.vout,
                 value: u.value,
+                chain: 0,
                 index: m.index,
             }));
         }
@@ -1415,9 +1446,17 @@ fn watch_wallet_coins(st: &State) -> Vec<WatchCoin> {
             txid: u.txid.clone(),
             vout: u.vout,
             value: u.value,
+            chain: 0,
             index: nb,
         }));
     }
+    coins.extend(st.change_coins.iter().map(|c| WatchCoin {
+        txid: c.txid.clone(),
+        vout: c.vout,
+        value: c.value,
+        chain: 1,
+        index: c.index,
+    }));
     coins
 }
 
@@ -1443,11 +1482,16 @@ fn watch_spend_build(
         return;
     }
     let notebooks = {
-        let mut ids: Vec<u32> = coins.iter().map(|c| c.index).collect();
+        let mut ids: Vec<u32> = coins.iter().filter(|c| c.chain == 0).map(|c| c.index).collect();
         ids.sort_unstable();
         ids.dedup();
         ids.len()
     };
+    // Unit 6: chain-1 (change) inputs riding along — pruned from
+    // `State.change_coins` on success and marked non-bumpable (see
+    // `WatchSpend.change_spent`'s doc comment).
+    let change_spent: Vec<(String, u32)> =
+        coins.iter().filter(|c| c.chain == 1).map(|c| (c.txid.clone(), c.vout)).collect();
     let inputs: Vec<app_core::store::TxInput> = coins
         .iter()
         .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
@@ -1472,13 +1516,15 @@ fn watch_spend_build(
                 inputs,
                 input_indexes,
                 dest_index: None,
+                change_spent: change_spent.clone(),
                 bump_ref: None,
             });
             println!(
-                "cb: watch-spend-build kind={kind} txid={} fee={} inputs={} notebooks={notebooks}",
+                "cb: watch-spend-build kind={kind} txid={} fee={} inputs={} notebooks={notebooks}{}",
                 built.txid,
                 built.fee,
-                coins.len()
+                coins.len(),
+                if change_spent.is_empty() { String::new() } else { format!(" change={}", change_spent.len()) }
             );
             show_psbt_sign_screen(w, st, built, cost);
         }
@@ -1512,6 +1558,24 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
         w.set_status("transaction not found".into());
         return;
     };
+    // Unit 6 defense-in-depth (mirrors keyed CHANGE 2's `mixed_inputs`
+    // guard): a watch sweep/consolidate that included a chain-1 change coin
+    // is recorded `mixed_inputs = true` and can't be bumped — the
+    // `fetch_tx_io` rebuild below only resolves NOTEBOOK addresses, so it
+    // can't safely reconstruct a chain-1 leaf's key origin.
+    if !is_note
+        && st
+            .store
+            .as_ref()
+            .map(|s| s.txs.iter().any(|t| t.txids.iter().any(|x| *x == ref_id) && t.mixed_inputs))
+            .unwrap_or(false)
+    {
+        w.set_status(
+            "this sweep included a change-chain coin — it can't be sped up (rebroadcast still works)"
+                .into(),
+        );
+        return;
+    }
     // Multi-notebook records: stamp each input's owning receive index by
     // its prevout address (fetch_tx_io alone can't know our leaves) — the
     // rebuild derives every input's spk/key-origin from that index.
@@ -1604,6 +1668,7 @@ fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
                 input_indexes: Vec::new(),
                 dest_index: None,
                 bump_ref: Some((wb.ref_id.clone(), wb.is_note)),
+                change_spent: Vec::new(),
             });
             println!("cb: watch-bump-build ref={} txid={} fee={}", wb.ref_id, built.txid, built.fee);
             show_psbt_sign_screen(w, st, built, cost);
@@ -3607,6 +3672,12 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
     // yields an empty result with no chain call — matches
     // `scan_change_chain`'s own "nothing to walk" shape for watch/WIF/hex.
     let material_for_change = st.material.clone();
+    // Unit 6: a WATCH identity has no material `realize_change` can use
+    // (it errors on Xpub) — its chain-1 change chain lives in the SAME
+    // `tr(.../<0;1>/*)` descriptor `watch_source()` already exposes for
+    // sweep/consolidate, so scan it via `scan_change_chain_watch` instead.
+    let is_watch = st.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
+    let watch_src_for_change = st.ident.as_ref().and_then(|i| i.watch_source()).cloned();
     let key = format!("wstores/{fp8}/{}/{account}", network.as_str());
     let weak = w.as_weak();
     let job = move || {
@@ -3626,14 +3697,20 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
             current_address.as_deref().unwrap_or_default(),
             &dropped_checks,
         );
-        let change = match material_for_change
-            .as_deref()
-            .map(|m| parse_key_material(m, network))
-        {
-            Some(Ok(material)) => scan_change_chain(&client, &material, network, account, 1)
-                .map_err(|e| format!("{e}")),
-            Some(Err(e)) => Err(e.to_string()),
-            None => Ok(Vec::new()),
+        let change = if is_watch {
+            // Unit 6: watch-only walks the descriptor's own chain-1 range —
+            // no material to parse, no material to zeroize.
+            match &watch_src_for_change {
+                Some(src) => scan_change_chain_watch(&client, src, 1).map_err(|e| format!("{e}")),
+                None => Ok(Vec::new()),
+            }
+        } else {
+            match material_for_change.as_deref().map(|m| parse_key_material(m, network)) {
+                Some(Ok(material)) => scan_change_chain(&client, &material, network, account, 1)
+                    .map_err(|e| format!("{e}")),
+                Some(Err(e)) => Err(e.to_string()),
+                None => Ok(Vec::new()),
+            }
         };
         drop(material_for_change); // Zeroizing — wiped as soon as the scan is done
         WALLET_STORES_REFRESH_RESULTS
@@ -4219,8 +4296,14 @@ fn apply_psbt_broadcast_result(w: &AppWindow, st: &mut State, r: PsbtBroadcastRe
             } else if let Some(ws) = st.watch_spend.take() {
                 // Watch-mode spend: record it so Activity gets the
                 // pending→confirmed lifecycle, and lock the coins.
+                let change_n = ws.change_spent.len();
                 record_watch_spend(st, &ws, txid, raw, vsize as u64);
-                println!("cb: watch-{} txid={txid} fee={} ok", ws.kind, ws.fee);
+                println!(
+                    "cb: watch-{} txid={txid} fee={} ok{}",
+                    ws.kind,
+                    ws.fee,
+                    if change_n > 0 { format!(" change={change_n}") } else { String::new() }
+                );
                 wallet_flow = ws.bump_ref.is_none() && (ws.kind == "sweep" || ws.kind == "consolidate");
             } else {
                 println!("cb: fund-broadcast txid={txid} ok");
@@ -8651,7 +8734,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
                 coins.iter().map(move |u| {
                     let mut t = u.txid;
                     t.reverse();
-                    WatchCoin { txid: hex::encode(t), vout: u.vout, value: u.value, index: *index }
+                    WatchCoin { txid: hex::encode(t), vout: u.vout, value: u.value, chain: 0, index: *index }
                 })
             })
             .collect();
@@ -8682,6 +8765,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
                     input_indexes,
                     dest_index: Some(wc.dest_index),
                     bump_ref: None,
+                    change_spent: Vec::new(), // wconsol sources are notebook coins only (chain 0)
                 });
                 println!(
                     "cb: wallet-consolidate build txid={} coins={} notebooks={} fee={}",
@@ -10758,7 +10842,7 @@ pub fn run() {
                             .utxos
                             .iter()
                             .filter(|u| !u.pending_spend)
-                            .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: nb })
+                            .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, chain: 0, index: nb })
                             .collect()
                     })
                     .unwrap_or_default()
@@ -10772,6 +10856,12 @@ pub fn run() {
                 .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
                 .collect();
             let input_indexes: Vec<u32> = notes_coins.iter().map(|c| c.index).collect();
+            // Unit 6: the watch branch's `notes_coins` (from `watch_wallet_coins`)
+            // may include chain-1 change coins riding in this fee-external-
+            // funded sweep too — same non-bumpable + prune-on-success
+            // treatment as the self-paid watch sweep.
+            let change_spent: Vec<(String, u32)> =
+                notes_coins.iter().filter(|c| c.chain == 1).map(|c| (c.txid.clone(), c.vout)).collect();
             let Some(ident) = s.ident.as_ref() else { return };
             let identity_spk = p2tr_script_pubkey(&ident.output_x());
             let identity_source = ident.watch_source().cloned();
@@ -10817,13 +10907,15 @@ pub fn run() {
                         input_indexes,
                         dest_index: None,
                         bump_ref: None,
+                        change_spent: change_spent.clone(),
                     });
                     println!(
-                        "cb: sweep-build funded=1 txid={} fee={} notes_in={} fund_in={}",
+                        "cb: sweep-build funded=1 txid={} fee={} notes_in={} fund_in={}{}",
                         built.txid,
                         built.fee,
                         notes_coins.len(),
-                        fund_coins.len()
+                        fund_coins.len(),
+                        if change_spent.is_empty() { String::new() } else { format!(" change={}", change_spent.len()) }
                     );
                     show_psbt_sign_screen(&w, &mut s, built, cost);
                 }
@@ -12310,7 +12402,7 @@ pub fn run() {
                 .utxos
                 .iter()
                 .filter(|u| !u.pending_spend && sel.contains(&(u.txid.clone(), u.vout)))
-                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: nb })
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, chain: 0, index: nb })
                 .collect();
             if coins.is_empty() {
                 println!("cb: compose-send bail=no-coins src=watch");
