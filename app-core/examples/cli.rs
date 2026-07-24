@@ -74,6 +74,23 @@ fn main() {
             let net = network(&args[2]);
             println!("{}", identity(net).address);
         }
+        Some("change-address") => {
+            // change-address <network> [change_index]
+            // Watch identity (taproot change-chain unit 6): the address of
+            // the account's OWN taproot CHANGE leaf (m/86'/{coin}'/
+            // {account}'/1/{change_index}) — the same descriptor's `<0;1>`
+            // multipath, chain 1 instead of the notebook chain 0. Prints
+            // just the address so a caller can fund it before
+            // `change-spend-build`.
+            let net = network(&args[2]);
+            let ident = identity(net);
+            let src = ident
+                .watch_source()
+                .expect("change-address needs watch-only APP_KEY (xpub / descriptor)")
+                .clone();
+            let index: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            println!("{}", src.derive(1, index).expect("derive change address").address);
+        }
         Some("xpub") => {
             // xpub <network> — the account-level xpub for hierarchical
             // APP_KEY material (APP_ACCOUNT selects the account): the
@@ -185,7 +202,7 @@ fn main() {
                 .utxos
                 .iter()
                 .filter(|u| !u.pending_spend)
-                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: ident.index })
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, chain: 0, index: ident.index })
                 .collect();
             let dest_addr = args.get(6).cloned().unwrap_or_else(|| ident.address.clone());
             let dest = Recipient::parse(net, &dest_addr).expect("dest address");
@@ -231,6 +248,7 @@ fn main() {
                         txid: u.txid.clone(),
                         vout: u.vout,
                         value: u.value,
+                        chain: 0,
                         index: *index,
                     })
                 })
@@ -246,6 +264,49 @@ fn main() {
                 coins.len(),
                 sources.len(),
                 args[4]
+            );
+        }
+        Some("change-spend-build") => {
+            // change-spend-build <base-url> <network> <rate> <out.psbt> <dest> [change_index]
+            // Watch identity (taproot change-chain unit 6): spend ONE of
+            // the account's OWN taproot CHANGE-chain coins
+            // (m/86'/{coin}'/{account}'/1/{change_index}) — no local store,
+            // the coin is read live from the chain. Proves an external
+            // signer recognizes the `.../1/{change_index}` key origin
+            // (the watch-signer harness's change-chain leg exercises this
+            // end to end). Sign externally, then spend-broadcast.
+            let base = &args[2];
+            let net = network(&args[3]);
+            let rate: f64 = args[4].parse().expect("fee rate");
+            let ident = identity(net);
+            let src = ident
+                .watch_source()
+                .expect("change-spend-build needs watch-only APP_KEY (xpub / descriptor)")
+                .clone();
+            let index: u32 = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let d = src.derive(1, index).expect("derive change address");
+            let client = ChainClient::new(HttpTransport::new(base), net);
+            let coins: Vec<WatchCoin> = client
+                .utxos(&d.address)
+                .expect("utxo fetch")
+                .into_iter()
+                .map(|u| WatchCoin { txid: u.txid, vout: u.vout, value: u.value, chain: 1, index })
+                .collect();
+            assert!(
+                !coins.is_empty(),
+                "no funds at change address {} (index {index}) — fund it first",
+                d.address
+            );
+            let dest = Recipient::parse(net, &args[6]).expect("dest address");
+            let built = build_watch_spend_psbt(&src, &coins, dest.spk, rate).expect("build");
+            std::fs::write(&args[5], built.to_bytes()).expect("write psbt");
+            println!(
+                "cli: change-spend-build chain=1 index={index} txid={} fee={} value={} inputs={} -> {}",
+                built.txid,
+                built.fee,
+                built.sent_to_recipient,
+                coins.len(),
+                args[5]
             );
         }
         Some("bump-build") => {
@@ -309,7 +370,7 @@ fn main() {
                 .utxos
                 .iter()
                 .filter(|u| !u.pending_spend)
-                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: ident.index })
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, chain: 0, index: ident.index })
                 .collect();
             let dest = Recipient::parse(net, &args[7]).expect("dest address");
             let identity_spk =
@@ -354,7 +415,7 @@ fn main() {
                 .utxos
                 .iter()
                 .filter(|u| !u.pending_spend)
-                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: ident.index })
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, chain: 0, index: ident.index })
                 .collect();
             let recipient = args.get(6).map(|a| Recipient::parse(net, a).expect("dest address"));
             let gift: u64 = args.get(7).and_then(|g| g.parse().ok()).unwrap_or(330);

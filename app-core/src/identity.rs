@@ -13,7 +13,8 @@ use std::str::FromStr;
 use zeroize::Zeroizing;
 
 use crate::derive::{
-    btc_network, identity_from_leaf, leaf_from_account, leaf_from_master, leaf_from_mnemonic,
+    btc_network, identity_from_leaf, leaf_from_account, leaf_from_account_chain, leaf_from_master,
+    leaf_from_master_chain, leaf_from_mnemonic, leaf_from_mnemonic_chain,
 };
 use crate::funding::{FundingKind, FundingSource};
 use crate::Error;
@@ -354,6 +355,48 @@ pub fn realize(
                 keys: IdentityKeys::Watch { output_x, source: src.clone() },
                 address: d.address,
             });
+        }
+    });
+    let identity = identity_from_leaf(&leaf)?;
+    let address = identity.address(network);
+    Ok(AppIdentity {
+        kind: material.kind(),
+        account,
+        index,
+        keys: IdentityKeys::Full { leaf_secret: leaf, identity },
+        address,
+    })
+}
+
+/// Change-chain (`m/86'/{coin}'/{account}'/1/{index}`) counterpart to
+/// [`realize`] — same account, `chain=1` instead of the notebook's frozen
+/// `chain=0`. Foundation for the taproot change-chain feature
+/// (`../PLAN-chain-notes-app-taproot-change.md`): derivation + address
+/// only here, scanning/spending land in a later change. Reuses
+/// [`identity_from_leaf`] (⇒ `notes_core::bundle::Identity::from_leaf_secret`)
+/// for the BIP-341 tweak + P2TR address — the exact same code path
+/// [`realize`]'s chain-0 leaves go through, never reimplemented.
+///
+/// WIF/hex/watch-only material has no chain concept (WIF/hex are a single
+/// raw key with no hierarchy to walk; watch-only descriptors are out of
+/// scope for this foundation unit) — all three error here rather than
+/// fabricate a leaf.
+pub fn realize_change(
+    material: &KeyMaterial,
+    network: Network,
+    account: u32,
+    index: u32,
+) -> Result<AppIdentity, Error> {
+    const NEEDS_HD: &str = "change chain needs a BIP-39 seed or master/account xprv identity";
+    let leaf: Zeroizing<[u8; 32]> = Zeroizing::new(match material {
+        KeyMaterial::Mnemonic(m) => leaf_from_mnemonic_chain(m, network, account, 1, index)?,
+        KeyMaterial::Xprv(x) => match x.depth {
+            0 => leaf_from_master_chain(x, network, account, 1, index)?,
+            3 => leaf_from_account_chain(x, 1, index)?,
+            d => return Err(Error::XprvDepth(d)),
+        },
+        KeyMaterial::Wif(_) | KeyMaterial::Hex(_) | KeyMaterial::Xpub(_) => {
+            return Err(Error::Funding(NEEDS_HD.into()))
         }
     });
     let identity = identity_from_leaf(&leaf)?;

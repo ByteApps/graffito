@@ -37,7 +37,11 @@ export struct CoinItem { outpoint: string, value: string, status: string, notebo
 // segment) — address instead of `notebook` since these coins live on the
 // BIP-84 fresh-address chain, not any one notebook.
 export struct SpendingCoinItem { address: string, value: string, status: string }
-export struct SpendCoin { outpoint: string, value: string, confirmed: bool, selected: bool, txid-short: string, explorer: string }
+// `tag`: "" for an ordinary coin, "change" for a taproot CHANGE-chain coin
+// (m/86'/…/1/{index}, taproot-change unit 5) folded into the Pay-from
+// "Notebook" panel — CoinListPanel shows a small badge when non-empty,
+// mirroring the Coins screen's CoinItem.notebook == "change" convention.
+export struct SpendCoin { outpoint: string, value: string, confirmed: bool, selected: bool, txid-short: string, explorer: string, tag: string }
 // One input/output row in the Sparrow-style PSBT confirmation. `kind` drives
 // the accent: note · self · recipient · change · input · other.
 export struct PsbtRow { title: string, subtitle: string, amount: string, kind: string }
@@ -1250,6 +1254,10 @@ component CoinListPanel inherits VerticalLayout {
                 Text { text: c.value + " sats"; font-size: 12px; color: Pal.text; }
             }
             Rectangle { }
+            if c.tag != "": VerticalLayout {
+                alignment: center;
+                Badge { label: c.tag; tint: Pal.accent; }
+            }
             VerticalLayout {
                 alignment: center;
                 Badge { label: c.confirmed ? "confirmed" : "unconfirmed"; tint: c.confirmed ? Pal.good : Pal.warn; }
@@ -3745,7 +3753,13 @@ export component AppWindow inherits Window {
                                 font-weight: 700;
                                 color: Pal.text;
                             }
-                            if c.notebook != "": Badge { label: c.notebook; tint: Pal.muted; }
+                            // "change" (taproot change-chain coins, unit 3) gets the
+                            // accent tint so it reads distinctly from a notebook-name
+                            // badge at a glance, same Badge component either way.
+                            if c.notebook != "": Badge {
+                                label: c.notebook;
+                                tint: c.notebook == "change" ? Pal.accent : Pal.muted;
+                            }
                             Rectangle { }
                             Badge {
                                 label: c.status;

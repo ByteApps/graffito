@@ -79,14 +79,20 @@ impl BuiltPsbt {
     }
 }
 
-/// A coin a watch identity spends — at the descriptor's receive leaf
-/// `0/{index}` (rev 3: each notebook is one receive index; pre-rev-3
-/// coins are all index 0, the original notes address).
+/// A coin a watch identity spends — at the descriptor's `chain/{index}` leaf
+/// (rev 3: each notebook is one receive (chain 0) index; pre-rev-3 coins are
+/// all index 0, the original notes address). Taproot change-chain unit 6:
+/// `chain` also carries 1 for the account's own CHANGE-chain coins
+/// (`m/86'/…/1/{index}`, [`crate::identity::realize_change`]'s watch-only
+/// sibling) — every existing caller constructs `chain: 0`, so a chain-0 coin
+/// behaves byte-identically to before the field existed.
 #[derive(Debug, Clone)]
 pub struct WatchCoin {
     pub txid: String,
     pub vout: u32,
     pub value: u64,
+    /// 0 = receive/notebook chain, 1 = change chain.
+    pub chain: u32,
     pub index: u32,
 }
 
@@ -108,7 +114,9 @@ fn taproot_keyspend_inputs(
     let mut prevouts = Vec::with_capacity(coins.len());
     let mut weights = Vec::with_capacity(coins.len());
     for coin in coins {
-        let leaf_spk = ScriptBuf::from_bytes(source.derive(0, coin.index)?.spk);
+        // Unit 6: each coin's OWN chain (0 = receive/notebook, 1 = change) —
+        // a chain-0 coin derives exactly as before (byte-identical no-op).
+        let leaf_spk = ScriptBuf::from_bytes(source.derive(coin.chain as usize, coin.index)?.spk);
         let txid = Txid::from_str(&coin.txid).map_err(|e| Error::Funding(format!("bad txid: {e}")))?;
         inputs.push(TxIn {
             previous_output: OutPoint { txid, vout: coin.vout },
@@ -134,8 +142,10 @@ fn assemble_watch_psbt(
     let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| Error::Funding(format!("psbt: {e}")))?;
     for (i, coin) in coins.iter().enumerate() {
         // Per-coin definite descriptor: key origins carry each input's own
-        // receive index, so a signer recognizes every notebook's coins.
-        let def = source.definite(0, coin.index)?;
+        // chain+index (unit 6: notebook coins at 0/{index}, change coins at
+        // 1/{index}), so a signer recognizes every notebook's AND the
+        // account's change coins.
+        let def = source.definite(coin.chain as usize, coin.index)?;
         psbt.inputs[i].witness_utxo = Some(prevouts[i].clone());
         psbt.inputs[i]
             .update_with_descriptor_unchecked(&def)
@@ -392,11 +402,12 @@ pub fn build_funded_sweep_psbt(
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         });
-        // Watch identities may sweep several notebooks at once — each coin
-        // sits at its own receive leaf `0/{index}`. Keyed identities pass
-        // identity_source = None and one spk (they sign their own inputs).
+        // Watch identities may sweep several notebooks (AND the account's
+        // change chain, unit 6) at once — each coin sits at its own
+        // `chain/{index}` leaf. Keyed identities pass identity_source = None
+        // and one spk (they sign their own inputs).
         let spk = match identity_source {
-            Some(src) => ScriptBuf::from_bytes(src.derive(0, coin.index)?.spk),
+            Some(src) => ScriptBuf::from_bytes(src.derive(coin.chain as usize, coin.index)?.spk),
             None => notes_spk.clone(),
         };
         prevouts.push(TxOut { value: Amount::from_sat(coin.value), script_pubkey: spk });
@@ -467,9 +478,10 @@ pub fn build_funded_sweep_psbt(
     if let Some(src) = identity_source {
         for (i, coin) in notes_coins.iter().enumerate() {
             // Per-coin definite descriptor: each input's key origin carries
-            // its own receive index, so the signer recognizes every
-            // notebook's coins (the assemble_watch_psbt rule).
-            let def = src.definite(0, coin.index)?;
+            // its own chain+index, so the signer recognizes every notebook's
+            // AND the account's change coins (the assemble_watch_psbt rule,
+            // unit 6).
+            let def = src.definite(coin.chain as usize, coin.index)?;
             psbt.inputs[i]
                 .update_with_descriptor_unchecked(&def)
                 .map_err(|e| Error::Funding(format!("identity key origins: {e}")))?;
@@ -1055,8 +1067,8 @@ mod tests {
             FundingSource::parse(&format!("tr([{fp}/86'/0'/0']{xpub}/<0;1>/*)"), NET).unwrap();
 
         let coins = vec![
-            WatchCoin { txid: "a".repeat(64), vout: 0, value: 60_000, index: 0 },
-            WatchCoin { txid: "b".repeat(64), vout: 1, value: 40_000, index: 0 },
+            WatchCoin { txid: "a".repeat(64), vout: 0, value: 60_000, chain: 0, index: 0 },
+            WatchCoin { txid: "b".repeat(64), vout: 1, value: 40_000, chain: 0, index: 0 },
         ];
         let dest = src.derive(0, 0).unwrap().spk; // consolidate to self
         let built = build_watch_spend_psbt(&src, &coins, dest.clone(), 2.0).unwrap();
@@ -1095,8 +1107,85 @@ mod tests {
         // A bump at (or below) the old rate is rejected.
         assert!(build_watch_bump_psbt(&src, &coins, &prev_outputs, 0, 2.0).is_err());
         // Sweeping less than fee+dust is rejected.
-        let tiny = vec![WatchCoin { txid: "c".repeat(64), vout: 0, value: 400, index: 0 }];
+        let tiny = vec![WatchCoin { txid: "c".repeat(64), vout: 0, value: 400, chain: 0, index: 0 }];
         assert!(build_watch_spend_psbt(&src, &tiny, dest, 2.0).is_err());
+    }
+
+    /// Unit 6 (watch-only spends the chain-1 change chain): a watch spend
+    /// PSBT containing a MIXED chain-0 notebook coin and a chain-1 change
+    /// coin must carry per-input taproot key origins whose derivation path
+    /// ends in `/{chain}/{index}` — `/0/{index}` for the notebook coin,
+    /// `/1/{index}` for the change coin, never swapped. This is the
+    /// money-critical guarantee an external signer relies on to derive the
+    /// right key; a wrong path signs (or fails to sign) the WRONG key. Also
+    /// proves the round-trip: the SAME master key signs BOTH inputs
+    /// correctly via their key origins alone (exactly like a hardware
+    /// signer would), and the finished tx finalizes.
+    #[test]
+    fn watch_spend_chain1_input_has_change_key_origin() {
+        use crate::psbt_finalize::{finalize_extract, validate_signed};
+        use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(bitcoin::Network::Bitcoin, &[0x44u8; 32]).unwrap();
+        let account = master
+            .derive_priv(
+                &secp,
+                &[
+                    ChildNumber::from_hardened_idx(86).unwrap(),
+                    ChildNumber::from_hardened_idx(0).unwrap(),
+                    ChildNumber::from_hardened_idx(0).unwrap(),
+                ],
+            )
+            .unwrap();
+        let xpub = Xpub::from_priv(&secp, &account);
+        let fp = master.fingerprint(&secp);
+        let src = FundingSource::parse(&format!("tr([{fp}/86'/0'/0']{xpub}/<0;1>/*)"), NET).unwrap();
+
+        // Notebook coin at receive index 2, change coin at change index 5 —
+        // deliberately DIFFERENT indexes so a chain/index swap would also
+        // change the derived pubkey (same-index coins alone couldn't rule
+        // out a swap that just happened to still look consistent).
+        let coins = vec![
+            WatchCoin { txid: "1".repeat(64), vout: 0, value: 50_000, chain: 0, index: 2 },
+            WatchCoin { txid: "2".repeat(64), vout: 1, value: 70_000, chain: 1, index: 5 },
+        ];
+        let dest = src.derive(0, 0).unwrap().spk;
+        let built = build_watch_spend_psbt(&src, &coins, dest, 2.0).unwrap();
+        assert_eq!(built.psbt.inputs.len(), 2);
+
+        let path_of = |i: usize| {
+            let pin = &built.psbt.inputs[i];
+            assert!(pin.witness_utxo.is_some(), "input {i} missing witness_utxo");
+            let (_leaf_hashes, (_fp, path)) = pin
+                .tap_key_origins
+                .values()
+                .next()
+                .unwrap_or_else(|| panic!("input {i} has no taproot key origin"));
+            path.clone()
+        };
+        let path0 = path_of(0).to_string();
+        let path1 = path_of(1).to_string();
+        assert!(path0.ends_with("/0/2"), "chain-0 input must end /0/2, got {path0}");
+        assert!(path1.ends_with("/1/5"), "chain-1 input must end /1/5, got {path1}");
+        assert_ne!(path0, path1);
+
+        // Prevout scripts differ (different leaves) — never accidentally equal.
+        assert_ne!(
+            built.psbt.inputs[0].witness_utxo.as_ref().unwrap().script_pubkey,
+            built.psbt.inputs[1].witness_utxo.as_ref().unwrap().script_pubkey
+        );
+
+        // The signer (the SAME master key, via BIP-32 key origins alone —
+        // exactly the mechanism a hardware wallet uses) signs BOTH inputs
+        // correctly and the tx finalizes — proving the key origins actually
+        // route to the right leaf, not just that they're present.
+        let mut psbt = built.psbt.clone();
+        let _ = psbt.sign(&master, &secp);
+        validate_signed(&psbt, &built.txid)
+            .expect("master signs chain-0 AND chain-1 inputs via key origins");
+        assert!(finalize_extract(psbt).is_ok());
     }
 
     /// Fee-funded sweep, both identity flavors: the notes balance rides in
@@ -1147,8 +1236,8 @@ mod tests {
         let alice = Identity::from_app_seed(&[7u8; 32]).unwrap();
         let alice_spk = notes_core::address::p2tr_script_pubkey(&alice.output_x);
         let notes_coins = vec![
-            WatchCoin { txid: "e".repeat(64), vout: 0, value: 60_000, index: 0 },
-            WatchCoin { txid: "f".repeat(64), vout: 1, value: 40_000, index: 0 },
+            WatchCoin { txid: "e".repeat(64), vout: 0, value: 60_000, chain: 0, index: 0 },
+            WatchCoin { txid: "f".repeat(64), vout: 1, value: 40_000, chain: 0, index: 0 },
         ];
         let built =
             build_funded_sweep_psbt(alice_spk.clone(), None, &notes_coins, &plan, dest_spk.clone())
@@ -1227,7 +1316,7 @@ mod tests {
         let fp = master.fingerprint(&secp);
         let src = FundingSource::parse(&format!("tr([{fp}/86'/0'/0']{xpub}/<0;1>/*)"), NET).unwrap();
         let self_addr = src.derive(0, 0).unwrap();
-        let coins = vec![WatchCoin { txid: "9".repeat(64), vout: 0, value: 50_000, index: 0 }];
+        let coins = vec![WatchCoin { txid: "9".repeat(64), vout: 0, value: 50_000, chain: 0, index: 0 }];
 
         // Self public note.
         let built = build_watch_note_psbt(
@@ -1613,7 +1702,7 @@ mod tests {
         let xpub = Xpub::from_priv(&secp, &master.derive_priv(&secp, &acct_path).unwrap());
         let fp = master.fingerprint(&secp);
         let src = FundingSource::parse(&format!("tr([{fp}/86'/0'/0']{xpub}/<0;1>/*)"), NET).unwrap();
-        let coins = vec![WatchCoin { txid: "9".repeat(64), vout: 0, value: 80_000, index: 0 }];
+        let coins = vec![WatchCoin { txid: "9".repeat(64), vout: 0, value: 80_000, chain: 0, index: 0 }];
 
         let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
         let carol = Identity::from_app_seed(&[11u8; 32]).unwrap();
@@ -1749,5 +1838,85 @@ mod tests {
             Err(e) => assert!(format!("{e}").to_lowercase().contains("taproot"), "got: {e}"),
             Ok(_) => panic!("expected a taproot-required error"),
         }
+    }
+
+    /// CHANGE-CHAIN sweep signing (taproot-change unit 6, see
+    /// `../PLAN-chain-notes-app-taproot-change.md`): a coin sitting at the
+    /// account's chain-1 (`m/86'/…/1/{index}`) leaf — the same leaf
+    /// `sweep`'s change-idents loop derives via `realize_change` — signs
+    /// with `sign_own_taproot_inputs` exactly like a chain-0 notebook coin
+    /// does, and the resulting `tap_key_sig` verifies against the OWNER'S
+    /// OWN tweaked output key (the P2TR output key for that chain-1
+    /// address), not some other leaf — proving the sweep signs the change
+    /// coin with the correct key, not a stray or chain-0 one.
+    #[test]
+    fn sign_own_taproot_inputs_signs_change_chain_coin() {
+        use crate::identity::{parse_key_material, realize_change};
+        use notes_core::sign::schnorr_verify;
+
+        const MNEMONIC: &str =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let material = parse_key_material(MNEMONIC, NET).unwrap();
+        let owner = realize_change(&material, NET, 0, 0).unwrap();
+        let identity = owner.full().expect("keyed material realizes a full identity");
+        let owner_spk = ScriptBuf::from_bytes(notes_core::address::p2tr_script_pubkey(&identity.output_x));
+
+        // A different chain-1 index (a DIFFERENT owner) — used below to
+        // prove the signature does NOT verify against the wrong key,
+        // ruling out a signer that ignores which leaf it's given.
+        let other = realize_change(&material, NET, 0, 1).unwrap();
+        let other_identity = other.full().unwrap();
+        assert_ne!(
+            identity.output_x, other_identity.output_x,
+            "chain-1 index 0 and 1 must derive to different leaves"
+        );
+
+        // One-input, one-output sweep-style PSBT: the chain-1 coin spent
+        // to an arbitrary destination, minus fee — the exact shape
+        // `build_sweep_tx_multi`/`build_wallet_sweep_mixed` construct
+        // (here assembled at the PSBT level, mirroring `assemble_watch_psbt`
+        // above, so `sign_own_taproot_inputs` runs against a real PSBT).
+        let dest = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let dest_spk = ScriptBuf::from_bytes(notes_core::address::p2tr_script_pubkey(&dest.output_x));
+        let coin_value = 60_000u64;
+        let fee = 200u64;
+        let txid = Txid::from_str(&"c".repeat(64)).unwrap();
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::from_sat(coin_value - fee), script_pubkey: dest_spk }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo =
+            Some(TxOut { value: Amount::from_sat(coin_value), script_pubkey: owner_spk.clone() });
+
+        let n = sign_own_taproot_inputs(&mut psbt, &identity.output_x, &identity.tweaked_seckey).unwrap();
+        assert_eq!(n, 1, "the one change-chain input was signed");
+        let sig = psbt.inputs[0].tap_key_sig.expect("tap_key_sig set");
+
+        // Recompute the exact sighash `sign_own_taproot_inputs` signed and
+        // verify the signature against the coin's OWN chain-1 output key —
+        // the money proof: this is a byte-valid BIP-340 signature that a
+        // full node would accept spending THIS chain-1 P2TR output.
+        use bitcoin::sighash::{Prevouts, SighashCache};
+        let prevouts: Vec<TxOut> = psbt.inputs.iter().map(|i| i.witness_utxo.clone().unwrap()).collect();
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+        let sighash = cache
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), bitcoin::TapSighashType::Default)
+            .unwrap();
+        assert!(
+            schnorr_verify(&identity.output_x, sighash.as_ref(), sig.signature.as_ref()),
+            "signature must verify against the change coin's own chain-1 output key"
+        );
+        assert!(
+            !schnorr_verify(&other_identity.output_x, sighash.as_ref(), sig.signature.as_ref()),
+            "signature must NOT verify against a different chain-1 leaf's key"
+        );
     }
 }

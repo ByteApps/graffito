@@ -51,11 +51,17 @@ pub(crate) fn normal(i: u32) -> ChildNumber {
     ChildNumber::from_normal_idx(i).expect("index < 2^31")
 }
 
-/// m/86'/{coin}'/{account}'/0/{index} from a master (depth-0) xprv.
-pub fn leaf_from_master(
+/// m/86'/{coin}'/{account}'/{chain}/{index} from a master (depth-0) xprv.
+/// `chain` 0 = receive (the FROZEN notebook rule below), 1 = change. Added
+/// for the change-chain foundation
+/// (`../PLAN-chain-notes-app-taproot-change.md`) — chain-0 behavior is
+/// untouched by construction, since [`leaf_from_master`] just delegates
+/// here with `chain=0`.
+pub fn leaf_from_master_chain(
     master: &Xpriv,
     network: Network,
     account: u32,
+    chain: u32,
     index: u32,
 ) -> Result<[u8; 32], Error> {
     let secp = Secp256k1::new();
@@ -63,7 +69,7 @@ pub fn leaf_from_master(
         hardened(86),
         hardened(coin_type(network)),
         hardened(account),
-        normal(0),
+        normal(chain),
         normal(index),
     ];
     let leaf = master
@@ -72,13 +78,33 @@ pub fn leaf_from_master(
     Ok(leaf.private_key.secret_bytes())
 }
 
-/// 0/{index} below an account-level (depth-3, e.g. 86'/coin'/n') xprv.
-pub fn leaf_from_account(account: &Xpriv, index: u32) -> Result<[u8; 32], Error> {
+/// m/86'/{coin}'/{account}'/0/{index} from a master (depth-0) xprv. FROZEN
+/// (see module doc) — delegates to [`leaf_from_master_chain`] with
+/// `chain=0`, byte-identical to before the change-chain addition.
+pub fn leaf_from_master(
+    master: &Xpriv,
+    network: Network,
+    account: u32,
+    index: u32,
+) -> Result<[u8; 32], Error> {
+    leaf_from_master_chain(master, network, account, 0, index)
+}
+
+/// {chain}/{index} below an account-level (depth-3, e.g. 86'/coin'/n')
+/// xprv. `chain` 0 = receive, 1 = change.
+pub fn leaf_from_account_chain(account: &Xpriv, chain: u32, index: u32) -> Result<[u8; 32], Error> {
     let secp = Secp256k1::new();
     let leaf = account
-        .derive_priv(&secp, &[normal(0), normal(index)])
+        .derive_priv(&secp, &[normal(chain), normal(index)])
         .map_err(|e| Error::Xprv(e.to_string()))?;
     Ok(leaf.private_key.secret_bytes())
+}
+
+/// 0/{index} below an account-level (depth-3, e.g. 86'/coin'/n') xprv.
+/// FROZEN (see module doc) — delegates to [`leaf_from_account_chain`] with
+/// `chain=0`, byte-identical to before the change-chain addition.
+pub fn leaf_from_account(account: &Xpriv, index: u32) -> Result<[u8; 32], Error> {
+    leaf_from_account_chain(account, 0, index)
 }
 
 /// The FROZEN note-encryption key rule — identical for all import formats.
@@ -99,15 +125,29 @@ pub fn identity_from_leaf(leaf_secret: &[u8; 32]) -> Result<Identity, Error> {
     Identity::from_leaf_secret(leaf_secret).map_err(Error::Notes)
 }
 
-/// BIP-39 seed bytes (mnemonic + empty passphrase) → leaf secret.
+/// BIP-39 seed bytes (mnemonic + empty passphrase) → leaf secret on
+/// `chain`/`index`. `chain` 0 = receive, 1 = change.
+pub fn leaf_from_mnemonic_chain(
+    mnemonic: &bip39::Mnemonic,
+    network: Network,
+    account: u32,
+    chain: u32,
+    index: u32,
+) -> Result<[u8; 32], Error> {
+    let seed = Zeroizing::new(mnemonic.to_seed(""));
+    let master = Xpriv::new_master(btc_network(network), seed.as_ref())
+        .map_err(|e| Error::Xprv(e.to_string()))?;
+    leaf_from_master_chain(&master, network, account, chain, index)
+}
+
+/// BIP-39 seed bytes (mnemonic + empty passphrase) → leaf secret. FROZEN
+/// (see module doc) — delegates to [`leaf_from_mnemonic_chain`] with
+/// `chain=0`, byte-identical to before the change-chain addition.
 pub fn leaf_from_mnemonic(
     mnemonic: &bip39::Mnemonic,
     network: Network,
     account: u32,
     index: u32,
 ) -> Result<[u8; 32], Error> {
-    let seed = Zeroizing::new(mnemonic.to_seed(""));
-    let master = Xpriv::new_master(btc_network(network), seed.as_ref())
-        .map_err(|e| Error::Xprv(e.to_string()))?;
-    leaf_from_master(&master, network, account, index)
+    leaf_from_mnemonic_chain(mnemonic, network, account, 0, index)
 }

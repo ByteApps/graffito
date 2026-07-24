@@ -18,14 +18,14 @@ use std::rc::Rc;
 
 use app_core::bitcoin;
 use app_core::chain::{
-    default_base, explorer_presets, explorer_tx_url, node_presets, AddrStats, ChainClient,
-    HttpTransport, TxLookupStatus,
+    default_base, explorer_presets, explorer_tx_url, node_presets, scan_change_chain,
+    scan_change_chain_watch, AddrStats, ChainClient, ChangeCoin, HttpTransport, TxLookupStatus,
 };
 use app_core::compose::ComposeRequest;
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
 use app_core::identity::{
     active_notebook_spks, generate_mnemonic, generate_mnemonic_with_salt, index_fp8,
-    parse_key_material, realize, AppIdentity,
+    parse_key_material, realize, realize_change, AppIdentity,
 };
 use app_core::notebooks::{NotebookIndex, SpendingAddr};
 use app_core::psbt_build::{
@@ -403,6 +403,40 @@ struct State {
     spending_source: Option<FundingSource>,
     spending_coins: Vec<FundingUtxo>,
     spending_scanned: bool,
+    /// Taproot CHANGE-chain coins (`m/86'/{coin}'/{account}'/1/{index}`,
+    /// [`app_core::identity::realize_change`]) for the ACTIVE account —
+    /// account-level (one change chain per account), not per-notebook.
+    /// Gap-walked alongside every wallet-stores rescan
+    /// ([`scan_change_chain`], gap 1 — external taproot wallets allocate
+    /// change sequentially, so the app's own usage never leaves a gap) and
+    /// folded into the Coins screen's unified coin list, each row tagged
+    /// "change" (Sal's decision: ONE balance, not a separate segment —
+    /// see `update_wallet_coins`). Empty for watch/WIF/hex identities
+    /// (`scan_change_chain` is a no-op for non-hierarchical material).
+    /// The wallet Sweep consumes these too (unit 4, see
+    /// `../PLAN-chain-notes-app-taproot-change.md`): `build_sweep_confirm`
+    /// derives each unique chain-1 index's owner via `realize_change` and
+    /// folds its coins into the swept inputs, signed by that owner's own
+    /// tweaked key — same own-coin discipline as notebook coins. Compose /
+    /// pay-from ALSO consumes them now (unit 5): change coins fold into the
+    /// Pay-from "Notebook" panel (tagged, `payfrom_panel_coins`), tracked
+    /// under a DISTINCT `"change"` key in `mixed_selected` (their signing
+    /// owner is per-index, unlike the notebook's one fixed leaf), and any
+    /// selection containing one forces the mixed compose path
+    /// (`payfrom_state`'s `PayfromShape::Mixed`) — see
+    /// `mixed_compose_args`/`on_compose_send_mixed`. Watch-only still
+    /// doesn't consume them (a later unit; `change_coins` is empty for
+    /// watch material anyway, `realize_change` errors on it).
+    change_coins: Vec<ChangeCoin>,
+    /// The `(fp8, network, account)` context `change_coins` was last scanned
+    /// under (taproot-change unit 7 fix). Change coins are ACCOUNT-level —
+    /// shared by every notebook of the account — so `activate()` must NOT
+    /// wipe them on a mere notebook switch within the SAME context (no
+    /// wallet-stores rescan follows a plain notebook open, so a wipe left the
+    /// compose Pay-from panel unable to offer change coins; the regtest e2e
+    /// caught it). `activate()` clears `change_coins` only when this context
+    /// changes; the wallet-stores apply stamps it whenever it repopulates.
+    change_coins_ctx: Option<(String, Network, u32)>,
     /// Settings → "Sweep notebook funds here": the spending-wallet receive
     /// index the sweep destination was set to, so the broadcast handler
     /// can mark it used on success (fresh-address discipline). None for
@@ -411,14 +445,19 @@ struct State {
     /// Cross-wallet coin selection for the Pay-from screen (funding-
     /// unification UI rework, 2026-07-16): (source key, txid, vout). Source
     /// key uses the convention `pay_from`/`use-funding-wallet` already use:
-    /// "notebook" | "spending" | "wallet:<id>". A note may spend coins
-    /// tagged with different source keys in ONE tx. This is a per-source
-    /// MEMORY the existing single-source scratch state (`selected_coins`/
-    /// `coins_overridden`) mirrors into/out of whenever the active source
-    /// (`payfrom_active_source`) changes — so every existing single-
-    /// source compute/send path keeps working on `selected_coins`
-    /// unmodified, and re-expanding a previously-touched wallet row
-    /// restores exactly what was selected there.
+    /// "notebook" | "spending" | "wallet:<id>" | "change" (taproot-change
+    /// unit 5 — a chain-1 coin's owner is per-INDEX, unlike the notebook's
+    /// one fixed leaf, so it gets its own key even though its rows render
+    /// inside the SAME "Notebook" panel — see `payfrom_panel_coins`). A
+    /// note may spend coins tagged with different source keys in ONE tx.
+    /// This is a per-source MEMORY the existing single-source scratch state
+    /// (`selected_coins`/`coins_overridden`) mirrors into/out of whenever
+    /// the active source (`payfrom_active_source`) changes — so every
+    /// existing single-source compute/send path keeps working on
+    /// `selected_coins` unmodified, and re-expanding a previously-touched
+    /// wallet row restores exactly what was selected there. "change" is
+    /// NEVER mirrored into `selected_coins` (mirrors "wallet:<id>"'s
+    /// treatment — see `on_toggle_coin`/`sync_and_finalize_payfrom`).
     mixed_selected: Vec<(String, String, u32)>,
     /// Which EXTERNAL WALLET row is expanded on the Pay-from screen — ""
     /// = none. Independent-expand rework (2026-07-18, Sal's iPhone
@@ -656,6 +695,11 @@ enum PendingPayload {
         change_default: app_core::mixed::ChangeDefault,
         notebook_spent: Vec<app_core::store::OutPointRef>,
         spent_spending: Vec<(String, u32)>,
+        /// Taproot CHANGE-chain coins ridden as inputs (unit 5, see
+        /// `../PLAN-chain-notes-app-taproot-change.md`) — same shape+timing
+        /// as `SweepSnapshot.change_spent`: pruned from `State.change_coins`
+        /// on broadcast success only (`apply_mixed_compose_result`).
+        change_spent: Vec<(String, u32)>,
         payloads_len: usize,
         /// Recipient OUTPUT count (0 = self-note, 1 = ordinary directed
         /// note, 2+ = multi) — drives the change-vout arithmetic in
@@ -764,6 +808,16 @@ struct WatchNote {
     /// one; a watch identity's self-funded compose never does — it already
     /// spends from self) — shifts the change output's vout by one.
     dust_to_self: bool,
+    /// Taproot CHANGE-chain coins (chain 1) ridden as inputs by a keyed
+    /// mixed compose that ALSO pulled an external funding wallet (unit-5
+    /// follow-up): the change inputs are signed in-app before this note is
+    /// handed to the external signer, but — like `WatchSpend.change_spent`
+    /// (unit 6) — they must be pruned from `State.change_coins` on broadcast
+    /// success (`record_watch_note`), or the next compose would re-offer an
+    /// already-spent coin until the next chain-1 rescan. Empty for a genuine
+    /// watch identity's public-note compose (its coin control never offers
+    /// change coins) and for any selection without a change coin.
+    change_spent: Vec<(String, u32)>,
 }
 
 struct WatchSpend {
@@ -786,6 +840,15 @@ struct WatchSpend {
     dest_index: Option<u32>,
     /// (ref_id, is_note) of the record being replaced when kind == "bump".
     bump_ref: Option<(String, bool)>,
+    /// (txid, vout) of any taproot CHANGE-chain (chain 1) coins riding as
+    /// inputs (unit 6, see `../PLAN-chain-notes-app-taproot-change.md`) —
+    /// pruned from `State.change_coins` on broadcast success, same
+    /// treatment `SweepSnapshot.change_spent` gives the keyed sweep.
+    /// Non-empty makes the record non-bumpable (mirrors keyed CHANGE 2's
+    /// `mixed_inputs`): the bump reconstruction (`fetch_tx_io`'s
+    /// address→index resolver) only knows NOTEBOOK addresses, so it can't
+    /// safely re-derive a chain-1 leaf — see `watch_bump_open`.
+    change_spent: Vec<(String, u32)>,
 }
 
 struct WatchBump {
@@ -1227,6 +1290,16 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
             st.touch_contact(addr);
         }
     }
+    // Taproot CHANGE-chain coins (unit-5 follow-up): a keyed mixed compose
+    // that ALSO pulled an external funding wallet signed its change inputs
+    // in-app, then routed through this external-sign path — prune them from
+    // the runtime cache on broadcast success (same treatment as
+    // `record_watch_spend`/`WatchSpend.change_spent`), so the next compose
+    // doesn't re-offer an already-spent coin before the next chain-1 rescan.
+    if !wn.change_spent.is_empty() {
+        st.change_coins
+            .retain(|c| !wn.change_spent.iter().any(|(t, v)| t == &c.txid && *v == c.vout));
+    }
     st.save_store();
     st.save_contacts();
 }
@@ -1315,6 +1388,12 @@ fn record_watch_spend(st: &mut State, ws: &WatchSpend, txid: &str, raw: &str, vs
                 );
                 if let Some(rec) = store.txs.last_mut() {
                     rec.input_indexes = ws.input_indexes.clone();
+                    // Unit 6: a change-including watch spend is non-bumpable
+                    // (see `WatchSpend.change_spent`'s doc comment) — same
+                    // `mixed_inputs` flag keyed CHANGE 2 sweeps use, so the
+                    // Activity screen's Speed-up affordance hides itself the
+                    // same way (`ActivityItem.bumpable = !t.mixed_inputs`).
+                    rec.mixed_inputs = !ws.change_spent.is_empty();
                 }
             };
             match ws.dest_index {
@@ -1352,16 +1431,31 @@ fn record_watch_spend(st: &mut State, ws: &WatchSpend, txid: &str, raw: &str, vs
                     }
                 }
             }
+            // Taproot CHANGE-chain coins (unit 6): pruned from the runtime
+            // cache so they're not re-offered before the next wallet-stores
+            // refresh re-scans chain 1 and finds them gone — same treatment
+            // as the keyed sweep's `SweepSnapshot.change_spent`.
+            if !ws.change_spent.is_empty() {
+                st.change_coins.retain(|c| {
+                    !ws.change_spent.iter().any(|(t, v)| t == &c.txid && *v == c.vout)
+                });
+            }
         }
     }
     st.save_store();
 }
 
-/// Every ACTIVE notebook's spendable coins as WatchCoins stamped with
-/// their owning receive index — the gather behind the watch wallet-level
-/// flows (rev-3 follow-up 1: sweep/consolidate span notebooks in ONE
-/// externally-signed PSBT). Falls back to the active store alone when no
-/// index is loaded.
+/// Every ACTIVE notebook's spendable coins (chain 0) PLUS the account's
+/// taproot CHANGE-chain coins (chain 1, `State.change_coins`, unit 6) as
+/// WatchCoins stamped with their owning chain+index — the gather behind
+/// the watch wallet-level flows (rev-3 follow-up 1: sweep/consolidate span
+/// notebooks in ONE externally-signed PSBT; unit 6 extends that ONE PSBT
+/// to the account's own change coins too, so a hardware signer recognizes
+/// them via their `.../1/{index}` key origin). Falls back to the active
+/// store alone when no index is loaded. `State.change_coins` is empty for
+/// any identity that hasn't scanned chain 1 yet (or a keyed identity — this
+/// function is only ever called for watch), so appending it is a no-op
+/// until unit 6's watch scan (`wallet_stores_refresh_async`) populates it.
 fn watch_wallet_coins(st: &State) -> Vec<WatchCoin> {
     let mut coins = Vec::new();
     if let Some(ix) = &st.notebooks {
@@ -1371,6 +1465,7 @@ fn watch_wallet_coins(st: &State) -> Vec<WatchCoin> {
                 txid: u.txid.clone(),
                 vout: u.vout,
                 value: u.value,
+                chain: 0,
                 index: m.index,
             }));
         }
@@ -1380,9 +1475,17 @@ fn watch_wallet_coins(st: &State) -> Vec<WatchCoin> {
             txid: u.txid.clone(),
             vout: u.vout,
             value: u.value,
+            chain: 0,
             index: nb,
         }));
     }
+    coins.extend(st.change_coins.iter().map(|c| WatchCoin {
+        txid: c.txid.clone(),
+        vout: c.vout,
+        value: c.value,
+        chain: 1,
+        index: c.index,
+    }));
     coins
 }
 
@@ -1408,11 +1511,16 @@ fn watch_spend_build(
         return;
     }
     let notebooks = {
-        let mut ids: Vec<u32> = coins.iter().map(|c| c.index).collect();
+        let mut ids: Vec<u32> = coins.iter().filter(|c| c.chain == 0).map(|c| c.index).collect();
         ids.sort_unstable();
         ids.dedup();
         ids.len()
     };
+    // Unit 6: chain-1 (change) inputs riding along — pruned from
+    // `State.change_coins` on success and marked non-bumpable (see
+    // `WatchSpend.change_spent`'s doc comment).
+    let change_spent: Vec<(String, u32)> =
+        coins.iter().filter(|c| c.chain == 1).map(|c| (c.txid.clone(), c.vout)).collect();
     let inputs: Vec<app_core::store::TxInput> = coins
         .iter()
         .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
@@ -1437,13 +1545,15 @@ fn watch_spend_build(
                 inputs,
                 input_indexes,
                 dest_index: None,
+                change_spent: change_spent.clone(),
                 bump_ref: None,
             });
             println!(
-                "cb: watch-spend-build kind={kind} txid={} fee={} inputs={} notebooks={notebooks}",
+                "cb: watch-spend-build kind={kind} txid={} fee={} inputs={} notebooks={notebooks}{}",
                 built.txid,
                 built.fee,
-                coins.len()
+                coins.len(),
+                if change_spent.is_empty() { String::new() } else { format!(" change={}", change_spent.len()) }
             );
             show_psbt_sign_screen(w, st, built, cost);
         }
@@ -1477,6 +1587,24 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
         w.set_status("transaction not found".into());
         return;
     };
+    // Unit 6 defense-in-depth (mirrors keyed CHANGE 2's `mixed_inputs`
+    // guard): a watch sweep/consolidate that included a chain-1 change coin
+    // is recorded `mixed_inputs = true` and can't be bumped — the
+    // `fetch_tx_io` rebuild below only resolves NOTEBOOK addresses, so it
+    // can't safely reconstruct a chain-1 leaf's key origin.
+    if !is_note
+        && st
+            .store
+            .as_ref()
+            .map(|s| s.txs.iter().any(|t| t.txids.iter().any(|x| *x == ref_id) && t.mixed_inputs))
+            .unwrap_or(false)
+    {
+        w.set_status(
+            "this sweep included a change-chain coin — it can't be sped up (rebroadcast still works)"
+                .into(),
+        );
+        return;
+    }
     // Multi-notebook records: stamp each input's owning receive index by
     // its prevout address (fetch_tx_io alone can't know our leaves) — the
     // rebuild derives every input's spk/key-origin from that index.
@@ -1569,6 +1697,7 @@ fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
                 input_indexes: Vec::new(),
                 dest_index: None,
                 bump_ref: Some((wb.ref_id.clone(), wb.is_note)),
+                change_spent: Vec::new(),
             });
             println!("cb: watch-bump-build ref={} txid={} fee={}", wb.ref_id, built.txid, built.fee);
             show_psbt_sign_screen(w, st, built, cost);
@@ -1644,6 +1773,7 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
             selected: true,
             txid_short: u.txid[..8.min(u.txid.len())].to_string().into(),
             explorer: explorer_tx_url(exb.as_deref(), net, &u.txid).into(),
+            tag: "".into(),
         })
         .collect();
     rows.extend(spending_rows.iter().map(|c| SpendCoin {
@@ -1653,6 +1783,7 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
         selected: true,
         txid_short: c.txid[..8.min(c.txid.len())].to_string().into(),
         explorer: explorer_tx_url(exb.as_deref(), net, &c.txid).into(),
+        tag: "".into(),
     }));
     rows.sort_by_key(|r| r.value.parse::<u64>().unwrap_or(0));
     w.set_sweep_coins(VecModel::from_slice(&rows));
@@ -2159,6 +2290,24 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     st.spending_source = None;
     st.spending_coins.clear();
     st.spending_scanned = false;
+    // Taproot change-chain coins are per (identity, account, network) — but
+    // UNLIKE the spending wallet above, they must survive a mere notebook
+    // switch WITHIN the same context: they're account-level (shared by every
+    // notebook of the account) and no wallet-stores rescan follows a plain
+    // notebook open, so wiping them here left the compose Pay-from panel
+    // unable to offer change coins (unit 7 regtest e2e caught this). Clear
+    // ONLY when the (fp8, network, account) context actually changes — a
+    // genuine identity/account/network switch; a same-context re-activation
+    // keeps the last scan's coins until the next wallet-stores refresh
+    // replaces them (its `(fp8,network,account)` staleness guard still drops
+    // any result from the wrong context).
+    let change_ctx = index_fp8(&material, st.network)
+        .ok()
+        .map(|fp8| (fp8, st.network, st.account));
+    if st.change_coins_ctx != change_ctx {
+        st.change_coins.clear();
+        st.change_coins_ctx = None;
+    }
     let fp = hex::encode(ident.output_x());
     let path = st
         .data_dir
@@ -3215,7 +3364,15 @@ fn update_home(w: &AppWindow, st: &State) {
 /// The wallet-wide coins viewer (screen 10 + the Settings Coins card):
 /// every ACTIVE notebook's spendable UTXOs, each tagged with its
 /// notebook, plus the cross-wallet summary — data as of each notebook's
-/// last scan (the ↻ on the coins screen rescans them all).
+/// last scan (the ↻ on the coins screen rescans them all). Taproot
+/// change-chain coins (`st.change_coins`, unit 3 — see
+/// `../PLAN-chain-notes-app-taproot-change.md`) are folded into the SAME
+/// list, each tagged "change" instead of a notebook name (Sal's decision:
+/// one unified balance, not a separate segment) — they count toward the
+/// total coin count and spendable sats but NOT toward the "M notebooks"
+/// count below (they don't belong to any one notebook). The wallet Sweep
+/// consumes them (unit 6) — this list is display-only for that; compose /
+/// pay-from and watch-only still don't consume them (later units).
 fn update_wallet_coins(w: &AppWindow, st: &State) {
     let mut coins: Vec<CoinItem> = Vec::new();
     let mut spendable: u64 = 0;
@@ -3239,6 +3396,15 @@ fn update_wallet_coins(w: &AppWindow, st: &State) {
                 notebooks += 1;
             }
         }
+    }
+    for c in &st.change_coins {
+        coins.push(CoinItem {
+            outpoint: format!("{}:{}", c.txid, c.vout).into(),
+            value: c.value.to_string().into(),
+            status: if c.confirmed { "confirmed" } else { "unconfirmed" }.into(),
+            notebook: "change".into(),
+        });
+        spendable += c.value;
     }
     let n = coins.len();
     w.set_coins(VecModel::from_slice(&coins));
@@ -3457,6 +3623,14 @@ struct WalletStoresRefreshResult {
     /// Every active notebook's bundle fetch, including the snapshot-time
     /// active one.
     results: Vec<NotebookBundleResult>,
+    /// Taproot change-chain gap walk (unit 3, `../PLAN-chain-notes-app-taproot-change.md`) —
+    /// `scan_change_chain` gap 1, account-level (folded into the SAME
+    /// (fp8, network, account) staleness guard the notebook results use
+    /// above, so no separate guard is needed on apply). `Err` on a
+    /// transport/parse failure; empty `Ok` for watch/WIF/hex material
+    /// (no change chain to walk) or when no material was cached this
+    /// session.
+    change: Result<Vec<ChangeCoin>, String>,
 }
 
 static WALLET_STORES_REFRESH_RESULTS: std::sync::Mutex<Vec<WalletStoresRefreshResult>> =
@@ -3533,6 +3707,19 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
         .flat_map(|t| t.txids.iter().cloned())
         .collect();
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
+    // Taproot change-chain scan (unit 3): cloned here (worker-thread parse,
+    // same convention `spending_scan_async` uses for its own material
+    // clone) so the gap walk runs alongside the notebook rescans instead of
+    // needing a separate kick. `None` (no cached material this session)
+    // yields an empty result with no chain call — matches
+    // `scan_change_chain`'s own "nothing to walk" shape for watch/WIF/hex.
+    let material_for_change = st.material.clone();
+    // Unit 6: a WATCH identity has no material `realize_change` can use
+    // (it errors on Xpub) — its chain-1 change chain lives in the SAME
+    // `tr(.../<0;1>/*)` descriptor `watch_source()` already exposes for
+    // sweep/consolidate, so scan it via `scan_change_chain_watch` instead.
+    let is_watch = st.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
+    let watch_src_for_change = st.ident.as_ref().and_then(|i| i.watch_source()).cloned();
     let key = format!("wstores/{fp8}/{}/{account}", network.as_str());
     let weak = w.as_weak();
     let job = move || {
@@ -3552,6 +3739,22 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
             current_address.as_deref().unwrap_or_default(),
             &dropped_checks,
         );
+        let change = if is_watch {
+            // Unit 6: watch-only walks the descriptor's own chain-1 range —
+            // no material to parse, no material to zeroize.
+            match &watch_src_for_change {
+                Some(src) => scan_change_chain_watch(&client, src, 1).map_err(|e| format!("{e}")),
+                None => Ok(Vec::new()),
+            }
+        } else {
+            match material_for_change.as_deref().map(|m| parse_key_material(m, network)) {
+                Some(Ok(material)) => scan_change_chain(&client, &material, network, account, 1)
+                    .map_err(|e| format!("{e}")),
+                Some(Err(e)) => Err(e.to_string()),
+                None => Ok(Vec::new()),
+            }
+        };
+        drop(material_for_change); // Zeroizing — wiped as soon as the scan is done
         WALLET_STORES_REFRESH_RESULTS
             .lock()
             .expect("wallet stores refresh mutex")
@@ -3566,6 +3769,7 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
                 current_dropped_lookup,
                 current_dropped_unspent,
                 results,
+                change,
             });
         let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_stores_refresh());
     };
@@ -3756,6 +3960,12 @@ struct SweepSnapshot {
     /// address (`on_spending_sweep_here`) — marked used on success.
     pending_spending_sweep_index: Option<u32>,
     notebooks_n: usize,
+    /// Taproot CHANGE-chain coins (`m/86'/…/1/{index}`) that rode as
+    /// inputs — pruned from `State.change_coins` on success (unit 6, see
+    /// `../PLAN-chain-notes-app-taproot-change.md`), same treatment as
+    /// `spending_spent` above: the next wallet-stores refresh re-scans
+    /// chain 1 and would otherwise re-offer an already-spent coin.
+    change_spent: Vec<(String, u32)>,
 }
 
 struct SweepBroadcastResult {
@@ -3835,13 +4045,24 @@ fn apply_sweep_broadcast_result(w: &AppWindow, st: &mut State, r: SweepBroadcast
                 update_spending_ui(w, st);
                 spending_refresh_async(w, st);
             }
+            // Taproot CHANGE-chain coins (unit 6): same treatment as the
+            // spending-wallet coins above — pruned from the runtime cache
+            // so they're not re-offered before the next wallet-stores
+            // refresh re-scans chain 1 and finds them gone.
+            let change_n = snap.change_spent.len();
+            if change_n > 0 {
+                st.change_coins.retain(|c| {
+                    !snap.change_spent.iter().any(|(t, v)| t == &c.txid && *v == c.vout)
+                });
+            }
             st.save_store();
             println!(
-                "cb: sweep txid={txid} value={} fee={} notebooks={}{}",
+                "cb: sweep txid={txid} value={} fee={} notebooks={}{}{}",
                 snap.value,
                 snap.fee,
                 snap.notebooks_n,
-                if spending_n > 0 { format!(" spending={spending_n}") } else { String::new() }
+                if spending_n > 0 { format!(" spending={spending_n}") } else { String::new() },
+                if change_n > 0 { format!(" change={change_n}") } else { String::new() }
             );
             w.set_status(
                 format!(
@@ -4117,8 +4338,14 @@ fn apply_psbt_broadcast_result(w: &AppWindow, st: &mut State, r: PsbtBroadcastRe
             } else if let Some(ws) = st.watch_spend.take() {
                 // Watch-mode spend: record it so Activity gets the
                 // pending→confirmed lifecycle, and lock the coins.
+                let change_n = ws.change_spent.len();
                 record_watch_spend(st, &ws, txid, raw, vsize as u64);
-                println!("cb: watch-{} txid={txid} fee={} ok", ws.kind, ws.fee);
+                println!(
+                    "cb: watch-{} txid={txid} fee={} ok{}",
+                    ws.kind,
+                    ws.fee,
+                    if change_n > 0 { format!(" change={change_n}") } else { String::new() }
+                );
                 wallet_flow = ws.bump_ref.is_none() && (ws.kind == "sweep" || ws.kind == "consolidate");
             } else {
                 println!("cb: fund-broadcast txid={txid} ok");
@@ -4523,6 +4750,9 @@ struct MixedComposeResult {
     change_default: app_core::mixed::ChangeDefault,
     notebook_spent: Vec<app_core::store::OutPointRef>,
     spent_spending: Vec<(String, u32)>,
+    /// Taproot CHANGE-chain coins ridden as inputs (unit 5) — pruned from
+    /// `State.change_coins` on success, same treatment as `spent_spending`.
+    change_spent: Vec<(String, u32)>,
     payloads_len: usize,
     recipient_count: usize,
     change_index: u32,
@@ -4535,14 +4765,16 @@ static MIXED_COMPOSE_RESULTS: std::sync::Mutex<Vec<MixedComposeResult>> =
 fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResult) {
     match r.result {
         Ok(_echo) => {
-            // Input-anchored skip (2026-07-18 dust-skip rework): the
-            // dust-to-self output — and therefore its BEFORE-change vout
-            // slot — only exists when NO notebook coin funded this tx (same
-            // condition `assemble_mixed_note_psbt` used for real); a
-            // notebook coin can still participate while change defaults
-            // elsewhere-or-Notebook (the safe fallback), so this must be
-            // derived from `notebook_spent`, never assumed.
-            let dust_included = r.notebook_spent.is_empty();
+            // Input-anchored skip (2026-07-18 dust-skip rework; extended to
+            // Change by taproot-change unit 5): the dust-to-self output —
+            // and therefore its BEFORE-change vout slot — only exists when
+            // NO notebook OR change-chain coin funded this tx (same
+            // `has_self_input` condition `assemble_mixed_note_psbt` used
+            // for real); a notebook/change coin can still participate while
+            // change defaults elsewhere-or-Notebook (the safe fallback), so
+            // this must be derived from `notebook_spent`/`change_spent`,
+            // never assumed.
+            let dust_included = r.notebook_spent.is_empty() && r.change_spent.is_empty();
             if let Some(store) = st.store.as_mut() {
                 let change_utxo = (r.built_change > 0
                     && r.change_default == app_core::mixed::ChangeDefault::Notebook)
@@ -4600,6 +4832,16 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                 });
                 update_spending_ui(w, st);
             }
+            // Taproot CHANGE-chain coins (unit 5): same treatment as the
+            // spending-wallet coins above — pruned from the runtime cache so
+            // they're not re-offered before the next wallet-stores refresh
+            // re-scans chain 1 and finds them gone.
+            let change_n = r.change_spent.len();
+            if change_n > 0 {
+                st.change_coins.retain(|c| {
+                    !r.change_spent.iter().any(|(t, v)| t == &c.txid && *v == c.vout)
+                });
+            }
             if r.change_default == app_core::mixed::ChangeDefault::Spending {
                 if let Some(src) = r.spending_source.clone() {
                     if let Ok(change_addr) = src.derive(1, r.change_index) {
@@ -4619,9 +4861,10 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                 spending_refresh_async(w, st);
             }
             println!(
-                "cb: compose id={} txid={} fee={} vsize={} to={} private={} funded=mixed{} broadcast=ok",
+                "cb: compose id={} txid={} fee={} vsize={} to={} private={} funded=mixed{}{} broadcast=ok",
                 hex::encode(r.note_id), r.txid, r.built_fee, r.vsize,
                 r.to.as_deref().unwrap_or("self"), r.private,
+                if change_n > 0 { format!(" change={change_n}") } else { String::new() },
                 if r.recipients.len() > 1 { format!(" recipients={}", r.recipients.len()) } else { String::new() }
             );
             w.set_status(format!("broadcast {}…", &r.txid[..12.min(r.txid.len())]).into());
@@ -4997,6 +5240,22 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
             w.set_status("".into());
             continue;
         }
+        // Taproot change-chain coins (unit 3): folds into the SAME (fp8,
+        // network, account) staleness guard above — no separate guard
+        // needed. On error, leave `st.change_coins` at its last-known value
+        // (same "don't clobber on failure" rule the spending scan uses)
+        // rather than blanking a screen the user is actively looking at.
+        match r.change {
+            Ok(coins) => {
+                println!("cb: change-coins n={}", coins.len());
+                st.change_coins = coins;
+                // Stamp the context so activate() knows these coins belong to
+                // the CURRENT (fp8, network, account) and may survive a
+                // same-context notebook switch (unit 7 fix).
+                st.change_coins_ctx = Some((r.fp8.clone(), r.network, r.account));
+            }
+            Err(e) => println!("cb: change-scan err={e}"),
+        }
         let material =
             st.material.as_deref().and_then(|m| parse_key_material(m, st.network).ok());
         let notebook_spks = notebook_spks_for(st);
@@ -5031,6 +5290,11 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
         scanned += 1; // the snapshot-time-active notebook, unconditionally
         println!("cb: {label} notebooks={scanned}");
         w.set_status("".into());
+        // Repaint the Coins screen/card regardless of which ↻ kicked this
+        // scan off — `update_wallet_coins` is a pure re-derive from `st`
+        // (no side effects), and the change coins it now folds in just
+        // landed above.
+        update_wallet_coins(w, st);
         match r.purpose {
             WalletStoresPurpose::Coins => {
                 if st.spending_capable
@@ -5679,6 +5943,12 @@ fn mixed_sync_source(st: &mut State, source: &str, coins: &[(String, u32)]) {
 struct MixedComposeArgs {
     coins: Vec<app_core::mixed::MixedCoin>,
     wallets_map: HashMap<String, FundingSource>,
+    /// Chain-1 index → that leaf's own P2TR scriptPubKey, for every UNIQUE
+    /// index among the selected `CoinSource::Change` coins (taproot-change
+    /// unit 5) — the map `assemble_mixed_note_psbt_multi_ext` needs since
+    /// the builder itself has no key material. Empty when no change coin
+    /// is selected (every existing caller's shape, unaffected).
+    change_spks: HashMap<u32, Vec<u8>>,
     change_default: app_core::mixed::ChangeDefault,
     change_override: Option<Vec<u8>>,
     change_index: u32,
@@ -5748,6 +6018,39 @@ fn mixed_compose_args(w: &AppWindow, st: &State) -> Result<MixedComposeArgs, Str
         }
     }
 
+    // Taproot CHANGE-chain coins (unit 5, see
+    // `../PLAN-chain-notes-app-taproot-change.md`): same account, chain 1
+    // instead of the notebooks' chain 0 — `CoinSource::Change` carries the
+    // chain-1 index (needed to derive the signing owner later); the
+    // builder-side `change_spks` map is built here from the UNIQUE indexes
+    // actually selected, via `realize_change` (the chain-1 sibling of
+    // `realize`), mirroring `build_sweep_confirm`'s change-idents loop.
+    let change_sel = mixed_coins_for(st, "change");
+    let mut change_spks: HashMap<u32, Vec<u8>> = HashMap::new();
+    if !change_sel.is_empty() {
+        if let Some(material_str) = st.material.as_ref().map(|z| String::from(z.as_str())) {
+            if let Ok(material) = parse_key_material(&material_str, net) {
+                for (txid, vout) in &change_sel {
+                    if let Some(c) = st.change_coins.iter().find(|c| &c.txid == txid && c.vout == *vout) {
+                        coins.push(app_core::mixed::MixedCoin {
+                            source: app_core::mixed::CoinSource::Change,
+                            txid: c.txid.clone(),
+                            vout: c.vout,
+                            value: c.value,
+                            chain: 1,
+                            index: c.index,
+                        });
+                        if let std::collections::hash_map::Entry::Vacant(e) = change_spks.entry(c.index) {
+                            if let Ok(owner) = realize_change(&material, net, st.account, c.index) {
+                                e.insert(p2tr_script_pubkey(&owner.output_x()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Change: an explicit "custom" pick overrides; otherwise the resolved
     // default already reflected in `change-choice`.
     let choice = w.get_change_choice().to_string();
@@ -5775,7 +6078,7 @@ fn mixed_compose_args(w: &AppWindow, st: &State) -> Result<MixedComposeArgs, Str
     };
     let change_index = st.store.as_ref().map(|s| s.spending.next_change).unwrap_or(0);
 
-    Ok(MixedComposeArgs { coins, wallets_map, change_default, change_override, change_index })
+    Ok(MixedComposeArgs { coins, wallets_map, change_spks, change_default, change_override, change_index })
 }
 
 /// Build a source's OWN coin list + "N coins selected · X sats" caption for
@@ -5792,17 +6095,28 @@ fn mixed_compose_args(w: &AppWindow, st: &State) -> Result<MixedComposeArgs, Str
 /// only peek cache (`payfrom_wallet_coins`) populated by
 /// `payfrom_scan_wallet_for_display` — empty (not yet scanned) shows as a
 /// zero-coin panel, never a stale/wrong wallet's coins.
+///
+/// Taproot CHANGE-chain coins (unit 5, see
+/// `../PLAN-chain-notes-app-taproot-change.md`): folded into the
+/// `"notebook"` panel's row list — Sal's "one unified balance" rule, same
+/// philosophy as the Coins screen (`update_wallet_coins`'s `notebook:
+/// "change"` tag) — but their SELECTION membership is tracked under a
+/// DISTINCT `"change"` key in `mixed_selected` (a change coin's signing
+/// owner is per chain-1 INDEX, unlike the notebook's one fixed leaf, so
+/// `mixed_compose_args` must be able to tell them apart), and each row
+/// carries `tag: "change"` so `CoinListPanel` badges it.
 fn payfrom_panel_coins(st: &State, source: &str) -> (Vec<SpendCoin>, String) {
     let net = st.network;
     let exb = st.explorer_base();
     let sel: std::collections::HashSet<(String, u32)> = mixed_coins_for(st, source).into_iter().collect();
-    let row = |txid: &str, vout: u32, value: u64, confirmed: bool| SpendCoin {
+    let row = |txid: &str, vout: u32, value: u64, confirmed: bool, selected: bool, tag: &str| SpendCoin {
         outpoint: format!("{txid}:{vout}").into(),
         value: value.to_string().into(),
         confirmed,
-        selected: sel.contains(&(txid.to_string(), vout)),
+        selected,
         txid_short: txid[..8.min(txid.len())].to_string().into(),
         explorer: explorer_tx_url(exb.as_deref(), net, txid).into(),
+        tag: tag.into(),
     };
     let mut coins: Vec<SpendCoin> = Vec::new();
     match source {
@@ -5812,13 +6126,27 @@ fn payfrom_panel_coins(st: &State, source: &str) -> (Vec<SpendCoin>, String) {
                     store.utxos.iter().filter(|u| !u.pending_spend).collect();
                 spendable.sort_by(|a, b| a.value.cmp(&b.value));
                 for u in spendable {
-                    coins.push(row(&u.txid, u.vout, u.value, u.height.is_some()));
+                    let selected = sel.contains(&(u.txid.clone(), u.vout));
+                    coins.push(row(&u.txid, u.vout, u.value, u.height.is_some(), selected, ""));
                 }
+            }
+            // Fold in taproot CHANGE-chain coins (unit 5): SAME account,
+            // chain 1 — tagged into the SAME panel per Sal's "one unified
+            // balance" rule, but their selection lives under the DISTINCT
+            // "change" key (see this function's doc comment above).
+            let chg_sel: std::collections::HashSet<(String, u32)> =
+                mixed_coins_for(st, "change").into_iter().collect();
+            let mut change_sorted: Vec<&ChangeCoin> = st.change_coins.iter().collect();
+            change_sorted.sort_by(|a, b| a.value.cmp(&b.value));
+            for c in change_sorted {
+                let selected = chg_sel.contains(&(c.txid.clone(), c.vout));
+                coins.push(row(&c.txid, c.vout, c.value, c.confirmed, selected, "change"));
             }
         }
         "spending" => {
             for c in &st.spending_coins {
-                coins.push(row(&c.txid, c.vout, c.value, c.confirmed));
+                let selected = sel.contains(&(c.txid.clone(), c.vout));
+                coins.push(row(&c.txid, c.vout, c.value, c.confirmed, selected, ""));
             }
         }
         _ => {
@@ -5829,7 +6157,8 @@ fn payfrom_panel_coins(st: &State, source: &str) -> (Vec<SpendCoin>, String) {
                     st.payfrom_wallet_coins.get(id).cloned().unwrap_or_default()
                 };
                 for c in &cached {
-                    coins.push(row(&c.txid, c.vout, c.value, c.confirmed));
+                    let selected = sel.contains(&(c.txid.clone(), c.vout));
+                    coins.push(row(&c.txid, c.vout, c.value, c.confirmed, selected, ""));
                 }
             }
         }
@@ -6034,6 +6363,15 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         .iter()
         .filter_map(|(t, v)| st.spending_coins.iter().find(|c| &c.txid == t && c.vout == *v).map(|c| c.value))
         .sum();
+    // Taproot CHANGE-chain coins (unit 5, see
+    // `../PLAN-chain-notes-app-taproot-change.md`): tracked under their own
+    // "change" key in `mixed_selected` (see `payfrom_panel_coins`'s doc),
+    // even though their rows render inside the "Notebook" panel.
+    let chg_sel = mixed_coins_for(st, "change");
+    let chg_total: u64 = chg_sel
+        .iter()
+        .filter_map(|(t, v)| st.change_coins.iter().find(|c| &c.txid == t && c.vout == *v).map(|c| c.value))
+        .sum();
     let mut wallet_sources: Vec<String> = st
         .mixed_selected
         .iter()
@@ -6056,8 +6394,14 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         })
         .sum();
 
-    let selected = nb_total + sp_total + ext_total;
-    let groups = [nb_total > 0, sp_total > 0, ext_total > 0].into_iter().filter(|b| *b).count();
+    let selected = nb_total + sp_total + ext_total + chg_total;
+    // A change coin is always this identity's OWN coin — never a distinct
+    // "group" the way an external wallet is — but it DOES need the mixed
+    // builder (no single-source Sign button covers it), so it still counts
+    // toward the group tally that decides whether a single-source branch
+    // below applies (taproot-change unit 5).
+    let groups =
+        [nb_total > 0, sp_total > 0, ext_total > 0, chg_total > 0].into_iter().filter(|b| *b).count();
 
     // ---- shared compose context ----
     let text = w.get_compose_text().to_string();
@@ -6199,9 +6543,13 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         source_label = "Spending wallet".to_string();
         required_line = fold_required_line(required, fold);
         shape = PayfromShape::Spending;
-    } else if groups == 1 {
+    } else if ext_total > 0 && groups == 1 {
         // External-only — cost is "whatever the wallet pays"; never invent a
-        // numeric fee for it (unchanged design intent).
+        // numeric fee for it (unchanged design intent). Guarded on
+        // `ext_total > 0` (taproot-change unit 5): a change-ONLY selection
+        // is ALSO `groups == 1` (its own single group) but has no wallet
+        // source at all — it must fall through to the Mixed branch below,
+        // the only builder that knows `CoinSource::Change`.
         let id = wallet_sources.first().and_then(|s| s.strip_prefix("wallet:"));
         let label = id
             .and_then(|id| st.funding_wallets.iter().find(|fw| fw.id == id))
@@ -6223,6 +6571,9 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         let mut weights: Vec<bitcoin::transaction::InputWeightPrediction> = Vec::new();
         weights.extend(std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH).take(nb_sel.len()));
         weights.extend(std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX).take(sp_sel.len()));
+        // Taproot CHANGE-chain coins (unit 5) are P2TR key-path, same
+        // weight as a notebook coin.
+        weights.extend(std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH).take(chg_sel.len()));
         for src in &wallet_sources {
             let id = src.strip_prefix("wallet:").unwrap_or("");
             let taproot = st.funding_wallets.iter().find(|fw| fw.id == id).map(|fw| fw.kind == "taproot").unwrap_or(true);
@@ -6234,7 +6585,11 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
             weights.extend(std::iter::repeat(iw).take(mixed_coins_for(st, src).len()));
         }
         let spending_enabled = st.spending_capable && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false);
-        let single_external = if wallet_sources.len() == 1 && nb_total == 0 && sp_total == 0 {
+        // `chg_total == 0` (taproot-change unit 5): a change coin is this
+        // identity's OWN coin, so its presence disqualifies the "only an
+        // external wallet participates" default just like a notebook coin
+        // would — `resolve_change_default` then falls back to Notebook.
+        let single_external = if wallet_sources.len() == 1 && nb_total == 0 && sp_total == 0 && chg_total == 0 {
             wallet_sources.first().and_then(|s| s.strip_prefix("wallet:"))
         } else {
             None
@@ -6251,21 +6606,27 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
                 .map(|fw| if fw.kind == "taproot" { 34 } else { 22 })
                 .unwrap_or(34),
         });
-        // Input-anchored skip (2026-07-18 dust-skip rework): a notebook coin
+        // Input-anchored skip (2026-07-18 dust-skip rework; extended to
+        // Change by taproot-change unit 5): a notebook OR change-chain coin
         // in this mixed selection means the tx is already input-anchored —
-        // `assemble_mixed_note_psbt` omits dust-to-self, so the preview
-        // must too, or the Required/Leftover figures drift from the real
-        // build's fee.
-        let has_notebook = nb_total > 0;
-        let dust_sats = if has_notebook { 0 } else { DUST_SATS };
-        let fees = funded_fee_pair(&weights, change_len, !has_notebook);
+        // both are this identity's own coin — `assemble_mixed_note_psbt`
+        // omits dust-to-self, so the preview must too, or the
+        // Required/Leftover figures drift from the real build's fee.
+        let has_self_input = nb_total > 0 || chg_total > 0;
+        let dust_sats = if has_self_input { 0 } else { DUST_SATS };
+        let fees = funded_fee_pair(&weights, change_len, !has_self_input);
         // `total_sent` (not `gift`) is the fixed non-fee output total when
         // 2+ recipients are chipped in — uniform gift × N (Sal, 2026-07-19).
         let fixed_out = total_sent + dust_sats; // recipients (if any) + dust-to-self, when present
         let fold = fees.and_then(|(fee_wc, fee_nc)| app_core::mixed::predict_fold(selected, fixed_out, fee_wc, fee_nc, false));
         let nominal = fold.map(|(n, _)| n).or_else(|| fees.map(|(wc, _)| wc));
         required = nominal.map(|f| f + total_sent + dust_sats);
-        source_label = format!("{groups} wallets");
+        // A notebook and/or change-chain-only mix is still ONE wallet (two
+        // chains of the same account, taproot-change unit 5) — "N wallets"
+        // only describes a genuine cross-wallet mix (spending and/or an
+        // external wallet participating).
+        source_label =
+            if sp_total == 0 && ext_total == 0 { "Notebook".to_string() } else { format!("{groups} wallets") };
         required_line = fold_required_line(required, fold);
         shape = PayfromShape::Mixed;
     }
@@ -6391,6 +6752,12 @@ fn update_change_label(w: &AppWindow, st: &mut State) {
     let spending_enabled =
         st.spending_capable && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false);
     let spending_participates = sources.contains("spending") || st.payfrom_active_source == "spending";
+    // Taproot-change unit 5: a "change" source key lands in this list too
+    // (it's neither "notebook" nor "spending"), but `strip_prefix("wallet:")`
+    // below always fails for it, so `only_external` correctly stays `None`
+    // whenever change participates — resolve_change_default then falls back
+    // to Notebook, same as a notebook coin would (both are this identity's
+    // own coin; no code change needed here beyond this note).
     let non_notebook_spending: Vec<&str> =
         sources.iter().filter(|s| **s != "notebook" && **s != "spending").copied().collect();
     let only_external: Option<String> = if !sources.contains("notebook")
@@ -6707,6 +7074,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             selected,
             txid_short: u.txid[..8.min(u.txid.len())].to_string().into(),
             explorer: explorer_tx_url(exb.as_deref(), net, &u.txid).into(),
+            tag: "".into(),
         });
     }
     w.set_spend_coins(VecModel::from_slice(&coins));
@@ -6902,6 +7270,7 @@ fn funding_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
             selected: sel.contains(&(c.txid.clone(), c.vout)),
             txid_short: c.txid[..8.min(c.txid.len())].to_string().into(),
             explorer: explorer_tx_url(exb.as_deref(), net, &c.txid).into(),
+            tag: "".into(),
         })
         .collect();
     let sel_count = coins.iter().filter(|c| c.selected).count();
@@ -6968,6 +7337,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
             selected: sel.contains(&(c.txid.clone(), c.vout)),
             txid_short: c.txid[..8.min(c.txid.len())].to_string().into(),
             explorer: explorer_tx_url(exb.as_deref(), net, &c.txid).into(),
+            tag: "".into(),
         })
         .collect();
     let sel_count = coins.iter().filter(|c| c.selected).count();
@@ -7251,11 +7621,12 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     };
     let recipient_spk_lens: Vec<usize> = recipient_spks.iter().map(|s| s.len()).collect();
     let recipients_out: Vec<(Vec<u8>, u64)> = recipient_spks.into_iter().map(|spk| (spk, gift)).collect();
-    match app_core::mixed::assemble_mixed_note_psbt_multi(
+    match app_core::mixed::assemble_mixed_note_psbt_multi_ext(
         &args.coins,
         p2tr_script_pubkey(&identity.output_x),
         st.spending_source.as_ref(),
         &args.wallets_map,
+        &args.change_spks,
         &payloads,
         &recipients_out,
         &args.change_default,
@@ -7286,6 +7657,9 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                             }
                             _ => bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH,
                         },
+                        app_core::mixed::CoinSource::Change => {
+                            bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH
+                        }
                     })
                     .collect();
                 let nominal = app_core::mixed::estimate_funded_fee_no_change_multi(
@@ -8058,7 +8432,48 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
     } else {
         Vec::new()
     };
-    if idents.is_empty() && spending_coins_for_sweep.is_empty() {
+    // Taproot CHANGE-chain coins (unit 6, see
+    // `../PLAN-chain-notes-app-taproot-change.md`): same account, chain 1
+    // instead of the notebooks' chain 0. Grouped by unique chain-1 index
+    // (mirrors the `idents` loop above) so each owner's OWN tweaked key
+    // signs exactly its own inputs — `realize_change` is the chain-1
+    // sibling of `realize`, same `output_x`/`full()` accessors. Each
+    // coin's display-hex `txid` is decoded + reversed into notes-core's
+    // internal byte order, the same conversion `Store::available_utxos`
+    // does for notebook coins.
+    let mut change_idents: Vec<(
+        u32,
+        app_core::notes_core::bundle::Identity,
+        Vec<app_core::notes_core::tx::Utxo>,
+        Vec<app_core::chain::ChangeCoin>,
+    )> = Vec::new();
+    {
+        let mut seen_idx: Vec<u32> = Vec::new();
+        for c in &s.change_coins {
+            if seen_idx.contains(&c.index) {
+                continue;
+            }
+            seen_idx.push(c.index);
+            let Ok(owner) = realize_change(&material, net, s.account, c.index) else { continue };
+            let Some(full) = owner.full().map(|i| i.clone_fields()) else { continue };
+            let raw: Vec<app_core::chain::ChangeCoin> =
+                s.change_coins.iter().filter(|x| x.index == c.index).cloned().collect();
+            let utxos: Vec<app_core::notes_core::tx::Utxo> = raw
+                .iter()
+                .filter_map(|x| {
+                    let mut txid = [0u8; 32];
+                    hex::decode_to_slice(&x.txid, &mut txid).ok()?;
+                    txid.reverse();
+                    Some(app_core::notes_core::tx::Utxo { txid, vout: x.vout, value: x.value })
+                })
+                .collect();
+            if utxos.is_empty() {
+                continue; // a coin whose txid failed to decode — should not happen; skip defensively
+            }
+            change_idents.push((c.index, full, utxos, raw));
+        }
+    }
+    if idents.is_empty() && spending_coins_for_sweep.is_empty() && change_idents.is_empty() {
         w.set_status("nothing to sweep".into());
         return;
     }
@@ -8094,12 +8509,48 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
             (*index, locks)
         })
         .collect();
+    // Fold in the change-chain owners' inputs (unit 6): same all_inputs/
+    // prevouts bookkeeping as the notebook loop above, tagged "Change"
+    // instead of "Notebook · <name>" (change coins don't belong to any one
+    // notebook — see `update_wallet_coins`). No lock-list is needed here:
+    // like the notebook path, coins are only removed from the runtime
+    // cache in `apply_sweep_broadcast_result` AFTER a successful
+    // broadcast (see `change_spent` below), matching the existing
+    // pre-confirm timing exactly.
+    for (_, _, _, raw) in &change_idents {
+        for c in raw {
+            all_inputs.push(app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value });
+            prevouts.insert(
+                format!("{}:{}", c.txid, c.vout),
+                app_core::confirm::PrevoutInfo {
+                    value: c.value,
+                    address: Some(c.address.clone()),
+                    source: "Change".to_string(),
+                },
+            );
+        }
+    }
+    let change_spent: Vec<(String, u32)> = change_idents
+        .iter()
+        .flat_map(|(_, _, _, raw)| raw.iter().map(|c| (c.txid.clone(), c.vout)))
+        .collect();
     let dest_spk_hex = hex::encode(&recipient.spk);
-    let mixed = !spending_coins_for_sweep.is_empty();
-    // Mixed record: no per-input owner scheme covers both notebook and
-    // spending-wallet inputs, so it can't be RBF-bumped — see CHANGE 2 /
-    // TxRecord.mixed_inputs. A pure-notebook sweep keeps its owners
+    // `spending_included` decides which notes-core builder runs (whether
+    // spending-wallet P2WPKH coins ride along) — independent of change
+    // coins, which are taproot key-path just like notebook coins and slot
+    // into EITHER builder's all-taproot source list unchanged.
+    let spending_included = !spending_coins_for_sweep.is_empty();
+    let has_change = !change_idents.is_empty();
+    // Mixed record: no per-input owner scheme covers notebook, change-
+    // chain, AND spending-wallet inputs together, so it can't be
+    // RBF-bumped — see CHANGE 2 / TxRecord.mixed_inputs. Change coins
+    // ALSO force non-bumpable even with no spending-wallet coins involved:
+    // `TxRecord.input_indexes` only carries chain-0 receive-notebook
+    // indexes, so a bump could never re-derive a chain-1 leaf from it —
+    // marking it non-bumpable is the safe v1 (rebroadcast still works). A
+    // pure-notebook sweep (no change, no spending) keeps its owners
     // (bumpable, unchanged).
+    let mixed = spending_included || has_change;
     let input_indexes: Vec<u32> = if mixed {
         Vec::new()
     } else {
@@ -8120,8 +8571,8 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
             );
         }
     }
-    let sweep: Result<app_core::notes_core::tx::NoteTx, String> = if mixed {
-        let notebook_sources: Vec<app_core::mixed::NotebookSweepSource> = idents
+    let sweep: Result<app_core::notes_core::tx::NoteTx, String> = if spending_included {
+        let mut notebook_sources: Vec<app_core::mixed::NotebookSweepSource> = idents
             .iter()
             .map(|(_, id, coins, _)| app_core::mixed::NotebookSweepSource {
                 output_x: id.output_x,
@@ -8129,6 +8580,13 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
                 utxos: coins,
             })
             .collect();
+        notebook_sources.extend(change_idents.iter().map(|(_, id, utxos, _)| {
+            app_core::mixed::NotebookSweepSource {
+                output_x: id.output_x,
+                tweaked_seckey: &id.tweaked_seckey,
+                utxos,
+            }
+        }));
         app_core::mixed::build_wallet_sweep_mixed(
             &notebook_sources,
             Some((&material, net, s.account, &spending_coins_for_sweep)),
@@ -8137,7 +8595,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
         )
         .map_err(|e| format!("{e}"))
     } else {
-        let sources: Vec<app_core::notes_core::tx::SweepSource> = idents
+        let mut sources: Vec<app_core::notes_core::tx::SweepSource> = idents
             .iter()
             .map(|(_, id, coins, _)| app_core::notes_core::tx::SweepSource {
                 utxos: coins,
@@ -8145,6 +8603,13 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
                 tweaked_seckey: &id.tweaked_seckey,
             })
             .collect();
+        sources.extend(change_idents.iter().map(|(_, id, utxos, _)| {
+            app_core::notes_core::tx::SweepSource {
+                utxos,
+                output_x: id.output_x,
+                tweaked_seckey: &id.tweaked_seckey,
+            }
+        }));
         app_core::notes_core::tx::build_sweep_tx_multi(
             &sources,
             recipient.spk.clone(),
@@ -8170,6 +8635,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
                 spending_spent,
                 pending_spending_sweep_index: s.pending_spending_sweep_index,
                 notebooks_n: idents.len(),
+                change_spent,
             };
             let (self_spks, spending_spks) = confirm_self_spks(s);
             let ctx = app_core::confirm::ConfirmCtx {
@@ -8317,7 +8783,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
                 coins.iter().map(move |u| {
                     let mut t = u.txid;
                     t.reverse();
-                    WatchCoin { txid: hex::encode(t), vout: u.vout, value: u.value, index: *index }
+                    WatchCoin { txid: hex::encode(t), vout: u.vout, value: u.value, chain: 0, index: *index }
                 })
             })
             .collect();
@@ -8348,6 +8814,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
                     input_indexes,
                     dest_index: Some(wc.dest_index),
                     bump_ref: None,
+                    change_spent: Vec::new(), // wconsol sources are notebook coins only (chain 0)
                 });
                 println!(
                     "cb: wallet-consolidate build txid={} coins={} notebooks={} fee={}",
@@ -8854,6 +9321,8 @@ pub fn run() {
         spending_source: None,
         spending_coins: Vec::new(),
         spending_scanned: false,
+        change_coins: Vec::new(),
+        change_coins_ctx: None,
         pending_spending_sweep_index: None,
         mixed_selected: Vec::new(),
         payfrom_expanded_source: String::new(),
@@ -10423,7 +10892,7 @@ pub fn run() {
                             .utxos
                             .iter()
                             .filter(|u| !u.pending_spend)
-                            .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: nb })
+                            .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, chain: 0, index: nb })
                             .collect()
                     })
                     .unwrap_or_default()
@@ -10437,6 +10906,12 @@ pub fn run() {
                 .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
                 .collect();
             let input_indexes: Vec<u32> = notes_coins.iter().map(|c| c.index).collect();
+            // Unit 6: the watch branch's `notes_coins` (from `watch_wallet_coins`)
+            // may include chain-1 change coins riding in this fee-external-
+            // funded sweep too — same non-bumpable + prune-on-success
+            // treatment as the self-paid watch sweep.
+            let change_spent: Vec<(String, u32)> =
+                notes_coins.iter().filter(|c| c.chain == 1).map(|c| (c.txid.clone(), c.vout)).collect();
             let Some(ident) = s.ident.as_ref() else { return };
             let identity_spk = p2tr_script_pubkey(&ident.output_x());
             let identity_source = ident.watch_source().cloned();
@@ -10482,13 +10957,15 @@ pub fn run() {
                         input_indexes,
                         dest_index: None,
                         bump_ref: None,
+                        change_spent: change_spent.clone(),
                     });
                     println!(
-                        "cb: sweep-build funded=1 txid={} fee={} notes_in={} fund_in={}",
+                        "cb: sweep-build funded=1 txid={} fee={} notes_in={} fund_in={}{}",
                         built.txid,
                         built.fee,
                         notes_coins.len(),
-                        fund_coins.len()
+                        fund_coins.len(),
+                        if change_spent.is_empty() { String::new() } else { format!(" change={}", change_spent.len()) }
                     );
                     show_psbt_sign_screen(&w, &mut s, built, cost);
                 }
@@ -10850,6 +11327,18 @@ pub fn run() {
         let op = outpoint.as_str();
         if let Some((txid, vout)) = op.rsplit_once(':') {
             if let Ok(vout) = vout.parse::<u32>() {
+                // Taproot CHANGE-chain coins (unit 5, see
+                // `../PLAN-chain-notes-app-taproot-change.md`) render folded
+                // into the "notebook" panel (`payfrom_panel_coins`), so the
+                // slint call site always passes source="notebook" for their
+                // rows too — resolve the TRUE source from the outpoint
+                // itself (globally unique) rather than trusting the caller,
+                // so a change coin is tracked under its own "change" key.
+                let source = if s.change_coins.iter().any(|c| c.txid == txid && c.vout == vout) {
+                    "change".to_string()
+                } else {
+                    source
+                };
                 let mut coins = mixed_coins_for(&s, &source);
                 let key = (txid.to_string(), vout);
                 if let Some(i) = coins.iter().position(|c| c == &key) {
@@ -11345,6 +11834,7 @@ pub fn run() {
                         is_watch: true,
                         private: false,
                         dust_to_self: false,
+                        change_spent: Vec::new(), // watch compose never spends change coins
                     });
                     let n = coins.len();
                     let nr = recipients.len();
@@ -11629,6 +12119,7 @@ pub fn run() {
                 change_default,
                 notebook_spent,
                 spent_spending,
+                change_spent,
                 payloads_len,
                 recipient_count,
                 change_index,
@@ -11666,6 +12157,7 @@ pub fn run() {
                             change_default,
                             notebook_spent,
                             spent_spending,
+                            change_spent,
                             payloads_len,
                             recipient_count,
                             change_index,
@@ -11961,7 +12453,7 @@ pub fn run() {
                 .utxos
                 .iter()
                 .filter(|u| !u.pending_spend && sel.contains(&(u.txid.clone(), u.vout)))
-                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, index: nb })
+                .map(|u| WatchCoin { txid: u.txid.clone(), vout: u.vout, value: u.value, chain: 0, index: nb })
                 .collect();
             if coins.is_empty() {
                 println!("cb: compose-send bail=no-coins src=watch");
@@ -12006,6 +12498,7 @@ pub fn run() {
                         is_watch: true,
                         private: false,
                         dust_to_self: false,
+                        change_spent: Vec::new(), // watch compose never spends change coins
                     });
                     let n = recipients.len();
                     let cost = format!(
@@ -12462,7 +12955,7 @@ pub fn run() {
         // the compose preview (`mixed_compose_ui`) dry-runs — the shared seam
         // that makes preview and send structurally identical (TestFlight
         // build-20 fix, 2026-07-18).
-        let MixedComposeArgs { coins, wallets_map, change_default, change_override, change_index } =
+        let MixedComposeArgs { coins, wallets_map, change_spks, change_default, change_override, change_index } =
             match mixed_compose_args(&w, &s) {
                 Ok(a) => a,
                 Err(e) => {
@@ -12476,7 +12969,13 @@ pub fn run() {
             w.set_status("no coins selected".into());
             return;
         }
-        if !app_core::mixed::spans_multiple_wallets(&coins) {
+        // A change-ONLY selection is single-source by `spans_multiple_wallets`'s
+        // count (one distinct `CoinSource::Change`), but there IS no other
+        // Sign button for it — taproot-change unit 5 — so it must still
+        // route here rather than bounce with "use the Sign button on that
+        // source instead".
+        let has_change = coins.iter().any(|c| matches!(c.source, app_core::mixed::CoinSource::Change));
+        if !has_change && !app_core::mixed::spans_multiple_wallets(&coins) {
             println!("cb: compose-send bail=single-source src=mixed");
             w.set_status("selection is single-source — use the Sign button on that source instead".into());
             return;
@@ -12529,11 +13028,12 @@ pub fn run() {
         };
         let recipients_out: Vec<(Vec<u8>, u64)> = recipient_spks.into_iter().map(|spk| (spk, gift)).collect();
 
-        let mut built = match app_core::mixed::assemble_mixed_note_psbt_multi(
+        let mut built = match app_core::mixed::assemble_mixed_note_psbt_multi_ext(
             &coins,
             notebook_spk,
             s.spending_source.as_ref(),
             &wallets_map,
+            &change_spks,
             &payloads,
             &recipients_out,
             &change_default,
@@ -12555,6 +13055,46 @@ pub fn run() {
         {
             w.set_status(format!("{e}").into());
             return;
+        }
+        // Taproot CHANGE-chain owners (unit 5): group the selected coins by
+        // UNIQUE chain-1 index and sign each owner's inputs with its OWN
+        // tweaked key — exactly unit 4's `build_sweep_confirm` change-idents
+        // loop, at the PSBT level. `realize_change`'s `AppIdentity` (and its
+        // `Zeroizing` leaf secret) drops — and zeroizes — at the end of each
+        // loop iteration, never escaping this scope.
+        if has_change {
+            let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+                w.set_status("no identity".into());
+                return;
+            };
+            let Ok(key_material) = parse_key_material(&material_str, net) else {
+                w.set_status("identity parse failed".into());
+                return;
+            };
+            let mut seen_idx: Vec<u32> = Vec::new();
+            for c in coins.iter().filter(|c| matches!(c.source, app_core::mixed::CoinSource::Change)) {
+                if seen_idx.contains(&c.index) {
+                    continue;
+                }
+                seen_idx.push(c.index);
+                let owner = match realize_change(&key_material, net, s.account, c.index) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        w.set_status(format!("{e}").into());
+                        return;
+                    }
+                };
+                let Some(owner_identity) = owner.full() else {
+                    w.set_status("change-chain identity has no key".into());
+                    return;
+                };
+                if let Err(e) = app_core::psbt_build::sign_own_taproot_inputs(
+                    &mut built.psbt, &owner_identity.output_x, &owner_identity.tweaked_seckey,
+                ) {
+                    w.set_status(format!("{e}").into());
+                    return;
+                }
+            }
         }
         let spending_funding_utxos = app_core::mixed::spending_funding_utxos(&coins);
         if !spending_funding_utxos.is_empty() {
@@ -12579,12 +13119,24 @@ pub fn run() {
             .filter(|c| matches!(c.source, app_core::mixed::CoinSource::Notebook))
             .map(|c| app_core::store::OutPointRef { txid: c.txid.clone(), vout: c.vout })
             .collect();
+        // Taproot CHANGE-chain coins ridden as inputs (unit 5): NOT part of
+        // `store.utxos` (they live in `State.change_coins`, a separate
+        // per-account pool), so they're tracked as their own (txid, vout)
+        // list — same shape+timing as `SweepSnapshot.change_spent` (unit 4):
+        // pruned from `State.change_coins` only on broadcast SUCCESS.
+        let change_spent: Vec<(String, u32)> = coins
+            .iter()
+            .filter(|c| matches!(c.source, app_core::mixed::CoinSource::Change))
+            .map(|c| (c.txid.clone(), c.vout))
+            .collect();
         let has_external = coins.iter().any(|c| matches!(c.source, app_core::mixed::CoinSource::Wallet(_)));
-        // Input-anchored skip (2026-07-18 dust-skip rework): mirrors
-        // `assemble_mixed_note_psbt`'s own condition exactly, so a bumped/
-        // re-read `WatchNote`'s change-vout math (`wn.dust_to_self`) stays
-        // byte-true to what the built tx actually contains.
-        let has_notebook_input = !notebook_spent.is_empty();
+        // Input-anchored skip (2026-07-18 dust-skip rework; extended to
+        // Change by taproot-change unit 5): mirrors
+        // `assemble_mixed_note_psbt`'s own `has_self_input` condition
+        // exactly, so a bumped/re-read `WatchNote`'s change-vout math
+        // (`wn.dust_to_self`) stays byte-true to what the built tx actually
+        // contains.
+        let has_notebook_input = !notebook_spent.is_empty() || !change_spent.is_empty();
 
         if has_external {
             // Our own inputs are already signed above; export for the
@@ -12604,6 +13156,7 @@ pub fn run() {
                 is_watch: false,
                 private,
                 dust_to_self: !has_notebook_input,
+                change_spent: change_spent.clone(),
             });
             let n = coins.len();
             let nr = recipients.len();
@@ -12687,6 +13240,20 @@ pub fn run() {
                         },
                     );
                 }
+                // Taproot CHANGE-chain coin (unit 5): same account, chain 1
+                // — tagged "Change" (mirrors the sweep confirm's own
+                // `source: "Change"` label from unit 4).
+                app_core::mixed::CoinSource::Change => {
+                    let addr = s
+                        .change_coins
+                        .iter()
+                        .find(|cc| cc.txid == c.txid && cc.vout == c.vout)
+                        .map(|cc| cc.address.clone());
+                    prevouts.insert(
+                        key,
+                        app_core::confirm::PrevoutInfo { value: c.value, address: addr, source: "Change".to_string() },
+                    );
+                }
                 // Unreachable here: `has_external` (Wallet(_) coins present)
                 // returned above via the external-sign screen instead.
                 app_core::mixed::CoinSource::Wallet(_) => {}
@@ -12750,6 +13317,7 @@ pub fn run() {
                 change_default,
                 notebook_spent,
                 spent_spending,
+                change_spent,
                 payloads_len,
                 recipient_count,
                 change_index,
@@ -13596,8 +14164,8 @@ fn preview_mock(w: &AppWindow) {
     );
 
     let coins = [
-        SpendCoin { outpoint: "aa:0".into(), value: "200,000".into(), confirmed: true, selected: true, txid_short: "aaaa…aaaa".into(), explorer: "".into() },
-        SpendCoin { outpoint: "bb:1".into(), value: "20,000".into(), confirmed: false, selected: false, txid_short: "bbbb…bbbb".into(), explorer: "".into() },
+        SpendCoin { outpoint: "aa:0".into(), value: "200,000".into(), confirmed: true, selected: true, txid_short: "aaaa…aaaa".into(), explorer: "".into(), tag: "".into() },
+        SpendCoin { outpoint: "bb:1".into(), value: "20,000".into(), confirmed: false, selected: false, txid_short: "bbbb…bbbb".into(), explorer: "".into(), tag: "".into() },
     ];
     w.set_spend_coins(VecModel::from_slice(&coins));
     w.set_spend_title("Spending 1 coin · 200,000 sats".into());

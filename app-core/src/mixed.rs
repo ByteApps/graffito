@@ -7,11 +7,13 @@
 //! shape (OP_RETURNs, optional recipient, dust-to-self, then change) is
 //! reused verbatim, with ONE additive rule on top —
 //! [`assemble_mixed_note_psbt`] SKIPS the dust-to-self output when the
-//! selection includes a `CoinSource::Notebook` coin (input-anchored: the
-//! note's ownership/discoverability already hold via the input side, so
-//! the extra output is redundant there); `assemble_funded_note_psbt` never
-//! sees a notebook coin by construction (spending/external funding never
-//! spends notebook UTXOs), so its own dust-to-self stays unconditional.
+//! selection includes a `CoinSource::Notebook` OR `CoinSource::Change`
+//! coin (input-anchored: both are the identity's own coin — chain 0 and
+//! chain 1 of the same account, taproot-change unit 5 — so the note's
+//! ownership/discoverability already hold via the input side, and the
+//! extra output is redundant there); `assemble_funded_note_psbt` never
+//! sees a notebook or change coin by construction (spending/external
+//! funding never spends them), so its own dust-to-self stays unconditional.
 //! Only input assembly otherwise generalizes to per-coin sources. Signing
 //! still dispatches to the existing per-kind signers
 //! ([`crate::psbt_build::sign_own_taproot_inputs`],
@@ -43,6 +45,14 @@ pub enum CoinSource {
     Spending,
     /// An external (watch-only) funding wallet, identified by its saved id.
     Wallet(String),
+    /// The identity's own taproot CHANGE-chain coin (`m/86'/…/1/{index}`,
+    /// taproot-change unit 5 — see `../PLAN-chain-notes-app-taproot-change.md`).
+    /// Same account as `Notebook`, just chain 1 instead of chain 0 — an
+    /// OWN coin, not a distinct wallet (Sal's "one unified balance" rule).
+    /// `MixedCoin.index` is its chain-1 index (needed by the caller to
+    /// derive its signing owner via `identity::realize_change`); `chain`
+    /// is always 1.
+    Change,
 }
 
 /// One coin selected for a mixed-source note, tagged with its source and
@@ -418,15 +428,17 @@ pub fn spending_funding_utxos(coins: &[MixedCoin]) -> Vec<crate::funding::Fundin
 }
 
 /// Assemble the unsigned mixed-source note PSBT: inputs from potentially
-/// notebook + spending + several external wallets, in ONE transaction.
-/// Output shape mirrors
+/// notebook + change-chain + spending + several external wallets, in ONE
+/// transaction. Output shape mirrors
 /// [`crate::psbt_build::assemble_funded_note_psbt`] byte-for-byte (OP_RETURNs,
 /// optional recipient, dust-to-self, then change) — EXCEPT the dust-to-self
-/// output is SKIPPED when `coins` includes any `CoinSource::Notebook` coin
-/// (input-anchored: the note is already provably ours via the input side,
-/// so the discoverability/ownership dust would be redundant — Sal's rule,
-/// funding-unification, 2026-07-18). Otherwise this is an additive
-/// generalization of that function's INPUT side only.
+/// output is SKIPPED when `coins` includes any `CoinSource::Notebook` OR
+/// `CoinSource::Change` coin (input-anchored: the note is already provably
+/// ours via the input side — both are this identity's own coin — so the
+/// discoverability/ownership dust would be redundant — Sal's rule,
+/// funding-unification, 2026-07-18; extended to change-chain coins by
+/// taproot-change unit 5). Otherwise this is an additive generalization of
+/// that function's INPUT side only.
 ///
 /// `notebook_spk` is the identity's own P2TR scriptPubkey (Notebook coins'
 /// prevout and, when present, the dust-to-self output — one notebook, one
@@ -492,6 +504,45 @@ pub fn assemble_mixed_note_psbt_multi(
     change_index: u32,
     fee_rate: f64,
 ) -> Result<BuiltPsbt, Error> {
+    assemble_mixed_note_psbt_multi_ext(
+        coins,
+        notebook_spk,
+        spending_source,
+        wallets,
+        &HashMap::new(),
+        payloads,
+        recipients,
+        change_default,
+        change_spk_override,
+        change_index,
+        fee_rate,
+    )
+}
+
+/// [`assemble_mixed_note_psbt_multi`] extended with taproot CHANGE-chain
+/// coins (`CoinSource::Change`, taproot-change unit 5 — see
+/// `../PLAN-chain-notes-app-taproot-change.md`): `change_spks` maps a
+/// chain-1 index to that leaf's own P2TR scriptPubKey (the caller derives
+/// these via `identity::realize_change` — this builder has no key
+/// material, only spks). `assemble_mixed_note_psbt_multi`/
+/// `assemble_mixed_note_psbt` delegate here with an empty map, so every
+/// existing caller (no `Change` coins possible without one) stays
+/// byte-identical — the additive-delegation discipline this module's
+/// other generalizations (e.g. `_multi` itself) already follow.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_mixed_note_psbt_multi_ext(
+    coins: &[MixedCoin],
+    notebook_spk: Vec<u8>,
+    spending_source: Option<&FundingSource>,
+    wallets: &HashMap<String, FundingSource>,
+    change_spks: &HashMap<u32, Vec<u8>>,
+    payloads: &[Vec<u8>],
+    recipients: &[(Vec<u8>, u64)],
+    change_default: &ChangeDefault,
+    change_spk_override: Option<Vec<u8>>,
+    change_index: u32,
+    fee_rate: f64,
+) -> Result<BuiltPsbt, Error> {
     if coins.is_empty() {
         return Err(Error::Funding("no coins selected".into()));
     }
@@ -524,6 +575,13 @@ pub fn assemble_mixed_note_psbt_multi(
                 };
                 (src.derive(coin.chain, coin.index)?.spk, w)
             }
+            CoinSource::Change => {
+                let spk = change_spks
+                    .get(&coin.index)
+                    .cloned()
+                    .ok_or_else(|| Error::Funding(format!("missing change spk for chain-1 index {}", coin.index)))?;
+                (spk, InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH)
+            }
         };
         prevouts.push(TxOut { value: Amount::from_sat(coin.value), script_pubkey: ScriptBuf::from_bytes(spk) });
         weights.push(weight);
@@ -544,14 +602,19 @@ pub fn assemble_mixed_note_psbt_multi(
         });
         sent_to_recipient += amount;
     }
-    // Input-anchored skip (Sal's rule, funding-unification, 2026-07-18): a
-    // notebook coin in this selection is always this identity's OWN
-    // notebook UTXO (see `notebook_prevouts`'s doc comment in src/lib.rs —
-    // coin control never crosses notebooks), so the tx already spends from
-    // self; the dust-to-self output would be a redundant discoverability
-    // signal and is skipped entirely.
-    let has_notebook_input = coins.iter().any(|c| c.source == CoinSource::Notebook);
-    let dust_to_self = if has_notebook_input {
+    // Input-anchored skip (Sal's rule, funding-unification, 2026-07-18;
+    // extended to `Change` by taproot-change unit 5): a notebook coin in
+    // this selection is always this identity's OWN notebook UTXO (see
+    // `notebook_prevouts`'s doc comment in src/lib.rs — coin control never
+    // crosses notebooks), so the tx already spends from self; a chain-1
+    // CHANGE coin is the SAME identity's own coin too (same account, just
+    // chain 1 instead of chain 0 — Sal's "one unified balance" rule), so it
+    // anchors the note as self exactly like a notebook input. Either way
+    // the dust-to-self output would be a redundant discoverability signal
+    // and is skipped entirely.
+    let has_self_input =
+        coins.iter().any(|c| matches!(c.source, CoinSource::Notebook | CoinSource::Change));
+    let dust_to_self = if has_self_input {
         0
     } else {
         outputs.push(TxOut { value: Amount::from_sat(DUST_LIMIT), script_pubkey: ScriptBuf::from_bytes(notebook_spk.clone()) });
@@ -706,7 +769,7 @@ pub fn build_wallet_sweep_mixed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::parse_key_material;
+    use crate::identity::{parse_key_material, realize, realize_change};
     use crate::psbt_build::{sign_own_taproot_inputs, sign_own_wpkh_inputs};
     use crate::psbt_finalize::{finalize_extract, validate_signed};
     use notes_core::bundle::Identity;
@@ -1512,5 +1575,238 @@ mod tests {
         assert_eq!(outs[op_returns + 1].script_pubkey.as_bytes(), carol_spk.as_slice());
         assert_eq!(outs[op_returns + 2].script_pubkey.as_bytes(), notebook_spk.as_slice());
         assert_eq!(outs[op_returns + 2].value.to_sat(), DUST_LIMIT);
+    }
+
+    // ---- taproot-change unit 5: CoinSource::Change compose paths ----
+    // See `../PLAN-chain-notes-app-taproot-change.md`. `realize_change`
+    // derives the chain-1 (`m/86'/…/1/{index}`) owner exactly as
+    // `build_sweep_confirm`'s change-idents loop already does for the
+    // SWEEP path (unit 4, MONEY-VERIFIED on regtest) — these three tests
+    // are that same derivation + `sign_own_taproot_inputs` proof, but for
+    // the COMPOSE builder (`assemble_mixed_note_psbt_multi_ext`).
+
+    /// (a) A change-ONLY selection: no notebook coin at all, just one
+    /// chain-1 coin. Must build with NO dust-to-self (a change coin
+    /// anchors as self on its own), correct P2TR input weight (proven by
+    /// cross-checking the real fee against `estimate_funded_fee_multi`
+    /// called with the same weight independently), and change-to-self —
+    /// then sign + finalize under rust-bitcoin.
+    #[test]
+    fn mixed_note_change_only_no_dust_to_self() {
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let change_owner = realize_change(&material, net, 0, 0).unwrap();
+        let change_identity = change_owner.full().unwrap();
+        let change_spk = notes_core::address::p2tr_script_pubkey(&change_identity.output_x);
+
+        // `notebook_spk` is still a required builder param (it's also the
+        // ChangeDefault::Notebook change destination below) even though no
+        // Notebook-sourced coin participates.
+        let notebook_spk =
+            notes_core::address::p2tr_script_pubkey(&Identity::from_app_seed(&[7u8; 32]).unwrap().output_x);
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let recipient_spk = notes_core::address::p2tr_script_pubkey(&bob.output_x);
+
+        let coins = vec![MixedCoin {
+            source: CoinSource::Change, txid: "a".repeat(64), vout: 0, value: 60_000, chain: 1, index: 0,
+        }];
+        let mut change_spks = HashMap::new();
+        change_spks.insert(0u32, change_spk.clone());
+
+        let payloads = notes_core::envelope::encode_chunks(
+            [1, 2, 3, 4], notes_core::envelope::FLAG_DIRECTED, b"change only note", 80,
+        )
+        .unwrap();
+        let built = assemble_mixed_note_psbt_multi_ext(
+            &coins, notebook_spk, None, &HashMap::new(), &change_spks, &payloads,
+            &[(recipient_spk.clone(), 330)], &ChangeDefault::Notebook, None, 0, 2.0,
+        )
+        .unwrap();
+
+        assert_eq!(built.dust_to_self, 0, "a change coin anchors the tx as self — no dust-to-self");
+        assert!(built.change > 0, "plenty of value — a change output is affordable");
+        // The assembled prevout spk for the change input equals the
+        // passed-in change spk — proves the map lookup wired the right
+        // scriptPubKey in, not the notebook's or a blank one.
+        assert_eq!(
+            built.psbt.inputs[0].witness_utxo.as_ref().unwrap().script_pubkey.as_bytes(),
+            change_spk.as_slice()
+        );
+        assert!(built
+            .psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .any(|o| o.script_pubkey.as_bytes() == recipient_spk.as_slice() && o.value.to_sat() == 330));
+
+        // Correct P2TR input weight: an independent fee estimate using the
+        // SAME weight (`P2TR_KEY_DEFAULT_SIGHASH`) the builder used for a
+        // Change coin must equal the real build's fee — the same drift
+        // guard the notebook/spending cases already have.
+        let est = estimate_funded_fee(
+            &[InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH],
+            &payloads,
+            Some(recipient_spk.len()),
+            34, // notebook-default change spk length
+            false,
+            2.0,
+        );
+        assert_eq!(est, built.fee, "estimate drifted from the real builder's fee for a Change coin");
+
+        let mut psbt = built.psbt.clone();
+        let n = sign_own_taproot_inputs(&mut psbt, &change_identity.output_x, &change_identity.tweaked_seckey)
+            .unwrap();
+        assert_eq!(n, 1, "the change-chain input signs");
+        validate_signed(&psbt, &built.txid).expect("the change input signed");
+        let (raw, txid, _) = finalize_extract(psbt).expect("finalize change-only tx");
+        assert_eq!(txid, built.txid);
+        assert!(!raw.is_empty());
+    }
+
+    /// (b) A notebook (chain-0) + change (chain-1) selection of the SAME
+    /// account: two DIFFERENT owners (different leaves), each must sign
+    /// ONLY its own input — proven the same way
+    /// `wallet_sweep_mixed_multiple_notebooks_each_sign_their_own_coin`
+    /// proves it for the sweep builder. No dust-to-self (both inputs are
+    /// this identity's own coin).
+    #[test]
+    fn mixed_note_notebook_plus_change() {
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let notebook_owner = realize(&material, net, 0, 0).unwrap();
+        let notebook_identity = notebook_owner.full().unwrap();
+        let notebook_spk = notes_core::address::p2tr_script_pubkey(&notebook_identity.output_x);
+
+        let change_owner = realize_change(&material, net, 0, 0).unwrap();
+        let change_identity = change_owner.full().unwrap();
+        let change_spk = notes_core::address::p2tr_script_pubkey(&change_identity.output_x);
+        assert_ne!(notebook_spk, change_spk, "chain-0 and chain-1 leaves at the same index must differ");
+
+        let coins = vec![
+            MixedCoin { source: CoinSource::Notebook, txid: "a".repeat(64), vout: 0, value: 50_000, chain: 0, index: 0 },
+            MixedCoin { source: CoinSource::Change, txid: "b".repeat(64), vout: 1, value: 40_000, chain: 1, index: 0 },
+        ];
+        let mut change_spks = HashMap::new();
+        change_spks.insert(0u32, change_spk.clone());
+
+        let payloads =
+            notes_core::envelope::encode_chunks([2, 0, 0, 1], 0, b"notebook plus change, self note", 80).unwrap();
+        let built = assemble_mixed_note_psbt_multi_ext(
+            &coins, notebook_spk.clone(), None, &HashMap::new(), &change_spks, &payloads,
+            &[], &ChangeDefault::Notebook, None, 0, 2.0,
+        )
+        .unwrap();
+
+        assert_eq!(built.dust_to_self, 0, "both inputs are this identity's own coin — anchored, no dust-to-self");
+        assert_eq!(built.psbt.inputs.len(), 2);
+        assert_eq!(
+            built.psbt.inputs[0].witness_utxo.as_ref().unwrap().script_pubkey.as_bytes(),
+            notebook_spk.as_slice()
+        );
+        assert_eq!(
+            built.psbt.inputs[1].witness_utxo.as_ref().unwrap().script_pubkey.as_bytes(),
+            change_spk.as_slice()
+        );
+
+        let mut psbt = built.psbt.clone();
+        let n1 = sign_own_taproot_inputs(&mut psbt, &notebook_identity.output_x, &notebook_identity.tweaked_seckey)
+            .unwrap();
+        assert_eq!(n1, 1, "the notebook input signs");
+        let n2 = sign_own_taproot_inputs(&mut psbt, &change_identity.output_x, &change_identity.tweaked_seckey)
+            .unwrap();
+        assert_eq!(n2, 1, "the change input signs");
+
+        // Cross-check: the notebook owner's key must NOT verify the change
+        // input's signature (each owner signs strictly its own input, not
+        // a shared/wrong key) — mirrors the sweep builder's own cross-check.
+        use bitcoin::hashes::Hash;
+        use bitcoin::secp256k1::{schnorr::Signature as SecpSchnorrSignature, Message, Secp256k1, XOnlyPublicKey};
+        use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+        let prevouts: Vec<TxOut> =
+            psbt.inputs.iter().map(|i| i.witness_utxo.clone().unwrap()).collect();
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+        let change_sighash =
+            cache.taproot_key_spend_signature_hash(1, &Prevouts::All(&prevouts), TapSighashType::Default).unwrap();
+        let notebook_key = XOnlyPublicKey::from_slice(&notebook_identity.output_x).unwrap();
+        let secp = Secp256k1::verification_only();
+        assert!(
+            secp.verify_schnorr(
+                &SecpSchnorrSignature::from_slice(psbt.inputs[1].tap_key_sig.unwrap().signature.as_ref()).unwrap(),
+                &Message::from_digest(change_sighash.to_byte_array()),
+                &notebook_key,
+            )
+            .is_err(),
+            "the change input's signature must NOT verify against the notebook owner's key"
+        );
+
+        validate_signed(&psbt, &built.txid).expect("both taproot inputs signed");
+        let (raw, txid, _) = finalize_extract(psbt).expect("finalize notebook+change tx");
+        assert_eq!(txid, built.txid);
+        assert!(!raw.is_empty());
+    }
+
+    /// (c) A change (chain-1) + spending-wallet (BIP-84) selection: two
+    /// taproot/P2WPKH input kinds sign via their existing per-kind signers
+    /// (mirrors `mixed_notebook_and_spending_psbt_signs_both_kinds`), but
+    /// with NO notebook coin present — proving the own-note dust-to-self
+    /// skip fires from the Change coin ALONE, not only a Notebook one
+    /// (contrast `predict_funded_fold_matches_real_build_unanchored` above,
+    /// spending-only, where dust-to-self stays).
+    #[test]
+    fn mixed_note_change_plus_spending() {
+        let net = Network::Mainnet;
+        let material = parse_key_material(MNEMONIC, net).unwrap();
+        let spending_src = crate::spending::funding_source(&material, net, 0).unwrap();
+        let change_owner = realize_change(&material, net, 0, 0).unwrap();
+        let change_identity = change_owner.full().unwrap();
+        let change_spk = notes_core::address::p2tr_script_pubkey(&change_identity.output_x);
+        let notebook_spk =
+            notes_core::address::p2tr_script_pubkey(&Identity::from_app_seed(&[7u8; 32]).unwrap().output_x);
+        let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let recipient_spk = notes_core::address::p2tr_script_pubkey(&bob.output_x);
+
+        let coins = vec![
+            MixedCoin { source: CoinSource::Change, txid: "c".repeat(64), vout: 0, value: 40_000, chain: 1, index: 0 },
+            MixedCoin { source: CoinSource::Spending, txid: "d".repeat(64), vout: 1, value: 40_000, chain: 0, index: 0 },
+        ];
+        let mut change_spks = HashMap::new();
+        change_spks.insert(0u32, change_spk.clone());
+
+        let payloads = notes_core::envelope::encode_chunks(
+            [3, 0, 0, 2], notes_core::envelope::FLAG_DIRECTED, b"change plus spending", 80,
+        )
+        .unwrap();
+        let built = assemble_mixed_note_psbt_multi_ext(
+            &coins, notebook_spk, Some(&spending_src), &HashMap::new(), &change_spks, &payloads,
+            &[(recipient_spk.clone(), 330)], &ChangeDefault::Spending, None, 0, 2.0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            built.dust_to_self, 0,
+            "a change input anchors the tx as self, even without a notebook coin — no dust-to-self"
+        );
+        assert_eq!(
+            built.psbt.inputs[0].witness_utxo.as_ref().unwrap().script_pubkey.as_bytes(),
+            change_spk.as_slice()
+        );
+        let spending_spk = spending_src.derive(0, 0).unwrap().spk;
+        assert_eq!(
+            built.psbt.inputs[1].witness_utxo.as_ref().unwrap().script_pubkey.as_bytes(),
+            spending_spk.as_slice()
+        );
+
+        let mut psbt = built.psbt.clone();
+        let n1 = sign_own_taproot_inputs(&mut psbt, &change_identity.output_x, &change_identity.tweaked_seckey)
+            .unwrap();
+        assert_eq!(n1, 1, "the change input signs");
+        let spending_coins = spending_funding_utxos(&coins);
+        let n2 = sign_own_wpkh_inputs(&mut psbt, &material, net, 0, &spending_coins).unwrap();
+        assert_eq!(n2, 1, "the spending-wallet input signs");
+
+        validate_signed(&psbt, &built.txid).expect("both input kinds signed");
+        let (raw, txid, _) = finalize_extract(psbt).expect("finalize change+spending tx");
+        assert_eq!(txid, built.txid);
+        assert!(!raw.is_empty());
     }
 }
