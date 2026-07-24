@@ -4728,7 +4728,12 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
         let found = parse_key_material(&material_str, network)
             .map(|material| {
                 let client = ChainClient::new(HttpTransport::new(base), network);
-                app_core::chain::discover_indexes(&client, &material, network, account, &known, 5)
+                // gap=1 (Sal 2026-07-23): notebooks are used sequentially from
+                // index 0, so stop at the first unused receive index. Misses
+                // only a FUNDED notebook stranded behind a skipped-empty one
+                // (recover by manually creating a notebook at that index); an
+                // unfunded notebook has no on-chain trace to discover anyway.
+                app_core::chain::discover_indexes(&client, &material, network, account, &known, 1)
             })
             .unwrap_or_default();
         drop(material_str); // Zeroizing — wiped as soon as the walk is done
