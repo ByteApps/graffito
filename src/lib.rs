@@ -428,6 +428,15 @@ struct State {
     /// doesn't consume them (a later unit; `change_coins` is empty for
     /// watch material anyway, `realize_change` errors on it).
     change_coins: Vec<ChangeCoin>,
+    /// The `(fp8, network, account)` context `change_coins` was last scanned
+    /// under (taproot-change unit 7 fix). Change coins are ACCOUNT-level —
+    /// shared by every notebook of the account — so `activate()` must NOT
+    /// wipe them on a mere notebook switch within the SAME context (no
+    /// wallet-stores rescan follows a plain notebook open, so a wipe left the
+    /// compose Pay-from panel unable to offer change coins; the regtest e2e
+    /// caught it). `activate()` clears `change_coins` only when this context
+    /// changes; the wallet-stores apply stamps it whenever it repopulates.
+    change_coins_ctx: Option<(String, Network, u32)>,
     /// Settings → "Sweep notebook funds here": the spending-wallet receive
     /// index the sweep destination was set to, so the broadcast handler
     /// can mark it used on success (fresh-address discipline). None for
@@ -2261,11 +2270,24 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     st.spending_source = None;
     st.spending_coins.clear();
     st.spending_scanned = false;
-    // Taproot change-chain coins are also per (identity, account) — same
-    // reset rule as the spending wallet above, so a switch never shows a
-    // stale prior identity's change coins until the next wallet-stores scan
-    // repopulates them.
-    st.change_coins.clear();
+    // Taproot change-chain coins are per (identity, account, network) — but
+    // UNLIKE the spending wallet above, they must survive a mere notebook
+    // switch WITHIN the same context: they're account-level (shared by every
+    // notebook of the account) and no wallet-stores rescan follows a plain
+    // notebook open, so wiping them here left the compose Pay-from panel
+    // unable to offer change coins (unit 7 regtest e2e caught this). Clear
+    // ONLY when the (fp8, network, account) context actually changes — a
+    // genuine identity/account/network switch; a same-context re-activation
+    // keeps the last scan's coins until the next wallet-stores refresh
+    // replaces them (its `(fp8,network,account)` staleness guard still drops
+    // any result from the wrong context).
+    let change_ctx = index_fp8(&material, st.network)
+        .ok()
+        .map(|fp8| (fp8, st.network, st.account));
+    if st.change_coins_ctx != change_ctx {
+        st.change_coins.clear();
+        st.change_coins_ctx = None;
+    }
     let fp = hex::encode(ident.output_x());
     let path = st
         .data_dir
@@ -5204,7 +5226,14 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
         // (same "don't clobber on failure" rule the spending scan uses)
         // rather than blanking a screen the user is actively looking at.
         match r.change {
-            Ok(coins) => st.change_coins = coins,
+            Ok(coins) => {
+                println!("cb: change-coins n={}", coins.len());
+                st.change_coins = coins;
+                // Stamp the context so activate() knows these coins belong to
+                // the CURRENT (fp8, network, account) and may survive a
+                // same-context notebook switch (unit 7 fix).
+                st.change_coins_ctx = Some((r.fp8.clone(), r.network, r.account));
+            }
             Err(e) => println!("cb: change-scan err={e}"),
         }
         let material =
@@ -9273,6 +9302,7 @@ pub fn run() {
         spending_coins: Vec::new(),
         spending_scanned: false,
         change_coins: Vec::new(),
+        change_coins_ctx: None,
         pending_spending_sweep_index: None,
         mixed_selected: Vec::new(),
         payfrom_expanded_source: String::new(),
