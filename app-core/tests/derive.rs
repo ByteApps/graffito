@@ -2,8 +2,11 @@
 //! cross-check of the taproot tweak, frozen enc-key vector, xprv depth
 //! equivalence.
 
-use app_core::derive::{enc_key_from_leaf, identity_from_leaf, leaf_from_account};
-use app_core::identity::{parse_key_material, realize, KeyMaterial};
+use app_core::derive::{
+    enc_key_from_leaf, identity_from_leaf, leaf_from_account, leaf_from_account_chain,
+    leaf_from_master, leaf_from_master_chain, leaf_from_mnemonic, leaf_from_mnemonic_chain,
+};
+use app_core::identity::{parse_key_material, realize, realize_change, KeyMaterial};
 use app_core::notes_core::Network;
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::key::Secp256k1;
@@ -215,4 +218,153 @@ fn prime_recovery_seed_words_import_identically() {
         assert_eq!(enc, ident.enc_key);
     });
     ident.unwrap();
+}
+
+// ---------------------------------------------------------------------
+// Change chain (m/86'/{coin}'/{account}'/1/{index}) — foundation for
+// PLAN-chain-notes-app-taproot-change.md. This unit ONLY adds derivation
+// + address; the tests below are the correctness proof: chain-0 stays
+// byte-identical, and chain-1 matches an independent rust-bitcoin
+// derivation of the same BIP-86 change path.
+// ---------------------------------------------------------------------
+
+/// The new chain-param leaf functions, called with `chain=0`, must be
+/// byte-identical to the EXISTING (frozen) `leaf_from_*` functions for the
+/// same inputs — proves the additive change touched nothing on the
+/// receive chain.
+#[test]
+fn chain_zero_is_byte_identical_to_existing_leaf_fns() {
+    let mnemonic = bip39::Mnemonic::parse(BIP86_MNEMONIC).unwrap();
+    let secp = Secp256k1::new();
+    let master = Xpriv::new_master(bitcoin::Network::Bitcoin, &mnemonic.to_seed("")).unwrap();
+
+    for account in [0u32, 1, 7] {
+        for index in [0u32, 1, 42] {
+            assert_eq!(
+                leaf_from_master_chain(&master, Network::Mainnet, account, 0, index).unwrap(),
+                leaf_from_master(&master, Network::Mainnet, account, index).unwrap(),
+                "leaf_from_master_chain(chain=0) vs leaf_from_master a{account} i{index}",
+            );
+            assert_eq!(
+                leaf_from_mnemonic_chain(&mnemonic, Network::Mainnet, account, 0, index).unwrap(),
+                leaf_from_mnemonic(&mnemonic, Network::Mainnet, account, index).unwrap(),
+                "leaf_from_mnemonic_chain(chain=0) vs leaf_from_mnemonic a{account} i{index}",
+            );
+        }
+    }
+
+    let account_xprv = master
+        .derive_priv(
+            &secp,
+            &[
+                ChildNumber::from_hardened_idx(86).unwrap(),
+                ChildNumber::from_hardened_idx(0).unwrap(),
+                ChildNumber::from_hardened_idx(0).unwrap(),
+            ],
+        )
+        .unwrap();
+    for index in [0u32, 1, 42] {
+        assert_eq!(
+            leaf_from_account_chain(&account_xprv, 0, index).unwrap(),
+            leaf_from_account(&account_xprv, index).unwrap(),
+            "leaf_from_account_chain(chain=0) vs leaf_from_account i{index}",
+        );
+    }
+
+    // And the full realize() path (which calls the unchanged leaf_from_*
+    // functions) still lands on the frozen BIP-86 spec address.
+    let material = parse_key_material(BIP86_MNEMONIC, Network::Mainnet).unwrap();
+    let ident = realize(&material, Network::Mainnet, 0, 0).unwrap();
+    assert_eq!(ident.address, BIP86_ADDR_0);
+}
+
+/// Chain-1 (change) addresses for the standard test mnemonic, cross-checked
+/// against an INDEPENDENT derivation through rust-bitcoin's own bip32 +
+/// taproot machinery (path built by hand here, not via app-core's
+/// `hardened`/`normal` helpers; address built via `bitcoin::Address::p2tr`,
+/// not via notes-core's `Identity::from_leaf_secret`). This is the proof
+/// that our change-chain leaves are what a standard BIP-86 taproot wallet
+/// would derive as the change chain — the funds a
+/// later feature sweeps from here are really the seed's change coins.
+#[test]
+fn change_chain_matches_independent_rust_bitcoin_derivation() {
+    let material = parse_key_material(BIP86_MNEMONIC, Network::Mainnet).unwrap();
+    let secp = Secp256k1::new();
+    let mnemonic = bip39::Mnemonic::parse(BIP86_MNEMONIC).unwrap();
+    let master = Xpriv::new_master(bitcoin::Network::Bitcoin, &mnemonic.to_seed("")).unwrap();
+
+    for index in [0u32, 1] {
+        // app-core's change-chain path.
+        let ours = realize_change(&material, Network::Mainnet, 0, index).unwrap();
+
+        // Independent rust-bitcoin derivation of m/86'/0'/0'/1/{index}.
+        let path = [
+            ChildNumber::from_hardened_idx(86).unwrap(),
+            ChildNumber::from_hardened_idx(0).unwrap(),
+            ChildNumber::from_hardened_idx(0).unwrap(),
+            ChildNumber::from_normal_idx(1).unwrap(),
+            ChildNumber::from_normal_idx(index).unwrap(),
+        ];
+        let leaf = master.derive_priv(&secp, &path).unwrap();
+        let (internal, _parity) = leaf.private_key.public_key(&secp).x_only_public_key();
+        let addr = bitcoin::Address::p2tr(&secp, internal, None, bitcoin::Network::Bitcoin);
+
+        assert_eq!(ours.address, addr.to_string(), "change address index {index}");
+        // And the raw leaf secret itself matches too (not just the address
+        // — an address collision on a bug would be extraordinarily
+        // unlucky, but comparing the underlying secret is the real proof).
+        assert_eq!(ours.expect_full().internal_x.as_slice(), internal.serialize().as_slice());
+    }
+}
+
+/// Sanity: the change chain (1) and receive chain (0) diverge — same
+/// account, same index, different address. If they ever matched it would
+/// mean the chain child number silently collapsed.
+#[test]
+fn change_chain_differs_from_receive_chain() {
+    let material = parse_key_material(BIP86_MNEMONIC, Network::Mainnet).unwrap();
+    for index in [0u32, 1, 5] {
+        let receive = realize(&material, Network::Mainnet, 0, index).unwrap();
+        let change = realize_change(&material, Network::Mainnet, 0, index).unwrap();
+        assert_ne!(receive.address, change.address, "index {index}");
+    }
+}
+
+/// Account-xprv (depth 3) change-chain derivation must land on the same
+/// leaf as deriving through the master — same equivalence the existing
+/// `account_xprv_equals_master_derivation` test proves for chain 0.
+#[test]
+fn change_chain_account_xprv_equals_master_derivation() {
+    let material = parse_key_material(BIP86_MNEMONIC, Network::Mainnet).unwrap();
+    let from_master = realize_change(&material, Network::Mainnet, 0, 3).unwrap();
+
+    let KeyMaterial::Mnemonic(m) = &material else { panic!("parsed as mnemonic") };
+    let secp = Secp256k1::new();
+    let master = Xpriv::new_master(bitcoin::Network::Bitcoin, &m.to_seed("")).unwrap();
+    let account = master
+        .derive_priv(
+            &secp,
+            &[
+                ChildNumber::from_hardened_idx(86).unwrap(),
+                ChildNumber::from_hardened_idx(0).unwrap(),
+                ChildNumber::from_hardened_idx(0).unwrap(),
+            ],
+        )
+        .unwrap();
+
+    let parsed = parse_key_material(&account.to_string(), Network::Mainnet).unwrap();
+    let from_account = realize_change(&parsed, Network::Mainnet, 0, 3).unwrap();
+    assert_eq!(from_account.address, from_master.address);
+
+    let leaf = leaf_from_account_chain(&account, 1, 3).unwrap();
+    assert_eq!(from_master.leaf_secret().unwrap(), &leaf);
+}
+
+/// WIF and raw hex have no chain concept (single raw key, no hierarchy) —
+/// the change chain must error rather than fabricate a leaf.
+#[test]
+fn change_chain_rejects_non_hierarchical_material() {
+    let hex_key = "01".repeat(32);
+    let m = parse_key_material(&hex_key, Network::Mainnet).unwrap();
+    assert!(realize_change(&m, Network::Mainnet, 0, 0).is_err());
 }
