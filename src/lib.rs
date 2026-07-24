@@ -18,8 +18,8 @@ use std::rc::Rc;
 
 use app_core::bitcoin;
 use app_core::chain::{
-    default_base, explorer_presets, explorer_tx_url, node_presets, AddrStats, ChainClient,
-    HttpTransport, TxLookupStatus,
+    default_base, explorer_presets, explorer_tx_url, node_presets, scan_change_chain, AddrStats,
+    ChainClient, ChangeCoin, HttpTransport, TxLookupStatus,
 };
 use app_core::compose::ComposeRequest;
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
@@ -403,6 +403,18 @@ struct State {
     spending_source: Option<FundingSource>,
     spending_coins: Vec<FundingUtxo>,
     spending_scanned: bool,
+    /// Taproot CHANGE-chain coins (`m/86'/{coin}'/{account}'/1/{index}`,
+    /// [`app_core::identity::realize_change`]) for the ACTIVE account —
+    /// account-level (one change chain per account), not per-notebook.
+    /// Gap-walked alongside every wallet-stores rescan
+    /// ([`scan_change_chain`], gap 1 — external taproot wallets allocate
+    /// change sequentially, so the app's own usage never leaves a gap) and
+    /// folded into the Coins screen's unified coin list, each row tagged
+    /// "change" (Sal's decision: ONE balance, not a separate segment —
+    /// see `update_wallet_coins`). Empty for watch/WIF/hex identities
+    /// (`scan_change_chain` is a no-op for non-hierarchical material).
+    /// READ-ONLY for now: no spend/sweep/compose path consumes these yet.
+    change_coins: Vec<ChangeCoin>,
     /// Settings → "Sweep notebook funds here": the spending-wallet receive
     /// index the sweep destination was set to, so the broadcast handler
     /// can mark it used on success (fresh-address discipline). None for
@@ -2159,6 +2171,11 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     st.spending_source = None;
     st.spending_coins.clear();
     st.spending_scanned = false;
+    // Taproot change-chain coins are also per (identity, account) — same
+    // reset rule as the spending wallet above, so a switch never shows a
+    // stale prior identity's change coins until the next wallet-stores scan
+    // repopulates them.
+    st.change_coins.clear();
     let fp = hex::encode(ident.output_x());
     let path = st
         .data_dir
@@ -3215,7 +3232,14 @@ fn update_home(w: &AppWindow, st: &State) {
 /// The wallet-wide coins viewer (screen 10 + the Settings Coins card):
 /// every ACTIVE notebook's spendable UTXOs, each tagged with its
 /// notebook, plus the cross-wallet summary — data as of each notebook's
-/// last scan (the ↻ on the coins screen rescans them all).
+/// last scan (the ↻ on the coins screen rescans them all). Taproot
+/// change-chain coins (`st.change_coins`, unit 3 — see
+/// `../PLAN-chain-notes-app-taproot-change.md`) are folded into the SAME
+/// list, each tagged "change" instead of a notebook name (Sal's decision:
+/// one unified balance, not a separate segment) — they count toward the
+/// total coin count and spendable sats but NOT toward the "M notebooks"
+/// count below (they don't belong to any one notebook). READ-ONLY for
+/// now: no spend/sweep/compose path consumes them yet.
 fn update_wallet_coins(w: &AppWindow, st: &State) {
     let mut coins: Vec<CoinItem> = Vec::new();
     let mut spendable: u64 = 0;
@@ -3239,6 +3263,15 @@ fn update_wallet_coins(w: &AppWindow, st: &State) {
                 notebooks += 1;
             }
         }
+    }
+    for c in &st.change_coins {
+        coins.push(CoinItem {
+            outpoint: format!("{}:{}", c.txid, c.vout).into(),
+            value: c.value.to_string().into(),
+            status: if c.confirmed { "confirmed" } else { "unconfirmed" }.into(),
+            notebook: "change".into(),
+        });
+        spendable += c.value;
     }
     let n = coins.len();
     w.set_coins(VecModel::from_slice(&coins));
@@ -3457,6 +3490,14 @@ struct WalletStoresRefreshResult {
     /// Every active notebook's bundle fetch, including the snapshot-time
     /// active one.
     results: Vec<NotebookBundleResult>,
+    /// Taproot change-chain gap walk (unit 3, `../PLAN-chain-notes-app-taproot-change.md`) —
+    /// `scan_change_chain` gap 1, account-level (folded into the SAME
+    /// (fp8, network, account) staleness guard the notebook results use
+    /// above, so no separate guard is needed on apply). `Err` on a
+    /// transport/parse failure; empty `Ok` for watch/WIF/hex material
+    /// (no change chain to walk) or when no material was cached this
+    /// session.
+    change: Result<Vec<ChangeCoin>, String>,
 }
 
 static WALLET_STORES_REFRESH_RESULTS: std::sync::Mutex<Vec<WalletStoresRefreshResult>> =
@@ -3533,6 +3574,13 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
         .flat_map(|t| t.txids.iter().cloned())
         .collect();
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
+    // Taproot change-chain scan (unit 3): cloned here (worker-thread parse,
+    // same convention `spending_scan_async` uses for its own material
+    // clone) so the gap walk runs alongside the notebook rescans instead of
+    // needing a separate kick. `None` (no cached material this session)
+    // yields an empty result with no chain call — matches
+    // `scan_change_chain`'s own "nothing to walk" shape for watch/WIF/hex.
+    let material_for_change = st.material.clone();
     let key = format!("wstores/{fp8}/{}/{account}", network.as_str());
     let weak = w.as_weak();
     let job = move || {
@@ -3552,6 +3600,16 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
             current_address.as_deref().unwrap_or_default(),
             &dropped_checks,
         );
+        let change = match material_for_change
+            .as_deref()
+            .map(|m| parse_key_material(m, network))
+        {
+            Some(Ok(material)) => scan_change_chain(&client, &material, network, account, 1)
+                .map_err(|e| format!("{e}")),
+            Some(Err(e)) => Err(e.to_string()),
+            None => Ok(Vec::new()),
+        };
+        drop(material_for_change); // Zeroizing — wiped as soon as the scan is done
         WALLET_STORES_REFRESH_RESULTS
             .lock()
             .expect("wallet stores refresh mutex")
@@ -3566,6 +3624,7 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
                 current_dropped_lookup,
                 current_dropped_unspent,
                 results,
+                change,
             });
         let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_stores_refresh());
     };
@@ -4997,6 +5056,15 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
             w.set_status("".into());
             continue;
         }
+        // Taproot change-chain coins (unit 3): folds into the SAME (fp8,
+        // network, account) staleness guard above — no separate guard
+        // needed. On error, leave `st.change_coins` at its last-known value
+        // (same "don't clobber on failure" rule the spending scan uses)
+        // rather than blanking a screen the user is actively looking at.
+        match r.change {
+            Ok(coins) => st.change_coins = coins,
+            Err(e) => println!("cb: change-scan err={e}"),
+        }
         let material =
             st.material.as_deref().and_then(|m| parse_key_material(m, st.network).ok());
         let notebook_spks = notebook_spks_for(st);
@@ -5031,6 +5099,11 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
         scanned += 1; // the snapshot-time-active notebook, unconditionally
         println!("cb: {label} notebooks={scanned}");
         w.set_status("".into());
+        // Repaint the Coins screen/card regardless of which ↻ kicked this
+        // scan off — `update_wallet_coins` is a pure re-derive from `st`
+        // (no side effects), and the change coins it now folds in just
+        // landed above.
+        update_wallet_coins(w, st);
         match r.purpose {
             WalletStoresPurpose::Coins => {
                 if st.spending_capable
@@ -8854,6 +8927,7 @@ pub fn run() {
         spending_source: None,
         spending_coins: Vec::new(),
         spending_scanned: false,
+        change_coins: Vec::new(),
         pending_spending_sweep_index: None,
         mixed_selected: Vec::new(),
         payfrom_expanded_source: String::new(),

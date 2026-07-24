@@ -3745,7 +3745,13 @@ export component AppWindow inherits Window {
                                 font-weight: 700;
                                 color: Pal.text;
                             }
-                            if c.notebook != "": Badge { label: c.notebook; tint: Pal.muted; }
+                            // "change" (taproot change-chain coins, unit 3) gets the
+                            // accent tint so it reads distinctly from a notebook-name
+                            // badge at a glance, same Badge component either way.
+                            if c.notebook != "": Badge {
+                                label: c.notebook;
+                                tint: c.notebook == "change" ? Pal.accent : Pal.muted;
+                            }
                             Rectangle { }
                             Badge {
                                 label: c.status;
