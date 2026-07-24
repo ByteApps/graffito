@@ -1750,4 +1750,84 @@ mod tests {
             Ok(_) => panic!("expected a taproot-required error"),
         }
     }
+
+    /// CHANGE-CHAIN sweep signing (taproot-change unit 6, see
+    /// `../PLAN-chain-notes-app-taproot-change.md`): a coin sitting at the
+    /// account's chain-1 (`m/86'/…/1/{index}`) leaf — the same leaf
+    /// `sweep`'s change-idents loop derives via `realize_change` — signs
+    /// with `sign_own_taproot_inputs` exactly like a chain-0 notebook coin
+    /// does, and the resulting `tap_key_sig` verifies against the OWNER'S
+    /// OWN tweaked output key (the P2TR output key for that chain-1
+    /// address), not some other leaf — proving the sweep signs the change
+    /// coin with the correct key, not a stray or chain-0 one.
+    #[test]
+    fn sign_own_taproot_inputs_signs_change_chain_coin() {
+        use crate::identity::{parse_key_material, realize_change};
+        use notes_core::sign::schnorr_verify;
+
+        const MNEMONIC: &str =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let material = parse_key_material(MNEMONIC, NET).unwrap();
+        let owner = realize_change(&material, NET, 0, 0).unwrap();
+        let identity = owner.full().expect("keyed material realizes a full identity");
+        let owner_spk = ScriptBuf::from_bytes(notes_core::address::p2tr_script_pubkey(&identity.output_x));
+
+        // A different chain-1 index (a DIFFERENT owner) — used below to
+        // prove the signature does NOT verify against the wrong key,
+        // ruling out a signer that ignores which leaf it's given.
+        let other = realize_change(&material, NET, 0, 1).unwrap();
+        let other_identity = other.full().unwrap();
+        assert_ne!(
+            identity.output_x, other_identity.output_x,
+            "chain-1 index 0 and 1 must derive to different leaves"
+        );
+
+        // One-input, one-output sweep-style PSBT: the chain-1 coin spent
+        // to an arbitrary destination, minus fee — the exact shape
+        // `build_sweep_tx_multi`/`build_wallet_sweep_mixed` construct
+        // (here assembled at the PSBT level, mirroring `assemble_watch_psbt`
+        // above, so `sign_own_taproot_inputs` runs against a real PSBT).
+        let dest = Identity::from_app_seed(&[9u8; 32]).unwrap();
+        let dest_spk = ScriptBuf::from_bytes(notes_core::address::p2tr_script_pubkey(&dest.output_x));
+        let coin_value = 60_000u64;
+        let fee = 200u64;
+        let txid = Txid::from_str(&"c".repeat(64)).unwrap();
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::from_sat(coin_value - fee), script_pubkey: dest_spk }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo =
+            Some(TxOut { value: Amount::from_sat(coin_value), script_pubkey: owner_spk.clone() });
+
+        let n = sign_own_taproot_inputs(&mut psbt, &identity.output_x, &identity.tweaked_seckey).unwrap();
+        assert_eq!(n, 1, "the one change-chain input was signed");
+        let sig = psbt.inputs[0].tap_key_sig.expect("tap_key_sig set");
+
+        // Recompute the exact sighash `sign_own_taproot_inputs` signed and
+        // verify the signature against the coin's OWN chain-1 output key —
+        // the money proof: this is a byte-valid BIP-340 signature that a
+        // full node would accept spending THIS chain-1 P2TR output.
+        use bitcoin::sighash::{Prevouts, SighashCache};
+        let prevouts: Vec<TxOut> = psbt.inputs.iter().map(|i| i.witness_utxo.clone().unwrap()).collect();
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+        let sighash = cache
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), bitcoin::TapSighashType::Default)
+            .unwrap();
+        assert!(
+            schnorr_verify(&identity.output_x, sighash.as_ref(), sig.signature.as_ref()),
+            "signature must verify against the change coin's own chain-1 output key"
+        );
+        assert!(
+            !schnorr_verify(&other_identity.output_x, sighash.as_ref(), sig.signature.as_ref()),
+            "signature must NOT verify against a different chain-1 leaf's key"
+        );
+    }
 }
