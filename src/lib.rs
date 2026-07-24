@@ -808,6 +808,16 @@ struct WatchNote {
     /// one; a watch identity's self-funded compose never does — it already
     /// spends from self) — shifts the change output's vout by one.
     dust_to_self: bool,
+    /// Taproot CHANGE-chain coins (chain 1) ridden as inputs by a keyed
+    /// mixed compose that ALSO pulled an external funding wallet (unit-5
+    /// follow-up): the change inputs are signed in-app before this note is
+    /// handed to the external signer, but — like `WatchSpend.change_spent`
+    /// (unit 6) — they must be pruned from `State.change_coins` on broadcast
+    /// success (`record_watch_note`), or the next compose would re-offer an
+    /// already-spent coin until the next chain-1 rescan. Empty for a genuine
+    /// watch identity's public-note compose (its coin control never offers
+    /// change coins) and for any selection without a change coin.
+    change_spent: Vec<(String, u32)>,
 }
 
 struct WatchSpend {
@@ -1279,6 +1289,16 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
         for addr in &wn.recipients {
             st.touch_contact(addr);
         }
+    }
+    // Taproot CHANGE-chain coins (unit-5 follow-up): a keyed mixed compose
+    // that ALSO pulled an external funding wallet signed its change inputs
+    // in-app, then routed through this external-sign path — prune them from
+    // the runtime cache on broadcast success (same treatment as
+    // `record_watch_spend`/`WatchSpend.change_spent`), so the next compose
+    // doesn't re-offer an already-spent coin before the next chain-1 rescan.
+    if !wn.change_spent.is_empty() {
+        st.change_coins
+            .retain(|c| !wn.change_spent.iter().any(|(t, v)| t == &c.txid && *v == c.vout));
     }
     st.save_store();
     st.save_contacts();
@@ -11814,6 +11834,7 @@ pub fn run() {
                         is_watch: true,
                         private: false,
                         dust_to_self: false,
+                        change_spent: Vec::new(), // watch compose never spends change coins
                     });
                     let n = coins.len();
                     let nr = recipients.len();
@@ -12477,6 +12498,7 @@ pub fn run() {
                         is_watch: true,
                         private: false,
                         dust_to_self: false,
+                        change_spent: Vec::new(), // watch compose never spends change coins
                     });
                     let n = recipients.len();
                     let cost = format!(
@@ -13134,6 +13156,7 @@ pub fn run() {
                 is_watch: false,
                 private,
                 dust_to_self: !has_notebook_input,
+                change_spent: change_spent.clone(),
             });
             let n = coins.len();
             let nr = recipients.len();
