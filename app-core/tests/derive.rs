@@ -310,6 +310,16 @@ fn change_chain_matches_independent_rust_bitcoin_derivation() {
         let addr = bitcoin::Address::p2tr(&secp, internal, None, bitcoin::Network::Bitcoin);
 
         assert_eq!(ours.address, addr.to_string(), "change address index {index}");
+        // Gold standard: the literal BIP-86 spec change-0 vector (bip-0086.md,
+        // "abandon…about", m/86'/0'/0'/1/0). Human-verifiable, not just
+        // rust-bitcoin-agrees — money-critical.
+        if index == 0 {
+            assert_eq!(
+                ours.address,
+                "bc1p3qkhfews2uk44qtvauqyr2ttdsw7svhkl9nkm9s9c3x4ax5h60wqwruhk7",
+                "chain-1 index 0 MUST equal the BIP-86 spec change-address vector"
+            );
+        }
         // And the raw leaf secret itself matches too (not just the address
         // — an address collision on a bug would be extraordinarily
         // unlucky, but comparing the underlying secret is the real proof).
