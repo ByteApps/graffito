@@ -88,6 +88,17 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon-mac
         # App Sandbox + camera/files/network/keychain-access-groups.
         CODE_SIGN_ENTITLEMENTS: chain-notes-mac.entitlements
+        # Hardened Runtime (audit M5). App Sandbox and Hardened Runtime cover
+        # different things: the sandbox limits what this process may reach,
+        # Hardened Runtime stops another process running as the same user from
+        # attaching a debugger or injecting a dylib INTO it. That matters here
+        # because the notes key is cached in memory for the whole session
+        # (there is no idle re-lock yet -- audit M4), so process memory is a
+        # standing target. Not required for the Mac App Store, but free: the
+        # app loads no third-party plug-ins and needs no JIT (femtovg renders
+        # through OpenGL), so none of the com.apple.security.cs.* relaxations
+        # are needed -- and none should be added without re-reading M5.
+        ENABLE_HARDENED_RUNTIME: YES
     info:
       path: Info-mac.plist
       properties:

@@ -1974,6 +1974,10 @@ export component AppWindow inherits Window {
     callback private-pick-notebook(int);  // hex/WIF only: re-derive for a different notebook, no re-auth
     callback reveal-hide();            // back/Done from 18 or 19: wipes every revealed value
     callback copy-value(string);       // copy a revealed format to the clipboard
+    // Same, but for SPENDING material (recovery phrase / xprv / hex / WIF):
+    // routes to the concealed, local-only, expiring clipboard path. Public
+    // keys keep copy-value — an xpub is privacy-sensitive, not spendable.
+    callback copy-secret(string);
     callback go-home();
     // Internal: a background scan finished — Rust invokes this from the
     // event loop to apply the result (never called from UI elements).
@@ -5019,7 +5023,7 @@ export component AppWindow inherits Window {
 
                 if root.reveal-private-format != "": GhostButton {
                     text: "Copy";
-                    clicked => { root.copy-value(root.reveal-private-value); }
+                    clicked => { root.copy-secret(root.reveal-private-value); }
                 }
             }
         }

@@ -9313,6 +9313,8 @@ pub fn run() {
             Some("keychain-atomic-auth") => keychain::spike_atomic_auth(),
             #[cfg(target_vendor = "apple")]
             Some("file-protection") => platform::spike_file_protection(),
+            #[cfg(target_os = "macos")]
+            Some("clipboard") => platform::spike_clipboard(),
             Some("camera") => {
                 camera::spike(args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15))
             }
@@ -14043,6 +14045,15 @@ pub fn run() {
         let _ = &mut s;
         let ok = platform::set_clipboard_text(value.as_str());
         println!("cb: copy-value len={}", value.len());
+        show_toast(&w, if ok { "Copied" } else { "Copy failed" });
+    });
+
+    // Spending material (audit M3) — concealed/local-only/expiring clipboard,
+    // never the plain broadcast one. Length only, as ever; never the value.
+    cb!(on_copy_secret, |w, s, value: SharedString| {
+        let _ = &mut s;
+        let ok = platform::set_clipboard_secret(value.as_str());
+        println!("cb: copy-secret len={}", value.len());
         show_toast(&w, if ok { "Copied" } else { "Copy failed" });
     });
 
