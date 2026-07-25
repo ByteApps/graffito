@@ -3898,6 +3898,12 @@ struct DiscoveryResult {
 
 static DISCOVERY_RESULTS: std::sync::Mutex<Vec<DiscoveryResult>> = std::sync::Mutex::new(Vec::new());
 
+/// Result of the deferred auto-unlock, handed from its worker thread to the
+/// UI thread via the `apply-pending-unlock` trampoline (same shape as
+/// REFRESH_RESULTS / DISCOVERY_RESULTS).
+static UNLOCK_RESULT: std::sync::Mutex<Option<Result<Option<String>, String>>> =
+    std::sync::Mutex::new(None);
+
 /// A finished rebroadcast raw-hex fetch (`on_act_retry`'s sub-case (b): a
 /// chain-recovered/watch record with no locally cached hex) — waiting to
 /// enter the universal confirm screen on the UI thread. Mirrors
@@ -9804,19 +9810,27 @@ pub fn run() {
             // frame. "Automatic" must never mean "during launch": the Face ID
             // prompt blocks, and a user who looks away long enough would be
             // right back at the watchdog kill this whole change exists to fix.
+            // OFF the main thread, and only after the first frame. Deferring
+            // alone is NOT enough: the crash log for build 42 shows the
+            // watchdog budget that ran out is `process-launch`, 20 s of WALL
+            // CLOCK — so a main-thread Face ID prompt that the user is slow to
+            // answer can still exhaust it even once the UI is up. On a worker
+            // thread nothing the user does can block the main thread, so the
+            // watchdog cannot fire no matter how long they take. (The system
+            // presents the prompt itself; it needs nothing from us.) The
+            // result comes back through UNLOCK_RESULT + `apply-pending-unlock`,
+            // the same trampoline shape the async scans use.
             let w = window.as_weak();
-            let st_boot = st.clone();
-            // 700 ms, not the 300 ms the network sync uses: this one puts a
-            // BLOCKING system prompt on screen, so give the first frame clear
-            // margin rather than racing it. The extra 400 ms costs nothing —
-            // the user is about to be asked for Face ID either way.
             slint::Timer::single_shot(std::time::Duration::from_millis(700), move || {
-                if let Some(win) = w.upgrade() {
-                    if let Some(m) = read_saved_material(&win) {
-                        let mut s = st_boot.borrow_mut();
-                        activate_restored(&win, &mut s, m);
-                    }
-                }
+                let weak = w.clone();
+                std::thread::spawn(move || {
+                    let r = keychain::load_secret_protected(
+                        KEYCHAIN_ACCOUNT,
+                        "unlock your Chain Notes identity",
+                    );
+                    *UNLOCK_RESULT.lock().expect("unlock result mutex") = Some(r);
+                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_unlock());
+                });
             });
         }
     }
@@ -10382,6 +10396,31 @@ pub fn run() {
     // Discovery is the sanctioned exception to deliberate notebook
     // creation — every found index has on-chain history, so recovering it
     // is what the user meant by importing the seed.
+    // Deferred auto-unlock landed. Mirrors read_saved_material's error
+    // handling, but on the UI thread with the result already in hand.
+    cb!(on_apply_pending_unlock, |w, s| {
+        let taken = UNLOCK_RESULT.lock().expect("unlock result mutex").take();
+        match taken {
+            Some(Ok(Some(m))) => activate_restored(&w, &mut s, m),
+            Some(Ok(None)) => {
+                println!("cb: unlock none");
+                s.saved_key_present = false;
+                w.set_saved_key_present(false);
+            }
+            Some(Err(e)) if e == "cancelled" => {
+                // Left on onboarding with the door still there, so a
+                // mis-tapped or timed-out prompt is one tap from retrying.
+                println!("cb: unlock cancelled");
+                w.set_status("unlock cancelled — tap Restore to try again".into());
+            }
+            Some(Err(e)) => {
+                println!("cb: unlock err={e}");
+                w.set_status(format!("keychain: {e}").into());
+            }
+            None => {}
+        }
+    });
+
     cb!(on_apply_pending_discovery, |w, s| {
         let results: Vec<DiscoveryResult> =
             DISCOVERY_RESULTS.lock().expect("discovery results mutex").drain(..).collect();

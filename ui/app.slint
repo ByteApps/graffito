@@ -1995,6 +1995,9 @@ export component AppWindow inherits Window {
     // Internal: a notebook gap-discovery walk finished (seed re-import) —
     // same trampoline pattern as apply-pending-refresh.
     callback apply-pending-discovery();
+    // Deferred auto-unlock finished on its worker thread — apply on the UI
+    // thread (see UNLOCK_RESULT in lib.rs).
+    callback apply-pending-unlock();
     // Create-notebook picker: used/new address probes finished on a worker
     // thread; fill in the pills without blocking the tap that opened it.
     callback apply-pending-picker-probe();
