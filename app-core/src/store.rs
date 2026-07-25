@@ -21,6 +21,18 @@ use crate::Error;
 
 pub const DEFAULT_CHUNK: usize = 100_000;
 
+/// Current note-CLASSIFICATION generation (spending-self-notes fix, Unit
+/// D — see [`Store::migrate_classification`]). BUMP THIS whenever a code
+/// change makes an existing store's notes classify differently (ownership
+/// / sender / received-vs-own), so every store force-rescans once instead
+/// of sitting behind the `addr_stats` "nothing moved" short-circuit with
+/// stale records forever.
+///
+/// 1 = the spending-window + stale-received-twin fix (a note funded from
+/// the identity's own spending wallet was filed `received` with an
+/// "unknown" sender).
+pub const CLASSIFY_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutPointRef {
     pub txid: String, // display hex
@@ -296,6 +308,18 @@ pub struct Store {
     /// `ChainClient::address_stats` call comes back unchanged.
     #[serde(default)]
     pub addr_stats: Option<crate::chain::AddrStats>,
+    /// Which CLASSIFICATION generation this store's notes were scanned
+    /// under (spending-self-notes fix, Unit D). Bumping
+    /// [`CLASSIFY_VERSION`] forces exactly one full rescan per store on
+    /// the next load — see [`Self::load`]. Needed because the
+    /// `addr_stats` short-circuit above skips fetching a bundle entirely
+    /// when nothing moved on-chain, so a pure code-side classification
+    /// improvement would otherwise NEVER re-run on an existing wallet:
+    /// stale "unknown"-sender records would persist until some unrelated
+    /// tx happened to move the fingerprint. `#[serde(default)]` = 0, so
+    /// every pre-existing store file migrates on first load.
+    #[serde(default)]
+    pub classify_version: u32,
     #[serde(default = "default_chunk")]
     pub chunk_size: usize,
     /// Legacy per-identity Bitcoin-node URL (shipped as `esplora`). The node
@@ -382,6 +406,10 @@ impl Store {
             tip_height: 0,
             last_scan_time: 0,
             addr_stats: None,
+            // A brand-new store is scanned by the CURRENT code from its
+            // first bundle on, so it is already at this generation — no
+            // migration rescan is owed (Unit D).
+            classify_version: CLASSIFY_VERSION,
             chunk_size: DEFAULT_CHUNK,
             node_url: None,
             excluded_senders: Vec::new(),
@@ -392,7 +420,34 @@ impl Store {
 
     pub fn load(path: &std::path::Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::Store(e.to_string()))?;
-        serde_json::from_str(&text).map_err(|e| Error::Store(e.to_string()))
+        let mut store: Self =
+            serde_json::from_str(&text).map_err(|e| Error::Store(e.to_string()))?;
+        store.migrate_classification();
+        Ok(store)
+    }
+
+    /// Force ONE full rescan when this store was last scanned under an
+    /// older classification generation (spending-self-notes fix, Unit D).
+    ///
+    /// Dropping `addr_stats` is the whole mechanism: a refresh pre-checks
+    /// that fingerprint and short-circuits WITHOUT fetching a bundle when
+    /// nothing moved on-chain (`cb: refresh unchanged`), so `apply_bundle`
+    /// — and therefore the widened self-spk classification (Unit A) and
+    /// the stale-twin prune (Unit B) — would never run again on a wallet
+    /// with no new activity. Clearing the fingerprint makes the next
+    /// refresh a full scan, which re-derives every note's ownership and
+    /// heals the records a narrower past scan misfiled.
+    ///
+    /// Idempotent and self-limiting: the stamp is bumped here and
+    /// persisted by the save that follows any successful scan, so this
+    /// costs exactly one extra scan per store per version bump. Runs for
+    /// EVERY store (the wallet-wide refresh loads sibling notebooks from
+    /// disk), not just the active one.
+    fn migrate_classification(&mut self) {
+        if self.classify_version < CLASSIFY_VERSION {
+            self.addr_stats = None;
+            self.classify_version = CLASSIFY_VERSION;
+        }
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<(), Error> {
@@ -1596,6 +1651,80 @@ mod tests {
 
         let back = Store::load(&path).unwrap();
         assert_eq!(back.addr_stats, s.addr_stats);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Unit D: classification-generation forced rescan ----
+
+    /// A store last scanned under an OLDER classification generation must
+    /// drop its `addr_stats` fingerprint on load, so the next refresh is a
+    /// FULL scan instead of short-circuiting on "nothing moved" — the only
+    /// way Units A/B's corrected ownership ever reaches an existing wallet
+    /// with no new on-chain activity (the reported bug: reinstall +
+    /// restore + refresh + restart left every "unknown" row in place).
+    #[test]
+    fn classification_migration_forces_one_rescan_on_old_store() {
+        let dir = std::env::temp_dir().join(format!("cn-store-classify-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store-regtest-classify-old.json");
+        // A pre-fix store file: a stamped fingerprint and NO
+        // classify_version field at all (serde default 0).
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "network": "regtest",
+                "identity_fingerprint": "aa",
+                "address": "bcrt1paaaa",
+                "notes": [],
+                "utxos": [],
+                "contacts": [],
+                "txs": [],
+                "addr_stats": {
+                    "chain_tx_count": 4, "chain_funded": 150000, "chain_spent": 50000,
+                    "mempool_tx_count": 0, "mempool_funded": 0, "mempool_spent": 0
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let back = Store::load(&path).unwrap();
+        assert!(
+            back.addr_stats.is_none(),
+            "an old-generation store must drop its fingerprint so the next refresh does a FULL scan"
+        );
+        assert_eq!(back.classify_version, CLASSIFY_VERSION, "and be stamped current");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ...but a store already at the current generation keeps its
+    /// fingerprint — the migration is one-shot, never a rescan on every
+    /// single launch.
+    #[test]
+    fn classification_migration_leaves_current_store_alone() {
+        use crate::chain::AddrStats;
+
+        let dir = std::env::temp_dir().join(format!("cn-store-classify-cur-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store-regtest-classify-cur.json");
+
+        let mut s = Store::new(&[7u8; 32], Network::Regtest);
+        assert_eq!(s.classify_version, CLASSIFY_VERSION, "a fresh store is born current");
+        let stats = AddrStats {
+            chain_tx_count: 9,
+            chain_funded: 1,
+            chain_spent: 0,
+            mempool_tx_count: 0,
+            mempool_funded: 0,
+            mempool_spent: 0,
+        };
+        s.addr_stats = Some(stats.clone());
+        s.save(&path).unwrap();
+
+        let back = Store::load(&path).unwrap();
+        assert_eq!(back.addr_stats, Some(stats), "no gratuitous rescan for an up-to-date store");
 
         std::fs::remove_dir_all(&dir).ok();
     }
