@@ -279,8 +279,19 @@ impl Transport for HttpTransport {
         // Per-request instrumentation for the networking-efficiency work
         // (2026-07-22) — debug builds only, so release/App Store builds never
         // log request paths. Suites/repros run the debug binary and grep these.
+        //
+        // STDERR, never stdout (fixed 2026-07-25): `examples/cli.rs` is a
+        // UNIX-style filter whose stdout is DATA — callers capture it with
+        // `$(…)` (a PSBT from `fund-build`, an address, a descriptor, bundle
+        // JSON). Tracing to stdout spliced these lines into that data and
+        // broke every such command: `regtest-e2e.sh`'s external-funding legs
+        // died with `fund-sign … not a valid PSBT (base64 or hex)` because
+        // the captured "PSBT" started with 7 `cb: http GET …` lines. Every
+        // other `cli:`/`cb:` line already goes to stderr; keep it that way.
+        // (The GUI redirects both streams to one log, so its suites' greps
+        // are unaffected.)
         #[cfg(debug_assertions)]
-        println!("cb: http GET {path}");
+        eprintln!("cb: http GET {path}");
         let mut attempt = 0u32;
         loop {
             if self.paced {
@@ -304,8 +315,9 @@ impl Transport for HttpTransport {
 
     fn post_text(&self, path: &str, body: String) -> Result<String, Error> {
         let url = format!("{}{}", self.base, path);
+        // stderr, not stdout — see the `get_text` note above.
         #[cfg(debug_assertions)]
-        println!("cb: http POST {path}");
+        eprintln!("cb: http POST {path}");
         let mut attempt = 0u32;
         loop {
             if self.paced {
