@@ -3436,11 +3436,16 @@ fn update_wallet_coins(w: &AppWindow, st: &State) {
 /// and the doc comment on the old synchronous `refresh_wallet_stores` this
 /// replaced). `material` is parsed once by the caller for the whole batch.
 /// Best-effort: any failure (realize/apply) is silently skipped, exactly
-/// like the old loop's `continue`.
+/// like the old loop's `continue`. `spending_window_spks` (spending-self-
+/// notes fix, Unit A): the caller derives it ONCE per wallet-wide scan
+/// (`spending_window_spks_for`) and threads it through unchanged — the
+/// spending wallet is account-level (shared across every notebook), so one
+/// derivation covers this whole batch; an empty slice is a strict no-op.
 fn apply_bundle_to_notebook_file(
     st: &State,
     material: &app_core::identity::KeyMaterial,
     notebook_spks: &[Vec<u8>],
+    spending_window_spks: &[Vec<u8>],
     index: u32,
     bundle: &app_core::notes_core::bundle::SyncBundle,
 ) -> bool {
@@ -3448,8 +3453,14 @@ fn apply_bundle_to_notebook_file(
     let mut store =
         notebook_store(st, index).unwrap_or_else(|| Store::new(&ident.output_x(), st.network));
     let applied = match ident.full() {
-        Some(id) => store.apply_bundle(bundle, id, st.network, notebook_spks),
-        None => store.apply_bundle_watch(bundle, &ident.output_x(), st.network, notebook_spks),
+        Some(id) => store.apply_bundle(bundle, id, st.network, notebook_spks, spending_window_spks),
+        None => store.apply_bundle_watch(
+            bundle,
+            &ident.output_x(),
+            st.network,
+            notebook_spks,
+            spending_window_spks,
+        ),
     };
     if applied.is_ok() {
         if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == index) {
@@ -5121,15 +5132,25 @@ fn apply_active_bundle(
             let output_x = st.ident.as_ref().unwrap().output_x();
             let network = st.network;
             let notebook_spks = notebook_spks_for(st);
+            // Spending-self-notes fix (Unit A): derived once for this apply
+            // — a single-notebook scan, so no cross-notebook reuse needed
+            // here (the wallet-wide caller derives it once itself; see
+            // `apply_wallet_stores_refresh_results`).
+            let spending_window_spks = spending_window_spks_for(st);
             let applied = match &keyed {
-                Some(identity) => {
-                    st.store.as_mut().unwrap().apply_bundle(&bundle, identity, network, &notebook_spks)
-                }
+                Some(identity) => st.store.as_mut().unwrap().apply_bundle(
+                    &bundle,
+                    identity,
+                    network,
+                    &notebook_spks,
+                    &spending_window_spks,
+                ),
                 None => st.store.as_mut().unwrap().apply_bundle_watch(
                     &bundle,
                     &output_x,
                     network,
                     &notebook_spks,
+                    &spending_window_spks,
                 ),
             };
             match applied {
@@ -5152,6 +5173,13 @@ fn apply_active_bundle(
                         // the next refresh does a full scan. Errs toward
                         // rescanning, never toward skipping real changes.
                         st.store.as_mut().unwrap().addr_stats = Some(ns);
+                    }
+                    if stats.reclassified > 0 {
+                        // Unit B / RC2: a past too-narrow scan's stale
+                        // received/"unknown" twin just got corrected —
+                        // worth its own line (rare, so never spamming the
+                        // common case with `reclassified=0`).
+                        println!("cb: refresh reclassified n={}", stats.reclassified);
                     }
                     println!(
                         "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
@@ -5259,6 +5287,11 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
         let material =
             st.material.as_deref().and_then(|m| parse_key_material(m, st.network).ok());
         let notebook_spks = notebook_spks_for(st);
+        // Spending-self-notes fix (Unit A): derived ONCE for this whole
+        // wallet-wide pass and reused across every notebook below — the
+        // spending wallet is account-level, so re-deriving per notebook
+        // would repeat the same ~2×upto secp derivations for nothing.
+        let spending_window_spks = spending_window_spks_for(st);
         let now_active_addr = st.ident.as_ref().map(|i| i.address.clone());
         let mut scanned = 0usize;
         for nr in &r.results {
@@ -5282,7 +5315,14 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
                     None,
                 );
             } else if let (Ok(bundle), Some(material)) = (&nr.bundle, &material) {
-                if apply_bundle_to_notebook_file(st, material, &notebook_spks, nr.index, bundle) {
+                if apply_bundle_to_notebook_file(
+                    st,
+                    material,
+                    &notebook_spks,
+                    &spending_window_spks,
+                    nr.index,
+                    bundle,
+                ) {
                     scanned += 1;
                 }
             }
@@ -5330,13 +5370,24 @@ fn refresh(w: &AppWindow, st: &mut State) {
             let output_x = st.ident.as_ref().unwrap().output_x();
             let network = st.network;
             let notebook_spks = notebook_spks_for(st);
+            // Spending-self-notes fix (Unit A) — see the matching comment
+            // in `apply_active_bundle`.
+            let spending_window_spks = spending_window_spks_for(st);
             let applied = match &keyed {
-                Some(identity) => {
-                    st.store.as_mut().unwrap().apply_bundle(&bundle, identity, network, &notebook_spks)
-                }
-                None => {
-                    st.store.as_mut().unwrap().apply_bundle_watch(&bundle, &output_x, network, &notebook_spks)
-                }
+                Some(identity) => st.store.as_mut().unwrap().apply_bundle(
+                    &bundle,
+                    identity,
+                    network,
+                    &notebook_spks,
+                    &spending_window_spks,
+                ),
+                None => st.store.as_mut().unwrap().apply_bundle_watch(
+                    &bundle,
+                    &output_x,
+                    network,
+                    &notebook_spks,
+                    &spending_window_spks,
+                ),
             };
             match applied {
                 Ok(stats) => {
@@ -5355,6 +5406,9 @@ fn refresh(w: &AppWindow, st: &mut State) {
                     let (dropped_lookup, dropped_unspent) =
                         fetch_dropped_checks(&client, &address, &dropped_checks);
                     apply_dropped_checks(st.store.as_mut().unwrap(), &dropped_lookup, &dropped_unspent);
+                    if stats.reclassified > 0 {
+                        println!("cb: refresh reclassified n={}", stats.reclassified);
+                    }
                     println!(
                         "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
                         stats.notes_seen,
@@ -8116,6 +8170,47 @@ fn notebook_spks_for(st: &State) -> Vec<Vec<u8>> {
             .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+/// Spending-self-notes fix window sizing (PLAN-chain-notes-app-spending-
+/// self-notes.md, Unit A / RC1 — LOCKED decision 4): self-extending, no
+/// magic cap. `WINDOW_MIN` is the floor for a fresh/lightly-used spending
+/// wallet; `WINDOW_BUFFER` covers addresses handed out but not yet recorded
+/// as `used` by THIS device (a scan that hasn't landed, or a disk-loaded
+/// non-active store). Derivation is pure secp math (no network) — "generous"
+/// is nearly free, computed ONCE per scan/apply pass (see call sites) and
+/// reused across every notebook, never re-derived per notebook.
+const SPENDING_WINDOW_MIN: u32 = 100;
+const SPENDING_WINDOW_BUFFER: u32 = 50;
+
+/// The derived spending-address classification window (Unit A / RC1): both
+/// chains' scriptPubKeys for indexes `0..max(SPENDING_WINDOW_MIN,
+/// discovered_next_index + SPENDING_WINDOW_BUFFER)`, where
+/// `discovered_next_index` is the account's spending section's
+/// `next_receive`/`next_change` high-water mark
+/// (`NotebookIndex::spending_for`, history-based and already correct — see
+/// the PLAN's RC1 analysis). Fed to `Store::apply_bundle`/
+/// `apply_bundle_watch` as `extra_spending_spks` alongside a scan, UNIONED
+/// with (never replacing) the store's own recorded-`used` snapshot — this
+/// is what fixes a spending-wallet-funded self-note classifying as
+/// "Unknown" after a fresh install or on a disk-loaded non-active store,
+/// where that snapshot is empty or stale.
+///
+/// Empty for watch-only or non-hierarchical material (`spending::
+/// window_spks` mirrors `can_derive_spending`, so a watch identity — which
+/// has no spending wallet — degrades to today's byte-identical behavior)
+/// or when there's no notebooks index / material loaded yet.
+fn spending_window_spks_for(st: &State) -> Vec<Vec<u8>> {
+    let (Some(ix), Some(material_str)) = (&st.notebooks, st.material.as_deref()) else {
+        return Vec::new();
+    };
+    let Ok(material) = parse_key_material(material_str, st.network) else {
+        return Vec::new();
+    };
+    let section = ix.spending_for(st.account);
+    let discovered_next_index = section.next_receive.max(section.next_change);
+    let upto = SPENDING_WINDOW_MIN.max(discovered_next_index.saturating_add(SPENDING_WINDOW_BUFFER));
+    app_core::spending::window_spks(&material, st.network, st.account, upto).unwrap_or_default()
 }
 
 /// The confirm screen's one-liner caption for any note-composing tx:
