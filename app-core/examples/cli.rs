@@ -168,10 +168,15 @@ fn main() {
             }
             let client = ChainClient::new(HttpTransport::new(&args[3]), net);
             let bundle = client.build_bundle(&store.address, None).expect("build bundle");
+            // Spending-self-notes fix Unit A: `&[]` keeps the CLI
+            // byte-identical (minimal blast radius) — the derived window is
+            // a UI-layer scan concern, not this stateless scriptable role.
             let stats = match ident.full() {
-                Some(id) => store.apply_bundle(&bundle, id, net, &notebook_spks).expect("apply"),
+                Some(id) => {
+                    store.apply_bundle(&bundle, id, net, &notebook_spks, &[]).expect("apply")
+                }
                 None => store
-                    .apply_bundle_watch(&bundle, &ident.output_x(), net, &notebook_spks)
+                    .apply_bundle_watch(&bundle, &ident.output_x(), net, &notebook_spks, &[])
                     .expect("apply"),
             };
             store.resolve_spend_statuses(|t| client.fetch_tx_status(t));

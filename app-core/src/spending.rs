@@ -129,6 +129,42 @@ pub fn derive_spending_key(
     })
 }
 
+/// Derive both spending chains' scriptPubKeys for indexes `0..upto` —
+/// chain 0 (receive) then chain 1 (change), in that order. Pure secp math,
+/// NO network calls. This is the classification-window widening lever
+/// (`PLAN-chain-notes-app-spending-self-notes.md`, Unit A / RC1): the
+/// caller unions the result into the self-spk SET handed to
+/// `Store::apply_bundle`/`apply_bundle_watch`, so a note funded from a
+/// spending address within the window classifies OWN even when the
+/// recorded-`used` snapshot (`SpendingSection::self_spks`) is empty or
+/// stale (fresh install, disk-loaded non-active store, a scan that hasn't
+/// stamped the active store yet).
+///
+/// Returns an empty `Vec` (never `Err`) for material that can't derive a
+/// spending wallet at all — mirrors [`can_derive_spending`], so a watch-only
+/// or single-key identity gets an empty window rather than an error. Once
+/// past that gate, `upto` is caller-controlled public derivation — a
+/// failure past `can_derive_spending` would indicate a genuine bug, not an
+/// expected "no spending wallet" case, so it propagates as `Err`.
+pub fn window_spks(
+    material: &KeyMaterial,
+    network: Network,
+    account: u32,
+    upto: u32,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if !can_derive_spending(material) {
+        return Ok(Vec::new());
+    }
+    let src = funding_source(material, network, account)?;
+    let mut out = Vec::with_capacity(upto as usize * 2);
+    for chain in [0usize, 1usize] {
+        for index in 0..upto {
+            out.push(src.derive(chain, index)?.spk);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +223,26 @@ mod tests {
         let a0 = derive_spending_key(&m, Network::Mainnet, 0, 0, 0).unwrap();
         let a1 = derive_spending_key(&m, Network::Mainnet, 1, 0, 0).unwrap();
         assert_ne!(a0.address, a1.address);
+    }
+
+    #[test]
+    fn window_spks_covers_both_chains_and_matches_leaf_derivation() {
+        let m = material();
+        let spks = window_spks(&m, Network::Mainnet, 0, 4).unwrap();
+        assert_eq!(spks.len(), 8, "4 receive + 4 change");
+        for i in 0..4u32 {
+            let recv = derive_spending_key(&m, Network::Mainnet, 0, 0, i).unwrap();
+            assert!(spks.contains(&recv.script_pubkey), "receive index {i} must be in the window");
+            let chg = derive_spending_key(&m, Network::Mainnet, 0, 1, i).unwrap();
+            assert!(spks.contains(&chg.script_pubkey), "change index {i} must be in the window");
+        }
+    }
+
+    #[test]
+    fn window_spks_is_empty_for_non_hierarchical_material_never_err() {
+        let hex_key = "01".repeat(32);
+        let m = parse_key_material(&hex_key, Network::Mainnet).unwrap();
+        let spks = window_spks(&m, Network::Mainnet, 0, 100).unwrap();
+        assert!(spks.is_empty());
     }
 }

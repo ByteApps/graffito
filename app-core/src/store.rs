@@ -458,16 +458,31 @@ impl Store {
     /// `identity::active_notebook_spks`, the caller's usual source. An
     /// empty slice is a strict no-op (byte-identical to the pre-dedup
     /// `extract_notes_multi` call), so old callers/tests are unaffected.
+    ///
+    /// `extra_spending_spks` (spending-self-notes fix, Unit A / RC1) is
+    /// UNIONED (deduped) with [`Self::spending_self_spks`] into the self-spk
+    /// SET — it does not replace the recorded-`used` snapshot, it widens it.
+    /// The usual source is a derived spending-address window
+    /// (`spending::window_spks`), which fixes classification for a note
+    /// funded from a spending address the recorded snapshot doesn't (yet, or
+    /// ever, on a disk-loaded non-active store) know about. An empty slice
+    /// is a strict no-op — byte-identical to before this parameter existed.
     pub fn apply_bundle(
         &mut self,
         bundle: &SyncBundle,
         identity: &Identity,
         network: Network,
         notebook_spks: &[Vec<u8>],
+        extra_spending_spks: &[Vec<u8>],
     ) -> Result<ApplyStats, Error> {
         self.check_identity(&identity.output_x)?;
         let mut self_spks = vec![p2tr_script_pubkey(&identity.output_x)];
         self_spks.extend(self.spending_self_spks());
+        for spk in extra_spending_spks {
+            if !self_spks.contains(spk) {
+                self_spks.push(spk.clone());
+            }
+        }
         self.apply_recovered(
             bundle,
             extract_notes_multi_deduped(bundle, identity, network, &self_spks, notebook_spks),
@@ -477,28 +492,31 @@ impl Store {
     /// Watch-only [`Self::apply_bundle`]: same merge, but notes extract
     /// without keys — every private body stays sealed (text: None). Watch
     /// identities have no spending wallet (PLAN decision 7), so
-    /// `spending_self_spks` is always empty here — this stays byte-
-    /// identical to the old `extract_notes_watch` call. `notebook_spks`:
-    /// see [`Self::apply_bundle`] — this scan's own notebook spk (derived
-    /// from `output_x`) is the anchor identity compared against.
+    /// `spending_self_spks` is always empty here, and callers must pass an
+    /// empty `extra_spending_spks` too (no spending wallet to derive a
+    /// window from) — this stays byte-identical to the old
+    /// `extract_notes_watch` call. `notebook_spks`: see
+    /// [`Self::apply_bundle`] — this scan's own notebook spk (derived from
+    /// `output_x`) is the anchor identity compared against.
     pub fn apply_bundle_watch(
         &mut self,
         bundle: &SyncBundle,
         output_x: &[u8; 32],
         network: Network,
         notebook_spks: &[Vec<u8>],
+        extra_spending_spks: &[Vec<u8>],
     ) -> Result<ApplyStats, Error> {
         self.check_identity(output_x)?;
         let own_spk = p2tr_script_pubkey(output_x);
+        let mut self_spks = self.spending_self_spks();
+        for spk in extra_spending_spks {
+            if !self_spks.contains(spk) {
+                self_spks.push(spk.clone());
+            }
+        }
         self.apply_recovered(
             bundle,
-            extract_notes_watch_multi_deduped(
-                bundle,
-                network,
-                &self.spending_self_spks(),
-                notebook_spks,
-                &own_spk,
-            ),
+            extract_notes_watch_multi_deduped(bundle, network, &self_spks, notebook_spks, &own_spk),
         )
     }
 
@@ -520,6 +538,17 @@ impl Store {
             if self.upsert_note(note) {
                 stats.notes_new += 1;
             }
+        }
+
+        // Spending-self-notes fix, Unit B / RC2: an authoritative scan can
+        // now recover as OWN a note that a PAST scan (running with a
+        // too-narrow self-spk set, RC1) stored as `received`/"unknown" —
+        // `upsert_note` keys on (note_id, received, sender), so that stale
+        // record would otherwise linger forever beside the freshly-correct
+        // one. Only `bundle.full` runs this (an incremental bundle is a
+        // partial view and must never delete anything it didn't fully see).
+        if bundle.full {
+            self.prune_stale_received_twins(&recovered, &mut stats);
         }
 
         // Confirm pending notes whose txid surfaced with a height even if
@@ -558,6 +587,44 @@ impl Store {
         self.tip_height = self.tip_height.max(bundle.tip_height);
         self.last_scan_time = bundle.bundle_time;
         Ok(stats)
+    }
+
+    /// Spending-self-notes fix, Unit B / RC2: remove any stored `received`
+    /// record whose `note_id` + at least one `txid` matches a note THIS
+    /// batch recovered as OWN. `recovered` is the just-extracted batch (the
+    /// same one `apply_recovered`'s upsert loop just applied), so an OWN
+    /// entry here is provably, freshly re-derived from `self_spks` — the
+    /// caller only reaches this when `bundle.full` (an authoritative scan).
+    ///
+    /// SAFETY (one-directional): a `received` record is pruned ONLY when
+    /// the SAME transaction ALSO recovers as own in THIS scan — i.e. it
+    /// provably spends our (possibly just-widened) self-spk set. A
+    /// genuinely third-party received note's tx never recovers as own (its
+    /// inputs are never ours, however wide the self-spk set gets), so it is
+    /// never touched. This preserves the received/own bucket split's
+    /// security property in the OTHER direction (a tx that merely PAYS us
+    /// must never become — or stay disguised as — an own note): this
+    /// function only ever deletes `received` rows, never touches or creates
+    /// an own one, and only in response to independently-proven ownership.
+    fn prune_stale_received_twins(&mut self, recovered: &[RecoveredNote], stats: &mut ApplyStats) {
+        let own: Vec<(String, &[String])> = recovered
+            .iter()
+            .filter(|n| !n.received)
+            .map(|n| (hex::encode(n.note_id), n.txids.as_slice()))
+            .collect();
+        if own.is_empty() {
+            return;
+        }
+        let before = self.notes.len();
+        self.notes.retain(|n| {
+            if !n.received {
+                return true; // only ever prunes the received bucket
+            }
+            !own.iter().any(|(id, txids)| {
+                *id == n.note_id && n.txids.iter().any(|t| txids.contains(t))
+            })
+        });
+        stats.reclassified += before - self.notes.len();
     }
 
     /// Resolve pending sweep/consolidate records against REAL tx statuses.
@@ -1051,6 +1118,13 @@ pub struct ApplyStats {
     pub notes_seen: usize,
     pub notes_new: usize,
     pub orphaned: usize,
+    /// Stale `received` twins pruned this apply (spending-self-notes fix,
+    /// Unit B / RC2) — a note that a past, too-narrow scan filed as
+    /// received/"unknown" and THIS scan re-derived as OWN. Always 0 on an
+    /// incremental (non-`full`) bundle; only ever counts a `received` row
+    /// removed in favor of an independently-proven own one, never the
+    /// reverse.
+    pub reclassified: usize,
 }
 
 #[cfg(test)]
