@@ -38,6 +38,36 @@ const SERVICE: &str = "com.objsal.chainnotes";
 const ERR_NOT_FOUND: i32 = -25300; // errSecItemNotFound
 const ERR_CANCELED: i32 = -128; // errSecUserCanceled
 
+/// Set whenever the key is written to, or read from, the ungated `#la`
+/// fallback item instead of an OS-protected one (audit M2).
+///
+/// The fallback exists because unsigned dev builds have no data-protection
+/// keychain (errSecMissingEntitlement, -34018) and would otherwise be unable
+/// to hold an identity at all. The problem was that it was SILENT: a signed
+/// build that lost its entitlement — provisioning drift, an entitlement
+/// regression, a future Mac App Store config change — would quietly swap the
+/// OS-enforced UserPresence ACL for an in-app LAContext check that anything
+/// running in the app's context bypasses, with a `println!` nobody sees in
+/// release as the only trace.
+///
+/// It stays a fallback rather than a hard failure: refusing to store would
+/// brick the app for a user whose device is in that state, and this is the
+/// user's only copy of their key. Instead the downgrade is now VISIBLE —
+/// Settings carries a standing warning while this is set. Process-global
+/// because it describes the device/build, not one identity.
+static PROTECTION_DEGRADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn mark_degraded() {
+    PROTECTION_DEGRADED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Is the identity key sitting in the ungated fallback item rather than
+/// behind an OS-enforced ACL? Drives the Settings warning.
+pub fn protection_degraded() -> bool {
+    PROTECTION_DEGRADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn key(k: core_foundation_sys::string::CFStringRef) -> CFString {
     unsafe { CFString::wrap_under_get_rule(k) }
 }
@@ -129,6 +159,7 @@ fn add_item(account: &str, secret: &str, synced: bool) -> Result<bool, String> {
                 // below: a plain item under the #la account, reads gated
                 // by LAContext.
                 println!("cb: keychain sync=unavailable fallback=lacontext");
+                mark_degraded();
                 set_generic_password(SERVICE, &la_account(account), secret.as_bytes())
                     .map(|()| false)
                     .map_err(|e| e.to_string())
@@ -156,6 +187,7 @@ fn add_item(account: &str, secret: &str, synced: bool) -> Result<bool, String> {
             // unsigned builds. Plain item under the #la account; reads
             // gated by LAContext.
             println!("cb: keychain acl=unavailable fallback=lacontext");
+            mark_degraded();
             set_generic_password(SERVICE, &la_account(account), secret.as_bytes())
                 .map(|()| false)
                 .map_err(|e| e.to_string())
@@ -348,6 +380,9 @@ fn read_account(account: &str, prompt: &str) -> Result<Option<String>, String> {
             // presence via LAContext BEFORE returning it.
             match get_generic_password(SERVICE, &la_account(account)) {
                 Ok(bytes) => {
+                    // Reached the ungated shape — the key is in it regardless
+                    // of which session put it there (audit M2).
+                    mark_degraded();
                     user_presence_check(prompt)?;
                     String::from_utf8(bytes).map(Some).map_err(|e| e.to_string())
                 }
@@ -436,6 +471,9 @@ fn purge_account(account: &str) -> Result<(), String> {
 pub fn delete_secret(account: &str) -> Result<(), String> {
     let live = purge_account(account);
     let staged = purge_account(&staging_account(account));
+    // No key left, so "your key isn't protected" would be a lie. The next
+    // store re-sets it immediately if the device still can't do ACL items.
+    PROTECTION_DEGRADED.store(false, std::sync::atomic::Ordering::Relaxed);
     live.and(staged)
 }
 

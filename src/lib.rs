@@ -3243,6 +3243,10 @@ fn update_notebook_list(w: &AppWindow, st: &State) {
 /// row and a stale chunk value.
 fn update_settings_identity(w: &AppWindow, st: &State) {
     w.set_settings_network(st.network.as_str().into());
+    // Audit M2: surface a key-protection downgrade instead of letting it pass
+    // silently. Recomputed here because this runs after every activate /
+    // identity change, which is exactly when the answer can change.
+    w.set_key_protection_degraded(st.ident.is_some() && keychain::protection_degraded());
     w.set_settings_hierarchical(
         st.material
             .as_deref()
