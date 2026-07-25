@@ -1841,6 +1841,12 @@ export component AppWindow inherits Window {
     // flow), 5 = note view (opened via Reply).
     in-out property <int> compose-return: 7;
 
+    // A key is saved in this device's keychain (probed at boot WITHOUT
+    // unlocking it — reading it would prompt for Face ID and block launch).
+    in property <bool> saved-key-present;
+    // Onboarding's "Restore saved key" door. The prompt happens on THIS tap,
+    // never during launch.
+    callback restore-saved-key();
     callback door-import();
     callback door-create(int);
     callback import-changed(string);
@@ -2223,8 +2229,19 @@ export component AppWindow inherits Window {
             horizontal-alignment: center;
         }
         Rectangle { height: 12px; }
-        DoorCard {
+        // A key saved on THIS device (iOS keychain entries outlive the app, so
+        // this shows up even after a delete-and-reinstall). It is just another
+        // door, deliberately — ignore it and import or create instead, and
+        // saving that new key overwrites this entry. Face ID fires only on the
+        // tap; launch itself never unlocks.
+        if root.saved-key-present: DoorCard {
             highlight: true;
+            title: "Restore saved key";
+            subtitle: "A key saved on this device was found. Unlock it to pick up your notebooks where you left off — or ignore this and set up a different key below.";
+            clicked => { root.restore-saved-key(); }
+        }
+        DoorCard {
+            highlight: !root.saved-key-present;
             title: "Import a key";
             subtitle: "Any mnemonic, xprv, WIF, or 32-byte hex key — e.g. a BIP-85 child from your hardware wallet. An account xpub imports as watch-only. Type, scan, or open a file.";
             clicked => { root.door-import(); }

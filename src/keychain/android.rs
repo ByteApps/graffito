@@ -295,6 +295,13 @@ fn log_len(op: &str, n: usize) {
     eprintln!("cb: keychain {op} bytes={n}");
 }
 
+/// Is there a saved identity to restore, without unlocking it? The wrapped
+/// blob's presence is the whole answer here — no Keystore round-trip, so no
+/// biometric prompt. Mirrors the Apple probe the launch path uses.
+pub fn identity_exists(account: &str) -> bool {
+    blob_path(account).exists()
+}
+
 /// Android has no equivalent downgrade (audit M2): the blob is wrapped by a
 /// hardware-backed AndroidKeyStore key with no software fallback path — if
 /// the Keystore is unavailable the store fails outright rather than quietly

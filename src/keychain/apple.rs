@@ -226,6 +226,23 @@ fn item_exists(account: &str) -> bool {
     false
 }
 
+/// Is there a saved identity to restore — WITHOUT unlocking it?
+///
+/// This is what the launch path is allowed to ask. `load_secret_protected`
+/// must never run during launch: reading a UserPresence item makes the OS put
+/// up Face ID and BLOCKS the calling thread until the user answers, which is
+/// exactly the shape that gets the app killed by the iOS launch watchdog
+/// (black screen → `0x8badf00d`, invisible under Xcode/devicectl because they
+/// relax the watchdog — same rule the post-first-frame network sync follows).
+/// This probe reads attributes only, never `kSecReturnData`, so nothing is
+/// decrypted and no prompt appears.
+///
+/// Also true when only a staging copy survives an interrupted write — that
+/// key is restorable too, and `load_secret_protected` adopts it.
+pub fn identity_exists(account: &str) -> bool {
+    item_exists(account) || item_exists(&staging_account(account))
+}
+
 /// Store `secret` under `account`, replacing whatever is there.
 ///
 /// **Crash-safe two-phase write.** The obvious shape — delete, then add —

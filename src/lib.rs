@@ -315,6 +315,15 @@ struct State {
     /// First-run disclaimer accepted (config.json "terms_accepted"). When false
     /// the app opens on the accept gate (screen 24) before anything else.
     terms_accepted: bool,
+    /// The user has opted into unlocking the saved key automatically
+    /// (config.json "auto_unlock"). Set once they restore a saved key or save
+    /// a new one; cleared by reset-identity. Even when true the unlock runs
+    /// AFTER the first frame — never on the launch path, or the Face ID
+    /// prompt blocks launch and the watchdog kills the app.
+    auto_unlock: bool,
+    /// A saved identity exists in the keychain (probed WITHOUT unlocking it).
+    /// Drives onboarding's "Restore saved key" door.
+    saved_key_present: bool,
     pending_import: Option<Zeroizing<String>>, // hierarchical import awaiting account pick
     pending_mnemonic: Option<String>,
     quiz_indices: Vec<usize>,
@@ -861,6 +870,61 @@ struct WatchBump {
     vsize: u64,
 }
 
+/// Unlock the saved keychain identity — the half that PROMPTS. Split from
+/// [`activate_restored`] so the caller isn't holding a `State` borrow across a
+/// Face ID prompt that can sit there for as long as the user takes.
+///
+/// **Never call this on the launch path.** Both callers are safe by
+/// construction: the onboarding "Restore saved key" tap (user-initiated) and
+/// the deferred auto-unlock timer (after the first frame).
+fn read_saved_material(window: &AppWindow) -> Option<String> {
+    match keychain::load_secret_protected(KEYCHAIN_ACCOUNT, "unlock your Chain Notes identity") {
+        Ok(Some(m)) => Some(m),
+        Ok(None) => {
+            // Probed present but gone by the time we read it (deleted from
+            // another device, or an iCloud item that vanished).
+            println!("cb: unlock none");
+            window.set_saved_key_present(false);
+            None
+        }
+        Err(e) if e == "cancelled" => {
+            println!("cb: unlock cancelled");
+            window.set_status("unlock cancelled — tap Restore to try again".into());
+            None
+        }
+        Err(e) => {
+            println!("cb: unlock err={e}");
+            window.set_status(format!("keychain: {e}").into());
+            None
+        }
+    }
+}
+
+/// Activate a just-unlocked saved identity and land on the notebook list.
+/// Restoring IS the opt-in for automatic unlock: from here on launches unlock
+/// on their own (still deferred past the first frame).
+fn activate_restored(window: &AppWindow, s: &mut State, material: String) {
+    match activate(s, &material, false) {
+        Ok(()) => {
+            if !s.auto_unlock {
+                s.auto_unlock = true;
+                s.save_config();
+            }
+            println!("cb: unlock ok auto-unlock=1");
+            update_home(window, s);
+            update_notebook_list(window, s);
+            window.set_status("".into());
+            window.set_screen(17);
+            refresh_async(window, s);
+            spending_refresh_async(window, s);
+        }
+        Err(e) => {
+            println!("cb: unlock activate-err={e}");
+            window.set_status(format!("stored key failed: {e}").into());
+        }
+    }
+}
+
 /// The ONE way a store reaches disk (audit M1). `Store::save` writes a temp
 /// file and renames it over the target, so the backup-exclusion flag — which
 /// lives on the file, not the path — is destroyed on every save and has to be
@@ -1067,6 +1131,7 @@ impl State {
                 "explorers": self.explorers,
                 "chunk": self.chunk,
                 "terms_accepted": self.terms_accepted,
+                "auto_unlock": self.auto_unlock,
             })
             .to_string(),
         );
@@ -2295,7 +2360,17 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     let ident =
         realize(&material, st.network, st.account, st.nb_index).map_err(|e| e.to_string())?;
     if persist {
+        // Overwrites any existing entry — including one the user just chose to
+        // ignore at the "Restore saved key" door. Safe by construction: the
+        // two-phase write never leaves the device without a copy (audit H1).
         keychain::store_secret_protected(KEYCHAIN_ACCOUNT, material_str.trim(), st.icloud_backup)?;
+        // Saving a key IS the opt-in for automatic unlock, same as restoring
+        // one — from here launches unlock on their own (after the first frame).
+        st.saved_key_present = true;
+        if !st.auto_unlock {
+            st.auto_unlock = true;
+            st.save_config(); // or the opt-in dies with the process
+        }
     }
     st.material = Some(Zeroizing::new(material_str.trim().to_string()));
     // Funding-unification M3: the spending wallet is per (identity,
@@ -9398,6 +9473,7 @@ pub fn run() {
         .get("terms_accepted")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let auto_unlock = config.get("auto_unlock").and_then(|v| v.as_bool()).unwrap_or(false);
     // Device-level per-network Settings (Bitcoin node / block explorer URLs).
     let str_map = |key: &str| -> HashMap<String, String> {
         config
@@ -9442,6 +9518,8 @@ pub fn run() {
         material: None,
         icloud_backup: false,
         terms_accepted,
+        auto_unlock,
+        saved_key_present: false,
         pending_import: None,
         pending_mnemonic: None,
         quiz_indices: Vec::new(),
@@ -9646,27 +9724,40 @@ pub fn run() {
     }
 
     // Boot identity: APP_KEY env (dev/tests) or the keychain.
+    //
+    // **THE LAUNCH PATH NEVER UNLOCKS THE KEYCHAIN.** `load_secret_protected`
+    // on a UserPresence item makes the OS put up Face ID and BLOCKS this
+    // thread until the user answers — on the launch path that is a hung
+    // launch, and iOS kills the app (black screen → `0x8badf00d`). It is the
+    // same rule the post-first-frame network sync below already follows, and
+    // it is invisible under Xcode/devicectl because those relax the watchdog:
+    // only a home-screen tap shows it. Reported from TestFlight on build 42
+    // ("something is blocking a smooth launch, then it asked for Face ID"),
+    // though the call has been on this path since 2026-07-09 — it stayed
+    // hidden while iCloud backup was on, since a synced item carries no ACL
+    // and so never prompts.
+    //
+    // So boot only PROBES (attributes only, no prompt). What happens next:
+    //   - no saved key            → onboarding, exactly as before
+    //   - saved key, auto_unlock  → unlock AFTER the first frame (deferred)
+    //   - saved key, not opted in → onboarding shows the "Restore saved key"
+    //                               door; Face ID fires on that TAP, which is
+    //                               user-initiated and can't trip a watchdog
     {
         let mut s = st.borrow_mut();
         let material = match std::env::var("APP_KEY") {
             Ok(k) => Some(k),
-            Err(_) => match keychain::load_secret_protected(
-                KEYCHAIN_ACCOUNT,
-                "unlock your Chain Notes identity",
-            ) {
-                Ok(m) => m,
-                Err(e) if e == "cancelled" => {
-                    println!("cb: unlock cancelled");
-                    window.set_status(
-                        "unlock cancelled — restart the app to try again, or import a key".into(),
-                    );
-                    None
-                }
-                Err(e) => {
-                    window.set_status(format!("keychain: {e}").into());
-                    None
-                }
-            },
+            Err(_) => {
+                let found = keychain::identity_exists(KEYCHAIN_ACCOUNT);
+                s.saved_key_present = found;
+                window.set_saved_key_present(found);
+                println!(
+                    "cb: boot saved-key={} auto-unlock={}",
+                    u8::from(found),
+                    u8::from(s.auto_unlock)
+                );
+                None // never unlock here — see the note above
+            }
         };
         if let Some(m) = material {
             match activate(&mut s, &m, false) {
@@ -9708,6 +9799,25 @@ pub fn run() {
                 }
                 Err(e) => window.set_status(format!("stored key failed: {e}").into()),
             }
+        } else if s.saved_key_present && s.auto_unlock {
+            // Opted in already, so don't ask again — but still AFTER the first
+            // frame. "Automatic" must never mean "during launch": the Face ID
+            // prompt blocks, and a user who looks away long enough would be
+            // right back at the watchdog kill this whole change exists to fix.
+            let w = window.as_weak();
+            let st_boot = st.clone();
+            // 700 ms, not the 300 ms the network sync uses: this one puts a
+            // BLOCKING system prompt on screen, so give the first frame clear
+            // margin rather than racing it. The extra 400 ms costs nothing —
+            // the user is about to be asked for Face ID either way.
+            slint::Timer::single_shot(std::time::Duration::from_millis(700), move || {
+                if let Some(win) = w.upgrade() {
+                    if let Some(m) = read_saved_material(&win) {
+                        let mut s = st_boot.borrow_mut();
+                        activate_restored(&win, &mut s, m);
+                    }
+                }
+            });
         }
     }
 
@@ -9755,6 +9865,25 @@ pub fn run() {
                 $body
             });
         }};
+    }
+
+    // Onboarding's "Restore saved key" door. This is the ONLY place a user
+    // meets the Face ID prompt for the stored key on a cold start, and it is
+    // reached by a tap — so it can block for as long as it likes.
+    // Written out rather than via cb!: that macro takes a State borrow for the
+    // whole body, and this body sits on a Face ID prompt that can last as long
+    // as the user does. Borrow only AFTER the prompt returns.
+    {
+        let st_restore = st.clone();
+        let weak = window.as_weak();
+        window.on_restore_saved_key(move || {
+            let w = weak.unwrap();
+            println!("cb: restore-saved-key");
+            if let Some(m) = read_saved_material(&w) {
+                let mut s = st_restore.borrow_mut();
+                activate_restored(&w, &mut s, m);
+            }
+        });
     }
 
     cb!(on_door_import, |w, s| {
@@ -9837,9 +9966,14 @@ pub fn run() {
         println!("cb: set-icloud-backup {enabled}");
         if let Some(material) = s.material.clone() {
             match keychain::store_secret_protected(KEYCHAIN_ACCOUNT, material.trim(), enabled) {
-                Ok(()) => w.set_status(
-                    if enabled { "iCloud backup on" } else { "iCloud backup off" }.into(),
-                ),
+                Ok(()) => {
+                    // Re-stored under a new sync mode — still a saved key.
+                    s.saved_key_present = true;
+                    w.set_saved_key_present(true);
+                    w.set_status(
+                        if enabled { "iCloud backup on" } else { "iCloud backup off" }.into(),
+                    );
+                }
                 Err(e) => {
                     w.set_status(format!("iCloud: {e}").into());
                     s.icloud_backup = !enabled;
@@ -13709,6 +13843,13 @@ pub fn run() {
         s.icloud_backup = false;
         w.set_icloud_backup(false);
         w.set_icloud_available(false);
+        // The key is gone, so there is nothing to restore and nothing to
+        // auto-unlock — leaving either set would show a "Restore saved key"
+        // door pointing at an item we just deleted.
+        s.auto_unlock = false;
+        s.saved_key_present = false;
+        w.set_saved_key_present(false);
+        s.save_config();
         w.set_show_reset_confirm(false);
         clear_reveal(&w, &mut s);
         w.set_status("".into());
