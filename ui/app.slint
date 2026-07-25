@@ -1737,6 +1737,10 @@ export component AppWindow inherits Window {
 
     in property <string> settings-network;
     in property <string> settings-identity;
+    // True while the identity key sits in the ungated fallback keychain item
+    // rather than behind an OS-enforced ACL (audit M2) — normal for unsigned
+    // dev builds, a real warning anywhere else.
+    in property <bool> key-protection-degraded;
     in property <bool> settings-hierarchical;
     // Watch-only identity (account-xpub import): no signing key, no private
     // notes — compose/sweep/consolidate/bump are hidden everywhere.
@@ -1974,6 +1978,10 @@ export component AppWindow inherits Window {
     callback private-pick-notebook(int);  // hex/WIF only: re-derive for a different notebook, no re-auth
     callback reveal-hide();            // back/Done from 18 or 19: wipes every revealed value
     callback copy-value(string);       // copy a revealed format to the clipboard
+    // Same, but for SPENDING material (recovery phrase / xprv / hex / WIF):
+    // routes to the concealed, local-only, expiring clipboard path. Public
+    // keys keep copy-value — an xpub is privacy-sensitive, not spendable.
+    callback copy-secret(string);
     callback go-home();
     // Internal: a background scan finished — Rust invokes this from the
     // event loop to apply the result (never called from UI elements).
@@ -3573,6 +3581,15 @@ export component AppWindow inherits Window {
             GhostButton { text: "Privacy"; clicked => { root.open-info("privacy"); } }
             GhostButton { text: "Terms & disclaimer"; clicked => { root.open-info("terms"); } }
         }
+        // Key-protection downgrade (audit M2). Deliberately the LAST card:
+        // it appears and disappears with device state, and anything above it
+        // would shift under the e2e suites' calibrated tap offsets.
+        if root.key-protection-degraded: SettingsCard {
+            // No glyph in the title: the icon rule (femtovg has no font
+            // fallback) makes "⚠" tofu on Android's stricter renderer.
+            title: "Key not protected by this device";
+            subtitle: "Your key is stored without the operating system's Face ID / Touch ID lock, so the app is guarding it on its own. This normally means an unsigned development build. If you see this in an App Store build, move your funds using your recovery phrase and reinstall.";
+        }
         if root.status != "": Caption { text: root.status; color: Pal.bad; }
         // Signature tagline — last thing under every settings card, centered
         // with breathing room above and below.
@@ -5019,7 +5036,7 @@ export component AppWindow inherits Window {
 
                 if root.reveal-private-format != "": GhostButton {
                     text: "Copy";
-                    clicked => { root.copy-value(root.reveal-private-value); }
+                    clicked => { root.copy-secret(root.reveal-private-value); }
                 }
             }
         }

@@ -861,6 +861,22 @@ struct WatchBump {
     vsize: u64,
 }
 
+/// The ONE way a store reaches disk (audit M1). `Store::save` writes a temp
+/// file and renames it over the target, so the backup-exclusion flag — which
+/// lives on the file, not the path — is destroyed on every save and has to be
+/// re-applied here. Routing every write through this is what keeps decrypted
+/// note text out of unencrypted device backups; a `store.save(...)` called
+/// directly would silently re-enrol that notebook.
+///
+/// Save failures stay swallowed, exactly as every call site already did:
+/// the store is a chain-derived cache, and a failed write leaves the previous
+/// file intact (temp-then-rename).
+fn save_store_file(store: &app_core::store::Store, path: &std::path::Path) {
+    if store.save(path).is_ok() {
+        platform::exclude_from_backup(path);
+    }
+}
+
 impl State {
     /// Per-identity, per-network store file — switching keys or accounts
     /// can never collide notebooks.
@@ -890,7 +906,7 @@ impl State {
 
     fn save_store(&self) {
         if let (Some(s), Some(p)) = (&self.store, self.store_path()) {
-            let _ = s.save(&p);
+            save_store_file(s, &p);
         }
     }
 
@@ -1365,7 +1381,7 @@ fn record_watch_spend(st: &mut State, ws: &WatchSpend, txid: &str, raw: &str, vs
                 } else if let Some(mut store) = notebook_store(st, *index) {
                     lock(&mut store, *index);
                     if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == *index) {
-                        let _ = store.save(&st.store_path_for(fp8));
+                        save_store_file(&store, &st.store_path_for(fp8));
                     }
                 }
             }
@@ -1408,7 +1424,7 @@ fn record_watch_spend(st: &mut State, ws: &WatchSpend, txid: &str, raw: &str, vs
                             pending_spend: false,
                         });
                         if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == dest) {
-                            let _ = dstore.save(&st.store_path_for(fp8));
+                            save_store_file(&dstore, &st.store_path_for(fp8));
                         }
                     }
                 }
@@ -3227,6 +3243,10 @@ fn update_notebook_list(w: &AppWindow, st: &State) {
 /// row and a stale chunk value.
 fn update_settings_identity(w: &AppWindow, st: &State) {
     w.set_settings_network(st.network.as_str().into());
+    // Audit M2: surface a key-protection downgrade instead of letting it pass
+    // silently. Recomputed here because this runs after every activate /
+    // identity change, which is exactly when the answer can change.
+    w.set_key_protection_degraded(st.ident.is_some() && keychain::protection_degraded());
     w.set_settings_hierarchical(
         st.material
             .as_deref()
@@ -3464,7 +3484,7 @@ fn apply_bundle_to_notebook_file(
     };
     if applied.is_ok() {
         if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == index) {
-            let _ = store.save(&st.store_path_for(fp8));
+            save_store_file(&store, &st.store_path_for(fp8));
         }
         true
     } else {
@@ -4012,7 +4032,7 @@ fn apply_sweep_broadcast_result(w: &AppWindow, st: &mut State, r: SweepBroadcast
                 } else if let Some(mut store) = notebook_store(st, *index) {
                     mark(&mut store);
                     if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == *index) {
-                        let _ = store.save(&st.store_path_for(fp8));
+                        save_store_file(&store, &st.store_path_for(fp8));
                     }
                 }
             }
@@ -4243,7 +4263,7 @@ fn apply_wconsol_broadcast_result(w: &AppWindow, st: &mut State, r: WConsolBroad
                     pending_spend: false,
                 });
                 if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == snap.dest_index) {
-                    let _ = dstore.save(&st.store_path_for(fp8));
+                    save_store_file(&dstore, &st.store_path_for(fp8));
                 }
             }
             for (index, coins) in &snap.source_locks {
@@ -4257,7 +4277,7 @@ fn apply_wconsol_broadcast_result(w: &AppWindow, st: &mut State, r: WConsolBroad
                     }
                 }
                 if let Some((_, _, fp8)) = st.nb_addrs.iter().find(|(a, ..)| *a == *index) {
-                    let _ = store.save(&st.store_path_for(fp8));
+                    save_store_file(&store, &st.store_path_for(fp8));
                 }
             }
             // Reload the active store from disk (it may be source and/or
@@ -9289,6 +9309,16 @@ pub fn run() {
         let result = match args.get(2).map(String::as_str) {
             Some("keychain") => keychain::spike(),
             Some("keychain-auth") => keychain::spike_auth(),
+            // Crash-safe two-phase write (H1). The plain one is
+            // automation-safe; `-auth` prompts and is human-run.
+            #[cfg(target_vendor = "apple")]
+            Some("keychain-atomic") => keychain::spike_atomic(),
+            #[cfg(target_vendor = "apple")]
+            Some("keychain-atomic-auth") => keychain::spike_atomic_auth(),
+            #[cfg(target_vendor = "apple")]
+            Some("file-protection") => platform::spike_file_protection(),
+            #[cfg(target_os = "macos")]
+            Some("clipboard") => platform::spike_clipboard(),
             Some("camera") => {
                 camera::spike(args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15))
             }
@@ -9321,6 +9351,20 @@ pub fn run() {
             .join("Library/Application Support/ChainNotes")
     });
     let _ = std::fs::create_dir_all(&data_dir);
+    // Data-at-rest (audit M1). Directory first: every file created inside
+    // inherits the protection class, so this one call covers all the
+    // temp-then-rename churn that follows. Then re-assert backup exclusion on
+    // the store files — the flag dies with the inode each save replaces, and
+    // a build that predates `save_store_file` left them all enrolled.
+    platform::protect_data_dir(&data_dir);
+    if let Ok(entries) = std::fs::read_dir(&data_dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("store-") && name.ends_with(".json") {
+                platform::exclude_from_backup(&e.path());
+            }
+        }
+    }
     let config: serde_json::Value = std::fs::read_to_string(data_dir.join("config.json"))
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
@@ -14005,6 +14049,15 @@ pub fn run() {
         let _ = &mut s;
         let ok = platform::set_clipboard_text(value.as_str());
         println!("cb: copy-value len={}", value.len());
+        show_toast(&w, if ok { "Copied" } else { "Copy failed" });
+    });
+
+    // Spending material (audit M3) — concealed/local-only/expiring clipboard,
+    // never the plain broadcast one. Length only, as ever; never the value.
+    cb!(on_copy_secret, |w, s, value: SharedString| {
+        let _ = &mut s;
+        let ok = platform::set_clipboard_secret(value.as_str());
+        println!("cb: copy-secret len={}", value.len());
         show_toast(&w, if ok { "Copied" } else { "Copy failed" });
     });
 

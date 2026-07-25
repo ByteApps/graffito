@@ -34,6 +34,211 @@ pub fn save_file(_name: &str) -> Option<PathBuf> {
     None
 }
 
+// ---- Data-at-rest protection (audit M1) ----
+//
+// The store files cache DECRYPTED note text (`NoteRecord.text`) — the very
+// content the product exists to keep private. The notes key gets Keychain +
+// Touch ID; until this shipped, the plaintext it protects got the process-wide
+// defaults: readable from first unlock, and swept into device backups.
+
+/// Raise the app data directory to `NSFileProtectionComplete` — its contents
+/// become unreadable while the device is locked, instead of the iOS default
+/// (`CompleteUntilFirstUserAuthentication`, i.e. readable from first unlock
+/// until reboot).
+///
+/// Setting it on the DIRECTORY is what makes this maintenance-free: files
+/// created inside inherit the class, including the `<store>.json.tmp` that
+/// `Store::save` writes and renames over the real file on every single save.
+/// No call site has to remember anything. Existing files from before this
+/// shipped are migrated in the same pass.
+///
+/// Safe because the app declares no `UIBackgroundModes` — it only runs in the
+/// foreground, i.e. while unlocked. A save racing a lock fails cleanly rather
+/// than corrupting: `Store::save` writes the temp file first and only renames
+/// on success, so a denied write leaves the previous file intact and the
+/// cache re-derives from the chain on the next scan.
+#[cfg(target_os = "ios")]
+pub fn protect_data_dir(dir: &std::path::Path) {
+    use objc2_foundation::{
+        NSDictionary, NSFileAttributeKey, NSFileManager, NSFileProtectionComplete,
+        NSFileProtectionKey, NSString,
+    };
+    let apply = |p: &std::path::Path| unsafe {
+        let attrs = NSDictionary::<NSFileAttributeKey, objc2::runtime::AnyObject>::from_slices(
+            &[NSFileProtectionKey],
+            &[(*NSFileProtectionComplete).as_ref()],
+        );
+        let path = NSString::from_str(&p.to_string_lossy());
+        if let Err(e) = NSFileManager::defaultManager().setAttributes_ofItemAtPath_error(&attrs, &path)
+        {
+            eprintln!("cb: file-protect failed err={e}");
+        }
+    };
+    apply(dir);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            apply(&e.path());
+        }
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn protect_data_dir(_dir: &std::path::Path) {
+    // macOS has no file Data Protection classes (FileVault is volume-level),
+    // and Android app-private storage is covered by device encryption.
+}
+
+/// Mark `path` excluded from backups — iCloud and, on macOS, Time Machine.
+///
+/// Applied to the `store-*.json` files ONLY. They cache decrypted note text
+/// AND are fully chain-recoverable, so keeping them out of an **unencrypted**
+/// Finder/iTunes backup (which would otherwise write every private note to
+/// the host Mac in cleartext) costs nothing that a rescan can't rebuild.
+///
+/// Deliberately NOT applied to `contacts.json`, `notebooks-*.json` or
+/// `config.json`: those hold user-authored data — contact names, notebook
+/// names, node choices — that nothing can reconstruct, and none of it is note
+/// plaintext.
+///
+/// Must be re-applied after every save: the flag lives on the file, and
+/// `Store::save`'s temp-then-rename swaps in a fresh one each time. That is
+/// what `save_store_file` in lib.rs is for.
+#[cfg(target_vendor = "apple")]
+pub fn exclude_from_backup(path: &std::path::Path) {
+    use objc2_foundation::{NSNumber, NSString, NSURL, NSURLIsExcludedFromBackupKey};
+    unsafe {
+        let s = NSString::from_str(&path.to_string_lossy());
+        let url = NSURL::fileURLWithPath(&s);
+        let yes = NSNumber::new_bool(true);
+        if let Err(e) = url.setResourceValue_forKey_error(Some(yes.as_ref()), NSURLIsExcludedFromBackupKey)
+        {
+            eprintln!("cb: backup-exclude failed err={e}");
+        }
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+pub fn exclude_from_backup(_path: &std::path::Path) {}
+
+/// Read back `NSURLIsExcludedFromBackupKey`. `None` = the attribute isn't set
+/// (or couldn't be read), which the OS treats as "include in backups".
+/// Exists for `--spike file-protection`; nothing in the app reads it.
+#[cfg(target_vendor = "apple")]
+pub fn is_excluded_from_backup(path: &std::path::Path) -> Option<bool> {
+    use objc2_foundation::{NSNumber, NSString, NSURL, NSURLIsExcludedFromBackupKey};
+    unsafe {
+        let s = NSString::from_str(&path.to_string_lossy());
+        let url = NSURL::fileURLWithPath(&s);
+        let mut value = None;
+        url.getResourceValue_forKey_error(&mut value, NSURLIsExcludedFromBackupKey).ok()?;
+        let n = value?.downcast::<NSNumber>().ok()?;
+        Some(n.boolValue())
+    }
+}
+
+/// Spike: the clipboard paths (audit M3) against the real pasteboard.
+///
+/// Proves three things the app depends on: the NSPasteboard rewrite still
+/// round-trips (it replaced the `pbcopy`/`pbpaste` shell-outs, which a
+/// sandboxed Mac App Store build cannot rely on), a secret copy is still
+/// paste-able by the user, and — the actual point — a secret copy carries the
+/// concealed flavour while an ordinary copy does not.
+///
+/// macOS-only: the iOS `localOnly` + expiry path has no host equivalent and
+/// needs a device run.
+#[cfg(target_os = "macos")]
+pub fn spike_clipboard() -> Result<(), String> {
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSString;
+
+    // Is the concealed flavour present on the current pasteboard contents?
+    let concealed_now = || unsafe {
+        let pb: *mut AnyObject = objc2::msg_send![objc2::class!(NSPasteboard), generalPasteboard];
+        let ty = NSString::from_str(PASTEBOARD_CONCEALED_TYPE);
+        let s: Option<objc2::rc::Retained<NSString>> = objc2::msg_send![pb, stringForType: &*ty];
+        s.is_some()
+    };
+
+    let plain = "not-a-secret-address";
+    if !set_clipboard_text(plain) {
+        return Err("set_clipboard_text failed".into());
+    }
+    if clipboard_text().as_deref() != Some(plain) {
+        return Err("plain copy did not round-trip".into());
+    }
+    if concealed_now() {
+        return Err("an ordinary copy was marked concealed".into());
+    }
+
+    let secret = "spike secret material";
+    if !set_clipboard_secret(secret) {
+        return Err("set_clipboard_secret failed".into());
+    }
+    // Still readable as text, or the user could not paste it anywhere.
+    if clipboard_text().as_deref() != Some(secret) {
+        return Err("secret copy is not paste-able as plain text".into());
+    }
+    if !concealed_now() {
+        return Err("secret copy was NOT marked concealed".into());
+    }
+
+    // Leave the pasteboard clean rather than holding the spike's "secret".
+    let _ = set_clipboard_text("");
+    println!("cb: spike-clipboard roundtrip=ok concealed=secret-only");
+    Ok(())
+}
+
+/// Spike: prove the data-at-rest wiring (audit M1) on the real filesystem.
+///
+/// The load-bearing claim is that the exclusion flag lives on the FILE, so
+/// `Store::save`'s temp-then-rename silently drops it — which is why every
+/// store write has to go back through `save_store_file`. That is exactly what
+/// this asserts, rather than trusting the reasoning.
+///
+/// macOS-verifiable only. `protect_data_dir` is a no-op here (no file Data
+/// Protection classes off iOS), so the protection class itself needs a run on
+/// a real iOS device.
+#[cfg(target_vendor = "apple")]
+pub fn spike_file_protection() -> Result<(), String> {
+    let dir = std::env::temp_dir().join("chain-notes-spike-fileprot");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    protect_data_dir(&dir);
+
+    let path = dir.join("store-testnet4-deadbeef.json");
+    std::fs::write(&path, b"{}").map_err(|e| e.to_string())?;
+    if is_excluded_from_backup(&path) == Some(true) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err("a fresh file was already excluded — test proves nothing".into());
+    }
+    exclude_from_backup(&path);
+    if is_excluded_from_backup(&path) != Some(true) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err("exclude_from_backup did not take".into());
+    }
+
+    // The regression this design exists to prevent: a temp-then-rename save,
+    // exactly as `Store::save` does it, must LOSE the flag.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, b"{\"v\":2}").map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    let survived = is_excluded_from_backup(&path) == Some(true);
+
+    // ...and re-applying restores it, which is what `save_store_file` does.
+    exclude_from_backup(&path);
+    let restored = is_excluded_from_backup(&path) == Some(true);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if !restored {
+        return Err("re-applying after a rename did not take".into());
+    }
+    println!(
+        "cb: spike-file-protection exclude=ok survives-rename={} reapply=ok",
+        u8::from(survived)
+    );
+    Ok(())
+}
+
 /// Safe-area insets (top, bottom) in LOGICAL px. `scale` is the window's
 /// scale factor — used on Android to convert `content_rect`'s physical
 /// pixels; ignored on iOS, where UIKit already reports points (= logical
@@ -100,14 +305,57 @@ pub fn clipboard_text() -> Option<String> {
     Some(s.to_string())
 }
 
+/// macOS pasteboard access goes through NSPasteboard, NOT the `pbcopy` /
+/// `pbpaste` shell-outs the app used to spawn. Two reasons: a sandboxed Mac
+/// App Store build cannot rely on exec'ing helpers outside its container, and
+/// only the direct API can attach the concealed flavour
+/// [`set_clipboard_secret`] needs.
+#[cfg(target_os = "macos")]
+const PASTEBOARD_STRING_TYPE: &str = "public.utf8-plain-text";
+
+/// The flavour password managers write so clipboard managers skip the value
+/// instead of persisting it to disk. A de-facto convention, not an Apple API,
+/// but it is the only lever macOS offers here.
+#[cfg(target_os = "macos")]
+const PASTEBOARD_CONCEALED_TYPE: &str = "org.nspasteboard.ConcealedType";
+
+#[cfg(target_os = "macos")]
+fn write_pasteboard(text: &str, concealed: bool) -> bool {
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSString;
+    unsafe {
+        let pb: *mut AnyObject = objc2::msg_send![objc2::class!(NSPasteboard), generalPasteboard];
+        if pb.is_null() {
+            return false;
+        }
+        let _: isize = objc2::msg_send![pb, clearContents];
+        let value = NSString::from_str(text);
+        // Concealed FIRST: a clipboard manager that sees this flavour skips
+        // the item wholesale, so the plain flavour below stays paste-able by
+        // the user without being archived.
+        if concealed {
+            let ty = NSString::from_str(PASTEBOARD_CONCEALED_TYPE);
+            let _: bool = objc2::msg_send![pb, setString: &*value, forType: &*ty];
+        }
+        let ty = NSString::from_str(PASTEBOARD_STRING_TYPE);
+        objc2::msg_send![pb, setString: &*value, forType: &*ty]
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn clipboard_text() -> Option<String> {
-    // The app already shells out to pbcopy for copy; pbpaste for read.
-    std::process::Command::new("pbpaste")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .filter(|s| !s.is_empty())
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSString;
+    unsafe {
+        let pb: *mut AnyObject = objc2::msg_send![objc2::class!(NSPasteboard), generalPasteboard];
+        if pb.is_null() {
+            return None;
+        }
+        let ty = NSString::from_str(PASTEBOARD_STRING_TYPE);
+        let s: Option<objc2::rc::Retained<NSString>> =
+            objc2::msg_send![pb, stringForType: &*ty];
+        s.map(|s| s.to_string()).filter(|s| !s.is_empty())
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -131,15 +379,67 @@ pub fn clipboard_text() -> Option<String> {
 /// ClipboardManager over JNI. Returns whether the write took.
 #[cfg(target_os = "macos")]
 pub fn set_clipboard_text(text: &str) -> bool {
-    use std::io::Write;
-    std::process::Command::new("pbcopy")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut c| {
-            c.stdin.as_mut().expect("piped").write_all(text.as_bytes())?;
-            c.wait()
-        })
-        .is_ok()
+    write_pasteboard(text, false)
+}
+
+/// How long a copied secret stays on the iOS pasteboard. Long enough to
+/// switch apps and paste, short enough that it isn't still sitting there
+/// hours later.
+#[cfg(target_os = "ios")]
+const SECRET_CLIPBOARD_TTL_SECS: f64 = 60.0;
+
+// ---- Secret clipboard (audit M3) ----
+//
+// The general pasteboard is a broadcast channel. On iOS every installed app
+// can read it (iOS 14+ shows a banner but does not block the read) and it
+// syncs to nearby devices over Universal Clipboard; on macOS clipboard
+// managers persist it to disk. That is the wrong place for a recovery phrase,
+// xprv, WIF or raw key — material that spends the wallet outright — so the
+// private-keys screen routes through here instead of `set_clipboard_text`,
+// and takes whatever opt-out each OS actually offers.
+
+/// iOS: `localOnly` keeps it off Universal Clipboard, and an expiry date has
+/// the system drop it after [`SECRET_CLIPBOARD_TTL_SECS`]. Neither hides it
+/// from a determined app reading the pasteboard in that window — no iOS API
+/// does — but together they stop the value leaving the device and stop it
+/// lingering.
+#[cfg(target_os = "ios")]
+pub fn set_clipboard_secret(text: &str) -> bool {
+    use objc2_foundation::{NSArray, NSDate, NSDictionary, NSNumber, NSString};
+    use objc2_ui_kit::{
+        UIPasteboard, UIPasteboardOptionExpirationDate, UIPasteboardOptionLocalOnly,
+    };
+    unsafe {
+        let pb = UIPasteboard::generalPasteboard();
+        let value = NSString::from_str(text);
+        let ty = NSString::from_str("public.utf8-plain-text");
+        let item = NSDictionary::from_slices(&[&*ty], &[value.as_ref()]);
+        let items = NSArray::from_slice(&[&*item]);
+        let local = NSNumber::new_bool(true);
+        let expires = NSDate::dateWithTimeIntervalSinceNow(SECRET_CLIPBOARD_TTL_SECS);
+        let options = NSDictionary::from_slices(
+            &[UIPasteboardOptionLocalOnly, UIPasteboardOptionExpirationDate],
+            &[local.as_ref(), expires.as_ref()],
+        );
+        pb.setItems_options(&items, &options);
+    }
+    true
+}
+
+/// macOS: mark the value concealed so clipboard managers skip it. Universal
+/// Clipboard cannot be opted out of per-item here, so this is a partial
+/// mitigation — the "never a screenshot" caption on the backup screen carries
+/// the rest of the message.
+#[cfg(target_os = "macos")]
+pub fn set_clipboard_secret(text: &str) -> bool {
+    write_pasteboard(text, true)
+}
+
+/// Android has `ClipDescription.EXTRA_IS_SENSITIVE` (API 33+) which would be
+/// the equivalent; not wired up, so this is a plain copy for now.
+#[cfg(not(target_vendor = "apple"))]
+pub fn set_clipboard_secret(text: &str) -> bool {
+    set_clipboard_text(text)
 }
 
 #[cfg(target_os = "ios")]

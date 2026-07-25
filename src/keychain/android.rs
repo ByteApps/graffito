@@ -295,6 +295,14 @@ fn log_len(op: &str, n: usize) {
     eprintln!("cb: keychain {op} bytes={n}");
 }
 
+/// Android has no equivalent downgrade (audit M2): the blob is wrapped by a
+/// hardware-backed AndroidKeyStore key with no software fallback path — if
+/// the Keystore is unavailable the store fails outright rather than quietly
+/// writing something weaker. Always false.
+pub fn protection_degraded() -> bool {
+    false
+}
+
 // --spike entry points don't run on Android (no CLI), but the shared
 // dispatch in run() references them, so they must exist.
 pub fn spike() -> Result<(), String> {
