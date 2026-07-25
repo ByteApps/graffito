@@ -1124,13 +1124,29 @@ fn classify_tx_inner(tx: &EsploraTx, address: &str, network: Option<Network>) ->
         .any(|i| i.prevout.as_ref().and_then(|p| p.scriptpubkey_address.as_deref()) == Some(address));
     let pays_self = tx.vout.iter().any(|o| o.scriptpubkey_address.as_deref() == Some(address));
 
-    let sender = tx
+    // FROZEN: prefer the first TAPROOT input prevout address — this is the
+    // sender rule notes-core/contacts/reply-target logic keys off, since a
+    // taproot address is the one that can double as a chain-notes identity.
+    // Do not change the taproot-first preference.
+    //
+    // DISPLAY-ONLY fallback: when the tx has no taproot input at all (e.g.
+    // funded purely from a native-segwit P2WPKH wallet), fall back to the
+    // first input prevout address of ANY type, just so the UI can name the
+    // funder instead of bucketing the note under an anonymous "unknown"
+    // sender row. This never feeds `author_candidates` (below, taproot-only)
+    // or any ECDH/crypto path — it's scanner display metadata only, and it
+    // only fires when the taproot search above finds nothing.
+    let input_addrs_any: Vec<&str> = tx
         .vin
         .iter()
         .filter_map(|i| i.prevout.as_ref())
         .filter_map(|p| p.scriptpubkey_address.as_deref())
+        .collect();
+    let sender = input_addrs_any
+        .iter()
         .find(|a| is_taproot_addr(a))
-        .map(String::from);
+        .or_else(|| input_addrs_any.first())
+        .map(|a| a.to_string());
 
     let externals: Vec<&str> = tx
         .vout
@@ -1782,6 +1798,88 @@ mod tests {
         let tx2: EsploraTx = serde_json::from_str(&json_hex).unwrap();
         let onchain2 = classify_tx_net(&tx2, "not-our-address", Network::Regtest).unwrap();
         assert_eq!(onchain2.input_prevout_spks, vec![spk_hex]);
+    }
+
+    // ---- Unit C: sender falls back to the first non-taproot input prevout
+    // address when the tx has no taproot input at all (e.g. funded purely
+    // from a native-segwit P2WPKH wallet) — display-only, so an "Unknown"
+    // received note can show a real funder address instead. ----
+
+    #[test]
+    fn sender_falls_back_to_first_non_taproot_input() {
+        use notes_core::tx::op_return_script;
+        let payload_hex = hex::encode(op_return_script(b"hi"));
+        let json = format!(
+            r#"{{"txid":"t1","vin":[
+                {{"txid":"a","vout":0,"prevout":{{"scriptpubkey_address":"bcrt1q-wpkh-funder","value":1000}}}}],
+              "vout":[
+                {{"scriptpubkey":"{payload_hex}","scriptpubkey_type":"op_return","value":0}},
+                {{"scriptpubkey_address":"our-address","value":500}}],
+              "status":{{"confirmed":false}}}}"#
+        );
+        let tx: EsploraTx = serde_json::from_str(&json).unwrap();
+        let onchain = classify_tx(&tx, "our-address").unwrap();
+        assert_eq!(onchain.sender.as_deref(), Some("bcrt1q-wpkh-funder"));
+    }
+
+    #[test]
+    fn sender_prefers_taproot_input_regardless_of_order() {
+        use notes_core::tx::op_return_script;
+        let payload_hex = hex::encode(op_return_script(b"hi"));
+        // Taproot input is SECOND in vin order — proves the preference isn't
+        // just "first input", it's "first taproot input" even when a
+        // non-taproot input comes first.
+        let json = format!(
+            r#"{{"txid":"t1","vin":[
+                {{"txid":"a","vout":0,"prevout":{{"scriptpubkey_address":"bcrt1q-wpkh-funder","value":1000}}}},
+                {{"txid":"b","vout":0,"prevout":{{"scriptpubkey_address":"bcrt1p-taproot-funder","value":2000}}}}],
+              "vout":[
+                {{"scriptpubkey":"{payload_hex}","scriptpubkey_type":"op_return","value":0}},
+                {{"scriptpubkey_address":"our-address","value":2500}}],
+              "status":{{"confirmed":false}}}}"#
+        );
+        let tx: EsploraTx = serde_json::from_str(&json).unwrap();
+        let onchain = classify_tx(&tx, "our-address").unwrap();
+        assert_eq!(onchain.sender.as_deref(), Some("bcrt1p-taproot-funder"));
+    }
+
+    #[test]
+    fn sender_none_when_tx_spends_from_self() {
+        use notes_core::tx::op_return_script;
+        let payload_hex = hex::encode(op_return_script(b"hi"));
+        // The tx spends OUR OWN address as an input — the return-site rule
+        // (`sender: if spends_from_self { None } else { sender }`) must still
+        // blank the sender, unaffected by the new fallback.
+        let json = format!(
+            r#"{{"txid":"t1","vin":[
+                {{"txid":"a","vout":0,"prevout":{{"scriptpubkey_address":"our-address","value":1000}}}}],
+              "vout":[
+                {{"scriptpubkey":"{payload_hex}","scriptpubkey_type":"op_return","value":0}},
+                {{"scriptpubkey_address":"our-address","value":500}}],
+              "status":{{"confirmed":false}}}}"#
+        );
+        let tx: EsploraTx = serde_json::from_str(&json).unwrap();
+        let onchain = classify_tx(&tx, "our-address").unwrap();
+        assert_eq!(onchain.sender, None);
+    }
+
+    #[test]
+    fn sender_none_when_no_resolvable_prevout_address() {
+        use notes_core::tx::op_return_script;
+        let payload_hex = hex::encode(op_return_script(b"hi"));
+        // No inputs at all resolve to a prevout address (prevout missing
+        // entirely) — must degrade to None, never panic.
+        let json = format!(
+            r#"{{"txid":"t1","vin":[
+                {{"txid":"a","vout":0}}],
+              "vout":[
+                {{"scriptpubkey":"{payload_hex}","scriptpubkey_type":"op_return","value":0}},
+                {{"scriptpubkey_address":"our-address","value":500}}],
+              "status":{{"confirmed":false}}}}"#
+        );
+        let tx: EsploraTx = serde_json::from_str(&json).unwrap();
+        let onchain = classify_tx(&tx, "our-address").unwrap();
+        assert_eq!(onchain.sender, None);
     }
 
     // ---- task #14: dropped-pending detection — tx_lookup_status /
