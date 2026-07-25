@@ -158,6 +158,16 @@ fn main() {
             // notebooks index loaded above for the spending section —
             // empty (no-op) for non-hierarchical APP_KEY or no index yet.
             let mut notebook_spks: Vec<Vec<u8>> = Vec::new();
+            // Spending-self-notes fix, Unit A: the DERIVED spending-address
+            // window, mirroring `src/lib.rs`'s `spending_window_spks_for`.
+            // This CLI plays the APP role for the e2e scripts, so it must
+            // classify identically — a note funded from the identity's own
+            // spending wallet is OWN even when this store's recorded-`used`
+            // snapshot is empty (a fresh `init`, i.e. the reinstall case).
+            // Same self-extending sizing as the app.
+            const SPENDING_WINDOW_MIN: u32 = 100;
+            const SPENDING_WINDOW_BUFFER: u32 = 50;
+            let mut spending_window: Vec<Vec<u8>> = Vec::new();
             if let Ok(material) = parse_key_material(&key, net) {
                 let ix_path = spending_index_path(&args[2], net, &material);
                 if let Ok(ix) = NotebookIndex::load(&ix_path) {
@@ -165,13 +175,19 @@ fn main() {
                     notebook_spks =
                         app_core::identity::active_notebook_spks(&material, net, account, &ix);
                 }
+                let next = store.spending.next_receive.max(store.spending.next_change);
+                let upto = SPENDING_WINDOW_MIN.max(next.saturating_add(SPENDING_WINDOW_BUFFER));
+                spending_window =
+                    app_core::spending::window_spks(&material, net, account, upto).unwrap_or_default();
             }
             let client = ChainClient::new(HttpTransport::new(&args[3]), net);
             let bundle = client.build_bundle(&store.address, None).expect("build bundle");
             let stats = match ident.full() {
-                Some(id) => store.apply_bundle(&bundle, id, net, &notebook_spks).expect("apply"),
+                Some(id) => store
+                    .apply_bundle(&bundle, id, net, &notebook_spks, &spending_window)
+                    .expect("apply"),
                 None => store
-                    .apply_bundle_watch(&bundle, &ident.output_x(), net, &notebook_spks)
+                    .apply_bundle_watch(&bundle, &ident.output_x(), net, &notebook_spks, &spending_window)
                     .expect("apply"),
             };
             store.resolve_spend_statuses(|t| client.fetch_tx_status(t));

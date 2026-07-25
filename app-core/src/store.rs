@@ -21,6 +21,18 @@ use crate::Error;
 
 pub const DEFAULT_CHUNK: usize = 100_000;
 
+/// Current note-CLASSIFICATION generation (spending-self-notes fix, Unit
+/// D — see [`Store::migrate_classification`]). BUMP THIS whenever a code
+/// change makes an existing store's notes classify differently (ownership
+/// / sender / received-vs-own), so every store force-rescans once instead
+/// of sitting behind the `addr_stats` "nothing moved" short-circuit with
+/// stale records forever.
+///
+/// 1 = the spending-window + stale-received-twin fix (a note funded from
+/// the identity's own spending wallet was filed `received` with an
+/// "unknown" sender).
+pub const CLASSIFY_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutPointRef {
     pub txid: String, // display hex
@@ -296,6 +308,18 @@ pub struct Store {
     /// `ChainClient::address_stats` call comes back unchanged.
     #[serde(default)]
     pub addr_stats: Option<crate::chain::AddrStats>,
+    /// Which CLASSIFICATION generation this store's notes were scanned
+    /// under (spending-self-notes fix, Unit D). Bumping
+    /// [`CLASSIFY_VERSION`] forces exactly one full rescan per store on
+    /// the next load — see [`Self::load`]. Needed because the
+    /// `addr_stats` short-circuit above skips fetching a bundle entirely
+    /// when nothing moved on-chain, so a pure code-side classification
+    /// improvement would otherwise NEVER re-run on an existing wallet:
+    /// stale "unknown"-sender records would persist until some unrelated
+    /// tx happened to move the fingerprint. `#[serde(default)]` = 0, so
+    /// every pre-existing store file migrates on first load.
+    #[serde(default)]
+    pub classify_version: u32,
     #[serde(default = "default_chunk")]
     pub chunk_size: usize,
     /// Legacy per-identity Bitcoin-node URL (shipped as `esplora`). The node
@@ -382,6 +406,10 @@ impl Store {
             tip_height: 0,
             last_scan_time: 0,
             addr_stats: None,
+            // A brand-new store is scanned by the CURRENT code from its
+            // first bundle on, so it is already at this generation — no
+            // migration rescan is owed (Unit D).
+            classify_version: CLASSIFY_VERSION,
             chunk_size: DEFAULT_CHUNK,
             node_url: None,
             excluded_senders: Vec::new(),
@@ -392,7 +420,34 @@ impl Store {
 
     pub fn load(path: &std::path::Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::Store(e.to_string()))?;
-        serde_json::from_str(&text).map_err(|e| Error::Store(e.to_string()))
+        let mut store: Self =
+            serde_json::from_str(&text).map_err(|e| Error::Store(e.to_string()))?;
+        store.migrate_classification();
+        Ok(store)
+    }
+
+    /// Force ONE full rescan when this store was last scanned under an
+    /// older classification generation (spending-self-notes fix, Unit D).
+    ///
+    /// Dropping `addr_stats` is the whole mechanism: a refresh pre-checks
+    /// that fingerprint and short-circuits WITHOUT fetching a bundle when
+    /// nothing moved on-chain (`cb: refresh unchanged`), so `apply_bundle`
+    /// — and therefore the widened self-spk classification (Unit A) and
+    /// the stale-twin prune (Unit B) — would never run again on a wallet
+    /// with no new activity. Clearing the fingerprint makes the next
+    /// refresh a full scan, which re-derives every note's ownership and
+    /// heals the records a narrower past scan misfiled.
+    ///
+    /// Idempotent and self-limiting: the stamp is bumped here and
+    /// persisted by the save that follows any successful scan, so this
+    /// costs exactly one extra scan per store per version bump. Runs for
+    /// EVERY store (the wallet-wide refresh loads sibling notebooks from
+    /// disk), not just the active one.
+    fn migrate_classification(&mut self) {
+        if self.classify_version < CLASSIFY_VERSION {
+            self.addr_stats = None;
+            self.classify_version = CLASSIFY_VERSION;
+        }
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<(), Error> {
@@ -458,16 +513,31 @@ impl Store {
     /// `identity::active_notebook_spks`, the caller's usual source. An
     /// empty slice is a strict no-op (byte-identical to the pre-dedup
     /// `extract_notes_multi` call), so old callers/tests are unaffected.
+    ///
+    /// `extra_spending_spks` (spending-self-notes fix, Unit A / RC1) is
+    /// UNIONED (deduped) with [`Self::spending_self_spks`] into the self-spk
+    /// SET — it does not replace the recorded-`used` snapshot, it widens it.
+    /// The usual source is a derived spending-address window
+    /// (`spending::window_spks`), which fixes classification for a note
+    /// funded from a spending address the recorded snapshot doesn't (yet, or
+    /// ever, on a disk-loaded non-active store) know about. An empty slice
+    /// is a strict no-op — byte-identical to before this parameter existed.
     pub fn apply_bundle(
         &mut self,
         bundle: &SyncBundle,
         identity: &Identity,
         network: Network,
         notebook_spks: &[Vec<u8>],
+        extra_spending_spks: &[Vec<u8>],
     ) -> Result<ApplyStats, Error> {
         self.check_identity(&identity.output_x)?;
         let mut self_spks = vec![p2tr_script_pubkey(&identity.output_x)];
         self_spks.extend(self.spending_self_spks());
+        for spk in extra_spending_spks {
+            if !self_spks.contains(spk) {
+                self_spks.push(spk.clone());
+            }
+        }
         self.apply_recovered(
             bundle,
             extract_notes_multi_deduped(bundle, identity, network, &self_spks, notebook_spks),
@@ -477,28 +547,31 @@ impl Store {
     /// Watch-only [`Self::apply_bundle`]: same merge, but notes extract
     /// without keys — every private body stays sealed (text: None). Watch
     /// identities have no spending wallet (PLAN decision 7), so
-    /// `spending_self_spks` is always empty here — this stays byte-
-    /// identical to the old `extract_notes_watch` call. `notebook_spks`:
-    /// see [`Self::apply_bundle`] — this scan's own notebook spk (derived
-    /// from `output_x`) is the anchor identity compared against.
+    /// `spending_self_spks` is always empty here, and callers must pass an
+    /// empty `extra_spending_spks` too (no spending wallet to derive a
+    /// window from) — this stays byte-identical to the old
+    /// `extract_notes_watch` call. `notebook_spks`: see
+    /// [`Self::apply_bundle`] — this scan's own notebook spk (derived from
+    /// `output_x`) is the anchor identity compared against.
     pub fn apply_bundle_watch(
         &mut self,
         bundle: &SyncBundle,
         output_x: &[u8; 32],
         network: Network,
         notebook_spks: &[Vec<u8>],
+        extra_spending_spks: &[Vec<u8>],
     ) -> Result<ApplyStats, Error> {
         self.check_identity(output_x)?;
         let own_spk = p2tr_script_pubkey(output_x);
+        let mut self_spks = self.spending_self_spks();
+        for spk in extra_spending_spks {
+            if !self_spks.contains(spk) {
+                self_spks.push(spk.clone());
+            }
+        }
         self.apply_recovered(
             bundle,
-            extract_notes_watch_multi_deduped(
-                bundle,
-                network,
-                &self.spending_self_spks(),
-                notebook_spks,
-                &own_spk,
-            ),
+            extract_notes_watch_multi_deduped(bundle, network, &self_spks, notebook_spks, &own_spk),
         )
     }
 
@@ -520,6 +593,17 @@ impl Store {
             if self.upsert_note(note) {
                 stats.notes_new += 1;
             }
+        }
+
+        // Spending-self-notes fix, Unit B / RC2: an authoritative scan can
+        // now recover as OWN a note that a PAST scan (running with a
+        // too-narrow self-spk set, RC1) stored as `received`/"unknown" —
+        // `upsert_note` keys on (note_id, received, sender), so that stale
+        // record would otherwise linger forever beside the freshly-correct
+        // one. Only `bundle.full` runs this (an incremental bundle is a
+        // partial view and must never delete anything it didn't fully see).
+        if bundle.full {
+            self.prune_stale_received_twins(&recovered, &mut stats);
         }
 
         // Confirm pending notes whose txid surfaced with a height even if
@@ -558,6 +642,44 @@ impl Store {
         self.tip_height = self.tip_height.max(bundle.tip_height);
         self.last_scan_time = bundle.bundle_time;
         Ok(stats)
+    }
+
+    /// Spending-self-notes fix, Unit B / RC2: remove any stored `received`
+    /// record whose `note_id` + at least one `txid` matches a note THIS
+    /// batch recovered as OWN. `recovered` is the just-extracted batch (the
+    /// same one `apply_recovered`'s upsert loop just applied), so an OWN
+    /// entry here is provably, freshly re-derived from `self_spks` — the
+    /// caller only reaches this when `bundle.full` (an authoritative scan).
+    ///
+    /// SAFETY (one-directional): a `received` record is pruned ONLY when
+    /// the SAME transaction ALSO recovers as own in THIS scan — i.e. it
+    /// provably spends our (possibly just-widened) self-spk set. A
+    /// genuinely third-party received note's tx never recovers as own (its
+    /// inputs are never ours, however wide the self-spk set gets), so it is
+    /// never touched. This preserves the received/own bucket split's
+    /// security property in the OTHER direction (a tx that merely PAYS us
+    /// must never become — or stay disguised as — an own note): this
+    /// function only ever deletes `received` rows, never touches or creates
+    /// an own one, and only in response to independently-proven ownership.
+    fn prune_stale_received_twins(&mut self, recovered: &[RecoveredNote], stats: &mut ApplyStats) {
+        let own: Vec<(String, &[String])> = recovered
+            .iter()
+            .filter(|n| !n.received)
+            .map(|n| (hex::encode(n.note_id), n.txids.as_slice()))
+            .collect();
+        if own.is_empty() {
+            return;
+        }
+        let before = self.notes.len();
+        self.notes.retain(|n| {
+            if !n.received {
+                return true; // only ever prunes the received bucket
+            }
+            !own.iter().any(|(id, txids)| {
+                *id == n.note_id && n.txids.iter().any(|t| txids.contains(t))
+            })
+        });
+        stats.reclassified += before - self.notes.len();
     }
 
     /// Resolve pending sweep/consolidate records against REAL tx statuses.
@@ -1051,6 +1173,13 @@ pub struct ApplyStats {
     pub notes_seen: usize,
     pub notes_new: usize,
     pub orphaned: usize,
+    /// Stale `received` twins pruned this apply (spending-self-notes fix,
+    /// Unit B / RC2) — a note that a past, too-narrow scan filed as
+    /// received/"unknown" and THIS scan re-derived as OWN. Always 0 on an
+    /// incremental (non-`full`) bundle; only ever counts a `received` row
+    /// removed in favor of an independently-proven own one, never the
+    /// reverse.
+    pub reclassified: usize,
 }
 
 #[cfg(test)]
@@ -1522,6 +1651,80 @@ mod tests {
 
         let back = Store::load(&path).unwrap();
         assert_eq!(back.addr_stats, s.addr_stats);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Unit D: classification-generation forced rescan ----
+
+    /// A store last scanned under an OLDER classification generation must
+    /// drop its `addr_stats` fingerprint on load, so the next refresh is a
+    /// FULL scan instead of short-circuiting on "nothing moved" — the only
+    /// way Units A/B's corrected ownership ever reaches an existing wallet
+    /// with no new on-chain activity (the reported bug: reinstall +
+    /// restore + refresh + restart left every "unknown" row in place).
+    #[test]
+    fn classification_migration_forces_one_rescan_on_old_store() {
+        let dir = std::env::temp_dir().join(format!("cn-store-classify-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store-regtest-classify-old.json");
+        // A pre-fix store file: a stamped fingerprint and NO
+        // classify_version field at all (serde default 0).
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "network": "regtest",
+                "identity_fingerprint": "aa",
+                "address": "bcrt1paaaa",
+                "notes": [],
+                "utxos": [],
+                "contacts": [],
+                "txs": [],
+                "addr_stats": {
+                    "chain_tx_count": 4, "chain_funded": 150000, "chain_spent": 50000,
+                    "mempool_tx_count": 0, "mempool_funded": 0, "mempool_spent": 0
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let back = Store::load(&path).unwrap();
+        assert!(
+            back.addr_stats.is_none(),
+            "an old-generation store must drop its fingerprint so the next refresh does a FULL scan"
+        );
+        assert_eq!(back.classify_version, CLASSIFY_VERSION, "and be stamped current");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ...but a store already at the current generation keeps its
+    /// fingerprint — the migration is one-shot, never a rescan on every
+    /// single launch.
+    #[test]
+    fn classification_migration_leaves_current_store_alone() {
+        use crate::chain::AddrStats;
+
+        let dir = std::env::temp_dir().join(format!("cn-store-classify-cur-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store-regtest-classify-cur.json");
+
+        let mut s = Store::new(&[7u8; 32], Network::Regtest);
+        assert_eq!(s.classify_version, CLASSIFY_VERSION, "a fresh store is born current");
+        let stats = AddrStats {
+            chain_tx_count: 9,
+            chain_funded: 1,
+            chain_spent: 0,
+            mempool_tx_count: 0,
+            mempool_funded: 0,
+            mempool_spent: 0,
+        };
+        s.addr_stats = Some(stats.clone());
+        s.save(&path).unwrap();
+
+        let back = Store::load(&path).unwrap();
+        assert_eq!(back.addr_stats, Some(stats), "no gratuitous rescan for an up-to-date store");
 
         std::fs::remove_dir_all(&dir).ok();
     }
