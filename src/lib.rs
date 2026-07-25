@@ -5887,8 +5887,19 @@ fn fit_check(
     }
 }
 
-/// Suggested coin selection over CONFIRMED coins only (unconfirmed are
-/// never auto-selected — the user adds them manually). `consolidate` = pick
+/// Suggested coin selection over every SPENDABLE coin — unconfirmed
+/// included (Sal 2026-07-25). The old rule auto-selected CONFIRMED coins
+/// only, which left a freshly funded notebook (and, right after a note, its
+/// own unconfirmed change) with an empty selection and a red
+/// Required/Selected line, forcing a manual tap every time on a slow
+/// network. Only `pending_spend` (locked by one of our own pending spends)
+/// still excludes a coin — the same set the panel lists as spendable, so
+/// the suggestion can now always cover what the panel shows. Every row
+/// carries a confirmed/unconfirmed badge (`CoinPickRow`), so a chained-on
+/// unconfirmed parent is visible, not silent. The spending-wallet panel has
+/// always auto-selected regardless of confirmation
+/// (`spending_compose_ui`) — this aligns the notebook path with it.
+/// `consolidate` = pick
 /// SMALLEST coins first (sweeps dust up into the change); otherwise LARGEST
 /// first (fewest inputs, lowest fee). Stops once the note + fee is covered.
 /// `recipient_spk_lens` replaces the old singular `spk_len` (additive,
@@ -5911,7 +5922,7 @@ fn suggested_coins(
     let mut coins: Vec<&app_core::store::LedgerUtxo> = store
         .utxos
         .iter()
-        .filter(|u| !u.pending_spend && u.height.is_some())
+        .filter(|u| !u.pending_spend)
         .collect();
     if consolidate {
         coins.sort_by(|a, b| a.value.cmp(&b.value)); // smallest first
