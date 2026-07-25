@@ -9289,6 +9289,12 @@ pub fn run() {
         let result = match args.get(2).map(String::as_str) {
             Some("keychain") => keychain::spike(),
             Some("keychain-auth") => keychain::spike_auth(),
+            // Crash-safe two-phase write (H1). The plain one is
+            // automation-safe; `-auth` prompts and is human-run.
+            #[cfg(target_vendor = "apple")]
+            Some("keychain-atomic") => keychain::spike_atomic(),
+            #[cfg(target_vendor = "apple")]
+            Some("keychain-atomic-auth") => keychain::spike_atomic_auth(),
             Some("camera") => {
                 camera::spike(args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15))
             }
