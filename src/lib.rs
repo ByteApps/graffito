@@ -1198,8 +1198,10 @@ impl State {
         self.save_notebooks();
     }
 
-    /// A notebook's display name: its local name, else the short form of
-    /// its address (never empty — rows and the home title read this).
+    /// A notebook's display name: its local name, else the 1-based default
+    /// "Notebook <index+1>" (never empty — rows and the home title read
+    /// this). Every notebook is created named, so the fallback only covers
+    /// entries written before that rule.
     fn notebook_display_name(&self, index: u32) -> String {
         let named = self
             .notebooks
@@ -1210,11 +1212,7 @@ impl State {
         if !named.is_empty() {
             return named;
         }
-        self.nb_addrs
-            .iter()
-            .find(|(a, ..)| *a == index)
-            .map(|(_, addr, _)| addr_short(addr))
-            .unwrap_or_else(|| format!("Notebook {index}"))
+        app_core::notebooks::default_name(index)
     }
 
     /// The store file of another (not necessarily active) notebook.
@@ -2456,7 +2454,8 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     // created DELIBERATELY (the name-first dialog, an import's account
     // pick — via ensure_notebook); activate() itself adds one only for:
     //   * migration: a pre-notebooks install (no index file yet, but this
-    //     leaf already has a store on disk) becomes notebook "Main";
+    //     leaf already has a store on disk) becomes notebook "Main"
+    //     (the one notebook that does not take the default name);
     //   * non-multi-notebook identities (WIF/hex): exactly one intrinsic
     //     notebook — nothing to choose, nothing to create.
     // Saving the (possibly empty) index on first touch marks the identity
@@ -3013,23 +3012,21 @@ fn ensure_notebook(st: &mut State, index: u32) {
     }
 }
 
-/// The display name auto-assigned to the very first notebook created during
-/// onboarding (create/import/restore). Sal 2026-07-21: onboarding lands on
-/// the notebook LIST with this first row already named, rather than opening
-/// the notebook's home. (The pre-notebooks migration path names its first
-/// notebook "Main" — see notebooks::FIRST_NOTEBOOK_NAME — that path is
-/// untouched; this is only for new onboarding.)
-const ONBOARDING_FIRST_NOTEBOOK_NAME: &str = "Notebook 1";
-
 /// Ensure the account's notebook 0 exists (first receive address) and, if it
 /// has no name yet, auto-name it for the onboarding list view.
+/// Sal 2026-07-21: onboarding (create/import/restore) lands on the notebook
+/// LIST with this first row already named, rather than opening the
+/// notebook's home. The name is the shared default, "Notebook 1"
+/// (`notebooks::default_name`) — same as every other creation path since
+/// 2026-07-26. (The pre-notebooks migration path names its first notebook
+/// "Main" — see notebooks::FIRST_NOTEBOOK_NAME — that path is untouched.)
 fn ensure_first_onboarded_notebook(s: &mut State) {
     ensure_notebook(s, 0);
     let account = s.account;
     if let Some(ix) = s.notebooks.as_mut() {
         let unnamed = ix.get(account, 0).map(|m| m.name.is_empty()).unwrap_or(true);
         if unnamed {
-            ix.rename(account, 0, ONBOARDING_FIRST_NOTEBOOK_NAME);
+            ix.rename(account, 0, &app_core::notebooks::default_name(0));
         }
     }
     s.save_notebooks();
@@ -3085,10 +3082,11 @@ fn private_nb_rows(st: &State) -> Vec<NbPickRow> {
                 .find(|(a, ..)| *a == m.index)
                 .map(|(_, a, _)| addr_short(a))
                 .unwrap_or_default();
-            // Named notebooks show their name; unnamed ones read "Notebook N"
-            // (not the address again — the addr already sits in its own column).
+            // Named notebooks show their name; unnamed ones read the
+            // default "Notebook <index+1>" (not the address again — the
+            // addr already sits in its own column).
             let name = if m.name.trim().is_empty() {
-                format!("Notebook {}", m.index)
+                app_core::notebooks::default_name(m.index)
             } else {
                 m.name.clone()
             };
@@ -13792,8 +13790,9 @@ pub fn run() {
                 }
             }
             if s.notebooks.as_ref().and_then(|ix| ix.get(s.account, index)).is_none() {
-                // Unnamed on purpose — the picker has no name field in this
-                // mode; the row shows the address short form until renamed.
+                // The picker has no name field in this mode, so the new
+                // notebook takes the default name ("Notebook <index+1>")
+                // until the user renames it from the list.
                 ensure_notebook(&mut s, index);
             }
             let Some(addr) =
@@ -13821,7 +13820,8 @@ pub fn run() {
         }
         if w.get_account_pick_mode() == "notebook" {
             // Create flow: the inline name field is already filled (or
-            // deliberately empty) — tapping an address creates right away.
+            // left empty, taking the default "Notebook <index+1>") —
+            // tapping an address creates right away.
             let index = idx.max(0) as u32;
             if s.notebooks.as_ref().and_then(|ix| ix.get(s.account, index)).is_some() {
                 return; // row is disabled in the UI; never re-add
