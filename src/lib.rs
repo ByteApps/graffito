@@ -903,12 +903,36 @@ fn read_saved_material(window: &AppWindow) -> Option<String> {
 /// Activate a just-unlocked saved identity and land on the notebook list.
 /// Restoring IS the opt-in for automatic unlock: from here on launches unlock
 /// on their own (still deferred past the first frame).
-fn activate_restored(window: &AppWindow, s: &mut State, material: String) {
+fn activate_restored(window: &AppWindow, s: &mut State, material: String, onboarding: bool) {
     match activate(s, &material, false) {
         Ok(()) => {
             if !s.auto_unlock {
                 s.auto_unlock = true;
                 s.save_config();
+            }
+            // Restoring from the onboarding door is an ONBOARDING EXIT, and
+            // every other one (create-seed, import, iCloud restore) ensures
+            // the account's notebook 0 — I added this path and skipped it, so
+            // a restore after a fresh install landed on an empty list. The
+            // keychain item survives app deletion but `notebooks-*.json` does
+            // NOT, so a restored key genuinely has no index to load.
+            //
+            // Guarded two ways. Only on the onboarding tap, never on the
+            // deferred auto-unlock, which is a BOOT path — "boot never
+            // resurrects archived entries". And only when the account has NO
+            // notebooks AT ALL, active or archived: zero ACTIVE notebooks is
+            // legitimate (archive-all is allowed), and re-creating one there
+            // would undo a deliberate archive.
+            if onboarding {
+                let none_at_all = s
+                    .notebooks
+                    .as_ref()
+                    .map(|ix| ix.active(s.account).count() == 0 && ix.archived_count(s.account) == 0)
+                    .unwrap_or(true);
+                if none_at_all {
+                    println!("cb: restore first-notebook");
+                    ensure_first_onboarded_notebook(s);
+                }
             }
             println!("cb: unlock ok auto-unlock=1");
             update_home(window, s);
@@ -9935,7 +9959,7 @@ pub fn run() {
             println!("cb: restore-saved-key");
             if let Some(m) = read_saved_material(&w) {
                 let mut s = st_restore.borrow_mut();
-                activate_restored(&w, &mut s, m);
+                activate_restored(&w, &mut s, m, true); // onboarding exit
             }
         });
     }
@@ -10441,7 +10465,8 @@ pub fn run() {
     cb!(on_apply_pending_unlock, |w, s| {
         let taken = UNLOCK_RESULT.lock().expect("unlock result mutex").take();
         match taken {
-            Some(Ok(Some(m))) => activate_restored(&w, &mut s, m),
+            // Boot path, not onboarding: never create a notebook here.
+            Some(Ok(Some(m))) => activate_restored(&w, &mut s, m, false),
             Some(Ok(None)) => {
                 println!("cb: unlock none");
                 s.saved_key_present = false;
