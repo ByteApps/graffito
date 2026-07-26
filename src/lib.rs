@@ -910,6 +910,17 @@ fn activate_restored(window: &AppWindow, s: &mut State, material: String, onboar
                 s.auto_unlock = true;
                 s.save_config();
             }
+            // Stamp the backup state from the ITEM, not from a boot guess.
+            // Boot sets `icloud_backup = icloud_available()` while no key is
+            // loaded (it's the default for a key about to be created), so a
+            // restored LOCAL-ONLY key on an iCloud-signed-in device would
+            // otherwise leave Settings claiming a backup that doesn't exist.
+            // The removed "Restore from iCloud" door hid this by forcing
+            // true — right for its case only. `is_synced` forbids auth UI, so
+            // this cannot prompt.
+            let synced = keychain::is_synced(KEYCHAIN_ACCOUNT);
+            s.icloud_backup = synced;
+            window.set_icloud_backup(synced);
             // Restoring from the onboarding door is an ONBOARDING EXIT, and
             // every other one (create-seed, import, iCloud restore) ensures
             // the account's notebook 0 — I added this path and skipped it, so
@@ -9909,7 +9920,6 @@ pub fn run() {
         let has_key = s.material.is_some();
         s.icloud_backup = if has_key { synced } else { icloud_avail };
         window.set_icloud_backup(s.icloud_backup);
-        window.set_icloud_available(synced); // restore door: a synced backup exists
         window.set_icloud_enabled(icloud_avail); // iCloud usable for new backups
     }
 
@@ -10086,40 +10096,10 @@ pub fn run() {
         spending_scan_deep_async(&w, &mut s);
     });
 
-    // Restore from an existing iCloud-synced key (onboarding, after reinstall
-    // or on a new device).
-    cb!(on_restore_icloud, |w, s| {
-        match keychain::load_secret_protected(KEYCHAIN_ACCOUNT, "restore your Chain Notes identity") {
-            Ok(Some(material)) => {
-                s.icloud_backup = true;
-                // Restore starts at account 0 like a fresh import — the account
-                // is device-config, not part of the restored key; gap discovery
-                // re-adds account 0's funded notebooks (Sal 2026-07-22).
-                s.account = 0;
-                s.nb_index = 0;
-                match activate(&mut s, &material, false) {
-                    Ok(()) => {
-                        println!("cb: restore-icloud ok");
-                        w.set_icloud_backup(true);
-                        // Onboarding unification (Sal 2026-07-21): a restore
-                        // behaves like an import — the account's notebook 0
-                        // exists (idempotent for a same-device restore that
-                        // still has its index file), auto-named for the list
-                        // view, and the notebook LIST opens; gap discovery
-                        // re-adds funded notebooks behind it.
-                        ensure_first_onboarded_notebook(&mut s);
-                        update_notebook_list(&w, &s);
-                        w.set_screen(17);
-                        refresh_async(&w, &mut s);
-                        spending_refresh_async(&w, &mut s); // CHANGE 5
-                    }
-                    Err(e) => w.set_status(format!("restore: {e}").into()),
-                }
-            }
-            Ok(None) => w.set_status("no iCloud backup found".into()),
-            Err(e) => w.set_status(format!("restore: {e}").into()),
-        }
-    });
+    // (`on_restore_icloud` lived here until 2026-07-26. A synced key is a
+    // saved key — the same `load_secret_protected` call behind the same
+    // onboarding door — so the separate handler only duplicated the door and
+    // left different state behind. See `activate_restored`.)
 
     cb!(on_backup_continue, |w, s| {
         let Some(phrase) = s.pending_mnemonic.clone() else { return };
@@ -10470,14 +10450,25 @@ pub fn run() {
                 s.saved_key_present = false;
                 w.set_saved_key_present(false);
             }
+            // Both failure branches REVEAL the door. The auto-unlock branch
+            // never runs the `identity_exists` probe (it went straight for the
+            // key), so `saved_key_present` is still false here — and the status
+            // line tells the user to "tap Restore" on a door that isn't
+            // rendered. We know an item exists: that is why we tried to unlock
+            // it. (Until 2026-07-26 the separate "Restore from iCloud" door
+            // accidentally covered this, but only for a SYNCED key.)
             Some(Err(e)) if e == "cancelled" => {
-                // Left on onboarding with the door still there, so a
-                // mis-tapped or timed-out prompt is one tap from retrying.
+                // Left on onboarding with the door there, so a mis-tapped or
+                // timed-out prompt is one tap from retrying.
                 println!("cb: unlock cancelled");
+                s.saved_key_present = true;
+                w.set_saved_key_present(true);
                 w.set_status("unlock cancelled — tap Restore to try again".into());
             }
             Some(Err(e)) => {
                 println!("cb: unlock err={e}");
+                s.saved_key_present = true;
+                w.set_saved_key_present(true);
                 w.set_status(format!("keychain: {e}").into());
             }
             None => {}
@@ -13946,7 +13937,6 @@ pub fn run() {
         w.set_picking_extra(false);
         s.icloud_backup = false;
         w.set_icloud_backup(false);
-        w.set_icloud_available(false);
         // The key is gone, so there is nothing to restore and nothing to
         // auto-unlock — leaving either set would show a "Restore saved key"
         // door pointing at an item we just deleted.

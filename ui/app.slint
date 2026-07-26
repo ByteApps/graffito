@@ -1503,8 +1503,6 @@ export component AppWindow inherits Window {
 
     // iCloud Keychain backup opt-in (current stored state) + restore-availability.
     in-out property <bool> icloud-backup: false;
-    // A synced backup EXISTS (offer a restore door in onboarding).
-    in property <bool> icloud-available: false;
     // iCloud is available on this device (signed in) so backup CAN work — gates
     // the "Back up to iCloud" toggle; when false we disable it and say so.
     in property <bool> icloud-enabled: false;
@@ -1858,7 +1856,6 @@ export component AppWindow inherits Window {
     callback backup-continue();
     callback regenerate-words();
     callback set-icloud-backup(bool);
-    callback restore-icloud();
     // Contacts sync-status UI (2026-07-20): send-to picker header button —
     // force a re-merge + push right now (see `sync_contacts_now` in
     // lib.rs), so the user can confirm/retry sync without waiting for the
@@ -2264,12 +2261,13 @@ export component AppWindow inherits Window {
             subtitle: "Same, with the longest phrase.";
             clicked => { root.door-create(24); }
         }
-        if root.icloud-available: DoorCard {
-            highlight: true;
-            title: "Restore from iCloud";
-            subtitle: "A key you backed up to iCloud Keychain is available — restore it on this device.";
-            clicked => { root.restore-icloud(); }
-        }
+        // NO separate "Restore from iCloud" door (removed 2026-07-26): an
+        // iCloud-synced key IS a saved key on this device — `identity_exists`
+        // matches it (SynchronizableAny) and `load_secret_protected` reads it
+        // through the same call the iCloud door used. Both doors therefore lit
+        // up for ONE key after a fresh install, and each left different state
+        // behind (auto-unlock vs icloud-backup). "Restore saved key" above
+        // covers both shapes.
         Caption { text: root.status; color: Pal.bad; }
     }
 
