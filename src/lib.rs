@@ -878,7 +878,14 @@ struct WatchBump {
 /// construction: the onboarding "Restore saved key" tap (user-initiated) and
 /// the deferred auto-unlock timer (after the first frame).
 fn read_saved_material(window: &AppWindow) -> Option<String> {
-    match keychain::load_secret_protected(KEYCHAIN_ACCOUNT, "unlock your Chain Notes identity") {
+    // `load_secret_gated`, NOT `load_secret_protected`: a synced item has no
+    // ACL to prompt on, so the restore door read the seed silently — most
+    // visibly on a fresh install, where tapping Restore on an unlocked phone
+    // was the whole authentication story (Sal, 2026-07-26). The gated variant
+    // adds an LAContext check for exactly that shape; the local-ACL shape is
+    // unchanged, the OS already prompts. Only the TAP path uses it — the
+    // deferred auto-unlock reads directly, off-thread.
+    match keychain::load_secret_gated(KEYCHAIN_ACCOUNT, "unlock your Chain Notes identity") {
         Ok(Some(m)) => Some(m),
         Ok(None) => {
             // Probed present but gone by the time we read it (deleted from
