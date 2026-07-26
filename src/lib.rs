@@ -9400,20 +9400,6 @@ pub fn run() {
             Some("file-protection") => platform::spike_file_protection(),
             #[cfg(target_os = "macos")]
             Some("clipboard") => platform::spike_clipboard(),
-            // DELIBERATE CRASH, for proving the crash-reporting pipeline
-            // end-to-end: app -> Apple -> Xcode Organizer. Ships in release
-            // on purpose (a debug-only trigger could never reach a TestFlight
-            // build, which is the only distribution Apple routes crash
-            // reports for). Unreachable through the UI — it needs an explicit
-            // argv, so no user finds it by accident:
-            //     open -a "Chain Notes" --args --spike crash
-            // `abort()` raises SIGABRT, which always produces a real crash
-            // report; a Rust `panic!` unwinds to a clean exit 101 and may not.
-            // REMOVE once the pipeline is confirmed.
-            Some("crash") => {
-                eprintln!("cb: spike-crash deliberate abort (pipeline test)");
-                std::process::abort();
-            }
             Some("camera") => {
                 camera::spike(args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15))
             }
