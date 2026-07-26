@@ -3649,10 +3649,10 @@ export component AppWindow inherits Window {
         // address creates immediately (no second dialog). The consolidate
         // picker deliberately has NO name field: most picks are existing
         // notebooks (a typed name would be dead input); a fresh destination
-        // starts as the address short form, renameable from the list.
+        // takes the default "Notebook <index+1>", renameable from the list.
         if root.account-pick-mode == "notebook": EditField {
             text <=> root.nb-create-name;
-            placeholder-text: "name (optional — empty = address short form)";
+            placeholder-text: "name (optional — empty = the row's name)";
         }
         for a in root.accounts: Rectangle {
             // Rows already added as notebooks are informational-only when
@@ -3675,8 +3675,11 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 8px;
                     Text {
+                        // Notebook rows are 1-based, matching the default
+                        // name a created notebook gets ("Notebook <index+1>");
+                        // account rows keep their raw account number.
                         text: (root.account-pick-mode == "notebook" || root.account-pick-mode == "wconsol"
-                            ? "Notebook " : "Account ") + a.index;
+                            ? "Notebook " + (a.index + 1) : "Account " + a.index);
                         font-size: 14px;
                         font-weight: 700;
                         color: a.active ? Pal.accent : Pal.text;
@@ -3707,8 +3710,11 @@ export component AppWindow inherits Window {
                 clicked => { root.accounts-page(-1); }
             }
             Caption {
-                text: (root.account-pick-mode == "notebook" || root.account-pick-mode == "wconsol"
-                    ? "addresses " : "accounts ") + (root.account-page * 5) + " – " + (root.account-page * 5 + 4);
+                // Notebook rows are 1-based (they match the default name a
+                // created notebook gets); account rows keep raw numbering.
+                text: root.account-pick-mode == "notebook" || root.account-pick-mode == "wconsol"
+                    ? "notebooks " + (root.account-page * 5 + 1) + " – " + (root.account-page * 5 + 5)
+                    : "accounts " + (root.account-page * 5) + " – " + (root.account-page * 5 + 4);
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }

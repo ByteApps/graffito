@@ -150,9 +150,18 @@ pub struct NotebookIndex {
 }
 
 /// The name a pre-notebooks identity's existing store gets when it is
-/// MIGRATED into a fresh index (the only auto-created notebook — every
-/// other notebook is created deliberately and starts unnamed).
+/// MIGRATED into a fresh index (the one notebook that does NOT take the
+/// `default_name` — it predates the index entirely).
 pub const FIRST_NOTEBOOK_NAME: &str = "Main";
+
+/// The name every notebook gets unless the user typed one: **"Notebook
+/// <index+1>"** — 1-based, so the first notebook (receive index 0) reads
+/// "Notebook 1" (Sal 2026-07-26, all platforms and every creation path:
+/// the create button, an import/restore, chain gap-discovery, a fresh
+/// key). Also the display fallback for entries that predate this rule.
+pub fn default_name(index: u32) -> String {
+    format!("Notebook {}", index + 1)
+}
 
 /// The shipped v1 shape (accounts-as-notebooks), read for migration only.
 #[derive(Deserialize)]
@@ -189,7 +198,11 @@ impl NotebookIndex {
         let mut ix = NotebookIndex::new();
         for m in v1.notebooks {
             ix.ensure(m.account, 0);
-            ix.rename(m.account, 0, &m.name);
+            // An unnamed v1 entry keeps `ensure`'s default name rather
+            // than being renamed back to empty.
+            if !m.name.trim().is_empty() {
+                ix.rename(m.account, 0, &m.name);
+            }
             ix.set_archived(m.account, 0, m.archived);
         }
         Ok(ix)
@@ -215,9 +228,10 @@ impl NotebookIndex {
         self.account(account)?.notebooks.iter().find(|n| n.index == index)
     }
 
-    /// Make sure notebook `index` exists under `account`, unnamed (naming
-    /// is the caller's business — the create dialog, or the migration
-    /// rule). Returns true when it was added.
+    /// Make sure notebook `index` exists under `account`, carrying the
+    /// DEFAULT name (`default_name` — "Notebook <index+1>"). A caller with
+    /// a better name (the create dialog's field, the migration rule)
+    /// renames right after. Returns true when it was added.
     pub fn ensure(&mut self, account: u32, index: u32) -> bool {
         if self.get(account, index).is_some() {
             return false;
@@ -230,7 +244,7 @@ impl NotebookIndex {
                 self.accounts.iter_mut().find(|a| a.account == account).expect("just added")
             }
         };
-        books.notebooks.push(NotebookMeta { index, name: String::new(), archived: false });
+        books.notebooks.push(NotebookMeta { index, name: default_name(index), archived: false });
         books.notebooks.sort_by_key(|n| n.index);
         true
     }
@@ -306,16 +320,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ensure_adds_unnamed_and_sorts() {
+    fn ensure_default_names_and_sorts() {
         let mut ix = NotebookIndex::new();
         assert!(ix.ensure(0, 3));
         assert!(ix.ensure(0, 0));
         assert!(!ix.ensure(0, 3)); // idempotent
         assert_eq!(ix.books(0).len(), 2);
-        // ensure() never names — naming belongs to the caller (create
-        // dialog / migration).
-        assert_eq!(ix.get(0, 3).unwrap().name, "");
-        assert_eq!(ix.get(0, 0).unwrap().name, "");
+        // ensure() applies the 1-based default name; a caller with a
+        // better one (create dialog / migration) renames after.
+        assert_eq!(ix.get(0, 3).unwrap().name, "Notebook 4");
+        assert_eq!(ix.get(0, 0).unwrap().name, "Notebook 1");
         // Sorted by index regardless of insertion order.
         assert_eq!(ix.books(0)[0].index, 0);
         assert_eq!(ix.next_index(0), 4);
