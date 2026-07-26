@@ -487,6 +487,26 @@ pub fn load_secret_protected(account: &str, prompt: &str) -> Result<Option<Strin
     Ok(Some(secret))
 }
 
+/// Read for a USER-INITIATED restore (onboarding's "Restore saved key").
+///
+/// A device-local item carries a UserPresence ACL, so the OS prompts by
+/// itself. A SYNCED item carries NO ACL — it cannot, a biometric ACL is
+/// inherently device-local (see `add_item`) — so nothing prompts at all, and
+/// on a FRESH INSTALL anyone holding the unlocked phone could install the app,
+/// tap Restore and walk away with the seed. iCloud Keychain protects the item
+/// at rest, not per read. Gate that shape here with LAContext, exactly as
+/// `reveal_secret` does.
+///
+/// NEVER call this from a boot path: it blocks on a prompt, which is what the
+/// launch watchdog killed builds 42 and 44 for. The tap is user-initiated, so
+/// blocking is fine.
+pub fn load_secret_gated(account: &str, prompt: &str) -> Result<Option<String>, String> {
+    if is_synced(account) {
+        user_presence_check(prompt)?;
+    }
+    load_secret_protected(account, prompt)
+}
+
 /// Read the key for the Reveal-backup action — ALWAYS gated on user presence.
 /// For the local ACL item the OS prompts; for the synced item (no ACL) we gate
 /// with LAContext here. Unlike boot, this is invoked from a user action while

@@ -278,6 +278,15 @@ pub fn reveal_secret(account: &str, prompt: &str) -> Result<Option<String>, Stri
     load_secret_protected(account, prompt)
 }
 
+/// Apple's counterpart gates a SYNCED (ACL-less) item behind LAContext before
+/// a user-initiated restore. Android has no synced shape (`is_synced` is
+/// always false) and no biometric layer yet — the BiometricPrompt reveal is
+/// still pending — so this is the plain load, and restore here is as
+/// unauthenticated as `reveal_secret` is.
+pub fn load_secret_gated(account: &str, prompt: &str) -> Result<Option<String>, String> {
+    load_secret_protected(account, prompt)
+}
+
 pub fn delete_secret(account: &str) -> Result<(), String> {
     let _ = std::fs::remove_file(blob_path(account));
     let alias_str = alias(account);
