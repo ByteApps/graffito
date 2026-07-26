@@ -20,7 +20,8 @@ use security_framework::passwords::{
 use security_framework_sys::access_control::kSecAccessControlUserPresence;
 use security_framework_sys::item::{
     kSecAttrAccessControl, kSecAttrAccount, kSecAttrService, kSecClass,
-    kSecClassGenericPassword, kSecReturnAttributes, kSecReturnData, kSecValueData,
+    kSecClassGenericPassword, kSecReturnAttributes, kSecReturnData,
+    kSecUseAuthenticationUI, kSecValueData,
 };
 
 // Deprecated in the SDK headers (and unbound in security-framework-sys)
@@ -31,12 +32,19 @@ extern "C" {
     // iCloud Keychain sync: the attribute key + the "match either" query value.
     static kSecAttrSynchronizable: core_foundation_sys::string::CFStringRef;
     static kSecAttrSynchronizableAny: core_foundation_sys::string::CFStringRef;
+    // "Do not present authentication UI; fail instead." Unbound in
+    // security-framework-sys (the key itself IS bound, only this value is not).
+    static kSecUseAuthenticationUIFail: core_foundation_sys::string::CFStringRef;
 }
 use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete};
 
 const SERVICE: &str = "com.objsal.chainnotes";
 const ERR_NOT_FOUND: i32 = -25300; // errSecItemNotFound
 const ERR_CANCELED: i32 = -128; // errSecUserCanceled
+/// errSecInteractionNotAllowed — returned when a query matches an item that
+/// WOULD need authentication and we forbade the UI. For an existence check
+/// this is a positive answer: the item is there, it just needs a prompt.
+const ERR_INTERACTION_NOT_ALLOWED: i32 = -25308;
 
 /// Set whenever the key is written to, or read from, the ungated `#la`
 /// fallback item instead of an OS-protected one (audit M2).
@@ -212,6 +220,21 @@ fn item_exists(account: &str) -> bool {
             key(unsafe { kSecReturnAttributes }),
             CFBoolean::true_value().as_CFType(),
         ));
+        // THE LOAD-BEARING LINE. Asking for attributes only does NOT avoid
+        // authentication: SecItemCopyMatching evaluates the item's access
+        // control to decide whether it MATCHES, so a UserPresence item drags
+        // in SecItemAuthDoQuery -> LAContext and blocks on an XPC round-trip
+        // no matter what you asked it to return. That is what killed build 44
+        // on launch (0x8BADF00D, 20 s wall clock, 0.095 s CPU). Forbidding the
+        // UI makes the query answer immediately with
+        // errSecInteractionNotAllowed, which is itself the "yes, it exists"
+        // signal we want. Do not remove this believing attributes are safe —
+        // an unsigned dev build cannot reproduce it, because its fallback item
+        // carries no ACL at all.
+        pairs.push((
+            key(unsafe { kSecUseAuthenticationUI }),
+            key(unsafe { kSecUseAuthenticationUIFail }).as_CFType(),
+        ));
         let dict = CFDictionary::from_CFType_pairs(&pairs);
         let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
         let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
@@ -219,7 +242,9 @@ fn item_exists(account: &str) -> bool {
             // Release the attribute dictionary we only needed to exist.
             unsafe { CFType::wrap_under_create_rule(result) };
         }
-        if status == 0 {
+        // 0 = present and readable without auth (plain/synced shapes).
+        // -25308 = present but gated — still present, which is the question.
+        if status == 0 || status == ERR_INTERACTION_NOT_ALLOWED {
             return true;
         }
     }
@@ -277,10 +302,19 @@ pub fn store_secret_protected(account: &str, secret: &str, synced: bool) -> Resu
 
     // Phase 1 — the new copy, off to the side. The live item is untouched,
     // so any failure here changes nothing at all.
-    add_item(&staging, secret, synced)?;
+    let protected = add_item(&staging, secret, synced)?;
+    // Corroboration, NOT the authority. `SecItemAdd` returning 0 is what
+    // proves the item persisted; this is a second opinion. It must not be
+    // able to fail a write on its own, because `item_exists` now runs with
+    // the auth UI forbidden and I cannot exercise the ACL shape on an
+    // unsigned dev build — if Apple answered that query differently than
+    // expected on a signed build, an abort here would break every import
+    // while the key was in fact stored perfectly well. So: shout, don't fail.
     if !item_exists(&staging) {
-        let _ = purge_account(&staging);
-        return Err("keychain accepted the new key but it did not persist".into());
+        println!(
+            "cb: keychain staging-unverified protected={} (add reported success)",
+            u8::from(protected)
+        );
     }
 
     // Phase 2 — only NOW is it safe to drop the old copy; staging holds one.
@@ -334,6 +368,14 @@ pub fn is_synced(account: &str) -> bool {
         CFBoolean::true_value().as_CFType(),
     ));
     pairs.push((key(unsafe { kSecReturnData }), CFBoolean::true_value().as_CFType()));
+    // This one also runs before the first frame. A synchronizable item carries
+    // no ACL so it should never authenticate — but that is exactly what was
+    // assumed about `item_exists`, so forbid the UI here too rather than
+    // reason about it again. Costs nothing: a no-ACL item is unaffected.
+    pairs.push((
+        key(unsafe { kSecUseAuthenticationUI }),
+        key(unsafe { kSecUseAuthenticationUIFail }).as_CFType(),
+    ));
     let dict = CFDictionary::from_CFType_pairs(&pairs);
     let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
     let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };

@@ -9776,15 +9776,18 @@ pub fn run() {
         let material = match std::env::var("APP_KEY") {
             Ok(k) => Some(k),
             Err(_) => {
-                let found = keychain::identity_exists(KEYCHAIN_ACCOUNT);
-                s.saved_key_present = found;
-                window.set_saved_key_present(found);
-                println!(
-                    "cb: boot saved-key={} auto-unlock={}",
-                    u8::from(found),
-                    u8::from(s.auto_unlock)
-                );
-                None // never unlock here — see the note above
+                // NOT EVEN A PROBE ON THIS THREAD. `identity_exists` looked
+                // safe — attributes only, never kSecReturnData — and was not:
+                // SecItemCopyMatching evaluates an item's access control to
+                // decide whether it MATCHES, so a UserPresence item drags in
+                // LAContext and blocks on XPC. That killed build 44 at launch,
+                // in the very code added to stop build 42 doing the same
+                // thing. `item_exists` now forbids the auth UI so it answers
+                // immediately, but the probe ALSO moved off this thread:
+                // after being wrong twice about what blocks, the launch path
+                // gets to make no keychain calls at all.
+                println!("cb: boot auto-unlock={}", u8::from(s.auto_unlock));
+                None
             }
         };
         if let Some(m) = material {
@@ -9827,7 +9830,7 @@ pub fn run() {
                 }
                 Err(e) => window.set_status(format!("stored key failed: {e}").into()),
             }
-        } else if s.saved_key_present && s.auto_unlock {
+        } else if s.auto_unlock {
             // Opted in already, so don't ask again — but still AFTER the first
             // frame. "Automatic" must never mean "during launch": the Face ID
             // prompt blocks, and a user who looks away long enough would be
@@ -9852,6 +9855,21 @@ pub fn run() {
                     );
                     *UNLOCK_RESULT.lock().expect("unlock result mutex") = Some(r);
                     let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_unlock());
+                });
+            });
+        } else {
+            // Not opted in: we still need to know whether to offer the
+            // "Restore saved key" door — but off the main thread and after the
+            // first frame, same reasoning. The door just appears a moment
+            // after onboarding paints.
+            let w = window.as_weak();
+            slint::Timer::single_shot(std::time::Duration::from_millis(700), move || {
+                let weak = w.clone();
+                std::thread::spawn(move || {
+                    let found = keychain::identity_exists(KEYCHAIN_ACCOUNT);
+                    println!("cb: probe saved-key={}", u8::from(found));
+                    // Window-only: no State borrow crosses the thread.
+                    let _ = weak.upgrade_in_event_loop(move |w| w.set_saved_key_present(found));
                 });
             });
         }
