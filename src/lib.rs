@@ -3318,6 +3318,9 @@ fn update_notebook_list(w: &AppWindow, st: &State) {
 /// row and a stale chunk value.
 fn update_settings_identity(w: &AppWindow, st: &State) {
     w.set_settings_network(st.network.as_str().into());
+    // Runs on every activate, including the import paths that never paint
+    // home — see `update_identity_flags`.
+    update_identity_flags(w, st);
     // Audit M2: surface a key-protection downgrade instead of letting it pass
     // silently. Recomputed here because this runs after every activate /
     // identity change, which is exactly when the answer can change.
@@ -3362,15 +3365,34 @@ fn update_settings_identity(w: &AppWindow, st: &State) {
     }
 }
 
-fn update_home(w: &AppWindow, st: &State) {
+/// Identity-derived UI flags, refreshed on EVERY path that activates an
+/// identity — not only the ones that paint home.
+///
+/// These lived in `update_home` alone, which meant they went stale after a
+/// hierarchical seed import: `go_home_or_list` only calls `update_home` when
+/// the notebook is already listed, and multi-notebook material deliberately
+/// is not listed at import time, so the import landed on the notebook LIST
+/// with both flags at their `false` defaults. Visible fallout: Settings hid
+/// "Public keys" until the user opened a notebook once, and — worse — a
+/// watch-only ranged xpub (also multi-notebook) left `watch-only` false, so
+/// the UI offered "Private keys" and the compose surfaces for an identity
+/// that has no private key. The Rust callbacks gate on `AppIdentity::full()`
+/// so nothing could actually be signed, but the affordances should not have
+/// been there. Boot was always fine — it calls `update_home` before landing.
+fn update_identity_flags(w: &AppWindow, st: &State) {
     let Some(ident) = &st.ident else { return };
-    let Some(store) = &st.store else { return };
-    let watch = ident.is_watch();
-    w.set_watch_only(watch);
+    w.set_watch_only(ident.is_watch());
     // Single-key imports (wif/hex) have no account-level public material —
     // no xpub/descriptor to export — so hide the "Public keys" entry rather
     // than route to a dead-end hint (mirrors hiding Private for watch-only).
     w.set_reveal_can_public(!matches!(ident.kind, "wif" | "hex"));
+}
+
+fn update_home(w: &AppWindow, st: &State) {
+    let Some(ident) = &st.ident else { return };
+    let Some(store) = &st.store else { return };
+    let watch = ident.is_watch();
+    update_identity_flags(w, st);
     w.set_notebook_title(st.notebook_display_name(ident.index).into());
     w.set_address(ident.address.as_str().into());
     if let Some(img) = qr::qr_image(&ident.address.to_uppercase()) {
