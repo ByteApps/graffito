@@ -450,9 +450,8 @@ fn sweep_tx_record_bump_and_confirm() {
     let inputs: Vec<TxInput> = store.utxos.iter()
         .map(|u| TxInput { txid: u.txid.clone(), vout: u.vout, value: u.value }).collect();
     let tx = app_core::notes_core::tx::build_sweep_tx(
-        &store.available_utxos(), &a.output_x, me.spk.clone(), 1.0, &a.tweaked_seckey,
-        app_core::notes_core::keys::generate_aux_rand,
-    ).unwrap();
+        &store.available_utxos(), &a.output_x, me.spk.clone(), 1.0, 0, &a.tweaked_seckey,
+        app_core::notes_core::keys::generate_aux_rand).unwrap();
     for u in &mut store.utxos { u.pending_spend = true; }
     store.record_tx("consolidate", tx.txid_hex.clone(), tx.tx.outputs[0].value, tx.fee,
         tx.vsize as u64, tx.raw_hex.clone(), "self".into(), inputs, hex::encode(&me.spk), 1000);

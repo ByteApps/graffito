@@ -322,6 +322,14 @@ pub struct Store {
     pub classify_version: u32,
     #[serde(default = "default_chunk")]
     pub chunk_size: usize,
+    /// What `nLockTime` composed/swept transactions carry (anti-fee-sniping).
+    /// Device-level in the same sense as `chunk_size`: the App owns it in
+    /// config.json and mirrors it in here on activate/change. Serde-default
+    /// `Tip`, so every pre-existing store migrates to anti-fee-sniping on
+    /// first load without a version bump — this changes only what NEW
+    /// transactions look like, never how existing notes classify.
+    #[serde(default)]
+    pub lock_time: notes_core::tx::LockTimePolicy,
     /// Legacy per-identity Bitcoin-node URL (shipped as `esplora`). The node
     /// and block-explorer choices are now device-level (config.json, keyed by
     /// network); this field is kept only to migrate old stores on load and is
@@ -411,6 +419,7 @@ impl Store {
             // migration rescan is owed (Unit D).
             classify_version: CLASSIFY_VERSION,
             chunk_size: DEFAULT_CHUNK,
+            lock_time: notes_core::tx::LockTimePolicy::default(),
             node_url: None,
             excluded_senders: Vec::new(),
             seen_received: Vec::new(),
@@ -460,6 +469,16 @@ impl Store {
     /// UTXOs compose may spend: confirmed or own unconfirmed change, not
     /// locked by a pending note. Internal byte order, largest handled by
     /// notes-core's selector.
+    /// The `nLockTime` to build with right now: this store's policy resolved
+    /// against the chain height we last scanned to.
+    ///
+    /// A height that does not fit in `u32` is treated as unknown rather than
+    /// wrapped — a wrapped value could land in the FUTURE, which would make
+    /// the transaction non-final and get it rejected from the mempool.
+    pub fn lock_time(&self) -> u32 {
+        self.lock_time.resolve(u32::try_from(self.tip_height).ok())
+    }
+
     pub fn available_utxos(&self) -> Vec<Utxo> {
         self.utxos
             .iter()

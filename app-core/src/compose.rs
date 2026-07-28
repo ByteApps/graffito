@@ -183,11 +183,11 @@ pub fn compose_note(
         match &selected {
             Some(ins) => compose_note_exact(
                 identity, ins, req.text, req.private, note_id, change_spk,
-                store.chunk_size, req.fee_rate, generate_aux_rand,
+                store.chunk_size, req.fee_rate, store.lock_time(), generate_aux_rand,
             ),
             None => compose_note_with_change(
                 identity, &utxos, req.text, req.private, note_id, change_spk,
-                store.chunk_size, req.fee_rate, generate_aux_rand,
+                store.chunk_size, req.fee_rate, store.lock_time(), generate_aux_rand,
             ),
         }
     } else {
@@ -201,11 +201,11 @@ pub fn compose_note(
         let result = match &selected {
             Some(ins) => compose_directed_note_multi_exact(
                 identity, ins, req.text, req.private, note_id, &recipients, content_key,
-                change_spk, store.chunk_size, req.fee_rate, generate_aux_rand,
+                change_spk, store.chunk_size, req.fee_rate, store.lock_time(), generate_aux_rand,
             ),
             None => compose_directed_note_multi_with_change(
                 identity, &utxos, req.text, req.private, note_id, &recipients, content_key,
-                change_spk, store.chunk_size, req.fee_rate, generate_aux_rand,
+                change_spk, store.chunk_size, req.fee_rate, store.lock_time(), generate_aux_rand,
             ),
         };
         content_key.zeroize();
@@ -376,11 +376,11 @@ pub fn bump_fee_build(
     let tx = match &recipient {
         Some(r) => compose_directed_note_with_change_amount(
             identity, &utxos, &text, private, note_id, r, gift, change_spk,
-            store.chunk_size, new_rate, generate_aux_rand,
+            store.chunk_size, new_rate, store.lock_time(), generate_aux_rand,
         ),
         None => compose_note_with_change(
             identity, &utxos, &text, private, note_id, change_spk,
-            store.chunk_size, new_rate, generate_aux_rand,
+            store.chunk_size, new_rate, store.lock_time(), generate_aux_rand,
         ),
     }?;
 
@@ -476,6 +476,9 @@ pub fn bump_raw_tx_build(
         &identity.output_x,
         dest_spk,
         new_rate,
+        // A replacement is the same logical transaction; re-resolving the
+        // policy just gives it a fresher anti-fee-sniping height.
+        store.lock_time(),
         &identity.tweaked_seckey,
         generate_aux_rand,
     )
@@ -585,7 +588,13 @@ pub fn bump_raw_tx_multi_build(
             })
         })
         .collect::<Result<_, Error>>()?;
-    notes_core::tx::build_sweep_tx_multi(&sources, dest_spk, new_rate, generate_aux_rand)
+    notes_core::tx::build_sweep_tx_multi(
+        &sources,
+        dest_spk,
+        new_rate,
+        store.lock_time(),
+        generate_aux_rand,
+    )
         .map_err(Into::into)
 }
 
@@ -888,6 +897,7 @@ mod multi_recipient_tests {
             None,
             store.chunk_size,
             1.0,
+            0,
             notes_core::keys::generate_aux_rand,
         )
         .unwrap();

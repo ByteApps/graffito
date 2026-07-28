@@ -136,8 +136,14 @@ fn assemble_watch_psbt(
     inputs: Vec<TxIn>,
     prevouts: Vec<TxOut>,
     outputs: Vec<TxOut>,
+    lock_time: u32,
 ) -> Result<(Psbt, String), Error> {
-    let tx = Transaction { version: Version::TWO, lock_time: LockTime::ZERO, input: inputs, output: outputs };
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::from_consensus(lock_time),
+        input: inputs,
+        output: outputs,
+    };
     let txid = tx.compute_txid().to_string();
     let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| Error::Funding(format!("psbt: {e}")))?;
     for (i, coin) in coins.iter().enumerate() {
@@ -162,6 +168,7 @@ pub fn build_watch_spend_psbt(
     coins: &[WatchCoin],
     dest_spk: Vec<u8>,
     fee_rate: f64,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     if coins.is_empty() {
         return Err(Error::Funding("no coins to spend".into()));
@@ -178,7 +185,7 @@ pub fn build_watch_spend_psbt(
         value: Amount::from_sat(out_value),
         script_pubkey: ScriptBuf::from_bytes(dest_spk),
     }];
-    let (psbt, txid) = assemble_watch_psbt(source, coins, inputs, prevouts, outputs)?;
+    let (psbt, txid) = assemble_watch_psbt(source, coins, inputs, prevouts, outputs, lock_time)?;
     Ok(BuiltPsbt { psbt, fee, change: 0, sent_to_recipient: out_value, dust_to_self: 0, txid })
 }
 
@@ -192,6 +199,7 @@ pub fn build_watch_bump_psbt(
     prev_outputs: &[(Vec<u8>, u64)],
     reduce_vout: usize,
     new_rate: f64,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     if coins.is_empty() || prev_outputs.is_empty() {
         return Err(Error::Funding("nothing to bump".into()));
@@ -222,7 +230,7 @@ pub fn build_watch_bump_psbt(
             script_pubkey: ScriptBuf::from_bytes(spk.clone()),
         })
         .collect();
-    let (psbt, txid) = assemble_watch_psbt(source, coins, inputs, prevouts, outputs)?;
+    let (psbt, txid) = assemble_watch_psbt(source, coins, inputs, prevouts, outputs, lock_time)?;
     Ok(BuiltPsbt {
         psbt,
         fee: new_fee,
@@ -272,10 +280,13 @@ pub fn build_watch_note_psbt(
     note_id: [u8; 4],
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     let recipients: Vec<(Vec<u8>, u64)> =
         recipient_spk.map(|spk| vec![(spk, recipient_amount)]).unwrap_or_default();
-    build_watch_note_psbt_multi(source, coins, text, &recipients, note_id, max_op_return_bytes, fee_rate)
+    build_watch_note_psbt_multi(
+        source, coins, text, &recipients, note_id, max_op_return_bytes, fee_rate, lock_time,
+    )
 }
 
 /// Multi-recipient generalization of [`build_watch_note_psbt`]: `recipients`
@@ -297,6 +308,7 @@ pub fn build_watch_note_psbt_multi(
     note_id: [u8; 4],
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     if coins.is_empty() {
         return Err(Error::Funding("no coins selected".into()));
@@ -367,7 +379,7 @@ pub fn build_watch_note_psbt_multi(
         outputs.push(TxOut { value: Amount::from_sat(change), script_pubkey: self_spk });
     }
 
-    let (psbt, txid) = assemble_watch_psbt(source, coins, inputs, prevouts, outputs)?;
+    let (psbt, txid) = assemble_watch_psbt(source, coins, inputs, prevouts, outputs, lock_time)?;
     Ok(BuiltPsbt { psbt, fee, change, sent_to_recipient, dust_to_self: 0, txid })
 }
 
@@ -383,6 +395,7 @@ pub fn build_funded_sweep_psbt(
     notes_coins: &[WatchCoin],
     plan: &FundingPlan,
     dest_spk: Vec<u8>,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     if notes_coins.is_empty() {
         return Err(Error::Funding("nothing to sweep".into()));
@@ -469,7 +482,12 @@ pub fn build_funded_sweep_psbt(
         outputs.push(TxOut { value: Amount::from_sat(change), script_pubkey: change_spk });
     }
 
-    let tx = Transaction { version: Version::TWO, lock_time: LockTime::ZERO, input: inputs, output: outputs };
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::from_consensus(lock_time),
+        input: inputs,
+        output: outputs,
+    };
     let txid = tx.compute_txid().to_string();
     let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| Error::Funding(format!("psbt: {e}")))?;
     for (i, prevout) in prevouts.iter().enumerate() {
@@ -642,8 +660,12 @@ pub fn sign_own_wpkh_inputs(
 
 /// Build the unsigned funding PSBT. Fails with `Error::Funding` on bad coins,
 /// insufficient funds, or descriptor derivation problems.
-pub fn build_funding_psbt(plan: &FundingPlan, note: &NoteParams) -> Result<BuiltPsbt, Error> {
-    build_funding_psbt_amount(plan, note, DUST_LIMIT)
+pub fn build_funding_psbt(
+    plan: &FundingPlan,
+    note: &NoteParams,
+    lock_time: u32,
+) -> Result<BuiltPsbt, Error> {
+    build_funding_psbt_amount(plan, note, DUST_LIMIT, lock_time)
 }
 
 /// [`build_funding_psbt`] with a configurable recipient amount (the "gift",
@@ -657,6 +679,7 @@ pub fn build_funding_psbt_amount(
     plan: &FundingPlan,
     note: &NoteParams,
     recipient_amount: u64,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     let (payloads, recipient_spk) = sealed_note_payloads(
         note.identity,
@@ -669,7 +692,7 @@ pub fn build_funding_psbt_amount(
     let self_spk = notes_core::address::p2tr_script_pubkey(&note.identity.output_x);
     let amount = if recipient_spk.is_some() { recipient_amount.max(DUST_LIMIT) } else { DUST_LIMIT };
     let recipients: Vec<(Vec<u8>, u64)> = recipient_spk.map(|spk| vec![(spk, amount)]).unwrap_or_default();
-    assemble_funded_note_psbt(plan, &payloads, &recipients, self_spk)
+    assemble_funded_note_psbt(plan, &payloads, &recipients, self_spk, lock_time)
 }
 
 /// Multi-recipient generalization of [`build_funding_psbt_amount`]: a
@@ -688,6 +711,7 @@ pub fn build_funding_psbt_multi(
     note: &NoteParams,
     recipients: &[Recipient],
     gift_amount: u64,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     let gift = gift_amount.max(DUST_LIMIT);
     let (payloads, spks): (Vec<Vec<u8>>, Vec<Vec<u8>>) = if recipients.is_empty() {
@@ -711,7 +735,7 @@ pub fn build_funding_psbt_multi(
     };
     let self_spk = notes_core::address::p2tr_script_pubkey(&note.identity.output_x);
     let out_recipients: Vec<(Vec<u8>, u64)> = spks.into_iter().map(|spk| (spk, gift)).collect();
-    assemble_funded_note_psbt(plan, &payloads, &out_recipients, self_spk)
+    assemble_funded_note_psbt(plan, &payloads, &out_recipients, self_spk, lock_time)
 }
 
 /// A WATCH identity's externally funded PUBLIC note: the funding wallet's
@@ -729,10 +753,13 @@ pub fn build_watch_funded_note_psbt(
     recipient_amount: u64,
     note_id: [u8; 4],
     max_op_return_bytes: usize,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     let recipients: Vec<(Vec<u8>, u64)> =
         recipient_spk.map(|spk| vec![(spk, recipient_amount)]).unwrap_or_default();
-    build_watch_funded_note_psbt_multi(self_output_x, plan, text, &recipients, note_id, max_op_return_bytes)
+    build_watch_funded_note_psbt_multi(
+        self_output_x, plan, text, &recipients, note_id, max_op_return_bytes, lock_time,
+    )
 }
 
 /// Multi-recipient generalization of [`build_watch_funded_note_psbt`] — the
@@ -747,6 +774,7 @@ pub fn build_watch_funded_note_psbt_multi(
     recipients: &[(Vec<u8>, u64)],
     note_id: [u8; 4],
     max_op_return_bytes: usize,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     if text.is_empty() {
         return Err(Error::Funding("empty note".into()));
@@ -766,7 +794,7 @@ pub fn build_watch_funded_note_psbt_multi(
         notes_core::envelope::encode_chunks(note_id, flags, text.as_bytes(), max_op_return_bytes)?
     };
     let self_spk = notes_core::address::p2tr_script_pubkey(self_output_x);
-    assemble_funded_note_psbt(plan, &payloads, recipients, self_spk)
+    assemble_funded_note_psbt(plan, &payloads, recipients, self_spk, lock_time)
 }
 
 /// Shared tail of both funded-note builders: payloads → outputs (OP_RETURNs,
@@ -788,6 +816,7 @@ fn assemble_funded_note_psbt(
     payloads: &[Vec<u8>],
     recipients: &[(Vec<u8>, u64)],
     self_spk: Vec<u8>,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     if plan.coins.is_empty() {
         return Err(Error::Funding("no funding coins selected".into()));
@@ -870,7 +899,12 @@ fn assemble_funded_note_psbt(
     }
 
     // --- assemble tx + PSBT ---
-    let tx = Transaction { version: Version::TWO, lock_time: LockTime::ZERO, input: inputs, output: outputs };
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::from_consensus(lock_time),
+        input: inputs,
+        output: outputs,
+    };
     let txid = tx.compute_txid().to_string();
     let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| Error::Funding(format!("psbt: {e}")))?;
     for (i, coin) in plan.coins.iter().enumerate() {
@@ -928,7 +962,7 @@ mod tests {
             max_op_return_bytes: 80,
             network: NET,
         };
-        let built = build_funding_psbt(&plan, &np).unwrap();
+        let built = build_funding_psbt(&plan, &np, 0).unwrap();
         let tx = &built.psbt.unsigned_tx;
 
         // dust to self (identity, discoverability) + dust to bob + change present.
@@ -989,13 +1023,13 @@ mod tests {
             max_op_return_bytes: 80,
             network: NET,
         };
-        let built = build_funding_psbt(&plan, &np).unwrap();
+        let built = build_funding_psbt(&plan, &np, 0).unwrap();
         assert_eq!(built.sent_to_recipient, 0);
         assert_eq!(built.dust_to_self, 330);
         assert_eq!(100_000, built.fee + built.change + 330);
     }
 
-    /// `build_funding_psbt` == `build_funding_psbt_amount(.., DUST_LIMIT)`
+    /// `build_funding_psbt` == `build_funding_psbt_amount(.., DUST_LIMIT, 0)`
     /// byte-for-byte (the delegation this milestone introduced must not
     /// change the existing external-funding path), and a configurable gift
     /// (funding-unification M3, the spending-wallet compose path) sizes the
@@ -1018,24 +1052,24 @@ mod tests {
             max_op_return_bytes: 80,
             network: NET,
         };
-        let default_built = build_funding_psbt(&plan, &np).unwrap();
-        let dust_built = build_funding_psbt_amount(&plan, &np, DUST_LIMIT).unwrap();
+        let default_built = build_funding_psbt(&plan, &np, 0).unwrap();
+        let dust_built = build_funding_psbt_amount(&plan, &np, DUST_LIMIT, 0).unwrap();
         assert_eq!(default_built.sent_to_recipient, dust_built.sent_to_recipient);
         assert_eq!(default_built.fee, dust_built.fee);
         assert_eq!(default_built.sent_to_recipient, DUST_LIMIT);
 
-        let gifted = build_funding_psbt_amount(&plan, &np, 5_000).unwrap();
+        let gifted = build_funding_psbt_amount(&plan, &np, 5_000, 0).unwrap();
         assert_eq!(gifted.sent_to_recipient, 5_000);
         assert!(gifted.psbt.unsigned_tx.output.iter().any(|o| o.script_pubkey.as_bytes() == to_bob.spk && o.value.to_sat() == 5_000));
 
         // A gift below dust is clamped UP to dust, never dropped.
-        let below_dust = build_funding_psbt_amount(&plan, &np, 10).unwrap();
+        let below_dust = build_funding_psbt_amount(&plan, &np, 10, 0).unwrap();
         assert_eq!(below_dust.sent_to_recipient, DUST_LIMIT);
 
         // Self-note: the amount is irrelevant (no recipient output exists).
         let self_np = NoteParams { recipient: None, ..np };
         let self_plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 1.0, change_override: None };
-        let self_built = build_funding_psbt_amount(&self_plan, &self_np, 99_999).unwrap();
+        let self_built = build_funding_psbt_amount(&self_plan, &self_np, 99_999, 0).unwrap();
         assert_eq!(self_built.sent_to_recipient, 0);
         assert_eq!(self_built.dust_to_self, DUST_LIMIT);
     }
@@ -1071,7 +1105,7 @@ mod tests {
             WatchCoin { txid: "b".repeat(64), vout: 1, value: 40_000, chain: 0, index: 0 },
         ];
         let dest = src.derive(0, 0).unwrap().spk; // consolidate to self
-        let built = build_watch_spend_psbt(&src, &coins, dest.clone(), 2.0).unwrap();
+        let built = build_watch_spend_psbt(&src, &coins, dest.clone(), 2.0, 0).unwrap();
         assert_eq!(built.psbt.unsigned_tx.output.len(), 1);
         assert_eq!(100_000, built.fee + built.sent_to_recipient);
         assert!(built.psbt.inputs.iter().all(|i| i.tap_internal_key.is_some()
@@ -1088,7 +1122,7 @@ mod tests {
 
         // Bump the same tx: outputs preserved, fee delta out of output 0.
         let prev_outputs = vec![(dest.clone(), built.sent_to_recipient)];
-        let bumped = build_watch_bump_psbt(&src, &coins, &prev_outputs, 0, 5.0).unwrap();
+        let bumped = build_watch_bump_psbt(&src, &coins, &prev_outputs, 0, 5.0, 0).unwrap();
         assert!(bumped.fee > built.fee, "BIP-125: fee must rise");
         assert_eq!(
             bumped.psbt.unsigned_tx.output[0].value.to_sat(),
@@ -1105,10 +1139,10 @@ mod tests {
         assert!(finalize_extract(psbt).is_ok());
 
         // A bump at (or below) the old rate is rejected.
-        assert!(build_watch_bump_psbt(&src, &coins, &prev_outputs, 0, 2.0).is_err());
+        assert!(build_watch_bump_psbt(&src, &coins, &prev_outputs, 0, 2.0, 0).is_err());
         // Sweeping less than fee+dust is rejected.
         let tiny = vec![WatchCoin { txid: "c".repeat(64), vout: 0, value: 400, chain: 0, index: 0 }];
-        assert!(build_watch_spend_psbt(&src, &tiny, dest, 2.0).is_err());
+        assert!(build_watch_spend_psbt(&src, &tiny, dest, 2.0, 0).is_err());
     }
 
     /// Unit 6 (watch-only spends the chain-1 change chain): a watch spend
@@ -1152,7 +1186,7 @@ mod tests {
             WatchCoin { txid: "2".repeat(64), vout: 1, value: 70_000, chain: 1, index: 5 },
         ];
         let dest = src.derive(0, 0).unwrap().spk;
-        let built = build_watch_spend_psbt(&src, &coins, dest, 2.0).unwrap();
+        let built = build_watch_spend_psbt(&src, &coins, dest, 2.0, 0).unwrap();
         assert_eq!(built.psbt.inputs.len(), 2);
 
         let path_of = |i: usize| {
@@ -1240,7 +1274,7 @@ mod tests {
             WatchCoin { txid: "f".repeat(64), vout: 1, value: 40_000, chain: 0, index: 0 },
         ];
         let built =
-            build_funded_sweep_psbt(alice_spk.clone(), None, &notes_coins, &plan, dest_spk.clone())
+            build_funded_sweep_psbt(alice_spk.clone(), None, &notes_coins, &plan, dest_spk.clone(), 0)
                 .unwrap();
         assert_eq!(built.sent_to_recipient, 100_000, "full notes balance to dest");
         let tx = &built.psbt.unsigned_tx;
@@ -1285,7 +1319,7 @@ mod tests {
         .unwrap();
         let id_spk = id_src.derive(0, 0).unwrap().spk;
         let built =
-            build_funded_sweep_psbt(id_spk, Some(&id_src), &notes_coins, &plan, dest_spk).unwrap();
+            build_funded_sweep_psbt(id_spk, Some(&id_src), &notes_coins, &plan, dest_spk, 0).unwrap();
         assert!(!built.psbt.inputs[0].tap_key_origins.is_empty(), "identity origins present");
         let mut psbt = built.psbt.clone();
         let _ = psbt.sign(&id_master, &secp);
@@ -1320,8 +1354,7 @@ mod tests {
 
         // Self public note.
         let built = build_watch_note_psbt(
-            &src, &coins, "public from a watch device", None, 0, [1, 2, 3, 4], 80, 2.0,
-        )
+            &src, &coins, "public from a watch device", None, 0, [1, 2, 3, 4], 80, 2.0, 0)
         .unwrap();
         assert_eq!(built.sent_to_recipient, 0);
         assert_eq!(50_000, built.fee + built.change);
@@ -1366,8 +1399,7 @@ mod tests {
         let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
         let to_bob = Recipient::parse(NET, &bob.address(NET)).unwrap();
         let built = build_watch_note_psbt(
-            &src, &coins, "hi bob", Some(to_bob.spk.clone()), 1_000, [5, 6, 7, 8], 80, 2.0,
-        )
+            &src, &coins, "hi bob", Some(to_bob.spk.clone()), 1_000, [5, 6, 7, 8], 80, 2.0, 0)
         .unwrap();
         assert_eq!(built.sent_to_recipient, 1_000);
         assert_eq!(50_000, built.fee + built.change + 1_000);
@@ -1381,7 +1413,7 @@ mod tests {
         assert!(finalize_extract(psbt).is_ok());
         assert!(build_watch_note_psbt(
             &src, &coins, "hi", Some(to_bob.spk.clone()), 100, [5, 6, 7, 9], 80, 2.0
-        )
+        , 0)
         .is_err(), "sub-dust gift rejected");
         let _ = self_addr;
     }
@@ -1437,7 +1469,7 @@ mod tests {
             700,
             [4, 4, 4, 4],
             80,
-        )
+            0)
         .unwrap();
         assert_eq!(built.sent_to_recipient, 700, "gift carried");
         assert_eq!(built.dust_to_self, 330);
@@ -1483,7 +1515,7 @@ mod tests {
         // Sub-dust gift rejected.
         assert!(build_watch_funded_note_psbt(
             &me.output_x, &plan, "x", Some(to_bob.spk), 100, [4, 4, 4, 5], 80
-        )
+        , 0)
         .is_err());
     }
 
@@ -1511,7 +1543,7 @@ mod tests {
             max_op_return_bytes: 80,
             network: NET,
         };
-        assert!(build_funding_psbt(&plan, &np).is_err());
+        assert!(build_funding_psbt(&plan, &np, 0).is_err());
     }
 
     /// Fully in-app funded note (funding-unification M2): the internal
@@ -1556,7 +1588,7 @@ mod tests {
             max_op_return_bytes: 80,
             network: NET,
         };
-        let built = build_funding_psbt(&plan, &np).unwrap();
+        let built = build_funding_psbt(&plan, &np, 0).unwrap();
 
         // Output order unchanged: OP_RETURN, dust-to-self (330), change.
         let outs = &built.psbt.unsigned_tx.output;
@@ -1641,7 +1673,7 @@ mod tests {
     }
 
     // ---- multi-all-paths: build_funding_psbt_multi (keyed spending/
-    // external funding) + the watch keyless public-multi byte-parity ----
+    // external funding, 0) + the watch keyless public-multi byte-parity ----
 
     /// [`public_multi_payloads`] (the watch-identity keyless hand-framer)
     /// must produce EXACTLY the bytes a KEYED identity's
@@ -1714,7 +1746,7 @@ mod tests {
         );
         let recipients = vec![(bob_spk.clone(), 330u64), (carol_spk.clone(), 330u64), (dave_spk.clone(), 330u64)];
 
-        let built = build_watch_note_psbt_multi(&src, &coins, "group note from watch", &recipients, [1, 2, 3, 4], 80, 2.0)
+        let built = build_watch_note_psbt_multi(&src, &coins, "group note from watch", &recipients, [1, 2, 3, 4], 80, 2.0, 0)
             .unwrap();
         assert_eq!(built.sent_to_recipient, 990);
         assert_eq!(80_000, built.fee + built.change + 990);
@@ -1733,8 +1765,8 @@ mod tests {
 
         // Single/zero recipients must delegate byte-identically to the old
         // signature (`build_watch_note_psbt`).
-        let one = build_watch_note_psbt(&src, &coins, "solo", Some(bob_spk.clone()), 500, [5, 5, 5, 5], 80, 2.0).unwrap();
-        let one_multi = build_watch_note_psbt_multi(&src, &coins, "solo", &[(bob_spk, 500)], [5, 5, 5, 5], 80, 2.0).unwrap();
+        let one = build_watch_note_psbt(&src, &coins, "solo", Some(bob_spk.clone()), 500, [5, 5, 5, 5], 80, 2.0, 0).unwrap();
+        let one_multi = build_watch_note_psbt_multi(&src, &coins, "solo", &[(bob_spk, 500)], [5, 5, 5, 5], 80, 2.0, 0).unwrap();
         assert_eq!(one.txid, one_multi.txid);
         assert_eq!(one.fee, one_multi.fee);
 
@@ -1742,7 +1774,7 @@ mod tests {
         // signing happens.
         assert!(build_watch_note_psbt_multi(
             &src, &coins, "x", &[(carol_spk, 100), (dave_spk, 500)], [6, 6, 6, 6], 80, 2.0
-        )
+        , 0)
         .is_err());
     }
 
@@ -1774,7 +1806,7 @@ mod tests {
             max_op_return_bytes: 80,
             network: NET,
         };
-        let built = build_funding_psbt_multi(&plan, &np, &recipients, 500).unwrap();
+        let built = build_funding_psbt_multi(&plan, &np, &recipients, 500, 0).unwrap();
         assert_eq!(built.sent_to_recipient, 1_500, "3 x 500 uniform gift");
         assert_eq!(built.dust_to_self, DUST_LIMIT, "spending/external funding is never input-anchored");
         assert_eq!(100_000, built.fee + built.change + built.dust_to_self + built.sent_to_recipient);
@@ -1789,14 +1821,14 @@ mod tests {
         // Exactly one recipient must be byte-identical to the pre-existing
         // single-recipient entry point.
         let single_np = NoteParams { recipient: Some(&recipients[0]), ..np };
-        let via_amount = build_funding_psbt_amount(&plan, &single_np, 500).unwrap();
-        let via_multi = build_funding_psbt_multi(&plan, &np, &recipients[..1], 500).unwrap();
+        let via_amount = build_funding_psbt_amount(&plan, &single_np, 500, 0).unwrap();
+        let via_multi = build_funding_psbt_multi(&plan, &np, &recipients[..1], 500, 0).unwrap();
         assert_eq!(via_amount.txid, via_multi.txid);
         assert_eq!(via_amount.fee, via_multi.fee);
         assert_eq!(via_amount.sent_to_recipient, via_multi.sent_to_recipient);
 
         // Zero recipients (self-note): dust-to-self only, no recipient outputs.
-        let self_built = build_funding_psbt_multi(&plan, &np, &[], 999).unwrap();
+        let self_built = build_funding_psbt_multi(&plan, &np, &[], 999, 0).unwrap();
         assert_eq!(self_built.sent_to_recipient, 0);
         assert_eq!(self_built.dust_to_self, DUST_LIMIT);
     }
@@ -1825,7 +1857,7 @@ mod tests {
             max_op_return_bytes: 80,
             network: NET,
         };
-        let built = build_funding_psbt_multi(&plan, &np, &recipients, DUST_LIMIT).unwrap();
+        let built = build_funding_psbt_multi(&plan, &np, &recipients, DUST_LIMIT, 0).unwrap();
         assert_eq!(built.sent_to_recipient, DUST_LIMIT * 2);
 
         // A non-taproot recipient among the extras is rejected before any
@@ -1834,7 +1866,7 @@ mod tests {
         let non_taproot = Recipient::parse(NET, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
         let bad_recipients =
             vec![Recipient::parse(NET, &bob.address(NET)).unwrap(), non_taproot];
-        match build_funding_psbt_multi(&plan, &np, &bad_recipients, DUST_LIMIT) {
+        match build_funding_psbt_multi(&plan, &np, &bad_recipients, DUST_LIMIT, 0) {
             Err(e) => assert!(format!("{e}").to_lowercase().contains("taproot"), "got: {e}"),
             Ok(_) => panic!("expected a taproot-required error"),
         }

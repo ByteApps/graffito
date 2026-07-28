@@ -273,6 +273,10 @@ struct State {
     /// the wallet-level Settings pill really is wallet-wide. None = each
     /// store keeps its own (legacy per-store value or the default).
     chunk: Option<usize>,
+    /// nLockTime policy (anti-fee-sniping), device-level exactly like
+    /// `chunk`: owned here + config.json, mirrored onto every store on
+    /// activate so the Settings control is genuinely wallet-wide.
+    lock_time_policy: app_core::notes_core::tx::LockTimePolicy,
     ident: Option<AppIdentity>,
     store: Option<Store>,
     fees: Option<FeeRates>,
@@ -1162,6 +1166,16 @@ impl State {
         }
     }
 
+    /// The `nLockTime` to build the next transaction with (anti-fee-sniping):
+    /// the active store's policy resolved against the height it last scanned
+    /// to. No store loaded (watch/PSBT flows before activate) falls back to 0,
+    /// the same "we don't know a height" answer `LockTimePolicy::Tip` gives —
+    /// never a guess, since a locktime in the FUTURE makes the transaction
+    /// non-final and gets it rejected from the mempool.
+    fn lock_time(&self) -> u32 {
+        self.store.as_ref().map(|st| st.lock_time()).unwrap_or(0)
+    }
+
     fn save_config(&self) {
         let _ = std::fs::write(
             self.data_dir.join("config.json"),
@@ -1174,6 +1188,7 @@ impl State {
                 "chunk": self.chunk,
                 "terms_accepted": self.terms_accepted,
                 "auto_unlock": self.auto_unlock,
+                "locktime": self.lock_time_policy,
             })
             .to_string(),
         );
@@ -1647,7 +1662,7 @@ fn watch_spend_build(
         .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
         .collect();
     let input_indexes: Vec<u32> = coins.iter().map(|c| c.index).collect();
-    match build_watch_spend_psbt(&src, &coins, dest_spk.clone(), rate) {
+    match build_watch_spend_psbt(&src, &coins, dest_spk.clone(), rate, st.lock_time()) {
         Ok(built) => {
             let cost = format!(
                 "{kind} · {} sats · fee {} sats · {} input{} · sign with your external wallet",
@@ -1798,7 +1813,7 @@ fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
         w.set_bump_error("no output can absorb the fee bump".into());
         return;
     };
-    match build_watch_bump_psbt(&src, &wb.coins, &wb.outputs, reduce, new_rate) {
+    match build_watch_bump_psbt(&src, &wb.coins, &wb.outputs, reduce, new_rate, st.lock_time()) {
         Ok(built) => {
             w.set_show_bump_dialog(false);
             let dest = st.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
@@ -2457,6 +2472,7 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     if let Some(c) = st.chunk {
         store.chunk_size = c;
     }
+    store.lock_time = st.lock_time_policy;
     println!(
         "cb: identity kind={} account={} index={} network={} address={}",
         ident.kind,
@@ -3356,7 +3372,36 @@ fn update_notebook_list(w: &AppWindow, st: &State) {
 /// note-size field were only ever set by `update_home`, so a fresh
 /// hierarchical import that never opened a home showed no "Change account…"
 /// row and a stale chunk value.
+/// One line under the locktime pills spelling out what the current policy
+/// would actually put on the wire — "chain height" is only meaningful if
+/// the user knows which height we last scanned to.
+fn locktime_caption(
+    policy: app_core::notes_core::tx::LockTimePolicy,
+    tip: Option<u64>,
+) -> String {
+    use app_core::notes_core::tx::LockTimePolicy;
+    match policy {
+        LockTimePolicy::Tip => match tip.filter(|h| *h > 0) {
+            Some(h) => format!(
+                "New transactions get locktime {h}, the height of your last scan."
+            ),
+            None => "Nothing scanned yet, so locktime stays 0 until the first sync.".to_string(),
+        },
+        LockTimePolicy::Zero => {
+            "New transactions get locktime 0 — simplest, but stands out from most wallets."
+                .to_string()
+        }
+        LockTimePolicy::Custom { height } => format!("New transactions get locktime {height}."),
+    }
+}
+
 fn update_settings_identity(w: &AppWindow, st: &State) {
+    let policy = st.lock_time_policy;
+    w.set_locktime_mode(policy.as_str().into());
+    w.set_locktime_text(st.lock_time().to_string().into());
+    w.set_locktime_effective(
+        locktime_caption(policy, st.store.as_ref().map(|s| s.tip_height)).into(),
+    );
     w.set_settings_network(st.network.as_str().into());
     // Runs on every activate, including the import paths that never paint
     // home — see `update_identity_flags`.
@@ -7675,9 +7720,9 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         network: net,
     };
     let build_result = if n_recipients >= 2 {
-        app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift)
+        app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift, st.lock_time())
     } else {
-        app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift)
+        app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift, st.lock_time())
     };
     match build_result {
         Ok(built) => {
@@ -7861,6 +7906,7 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         args.change_override.clone(),
         args.change_index,
         rate,
+        st.lock_time(),
     ) {
         Ok(built) => {
             // Sub-dust fold prediction — `built.change == 0` means the REAL
@@ -8861,6 +8907,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
             Some((&material, net, s.account, &spending_coins_for_sweep)),
             recipient.spk.clone(),
             rate,
+            s.lock_time(),
         )
         .map_err(|e| format!("{e}"))
     } else {
@@ -8883,6 +8930,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
             &sources,
             recipient.spk.clone(),
             rate,
+            s.lock_time(),
             app_core::notes_core::keys::generate_aux_rand,
         )
         .map_err(|e| format!("{e}"))
@@ -8970,6 +9018,7 @@ fn build_consolidate_confirm(w: &AppWindow, s: &mut State, rate: f64) {
         &identity.output_x,
         me.spk.clone(),
         rate,
+        s.lock_time(),
         &identity.tweaked_seckey,
         app_core::notes_core::keys::generate_aux_rand,
     );
@@ -9061,7 +9110,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
             .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
             .collect();
         let input_indexes: Vec<u32> = coins.iter().map(|c| c.index).collect();
-        match build_watch_spend_psbt(&src, &coins, dest_spk.clone(), wc.rate) {
+        match build_watch_spend_psbt(&src, &coins, dest_spk.clone(), wc.rate, s.lock_time()) {
             Ok(built) => {
                 let cost = format!(
                     "consolidate · {} sats · fee {} sats · {} input{} from {} notebook{} · sign with your external wallet",
@@ -9142,6 +9191,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
         &sources,
         dest_spk.clone(),
         wc.rate,
+        s.lock_time(),
         app_core::notes_core::keys::generate_aux_rand,
     ) {
         Ok(t) => t,
@@ -9542,6 +9592,12 @@ pub fn run() {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let auto_unlock = config.get("auto_unlock").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Absent (every pre-2026-07-27 config) => Tip: existing installs adopt
+    // anti-fee-sniping on upgrade rather than silently keeping locktime 0.
+    let lock_time_policy: app_core::notes_core::tx::LockTimePolicy = config
+        .get("locktime")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
     // Device-level per-network Settings (Bitcoin node / block explorer URLs).
     let str_map = |key: &str| -> HashMap<String, String> {
         config
@@ -9570,6 +9626,7 @@ pub fn run() {
         network,
         account,
         nb_index,
+        lock_time_policy,
         node_urls,
         explorers,
         ident: None,
@@ -11090,6 +11147,7 @@ pub fn run() {
             Some((&material, net, account, &coins)),
             dest.spk.clone(),
             rate,
+            s.lock_time(),
         );
         match built {
             Ok(tx) => {
@@ -11313,6 +11371,7 @@ pub fn run() {
                 &notes_coins,
                 &plan,
                 recipient.spk.clone(),
+                s.lock_time(),
             ) {
                 Ok(mut built) => {
                     // Keyed identity: the app signs its own inputs here and
@@ -12193,7 +12252,7 @@ pub fn run() {
                 if recipients.len() >= 2 { recipients.iter().map(|rc| rc.address.clone()).collect() } else { Vec::new() };
             let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
             match app_core::psbt_build::build_watch_funded_note_psbt_multi(
-                &output_x, &plan, &text, &recipients_out, r, chunk,
+                &output_x, &plan, &text, &recipients_out, r, chunk, s.lock_time(),
             ) {
                 Ok(built) => {
                     let payload_outputs = built
@@ -12254,7 +12313,7 @@ pub fn run() {
             max_op_return_bytes: DEFAULT_CHUNK,
             network: net,
         };
-        match build_funding_psbt(&plan, &np) {
+        match build_funding_psbt(&plan, &np, s.lock_time()) {
             Ok(built) => {
                 let n = coins.len();
                 let cost =
@@ -12855,7 +12914,9 @@ pub fn run() {
                 }
             }
             let chunk = store.chunk_size;
-            match build_watch_note_psbt_multi(&src, &coins, &text, &recipients_out, note_id, chunk, rate) {
+            match build_watch_note_psbt_multi(
+                &src, &coins, &text, &recipients_out, note_id, chunk, rate, s.lock_time(),
+            ) {
                 Ok(built) => {
                     let payload_outputs = built
                         .psbt
@@ -13141,9 +13202,9 @@ pub fn run() {
             network: net,
         };
         let built = if recipients.len() >= 2 {
-            app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift)
+            app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift, s.lock_time())
         } else {
-            app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift)
+            app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift, s.lock_time())
         };
         let built = match built {
             Ok(b) => b,
@@ -13424,6 +13485,7 @@ pub fn run() {
             change_override,
             change_index,
             rate,
+            s.lock_time(),
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -14009,6 +14071,37 @@ pub fn run() {
                 w.set_status("chunk bytes must be 20..=100000".into());
             }
         }
+    });
+
+    cb!(on_set_locktime, |w, s, mode: SharedString, height: SharedString| {
+        use app_core::notes_core::tx::LockTimePolicy;
+        let policy = match mode.as_str() {
+            "zero" => Some(LockTimePolicy::Zero),
+            "custom" => match height.trim().parse::<u32>() {
+                // >= 500_000_000 is read by consensus as a UNIX timestamp,
+                // never what someone typing a block height means.
+                Ok(h) if h < 500_000_000 => Some(LockTimePolicy::Custom { height: h }),
+                _ => None,
+            },
+            _ => Some(LockTimePolicy::Tip),
+        };
+        let Some(policy) = policy else {
+            println!("cb: set-locktime err=range");
+            w.set_status("locktime must be a block height below 500000000".into());
+            return;
+        };
+        s.lock_time_policy = policy;
+        if let Some(store) = &mut s.store {
+            store.lock_time = policy; // device-level: every notebook, on activate
+        }
+        s.save_store();
+        s.save_config();
+        let effective = s.lock_time();
+        println!("cb: set-locktime {} effective={effective} ok", policy.as_str());
+        w.set_locktime_mode(policy.as_str().into());
+        w.set_locktime_text(effective.to_string().into());
+        w.set_locktime_effective(locktime_caption(policy, s.store.as_ref().map(|st| st.tip_height)).into());
+        w.set_status("".into());
     });
 
     // Compose "too large" dialog: raise the chunk size to Standard and reprice

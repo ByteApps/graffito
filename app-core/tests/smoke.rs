@@ -33,6 +33,7 @@ fn compose_note_standalone() {
             [0xAB, 0xCD, 0xEF, 0x01],
             80, // chunked path
             1.0,
+            0,
             || Ok([0u8; 32]), // fixed aux → deterministic BIP340 signature
         )
         .unwrap()
