@@ -133,6 +133,26 @@ required = false
 [build-dependencies]
 slint-build = "=1.17.1"
 
+# APP STORE BLOCKER — do not drop this patch. slint pulls in winit, whose macOS
+# backend declares the PRIVATE `CGSSetWindowBackgroundBlurRadius` /
+# `CGSMainConnectionID` in `platform_impl/macos/ffi.rs` and calls them from
+# `WindowDelegate::set_blur`. Nothing in slint ever calls `Window::set_blur`, but
+# the extern block plus its one dead call site is enough to leave both symbols in
+# the binary's undefined symbol table (rustc does not pass `-dead_strip` for this
+# link), and Apple's static analysis rejects on the reference alone:
+#
+#   The app uses or references the following non-public or deprecated APIs:
+#   • _CGSSetWindowBackgroundBlurRadius
+#
+# (macOS 1.0 build 31, rejected 2026-07-28.) Upstream master hides them behind a
+# non-default `private-apple-apis` feature, but that gate does not exist on the
+# 0.30 branch and i-slint-backend-winit 1.17.1 requires winit ^0.30.2 — so the
+# fork below is v0.30.13 with those two entry points deleted and `set_blur` made
+# a no-op. Nothing else differs. Verify after any slint/winit bump with
+# `scripts/check-private-apis.sh` (also run from build_mac.bash / build_ios.bash).
+[patch.crates-io]
+winit = { git = "https://github.com/ObjSal/winit", rev = "cea753eacbc334b1b61056efb6690075b5235cf1" }
+
 # Slint's text shaper (harfrust, via parley) has an integer add that overflows
 # on very large single text runs. Release wraps it (overflow-checks off by
 # default), but debug builds panic-abort — crashing the app on a huge paste

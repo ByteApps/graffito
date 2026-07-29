@@ -64,6 +64,10 @@ targets:
           - UIInterfaceOrientationPortrait
     sources:
       - Assets.xcassets
+      # Required-reason API declarations (mandatory for iOS since 2024-05-01).
+      # Must be bundled at the .app root, which is what a plain source entry
+      # does. Shared verbatim with the macOS target below.
+      - PrivacyInfo.xcprivacy
     postCompileScripts:
       - name: Build Rust binary with cargo
         script: |
@@ -120,6 +124,9 @@ targets:
         LSApplicationCategoryType: public.app-category.productivity
     sources:
       - Assets.xcassets
+      # Not enforced on macOS, but shipped for parity so the two platforms make
+      # the same privacy claims from one file (Contents/Resources here).
+      - PrivacyInfo.xcprivacy
     postCompileScripts:
       - name: Build Rust binary with cargo
         script: |

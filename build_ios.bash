@@ -48,3 +48,10 @@ if [ "$PROFILE" = release ] && [ -n "${DWARF_DSYM_FOLDER_PATH:-}" ]; then
   dsymutil "$BIN" -o "$DSYM"
   strip -S "$TARGET_BUILD_DIR/$EXECUTABLE_PATH" || true
 fi
+
+# App Review rejects a binary that merely REFERENCES a non-public API — and it
+# does so AFTER upload, costing a review cycle. Catch it here instead. Release
+# only: this guards what ships, and a debug build links the same crates anyway.
+if [ "$PROFILE" = release ]; then
+  "$SRCROOT/scripts/check-private-apis.sh" "$TARGET_BUILD_DIR/$EXECUTABLE_PATH"
+fi
