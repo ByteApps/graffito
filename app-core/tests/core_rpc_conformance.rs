@@ -90,11 +90,30 @@ fn data_output(payload: &[u8]) -> serde_json::Value {
     serde_json::json!({"data": hex::encode(payload)})
 }
 
+/// True when a `bitcoind` executable exists on PATH. A pure filesystem
+/// lookup — it deliberately does NOT execute anything.
+///
+/// This replaces a `Command::new("bitcoind").arg("-version").status()`
+/// probe whose `Err(_) => false` / `!status.success() => false` arms were a
+/// silent-green hazard. Every one of the six tests here calls this BEFORE
+/// taking `NODE_LOCK`, so all six probes fire concurrently while other
+/// nodes are still live; under that process pressure `bitcoind -version`
+/// intermittently exits 1 even though the very same command exits 0 when
+/// run by hand. The old code read that as "not installed" and returned
+/// `ok` without running a thing — a deliberately-broken build was observed
+/// passing all six in 0.56s where a real run takes ~60s, which is exactly
+/// how a genuine regression ships behind a green suite.
+///
+/// Answering "is it on PATH" by *reading PATH* is both what the function
+/// name claims and immune to load: no subprocess, no flake, no silent
+/// pass. A node that is present but genuinely broken now surfaces where it
+/// should — in `start_node`, which fails loudly.
 fn bitcoind_on_path() -> bool {
-    match Command::new("bitcoind").arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status() {
-        Ok(status) => status.success(),
-        Err(_) => false,
-    }
+    let Some(path) = std::env::var_os("PATH") else { return false };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join("bitcoind");
+        std::fs::metadata(&candidate).map(|m| m.is_file()).unwrap_or(false)
+    })
 }
 
 /// A throwaway `bitcoind -regtest` this suite starts, drives via raw
