@@ -396,6 +396,61 @@ fn build_scenario_tx(node: &Node, txid: &str, tip: u64) -> ScenarioTx {
     ScenarioTx { txid: txid.to_string(), hex, confirmed_height, vin, vout }
 }
 
+/// `listdescriptors` on the transport-under-test's watch wallet, parsed
+/// into (desc-without-checksum, range-end) pairs. This exists to prove
+/// the MECHANISM under test, not just `assert_chain_contract`'s
+/// externally-observable PASS: a reviewer's mutation test that forces
+/// `ranged_lookup_or_widen` to always return `Ok(false)` (disabling the
+/// ranged path entirely) still passes the whole battery — the U3
+/// per-address fallback silently produces an identical answer — so an
+/// assertion on RESULTS alone cannot tell the two implementations apart.
+/// This CAN: a ranged family's `desc` is `tr(...)`/`wpkh(...)` with a
+/// wildcard; the per-address fallback's is literally `addr(<address>)`.
+/// Must be called against `"chain-notes-watch"`, matching
+/// `CoreRpcTransport::WATCH_WALLET` (private to app-core, so this test
+/// hardcodes the string it must match).
+fn watch_wallet_descriptors(node: &Node) -> Vec<(String, u32)> {
+    let v = node.rpc(Some("chain-notes-watch"), "listdescriptors", serde_json::json!([]));
+    v["descriptors"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| {
+            let desc = d["desc"].as_str().unwrap_or("").split('#').next().unwrap_or("").to_string();
+            let end = d["range"][1].as_u64().unwrap_or(0) as u32;
+            (desc, end)
+        })
+        .collect()
+}
+
+/// Every address currently imported as its OWN `addr(<address>)`
+/// descriptor — the sole observable signature of the U3 per-address
+/// fallback path. Zero entries here for an address that belongs to a
+/// configured ranged family is the thing a mutation disabling ranged
+/// lookup cannot fake.
+fn addr_import_addresses(node: &Node) -> Vec<String> {
+    watch_wallet_descriptors(node)
+        .into_iter()
+        .filter_map(|(desc, _)| desc.strip_prefix("addr(").and_then(|s| s.strip_suffix(')')).map(str::to_string))
+        .collect()
+}
+
+/// The `xpub`/`tpub` token inside a descriptor string — used to match a
+/// ranged descriptor's `listdescriptors` entries against the ORIGINAL
+/// multipath string this suite configured. Two things make an exact
+/// string comparison against the original descriptor wrong (verified
+/// live): bitcoind SPLITS a `<0;1>` multipath import into two separate
+/// single-path `listdescriptors` entries (`.../0/*)` and `.../1/*)`), and
+/// it NORMALIZES the hardened-path marker (`'` in, `h` out). The xpub
+/// itself is untouched by either, so it's the one thing safe to match on.
+fn xpub_of(descriptor: &str) -> &str {
+    descriptor
+        .split(['(', ')', '[', ']', '/'])
+        .find(|s| s.starts_with("xpub") || s.starts_with("tpub"))
+        .unwrap_or_else(|| panic!("descriptor carries no xpub/tpub: {descriptor}"))
+}
+
 /// Everything the ranged-descriptor conformance tests (U4 test 1) need: a
 /// running node with the SAME 43-tx scenario `core_rpc_conformance` (U3)
 /// exercises, already built — factored out of that test so a SECOND test
@@ -698,10 +753,63 @@ fn core_rpc_conformance_ranged_descriptors() {
     let client = ChainClient::new(transport, fx.network);
     assert_chain_contract(&client, &fx.scenario);
 
+    // Prove the MECHANISM, not just the result — a mutation that forces
+    // `ranged_lookup_or_widen` to always return `Ok(false)` (disabling
+    // the ranged path entirely) still passes the `assert_chain_contract`
+    // run above via the U3 per-address fallback, which produces an
+    // identical answer. That is caught here instead.
+    let descriptors = watch_wallet_descriptors(node);
+    let notebook_xpub = xpub_of(&fx.notebook_descriptor);
+    let spending_xpub = xpub_of(&fx.spending_descriptor);
+    // bitcoind splits a `<0;1>` multipath import into two SEPARATE
+    // single-path `listdescriptors` entries — verified live — so this
+    // checks for both chains individually by xpub + type + chain suffix,
+    // never an exact string match against the original multipath text.
+    let has_ranged_chain = |xpub: &str, prefix: &str, chain_suffix: &str| {
+        descriptors
+            .iter()
+            .any(|(d, end)| d.starts_with(prefix) && d.contains(xpub) && d.ends_with(chain_suffix) && *end >= 10)
+    };
+    assert!(
+        has_ranged_chain(notebook_xpub, "tr(", "/0/*)") && has_ranged_chain(notebook_xpub, "tr(", "/1/*)"),
+        "expected the notebook's ranged tr() descriptor imported on BOTH chains with range >= 10 — got {descriptors:?}"
+    );
+    assert!(
+        has_ranged_chain(spending_xpub, "wpkh(", "/0/*)") && has_ranged_chain(spending_xpub, "wpkh(", "/1/*)"),
+        "expected the spending wallet's ranged wpkh() descriptor imported on BOTH chains with range >= 10 — got {descriptors:?}"
+    );
+    // None of the specific addresses covered by those two ranged families
+    // may ALSO have been imported as their own `addr(...)` descriptor —
+    // that would mean the per-address fallback did the work instead.
+    // (The scenario's ad-hoc addresses — addr_a, addr_note, the pager,
+    // the probe/mempool legs — belong to neither family and legitimately
+    // DO show up as `addr(...)` entries; this only asserts about the
+    // notebook/spending-derived ones.)
+    let wallet = fx.scenario.wallet.as_ref().expect("scenario carries a wallet");
+    let ranged_addrs = [
+        wallet.notebook_watch.derive(0, 0).unwrap().address,
+        wallet.notebook_watch.derive(0, 2).unwrap().address,
+        wallet.notebook_watch.derive(1, 0).unwrap().address,
+        wallet.spending.derive(0, 0).unwrap().address,
+        wallet.spending.derive(0, 1).unwrap().address,
+        wallet.spending.derive(1, 0).unwrap().address,
+    ];
+    let addr_imports = addr_import_addresses(node);
+    for a in &ranged_addrs {
+        assert!(
+            !addr_imports.contains(a),
+            "{a} belongs to a configured ranged family — it must NEVER be individually \
+             imported as its own addr() descriptor (found addr() imports: {addr_imports:?})"
+        );
+    }
+
     eprintln!(
-        "core_rpc_conformance_ranged_descriptors: PASS ({} scenario txs, tip={}, datadir {:?})",
+        "core_rpc_conformance_ranged_descriptors: PASS ({} scenario txs, tip={}, {} watch-wallet \
+         descriptors, 0 addr() imports among the {} ranged-covered addresses, datadir {:?})",
         fx.scenario.txs.len(),
         fx.scenario.tip_height,
+        descriptors.len(),
+        ranged_addrs.len(),
         node.datadir
     );
 }
@@ -731,10 +839,29 @@ fn core_rpc_range_widening_finds_address_beyond_initial_range() {
         .expect("export_formats")
         .descriptor
         .expect("mnemonic yields a tr() descriptor");
-    // Configured range only covers 0..=2 — this index is well beyond it,
-    // but comfortably inside `CoreRpcTransport`'s widen search ceiling
-    // (`WIDEN_CHUNK * MAX_WIDEN_CHUNKS` = 1000 indices).
-    let far_index = 47u32;
+    // `far_index` is on the RECEIVE chain (chain 0) — bitcoind splits the
+    // `<0;1>` multipath import into two separate `listdescriptors`
+    // entries, so this looks up the chain-0 one specifically (by xpub +
+    // type + "/0/*)" suffix, never an exact string match against the
+    // original multipath text — see `xpub_of`'s doc comment).
+    let descriptor_xpub = xpub_of(&descriptor).to_string();
+    let find_receive_chain_end = |descs: &[(String, u32)]| -> Option<u32> {
+        descs
+            .iter()
+            .find(|(d, _)| d.starts_with("tr(") && d.contains(&descriptor_xpub) && d.ends_with("/0/*)"))
+            .map(|(_, end)| *end)
+    };
+    // Configured range only covers 0..=900 — bitcoind pads any requested
+    // span under 1000 indices up to a minimum of 999 (verified live), so
+    // the range this ACTUALLY imports at is [0, 999]. `far_index` is
+    // chosen past THAT padded ceiling too (not just past 900) so a
+    // widened re-import is observable as a genuine, unambiguous GROWTH in
+    // `listdescriptors`' reported range — not masked by bitcoind's own
+    // padding — while staying comfortably inside `CoreRpcTransport`'s
+    // widen search ceiling (`WIDEN_CHUNK * MAX_WIDEN_CHUNKS` = 1000
+    // indices beyond this transport's OWN `imported_end` bookkeeping,
+    // which tracks the REQUESTED 900, not bitcoind's padded 999).
+    let far_index = 1050u32;
     let addr_far = realize(&material, network, account, far_index).unwrap().address;
 
     let funding_txid = node.generate_single_capture(&addr_far);
@@ -744,10 +871,18 @@ fn core_rpc_range_widening_finds_address_beyond_initial_range() {
     let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
     match &transport {
         AnyTransport::Core(core) => core
-            .watch_descriptors(vec![WatchDescriptor { descriptor, network, timestamp: 0, range_end: 2 }])
+            .watch_descriptors(vec![WatchDescriptor {
+                descriptor: descriptor.clone(),
+                network,
+                timestamp: 0,
+                range_end: 900,
+            }])
             .expect("configure ranged descriptor"),
         AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
+
+    let range_before = find_receive_chain_end(&watch_wallet_descriptors(&node))
+        .expect("the notebook descriptor must already be imported before any address is queried");
 
     let client = ChainClient::new(transport, network);
     // The whole point: BEFORE any widening this address is outside the
@@ -760,8 +895,30 @@ fn core_rpc_range_widening_finds_address_beyond_initial_range() {
         "the far-index ({far_index}) coinbase (txid {funding_txid}) must be found after widening"
     );
 
+    // Prove the MECHANISM, not just the result — a mutation that forces
+    // `ranged_lookup_or_widen` to always return `Ok(false)` still finds
+    // this coin (via the U3 per-address `addr()` fallback), which would
+    // make the `chain_tx_count == 1` assertion above pass for the WRONG
+    // reason. Two independent, bitcoind-observable signals catch that:
+    // the descriptor's imported range must have genuinely grown, and
+    // `addr_far` must never have been imported as its own descriptor.
+    let after = watch_wallet_descriptors(&node);
+    let range_after = find_receive_chain_end(&after);
+    assert!(
+        range_after.is_some_and(|end| end > range_before),
+        "widening must have grown the descriptor's imported range on bitcoind \
+         (before={range_before}, after={range_after:?}, all descriptors={after:?})"
+    );
+    let addr_imports = addr_import_addresses(&node);
+    assert!(
+        !addr_imports.contains(&addr_far),
+        "addr_far ({addr_far}) must be covered by the WIDENED ranged descriptor, \
+         not imported as its own addr() descriptor (found: {addr_imports:?})"
+    );
+
     eprintln!(
-        "core_rpc_range_widening_finds_address_beyond_initial_range: PASS (index={far_index}, tip={tip}, datadir {:?})",
+        "core_rpc_range_widening_finds_address_beyond_initial_range: PASS \
+         (index={far_index}, tip={tip}, range {range_before} -> {range_after:?}, datadir {:?})",
         node.datadir
     );
 }
