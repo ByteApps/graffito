@@ -1200,23 +1200,125 @@ impl State {
         self.store.as_ref().map(|st| st.lock_time()).unwrap_or(0)
     }
 
+    /// The exact `serde_json::Value` `save_config` writes to `config.json`
+    /// — extracted to its own method (rather than inlined in `save_config`)
+    /// so a test can assert on the REAL production payload instead of a
+    /// hand-built mirror that can silently drift from it (U10 review fix:
+    /// a mirror-based test kept passing after `save_config` was edited, in
+    /// a review experiment, to leak `core_rpc_session_creds` in plaintext
+    /// under a new key — see `core_rpc_settings_tests::
+    /// config_payload_never_carries_session_credentials`). Deliberately
+    /// does NOT take `core_rpc_session_creds` as a parameter anywhere in
+    /// this list — the absence is what keeps it out.
+    fn config_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "network": self.network.as_str(),
+            "account": self.account,
+            "index": self.nb_index,
+            "nodes": self.node_urls,
+            "explorers": self.explorers,
+            "core_rpc_save_creds": self.core_rpc_save_creds,
+            "chunk": self.chunk,
+            "terms_accepted": self.terms_accepted,
+            "auto_unlock": self.auto_unlock,
+            "locktime": self.lock_time_policy,
+        })
+    }
+
     fn save_config(&self) {
-        let _ = std::fs::write(
-            self.data_dir.join("config.json"),
-            serde_json::json!({
-                "network": self.network.as_str(),
-                "account": self.account,
-                "index": self.nb_index,
-                "nodes": self.node_urls,
-                "explorers": self.explorers,
-                "core_rpc_save_creds": self.core_rpc_save_creds,
-                "chunk": self.chunk,
-                "terms_accepted": self.terms_accepted,
-                "auto_unlock": self.auto_unlock,
-                "locktime": self.lock_time_policy,
-            })
-            .to_string(),
-        );
+        let _ = std::fs::write(self.data_dir.join("config.json"), self.config_payload().to_string());
+    }
+
+    /// Test-only full `State` builder — every field the config-payload
+    /// tests don't care about gets the same inert default `run()`'s own
+    /// boot literal uses (`None`/empty/`false`), so a fresh test `State`
+    /// behaves like a just-booted app with no identity loaded. Only the
+    /// fields `config_payload` (or a test wanting to poke at them) reads
+    /// are parameters. Kept out of production builds entirely.
+    #[cfg(test)]
+    fn test_stub(
+        network: Network,
+        node_urls: HashMap<String, String>,
+        explorers: HashMap<String, String>,
+        core_rpc_save_creds: HashMap<String, bool>,
+        core_rpc_session_creds: HashMap<String, (String, Zeroizing<String>)>,
+    ) -> State {
+        State {
+            data_dir: PathBuf::new(),
+            network,
+            account: 0,
+            nb_index: 0,
+            node_urls,
+            explorers,
+            core_rpc_save_creds,
+            core_rpc_session_creds,
+            chunk: None,
+            lock_time_policy: Default::default(),
+            ident: None,
+            store: None,
+            fees: None,
+            usd: None,
+            fees_fetched_at: None,
+            to_address: None,
+            to_addresses_extra: Vec::new(),
+            picking_extra: false,
+            selected_coins: Vec::new(),
+            coins_overridden: false,
+            consolidate_coins: false,
+            material: None,
+            icloud_backup: false,
+            terms_accepted: false,
+            auto_unlock: false,
+            saved_key_present: false,
+            pending_import: None,
+            pending_mnemonic: None,
+            quiz_indices: Vec::new(),
+            compose_oversize: false,
+            compose_fold_shown: 0,
+            mixed_est_shown: None,
+            funding: None,
+            funding_coins: Vec::new(),
+            funding_change_index: 0,
+            built_psbt: None,
+            ur_frames: Vec::new(),
+            signed_psbt: None,
+            funding_wallets: Vec::new(),
+            active_funding_id: None,
+            watch_spend: None,
+            watch_bump: None,
+            watch_note: None,
+            notebooks: None,
+            notebooks_fp8: None,
+            nb_addrs: Vec::new(),
+            xacct_addrs: Vec::new(),
+            discovery_pending: false,
+            wconsol: None,
+            reveal_formats: None,
+            spending_capable: false,
+            spending_source: None,
+            spending_coins: Vec::new(),
+            spending_scanned: false,
+            change_coins: Vec::new(),
+            change_coins_ctx: None,
+            pending_spending_sweep_index: None,
+            mixed_selected: Vec::new(),
+            payfrom_expanded_source: String::new(),
+            nb_expanded: false,
+            sp_expanded: false,
+            payfrom_active_source: String::new(),
+            payfrom_wallet_coins: std::collections::HashMap::new(),
+            payfrom_aligning: false,
+            change_choice: String::new(),
+            compose_busy: false,
+            act_pending_ref: None,
+            payfrom_manual: false,
+            wallet_tx_busy: false,
+            scan_gate: app_core::scan_gate::ScanGate::new(),
+            pending_broadcast: None,
+            contacts: Vec::new(),
+            tombstones: Vec::new(),
+            last_sync: std::cell::Cell::new(SyncStatus::Unknown),
+        }
     }
 
     fn save_funding_wallets(&self) {
@@ -4219,7 +4321,7 @@ fn split_url_userinfo(url: &str) -> (String, Option<(String, String)>) {
 mod core_rpc_settings_tests {
     use super::{
         apply_core_rpc_persist_toggle, core_rpc_persist_default_true, parse_core_rpc_save_creds,
-        resolve_core_rpc_creds, route_core_rpc_creds, split_url_userinfo,
+        resolve_core_rpc_creds, route_core_rpc_creds, split_url_userinfo, Network, State,
     };
     use std::cell::Cell;
     use std::collections::HashMap;
@@ -4524,13 +4626,17 @@ mod core_rpc_settings_tests {
         assert_eq!(result.unwrap(), None);
     }
 
+    /// `parse_core_rpc_save_creds` round trip in isolation — a hand-built
+    /// `Value`, not the real `State::config_payload()`. This is READ-side
+    /// coverage only (the boot-time parse); the actual WRITE side is
+    /// covered by `config_payload_never_carries_session_credentials`
+    /// below, which drives the production method instead of mirroring its
+    /// shape.
     #[test]
     fn save_creds_preference_round_trips_through_config_json_never_carrying_secrets() {
         let mut before: HashMap<String, bool> = HashMap::new();
         before.insert("testnet4".to_string(), false);
         before.insert("mainnet".to_string(), true);
-        // Mirrors exactly the one field `State::save_config` writes for
-        // this feature — a boolean map, never a credential.
         let json = serde_json::json!({ "core_rpc_save_creds": before.clone() });
         let text = json.to_string();
         assert!(!text.contains("s3cr3t"));
@@ -4544,6 +4650,48 @@ mod core_rpc_settings_tests {
     fn save_creds_preference_absent_key_parses_to_empty_map() {
         let parsed: serde_json::Value = serde_json::json!({ "network": "testnet4" });
         assert!(parse_core_rpc_save_creds(&parsed).is_empty());
+    }
+
+    /// The load-bearing regression test: drives the REAL
+    /// `State::config_payload()` (what `save_config` actually serializes,
+    /// after this review's extraction) with a distinctive username AND
+    /// password sitting in `core_rpc_session_creds` — the exact plaintext
+    /// a leak would carry — and asserts neither appears anywhere in the
+    /// output, while the boolean preference map and the other expected
+    /// keys still do. A hand-built mirror of the payload shape (as the
+    /// prior version of this test was) cannot catch `save_config` drifting
+    /// to leak a new field; this asserts on bytes the production method
+    /// itself produced.
+    #[test]
+    fn config_payload_never_carries_session_credentials() {
+        let mut save_creds: HashMap<String, bool> = HashMap::new();
+        save_creds.insert("testnet4".to_string(), false);
+        let mut session_creds: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
+        session_creds.insert(
+            "testnet4".to_string(),
+            (
+                "SENTINEL_USER_do_not_leak".to_string(),
+                Zeroizing::new("SENTINEL_PASS_do_not_leak".to_string()),
+            ),
+        );
+        let state = State::test_stub(
+            Network::Testnet4,
+            HashMap::new(),
+            HashMap::new(),
+            save_creds,
+            session_creds,
+        );
+        let text = state.config_payload().to_string();
+        assert!(!text.contains("SENTINEL_USER_do_not_leak"), "leaked the session username: {text}");
+        assert!(!text.contains("SENTINEL_PASS_do_not_leak"), "leaked the session password: {text}");
+        assert!(!text.contains("core_rpc_session_creds"), "leaked the session-creds field name: {text}");
+        // The boolean preference map DOES round-trip (it's a preference,
+        // not a secret) — and a couple of the other expected keys, so this
+        // test would also fail loudly if `config_payload` lost fields
+        // rather than gained one.
+        assert!(text.contains("core_rpc_save_creds"));
+        assert!(text.contains("testnet4"));
+        assert!(text.contains("\"network\":\"testnet4\""));
     }
 }
 
