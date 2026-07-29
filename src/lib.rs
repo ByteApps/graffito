@@ -2200,17 +2200,192 @@ fn load_backend_settings(w: &AppWindow, st: &State) {
     }
 
     let net = st.network;
-    let (n_opts, n_idx, n_custom) =
-        fill(node_presets(net), st.node_urls.get(net.as_str()).map(String::as_str));
+    let (n_opts, n_idx, n_custom, n_core_addr) =
+        fill_node(node_presets(net), st.node_urls.get(net.as_str()).map(String::as_str));
     w.set_node_options(VecModel::from_slice(&n_opts));
     w.set_node_index(n_idx);
     w.set_node_custom_text(n_custom);
+    w.set_node_address_text(n_core_addr);
 
     let (e_opts, e_idx, e_custom) =
         fill(explorer_presets(net), st.explorers.get(net.as_str()).map(String::as_str));
     w.set_explorer_options(VecModel::from_slice(&e_opts));
     w.set_explorer_index(e_idx);
     w.set_explorer_custom_text(e_custom);
+}
+
+/// [`load_backend_settings`]'s node-dropdown counterpart to its local
+/// `fill` — the node picker gets an extra UI-managed row `fill` doesn't
+/// (the explorer picker has no "Bitcoin Core" concept, so it stays on the
+/// plain two-row-tail `fill`): `<presets…>, "Bitcoin Core", "Custom…"`.
+/// U12 (`PLAN-chain-notes-app-core-rpc.md` §2.5) moves the `bitcoind+`
+/// storage prefix out of user-facing text — a stored Core base now selects
+/// the dedicated row and displays as bare `host:port` (`display_core_url`),
+/// never the raw prefixed string; anything else follows the original
+/// preset-or-Custom matching unchanged. Returns
+/// `(options, selected_index, esplora_custom_text, core_address_text)` —
+/// exactly one of the last two is ever non-empty.
+fn fill_node(
+    presets: Vec<(&'static str, Option<&'static str>)>,
+    cur: Option<&str>,
+) -> (Vec<SharedString>, i32, SharedString, SharedString) {
+    let mut opts: Vec<SharedString> = presets.iter().map(|(l, _)| (*l).into()).collect();
+    let core_row = presets.len();
+    let custom_row = presets.len() + 1;
+    opts.push("Bitcoin Core".into());
+    opts.push("Custom…".into());
+
+    if let Some(u) = cur {
+        if u.starts_with("bitcoind+") {
+            return (opts, core_row as i32, "".into(), display_core_url(u).into());
+        }
+    }
+    let idx = presets.iter().position(|(_, u)| match (u, cur) {
+        (None, None) => true,
+        (Some(a), Some(b)) => *a == b,
+        _ => false,
+    });
+    match idx {
+        Some(i) => (opts, i as i32, "".into(), "".into()),
+        None => (opts, custom_row as i32, cur.unwrap_or("").into(), "".into()),
+    }
+}
+
+/// Default Bitcoin Core `-rpcport` per network — confirmed against the
+/// installed `bitcoind` v30.2.0's own `-help-debug` text: `-rpcport=<port>
+/// … (default: 8332, testnet3: 18332, testnet4: 48332, signet: 38332,
+/// regtest: 18443)`. This app has no Testnet3 variant.
+fn core_rpc_default_port(network: Network) -> u16 {
+    match network {
+        Network::Mainnet => 8332,
+        Network::Testnet4 => 48332,
+        Network::Signet => 38332,
+        Network::Regtest => 18443,
+    }
+}
+
+/// Normalize what a person types into the Settings "Bitcoin Core" node-
+/// address field into the stored `bitcoind+http(s)://host:port` form (U12,
+/// `PLAN-chain-notes-app-core-rpc.md` §2.5) — the ONLY thing that changes is
+/// how the field is spelled; `AnyTransport::new`/`node_backend_label` in
+/// app-core/src/chain.rs still read/produce exactly this prefix, untouched.
+/// Strips inline `user:pass@` userinfo first, same authority-vs-path guard
+/// [`split_url_userinfo`] uses (that function needs a `://` to anchor on,
+/// so it can't be reused directly on a bare `host` or `host:port` input —
+/// this reimplements the same rule on the post-scheme authority instead),
+/// and returns it separately so the caller can route it through
+/// `route_core_rpc_creds` exactly like a typed credential — a credential
+/// pasted here must never reach `config.json` either.
+///
+/// Accepted shapes (network default port fills in whenever none is given):
+///   `host`                   -> `bitcoind+http://host:<default>`
+///   `host:port`               -> `bitcoind+http://host:port`
+///   `http://host[:port]`      -> `bitcoind+http://host:<port|default>`
+///   `https://host[:port]`     -> `bitcoind+https://host:<port|default>`
+///   `bitcoind+http(s)://…`    -> re-normalized the same way (paste-tolerant
+///                                — a Sparrow-style export, or the app's own
+///                                stored string, both still work if pasted)
+/// Anything else (empty, a path component, an unsupported scheme, a
+/// non-numeric port) is rejected with a message meant to be shown verbatim.
+fn compose_core_url(input: &str, network: Network) -> Result<(String, Option<(String, String)>), String> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:8332".to_string());
+    }
+    // Paste-tolerant: a full `bitcoind+…` base (this app's own stored
+    // shape, or a Sparrow-style export) re-normalizes the same as a bare
+    // host would.
+    let raw = raw.strip_prefix("bitcoind+").unwrap_or(raw);
+    if raw.is_empty() {
+        return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:8332".to_string());
+    }
+
+    let (scheme, rest) = if let Some(r) = raw.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = raw.strip_prefix("http://") {
+        ("http", r)
+    } else if let Some((s, _)) = raw.split_once("://") {
+        return Err(format!("unsupported scheme {s:?} — use http:// or https://"));
+    } else {
+        ("http", raw)
+    };
+
+    // Strip inline `user:pass@` userinfo before touching the authority —
+    // an '@' that belongs to a path segment is not userinfo (mirrors
+    // `split_url_userinfo`'s guard).
+    let (authority, creds) = match rest.find('@') {
+        Some(at) if !rest[..at].contains('/') => {
+            let (userinfo, hostpart) = rest.split_at(at);
+            let hostpart = &hostpart[1..]; // drop '@'
+            let creds = userinfo.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()));
+            (hostpart, creds)
+        }
+        _ => (rest, None),
+    };
+
+    let authority = authority.trim_end_matches('/');
+    if authority.is_empty() {
+        return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:8332".to_string());
+    }
+    if authority.contains('/') {
+        return Err("node address must be host[:port] only, no path".to_string());
+    }
+
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal, e.g. `[::1]:8332`.
+        let Some(end) = rest.find(']') else {
+            return Err("unterminated IPv6 literal — missing ']'".to_string());
+        };
+        let (h, after) = rest.split_at(end);
+        if h.is_empty() {
+            return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:8332".to_string());
+        }
+        let after = &after[1..]; // drop ']'
+        let port = if after.is_empty() {
+            None
+        } else if let Some(p) = after.strip_prefix(':') {
+            if p.is_empty() {
+                return Err("empty port after ':'".to_string());
+            }
+            Some(p.parse::<u16>().map_err(|_| format!("invalid port {p:?}"))?)
+        } else {
+            return Err(format!("unexpected text after IPv6 literal: {after:?}"));
+        };
+        (format!("[{h}]"), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() => {
+                let port = p.parse::<u16>().map_err(|_| format!("invalid port {p:?}"))?;
+                (h.to_string(), Some(port))
+            }
+            Some((h, _)) if h.is_empty() => {
+                return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:8332".to_string())
+            }
+            _ => (authority.to_string(), None),
+        }
+    };
+    let port = port.unwrap_or_else(|| core_rpc_default_port(network));
+    Ok((format!("bitcoind+{scheme}://{host}:{port}"), creds))
+}
+
+/// The inverse of [`compose_core_url`] for display: a stored `bitcoind+
+/// http(s)://host:port` base back into what the node-address field shows —
+/// bare `host:port` for the (default) `http` scheme, `https://host:port`
+/// when the scheme is `https` (kept explicit so redisplaying then
+/// resubmitting the SAME text round-trips to the SAME stored URL — eliding
+/// it would silently downgrade an https node back to http on next save).
+/// Never called with credentials still embedded: every producer of a stored
+/// node URL (`compose_core_url`, `migrate_inline_node_creds`) strips them
+/// first, so there is nothing left to redact here.
+fn display_core_url(base: &str) -> String {
+    let rest = base.strip_prefix("bitcoind+").unwrap_or(base);
+    if let Some(host_port) = rest.strip_prefix("http://") {
+        host_port.trim_end_matches('/').to_string()
+    } else if let Some(host_port) = rest.strip_prefix("https://") {
+        format!("https://{}", host_port.trim_end_matches('/'))
+    } else {
+        rest.to_string()
+    }
 }
 
 /// Populate the Bitcoin Core section of the node card (backend label + RPC
@@ -4432,10 +4607,12 @@ fn flush_core_rpc_migration(s: &mut State) {
 #[cfg(test)]
 mod core_rpc_settings_tests {
     use super::{
-        apply_core_rpc_persist_toggle, core_rpc_persist_default_true, format_node_status,
+        apply_core_rpc_persist_toggle, compose_core_url, core_rpc_default_port,
+        core_rpc_persist_default_true, display_core_url, fill_node, format_node_status,
         migrate_inline_node_creds, parse_core_rpc_save_creds, resolve_core_rpc_creds,
         route_core_rpc_creds, split_url_userinfo, Network, State,
     };
+    use app_core::chain::node_presets;
     use app_core::chain::NodeStatus;
     use std::cell::Cell;
     use std::collections::HashMap;
@@ -4940,6 +5117,230 @@ mod core_rpc_settings_tests {
         let mut node_urls: HashMap<String, String> = HashMap::new();
         assert!(migrate_inline_node_creds(&mut node_urls).is_empty());
         assert!(node_urls.is_empty());
+    }
+
+    // ---- U12: node picker — "Bitcoin Core" row, prefix-free UI ----
+
+    #[test]
+    fn confirmed_default_rpc_ports_per_network() {
+        // Straight from the installed bitcoind v30.2.0's own
+        // `-help-debug` text (verified 2026-07-29):
+        //   -rpcport=<port> … (default: 8332, testnet3: 18332,
+        //   testnet4: 48332, signet: 38332, regtest: 18443)
+        // This app has no Testnet3 variant, so only the other four apply.
+        assert_eq!(core_rpc_default_port(Network::Mainnet), 8332);
+        assert_eq!(core_rpc_default_port(Network::Testnet4), 48332);
+        assert_eq!(core_rpc_default_port(Network::Signet), 38332);
+        assert_eq!(core_rpc_default_port(Network::Regtest), 18443);
+    }
+
+    #[test]
+    fn compose_core_url_normalization_table() {
+        // (input, network, expected stored URL, expected inline creds)
+        let cases: &[(&str, Network, &str, Option<(&str, &str)>)] = &[
+            // bare host -> default scheme + default port for the network
+            ("192.168.1.10", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
+            ("umbrel.local", Network::Testnet4, "bitcoind+http://umbrel.local:48332", None),
+            ("node.example", Network::Signet, "bitcoind+http://node.example:38332", None),
+            ("127.0.0.1", Network::Regtest, "bitcoind+http://127.0.0.1:18443", None),
+            // host:port -> default scheme, given port honored verbatim
+            ("192.168.1.10:8332", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
+            ("umbrel.local:9998", Network::Testnet4, "bitcoind+http://umbrel.local:9998", None),
+            // explicit http:// / https:// -> scheme honored, port defaults
+            // or is honored the same way
+            ("http://192.168.1.10", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
+            (
+                "https://node.example:8332",
+                Network::Mainnet,
+                "bitcoind+https://node.example:8332",
+                None,
+            ),
+            ("https://umbrel.local", Network::Signet, "bitcoind+https://umbrel.local:38332", None),
+            // whitespace tolerated
+            ("  192.168.1.10:8332  ", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
+            // pasted `bitcoind+…` (backward compat / Sparrow-style paste)
+            // re-normalizes exactly like the bare forms above
+            (
+                "bitcoind+http://192.168.1.10:8332",
+                Network::Mainnet,
+                "bitcoind+http://192.168.1.10:8332",
+                None,
+            ),
+            (
+                "bitcoind+https://node.example",
+                Network::Signet,
+                "bitcoind+https://node.example:38332",
+                None,
+            ),
+            (
+                "bitcoind+http://alice:s3cr3t@192.168.1.10:8332",
+                Network::Mainnet,
+                "bitcoind+http://192.168.1.10:8332",
+                Some(("alice", "s3cr3t")),
+            ),
+            // inline creds on a bare paste (no bitcoind+, no scheme)
+            (
+                "alice:s3cr3t@192.168.1.10:8332",
+                Network::Mainnet,
+                "bitcoind+http://192.168.1.10:8332",
+                Some(("alice", "s3cr3t")),
+            ),
+        ];
+        for (input, net, expect_url, expect_creds) in cases {
+            let (url, creds) = compose_core_url(input, *net)
+                .unwrap_or_else(|e| panic!("expected {input:?} to parse, got err {e:?}"));
+            assert_eq!(url, *expect_url, "input={input:?}");
+            assert_eq!(
+                creds,
+                expect_creds.map(|(u, p)| (u.to_string(), p.to_string())),
+                "input={input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_core_url_rejects_malformed_input() {
+        let bad: &[&str] = &[
+            "",
+            "   ",
+            "bitcoind+",
+            "192.168.1.10:not-a-port",
+            "192.168.1.10:99999999",
+            "ftp://192.168.1.10:8332",
+            "192.168.1.10:8332/wallet/foo", // path not allowed on this field
+            "http://",
+            "http://:8332", // empty host
+        ];
+        for input in bad {
+            assert!(
+                compose_core_url(input, Network::Mainnet).is_err(),
+                "expected {input:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_core_url_error_messages_are_useful() {
+        let err = compose_core_url("ftp://host:21", Network::Mainnet).unwrap_err();
+        assert!(err.contains("scheme"), "message should mention the bad scheme: {err}");
+        let err = compose_core_url("", Network::Mainnet).unwrap_err();
+        assert!(err.contains("host"), "message should ask for a host: {err}");
+    }
+
+    #[test]
+    fn display_core_url_elides_default_http_scheme_but_keeps_https() {
+        assert_eq!(display_core_url("bitcoind+http://192.168.1.10:8332"), "192.168.1.10:8332");
+        assert_eq!(
+            display_core_url("bitcoind+https://node.example:8332"),
+            "https://node.example:8332"
+        );
+    }
+
+    #[test]
+    fn compose_then_display_round_trips_to_the_same_text() {
+        // What gets shown after a successful commit must, if resubmitted
+        // unchanged, reproduce the exact same stored URL — an elided
+        // scheme must never silently flip http<->https on a second save.
+        for (typed, net) in [
+            ("192.168.1.10:8332", Network::Mainnet),
+            ("umbrel.local", Network::Testnet4),
+            ("https://node.example:8332", Network::Mainnet),
+            ("https://umbrel.local", Network::Signet),
+        ] {
+            let (stored1, _) = compose_core_url(typed, net).unwrap();
+            let shown = display_core_url(&stored1);
+            let (stored2, _) = compose_core_url(&shown, net).unwrap();
+            assert_eq!(stored1, stored2, "typed={typed:?} shown={shown:?}");
+        }
+    }
+
+    #[test]
+    fn fill_node_round_trip_core_base_selects_core_row_no_prefix_no_creds() {
+        let net = Network::Mainnet;
+        let presets = node_presets(net);
+        let (opts, idx, esplora_text, core_text) =
+            fill_node(presets.clone(), Some("bitcoind+http://192.168.1.10:8332"));
+        // Row order: <presets…>, "Bitcoin Core", "Custom…" — Core is
+        // second-to-last regardless of how many presets a network has.
+        assert_eq!(opts[opts.len() - 2], "Bitcoin Core");
+        assert_eq!(opts[opts.len() - 1], "Custom…");
+        assert_eq!(idx as usize, presets.len()); // the "Bitcoin Core" row
+        assert_eq!(esplora_text, "");
+        assert_eq!(core_text, "192.168.1.10:8332"); // no prefix, no creds
+    }
+
+    #[test]
+    fn fill_node_round_trip_preset_esplora_base_selects_that_preset() {
+        let net = Network::Mainnet;
+        let presets = node_presets(net);
+        // Blockstream is a real preset on mainnet with an explicit URL.
+        let (label, url) =
+            presets.iter().find(|(_, u)| u.is_some()).expect("mainnet has an explicit preset");
+        let (opts, idx, esplora_text, core_text) = fill_node(presets.clone(), *url);
+        assert_eq!(opts[idx as usize], *label);
+        assert_eq!(esplora_text, "");
+        assert_eq!(core_text, "");
+    }
+
+    #[test]
+    fn fill_node_round_trip_custom_esplora_base_selects_custom_row() {
+        let net = Network::Mainnet;
+        let presets = node_presets(net);
+        let (opts, idx, esplora_text, core_text) =
+            fill_node(presets.clone(), Some("https://my-own-node.example/api"));
+        assert_eq!(opts[idx as usize], "Custom…");
+        assert_eq!(idx as usize, presets.len() + 1);
+        assert_eq!(esplora_text, "https://my-own-node.example/api");
+        assert_eq!(core_text, "");
+    }
+
+    #[test]
+    fn fill_node_regtest_has_exactly_core_then_custom() {
+        // node_presets(Regtest) is empty — the dropdown must still resolve
+        // to exactly "Bitcoin Core", "Custom…" with correct index math.
+        let net = Network::Regtest;
+        let presets = node_presets(net);
+        assert!(presets.is_empty());
+        let (opts, idx, _, core_text) =
+            fill_node(presets.clone(), Some("bitcoind+http://127.0.0.1:18443"));
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0], "Bitcoin Core");
+        assert_eq!(opts[1], "Custom…");
+        assert_eq!(idx, 0);
+        assert_eq!(core_text, "127.0.0.1:18443");
+
+        // No configured value at all (default network base, None) selects
+        // Custom on regtest — there is no Esplora preset for it to match.
+        let (opts2, idx2, esplora_text2, core_text2) = fill_node(presets, None);
+        assert_eq!(opts2.len(), 2);
+        assert_eq!(idx2, 1); // "Custom…"
+        assert_eq!(esplora_text2, "");
+        assert_eq!(core_text2, "");
+    }
+
+    #[test]
+    fn credentials_typed_into_node_address_field_never_reach_the_stored_url() {
+        // The node-address field's own composer must never let a
+        // credential survive into the value that gets written to
+        // config.json — same invariant `split_url_userinfo` enforces for
+        // the Custom field's paste path, proven here end-to-end through
+        // `compose_core_url` for every accepted input shape that could
+        // carry one.
+        for input in [
+            "alice:s3cr3t@192.168.1.10:8332",
+            "http://alice:s3cr3t@192.168.1.10:8332",
+            "https://alice:s3cr3t@192.168.1.10",
+            "bitcoind+http://alice:s3cr3t@192.168.1.10:8332",
+        ] {
+            let (url, creds) = compose_core_url(input, Network::Mainnet).unwrap();
+            assert!(!url.contains("s3cr3t"), "stored url leaked a credential: {url}");
+            assert!(!url.contains('@'), "stored url carries userinfo syntax: {url}");
+            assert_eq!(creds, Some(("alice".to_string(), "s3cr3t".to_string())));
+            // And the round-trip display of that stored URL is equally
+            // creds-free (belt and suspenders — display never re-derives
+            // creds from anywhere, but prove it never echoes the input).
+            assert!(!display_core_url(&url).contains("s3cr3t"));
+        }
     }
 }
 
@@ -15525,9 +15926,11 @@ pub fn run() {
     });
 
     // Bitcoin node dropdown: a preset row writes its base (None = network
-    // default) to the device config for this network; the trailing "Custom…"
-    // row just reveals the text field (the Slint side already moved node-index)
-    // — the value follows when the user submits it via set-node-custom.
+    // default) to the device config for this network; the two trailing
+    // UI-managed rows — "Bitcoin Core" then "Custom…" (U12) — just reveal
+    // their own text field (the Slint side already moved node-index) and
+    // write nothing yet; the value follows when the user submits it via
+    // set-node-address / set-node-custom respectively.
     cb!(on_set_node_preset, |w, s, i: i32| {
         let net = s.network.as_str().to_string();
         let presets = node_presets(s.network);
@@ -15539,6 +15942,8 @@ pub fn run() {
             }
             s.save_config();
             println!("cb: set-node-preset {}", presets[i].0);
+        } else if i == presets.len() {
+            println!("cb: set-node-preset core");
         } else {
             println!("cb: set-node-preset custom");
         }
@@ -15546,6 +15951,54 @@ pub fn run() {
         // Every preset is Esplora — this both clears a previously-active
         // Core node's credential fields/health line and is a no-op (no
         // network call) whenever the picker was already on Esplora.
+        refresh_node_health(&w, &mut s);
+    });
+
+    // Bitcoin Core node-address field (U12): normalizes whatever a person
+    // typed (bare host, host:port, http(s)://…, or a pasted `bitcoind+…`)
+    // into the stored `bitcoind+http(s)://host:port` form via
+    // `compose_core_url` — the `bitcoind+` scheme prefix is a storage
+    // detail now, never something the user has to type or see. Inline
+    // credentials are stripped and routed exactly like `set-node-custom`'s
+    // paste path (never stored in the URL). On success the field is
+    // rewritten to the canonical `display_core_url` form so what's on
+    // screen always matches what got stored; on a malformed input nothing
+    // is written and the field is left as typed so the user can fix it.
+    cb!(on_set_node_address, |w, s, t: SharedString| {
+        let net = s.network.as_str().to_string();
+        match compose_core_url(t.trim(), s.network) {
+            Ok((v, inline_creds)) => {
+                s.node_urls.insert(net.clone(), v.clone());
+                s.save_config();
+                println!("cb: set-node-address {v}");
+                if let Some((user, pass)) = &inline_creds {
+                    let persist = s.core_rpc_should_persist(s.network);
+                    let result = route_core_rpc_creds(
+                        persist,
+                        &net,
+                        user,
+                        pass,
+                        &mut s.core_rpc_session_creds,
+                        |u, p| keychain::store_rpc_creds(&net, u, p),
+                        || keychain::delete_rpc_creds(&net),
+                    );
+                    match result {
+                        Ok(()) => println!(
+                            "cb: set-node-address inline-creds redacted stored=ok persist={persist}"
+                        ),
+                        Err(e) => {
+                            println!("cb: set-node-address inline-creds redacted stored=err ({e})")
+                        }
+                    }
+                }
+                w.set_node_address_text(display_core_url(&v).into());
+                w.set_status("".into());
+            }
+            Err(msg) => {
+                println!("cb: set-node-address err={msg}");
+                w.set_status(format!("Bitcoin node address: {msg}").into());
+            }
+        }
         refresh_node_health(&w, &mut s);
     });
 
