@@ -327,3 +327,40 @@ pub fn spike() -> Result<(), String> {
 pub fn spike_auth() -> Result<(), String> {
     Err("keychain spike is desktop-only".into())
 }
+
+// ---- Bitcoin Core RPC credentials (PLAN-chain-notes-app-core-rpc.md
+// §2.4/U6) — mirrors keychain/apple.rs's RPC-credentials section. ----
+//
+// These are network credentials, not key material, so they get NO
+// biometric gate here either — but on Android there is nothing to
+// deliberately weaken: `store_secret_protected` above already has no
+// UserPresence/BiometricPrompt gate (deferred to the Kotlin layer, per the
+// module doc) and is already device-bound (AndroidKeyStore keys never
+// leave the TEE/StrongBox, and `is_synced` is always false — no Google
+// backup path this needs to opt out of). Reusing it under a DISTINCT
+// account namespace (`rpc-creds-<network>`, never `identity-key`) gives
+// the same posture the Apple side hand-builds, for free.
+
+fn rpc_account(network: &str) -> String {
+    format!("rpc-creds-{network}")
+}
+
+fn encode_rpc_creds(user: &str, pass: &str) -> String {
+    format!("{user}\n{pass}")
+}
+
+fn decode_rpc_creds(blob: &str) -> Option<(String, String)> {
+    blob.split_once('\n').map(|(u, p)| (u.to_string(), p.to_string()))
+}
+
+pub fn store_rpc_creds(network: &str, user: &str, pass: &str) -> Result<(), String> {
+    store_secret_protected(&rpc_account(network), &encode_rpc_creds(user, pass), false)
+}
+
+pub fn load_rpc_creds(network: &str) -> Result<Option<(String, String)>, String> {
+    Ok(load_secret_protected(&rpc_account(network), "")?.and_then(|v| decode_rpc_creds(&v)))
+}
+
+pub fn delete_rpc_creds(network: &str) -> Result<(), String> {
+    delete_secret(&rpc_account(network))
+}
