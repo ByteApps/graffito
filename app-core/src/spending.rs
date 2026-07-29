@@ -71,6 +71,16 @@ pub fn account_xpub(
     Ok((Xpub::from_priv(&secp, &acct), fp))
 }
 
+/// The `wpkh([fp/84'/coin'/account']xpub/<0;1>/*)` descriptor STRING for
+/// the identity's spending wallet — e.g. for
+/// [`crate::chain::CoreRpcTransport::watch_descriptors`] (U4), which needs
+/// the raw string, not just a parsed [`FundingSource`]. [`funding_source`]
+/// delegates here so the two can never drift apart.
+pub fn funding_descriptor(material: &KeyMaterial, network: Network, account: u32) -> Result<String, Error> {
+    let (xpub, fp) = account_xpub(material, network, account)?;
+    Ok(format!("wpkh([{fp}/84'/{}'/{account}']{xpub}/<0;1>/*)", coin_type(network)))
+}
+
 /// The identity's spending wallet as a `FundingSource` — a `wpkh(...)`
 /// descriptor over the derived account xpub, so every existing
 /// FundingSource-based code path (coin scan, funded-note PSBT assembly)
@@ -80,8 +90,7 @@ pub fn funding_source(
     network: Network,
     account: u32,
 ) -> Result<FundingSource, Error> {
-    let (xpub, fp) = account_xpub(material, network, account)?;
-    let desc = format!("wpkh([{fp}/84'/{}'/{account}']{xpub}/<0;1>/*)", coin_type(network));
+    let desc = funding_descriptor(material, network, account)?;
     FundingSource::parse(&desc, network)
 }
 
