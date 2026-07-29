@@ -1757,15 +1757,29 @@ export component AppWindow inherits Window {
     in-out property <string> locktime-text;
     // What the current policy would actually put on the wire right now.
     in-out property <string> locktime-effective;
-    // Bitcoin node picker (URLs must be Esplora/mempool-compatible, OR a
-    // Bitcoin Core `bitcoind+http(s)://host:port` RPC base — see
-    // `PLAN-chain-notes-app-core-rpc.md`): option labels (last = "Custom…"),
-    // selected index, custom-URL text when active.
+    // Bitcoin node picker: option labels, in order
+    // `<network Esplora presets…>, "Bitcoin Core", "Custom…"` (U12 — the
+    // storage-only `bitcoind+http(s)://host:port` prefix, see
+    // `PLAN-chain-notes-app-core-rpc.md` §2.5, never appears in this UI;
+    // `node-address-text` below is a bare `host:port`). Row order means the
+    // last two indices are always the UI-managed rows regardless of how
+    // many presets a network has (zero on regtest, so there it's exactly
+    // "Bitcoin Core", "Custom…").
     in property <[string]> node-options;
     in-out property <int> node-index;
     in-out property <string> node-custom-text;
-    // True when the CONFIGURED node (not just the text being typed) is a
-    // Bitcoin Core RPC base — reveals the credentials fields + health line.
+    // The "Bitcoin Core" row is selected (second-to-last option) — purely a
+    // function of the dropdown, computed here rather than threaded from
+    // Rust so picking the row reveals its fields immediately, before any
+    // address has been typed/submitted. Drives the address/credentials/
+    // switch/health-caption rows below; NOT the same thing as
+    // `node-is-core` (the ACTUALLY ACTIVE backend, which only updates once
+    // an address is submitted — see `update_node_backend_ui` in lib.rs).
+    property <bool> node-core-row-selected: root.node-index == root.node-options.length - 2;
+    in-out property <string> node-address-text;
+    // True when the CONFIGURED node (not just the row being browsed) is a
+    // Bitcoin Core RPC base — drives the "Bitcoin node · Bitcoin Core" title
+    // suffix via `node-backend-label` below.
     in property <bool> node-is-core;
     // "Bitcoin Core" / "Esplora" — small label next to the picker.
     in property <string> node-backend-label;
@@ -2001,6 +2015,10 @@ export component AppWindow inherits Window {
     callback oversize-bump(); // raise chunk size to Standard from the compose dialog
     callback set-node-preset(int);
     callback set-node-custom(string);
+    // Bitcoin Core node-address field (U12): a bare host/host:port/http(s)
+    // URL, normalized+stored as `bitcoind+http(s)://host:port` in Rust —
+    // the prefix never appears here.
+    callback set-node-address(string);
     // Save Bitcoin Core RPC creds (user, pass) to the Keychain for the
     // active network's configured node — never written to config.json.
     callback set-node-core-creds(string, string);
@@ -3517,15 +3535,24 @@ export component AppWindow inherits Window {
         }
         SettingsCard {
             title: "Bitcoin node" + (root.node-is-core ? " · " + root.node-backend-label : "");
-            subtitle: "Scans and broadcasts go through this server — it learns your address and IP. Pick a provider, point at your own Esplora/mempool-compatible node, or run your own Bitcoin Core: bitcoind+http://host:8332 (RPC credentials below, never stored in this URL).";
+            subtitle: "Scans and broadcasts go through this server — it learns your address and IP. Pick a provider, point at your own Esplora/mempool-compatible node, or choose Bitcoin Core and enter your node's address (RPC credentials below, never stored in this URL).";
             Dropdown {
                 options: root.node-options;
                 current-index: root.node-index;
                 selected(i) => { root.node-index = i; root.set-node-preset(i); }
             }
+            // "Bitcoin Core" row (U12, second-to-last option — see
+            // `node-core-row-selected` above): a plain address field, no
+            // storage prefix in sight. "Custom…" (last option, unchanged)
+            // stays the free-text Esplora URL field.
+            if root.node-core-row-selected: EditField {
+                text <=> root.node-address-text;
+                placeholder-text: "192.168.1.10:8332  or  umbrel.local";
+                accepted(t) => { root.set-node-address(t); }
+            }
             if root.node-index == root.node-options.length - 1: EditField {
                 text <=> root.node-custom-text;
-                placeholder-text: "https://mempool.example/api  or  bitcoind+http://192.168.1.10:8332";
+                placeholder-text: "https://mempool.example/api";
                 accepted(t) => { root.set-node-custom(t); }
             }
             // FLATTENED (2026-07-29, U11): every row below used to live
@@ -3551,24 +3578,29 @@ export component AppWindow inherits Window {
             // lives in the NESTED VerticalLayout itself, not in how its
             // last child is toggled. Removing that nested layout — making
             // every row here a DIRECT child of the SettingsCard's own `l`
-            // layout, each individually gated by its own `if
-            // root.node-is-core: …` (repeating the condition, exactly the
-            // single-`if`-depth shape the iCloud-backup card's working
-            // `if !root.icloud-enabled: Caption` above already uses) — is
-            // what actually fixes it: `l` now sees every row as one of its
-            // own direct children, so its preferred-height always includes
-            // whichever are currently shown, at any point after the first
-            // paint. `l`'s own 8px spacing (SettingsCard) reproduces the
-            // nested layout's old `spacing: 8px` unchanged.
-            if root.node-is-core: Caption {
+            // layout, each individually gated by its own `if …: …`
+            // (repeating the condition, exactly the single-`if`-depth shape
+            // the iCloud-backup card's working `if !root.icloud-enabled:
+            // Caption` above already uses) — is what actually fixes it: `l`
+            // now sees every row as one of its own direct children, so its
+            // preferred-height always includes whichever are currently
+            // shown, at any point after the first paint. `l`'s own 8px
+            // spacing (SettingsCard) reproduces the nested layout's old
+            // `spacing: 8px` unchanged. U12 switched every gate below from
+            // `root.node-is-core` (the ACTUALLY ACTIVE backend) to
+            // `root.node-core-row-selected` (the dropdown row being
+            // browsed) — picking "Bitcoin Core" must reveal these rows
+            // immediately, before any address has been submitted, same as
+            // "Custom…" already reveals its own field on selection alone.
+            if root.node-core-row-selected: Caption {
                 text: "RPC username and password — stored in the device Keychain, never in app settings. Credentials cross the network in plaintext over http:// — use Tailscale, Tor, or an SSH tunnel unless this node is on localhost.";
                 wrap: word-wrap;
             }
-            if root.node-is-core: Caption {
+            if root.node-core-row-selected: Caption {
                 text: "Your node has no price oracle — USD estimates stay hidden while it's active, so no third-party price lookup happens either.";
                 wrap: word-wrap;
             }
-            if root.node-is-core: HorizontalLayout {
+            if root.node-core-row-selected: HorizontalLayout {
                 spacing: 8px;
                 EditField {
                     text <=> root.node-core-user;
@@ -3582,21 +3614,21 @@ export component AppWindow inherits Window {
                     accepted(t) => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
                 }
             }
-            if root.node-is-core: Switch {
+            if root.node-core-row-selected: Switch {
                 text: "Save credentials to Keychain";
                 checked <=> root.node-core-save-creds;
                 toggled => { root.set-node-core-save-creds(root.node-core-save-creds); }
             }
-            if root.node-is-core && !root.node-core-save-creds: Caption {
+            if root.node-core-row-selected && !root.node-core-save-creds: Caption {
                 text: "Credentials stay in memory for this session only — you'll re-enter them next launch.";
                 color: Pal.muted;
                 wrap: word-wrap;
             }
-            if root.node-is-core: GhostButton {
+            if root.node-core-row-selected: GhostButton {
                 text: "Save credentials";
                 clicked => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
             }
-            if root.node-is-core && root.node-health-text != "": Caption {
+            if root.node-core-row-selected && root.node-health-text != "": Caption {
                 text: root.node-health-text;
                 color: root.node-health-warn ? Pal.warn : Pal.muted;
                 wrap: word-wrap;
