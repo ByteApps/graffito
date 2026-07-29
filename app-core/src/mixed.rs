@@ -463,6 +463,7 @@ pub fn assemble_mixed_note_psbt(
     change_spk_override: Option<Vec<u8>>,
     change_index: u32,
     fee_rate: f64,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     let recipients: Vec<(Vec<u8>, u64)> =
         recipient_spk.map(|spk| vec![(spk, recipient_amount)]).unwrap_or_default();
@@ -477,6 +478,7 @@ pub fn assemble_mixed_note_psbt(
         change_spk_override,
         change_index,
         fee_rate,
+        lock_time,
     )
 }
 
@@ -503,6 +505,7 @@ pub fn assemble_mixed_note_psbt_multi(
     change_spk_override: Option<Vec<u8>>,
     change_index: u32,
     fee_rate: f64,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     assemble_mixed_note_psbt_multi_ext(
         coins,
@@ -516,6 +519,7 @@ pub fn assemble_mixed_note_psbt_multi(
         change_spk_override,
         change_index,
         fee_rate,
+        lock_time,
     )
 }
 
@@ -542,6 +546,7 @@ pub fn assemble_mixed_note_psbt_multi_ext(
     change_spk_override: Option<Vec<u8>>,
     change_index: u32,
     fee_rate: f64,
+    lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
     if coins.is_empty() {
         return Err(Error::Funding("no coins selected".into()));
@@ -670,7 +675,12 @@ pub fn assemble_mixed_note_psbt_multi_ext(
         outputs.push(TxOut { value: Amount::from_sat(change), script_pubkey: change_spk });
     }
 
-    let tx = Transaction { version: Version::TWO, lock_time: LockTime::ZERO, input: inputs, output: outputs };
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::from_consensus(lock_time),
+        input: inputs,
+        output: outputs,
+    };
     let txid = tx.compute_txid().to_string();
     let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| Error::Funding(format!("psbt: {e}")))?;
     for (i, coin) in coins.iter().enumerate() {
@@ -718,6 +728,7 @@ pub fn build_wallet_sweep_mixed(
     spending: Option<(&crate::identity::KeyMaterial, notes_core::Network, u32, &[crate::funding::FundingUtxo])>,
     dest_spk: Vec<u8>,
     fee_rate: f64,
+    lock_time: u32,
 ) -> Result<notes_core::tx::NoteTx, Error> {
     let mut inputs: Vec<notes_core::tx::MixedInput> = Vec::new();
 
@@ -762,8 +773,14 @@ pub fn build_wallet_sweep_mixed(
         return Err(Error::Funding("no coins to sweep".into()));
     }
 
-    notes_core::tx::build_sweep_tx_mixed(&inputs, dest_spk, fee_rate, notes_core::keys::generate_aux_rand)
-        .map_err(Error::Notes)
+    notes_core::tx::build_sweep_tx_mixed(
+        &inputs,
+        dest_spk,
+        fee_rate,
+        lock_time,
+        notes_core::keys::generate_aux_rand,
+    )
+    .map_err(Error::Notes)
 }
 
 #[cfg(test)]
@@ -821,7 +838,7 @@ mod tests {
             None,
             0,
             2.0,
-        )
+            0)
         .unwrap();
 
         let tx = &built.psbt.unsigned_tx;
@@ -888,7 +905,7 @@ mod tests {
             None,
             0,
             2.0,
-        )
+            0)
         .unwrap();
         assert_eq!(built.dust_to_self, 0, "notebook input present — anchored, no dust-to-self");
         let change_spk_len = spending_src.derive(1, 0).unwrap().spk.len();
@@ -943,7 +960,7 @@ mod tests {
             None,
             0,
             2.0,
-        )
+            0)
         .unwrap();
         assert!(built.dust_to_self > 0, "no notebook input — unanchored, dust-to-self stays");
         assert!(built.change > 0, "plenty of value — this must exercise the WITH-CHANGE branch");
@@ -981,8 +998,8 @@ mod tests {
             None,
             chunk,
             rate,
-            || Ok([7u8; 32]),
-        )
+            0,
+            || Ok([7u8; 32]))
         .unwrap();
         assert_eq!(built.change, 0, "the 330-sat coin must force the no-change fold shape");
         assert_eq!(built.fee, 330, "the whole coin goes to the fee — no room for anything else");
@@ -1045,7 +1062,7 @@ mod tests {
             None,
             0,
             rate,
-        )
+            0)
         .unwrap();
         assert_eq!(built.change, 0, "the 700-sat coin must force the no-change fold shape");
         assert!(built.dust_to_self > 0, "no notebook input — unanchored, dust-to-self stays");
@@ -1095,7 +1112,7 @@ mod tests {
             None,
             0,
             rate,
-        )
+            0)
         .unwrap();
         assert_eq!(built.dust_to_self, 0, "notebook input present — anchored, no dust-to-self");
         assert!(
@@ -1225,7 +1242,7 @@ mod tests {
             Some((&material, net, 0, &coins)),
             dest_spk.clone(),
             2.0,
-        )
+            0)
         .unwrap();
 
         // Single destination output, everything minus fee — no change, no
@@ -1334,7 +1351,7 @@ mod tests {
             Some((&material, net, 0, &coins)),
             dest_spk.clone(),
             2.0,
-        )
+            0)
         .unwrap();
 
         assert_eq!(sweep.tx.outputs.len(), 1);
@@ -1403,7 +1420,7 @@ mod tests {
         let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
         let dest_spk = notes_core::address::p2tr_script_pubkey(&bob.output_x);
 
-        let sweep = build_wallet_sweep_mixed(&notebook_sources, None, dest_spk.clone(), 2.0).unwrap();
+        let sweep = build_wallet_sweep_mixed(&notebook_sources, None, dest_spk.clone(), 2.0, 0).unwrap();
         assert_eq!(sweep.tx.outputs.len(), 1);
         assert_eq!(sweep.tx.outputs[0].script_pubkey, dest_spk);
         assert_eq!(sweep.fee + sweep.tx.outputs[0].value, 50_000);
@@ -1416,7 +1433,7 @@ mod tests {
     fn wallet_sweep_mixed_empty_inputs_errors_cleanly() {
         let bob = Identity::from_app_seed(&[9u8; 32]).unwrap();
         let dest_spk = notes_core::address::p2tr_script_pubkey(&bob.output_x);
-        let err = build_wallet_sweep_mixed(&[], None, dest_spk, 2.0).unwrap_err();
+        let err = build_wallet_sweep_mixed(&[], None, dest_spk, 2.0, 0).unwrap_err();
         match err {
             Error::Funding(msg) => assert!(msg.contains("no coins to sweep"), "unexpected message: {msg}"),
             other => panic!("expected Error::Funding, got {other:?}"),
@@ -1449,13 +1466,11 @@ mod tests {
         .unwrap();
         let old = assemble_mixed_note_psbt(
             &coins, notebook_spk.clone(), Some(&spending_src), &HashMap::new(), &payloads,
-            Some(recipient_spk.clone()), 330, &ChangeDefault::Spending, None, 0, 2.0,
-        )
+            Some(recipient_spk.clone()), 330, &ChangeDefault::Spending, None, 0, 2.0, 0)
         .unwrap();
         let new = assemble_mixed_note_psbt_multi(
             &coins, notebook_spk, Some(&spending_src), &HashMap::new(), &payloads,
-            &[(recipient_spk, 330)], &ChangeDefault::Spending, None, 0, 2.0,
-        )
+            &[(recipient_spk, 330)], &ChangeDefault::Spending, None, 0, 2.0, 0)
         .unwrap();
         assert_eq!(old.txid, new.txid);
         assert_eq!(old.fee, new.fee);
@@ -1500,8 +1515,7 @@ mod tests {
         let recipients = vec![(bob_spk.clone(), 330u64), (carol_spk.clone(), 330u64), (dave_spk.clone(), 330u64)];
         let built = assemble_mixed_note_psbt_multi(
             &coins, notebook_spk.clone(), Some(&spending_src), &HashMap::new(), &payloads,
-            &recipients, &ChangeDefault::Spending, None, 0, 2.0,
-        )
+            &recipients, &ChangeDefault::Spending, None, 0, 2.0, 0)
         .unwrap();
 
         assert_eq!(built.dust_to_self, 0, "notebook input anchors — no dust-to-self regardless of recipient count");
@@ -1563,8 +1577,7 @@ mod tests {
         let recipients = vec![(bob_spk.clone(), 330u64), (carol_spk.clone(), 330u64)];
         let built = assemble_mixed_note_psbt_multi(
             &coins, notebook_spk.clone(), Some(&spending_src), &HashMap::new(), &payloads,
-            &recipients, &ChangeDefault::Spending, None, 0, 2.0,
-        )
+            &recipients, &ChangeDefault::Spending, None, 0, 2.0, 0)
         .unwrap();
 
         assert_eq!(built.dust_to_self, DUST_LIMIT, "no notebook input — dust-to-self stays unconditional");
@@ -1619,8 +1632,7 @@ mod tests {
         .unwrap();
         let built = assemble_mixed_note_psbt_multi_ext(
             &coins, notebook_spk, None, &HashMap::new(), &change_spks, &payloads,
-            &[(recipient_spk.clone(), 330)], &ChangeDefault::Notebook, None, 0, 2.0,
-        )
+            &[(recipient_spk.clone(), 330)], &ChangeDefault::Notebook, None, 0, 2.0, 0)
         .unwrap();
 
         assert_eq!(built.dust_to_self, 0, "a change coin anchors the tx as self — no dust-to-self");
@@ -1693,8 +1705,7 @@ mod tests {
             notes_core::envelope::encode_chunks([2, 0, 0, 1], 0, b"notebook plus change, self note", 80).unwrap();
         let built = assemble_mixed_note_psbt_multi_ext(
             &coins, notebook_spk.clone(), None, &HashMap::new(), &change_spks, &payloads,
-            &[], &ChangeDefault::Notebook, None, 0, 2.0,
-        )
+            &[], &ChangeDefault::Notebook, None, 0, 2.0, 0)
         .unwrap();
 
         assert_eq!(built.dust_to_self, 0, "both inputs are this identity's own coin — anchored, no dust-to-self");
@@ -1778,8 +1789,7 @@ mod tests {
         .unwrap();
         let built = assemble_mixed_note_psbt_multi_ext(
             &coins, notebook_spk, Some(&spending_src), &HashMap::new(), &change_spks, &payloads,
-            &[(recipient_spk.clone(), 330)], &ChangeDefault::Spending, None, 0, 2.0,
-        )
+            &[(recipient_spk.clone(), 330)], &ChangeDefault::Spending, None, 0, 2.0, 0)
         .unwrap();
 
         assert_eq!(

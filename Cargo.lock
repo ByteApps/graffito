@@ -4082,7 +4082,7 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 [[package]]
 name = "notes-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ObjSal/prime-chain-notes.git?rev=54b4fce25f7db428c99d8ecc846a463640e26999#54b4fce25f7db428c99d8ecc846a463640e26999"
+source = "git+ssh://git@github.com/ObjSal/prime-chain-notes.git?rev=15431fbc74b2b761edf78a4f533673a89507585d#15431fbc74b2b761edf78a4f533673a89507585d"
 dependencies = [
  "bech32",
  "bs58",

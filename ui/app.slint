@@ -1752,6 +1752,11 @@ export component AppWindow inherits Window {
     in-out property <image> qr-zoom-image;
     in-out property <string> chunk-text;
     in-out property <bool> chunk-custom;
+    // nLockTime policy (anti-fee-sniping): "tip" | "zero" | "custom".
+    in-out property <string> locktime-mode: "tip";
+    in-out property <string> locktime-text;
+    // What the current policy would actually put on the wire right now.
+    in-out property <string> locktime-effective;
     // Bitcoin node picker (URLs must be Esplora/mempool-compatible): option
     // labels (last = "Custom…"), selected index, custom-URL text when active.
     in property <[string]> node-options;
@@ -1970,6 +1975,7 @@ export component AppWindow inherits Window {
     callback pick-account(int);
     callback account-cancel();
     callback set-chunk(string);
+    callback set-locktime(string, string); // (mode, custom-height)
     callback oversize-bump(); // raise chunk size to Standard from the compose dialog
     callback set-node-preset(int);
     callback set-node-custom(string);
@@ -3442,6 +3448,40 @@ export component AppWindow inherits Window {
                 }
                 Caption { text: "bytes · press Return to apply"; vertical-alignment: center; }
             }
+        }
+        SettingsCard {
+            title: "Transaction locktime";
+            subtitle: "Most wallets stamp the current block height, which discourages a re-org from stealing your fee and helps your transactions blend in. Zero is the simplest and what this app used to do.";
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                SelectPill {
+                    text: "Chain height";
+                    active: root.locktime-mode == "tip";
+                    clicked => { root.set-locktime("tip", root.locktime-text); }
+                }
+                SelectPill {
+                    text: "Zero";
+                    active: root.locktime-mode == "zero";
+                    clicked => { root.set-locktime("zero", root.locktime-text); }
+                }
+                SelectPill {
+                    text: "Custom";
+                    active: root.locktime-mode == "custom";
+                    clicked => { root.set-locktime("custom", root.locktime-text); }
+                }
+            }
+            if root.locktime-mode == "custom": HorizontalLayout {
+                spacing: 8px;
+                EditField {
+                    width: 130px;
+                    text <=> root.locktime-text;
+                    placeholder-text: "block height";
+                    accepted(t) => { root.set-locktime("custom", t); }
+                }
+                Caption { text: "height · press Return to apply"; vertical-alignment: center; }
+            }
+            Caption { text: root.locktime-effective; }
         }
         SettingsCard {
             title: "Bitcoin node";

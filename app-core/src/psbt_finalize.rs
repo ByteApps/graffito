@@ -221,7 +221,7 @@ mod tests {
             max_op_return_bytes: 80,
             network: NET,
         };
-        let b = build_funding_psbt(&plan, &np).unwrap();
+        let b = build_funding_psbt(&plan, &np, 0).unwrap();
         (b, alice, to_bob, src)
     }
 
@@ -302,7 +302,7 @@ mod tests {
             max_op_return_bytes: 80,
             network: NET,
         };
-        let built = crate::psbt_build::build_funding_psbt(&plan, &np).unwrap();
+        let built = crate::psbt_build::build_funding_psbt(&plan, &np, 0).unwrap();
         let expected_txid = built.txid.clone();
 
         // The external wallet signs (taproot key-path via bip32/tap origins).

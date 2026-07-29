@@ -222,7 +222,7 @@ fn main() {
                 .collect();
             let dest_addr = args.get(6).cloned().unwrap_or_else(|| ident.address.clone());
             let dest = Recipient::parse(net, &dest_addr).expect("dest address");
-            let built = build_watch_spend_psbt(&src, &coins, dest.spk, rate).expect("build");
+            let built = build_watch_spend_psbt(&src, &coins, dest.spk, rate, 0).expect("build");
             std::fs::write(&args[5], built.to_bytes()).expect("write psbt");
             println!(
                 "cli: spend-build kind={kind} txid={} fee={} value={} inputs={} -> {}",
@@ -270,7 +270,7 @@ fn main() {
                 })
                 .collect();
             let dest = Recipient::parse(net, &args[5]).expect("dest address");
-            let built = build_watch_spend_psbt(&src, &coins, dest.spk, rate).expect("build");
+            let built = build_watch_spend_psbt(&src, &coins, dest.spk, rate, 0).expect("build");
             std::fs::write(&args[4], built.to_bytes()).expect("write psbt");
             println!(
                 "cli: wallet-spend-build kind={kind} txid={} fee={} value={} inputs={} notebooks={} -> {}",
@@ -314,7 +314,7 @@ fn main() {
                 d.address
             );
             let dest = Recipient::parse(net, &args[6]).expect("dest address");
-            let built = build_watch_spend_psbt(&src, &coins, dest.spk, rate).expect("build");
+            let built = build_watch_spend_psbt(&src, &coins, dest.spk, rate, 0).expect("build");
             std::fs::write(&args[5], built.to_bytes()).expect("write psbt");
             println!(
                 "cli: change-spend-build chain=1 index={index} txid={} fee={} value={} inputs={} -> {}",
@@ -357,7 +357,7 @@ fn main() {
                 })
                 .expect("no reducible output");
             let built =
-                build_watch_bump_psbt(&src, &coins, &outputs, reduce, rate).expect("build bump");
+                build_watch_bump_psbt(&src, &coins, &outputs, reduce, rate, 0).expect("build bump");
             std::fs::write(&args[6], built.to_bytes()).expect("write psbt");
             println!(
                 "cli: bump-build replaces={} txid={} fee={} -> {}",
@@ -399,7 +399,7 @@ fn main() {
                 change_override: None,
             };
             let built =
-                build_funded_sweep_psbt(identity_spk, Some(&src), &notes_coins, &plan, dest.spk)
+                build_funded_sweep_psbt(identity_spk, Some(&src), &notes_coins, &plan, dest.spk, 0)
                     .expect("build funded sweep");
             std::fs::write(&args[6], built.to_bytes()).expect("write psbt");
             println!(
@@ -446,7 +446,7 @@ fn main() {
                 note_id,
                 store.chunk_size,
                 rate,
-            )
+                0)
             .expect("build note psbt");
             std::fs::write(&args[5], built.to_bytes()).expect("write psbt");
             println!(
@@ -493,7 +493,7 @@ fn main() {
                 if recipient.is_some() { gift } else { 0 },
                 note_id,
                 store.chunk_size,
-            )
+                0)
             .expect("build funded note psbt");
             std::fs::write(&args[7], built.to_bytes()).expect("write psbt");
             println!(
@@ -597,9 +597,9 @@ fn main() {
                 &ident.expect_full().output_x,
                 dest.spk,
                 rate,
+                0,
                 &ident.expect_full().tweaked_seckey,
-                app_core::notes_core::keys::generate_aux_rand,
-            )
+                app_core::notes_core::keys::generate_aux_rand)
             .expect("sweep build");
             let client = ChainClient::new(HttpTransport::new(&args[3]), net);
             let txid = client.broadcast(&sweep.raw_hex).expect("broadcast");
@@ -791,7 +791,7 @@ fn main() {
                 max_op_return_bytes: store.chunk_size,
                 network: net,
             };
-            let built = build_funding_psbt(&plan, &np).expect("build funded note psbt");
+            let built = build_funding_psbt(&plan, &np, 0).expect("build funded note psbt");
             let mut psbt = built.psbt.clone();
             let signed = app_core::psbt_build::sign_own_wpkh_inputs(
                 &mut psbt, &material, net, account, &scan.utxos,
@@ -889,7 +889,7 @@ fn main() {
                 max_op_return_bytes: store.chunk_size,
                 network: net,
             };
-            let built = app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift)
+            let built = app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift, 0)
                 .expect("build multi-recipient funded note psbt");
             assert_eq!(built.sent_to_recipient, gift * recipients.len() as u64, "uniform gift x N recipients");
             let mut psbt = built.psbt.clone();
@@ -986,7 +986,7 @@ fn main() {
                 max_op_return_bytes: 100_000,
                 network: net,
             };
-            let built = build_funding_psbt(&plan, &np).expect("build funding psbt");
+            let built = build_funding_psbt(&plan, &np, 0).expect("build funding psbt");
             eprintln!(
                 "cli: fund-build txid={} fee={} change={} coins={} to={} private={}",
                 built.txid,
@@ -1043,7 +1043,7 @@ fn main() {
                 max_op_return_bytes: 100_000,
                 network: net,
             };
-            let built = build_funding_psbt(&plan, &np).expect("build funding psbt");
+            let built = build_funding_psbt(&plan, &np, 0).expect("build funding psbt");
             eprintln!(
                 "cli: fund-build-fake txid={} fee={} change={} addr={} to={} private={}",
                 built.txid,
