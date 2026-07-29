@@ -1771,6 +1771,13 @@ export component AppWindow inherits Window {
     in property <string> node-backend-label;
     in-out property <string> node-core-user;
     in-out property <string> node-core-pass;
+    // "Save credentials" switch (plan §2.4 / U10) — per-network preference,
+    // default true (preserves the pre-U10 unconditional-Keychain behavior).
+    // On: the fields above persist to the Keychain, exactly as before. Off:
+    // they live in memory for this session only (gone on relaunch) and any
+    // previously stored Keychain item for this network is deleted
+    // immediately on the OFF transition.
+    in-out property <bool> node-core-save-creds;
     // Preflight summary (pruned / txindex / IBD / scanning), or "" before
     // the first check / when the node isn't Core. `node-health-warn` picks
     // the warning tint for a caption that needs one (pruned, no txindex);
@@ -1997,6 +2004,10 @@ export component AppWindow inherits Window {
     // Save Bitcoin Core RPC creds (user, pass) to the Keychain for the
     // active network's configured node — never written to config.json.
     callback set-node-core-creds(string, string);
+    // Toggle the "Save credentials" switch for the active network (plan
+    // §2.4 / U10): on persists to the Keychain, off deletes any stored
+    // item and keeps credentials in memory for this session only.
+    callback set-node-core-save-creds(bool);
     callback set-explorer-preset(int);
     callback set-explorer-custom(string);
     callback reveal-public();          // Settings entry: derive from cached material, no auth, -> screen 18
@@ -3540,6 +3551,16 @@ export component AppWindow inherits Window {
                         input-type: password;
                         accepted(t) => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
                     }
+                }
+                Switch {
+                    text: "Save credentials to Keychain";
+                    checked <=> root.node-core-save-creds;
+                    toggled => { root.set-node-core-save-creds(root.node-core-save-creds); }
+                }
+                if !root.node-core-save-creds: Caption {
+                    text: "Credentials stay in memory for this session only — you'll re-enter them next launch.";
+                    color: Pal.muted;
+                    wrap: word-wrap;
                 }
                 GhostButton {
                     text: "Save credentials";
