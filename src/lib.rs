@@ -18,8 +18,9 @@ use std::rc::Rc;
 
 use app_core::bitcoin;
 use app_core::chain::{
-    default_base, explorer_presets, explorer_tx_url, node_presets, scan_change_chain,
-    scan_change_chain_watch, AddrStats, AnyTransport, ChainClient, ChangeCoin, TxLookupStatus,
+    default_base, explorer_presets, explorer_tx_url, node_backend_label, node_presets,
+    scan_change_chain, scan_change_chain_watch, AddrStats, AnyTransport, ChainClient, ChangeCoin,
+    NodeStatus, TxLookupStatus,
 };
 use app_core::compose::ComposeRequest;
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
@@ -2074,6 +2075,128 @@ fn load_backend_settings(w: &AppWindow, st: &State) {
     w.set_explorer_custom_text(e_custom);
 }
 
+/// Populate the Bitcoin Core section of the node card (backend label + RPC
+/// credential fields) from the CURRENT node config — called only from
+/// Settings interactions (open, or a node/credentials edit while Settings
+/// is open), never from `update_home`/the refresh paths, which call
+/// [`load_backend_settings`] above on every repaint. That separation is
+/// what keeps RPC-credential Keychain reads off the hot path: this is the
+/// "Settings opened" lazy-load point the plan's §2.4 asks for
+/// (`PLAN-chain-notes-app-core-rpc.md`), not something that runs on boot or
+/// on every scan.
+fn update_node_backend_ui(w: &AppWindow, st: &State) {
+    let base = st.base_url();
+    let is_core = base.as_deref().is_some_and(|b| b.starts_with("bitcoind+"));
+    w.set_node_is_core(is_core);
+    w.set_node_backend_label(base.as_deref().map(node_backend_label).unwrap_or("Esplora").into());
+    if !is_core {
+        w.set_node_core_user("".into());
+        w.set_node_core_pass("".into());
+        w.set_node_health_text("".into());
+        w.set_node_health_warn(false);
+        return;
+    }
+    match keychain::load_rpc_creds(st.network.as_str()) {
+        Ok(Some((user, pass))) => {
+            w.set_node_core_user(user.into());
+            w.set_node_core_pass(pass.into());
+        }
+        Ok(None) => {
+            w.set_node_core_user("".into());
+            w.set_node_core_pass("".into());
+        }
+        Err(e) => {
+            // Never expected — this item carries no ACL — but degrade to
+            // blank fields rather than propagate a Keychain error into
+            // Settings; the user can just retype credentials.
+            println!("cb: rpc-creds load err={e}");
+            w.set_node_core_user("".into());
+            w.set_node_core_pass("".into());
+        }
+    }
+}
+
+/// Render one [`app_core::chain::NodeStatus`] preflight (plan §2.2/§2.3) as
+/// a single honest caption line, plus whether it should use the warning
+/// tint. Every condition here is a WARNING, never something this app
+/// silently works around or hides — a pruned node's missing history, a
+/// missing txindex's degraded sender attribution, and an in-progress
+/// rescan (which must never be mistaken for an empty wallet) all get named
+/// explicitly. An all-clear reports the tip height so "it's actually
+/// talking to your node" is visible too.
+fn format_node_status(status: &NodeStatus) -> (String, bool) {
+    let mut parts = Vec::new();
+    let mut warn = false;
+    if status.pruned {
+        warn = true;
+        match status.prune_height {
+            Some(h) => parts.push(format!(
+                "pruned below block {} — notes/history before it can't be recovered",
+                commas(h)
+            )),
+            None => parts.push("pruned — some history may be unavailable".to_string()),
+        }
+    }
+    if !status.txindex {
+        warn = true;
+        parts.push("no txindex — sender names on external notes may be missing".to_string());
+    }
+    if status.initial_block_download {
+        warn = true;
+        parts.push("still syncing to the chain tip (initial block download)".to_string());
+    }
+    if status.wallet_scanning == Some(true) {
+        warn = true;
+        parts.push("rescanning — balances/notes may be incomplete until it finishes".to_string());
+    }
+    if parts.is_empty() {
+        parts.push(format!("connected · tip {}", commas(status.tip_height)));
+    }
+    (parts.join(" · "), warn)
+}
+
+/// Preflight a configured Bitcoin Core node (plan §2.2/§2.3/U4,
+/// `CoreRpcTransport::preflight`) and render it honestly in Settings — a
+/// bonus courtesy, never a gate: the user is never blocked from proceeding
+/// on a pruned/scanning/no-txindex node, only told about it. A no-op for an
+/// Esplora base (`update_node_backend_ui` clears the health line and
+/// returns before any network call). Runs on a worker thread exactly like
+/// the account-picker's used/new probe (`show_notebook_picker`) — a
+/// one-off user-facing check, not a scan-lane job.
+fn refresh_node_health(w: &AppWindow, st: &State) {
+    update_node_backend_ui(w, st);
+    let Some(base) = st.base_url() else { return };
+    if !base.starts_with("bitcoind+") {
+        return;
+    }
+    let network = st.network;
+    w.set_node_health_text("checking node…".into());
+    w.set_node_health_warn(false);
+    let weak = w.as_weak();
+    std::thread::spawn(move || {
+        let _net_guard = NetOpGuard::new(weak.clone());
+        let (text, warn) = match open_client(&base, network) {
+            Ok(client) => match &client.transport {
+                AnyTransport::Core(t) => match t.preflight() {
+                    Ok(status) => format_node_status(&status),
+                    Err(e) => (format!("couldn't reach the node — {e}"), true),
+                },
+                // Unreachable: `base` was checked above to start with
+                // "bitcoind+", which `AnyTransport::new` always maps to Core.
+                AnyTransport::Esplora(_) => (String::new(), false),
+            },
+            Err(e) => (format!("couldn't reach the node — {e}"), true),
+        };
+        NODE_HEALTH_RESULTS.lock().expect("node health mutex").push(NodeHealthResult {
+            network,
+            base: base.clone(),
+            text: text.into(),
+            warn,
+        });
+        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_node_health());
+    });
+}
+
 /// Build the unified activity list (note txs + sweep/consolidate),
 /// actionable (pending) first, then newest.
 fn update_activity(w: &AppWindow, st: &State) {
@@ -3728,16 +3851,101 @@ struct DroppedCheck {
 
 /// Build a `ChainClient` against `base`, picking the Esplora or Bitcoin
 /// Core RPC backend by URL scheme (`app_core::chain::AnyTransport`, the
-/// backend seam of `../PLAN-chain-notes-app-core-rpc.md`). No credentials
-/// are sourced here — Core RPC auth is a later unit (§2.4/U6, sourced from
-/// the platform Keychain); every `base` this app stores is Esplora-shaped
-/// today, so in practice this is byte-identical to the
-/// `ChainClient::new(HttpTransport::new(base), network)` construction it
-/// replaces at every call site. Returns `Err` only for a malformed
-/// `bitcoind+` URL — callers surface it exactly like any other chain error
-/// (never `unwrap`/`expect`).
+/// backend seam of `../PLAN-chain-notes-app-core-rpc.md`). Every `base` an
+/// Esplora identity stores is unchanged and never touches the Keychain
+/// here at all — `core_rpc_creds_for` short-circuits on the URL prefix
+/// before doing anything. Returns `Err` only for a malformed `bitcoind+`
+/// URL — callers surface it exactly like any other chain error (never
+/// `unwrap`/`expect`).
 fn open_client(base: &str, network: Network) -> Result<ChainClient<AnyTransport>, app_core::Error> {
-    Ok(ChainClient::new(AnyTransport::new(base, None)?, network))
+    let creds = core_rpc_creds_for(base, network);
+    Ok(ChainClient::new(AnyTransport::new(base, creds)?, network))
+}
+
+/// Lazily source Bitcoin Core RPC credentials for a `bitcoind+` base — the
+/// one place this app ever reads the RPC-credentials Keychain item
+/// (§2.4/U6 of the plan). This runs on every call to [`open_client`], i.e.
+/// on every network request against a Core backend, NOT once at boot or
+/// once at Settings-open — deliberately: caching the credential in `State`
+/// would mean the launch path (or a later refactor of it) could plausibly
+/// grow a keychain read of its own, which is exactly the mistake that cost
+/// two shipped builds on the identity item (builds 42/44). A plain,
+/// no-ACL keychain read has no prompt to block on, so re-reading per
+/// request costs a little I/O and nothing else. Never called for an
+/// Esplora base. A Keychain error (never expected — this item carries no
+/// ACL) degrades to no creds rather than failing the request outright; an
+/// auth-required node then answers 401, which the caller already surfaces
+/// as an ordinary network error — never a panic, never a credential in a
+/// log line either way.
+fn core_rpc_creds_for(base: &str, network: Network) -> Option<(String, String)> {
+    if !base.starts_with("bitcoind+") {
+        return None;
+    }
+    keychain::load_rpc_creds(network.as_str()).ok().flatten()
+}
+
+/// Strip an inline `user:pass@` userinfo out of a node URL before it can
+/// reach `config.json`, a `cb:` log line, or the Settings text field (plan
+/// §2.4 — "the stored node URL must contain NO credentials"). Handles both
+/// `bitcoind+http(s)://user:pass@host:port` (the Sparrow-style paste this
+/// app's Custom field should tolerate) and a plain `http(s)://` Esplora URL
+/// (unusual, but stripping it is still correct — this app never sends an
+/// Esplora request with basic auth). Returns the creds-free URL plus the
+/// parsed `(user, pass)` if any were present.
+fn split_url_userinfo(url: &str) -> (String, Option<(String, String)>) {
+    let Some(scheme_end) = url.find("://") else { return (url.to_string(), None) };
+    let (scheme, rest) = url.split_at(scheme_end + 3);
+    let Some(at) = rest.find('@') else { return (url.to_string(), None) };
+    // An '@' that belongs to a PATH segment (after the authority) is not
+    // userinfo — bail rather than mis-parse.
+    if rest[..at].contains('/') {
+        return (url.to_string(), None);
+    }
+    let (userinfo, hostpart) = rest.split_at(at);
+    let hostpart = &hostpart[1..]; // drop the '@' itself
+    let creds = userinfo.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()));
+    (format!("{scheme}{hostpart}"), creds)
+}
+
+#[cfg(test)]
+mod core_rpc_settings_tests {
+    use super::split_url_userinfo;
+
+    #[test]
+    fn strips_inline_userinfo_from_core_url() {
+        let (url, creds) = split_url_userinfo("bitcoind+http://alice:s3cr3t@192.168.1.10:8332");
+        assert_eq!(url, "bitcoind+http://192.168.1.10:8332");
+        assert_eq!(creds, Some(("alice".to_string(), "s3cr3t".to_string())));
+    }
+
+    #[test]
+    fn leaves_a_plain_url_untouched() {
+        let (url, creds) = split_url_userinfo("bitcoind+http://192.168.1.10:8332");
+        assert_eq!(url, "bitcoind+http://192.168.1.10:8332");
+        assert_eq!(creds, None);
+    }
+
+    #[test]
+    fn leaves_esplora_urls_untouched() {
+        let (url, creds) = split_url_userinfo("https://mempool.example/api");
+        assert_eq!(url, "https://mempool.example/api");
+        assert_eq!(creds, None);
+    }
+
+    #[test]
+    fn does_not_confuse_a_path_at_sign_for_userinfo() {
+        // No userinfo here — the '@' (if any) would sit after a '/', which
+        // this function must not treat as an authority separator.
+        let (url, creds) = split_url_userinfo("http://127.0.0.1:3002/api@weird");
+        assert_eq!(url, "http://127.0.0.1:3002/api@weird");
+        assert_eq!(creds, None);
+    }
+
+    #[test]
+    fn empty_and_malformed_inputs_pass_through() {
+        assert_eq!(split_url_userinfo(""), (String::new(), None));
+        assert_eq!(split_url_userinfo("not-a-url"), ("not-a-url".to_string(), None));
+    }
 }
 
 /// Snapshot every PENDING record (sweep/consolidate txs AND notes) in
@@ -5208,6 +5416,21 @@ struct PickerProbeResult {
 }
 
 static PICKER_PROBE_RESULTS: std::sync::Mutex<Vec<PickerProbeResult>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Finished Bitcoin Core preflight check (`PLAN-chain-notes-app-core-rpc.md`
+/// §2.2/§2.3/U4, surfaced §3/U6). `network`+`base` are the snapshot the
+/// worker started against — `on_apply_pending_node_health` drops a stale
+/// result (network switched, or the node URL changed) rather than paint it
+/// over a config the user has since moved on from.
+struct NodeHealthResult {
+    network: Network,
+    base: String,
+    text: SharedString,
+    warn: bool,
+}
+
+static NODE_HEALTH_RESULTS: std::sync::Mutex<Vec<NodeHealthResult>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Kick off receive-chain notebook gap discovery on a worker thread when
@@ -10600,6 +10823,23 @@ pub fn run() {
         }
     });
 
+    // Trampoline: a finished Bitcoin Core preflight check (`refresh_node_health`).
+    // Dropped when stale — the network or the configured node changed since
+    // the check started (e.g. the user switched networks, or edited the
+    // node URL again before the first check returned).
+    cb!(on_apply_pending_node_health, |w, s| {
+        let results: Vec<NodeHealthResult> =
+            NODE_HEALTH_RESULTS.lock().expect("node health mutex").drain(..).collect();
+        for r in results {
+            if s.network != r.network || s.base_url().as_deref() != Some(r.base.as_str()) {
+                println!("cb: node-health stale-drop");
+                continue;
+            }
+            w.set_node_health_text(r.text);
+            w.set_node_health_warn(r.warn);
+        }
+    });
+
     // Trampoline: a finished notebook gap-discovery walk (seed re-import).
     // Discovery is the sanctioned exception to deliberate notebook
     // creation — every found index has on-chain history, so recovering it
@@ -13894,6 +14134,7 @@ pub fn run() {
         w.set_status("".into());
         w.set_chunk_custom(false);
         load_backend_settings(&w, &s);
+        refresh_node_health(&w, &s);
         // Settings shows identity/network/note-size fields that used to be set
         // only by update_home; onboarding now lands on the list (not a home),
         // so populate them here too or the "Change account…" row (gated on
@@ -14250,19 +14491,58 @@ pub fn run() {
             println!("cb: set-node-preset custom");
         }
         w.set_status("".into());
+        // Every preset is Esplora — this both clears a previously-active
+        // Core node's credential fields/health line and is a no-op (no
+        // network call) whenever the picker was already on Esplora.
+        refresh_node_health(&w, &s);
     });
 
     cb!(on_set_node_custom, |w, s, t: SharedString| {
         let net = s.network.as_str().to_string();
-        let v = t.trim().to_string();
+        // Strip any inline `user:pass@` userinfo BEFORE it ever reaches
+        // config.json or this `cb:` log line (plan §2.4 — "the stored node
+        // URL must contain NO credentials"). A pasted
+        // `bitcoind+http://user:pass@host:8332` is routed to the Keychain
+        // exactly as if typed into the credential fields below; the value
+        // that gets stored/logged/displayed is always the creds-free form.
+        let (v, inline_creds) = split_url_userinfo(t.trim());
         if v.is_empty() {
             s.node_urls.remove(&net);
         } else {
-            s.node_urls.insert(net, v.clone());
+            s.node_urls.insert(net.clone(), v.clone());
         }
         s.save_config();
         println!("cb: set-node-custom {}", if v.is_empty() { "default" } else { &v });
+        if let Some((user, pass)) = &inline_creds {
+            match keychain::store_rpc_creds(&net, user, pass) {
+                Ok(()) => println!("cb: set-node-custom inline-creds redacted stored=ok"),
+                Err(e) => println!("cb: set-node-custom inline-creds redacted stored=err ({e})"),
+            }
+        }
         w.set_status("".into());
+        refresh_node_health(&w, &s);
+    });
+
+    // Bitcoin Core RPC credentials (plan §2.4/U6): stored in the Keychain
+    // ONLY, under a distinct account namespace from the identity key — see
+    // `keychain::{store,load,delete}_rpc_creds`. Never written to
+    // config.json, never logged (length only). Clearing both fields
+    // deletes the stored credential instead of writing an empty one.
+    cb!(on_set_node_core_creds, |w, s, user: SharedString, pass: SharedString| {
+        let net = s.network.as_str().to_string();
+        let user = user.trim().to_string();
+        let pass = pass.to_string();
+        let result = if user.is_empty() && pass.is_empty() {
+            keychain::delete_rpc_creds(&net)
+        } else {
+            keychain::store_rpc_creds(&net, &user, &pass)
+        };
+        match &result {
+            Ok(()) => println!("cb: set-node-core-creds ok user_len={} pass_len={}", user.len(), pass.len()),
+            Err(e) => println!("cb: set-node-core-creds err={e}"),
+        }
+        w.set_status(if result.is_ok() { "".into() } else { "couldn't save RPC credentials".into() });
+        refresh_node_health(&w, &s);
     });
 
     cb!(on_set_explorer_preset, |w, s, i: i32| {

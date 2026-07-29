@@ -1757,11 +1757,26 @@ export component AppWindow inherits Window {
     in-out property <string> locktime-text;
     // What the current policy would actually put on the wire right now.
     in-out property <string> locktime-effective;
-    // Bitcoin node picker (URLs must be Esplora/mempool-compatible): option
-    // labels (last = "Custom…"), selected index, custom-URL text when active.
+    // Bitcoin node picker (URLs must be Esplora/mempool-compatible, OR a
+    // Bitcoin Core `bitcoind+http(s)://host:port` RPC base — see
+    // `PLAN-chain-notes-app-core-rpc.md`): option labels (last = "Custom…"),
+    // selected index, custom-URL text when active.
     in property <[string]> node-options;
     in-out property <int> node-index;
     in-out property <string> node-custom-text;
+    // True when the CONFIGURED node (not just the text being typed) is a
+    // Bitcoin Core RPC base — reveals the credentials fields + health line.
+    in property <bool> node-is-core;
+    // "Bitcoin Core" / "Esplora" — small label next to the picker.
+    in property <string> node-backend-label;
+    in-out property <string> node-core-user;
+    in-out property <string> node-core-pass;
+    // Preflight summary (pruned / txindex / IBD / scanning), or "" before
+    // the first check / when the node isn't Core. `node-health-warn` picks
+    // the warning tint for a caption that needs one (pruned, no txindex);
+    // an all-clear line stays the muted caption color.
+    in property <string> node-health-text;
+    in property <bool> node-health-warn;
     // Block-explorer picker: same shape.
     in property <[string]> explorer-options;
     in-out property <int> explorer-index;
@@ -1979,6 +1994,9 @@ export component AppWindow inherits Window {
     callback oversize-bump(); // raise chunk size to Standard from the compose dialog
     callback set-node-preset(int);
     callback set-node-custom(string);
+    // Save Bitcoin Core RPC creds (user, pass) to the Keychain for the
+    // active network's configured node — never written to config.json.
+    callback set-node-core-creds(string, string);
     callback set-explorer-preset(int);
     callback set-explorer-custom(string);
     callback reveal-public();          // Settings entry: derive from cached material, no auth, -> screen 18
@@ -2004,6 +2022,9 @@ export component AppWindow inherits Window {
     // Create-notebook picker: used/new address probes finished on a worker
     // thread; fill in the pills without blocking the tap that opened it.
     callback apply-pending-picker-probe();
+    // A Bitcoin Core preflight check (`refresh_node_health` in lib.rs)
+    // finished on a worker thread — fills in the node-health caption.
+    callback apply-pending-node-health();
     // Async sign+broadcast (2026-07-16): a compose send's build+broadcast
     // finished on a worker thread — same trampoline pattern.
     callback apply-pending-compose();
@@ -3484,8 +3505,8 @@ export component AppWindow inherits Window {
             Caption { text: root.locktime-effective; }
         }
         SettingsCard {
-            title: "Bitcoin node";
-            subtitle: "Scans and broadcasts go through this server — it learns your address and IP. Pick a provider, or point at your own Esplora/mempool-compatible node.";
+            title: "Bitcoin node" + (root.node-is-core ? " · " + root.node-backend-label : "");
+            subtitle: "Scans and broadcasts go through this server — it learns your address and IP. Pick a provider, point at your own Esplora/mempool-compatible node, or run your own Bitcoin Core: bitcoind+http://host:8332 (RPC credentials below, never stored in this URL).";
             Dropdown {
                 options: root.node-options;
                 current-index: root.node-index;
@@ -3493,8 +3514,42 @@ export component AppWindow inherits Window {
             }
             if root.node-index == root.node-options.length - 1: EditField {
                 text <=> root.node-custom-text;
-                placeholder-text: "https://mempool.example/api  or  http://127.0.0.1:3002";
+                placeholder-text: "https://mempool.example/api  or  bitcoind+http://192.168.1.10:8332";
                 accepted(t) => { root.set-node-custom(t); }
+            }
+            if root.node-is-core: VerticalLayout {
+                spacing: 8px;
+                Caption {
+                    text: "RPC username and password — stored in the device Keychain, never in app settings. Credentials cross the network in plaintext over http:// — use Tailscale, Tor, or an SSH tunnel unless this node is on localhost.";
+                    wrap: word-wrap;
+                }
+                Caption {
+                    text: "Your node has no price oracle — USD estimates stay hidden while it's active, so no third-party price lookup happens either.";
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    EditField {
+                        text <=> root.node-core-user;
+                        placeholder-text: "RPC username";
+                        accepted(t) => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
+                    }
+                    EditField {
+                        text <=> root.node-core-pass;
+                        placeholder-text: "RPC password";
+                        input-type: password;
+                        accepted(t) => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
+                    }
+                }
+                GhostButton {
+                    text: "Save credentials";
+                    clicked => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
+                }
+                if root.node-health-text != "": Caption {
+                    text: root.node-health-text;
+                    color: root.node-health-warn ? Pal.warn : Pal.muted;
+                    wrap: word-wrap;
+                }
             }
         }
         SettingsCard {

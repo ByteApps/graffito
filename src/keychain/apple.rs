@@ -17,7 +17,9 @@ use security_framework::access_control::{ProtectionMode, SecAccessControl};
 use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
 };
-use security_framework_sys::access_control::kSecAccessControlUserPresence;
+use security_framework_sys::access_control::{
+    kSecAccessControlUserPresence, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+};
 use security_framework_sys::item::{
     kSecAttrAccessControl, kSecAttrAccount, kSecAttrService, kSecClass,
     kSecClassGenericPassword, kSecReturnAttributes, kSecReturnData,
@@ -35,6 +37,13 @@ extern "C" {
     // "Do not present authentication UI; fail instead." Unbound in
     // security-framework-sys (the key itself IS bound, only this value is not).
     static kSecUseAuthenticationUIFail: core_foundation_sys::string::CFStringRef;
+    // The `kSecAttrAccessible` dictionary KEY itself — unbound in
+    // security-framework-sys, unlike the VALUES it's paired with
+    // (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` etc., which are
+    // bound in `access_control`). Used only by the RPC-credentials section
+    // below; the identity item above sets protection via
+    // `kSecAttrAccessControl` (an ACL), not this plain accessibility key.
+    static kSecAttrAccessible: core_foundation_sys::string::CFStringRef;
 }
 use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete};
 
@@ -773,4 +782,205 @@ pub fn spike_auth() -> Result<(), String> {
         }
         other => Err(format!("unexpected read-back: {other:?}")),
     }
+}
+
+// =======================================================================
+// Bitcoin Core RPC credentials
+// (`../../PLAN-chain-notes-app-core-rpc.md` §2.4/U6 — orchestrator-owned
+// security posture, not the implementer's call to change).
+// =======================================================================
+//
+// These are NETWORK credentials for the user's own `bitcoind` — not key
+// material — and get a DELIBERATELY DIFFERENT, weaker posture than the
+// identity item above:
+//
+//   - NO `SecAccessControl` / `kSecAccessControlUserPresence` ACL, and no
+//     `user_presence_check` (LAContext) gate anywhere in this section. A
+//     lost RPC password just means re-typing it in Settings; it is not the
+//     user's only copy of anything irreplaceable, so it does not earn the
+//     identity item's biometric gate.
+//   - `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`: readable by a
+//     background network worker once the device has unlocked at least once
+//     since boot, and NEVER synced (no `kSecAttrSynchronizable`) — an RPC
+//     password must not leave this device via iCloud Keychain the way an
+//     opted-in seed backup does.
+//   - A distinct account namespace (`rpc-creds-<network>`) that is
+//     structurally distinct from `identity-key` / `identity-key#la` /
+//     `identity-key#new` — collision is not just avoided, it's a different
+//     string shape entirely, so nothing here can shadow or be shadowed by
+//     the identity path.
+//
+// LAUNCH-PATH RULE, unchanged: nothing on the boot path may call these.
+// Load lazily — Settings open, or the first Core-backend network request —
+// exactly like the identity item's `identity_exists` probe must stay off
+// the boot path. These calls carry no ACL so they cannot themselves block
+// on a biometric prompt, but the launch-watchdog lesson (builds 42/44) was
+// general: zero NEW Keychain calls before the first frame, full stop.
+
+/// Distinct account namespace for RPC credentials — see the module doc
+/// above. Network-scoped because the Bitcoin-node URL itself is
+/// (`State.node_urls`, keyed by network).
+fn rpc_account(network: &str) -> String {
+    format!("rpc-creds-{network}")
+}
+
+fn rpc_staging_account(network: &str) -> String {
+    format!("rpc-creds-{network}#new")
+}
+
+/// One keychain item holds both fields as `"<user>\n<pass>"` — bitcoind's
+/// `rpcuser`/`rpcpassword` are single config-file tokens and never contain
+/// a newline, so this can't collide with either half.
+fn encode_rpc_creds(user: &str, pass: &str) -> String {
+    format!("{user}\n{pass}")
+}
+
+fn decode_rpc_creds(blob: &str) -> Option<(String, String)> {
+    blob.split_once('\n').map(|(u, p)| (u.to_string(), p.to_string()))
+}
+
+/// Write one plain (no-ACL) item under `account`. Deletes nothing — a
+/// collision fails with errSecDuplicateItem, exactly like the identity
+/// item's `add_item`, which is what makes the two-phase write below safe.
+fn add_rpc_item(account: &str, value: &str) -> Result<(), String> {
+    let mut pairs = base_query(account);
+    pairs.push((
+        key(unsafe { kSecValueData }),
+        CFData::from_buffer(value.as_bytes()).as_CFType(),
+    ));
+    pairs.push((
+        key(unsafe { kSecAttrAccessible }),
+        key(unsafe { kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly }).as_CFType(),
+    ));
+    // Deliberately absent: kSecAttrAccessControl (no ACL — see module doc)
+    // and kSecAttrSynchronizable (never iCloud-synced).
+    push_domain(&mut pairs, true);
+    let dict = CFDictionary::from_CFType_pairs(&pairs);
+    let status = unsafe { SecItemAdd(dict.as_concrete_TypeRef(), std::ptr::null_mut()) };
+    match status {
+        0 => Ok(()),
+        other => Err(format!("SecItemAdd(rpc-creds) failed ({other})")),
+    }
+}
+
+/// Attributes-only existence check — no `kSecReturnData`, so this never
+/// touches the value. There is no ACL here to trigger authentication in the
+/// first place (unlike the identity item's `probe_item`), but this keeps
+/// the same "confirm it landed" shape the two-phase write depends on.
+fn rpc_item_exists(account: &str) -> bool {
+    for dp in KEYCHAIN_DOMAINS {
+        let mut pairs = base_query(account);
+        pairs.push((key(unsafe { kSecReturnAttributes }), CFBoolean::true_value().as_CFType()));
+        push_domain(&mut pairs, dp);
+        let dict = CFDictionary::from_CFType_pairs(&pairs);
+        let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
+        if !result.is_null() {
+            unsafe { CFType::wrap_under_create_rule(result) };
+        }
+        if status == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn rpc_read_item(account: &str) -> Result<Option<String>, String> {
+    for dp in KEYCHAIN_DOMAINS {
+        let mut pairs = base_query(account);
+        pairs.push((key(unsafe { kSecReturnData }), CFBoolean::true_value().as_CFType()));
+        push_domain(&mut pairs, dp);
+        let dict = CFDictionary::from_CFType_pairs(&pairs);
+        let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
+        match status {
+            0 => {
+                let data = unsafe { CFData::wrap_under_create_rule(result as _) };
+                return String::from_utf8(data.bytes().to_vec())
+                    .map(Some)
+                    .map_err(|e| e.to_string());
+            }
+            ERR_NOT_FOUND | ERR_MISSING_ENTITLEMENT => continue,
+            other => return Err(format!("SecItemCopyMatching(rpc-creds) failed ({other})")),
+        }
+    }
+    Ok(None)
+}
+
+fn rpc_delete_account(account: &str) -> Result<(), String> {
+    for dp in KEYCHAIN_DOMAINS {
+        let mut pairs = base_query(account);
+        push_domain(&mut pairs, dp);
+        let dict = CFDictionary::from_CFType_pairs(&pairs);
+        let status = unsafe { SecItemDelete(dict.as_concrete_TypeRef()) };
+        if status != 0 && status != ERR_NOT_FOUND && status != ERR_MISSING_ENTITLEMENT {
+            return Err(format!("SecItemDelete(rpc-creds) failed ({status})"));
+        }
+    }
+    Ok(())
+}
+
+/// Store the RPC username/password for `network`, replacing whatever is
+/// there. Same crash-safe two-phase shape as [`store_secret_protected`]
+/// (2026-07-25 audit, H1) even though the stakes here are lower (a lost RPC
+/// password is retypeable, not catastrophic): stage under `<account>#new`,
+/// confirm it landed, purge the live item, write the live item, drop
+/// staging. At every instant at least one copy of the credential exists on
+/// the device.
+pub fn store_rpc_creds(network: &str, user: &str, pass: &str) -> Result<(), String> {
+    let account = rpc_account(network);
+    let staging = rpc_staging_account(network);
+    let value = encode_rpc_creds(user, pass);
+
+    // Debris from an earlier interrupted write whose primary was since
+    // restored — the live item wins, so clear the way (mirrors
+    // `store_secret_protected`'s opening `purge_account(&staging)`).
+    rpc_delete_account(&staging)?;
+
+    // Phase 1 — the new copy, off to the side. The live item is untouched.
+    add_rpc_item(&staging, &value)?;
+    if !rpc_item_exists(&staging) {
+        return Err("rpc-creds staging write did not verify".into());
+    }
+
+    // Phase 2 — only now is it safe to drop the old copy; staging holds one.
+    rpc_delete_account(&account)?;
+
+    // Phase 3 — the real item. If this fails, staging still holds the
+    // credential and the next `load_rpc_creds` recovers it.
+    match add_rpc_item(&account, &value) {
+        Ok(()) => {
+            let _ = rpc_delete_account(&staging);
+            Ok(())
+        }
+        Err(e) => Err(format!("{e} (credentials preserved in staging — retry from Settings)")),
+    }
+}
+
+/// Read the stored RPC username/password for `network`, if any. Adopts a
+/// surviving staging copy from an interrupted write (same recovery shape as
+/// [`load_secret_protected`]). Safe to call from any non-boot path — see
+/// the module doc for why boot itself must still never reach this.
+pub fn load_rpc_creds(network: &str) -> Result<Option<(String, String)>, String> {
+    let account = rpc_account(network);
+    if let Some(v) = rpc_read_item(&account)? {
+        return Ok(decode_rpc_creds(&v));
+    }
+    let staging = rpc_staging_account(network);
+    let Some(v) = rpc_read_item(&staging)? else {
+        return Ok(None);
+    };
+    // Promote the staging copy now that we know it's the only one.
+    if add_rpc_item(&account, &v).is_ok() {
+        let _ = rpc_delete_account(&staging);
+    }
+    Ok(decode_rpc_creds(&v))
+}
+
+/// Remove stored RPC credentials for `network` — the live item and any
+/// staging debris. A missing item is success.
+pub fn delete_rpc_creds(network: &str) -> Result<(), String> {
+    let live = rpc_delete_account(&rpc_account(network));
+    let staged = rpc_delete_account(&rpc_staging_account(network));
+    live.and(staged)
 }
