@@ -1090,3 +1090,138 @@ fn core_rpc_birthday_excludes_history_before_a_late_timestamp() {
         node.datadir
     );
 }
+
+/// U5 test 1 (plan §2.1, THE regression this unit exists to prevent): on a
+/// node started WITHOUT `-txindex`, a genuinely unknown txid must map to
+/// `TxLookupStatus::Unknown`, NEVER `NotFound` — the RPC code (-5) is
+/// identical to the txindex=1 case (`core_rpc_conformance` above already
+/// proves the POSITIVE case: NotFound on a healthy, synced, txindex=1
+/// node), but without txindex bitcoind genuinely cannot tell "this tx
+/// doesn't exist" apart from "this tx exists, confirmed, but I have no way
+/// to look it up" — treating the two identically would make the app
+/// declare a live, on-chain transaction dropped, which is the single worst
+/// failure mode `TxLookupStatus`'s own doc comment calls out.
+#[test]
+fn core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    // No `-txindex` (mirrors `core_rpc_preflight_reports_missing_txindex`).
+    let node = start_node_with("");
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+    let client = ChainClient::new(transport, Network::Regtest);
+
+    let unknown_txid = "ff".repeat(32);
+    assert_eq!(
+        client.tx_lookup_status(&unknown_txid),
+        TxLookupStatus::Unknown,
+        "a no-txindex node must NEVER report NotFound for an unresolvable txid — \
+         that would read a live transaction as dropped"
+    );
+
+    // Same node, `fetch_tx_status`/`fetch_tx_hex` (the other two
+    // `getrawtransaction`-backed routes) must degrade the SAME way — no
+    // caller anywhere may see a bare "confirmed" verdict manufactured out
+    // of an unresolved absence either.
+    assert_eq!(
+        client.fetch_tx_status(&unknown_txid),
+        None,
+        "fetch_tx_status must also read this as unknown, not confirmed/unconfirmed"
+    );
+
+    eprintln!(
+        "core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5: PASS (datadir {:?})",
+        node.datadir
+    );
+}
+
+/// U5 test 2 (plan §2.1, "cache it; do not re-probe per call"): several
+/// lookups of DIFFERENT unknown txids against the SAME transport instance
+/// must trigger exactly ONE real `getblockchaininfo`/`getindexinfo` probe,
+/// not one per lookup — proven via `CoreRpcTransport::preflight_probe_count`,
+/// a counter incremented only by the raw uncached probe. A reviewer's
+/// mutation that made the absence check bypass the cache would make this
+/// counter grow with every lookup instead of staying at 1.
+#[test]
+fn core_rpc_established_absence_caches_node_status_across_lookups() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_established_absence_caches_node_status_across_lookups: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    let node = start_node(); // txindex=1 — the positive case.
+    // A brand-new regtest node's tip is still the genesis block (an
+    // ancient timestamp), so `initialblockdownload` reports true until a
+    // RECENT block exists — mine a few (system-clock timestamps, no
+    // `setmocktime` needed, same as every other test here) so this test
+    // exercises the "fully synced" case `established_absent` requires,
+    // not an accidental IBD-driven `Unknown`.
+    node.rpc(None, "createwallet", serde_json::json!(["sender"]));
+    let addr = node.fresh_addr();
+    node.generate(3, &addr);
+
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+    let client = ChainClient::new(transport, Network::Regtest);
+
+    for i in 0..5u8 {
+        let txid = format!("{i:02x}{}", "ee".repeat(31));
+        assert_eq!(
+            client.tx_lookup_status(&txid),
+            TxLookupStatus::NotFound,
+            "each of these txids is genuinely unknown on this fresh node"
+        );
+    }
+
+    match &client.transport {
+        AnyTransport::Core(core) => assert_eq!(
+            core.preflight_probe_count(),
+            1,
+            "5 lookups must share ONE cached node-status probe, not re-probe per call"
+        ),
+        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+    }
+
+    eprintln!(
+        "core_rpc_established_absence_caches_node_status_across_lookups: PASS (datadir {:?})",
+        node.datadir
+    );
+}
+
+/// U5 test 3 (plan §2.4, "the garbage-address silent-success path — make
+/// it a decision, not an accident"): a syntactically invalid address reads
+/// as "never used, no coins" — an explicit, documented decision (see
+/// `CoreRpcTransport::ensure_address_watched`'s doc comment), not the
+/// accident of a test fixture. This proves the decision is real and
+/// stable against a live node: `getdescriptorinfo`/`listunspent` are never
+/// handed the garbage string (which would itself error), and every
+/// affected route answers with its empty shape instead of an `Error`.
+#[test]
+fn core_rpc_invalid_address_reads_as_never_used_not_error() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_invalid_address_reads_as_never_used_not_error: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    let node = start_node();
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+    let client = ChainClient::new(transport, Network::Regtest);
+
+    let garbage = "not-a-real-bitcoin-address";
+    let stats = client.address_stats(garbage).expect("address_stats must be Ok, not Err, for a garbage address");
+    assert_eq!(stats.chain_tx_count, 0);
+    assert_eq!(stats.mempool_tx_count, 0);
+    let utxos = client.utxos(garbage).expect("utxos must be Ok, not Err, for a garbage address");
+    assert!(utxos.is_empty());
+    let history = client.full_history(garbage).expect("full_history must be Ok, not Err, for a garbage address");
+    assert!(history.is_empty());
+
+    eprintln!("core_rpc_invalid_address_reads_as_never_used_not_error: PASS (datadir {:?})", node.datadir);
+}

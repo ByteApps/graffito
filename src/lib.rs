@@ -2479,6 +2479,60 @@ mod net_err_tests {
     }
 }
 
+/// U5 (`../PLAN-chain-notes-app-core-rpc.md` §2.1/§2.4): Bitcoin Core's
+/// rejection vocabulary — `testmempoolaccept` reject-reason tokens
+/// (`"txn-already-known"`, `"min relay fee not met, ..."`,
+/// `"bad-txns-inputs-missingorspent"`, `"non-final"`) and
+/// `sendrawtransaction` RPC-error messages (codes -25/-26/-27, forwarded
+/// verbatim by [`app_core::chain::CoreRpcTransport`]'s generic `rpc()`
+/// path) — reads nothing like mempool.space's own rejection bodies. Left
+/// alone, the exact same underlying condition (already broadcast, fee too
+/// low, a missing input, a non-final locktime) would show the user two
+/// completely different raw strings depending purely on which backend
+/// they picked. This recognizes both vocabularies — real Esplora/
+/// mempool.space bodies already tend to embed plain English for these
+/// cases; Core's are short machine tokens or terse RPC messages — and
+/// collapses the common ones to ONE calm, backend-agnostic phrase, so the
+/// UI reads identically either way. Matched case-insensitively against the
+/// FULL error text (whatever prefix `Error`'s `Display`/`trim_error_body`
+/// put in front of it) rather than anchored to a position, since Core and
+/// Esplora don't even agree on where in the string the reason token sits.
+/// `None` for anything not recognized — the existing pass-through/
+/// [`friendly_net_err`] path handles those exactly as before.
+fn map_broadcast_rejection(e: &str) -> Option<&'static str> {
+    let lower = e.to_ascii_lowercase();
+    const ALREADY: &[&str] = &[
+        "txn-already-known",
+        "already-known",
+        "already in block chain",
+        "already have transaction",
+        "already in the mempool",
+        "already in mempool",
+    ];
+    const LOW_FEE: &[&str] = &[
+        "min relay fee not met",
+        "insufficient fee",
+        "min-relay-fee-not-met",
+        "mempool min fee not met",
+    ];
+    const MISSING_INPUTS: &[&str] =
+        &["missing inputs", "missingorspent", "bad-txns-inputs-missingorspent"];
+    const NON_FINAL: &[&str] =
+        &["non-final", "non-bip68-final", "bad-txns-nonfinal", "transaction is not final"];
+
+    if ALREADY.iter().any(|s| lower.contains(s)) {
+        Some("already broadcast — this transaction is already on the network")
+    } else if LOW_FEE.iter().any(|s| lower.contains(s)) {
+        Some("fee too low — increase the fee and try again")
+    } else if MISSING_INPUTS.iter().any(|s| lower.contains(s)) {
+        Some("inputs missing or already spent — this transaction can't be sent")
+    } else if NON_FINAL.iter().any(|s| lower.contains(s)) {
+        Some("not final yet — try again once its timelock has passed")
+    } else {
+        None
+    }
+}
+
 /// Broadcast-failure sites see a stringified `app_core::Error` (workers
 /// already `.map_err(|e| format!("{e}"))` before crossing the thread
 /// boundary — see the `client.broadcast()` call sites). A TRANSPORT-class
@@ -2487,11 +2541,14 @@ mod net_err_tests {
 /// didn't reach a server) reads as raw reqwest text like `error sending
 /// request for url (...)`, which is Greek to a user on a weak connection;
 /// swap it for a plain-language message naming the node host instead.
-/// Anything else — a real server rejection (`Error::Http`, e.g. "400 Bad
-/// Request: ..."), a local build/sign error, ... — goes through
-/// [`friendly_net_err`] (a plain rejection like "400 Bad Request: foo"
-/// passes through that untouched too; it only bites on a 429 or a stray
-/// HTML body).
+/// A recognized rejection condition (U5: already-broadcast, fee too low, a
+/// missing input, a non-final locktime — [`map_broadcast_rejection`]) gets
+/// ONE calm phrase regardless of which backend produced it. Anything else
+/// — an unrecognized server rejection (`Error::Http`, e.g. "400 Bad
+/// Request: bad-txns-in-belowout"), a local build/sign error, ... — goes
+/// through [`friendly_net_err`] (a plain rejection like "400 Bad Request:
+/// foo" passes through that untouched too; it only bites on a 429 or a
+/// stray HTML body).
 ///
 /// Applied ONLY at user-facing `set_status`/toast broadcast-failure sites;
 /// every `cb:`/println! log line keeps the raw error verbatim (the
@@ -2499,7 +2556,10 @@ mod net_err_tests {
 fn friendly_broadcast_err(e: &str, base_url: &str) -> String {
     match e.strip_prefix("transport: ") {
         Some(_raw) => format!("network error reaching {} — check your connection", host_of(base_url)),
-        None => friendly_net_err(e),
+        None => match map_broadcast_rejection(e) {
+            Some(msg) => msg.to_string(),
+            None => friendly_net_err(e),
+        },
     }
 }
 
@@ -2535,6 +2595,65 @@ mod broadcast_err_tests {
     fn non_broadcast_errors_pass_through_untouched() {
         let e = "no signed PSBT";
         assert_eq!(friendly_broadcast_err(e, "https://mempool.space/api"), e);
+    }
+
+    /// U5 (plan §2.1/§2.4): the four common rejection categories must read
+    /// IDENTICALLY whether the raw text came from Core's short
+    /// `testmempoolaccept` reject-reason tokens or from a
+    /// `sendrawtransaction` RPC-error message forwarded verbatim — proving
+    /// the mapping is keyed on the CONDITION, not on which backend's exact
+    /// wording happened to arrive.
+    #[test]
+    fn already_broadcast_reads_identically_regardless_of_wording() {
+        let core_testmempoolaccept = "http: 400: txn-already-known";
+        let core_sendraw_rpc_error = "http: bitcoind [-27]: Transaction already in block chain";
+        let esplora_like = "http: 400 Bad Request: already in mempool";
+        let expected = "already broadcast — this transaction is already on the network";
+        assert_eq!(friendly_broadcast_err(core_testmempoolaccept, "bitcoind+http://127.0.0.1:8332"), expected);
+        assert_eq!(friendly_broadcast_err(core_sendraw_rpc_error, "bitcoind+http://127.0.0.1:8332"), expected);
+        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
+    }
+
+    #[test]
+    fn fee_too_low_reads_identically_regardless_of_wording() {
+        let core = "http: 400: min relay fee not met, 300 < 1000";
+        let esplora_like = "http: 400 Bad Request: insufficient fee, rejecting replacement";
+        let expected = "fee too low — increase the fee and try again";
+        assert_eq!(friendly_broadcast_err(core, "bitcoind+http://127.0.0.1:8332"), expected);
+        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
+    }
+
+    #[test]
+    fn missing_inputs_reads_identically_regardless_of_wording() {
+        let core = "http: 400: bad-txns-inputs-missingorspent";
+        let esplora_like = "http: 400 Bad Request: missing inputs";
+        let expected = "inputs missing or already spent — this transaction can't be sent";
+        assert_eq!(friendly_broadcast_err(core, "bitcoind+http://127.0.0.1:8332"), expected);
+        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
+    }
+
+    #[test]
+    fn non_final_reads_identically_regardless_of_wording() {
+        let core = "http: 400: non-final";
+        let esplora_like = "http: 400 Bad Request: transaction is not final";
+        let expected = "not final yet — try again once its timelock has passed";
+        assert_eq!(friendly_broadcast_err(core, "bitcoind+http://127.0.0.1:8332"), expected);
+        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
+    }
+
+    /// The pre-existing 429-in-a-fee-body guard ([`friendly_net_err`]'s own
+    /// `a_429_sat_amount_in_a_rejection_is_not_a_rate_limit` test) must
+    /// stay intact through this new layer too: a literal "429" sat amount
+    /// inside a min-relay-fee rejection must land on the FEE message, never
+    /// the "server is busy" one — `map_broadcast_rejection` runs BEFORE
+    /// `friendly_net_err`'s 429 check ever sees this text.
+    #[test]
+    fn a_429_sat_amount_in_a_fee_rejection_still_maps_to_fee_too_low_not_rate_limit() {
+        let e = "http: 400: sendrawtransaction min relay fee not met, 429 < 1000";
+        assert_eq!(
+            friendly_broadcast_err(e, "bitcoind+http://127.0.0.1:8332"),
+            "fee too low — increase the fee and try again"
+        );
     }
 }
 
