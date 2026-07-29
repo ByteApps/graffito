@@ -283,6 +283,16 @@ struct State {
     /// `Zeroizing` wipes the password on drop (switch flipped back to
     /// persist-on, replaced with new text, or process exit).
     core_rpc_session_creds: HashMap<String, (String, Zeroizing<String>)>,
+    /// U11 defense-in-depth: networks whose config.json node URL carried
+    /// inline `user:pass@` userinfo when it was LOADED (a hand-edited,
+    /// migrated, or pre-`on_set_node_custom`-stripping config) —
+    /// `migrate_inline_node_creds` stashes the creds into
+    /// `core_rpc_session_creds` at load time (safe: in-memory only) and
+    /// records the network here; `flush_core_rpc_migration` (called from
+    /// `refresh_node_health`, a Settings-only lazy point, NEVER the launch
+    /// path) routes them to the Keychain if this network's "Save
+    /// credentials" switch is on, exactly like a freshly typed credential.
+    core_rpc_migrate_pending: std::collections::HashSet<String>,
     /// Device-level note-size limit (config.json). Some = the user chose
     /// one in Settings; applied to every notebook's store on activate, so
     /// the wallet-level Settings pill really is wallet-wide. None = each
@@ -1252,6 +1262,7 @@ impl State {
             explorers,
             core_rpc_save_creds,
             core_rpc_session_creds,
+            core_rpc_migrate_pending: std::collections::HashSet::new(),
             chunk: None,
             lock_time_policy: Default::default(),
             ident: None,
@@ -2273,17 +2284,30 @@ fn update_node_backend_ui(w: &AppWindow, st: &State) {
 /// rescan (which must never be mistaken for an empty wallet) all get named
 /// explicitly. An all-clear reports the tip height so "it's actually
 /// talking to your node" is visible too.
+///
+/// `prune_height` of `0` (or absent while `pruned` is true) means the node
+/// is pruned-CAPABLE but hasn't actually deleted any blocks yet — a very
+/// common state right after `-prune` is turned on, since Core only starts
+/// deleting once it's past its target size. Telling the user "history
+/// before block 0 can't be recovered" there is nonsense (nothing is
+/// missing) and actively misleading, so that case gets an honest,
+/// non-alarming note instead of the strong warning; only a real nonzero
+/// prune height gets the "can't be recovered" wording and the warn tint.
 fn format_node_status(status: &NodeStatus) -> (String, bool) {
-    let mut parts = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     let mut warn = false;
     if status.pruned {
-        warn = true;
         match status.prune_height {
-            Some(h) => parts.push(format!(
-                "pruned below block {} — notes/history before it can't be recovered",
-                commas(h)
-            )),
-            None => parts.push("pruned — some history may be unavailable".to_string()),
+            Some(h) if h > 0 => {
+                warn = true;
+                parts.push(format!(
+                    "pruned below block {} — notes/history before it can't be recovered",
+                    commas(h)
+                ));
+            }
+            _ => parts.push(
+                "pruned-capable — nothing pruned yet, all history still available".to_string(),
+            ),
         }
     }
     if !status.txindex {
@@ -2301,7 +2325,13 @@ fn format_node_status(status: &NodeStatus) -> (String, bool) {
     if parts.is_empty() {
         parts.push(format!("connected · tip {}", commas(status.tip_height)));
     }
-    (parts.join(" · "), warn)
+    // `parts` never contains an empty string, but filter defensively so a
+    // future condition that pushes "" can never leave a dangling `· `
+    // separator in the joined caption.
+    (
+        parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · "),
+        warn,
+    )
 }
 
 /// Preflight a configured Bitcoin Core node (plan §2.2/§2.3/U4,
@@ -2311,8 +2341,13 @@ fn format_node_status(status: &NodeStatus) -> (String, bool) {
 /// Esplora base (`update_node_backend_ui` clears the health line and
 /// returns before any network call). Runs on a worker thread exactly like
 /// the account-picker's used/new probe (`show_notebook_picker`) — a
-/// one-off user-facing check, not a scan-lane job.
-fn refresh_node_health(w: &AppWindow, st: &State) {
+/// one-off user-facing check, not a scan-lane job. Also the U11 lazy point
+/// for `flush_core_rpc_migration` — a config.json loaded with an inline
+/// credential still on it (see `migrate_inline_node_creds`) gets that
+/// credential routed to the Keychain/session slot here, never on the
+/// launch path.
+fn refresh_node_health(w: &AppWindow, st: &mut State) {
+    flush_core_rpc_migration(st);
     update_node_backend_ui(w, st);
     let Some(base) = st.base_url() else { return };
     if !base.starts_with("bitcoind+") {
@@ -4317,12 +4352,91 @@ fn split_url_userinfo(url: &str) -> (String, Option<(String, String)>) {
     (format!("{scheme}{hostpart}"), creds)
 }
 
+/// U11 defense-in-depth: `on_set_node_custom`'s inline-userinfo stripping
+/// only ran on a URL typed/pasted THIS session — a `config.json` already
+/// on disk (hand-edited, migrated from an older build, or written before
+/// that stripping shipped) can still carry `bitcoind+http://user:pass@
+/// host:port` verbatim, and would otherwise be loaded, used, and displayed
+/// in the Settings field with the credential in plain sight. Applies
+/// [`split_url_userinfo`] to every entry of a just-loaded `node_urls` map,
+/// rewriting it in place to the creds-free form, and returns the
+/// `(network, user, pass)` triples found — in the SAME shape
+/// `on_set_node_custom` routes through `route_core_rpc_creds`, so the
+/// caller can treat a migrated credential exactly like a freshly typed
+/// one. Pure / host-testable; does not touch the Keychain (the boot path
+/// must make zero Keychain calls — see `flush_core_rpc_migration`).
+fn migrate_inline_node_creds(node_urls: &mut HashMap<String, String>) -> Vec<(String, String, String)> {
+    let mut found = Vec::new();
+    for (net, url) in node_urls.iter_mut() {
+        let (clean, creds) = split_url_userinfo(url);
+        if let Some((user, pass)) = creds {
+            found.push((net.clone(), user, pass));
+            *url = clean;
+        }
+    }
+    found
+}
+
+/// The Keychain-touching follow-through to [`migrate_inline_node_creds`]:
+/// route every network in `core_rpc_migrate_pending` to the Keychain (if
+/// that network's "Save credentials" switch is on) or leave it in the
+/// session-only slot (if it's off) — exactly like `on_set_node_custom`'s
+/// inline-creds branch, reusing the same [`route_core_rpc_creds`]. Called
+/// from `refresh_node_health`, which only ever runs from a Settings-screen
+/// UI callback — NEVER the launch path, so a migrated credential's
+/// Keychain write happens well after the first frame, never during boot
+/// (the same "defer to a lazy point" rule U6/U10 already follow for their
+/// own Keychain calls). A no-op (drains nothing) once the pending set is
+/// empty, so repeat calls from every `refresh_node_health` invocation cost
+/// nothing.
+fn flush_core_rpc_migration(s: &mut State) {
+    if s.core_rpc_migrate_pending.is_empty() {
+        return;
+    }
+    let pending: Vec<String> = s.core_rpc_migrate_pending.drain().collect();
+    for net in pending {
+        let Some((user, pass)) =
+            s.core_rpc_session_creds.get(&net).map(|(u, p)| (u.clone(), p.to_string()))
+        else {
+            continue;
+        };
+        let persist = core_rpc_persist_default_true(&s.core_rpc_save_creds, &net);
+        let net_for_store = net.clone();
+        let result = route_core_rpc_creds(
+            persist,
+            &net,
+            &user,
+            &pass,
+            &mut s.core_rpc_session_creds,
+            |u, p| keychain::store_rpc_creds(&net_for_store, u, p),
+            || Ok(()), // never reached: user/pass are non-empty by construction
+        );
+        match result {
+            Ok(()) => {
+                // route_core_rpc_creds only touches session_creds on the
+                // persist==false branch — a successful persist==true store
+                // leaves our load-time stash sitting in memory uselessly
+                // (never read once persisted — see `core_rpc_creds_for`),
+                // so drop it explicitly, same as `on_set_node_core_save_creds`
+                // does on its own ON transition.
+                if persist {
+                    s.core_rpc_session_creds.remove(&net);
+                }
+                println!("cb: core-rpc-migrate net={net} persist={persist} ok");
+            }
+            Err(e) => println!("cb: core-rpc-migrate net={net} persist={persist} err={e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod core_rpc_settings_tests {
     use super::{
-        apply_core_rpc_persist_toggle, core_rpc_persist_default_true, parse_core_rpc_save_creds,
-        resolve_core_rpc_creds, route_core_rpc_creds, split_url_userinfo, Network, State,
+        apply_core_rpc_persist_toggle, core_rpc_persist_default_true, format_node_status,
+        migrate_inline_node_creds, parse_core_rpc_save_creds, resolve_core_rpc_creds,
+        route_core_rpc_creds, split_url_userinfo, Network, State,
     };
+    use app_core::chain::NodeStatus;
     use std::cell::Cell;
     use std::collections::HashMap;
     use zeroize::Zeroizing;
@@ -4692,6 +4806,140 @@ mod core_rpc_settings_tests {
         assert!(text.contains("core_rpc_save_creds"));
         assert!(text.contains("testnet4"));
         assert!(text.contains("\"network\":\"testnet4\""));
+    }
+
+    // ---- U11: node-health caption copy (defect 2) ----
+
+    /// The exact nonsense the review caught: `prune_height` of `Some(0)`
+    /// used to render "pruned below block 0 — notes/history before it
+    /// can't be recovered", which claims something is unrecoverable when
+    /// NOTHING has actually been pruned yet. Zero must read as informational
+    /// (no warn tint), not the strong warning.
+    #[test]
+    fn prune_height_zero_is_not_alarming() {
+        let status = NodeStatus { pruned: true, prune_height: Some(0), txindex: true, ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(!warn, "prune height 0 must not set the warn tint: {text}");
+        assert!(!text.contains("can't be recovered"), "prune height 0 must not claim data is lost: {text}");
+        assert!(text.contains("nothing pruned"), "expected an honest not-yet-pruned note: {text}");
+    }
+
+    /// Same honesty rule for the ABSENT case (`prune_height: None` while
+    /// `pruned` is true) — bitcoind only populates `pruneheight` once it has
+    /// pruned at least once, so `None` means the same "nothing pruned yet"
+    /// state as `Some(0)`, never "unknown, assume the worst."
+    #[test]
+    fn prune_height_absent_is_not_alarming() {
+        let status = NodeStatus { pruned: true, prune_height: None, txindex: true, ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(!warn, "absent prune height must not set the warn tint: {text}");
+        assert!(!text.contains("can't be recovered"), "absent prune height must not claim data is lost: {text}");
+    }
+
+    /// A REAL nonzero prune height keeps the strong wording and the warn
+    /// tint — the fix must narrow the false-positive case, not silence the
+    /// real one.
+    #[test]
+    fn prune_height_nonzero_still_warns() {
+        let status = NodeStatus { pruned: true, prune_height: Some(500), txindex: true, ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(warn, "a real prune height must still warn: {text}");
+        assert!(text.contains("pruned below block 500"), "expected the real height named: {text}");
+        assert!(text.contains("can't be recovered"), "expected the strong wording for a real prune: {text}");
+    }
+
+    /// The exact scenario a locally-running pruned bitcoind hits moments
+    /// after `-prune` is turned on: pruned (height 0, not yet alarming) AND
+    /// no txindex (a real warning) in the SAME status. The overall `warn`
+    /// flag must still be true (txindex alone earns it), the join must not
+    /// leave a dangling `· ` separator, and the non-alarming prune note must
+    /// still be present alongside the real txindex warning.
+    #[test]
+    fn pruned_zero_plus_no_txindex_warns_from_txindex_only() {
+        let status = NodeStatus { pruned: true, prune_height: Some(0), txindex: false, ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(warn, "missing txindex alone must still warn: {text}");
+        assert!(text.contains("nothing pruned"));
+        assert!(text.contains("no txindex"));
+        assert!(!text.trim_end().ends_with('·'), "no dangling separator: {text:?}");
+        assert!(!text.contains("  "), "no doubled-up spacing from an empty joined part: {text:?}");
+    }
+
+    /// A fully healthy node — the "previously invisible" one-line case
+    /// (defect 1's UI symptom): no parts pushed at all, so the fallback
+    /// "connected · tip N" line is used, and it must never warn.
+    #[test]
+    fn healthy_node_reports_connected_and_never_warns() {
+        let status = NodeStatus { tip_height: 123_456, txindex: true, ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(!warn);
+        assert_eq!(text, "connected · tip 123,456");
+    }
+
+    /// A rescanning wallet must never look like a quiet/empty one — still
+    /// warns.
+    #[test]
+    fn wallet_scanning_warns() {
+        let status = NodeStatus { txindex: true, wallet_scanning: Some(true), ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(warn, "{text}");
+        assert!(text.contains("rescanning"));
+    }
+
+    // ---- U11: strip inline creds from a LOADED config.json (defect 3) ----
+
+    #[test]
+    fn migrate_strips_inline_creds_from_a_loaded_node_url() {
+        let mut node_urls = HashMap::new();
+        node_urls.insert(
+            "mainnet".to_string(),
+            "bitcoind+http://alice:s3cr3t@203.0.113.5:8332".to_string(),
+        );
+        let found = migrate_inline_node_creds(&mut node_urls);
+        assert_eq!(found, vec![("mainnet".to_string(), "alice".to_string(), "s3cr3t".to_string())]);
+        assert_eq!(node_urls.get("mainnet").map(String::as_str), Some("bitcoind+http://203.0.113.5:8332"));
+    }
+
+    #[test]
+    fn migrate_leaves_a_clean_loaded_url_untouched() {
+        let mut node_urls = HashMap::new();
+        node_urls.insert("testnet4".to_string(), "bitcoind+http://10.0.0.5:8332".to_string());
+        let found = migrate_inline_node_creds(&mut node_urls);
+        assert!(found.is_empty());
+        assert_eq!(node_urls.get("testnet4").map(String::as_str), Some("bitcoind+http://10.0.0.5:8332"));
+    }
+
+    #[test]
+    fn migrate_handles_multiple_networks_independently() {
+        let mut node_urls = HashMap::new();
+        node_urls.insert(
+            "mainnet".to_string(),
+            "bitcoind+http://alice:s3cr3t@203.0.113.5:8332".to_string(),
+        );
+        node_urls.insert("testnet4".to_string(), "https://mempool.example/api".to_string());
+        node_urls.insert(
+            "signet".to_string(),
+            "bitcoind+http://bob:hunter2@198.51.100.9:8332".to_string(),
+        );
+        let mut found = migrate_inline_node_creds(&mut node_urls);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("mainnet".to_string(), "alice".to_string(), "s3cr3t".to_string()),
+                ("signet".to_string(), "bob".to_string(), "hunter2".to_string()),
+            ]
+        );
+        assert_eq!(node_urls.get("mainnet").map(String::as_str), Some("bitcoind+http://203.0.113.5:8332"));
+        assert_eq!(node_urls.get("testnet4").map(String::as_str), Some("https://mempool.example/api"));
+        assert_eq!(node_urls.get("signet").map(String::as_str), Some("bitcoind+http://198.51.100.9:8332"));
+    }
+
+    #[test]
+    fn migrate_on_an_empty_map_is_a_noop() {
+        let mut node_urls: HashMap<String, String> = HashMap::new();
+        assert!(migrate_inline_node_creds(&mut node_urls).is_empty());
+        assert!(node_urls.is_empty());
     }
 }
 
@@ -10690,7 +10938,7 @@ pub fn run() {
             })
             .unwrap_or_default()
     };
-    let node_urls = str_map("nodes");
+    let mut node_urls = str_map("nodes");
     let explorers = str_map("explorers");
     // "Save credentials" switch per network (plan §2.4 / U10) — a preference,
     // not a secret, so it lives in config.json exactly like `nodes`/
@@ -10698,6 +10946,24 @@ pub fn run() {
     // network via `core_rpc_should_persist`'s default, so this map can stay
     // empty rather than needing every known network pre-filled.
     let core_rpc_save_creds = parse_core_rpc_save_creds(&config);
+    // U11 defense-in-depth: a `config.json` written by an older build (or
+    // hand-edited/migrated) can still carry `bitcoind+http://user:pass@
+    // host:port` verbatim — `on_set_node_custom`'s stripping only ever ran
+    // on a URL typed/pasted THIS session. Clean every loaded entry now; the
+    // extracted creds go straight into the in-memory session slot (safe,
+    // zero Keychain calls) and their network into
+    // `core_rpc_migrate_pending` for `flush_core_rpc_migration` to route to
+    // the Keychain LATER, from `refresh_node_health` — never here, or the
+    // boot/launch path would make a Keychain call (the exact mistake that
+    // crashed builds 42/44).
+    let migrated_core_rpc_creds = migrate_inline_node_creds(&mut node_urls);
+    let mut core_rpc_session_creds: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
+    let mut core_rpc_migrate_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (net, user, pass) in migrated_core_rpc_creds {
+        core_rpc_migrate_pending.insert(net.clone());
+        core_rpc_session_creds.insert(net, (user, Zeroizing::new(pass)));
+    }
+    let core_rpc_migrated = !core_rpc_migrate_pending.is_empty();
     let funding_wallets = load_funding_wallets(&data_dir);
     // Device-level contacts (iCloud-contacts feature): load or, on an
     // existing install's first boot under this scheme, migrate from every
@@ -10716,7 +10982,8 @@ pub fn run() {
         node_urls,
         explorers,
         core_rpc_save_creds,
-        core_rpc_session_creds: HashMap::new(),
+        core_rpc_session_creds,
+        core_rpc_migrate_pending,
         ident: None,
         store: None,
         fees: None,
@@ -10785,6 +11052,16 @@ pub fn run() {
         // see the sync-status init just after this block.
         last_sync: std::cell::Cell::new(SyncStatus::Unknown),
     }));
+    // U11 defense-in-depth, continued: `node_urls` above was already
+    // cleaned of inline creds before `State` was built, but the ON-DISK
+    // config.json still has the old (credential-carrying) text until it's
+    // rewritten — do that now. A plain file write, not a Keychain/network
+    // call, so it's safe on the launch path; the Keychain side
+    // (`flush_core_rpc_migration`) is deliberately NOT called here.
+    if core_rpc_migrated {
+        st.borrow().save_config();
+        println!("cb: core-rpc-migrate config-resaved");
+    }
     // Contacts boot sequence (iCloud-contacts feature): persist a fresh
     // migration (so `contacts.json` exists from here on and the union is
     // never redone), then merge in whatever the OTHER device last synced to
@@ -14909,7 +15186,7 @@ pub fn run() {
         w.set_status("".into());
         w.set_chunk_custom(false);
         load_backend_settings(&w, &s);
-        refresh_node_health(&w, &s);
+        refresh_node_health(&w, &mut s);
         // Settings shows identity/network/note-size fields that used to be set
         // only by update_home; onboarding now lands on the list (not a home),
         // so populate them here too or the "Change account…" row (gated on
@@ -15269,7 +15546,7 @@ pub fn run() {
         // Every preset is Esplora — this both clears a previously-active
         // Core node's credential fields/health line and is a no-op (no
         // network call) whenever the picker was already on Esplora.
-        refresh_node_health(&w, &s);
+        refresh_node_health(&w, &mut s);
     });
 
     cb!(on_set_node_custom, |w, s, t: SharedString| {
@@ -15310,7 +15587,7 @@ pub fn run() {
             }
         }
         w.set_status("".into());
-        refresh_node_health(&w, &s);
+        refresh_node_health(&w, &mut s);
     });
 
     // Bitcoin Core RPC credentials (plan §2.4/U6, extended by U10's "Save
@@ -15345,7 +15622,7 @@ pub fn run() {
             Err(e) => println!("cb: set-node-core-creds err={e}"),
         }
         w.set_status(if result.is_ok() { "".into() } else { "couldn't save RPC credentials".into() });
-        refresh_node_health(&w, &s);
+        refresh_node_health(&w, &mut s);
     });
 
     // "Save credentials" switch (plan §2.4 / U10): default ON, so nobody who
@@ -15390,7 +15667,7 @@ pub fn run() {
             }
         }
         update_node_backend_ui(&w, &s);
-        refresh_node_health(&w, &s);
+        refresh_node_health(&w, &mut s);
     });
 
     cb!(on_set_explorer_preset, |w, s, i: i32| {
