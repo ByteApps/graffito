@@ -45,6 +45,10 @@ const ERR_CANCELED: i32 = -128; // errSecUserCanceled
 /// WOULD need authentication and we forbade the UI. For an existence check
 /// this is a positive answer: the item is there, it just needs a prompt.
 const ERR_INTERACTION_NOT_ALLOWED: i32 = -25308;
+/// errSecMissingEntitlement — an unsigned dev build asking for the
+/// data-protection keychain. Never a failure when walking KEYCHAIN_DOMAINS,
+/// just "that domain isn't available to this binary"; keep looking.
+const ERR_MISSING_ENTITLEMENT: i32 = -34018;
 
 /// Set whenever the key is written to, or read from, the ungated `#la`
 /// fallback item instead of an OS-protected one (audit M2).
@@ -86,6 +90,48 @@ fn base_query(account: &str) -> Vec<(CFString, CFType)> {
         (key(unsafe { kSecAttrService }), CFString::new(SERVICE).as_CFType()),
         (key(unsafe { kSecAttrAccount }), CFString::new(account).as_CFType()),
     ]
+}
+
+/// macOS has **TWO** keychains, and an item's SHAPE silently decides which one
+/// it lands in: `kSecAttrAccessControl` (the protected shape) forces the
+/// data-protection keychain, while `set_generic_password` and any query that
+/// does not pass `kSecUseDataProtectionKeychain` address the legacy file-based
+/// one. A query only ever searches ONE of them.
+///
+/// That asymmetry is a real bug, found 2026-07-28 by running `--spike
+/// keychain-atomic` on a SIGNED macOS build for the first time: the add landed
+/// a protected item in the data-protection keychain, and every later probe —
+/// `item_exists`, `is_synced`, `read_account`, and the `SecItemDelete` in
+/// `purge_account` — looked in the file-based one and got `errSecItemNotFound`
+/// (-25300). Consequences were: the boot probe reporting no saved key (so
+/// onboarding never offered "Restore saved key"), staging recovery missing its
+/// copy, and — worst — reset-identity NOT deleting a protected key at all.
+///
+/// **iOS has only the data-protection keychain**, so a single pass is correct
+/// there and the whole class of bug is invisible — which is exactly how it
+/// shipped. Note this also explains -25300 rather than the -25308 the
+/// `kSecUseAuthenticationUIFail` reasoning predicted: the item was never
+/// matched at all, so its access control was never evaluated.
+///
+/// So every READ, EXISTENCE and DELETE walks both domains. Adds are
+/// deliberately NOT changed: their current placement works, and searching both
+/// domains is strictly additive — it can only find MORE items, never fewer, so
+/// no item that is reachable today becomes unreachable.
+#[cfg(target_os = "macos")]
+const KEYCHAIN_DOMAINS: [bool; 2] = [true, false];
+#[cfg(not(target_os = "macos"))]
+const KEYCHAIN_DOMAINS: [bool; 1] = [false];
+
+/// Target the data-protection keychain for this query. No-op when false, which
+/// leaves the query addressing macOS's legacy file-based keychain (and is the
+/// only meaningful setting on iOS, where the flag is redundant).
+fn push_domain(pairs: &mut Vec<(CFString, CFType)>, data_protection: bool) {
+    if data_protection {
+        pairs.push((
+            key(unsafe { kSecUseDataProtectionKeychain }),
+            CFBoolean::true_value().as_CFType(),
+        ));
+    }
 }
 
 /// OS-level check that the device owner is present (Touch ID or account
@@ -211,44 +257,57 @@ fn add_item(account: &str, secret: &str, synced: bool) -> Result<bool, String> {
 /// user mid-import.
 fn item_exists(account: &str) -> bool {
     for acct in [account.to_string(), la_account(account)] {
-        let mut pairs = base_query(&acct);
-        pairs.push((
-            key(unsafe { kSecAttrSynchronizable }),
-            key(unsafe { kSecAttrSynchronizableAny }).as_CFType(),
-        ));
-        pairs.push((
-            key(unsafe { kSecReturnAttributes }),
-            CFBoolean::true_value().as_CFType(),
-        ));
-        // THE LOAD-BEARING LINE. Asking for attributes only does NOT avoid
-        // authentication: SecItemCopyMatching evaluates the item's access
-        // control to decide whether it MATCHES, so a UserPresence item drags
-        // in SecItemAuthDoQuery -> LAContext and blocks on an XPC round-trip
-        // no matter what you asked it to return. That is what killed build 44
-        // on launch (0x8BADF00D, 20 s wall clock, 0.095 s CPU). Forbidding the
-        // UI makes the query answer immediately with
-        // errSecInteractionNotAllowed, which is itself the "yes, it exists"
-        // signal we want. Do not remove this believing attributes are safe —
-        // an unsigned dev build cannot reproduce it, because its fallback item
-        // carries no ACL at all.
-        pairs.push((
-            key(unsafe { kSecUseAuthenticationUI }),
-            key(unsafe { kSecUseAuthenticationUIFail }).as_CFType(),
-        ));
-        let dict = CFDictionary::from_CFType_pairs(&pairs);
-        let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
-        let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
-        if !result.is_null() {
-            // Release the attribute dictionary we only needed to exist.
-            unsafe { CFType::wrap_under_create_rule(result) };
-        }
-        // 0 = present and readable without auth (plain/synced shapes).
-        // -25308 = present but gated — still present, which is the question.
-        if status == 0 || status == ERR_INTERACTION_NOT_ALLOWED {
-            return true;
+        for dp in KEYCHAIN_DOMAINS {
+            let status = probe_item(&acct, dp);
+            // 0 = present and readable without auth (plain/synced shapes).
+            // -25308 = present but gated — still present, which is the question.
+            // Anything else (notably -25300, "not in THIS keychain") just means
+            // keep looking; see KEYCHAIN_DOMAINS.
+            if status == 0 || status == ERR_INTERACTION_NOT_ALLOWED {
+                return true;
+            }
         }
     }
     false
+}
+
+/// One existence probe, against one account shape in one keychain domain.
+/// Returns the raw `OSStatus` so the caller can tell "present but gated" from
+/// "not in this keychain".
+fn probe_item(account: &str, data_protection: bool) -> i32 {
+    let mut pairs = base_query(account);
+    pairs.push((
+        key(unsafe { kSecAttrSynchronizable }),
+        key(unsafe { kSecAttrSynchronizableAny }).as_CFType(),
+    ));
+    pairs.push((
+        key(unsafe { kSecReturnAttributes }),
+        CFBoolean::true_value().as_CFType(),
+    ));
+    // THE LOAD-BEARING LINE. Asking for attributes only does NOT avoid
+    // authentication: SecItemCopyMatching evaluates the item's access
+    // control to decide whether it MATCHES, so a UserPresence item drags
+    // in SecItemAuthDoQuery -> LAContext and blocks on an XPC round-trip
+    // no matter what you asked it to return. That is what killed build 44
+    // on launch (0x8BADF00D, 20 s wall clock, 0.095 s CPU). Forbidding the
+    // UI makes the query answer immediately with
+    // errSecInteractionNotAllowed, which is itself the "yes, it exists"
+    // signal we want. Do not remove this believing attributes are safe —
+    // an unsigned dev build cannot reproduce it, because its fallback item
+    // carries no ACL at all.
+    pairs.push((
+        key(unsafe { kSecUseAuthenticationUI }),
+        key(unsafe { kSecUseAuthenticationUIFail }).as_CFType(),
+    ));
+    push_domain(&mut pairs, data_protection);
+    let dict = CFDictionary::from_CFType_pairs(&pairs);
+    let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
+    let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
+    if !result.is_null() {
+        // Release the attribute dictionary we only needed to exist.
+        unsafe { CFType::wrap_under_create_rule(result) };
+    }
+    status
 }
 
 /// Is there a saved identity to restore — WITHOUT unlocking it?
@@ -362,6 +421,10 @@ pub fn icloud_available() -> bool {
 
 /// Does an iCloud-synced item exist for this account?
 pub fn is_synced(account: &str) -> bool {
+    KEYCHAIN_DOMAINS.iter().any(|&dp| is_synced_in(account, dp))
+}
+
+fn is_synced_in(account: &str, dp: bool) -> bool {
     let mut pairs = base_query(account);
     pairs.push((
         key(unsafe { kSecAttrSynchronizable }),
@@ -376,6 +439,7 @@ pub fn is_synced(account: &str) -> bool {
         key(unsafe { kSecUseAuthenticationUI }),
         key(unsafe { kSecUseAuthenticationUIFail }).as_CFType(),
     ));
+    push_domain(&mut pairs, dp);
     let dict = CFDictionary::from_CFType_pairs(&pairs);
     let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
     let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
@@ -388,23 +452,31 @@ pub fn is_synced(account: &str) -> bool {
 
 /// Read the synced item (no biometric ACL — caller gates auth if needed).
 fn read_synced(account: &str) -> Result<Option<String>, String> {
-    let mut pairs = base_query(account);
-    pairs.push((
-        key(unsafe { kSecAttrSynchronizable }),
-        CFBoolean::true_value().as_CFType(),
-    ));
-    pairs.push((key(unsafe { kSecReturnData }), CFBoolean::true_value().as_CFType()));
-    let dict = CFDictionary::from_CFType_pairs(&pairs);
-    let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
-    let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
-    match status {
-        0 => {
-            let data = unsafe { CFData::wrap_under_create_rule(result as _) };
-            String::from_utf8(data.bytes().to_vec()).map(Some).map_err(|e| e.to_string())
+    for dp in KEYCHAIN_DOMAINS {
+        let mut pairs = base_query(account);
+        pairs.push((
+            key(unsafe { kSecAttrSynchronizable }),
+            CFBoolean::true_value().as_CFType(),
+        ));
+        pairs.push((key(unsafe { kSecReturnData }), CFBoolean::true_value().as_CFType()));
+        push_domain(&mut pairs, dp);
+        let dict = CFDictionary::from_CFType_pairs(&pairs);
+        let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
+        match status {
+            0 => {
+                let data = unsafe { CFData::wrap_under_create_rule(result as _) };
+                return String::from_utf8(data.bytes().to_vec())
+                    .map(Some)
+                    .map_err(|e| e.to_string());
+            }
+            // Not in THIS keychain, or this keychain isn't ours to search —
+            // try the other domain before concluding.
+            ERR_NOT_FOUND | ERR_MISSING_ENTITLEMENT => continue,
+            other => return Err(format!("SecItemCopyMatching(sync) failed ({other})")),
         }
-        ERR_NOT_FOUND => Ok(None),
-        other => Err(format!("SecItemCopyMatching(sync) failed ({other})")),
     }
+    Ok(None)
 }
 
 /// Read whatever is stored under exactly `account`. No staging recovery —
@@ -418,15 +490,30 @@ fn read_account(account: &str, prompt: &str) -> Result<Option<String>, String> {
     if is_synced(account) {
         return read_synced(account);
     }
-    let mut pairs = base_query(account);
-    pairs.push((key(unsafe { kSecReturnData }), CFBoolean::true_value().as_CFType()));
-    pairs.push((
-        key(unsafe { kSecUseOperationPrompt }),
-        CFString::new(prompt).as_CFType(),
-    ));
-    let dict = CFDictionary::from_CFType_pairs(&pairs);
+    // Walk both macOS keychain domains before giving up: the protected shape
+    // lives in the data-protection keychain, the `#la` fallback in the
+    // file-based one (see KEYCHAIN_DOMAINS). Only once every domain has missed
+    // does the `#la` fallback below apply.
+    let mut status = ERR_NOT_FOUND;
     let mut result: core_foundation_sys::base::CFTypeRef = std::ptr::null();
-    let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
+    for dp in KEYCHAIN_DOMAINS {
+        let mut pairs = base_query(account);
+        pairs.push((key(unsafe { kSecReturnData }), CFBoolean::true_value().as_CFType()));
+        pairs.push((
+            key(unsafe { kSecUseOperationPrompt }),
+            CFString::new(prompt).as_CFType(),
+        ));
+        push_domain(&mut pairs, dp);
+        let dict = CFDictionary::from_CFType_pairs(&pairs);
+        result = std::ptr::null();
+        status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
+        // -25300 ("not in this keychain") and -34018 ("this keychain isn't
+        // ours") both mean keep looking; every other status — including a
+        // cancelled prompt — is a real answer about the item we were after.
+        if status != ERR_NOT_FOUND && status != ERR_MISSING_ENTITLEMENT {
+            break;
+        }
+    }
     match status {
         0 => {
             let data = unsafe { CFData::wrap_under_create_rule(result as _) };
@@ -524,16 +611,21 @@ pub fn reveal_secret(account: &str, prompt: &str) -> Result<Option<String>, Stri
 /// Does NOT touch the staging account: [`store_secret_protected`]'s phase 2
 /// depends on staging surviving this call.
 fn purge_account(account: &str) -> Result<(), String> {
-    // synchronizable=Any removes both the local (ACL) item and any synced one.
-    let mut pairs = base_query(account);
-    pairs.push((
-        key(unsafe { kSecAttrSynchronizable }),
-        key(unsafe { kSecAttrSynchronizableAny }).as_CFType(),
-    ));
-    let dict = CFDictionary::from_CFType_pairs(&pairs);
-    let status = unsafe { SecItemDelete(dict.as_concrete_TypeRef()) };
-    if status != 0 && status != ERR_NOT_FOUND {
-        return Err(format!("SecItemDelete failed ({status})"));
+    // synchronizable=Any removes both the local (ACL) item and any synced one —
+    // and BOTH macOS keychains, or a protected key survives reset-identity
+    // entirely (see KEYCHAIN_DOMAINS; this was live on macOS until 2026-07-28).
+    for dp in KEYCHAIN_DOMAINS {
+        let mut pairs = base_query(account);
+        pairs.push((
+            key(unsafe { kSecAttrSynchronizable }),
+            key(unsafe { kSecAttrSynchronizableAny }).as_CFType(),
+        ));
+        push_domain(&mut pairs, dp);
+        let dict = CFDictionary::from_CFType_pairs(&pairs);
+        let status = unsafe { SecItemDelete(dict.as_concrete_TypeRef()) };
+        if status != 0 && status != ERR_NOT_FOUND && status != ERR_MISSING_ENTITLEMENT {
+            return Err(format!("SecItemDelete failed ({status})"));
+        }
     }
     for acct in [account.to_string(), la_account(account)] {
         match delete_generic_password(SERVICE, &acct) {
