@@ -1225,3 +1225,75 @@ fn core_rpc_invalid_address_reads_as_never_used_not_error() {
 
     eprintln!("core_rpc_invalid_address_reads_as_never_used_not_error: PASS (datadir {:?})", node.datadir);
 }
+
+/// U7: `/v1/fees/recommended` against a REAL, freshly-started regtest node
+/// — which is exactly the "`estimatesmartfee` genuinely has nothing to
+/// estimate from" case the plan calls out by name (a brand-new regtest
+/// chain has coinbase-only blocks, never a real fee market), so this
+/// exercises the fallback path for real rather than merely asserting a
+/// mock never called. A live assertion, not a "did it not crash" smoke
+/// test: every tier must be present, non-zero, correctly ORDERED
+/// (fastest >= half_hour >= hour >= economy — the U7 ordering invariant),
+/// and `minimumFee` must reflect this node's OWN live
+/// `getmempoolinfo().mempoolminfee` (a plain regtest node's default, 1
+/// sat/vB) rather than a hardcoded stand-in.
+#[test]
+fn core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    let node = start_node();
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+    let client = ChainClient::new(transport, Network::Regtest);
+
+    // Independently confirm THIS node's `estimatesmartfee` really has
+    // nothing to estimate from right now — if a future bitcoind version
+    // ever changes that, this test should fail loudly here (with a clear
+    // reason) rather than silently exercising the "happy path" instead of
+    // the fallback path it claims to.
+    let estimate = node.rpc(None, "estimatesmartfee", serde_json::json!([1]));
+    assert!(
+        estimate.get("feerate").is_none(),
+        "expected a fresh regtest node to have no fee estimate yet, got {estimate:?}"
+    );
+
+    let fees = client.fee_rates().expect("fee_rates");
+
+    assert!(fees.fastest >= fees.half_hour, "fastest {} must be >= half_hour {}", fees.fastest, fees.half_hour);
+    assert!(fees.half_hour >= fees.hour, "half_hour {} must be >= hour {}", fees.half_hour, fees.hour);
+    assert!(fees.hour >= fees.economy, "hour {} must be >= economy {}", fees.hour, fees.economy);
+    assert!(fees.economy >= 1.0, "economy fee must never be zero (or negative), got {}", fees.economy);
+    assert!(
+        fees.fastest < 1000.0,
+        "fastest fallback must stay sane, nowhere near a real fee-spike rate: {}",
+        fees.fastest
+    );
+
+    // The node's own relay floor, read independently via `getmempoolinfo`
+    // (never trusting this driver's own conversion helper — the whole
+    // point is proving the ROUTE reads it from the live node) — a plain
+    // regtest node with no mempool pressure reports the network default,
+    // 0.00001 BTC/kvB = 1 sat/vB.
+    let mempool_info = node.rpc(None, "getmempoolinfo", serde_json::json!([]));
+    let relay_min_btc_per_kvb =
+        mempool_info.get("mempoolminfee").and_then(|v| v.as_f64()).expect("getmempoolinfo: no mempoolminfee");
+    let relay_min_sat_vb = (relay_min_btc_per_kvb * 100_000.0).ceil().max(1.0);
+    assert_eq!(
+        fees.minimum, relay_min_sat_vb,
+        "minimumFee must equal this node's own live relay minimum, not a hardcoded stand-in"
+    );
+    // Every tier must be AT LEAST the node's real relay floor — a composed
+    // tx built at any tier's rate must never fall below what this node
+    // will actually accept.
+    assert!(fees.economy >= relay_min_sat_vb, "economy {} must be >= relay minimum {relay_min_sat_vb}", fees.economy);
+
+    eprintln!(
+        "core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history: PASS \
+         (fees={fees:?}, relay_min_sat_vb={relay_min_sat_vb}, datadir {:?})",
+        node.datadir
+    );
+}

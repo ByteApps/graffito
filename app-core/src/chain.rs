@@ -1491,34 +1491,141 @@ impl CoreRpcTransport {
         Ok(serde_json::to_string(&items).unwrap())
     }
 
-    /// `GET /v1/fees/recommended` → `estimatesmartfee` for 1/3/6/144
-    /// blocks, BTC/kvB → sat/vB (`* 100_000`, ceil, floor 1). Regtest (and
-    /// any node with too little fee history) always fails to estimate —
-    /// verified live (`estimatesmartfee` returns an `errors` array with no
-    /// `feerate` field, not an RPC error) — so each tier independently
-    /// falls back to a fixed sat/vB rather than propagating an error, per
-    /// the plan's "callers must never see this break" rule. Fee *policy*
-    /// (tier selection, rounding strategy) is U7; this is just "always
-    /// answer with the right shape."
+    /// `GET /v1/fees/recommended` → `estimatesmartfee` for 1/3/6/144 blocks
+    /// (`fastestFee`/`halfHourFee`/`hourFee`/`economyFee`), clamped to the
+    /// node's own live relay minimum (`minimumFee`, from
+    /// `getmempoolinfo().mempoolminfee`) and forced non-increasing across
+    /// tiers (U7, `PLAN-chain-notes-app-core-rpc.md` §2.6).
+    ///
+    /// **Units, audited explicitly — this is the single most damaging bug
+    /// this route could ship.** `estimatesmartfee`'s `feerate` is BTC per
+    /// **kilo-virtual-byte**; every `FeeRates` field in this crate is
+    /// **sat/vB**. The conversion is `btc_per_kvb * 100_000_000 (sat/BTC) /
+    /// 1000 (vB/kvB)`, i.e. `* 100_000` — done in [`btc_per_kvb_to_sat_vb`],
+    /// which carries its own table-driven test vectors
+    /// (`btc_per_kvb_to_sat_vb_matches_known_vectors`) precisely so a
+    /// reviewer's mutation to that one constant (a 1000× error either
+    /// direction — `* 100.0` or `* 100_000_000.0` — is the obvious one to
+    /// try) fails a test outright instead of only showing up as "fees look
+    /// weird" in the UI.
+    ///
+    /// Regtest (and any node with too little fee history) always fails to
+    /// estimate — verified live (`estimatesmartfee` returns an `errors`
+    /// array with no `feerate` field, not an RPC error) — so each tier
+    /// independently falls back to a fixed sat/vB constant
+    /// ([`FASTEST_FALLBACK_SAT_VB`] etc.) rather than propagating an error,
+    /// per the plan's "callers must never see this break" rule. Those
+    /// constants are deliberately NOT all equal to the network's default
+    /// 1 sat/vB relay floor — they descend (3/2/1/1) so the fallback shape
+    /// still reads as "an estimate", never a flat line that would look like
+    /// this route silently broke, while staying nowhere near a real
+    /// mempool spike (see their own doc comments for the exact reasoning).
+    ///
+    /// Two things happen to every value (real estimate OR fallback) AFTER
+    /// tier selection, via [`clamp_fee_tiers`]:
+    ///
+    /// 1. **Floored to the node's live relay minimum.** A composed tx must
+    ///    never be built below what THIS node will actually accept — the
+    ///    hardcoded `"minimumFee": 1` this route used to answer with was
+    ///    silently wrong on any node configured with a higher
+    ///    `-minrelaytxfee`, or one under enough mempool pressure that
+    ///    `mempoolminfee` has risen dynamically above the static floor.
+    /// 2. **Forced non-increasing**, `fastest >= half_hour >= hour >=
+    ///    economy`. Required because each tier's estimate/fallback is
+    ///    chosen INDEPENDENTLY of its neighbors: a tier that got a real
+    ///    (volatile) estimate can otherwise sit below an adjacent tier that
+    ///    fell back to a stale constant, producing a `FeeRates` whose shape
+    ///    every caller (this crate's fee-tier UI included) reasonably
+    ///    assumes is sorted.
     fn fee_estimates_route(&self) -> Result<String, Error> {
         let sat_vb = |blocks: u64| -> Option<u64> {
             let v = self.rpc(None, "estimatesmartfee", serde_json::json!([blocks])).ok()?;
             let btc_per_kvb = v.get("feerate")?.as_f64()?;
-            Some(((btc_per_kvb * 100_000.0).ceil() as u64).max(1))
+            Some(btc_per_kvb_to_sat_vb(btc_per_kvb))
         };
-        let fastest = sat_vb(1).unwrap_or(3);
-        let half_hour = sat_vb(3).unwrap_or(2);
-        let hour = sat_vb(6).unwrap_or(1);
-        let economy = sat_vb(144).unwrap_or(1);
+        // The node's own relay floor — `mempoolminfee` is documented as the
+        // HIGHER of the static `-minrelaytxfee` and any dynamic
+        // mempool-pressure minimum, so it is the one number that answers
+        // "what is the least this node will relay right now." A failure
+        // here (RPC error, missing field) falls back to the network's
+        // universal default of 1 sat/vB — never 0, which would make the
+        // floor a no-op and let a degenerate real estimate of 0.0 through.
+        let relay_min = self
+            .rpc(None, "getmempoolinfo", serde_json::json!([]))
+            .ok()
+            .and_then(|v| v.get("mempoolminfee").and_then(|f| f.as_f64()))
+            .map(btc_per_kvb_to_sat_vb)
+            .unwrap_or(1);
+        let fastest = sat_vb(1).unwrap_or(FASTEST_FALLBACK_SAT_VB);
+        let half_hour = sat_vb(3).unwrap_or(HALF_HOUR_FALLBACK_SAT_VB);
+        let hour = sat_vb(6).unwrap_or(HOUR_FALLBACK_SAT_VB);
+        let economy = sat_vb(144).unwrap_or(ECONOMY_FALLBACK_SAT_VB);
+        let (fastest, half_hour, hour, economy) = clamp_fee_tiers(fastest, half_hour, hour, economy, relay_min);
         Ok(serde_json::json!({
             "fastestFee": fastest,
             "halfHourFee": half_hour,
             "hourFee": hour,
             "economyFee": economy,
-            "minimumFee": 1,
+            "minimumFee": relay_min,
         })
         .to_string())
     }
+}
+
+/// `10^8` sat/BTC ÷ `10^3` vB/kvB — see [`btc_per_kvb_to_sat_vb`]'s doc
+/// comment for why this exact constant is the entire ballgame.
+const SAT_VB_PER_BTC_PER_KVB: f64 = 100_000.0;
+
+/// BTC/kvB (`estimatesmartfee`'s and `getmempoolinfo`'s native unit) →
+/// sat/vB (every `FeeRates` field in this crate). Rounds UP
+/// (`.ceil()`) — rounding DOWN a genuine 1.4 sat/vB estimate to 1 could
+/// compose a tx that pays less than the rate it was estimated at, risking
+/// a slow confirmation or, at the relay-floor boundary, outright
+/// rejection; overpaying by a fraction of a sat/vB is the safe direction
+/// to round. `.max(1)` is a belt-and-braces floor for a degenerate `0.0`
+/// input (a node that answered but reported no real fee) — the
+/// AUTHORITATIVE relay-minimum floor is applied separately, from the live
+/// node, in [`clamp_fee_tiers`]; this local floor exists only so this
+/// function alone never returns a nonsensical 0.
+fn btc_per_kvb_to_sat_vb(btc_per_kvb: f64) -> u64 {
+    ((btc_per_kvb * SAT_VB_PER_BTC_PER_KVB).ceil() as u64).max(1)
+}
+
+/// Fallback sat/vB for the ~1-block tier when `estimatesmartfee` has
+/// nothing to estimate from. Deliberately just above the relay floor and
+/// the highest of the four fallbacks (never absurd — nowhere near a real
+/// mainnet fee spike — but visibly "the urgent one" so the fallback shape
+/// alone doesn't read as a flat, broken line).
+const FASTEST_FALLBACK_SAT_VB: u64 = 3;
+/// Fallback sat/vB for the ~3-block tier — see [`FASTEST_FALLBACK_SAT_VB`].
+const HALF_HOUR_FALLBACK_SAT_VB: u64 = 2;
+/// Fallback sat/vB for the ~6-block tier — the network's de-facto default
+/// relay rate. See [`FASTEST_FALLBACK_SAT_VB`].
+const HOUR_FALLBACK_SAT_VB: u64 = 1;
+/// Fallback sat/vB for the ~144-block (economy) tier — never below 1
+/// (never zero; a zero-fee tx does not relay at all). See
+/// [`FASTEST_FALLBACK_SAT_VB`].
+const ECONOMY_FALLBACK_SAT_VB: u64 = 1;
+
+/// Forces `fastest >= half_hour >= hour >= economy >= floor` — see
+/// [`CoreRpcTransport::fee_estimates_route`]'s doc comment for why this is
+/// necessary even though `estimatesmartfee` itself is monotonic per
+/// confirmation target: each tier passed in here was chosen independently
+/// (real estimate OR fallback), so a real, volatile value in one tier and
+/// a stale fallback in an adjacent one can otherwise cross.
+///
+/// Order of operations matters and is deliberate: the descending clamp
+/// (`half_hour.min(fastest)`, etc.) runs FIRST, then `floor` is applied via
+/// `.max(floor)` to every already-ordered value. `max` is a monotonic
+/// function of its first argument, so applying it independently to an
+/// already-descending sequence cannot un-sort it — doing the floor first
+/// (or interleaved) could let a tier that needed raising up to the floor
+/// end up ABOVE a neighbor that didn't.
+fn clamp_fee_tiers(fastest: u64, half_hour: u64, hour: u64, economy: u64, floor: u64) -> (u64, u64, u64, u64) {
+    let half_hour = half_hour.min(fastest);
+    let hour = hour.min(half_hour);
+    let economy = economy.min(hour);
+    (fastest.max(floor), half_hour.max(floor), hour.max(floor), economy.max(floor))
 }
 
 impl Transport for CoreRpcTransport {
@@ -3730,5 +3837,156 @@ mod tests {
                 mempool_spent: 0,
             }
         );
+    }
+
+    // ---- U7: fee-tier unit conversion + policy (plan §2.6) ----
+
+    /// The whole ballgame: BTC/kvB → sat/vB is `* 100_000`
+    /// (`10^8` sat/BTC ÷ `10^3` vB/kvB). Every vector here is a KNOWN input
+    /// with an independently-computed expected output — a reviewer who
+    /// mutates [`SAT_VB_PER_BTC_PER_KVB`] by a factor of 1000 in EITHER
+    /// direction (the obvious mistakes: `100.0`, forgetting the sats-per-BTC
+    /// scale, or `100_000_000.0`, forgetting the kvB-per-vB scale) fails
+    /// every non-zero-input case below, not just "looks off by eye".
+    #[test]
+    fn btc_per_kvb_to_sat_vb_matches_known_vectors() {
+        let cases: &[(f64, u64)] = &[
+            // A realistic mainnet-shaped moderate fee: 0.00010000 BTC/kvB
+            // (bitcoind's canonical "10 sat/vB" shape).
+            (0.00010000, 10),
+            // A realistic mainnet-shaped HIGH fee (fee-spike territory):
+            // 0.00050000 BTC/kvB -> 50 sat/vB.
+            (0.00050000, 50),
+            // The network's de-facto default relay minimum: 0.00001000
+            // BTC/kvB (1000 sat/kvB) -> exactly 1 sat/vB, the floor
+            // boundary itself, not just something safely above it.
+            (0.00001000, 1),
+            // A very low but non-degenerate rate that lands EXACTLY on an
+            // integer sat/vB after scaling — 0.00000500 BTC/kvB -> 0.5
+            // sat/vB pre-ceiling -> ceils UP to 1, never down to 0.
+            (0.00000500, 1),
+            // Rounding-edge case: 0.000015 BTC/kvB scales to EXACTLY 1.5
+            // sat/vB — proves `.ceil()`, not `.round()` (which would give
+            // 2 here too, so pair with the next case to actually
+            // distinguish) or truncation (which would wrongly give 1).
+            (0.000015, 2),
+            // A DIFFERENT rounding-edge case that `.round()` would get
+            // WRONG (rounds down to 1) but `.ceil()` gets right (2) —
+            // 0.0000101 BTC/kvB scales to 1.01 sat/vB, just barely over 1.
+            (0.0000101, 2),
+            // Degenerate zero input (a node that answered with a real
+            // `feerate: 0.0`, or the relay-min lookup itself returning
+            // nothing sane) must never produce a 0 sat/vB tier.
+            (0.0, 1),
+        ];
+        for &(btc_per_kvb, expected_sat_vb) in cases {
+            assert_eq!(
+                btc_per_kvb_to_sat_vb(btc_per_kvb),
+                expected_sat_vb,
+                "btc_per_kvb_to_sat_vb({btc_per_kvb}) should be {expected_sat_vb} sat/vB \
+                 (a 1000x unit error would give {} or {})",
+                (btc_per_kvb * 100.0).ceil() as u64,
+                (btc_per_kvb * 100_000_000.0).ceil() as u64,
+            );
+        }
+    }
+
+    /// A direct trap for the 1000× mutation the plan's mutation-testing
+    /// pass is explicitly expected to try: confirms the constant itself is
+    /// `100_000.0`, not `100.0` or `100_000_000.0` — belt-and-braces
+    /// alongside the vector test above, which would already fail either way
+    /// but this pins the exact value so the failure is immediate and
+    /// unambiguous.
+    #[test]
+    fn sat_vb_conversion_constant_is_exactly_100_000() {
+        assert_eq!(SAT_VB_PER_BTC_PER_KVB, 100_000.0);
+    }
+
+    #[test]
+    fn clamp_fee_tiers_leaves_an_already_sorted_above_floor_input_untouched() {
+        assert_eq!(clamp_fee_tiers(20, 15, 10, 5, 1), (20, 15, 10, 5));
+    }
+
+    #[test]
+    fn clamp_fee_tiers_floors_every_tier_to_the_relay_minimum() {
+        // Every raw tier below the floor -> every tier becomes the floor,
+        // and the result is trivially still "sorted" (all equal).
+        assert_eq!(clamp_fee_tiers(3, 2, 1, 1, 20), (20, 20, 20, 20));
+    }
+
+    #[test]
+    fn clamp_fee_tiers_forces_non_increasing_order_when_a_middle_tier_is_a_stale_high_fallback() {
+        // The exact scenario the doc comment describes: `fastest` got a
+        // real (low, quiet-mempool) estimate, but `half_hour` fell back to
+        // a fallback constant that happens to read HIGHER than the real
+        // fastest estimate. Without the clamp this would answer
+        // fastest < half_hour — backwards.
+        let (fastest, half_hour, hour, economy) = clamp_fee_tiers(2, 5, 5, 5, 1);
+        assert!(fastest >= half_hour, "fastest {fastest} must be >= half_hour {half_hour}");
+        assert!(half_hour >= hour, "half_hour {half_hour} must be >= hour {hour}");
+        assert!(hour >= economy, "hour {hour} must be >= economy {economy}");
+        assert_eq!((fastest, half_hour, hour, economy), (2, 2, 2, 2));
+    }
+
+    #[test]
+    fn clamp_fee_tiers_applies_the_floor_after_the_descending_clamp_so_order_survives() {
+        // A case that would break if the floor were applied BEFORE (or
+        // interleaved with) the descending clamp: economy's raw value (1)
+        // needs raising to the floor (5), but hour's raw value (4) does
+        // NOT — floor-first-then-clamp could leave economy(5) > hour(4).
+        // floor-AFTER-clamp (the real implementation) instead clamps
+        // economy = min(1, hour=4) = 1 first, THEN floors every already-
+        // ordered value to 5, landing on hour=5, economy=5 — still sorted.
+        let (fastest, half_hour, hour, economy) = clamp_fee_tiers(10, 8, 4, 1, 5);
+        assert!(fastest >= half_hour && half_hour >= hour && hour >= economy);
+        assert_eq!((fastest, half_hour, hour, economy), (10, 8, 5, 5));
+    }
+
+    /// Locks in plan §2.6: a Core-mode client must never even ATTEMPT an
+    /// RPC/HTTP call for `/v1/prices` — a personal node has no price
+    /// oracle, and the whole point of self-hosting is that nothing about
+    /// this app phones a third party on your behalf. Whitebox (this test
+    /// lives inside `chain.rs` itself, not an external integration test)
+    /// specifically so it can read the private `next_id` counter, which
+    /// [`CoreRpcTransport::call`] bumps on EVERY outbound JSON-RPC attempt
+    /// (success or failure) — the one piece of state that can prove "no
+    /// call was made" rather than merely "the call I expected failed".
+    ///
+    /// This is the exact regression the plan calls out: if a future change
+    /// "helpfully" wires a fallback price fetch into the Core path, one of
+    /// three things breaks here — `next_id` moves off zero (a real RPC/HTTP
+    /// attempt happened), the result stops being this crate's own crafted
+    /// `Error::Http` (a genuine network attempt against an unreachable
+    /// target — port 1, nothing listening, same shape used elsewhere in
+    /// this file — surfaces as `Error::Transport` instead, or as `Ok` if it
+    /// somehow succeeded), or the error text stops containing "no price
+    /// oracle" (this crate's own wording, not anything a real HTTP failure
+    /// or a real price API would ever produce).
+    #[test]
+    fn v1_prices_route_never_attempts_a_network_call() {
+        let t = CoreRpcTransport::new("http://127.0.0.1:1", None).unwrap();
+        let before = *t.next_id.lock().unwrap();
+        let result = t.get_text("/v1/prices");
+        let after = *t.next_id.lock().unwrap();
+        assert_eq!(before, after, "no RPC call should ever be attempted for /v1/prices");
+        match result {
+            Err(Error::Http(msg)) => {
+                assert!(msg.contains("no price oracle"), "unexpected error text: {msg}")
+            }
+            other => panic!("expected a crafted no-price-oracle Error::Http, got {other:?}"),
+        }
+    }
+
+    /// The `ChainClient::btc_usd()` layer above the transport must also see
+    /// exactly this — an `Err`, not a fabricated `Ok(None)` or `Ok(Some(_))`
+    /// — since `src/lib.rs`'s call sites degrade via `if let Ok(usd) = ...`
+    /// and silently keep the PREVIOUS cached price on any `Err`. A Core
+    /// backend must never look like a successful (if empty) price fetch.
+    #[test]
+    fn chain_client_btc_usd_surfaces_the_core_no_price_oracle_error() {
+        let t = CoreRpcTransport::new("http://127.0.0.1:1", None).unwrap();
+        let client = ChainClient::new(t, Network::Regtest);
+        let err = client.btc_usd().unwrap_err();
+        assert!(matches!(err, Error::Http(_)), "expected Error::Http, got {err:?}");
     }
 }
