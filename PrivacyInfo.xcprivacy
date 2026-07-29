@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Privacy manifest (Apple's "required reason API" rules, mandatory for iOS
+  submissions since 2024-05-01; macOS does not enforce it but shares this file).
+
+  The declarations below are derived from what the SHIPPED BINARY actually
+  imports, not from reading the source:
+
+      nm -u <binary> | grep -E '^_(stat|fstat|lstat|statfs|mach_absolute_time)$'
+
+  which reports _stat / _fstat / _lstat only (Rust's std::fs stats files as it
+  reads and renames them) — hence FileTimestamp and nothing else. Re-run that
+  check after adding a dependency; DiskSpace, SystemBootTime, ActiveKeyboards
+  and UserDefaults are all currently absent and deliberately NOT declared.
+
+  Data collection is empty because the app collects nothing — it has no
+  analytics, no accounts, and no server of its own (it talks only to the
+  Bitcoin node/esplora endpoint the user configures). That matches the "Data
+  Not Collected" answer given in App Store Connect; if one changes, change both.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<!--
+				  C617.1 — timestamps of files inside the app container only.
+				  The app stats its own data directory (store-*.json,
+				  notebooks-*.json, contacts.json, config.json) as it saves via
+				  temp-then-rename. It never stats files outside its container
+				  on iOS: the only file-picking paths (rfd) are gated behind
+				  `desktop-platform` and compile on macOS alone, which is why
+				  the user-provided-files reason (0A2A.1) is not declared.
+				-->
+				<string>C617.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -57,3 +57,9 @@ Direct dependencies of this app and its `app-core` library. The complete transit
 | Library | Version | License | Used for |
 |---|---|---|---|
 | [bip85-core](https://github.com/ObjSal/prime-bip85) | pinned git rev | MIT OR Apache-2.0 | Parity-test fixture generator (real BIP-85 outputs feed the importer tests) |
+
+## Patched dependencies
+
+| Library | Version | License | Why it is patched |
+|---|---|---|---|
+| [winit](https://github.com/ObjSal/winit/tree/v0.30.13-no-private-apple-apis) | 0.30.13 + 1 commit | Apache-2.0 | Pulled in by slint. Upstream's macOS backend declares Apple's **private** `CGSSetWindowBackgroundBlurRadius` / `CGSMainConnectionID` and calls them from `WindowDelegate::set_blur`. Slint never calls `Window::set_blur`, but the reference alone lands in the binary's undefined symbol table and App Review rejects on it. The fork deletes both entry points and makes `set_blur` a no-op; upstream master gates them behind a non-default `private-apple-apis` feature that does not exist on the 0.30 branch. Pinned by revision in `Cargo.toml`'s `[patch.crates-io]`. |
