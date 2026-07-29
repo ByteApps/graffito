@@ -9,7 +9,7 @@
 
 use std::str::FromStr;
 
-use app_core::chain::{ChainClient, HttpTransport};
+use app_core::chain::{AnyTransport, ChainClient};
 use app_core::compose::{compose_and_record, ComposeRequest};
 use app_core::funding::FundingSource;
 use app_core::identity::{parse_key_material, realize, AppIdentity, KeyMaterial};
@@ -36,6 +36,23 @@ fn identity(network: Network) -> AppIdentity {
 
 fn network(s: &str) -> Network {
     Network::from_str_opt(s).expect("network: mainnet|testnet4|signet|regtest")
+}
+
+/// Build a chain client for `base` — Esplora or Bitcoin Core RPC, picked by
+/// the `bitcoind+http(s)://` URL scheme (`app_core::chain::AnyTransport`,
+/// the backend seam of `../../PLAN-chain-notes-app-core-rpc.md` §1.2). This
+/// is what "gives the e2e suite a Core mode for free": every `<base-url>`
+/// positional argument the CLI already took now also accepts a
+/// `bitcoind+` base. Core RPC credentials come from `CORE_RPC_USER`/
+/// `CORE_RPC_PASS` env vars (never argv) when set; Esplora bases ignore
+/// them entirely. A malformed `bitcoind+` URL is a usage error, same as
+/// every other `.expect()` in this CLI.
+fn open_client(base: &str, network: Network) -> ChainClient<AnyTransport> {
+    let creds = match (std::env::var("CORE_RPC_USER"), std::env::var("CORE_RPC_PASS")) {
+        (Ok(user), Ok(pass)) => Some((user, pass)),
+        _ => None,
+    };
+    ChainClient::new(AnyTransport::new(base, creds).expect("<base-url> parse"), network)
 }
 
 fn load(path: &str) -> Store {
@@ -180,7 +197,7 @@ fn main() {
                 spending_window =
                     app_core::spending::window_spks(&material, net, account, upto).unwrap_or_default();
             }
-            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let client = open_client(&args[3], net);
             let bundle = client.build_bundle(&store.address, None).expect("build bundle");
             let stats = match ident.full() {
                 Some(id) => store
@@ -301,7 +318,7 @@ fn main() {
                 .clone();
             let index: u32 = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
             let d = src.derive(1, index).expect("derive change address");
-            let client = ChainClient::new(HttpTransport::new(base), net);
+            let client = open_client(base, net);
             let coins: Vec<WatchCoin> = client
                 .utxos(&d.address)
                 .expect("utxo fetch")
@@ -333,7 +350,7 @@ fn main() {
             let net = network(&store.network.clone());
             let ident = identity(net);
             let src = ident.watch_source().expect("bump-build needs watch-only APP_KEY").clone();
-            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let client = open_client(&args[3], net);
             // Single-notebook cli identity: every input is at APP_INDEX.
             let (coins, outputs, confirmed) =
                 client.fetch_tx_io(&args[4], |_| Some(ident.index)).expect("fetch tx");
@@ -378,7 +395,7 @@ fn main() {
                 .expect("sweep-funded-build needs watch-only APP_KEY (xpub / descriptor)")
                 .clone();
             let fund_src = FundingSource::parse(&args[4], net).expect("funding descriptor");
-            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let client = open_client(&args[3], net);
             let scan = client.scan_funding(&fund_src, 20).expect("funding scan");
             assert!(!scan.utxos.is_empty(), "funding wallet has no spendable coins");
             let rate: f64 = args[5].parse().expect("fee rate");
@@ -469,7 +486,7 @@ fn main() {
             let ident = identity(net);
             assert!(ident.watch_source().is_some(), "note-funded-build needs watch-only APP_KEY");
             let fund_src = FundingSource::parse(&args[4], net).expect("funding descriptor");
-            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let client = open_client(&args[3], net);
             let scan = client.scan_funding(&fund_src, 20).expect("funding scan");
             assert!(!scan.utxos.is_empty(), "funding wallet has no spendable coins");
             let text = &args[5];
@@ -518,7 +535,7 @@ fn main() {
             };
             validate_signed(&psbt, &args[5]).expect("signed PSBT must match the built tx");
             let (raw, txid, vsize) = finalize_extract(psbt).expect("finalize");
-            let client = ChainClient::new(HttpTransport::new(&args[2]), net);
+            let client = open_client(&args[2], net);
             let got = client.broadcast(&raw).expect("broadcast");
             assert_eq!(got, txid, "node echoed a different txid");
             println!("cli: spend-broadcast txid={txid} vsize={vsize} ok");
@@ -571,7 +588,7 @@ fn main() {
             )
             .expect("compose");
             save(&store, &args[2]);
-            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let client = open_client(&args[3], net);
             let txid = client.broadcast(&composed.tx.raw_hex).expect("broadcast");
             assert_eq!(txid, composed.tx.txid_hex, "endpoint echoed a different txid");
             println!(
@@ -601,7 +618,7 @@ fn main() {
                 &ident.expect_full().tweaked_seckey,
                 app_core::notes_core::keys::generate_aux_rand)
             .expect("sweep build");
-            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let client = open_client(&args[3], net);
             let txid = client.broadcast(&sweep.raw_hex).expect("broadcast");
             for u in &mut store.utxos { u.pending_spend = true; }
             save(&store, &args[2]);
@@ -610,7 +627,7 @@ fn main() {
         Some("bundle") => {
             // bundle <address> <network> <base-url> <out.json|->
             let net = network(&args[3]);
-            let client = ChainClient::new(HttpTransport::new(&args[4]), net);
+            let client = open_client(&args[4], net);
             let bundle = client.build_bundle(&args[2], None).expect("build bundle");
             let json = serde_json::to_string_pretty(&bundle).expect("serialize");
             if args[5] == "-" {
@@ -677,7 +694,7 @@ fn main() {
             let material = parse_key_material(&key, net).expect("APP_KEY parse");
             let source = app_core::spending::funding_source(&material, net, account)
                 .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
-            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let client = open_client(&args[3], net);
             let gap: u32 = args.get(4).and_then(|g| g.parse().ok()).unwrap_or(20);
             let (used, next_receive, next_change) =
                 app_core::chain::discover_spending(&client, &source, gap);
@@ -760,7 +777,7 @@ fn main() {
 
             let source = app_core::spending::funding_source(&material, net, account)
                 .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
-            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let client = open_client(&args[3], net);
             let gap: u32 =
                 std::env::var("CN_FUND_GAP").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
             let scan = client.scan_funding(&source, gap).expect("spending wallet scan");
@@ -859,7 +876,7 @@ fn main() {
 
             let source = app_core::spending::funding_source(&material, net, account)
                 .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
-            let client = ChainClient::new(HttpTransport::new(&args[3]), net);
+            let client = open_client(&args[3], net);
             let gap: u32 =
                 std::env::var("CN_FUND_GAP").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
             let scan = client.scan_funding(&source, gap).expect("spending wallet scan");
@@ -958,7 +975,7 @@ fn main() {
             let fee_rate: f64 = args[6].parse().expect("fee rate");
             let text = args[7].clone();
             let to = args.get(8).cloned();
-            let client = ChainClient::new(HttpTransport::new(&args[2]), net);
+            let client = open_client(&args[2], net);
             // Gap limit (CN_FUND_GAP overrides; the e2e uses a small gap since a
             // per-address genesis rescan on the regtest shim is expensive).
             let gap: u32 =
@@ -1192,7 +1209,7 @@ fn main() {
             let net = network(&args[3]);
             let psbt = parse_psbt(&args[4]).expect("psbt");
             let (raw, txid, vsize) = finalize_extract(psbt).expect("finalize");
-            let client = ChainClient::new(HttpTransport::new(&args[2]), net);
+            let client = open_client(&args[2], net);
             let got = client.broadcast(&raw).expect("broadcast");
             eprintln!("cli: fund-finalize txid={txid} vsize={vsize} broadcast=ok");
             println!("{}", got.trim());

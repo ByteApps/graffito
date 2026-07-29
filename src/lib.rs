@@ -19,7 +19,7 @@ use std::rc::Rc;
 use app_core::bitcoin;
 use app_core::chain::{
     default_base, explorer_presets, explorer_tx_url, node_presets, scan_change_chain,
-    scan_change_chain_watch, AddrStats, ChainClient, ChangeCoin, HttpTransport, TxLookupStatus,
+    scan_change_chain_watch, AddrStats, AnyTransport, ChainClient, ChangeCoin, TxLookupStatus,
 };
 use app_core::compose::ComposeRequest;
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
@@ -1746,7 +1746,13 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
     // rebuild derives every input's spk/key-origin from that index.
     let index_by_addr: HashMap<String, u32> =
         st.nb_addrs.iter().map(|(i, a, _)| (a.clone(), *i)).collect();
-    let client = ChainClient::new(HttpTransport::new(base), st.network);
+    let client = match open_client(&base, st.network) {
+        Ok(c) => c,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
     match client.fetch_tx_io(&txid, |a| index_by_addr.get(a).copied()) {
         Ok((coins, outputs, confirmed)) => {
             if confirmed {
@@ -2649,13 +2655,16 @@ fn show_notebook_picker(w: &AppWindow, st: &State, page: u32, mode: &str) {
     let weak = w.as_weak();
     std::thread::spawn(move || {
         let _net_guard = NetOpGuard::new(weak.clone());
-        let client = ChainClient::new(HttpTransport::new(base), network);
         let mut results: Vec<(u32, &'static str, String)> = Vec::new();
-        for (index, addr) in &to_probe {
-            if let Ok((used, balance)) = client.address_probe(addr) {
-                let pill = if used { "used" } else { "new" };
-                let bal = if used { format!("{} sats", commas(balance)) } else { String::new() };
-                results.push((*index, pill, bal));
+        // A malformed node URL degrades exactly like "offline" below (empty
+        // results → plain rows) rather than a new error path.
+        if let Ok(client) = open_client(&base, network) {
+            for (index, addr) in &to_probe {
+                if let Ok((used, balance)) = client.address_probe(addr) {
+                    let pill = if used { "used" } else { "new" };
+                    let bal = if used { format!("{} sats", commas(balance)) } else { String::new() };
+                    results.push((*index, pill, bal));
+                }
             }
         }
         PICKER_PROBE_RESULTS
@@ -3717,6 +3726,20 @@ struct DroppedCheck {
     first_input: (String, u32),
 }
 
+/// Build a `ChainClient` against `base`, picking the Esplora or Bitcoin
+/// Core RPC backend by URL scheme (`app_core::chain::AnyTransport`, the
+/// backend seam of `../PLAN-chain-notes-app-core-rpc.md`). No credentials
+/// are sourced here — Core RPC auth is a later unit (§2.4/U6, sourced from
+/// the platform Keychain); every `base` this app stores is Esplora-shaped
+/// today, so in practice this is byte-identical to the
+/// `ChainClient::new(HttpTransport::new(base), network)` construction it
+/// replaces at every call site. Returns `Err` only for a malformed
+/// `bitcoind+` URL — callers surface it exactly like any other chain error
+/// (never `unwrap`/`expect`).
+fn open_client(base: &str, network: Network) -> Result<ChainClient<AnyTransport>, app_core::Error> {
+    Ok(ChainClient::new(AnyTransport::new(base, None)?, network))
+}
+
 /// Snapshot every PENDING record (sweep/consolidate txs AND notes) in
 /// `store` into the (current-txid, first-input) pairs a worker thread needs
 /// — shared by both the async and synchronous refresh paths so they exhibit
@@ -3742,7 +3765,7 @@ fn gather_dropped_checks(store: &Store) -> Vec<DroppedCheck> {
 /// `NotFound` (the common "still pending"/"confirmed" cases never pay for
 /// the extra round trip).
 fn fetch_dropped_checks(
-    client: &ChainClient<HttpTransport>,
+    client: &ChainClient<AnyTransport>,
     address: &str,
     checks: &[DroppedCheck],
 ) -> (HashMap<String, TxLookupStatus>, HashMap<(String, u32), bool>) {
@@ -3937,7 +3960,40 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
-        let client = ChainClient::new(HttpTransport::new(base), network);
+        let client = match open_client(&base, network) {
+            Ok(c) => c,
+            Err(e) => {
+                // A malformed node URL fails the whole scan — every notebook's
+                // bundle fetch reports the same error, matching an entirely
+                // offline backend rather than inventing a new error path.
+                let msg = e.to_string();
+                let results: Vec<NotebookBundleResult> = all
+                    .into_iter()
+                    .map(|(index, _)| NotebookBundleResult { index, bundle: Err(msg.clone()) })
+                    .collect();
+                let current_statuses = pending_txids.iter().map(|t| (t.clone(), None)).collect();
+                drop(material_for_change); // Zeroizing, same as the success path.
+                WALLET_STORES_REFRESH_RESULTS
+                    .lock()
+                    .expect("wallet stores refresh mutex")
+                    .push(WalletStoresRefreshResult {
+                        purpose,
+                        fp8,
+                        network,
+                        account,
+                        current_index,
+                        current_address,
+                        current_statuses,
+                        current_dropped_lookup: HashMap::new(),
+                        current_dropped_unspent: HashMap::new(),
+                        results,
+                        change: Err(msg),
+                    });
+                let _ =
+                    weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_stores_refresh());
+                return;
+            }
+        };
         let results: Vec<NotebookBundleResult> = all
             .into_iter()
             .map(|(index, address)| NotebookBundleResult {
@@ -5189,13 +5245,23 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
         let _net_guard = NetOpGuard::new(weak.clone());
         let found = parse_key_material(&material_str, network)
             .map(|material| {
-                let client = ChainClient::new(HttpTransport::new(base), network);
-                // gap=1 (Sal 2026-07-23): notebooks are used sequentially from
-                // index 0, so stop at the first unused receive index. Misses
-                // only a FUNDED notebook stranded behind a skipped-empty one
-                // (recover by manually creating a notebook at that index); an
-                // unfunded notebook has no on-chain trace to discover anyway.
-                app_core::chain::discover_indexes(&client, &material, network, account, &known, 1)
+                // A malformed node URL degrades exactly like any other
+                // transport error here — best-effort, empty result.
+                match open_client(&base, network) {
+                    Ok(client) => {
+                        // gap=1 (Sal 2026-07-23): notebooks are used
+                        // sequentially from index 0, so stop at the first
+                        // unused receive index. Misses only a FUNDED notebook
+                        // stranded behind a skipped-empty one (recover by
+                        // manually creating a notebook at that index); an
+                        // unfunded notebook has no on-chain trace to discover
+                        // anyway.
+                        app_core::chain::discover_indexes(
+                            &client, &material, network, account, &known, 1,
+                        )
+                    }
+                    Err(_) => Vec::new(),
+                }
             })
             .unwrap_or_default();
         drop(material_str); // Zeroizing — wiped as soon as the walk is done
@@ -5255,7 +5321,21 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
-        let client = ChainClient::new(HttpTransport::new(base), network);
+        let client = match open_client(&base, network) {
+            Ok(c) => c,
+            Err(e) => {
+                REFRESH_RESULTS.lock().expect("refresh results mutex").push(RefreshResult {
+                    address,
+                    bundle: Some(Err(e.to_string())),
+                    new_stats: None,
+                    statuses: Vec::new(),
+                    dropped_lookup: HashMap::new(),
+                    dropped_unspent: HashMap::new(),
+                });
+                let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_refresh());
+                return;
+            }
+        };
         // 429 politeness (2026-07-20): ONE cheap `/address/:a` fingerprint
         // first — if nothing moved since the last applied scan (chain AND
         // mempool stats identical, so a pending tx confirming/dropping
@@ -5566,7 +5646,15 @@ fn refresh(w: &AppWindow, st: &mut State) {
         w.set_status("no Bitcoin node for this network — set one in Settings".into());
         return;
     };
-    let client = ChainClient::new(HttpTransport::new(base), st.network);
+    let client = match open_client(&base, st.network) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("cb: refresh err={e}");
+            w.set_status("couldn't reach the network — tap refresh to retry".into());
+            update_home(w, st);
+            return;
+        }
+    };
     let address = st.ident.as_ref().unwrap().address.clone();
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
     match client.build_bundle(&address, None) {
@@ -5660,7 +5748,7 @@ fn refresh_fees_price(_w: &AppWindow, st: &mut State) {
         }
     }
     let Some(base) = st.base_url() else { return };
-    let client = ChainClient::new(HttpTransport::new(base), st.network);
+    let Ok(client) = open_client(&base, st.network) else { return };
     let mut fetched = false;
     if let Ok(fees) = client.fee_rates() {
         st.fees = Some(fees);
@@ -5791,7 +5879,7 @@ fn spending_scan_async(w: &AppWindow, st: &mut State, gap: u32) {
             .as_ref()
             .map_err(|e| e.to_string())
             .and_then(|m| app_core::spending::funding_source(m, network, account).map_err(|e| e.to_string()));
-        let client = ChainClient::new(HttpTransport::new(base), network);
+        let client = open_client(&base, network).map_err(|e| e.to_string());
         // ONE merged walk (network-efficiency, 2026-07-23): `scan_funding`
         // now reports used addresses (receive AND change — so OWN-detection
         // on rescan covers coins this app never explicitly "handed out",
@@ -5799,7 +5887,9 @@ fn spending_scan_async(w: &AppWindow, st: &mut State, gap: u32) {
         // spendable coins in the same pass — no separate `discover_spending`
         // gap-walk needed. `gap` is SPENDING_GAP_SHALLOW for the automatic
         // scan or SPENDING_GAP_DEEP for the manual deep scan.
-        let scan = source.and_then(|src| client.scan_funding(&src, gap).map_err(|e| e.to_string()));
+        let scan = source.and_then(|src| {
+            client.and_then(|c| c.scan_funding(&src, gap).map_err(|e| e.to_string()))
+        });
         drop(material); // Zeroizing — wiped as soon as the scan is done
         SPENDING_REFRESH_RESULTS
             .lock()
@@ -6487,7 +6577,13 @@ fn payfrom_scan_wallet_for_display(w: &AppWindow, st: &mut State, id: &str) {
         return;
     };
     w.set_status("scanning funding wallet…".into());
-    let client = ChainClient::new(HttpTransport::new(&base), net);
+    let client = match open_client(&base, net) {
+        Ok(c) => c,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
     match client.scan_funding(&src, 20) {
         Ok(scan) => {
             st.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
@@ -8073,7 +8169,13 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
         return;
     };
     w.set_status("scanning funding wallet…".into());
-    let client = ChainClient::new(HttpTransport::new(&base), net);
+    let client = match open_client(&base, net) {
+        Ok(c) => c,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
     match client.scan_funding(&src, 20) {
         Ok(scan) => {
             st.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
@@ -10766,10 +10868,10 @@ pub fn run() {
         let weak = w.as_weak();
         std::thread::spawn(move || {
             let _net_guard = NetOpGuard::new(weak.clone());
-            let client = ChainClient::new(HttpTransport::new(base), net);
+            let client = open_client(&base, net).map_err(|e| e.to_string());
             let result = last_txid
                 .ok_or_else(|| "nothing to rebroadcast".to_string())
-                .and_then(|t| client.fetch_tx_hex(&t).map_err(|e| format!("{e}")));
+                .and_then(|t| client.and_then(|c| c.fetch_tx_hex(&t).map_err(|e| format!("{e}"))));
             REBROADCAST_FETCH_RESULTS.lock().expect("rebroadcast fetch results mutex").push(
                 RebroadcastFetchResult { ref_id: ref_id_s, is_note, identity_addr, result },
             );
@@ -12051,13 +12153,14 @@ pub fn run() {
         };
         let Ok(src) = FundingSource::parse(&descriptor, net) else { return };
         w.set_status("scanning…".into());
-        let client = ChainClient::new(HttpTransport::new(&base), net);
-        if let Ok(scan) = client.scan_funding(&src, 20) {
-            s.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
-            s.funding_wallets[idx].coins = scan.utxos.len();
-            s.funding_wallets[idx].scanned = true;
-            s.funding_wallets[idx].next_change_index = scan.next_change_index;
-            s.save_funding_wallets();
+        if let Ok(client) = open_client(&base, net) {
+            if let Ok(scan) = client.scan_funding(&src, 20) {
+                s.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
+                s.funding_wallets[idx].coins = scan.utxos.len();
+                s.funding_wallets[idx].scanned = true;
+                s.funding_wallets[idx].next_change_index = scan.next_change_index;
+                s.save_funding_wallets();
+            }
         }
         w.set_status("".into());
         refresh_funding_list(&w, &s);
@@ -12400,8 +12503,9 @@ pub fn run() {
         let weak = w.as_weak();
         std::thread::spawn(move || {
             let _net_guard = NetOpGuard::new(weak.clone());
-            let client = ChainClient::new(HttpTransport::new(&base), net);
-            let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+            let result = open_client(&base, net)
+                .map_err(|e| e.to_string())
+                .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
             PSBT_BROADCAST_RESULTS
                 .lock()
                 .expect("psbt broadcast results mutex")
@@ -12489,8 +12593,9 @@ pub fn run() {
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     NOTEBOOK_COMPOSE_RESULTS.lock().expect("notebook compose results mutex").push(
                         NotebookComposeResult { note_id, fee, vsize, to, private, result },
                     );
@@ -12525,8 +12630,9 @@ pub fn run() {
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     SPENDING_COMPOSE_RESULTS.lock().expect("spending compose results mutex").push(
                         SpendingComposeResult {
                             note_id,
@@ -12582,8 +12688,9 @@ pub fn run() {
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     MIXED_COMPOSE_RESULTS.lock().expect("mixed compose results mutex").push(
                         MixedComposeResult {
                             note_id,
@@ -12634,8 +12741,9 @@ pub fn run() {
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     SWEEP_BROADCAST_RESULTS
                         .lock()
                         .expect("sweep broadcast results mutex")
@@ -12657,8 +12765,9 @@ pub fn run() {
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     CONSOLIDATE_BROADCAST_RESULTS
                         .lock()
                         .expect("consolidate broadcast results mutex")
@@ -12680,8 +12789,9 @@ pub fn run() {
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     WCONSOL_BROADCAST_RESULTS
                         .lock()
                         .expect("wconsol broadcast results mutex")
@@ -12703,8 +12813,9 @@ pub fn run() {
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     SPENDING_CONSOLIDATE_RESULTS
                         .lock()
                         .expect("spending consolidate results mutex")
@@ -12748,8 +12859,9 @@ pub fn run() {
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     ACT_BUMP_RESULTS
                         .lock()
                         .expect("act-bump results mutex")
@@ -12771,8 +12883,9 @@ pub fn run() {
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     ACT_RETRY_RESULTS
                         .lock()
                         .expect("act-retry results mutex")

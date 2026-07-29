@@ -345,6 +345,132 @@ impl Transport for HttpTransport {
     }
 }
 
+/// The backend seam (`../../PLAN-chain-notes-app-core-rpc.md` §1.2):
+/// second-chain-backend selection rides the URL **scheme**, not a separate
+/// settings enum. `AnyTransport` implements [`Transport`] by delegating to
+/// whichever variant [`AnyTransport::new`] picked, so `ChainClient`, every
+/// free scan function, `netq`, `store`, `compose`, and the whole UI layer
+/// stay untouched — no `dyn`, no generics fallout.
+pub enum AnyTransport {
+    /// `http(s)://host/api` — mempool.space/Esplora, unchanged behavior.
+    Esplora(HttpTransport),
+    /// `bitcoind+http(s)://host[:port]` — Bitcoin Core JSON-RPC.
+    Core(CoreRpcTransport),
+}
+
+impl AnyTransport {
+    /// Parses `base` and picks a backend. Anything that does not start
+    /// with `bitcoind+` is handed to [`HttpTransport::new`] EXACTLY as
+    /// every call site already did — this refactor must not change one
+    /// byte of the Esplora path's behavior (request paths, pacing, 429
+    /// retry, error classification all untouched).
+    ///
+    /// `creds` is an explicit parameter (not read from anywhere) so
+    /// `app-core` stays platform-agnostic — a later unit sources it from
+    /// the platform Keychain; `examples/cli.rs` reads
+    /// `CORE_RPC_USER`/`CORE_RPC_PASS` env vars instead. When `base` also
+    /// carries inline `user:pass@` userinfo (`bitcoind+http://user:pass@
+    /// host:8332`, needed so the CLI can address a node with no Keychain
+    /// at all), the explicit `creds` parameter wins if both are present.
+    pub fn new(base: &str, creds: Option<(String, String)>) -> Result<Self, Error> {
+        match base.strip_prefix("bitcoind+") {
+            Some(rest) => Ok(AnyTransport::Core(CoreRpcTransport::new(rest, creds)?)),
+            None => Ok(AnyTransport::Esplora(HttpTransport::new(base))),
+        }
+    }
+}
+
+impl Transport for AnyTransport {
+    fn get_text(&self, path: &str) -> Result<String, Error> {
+        match self {
+            AnyTransport::Esplora(t) => t.get_text(path),
+            AnyTransport::Core(t) => t.get_text(path),
+        }
+    }
+    fn post_text(&self, path: &str, body: String) -> Result<String, Error> {
+        match self {
+            AnyTransport::Esplora(t) => t.post_text(path, body),
+            AnyTransport::Core(t) => t.post_text(path, body),
+        }
+    }
+}
+
+/// "Bitcoin Core" vs "Esplora" — small label for the Settings UI (a later
+/// unit) to name the active backend from its stored node URL.
+pub fn node_backend_label(base: &str) -> &'static str {
+    if base.starts_with("bitcoind+") {
+        "Bitcoin Core"
+    } else {
+        "Esplora"
+    }
+}
+
+/// Bitcoin Core JSON-RPC backend — **STUB**. This unit (U2) only adds the
+/// `AnyTransport` seam; the JSON-RPC client, auth, and Esplora-route
+/// translation (`getblockcount`, `listunspent`, `listtransactions`,
+/// `getrawtransaction`, `sendrawtransaction`, …) are a later unit — see
+/// `../../PLAN-chain-notes-app-core-rpc.md` §1.3. For now this parses and
+/// stores enough of a `bitcoind+http(s)://[user:pass@]host[:port]` base to
+/// exist as a distinct, addressable variant. It makes NO network calls:
+/// both [`Transport`] methods return a clear error.
+pub struct CoreRpcTransport {
+    /// "http" or "https" (validated at construction).
+    pub scheme: String,
+    pub host: String,
+    pub port: Option<u16>,
+    /// RPC basic-auth credentials, if any were supplied (explicit `creds`
+    /// param or inline URL userinfo — see [`AnyTransport::new`]).
+    pub creds: Option<(String, String)>,
+}
+
+impl CoreRpcTransport {
+    /// `rest` is the base URL with the `bitcoind+` prefix already
+    /// stripped by [`AnyTransport::new`] (e.g. `http://host:8332` or
+    /// `http://user:pass@host:8332`).
+    pub fn new(rest: &str, creds: Option<(String, String)>) -> Result<Self, Error> {
+        let (scheme, after_scheme) = rest
+            .split_once("://")
+            .ok_or_else(|| Error::Http("bitcoind+ URL missing a scheme".into()))?;
+        if scheme != "http" && scheme != "https" {
+            return Err(Error::Http(format!("unsupported bitcoind+ scheme: {scheme}")));
+        }
+        // Tolerate (and ignore) a stray trailing path/slash — Core's RPC
+        // endpoint has none.
+        let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+        let (userinfo, hostport) = match authority.rsplit_once('@') {
+            Some((u, h)) => (Some(u), h),
+            None => (None, authority),
+        };
+        let inline_creds = userinfo.and_then(|u| {
+            u.split_once(':').map(|(user, pass)| (user.to_string(), pass.to_string()))
+        });
+        let (host, port) = match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().ok()),
+            None => (hostport, None),
+        };
+        if host.is_empty() {
+            return Err(Error::Http("bitcoind+ URL missing a host".into()));
+        }
+        Ok(CoreRpcTransport {
+            scheme: scheme.to_string(),
+            host: host.to_string(),
+            port,
+            // Explicit creds win over inline userinfo when both present.
+            creds: creds.or(inline_creds),
+        })
+    }
+}
+
+impl Transport for CoreRpcTransport {
+    fn get_text(&self, _path: &str) -> Result<String, Error> {
+        Err(Error::Http("bitcoin core rpc backend not implemented yet".into()))
+    }
+
+    fn post_text(&self, _path: &str, _body: String) -> Result<String, Error> {
+        Err(Error::Http("bitcoin core rpc backend not implemented yet".into()))
+    }
+}
+
 // ---- esplora JSON shapes (only the fields we consume) ----
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2176,6 +2302,120 @@ mod tests {
                 mempool_spent: 0,
             }
         );
+    }
+
+    // ---- AnyTransport / CoreRpcTransport (U2: the backend seam) --------
+
+    #[test]
+    fn any_transport_picks_esplora_for_non_bitcoind_urls() {
+        for base in [
+            "https://mempool.space/api",
+            "http://127.0.0.1:18797/regtest/api",
+            "https://blockstream.info/api",
+        ] {
+            let t = AnyTransport::new(base, None).unwrap();
+            assert!(matches!(t, AnyTransport::Esplora(_)), "{base} must select Esplora");
+        }
+    }
+
+    #[test]
+    fn any_transport_picks_core_for_bitcoind_scheme() {
+        let t = AnyTransport::new("bitcoind+http://127.0.0.1:8332", None).unwrap();
+        assert!(matches!(t, AnyTransport::Core(_)));
+    }
+
+    #[test]
+    fn any_transport_esplora_behavior_is_unaffected() {
+        // Constructing through AnyTransport must be indistinguishable from
+        // constructing HttpTransport directly — same base stored, same
+        // pacing decision (loopback exemption untouched).
+        let base = "http://127.0.0.1:18797/regtest/api";
+        match AnyTransport::new(base, None).unwrap() {
+            AnyTransport::Esplora(t) => assert_eq!(t.base, base),
+            AnyTransport::Core(_) => panic!("expected Esplora"),
+        }
+    }
+
+    #[test]
+    fn core_rpc_transport_parses_scheme_host_port() {
+        let t = CoreRpcTransport::new("http://192.168.1.50:8332", None).unwrap();
+        assert_eq!(t.scheme, "http");
+        assert_eq!(t.host, "192.168.1.50");
+        assert_eq!(t.port, Some(8332));
+        assert_eq!(t.creds, None);
+    }
+
+    #[test]
+    fn core_rpc_transport_parses_no_port() {
+        let t = CoreRpcTransport::new("https://node.example.com", None).unwrap();
+        assert_eq!(t.scheme, "https");
+        assert_eq!(t.host, "node.example.com");
+        assert_eq!(t.port, None);
+    }
+
+    #[test]
+    fn core_rpc_transport_reads_inline_userinfo_credentials() {
+        let t = CoreRpcTransport::new("http://alice:s3cret@127.0.0.1:8332", None).unwrap();
+        assert_eq!(t.host, "127.0.0.1");
+        assert_eq!(t.port, Some(8332));
+        assert_eq!(t.creds, Some(("alice".to_string(), "s3cret".to_string())));
+    }
+
+    #[test]
+    fn core_rpc_transport_explicit_creds_win_over_inline() {
+        let t = CoreRpcTransport::new(
+            "http://alice:s3cret@127.0.0.1:8332",
+            Some(("bob".to_string(), "hunter2".to_string())),
+        )
+        .unwrap();
+        assert_eq!(t.creds, Some(("bob".to_string(), "hunter2".to_string())));
+    }
+
+    #[test]
+    fn core_rpc_transport_via_any_transport_new_end_to_end() {
+        // The full `bitcoind+` URL as a Settings/CLI user would type it,
+        // through the actual dispatch point.
+        let t = AnyTransport::new("bitcoind+http://user:pass@umbrel.local:8332", None).unwrap();
+        match t {
+            AnyTransport::Core(c) => {
+                assert_eq!(c.scheme, "http");
+                assert_eq!(c.host, "umbrel.local");
+                assert_eq!(c.port, Some(8332));
+                assert_eq!(c.creds, Some(("user".to_string(), "pass".to_string())));
+            }
+            AnyTransport::Esplora(_) => panic!("expected Core"),
+        }
+    }
+
+    #[test]
+    fn core_rpc_transport_rejects_missing_scheme() {
+        assert!(CoreRpcTransport::new("127.0.0.1:8332", None).is_err());
+    }
+
+    #[test]
+    fn core_rpc_transport_rejects_unsupported_scheme() {
+        assert!(CoreRpcTransport::new("ftp://127.0.0.1:8332", None).is_err());
+    }
+
+    #[test]
+    fn core_rpc_transport_rejects_empty_host() {
+        assert!(CoreRpcTransport::new("http://", None).is_err());
+    }
+
+    #[test]
+    fn core_rpc_transport_is_a_stub_that_never_calls_out() {
+        let t = CoreRpcTransport::new("http://127.0.0.1:8332", None).unwrap();
+        let get_err = t.get_text("/blocks/tip/height").unwrap_err();
+        assert!(matches!(get_err, Error::Http(msg) if msg.contains("not implemented")));
+        let post_err = t.post_text("/tx", "deadbeef".into()).unwrap_err();
+        assert!(matches!(post_err, Error::Http(msg) if msg.contains("not implemented")));
+    }
+
+    #[test]
+    fn node_backend_label_reflects_scheme() {
+        assert_eq!(node_backend_label("https://mempool.space/api"), "Esplora");
+        assert_eq!(node_backend_label("http://127.0.0.1:18797/regtest/api"), "Esplora");
+        assert_eq!(node_backend_label("bitcoind+http://127.0.0.1:8332"), "Bitcoin Core");
     }
 
     #[test]
