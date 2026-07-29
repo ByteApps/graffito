@@ -144,6 +144,17 @@ pub struct Scenario {
     /// Oldest → newest.
     pub txs: Vec<ScenarioTx>,
     pub wallet: Option<ScenarioWallet>,
+    /// U3 (`PLAN-chain-notes-app-core-rpc.md`, "Trap 1"): a genuinely
+    /// SIGNED `(raw hex, expected txid)` pair for the broadcast contract
+    /// check, when the backend under test actually validates scripts (a
+    /// real `bitcoind`). `EsploraFake` never validates scripts, so every
+    /// existing `chain_contract.rs` scenario leaves this `None` and
+    /// `assert_chain_contract` falls back to today's
+    /// `build_unsigned_spend_hex` behavior, byte-identical to before this
+    /// field existed. The Core RPC conformance suite is the one caller
+    /// that sets it — its bitcoind driver signs a real spend with the
+    /// node's own wallet.
+    pub broadcast_probe: Option<(String, String)>,
 }
 
 impl Scenario {
@@ -406,7 +417,18 @@ impl ScenarioBuilder {
     }
 
     pub fn build(self) -> Scenario {
-        Scenario { network: self.network, tip_height: self.tip_height, txs: self.txs, wallet: self.wallet }
+        Scenario {
+            network: self.network,
+            tip_height: self.tip_height,
+            txs: self.txs,
+            wallet: self.wallet,
+            // Every ScenarioBuilder-built scenario is made of UNSIGNED txs
+            // (module doc above) — never broadcastable against a real
+            // backend, so this always falls back to the old
+            // build_unsigned_spend_hex path (harmless against
+            // EsploraFake, which never validates scripts anyway).
+            broadcast_probe: None,
+        }
     }
 }
 
@@ -831,9 +853,18 @@ pub fn assert_chain_contract<T: Transport>(client: &ChainClient<T>, sc: &Scenari
         assert_eq!(got_utxo, exp_utxo, "build_bundle utxos for {address}");
     }
 
-    // broadcast: any unspent scenario coin, spent onward — the backend
-    // must accept it and echo the txid a genuine decode computes.
-    if let Some(address) = sc.all_addresses().into_iter().find(|a| !sc.utxos_for(a).is_empty()) {
+    // broadcast: the backend must accept a real tx and echo the txid a
+    // genuine decode computes. `EsploraFake` never validates scripts, so an
+    // UNSIGNED spend (today's behavior, `build_unsigned_spend_hex`) is fine
+    // there; a real backend (`bitcoind`) rejects an unsigned input, so
+    // `sc.broadcast_probe` (Trap 1, PLAN-chain-notes-app-core-rpc.md) lets
+    // such a caller supply a GENUINELY signed tx instead. Either way the
+    // assertion itself — the backend must return the tx's own txid — is
+    // identical.
+    if let Some((hex_tx, expected_txid)) = &sc.broadcast_probe {
+        let got_txid = client.broadcast(hex_tx).unwrap();
+        assert_eq!(got_txid, *expected_txid, "broadcast must return the backend's own computed txid");
+    } else if let Some(address) = sc.all_addresses().into_iter().find(|a| !sc.utxos_for(a).is_empty()) {
         let (txid, vout, value, _height) = sc.utxos_for(&address)[0].clone();
         let (hex_tx, expected_txid) = build_unsigned_spend_hex(sc.network, &txid, vout, value);
         let got_txid = client.broadcast(&hex_tx).unwrap();

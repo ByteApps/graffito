@@ -18,6 +18,7 @@
 //! retry-with-backoff (for the 429s that get through anyway). See the
 //! comment on `Transport for HttpTransport` below for the exact rules.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -405,25 +406,110 @@ pub fn node_backend_label(base: &str) -> &'static str {
     }
 }
 
-/// Bitcoin Core JSON-RPC backend — **STUB**. This unit (U2) only adds the
-/// `AnyTransport` seam; the JSON-RPC client, auth, and Esplora-route
-/// translation (`getblockcount`, `listunspent`, `listtransactions`,
-/// `getrawtransaction`, `sendrawtransaction`, …) are a later unit — see
-/// `../../PLAN-chain-notes-app-core-rpc.md` §1.3. For now this parses and
-/// stores enough of a `bitcoind+http(s)://[user:pass@]host[:port]` base to
-/// exist as a distinct, addressable variant. It makes NO network calls:
-/// both [`Transport`] methods return a clear error.
+/// Bitcoin Core JSON-RPC backend (`../../PLAN-chain-notes-app-core-rpc.md`
+/// §1.3/U3). A plain JSON-RPC 1.0 client over HTTP basic auth that receives
+/// an ESPLORA-shaped path (exactly what [`ChainClient`] already sends
+/// through [`Transport`]) and synthesizes an Esplora-shaped JSON body by
+/// calling `bitcoind` — no address index on Core, so a watch-only
+/// descriptor wallet ([`CoreRpcTransport::WATCH_WALLET`]) stands in for
+/// one, imported ONE `addr()` descriptor at a time as addresses are
+/// queried. Ported from the reference implementation,
+/// `prime-chain-notes/companion/server.py`, which does the identical
+/// translation against a real node and backs the whole regtest e2e +
+/// app↔Prime interop matrix.
+///
+/// Deliberately OUT of scope for this unit (see the plan's unit table):
+/// ranged-descriptor import + birthday/prune/txindex preflight (U4),
+/// formal JSON-RPC error-code semantics + credential redaction beyond "never
+/// put creds in a URL or log line" (U5), fee/fiat *policy* refinement (U7).
+/// The ONE error-mapping rule this unit DOES implement is the load-bearing
+/// one: [`CoreRpcTransport::getrawtransaction`]'s RPC code -5 → esplora
+/// 404, since `TxLookupStatus::NotFound` depends on it (§2.1 of the plan).
 pub struct CoreRpcTransport {
     /// "http" or "https" (validated at construction).
     pub scheme: String,
     pub host: String,
     pub port: Option<u16>,
     /// RPC basic-auth credentials, if any were supplied (explicit `creds`
-    /// param or inline URL userinfo — see [`AnyTransport::new`]).
+    /// param or inline URL userinfo — see [`AnyTransport::new`]). Sent ONLY
+    /// as an HTTP Authorization header ([`CoreRpcTransport::call`]) — never
+    /// interpolated into a URL, error string, or log line, so there is
+    /// nothing here for `reqwest`'s own error `Display` (which can echo the
+    /// request URL) to leak.
     pub creds: Option<(String, String)>,
+    client: reqwest::blocking::Client,
+    /// Addresses already `addr()`-imported into the watch wallet this
+    /// session — avoids re-importing (and re-triggering bitcoind's own
+    /// duplicate-descriptor bookkeeping) on every call to the same address.
+    watched: Mutex<HashSet<String>>,
+    /// Addresses confirmed SYNTACTICALLY INVALID this session (bitcoind's
+    /// RPC code -5) — never imported, so every route for one of these
+    /// short-circuits to an empty answer instead of handing a garbage
+    /// string to an RPC that validates its address argument (`listunspent`
+    /// does; `listtransactions` takes no address param at all, so it was
+    /// never at risk). Kept separate from `watched` rather than folded
+    /// into one "seen" set so a route can tell "definitely nothing to
+    /// look up" apart from "already imported, ask the node normally."
+    invalid: Mutex<HashSet<String>>,
+    /// Set once the watch wallet is confirmed created/loaded this session.
+    wallet_ready: Mutex<bool>,
+    next_id: Mutex<u64>,
+}
+
+/// The outcome of one JSON-RPC call, kept distinct from [`Error`] so
+/// [`CoreRpcTransport::getrawtransaction`] can pattern-match on the RPC
+/// error CODE (needed for the -5 → 404 mapping) before it collapses down
+/// to the crate-wide [`Error`] shape everything else uses.
+enum RpcOutcome {
+    Ok(serde_json::Value),
+    /// A well-formed JSON-RPC error response (bitcoind answered, just with
+    /// an error) — `code` is bitcoind's own numeric RPC error code.
+    RpcError { code: Option<i64>, message: String },
+    /// The request never reached a server, or no full response came back —
+    /// mirrors [`Error::Transport`]'s "safe to retry" class.
+    Transport(String),
+    /// A response DID arrive but wasn't a parseable JSON-RPC envelope (bad
+    /// auth with an empty 401 body, a proxy error page, ...).
+    BadResponse(String),
+}
+
+/// `10^8` scale, rounded — bitcoind reports amounts in BTC (f64); every
+/// esplora shape in this crate is sats (u64).
+fn btc_to_sats(btc: f64) -> u64 {
+    (btc * 1e8).round() as u64
+}
+
+/// Does `tx` (an esplora-shaped JSON value, as built by
+/// [`CoreRpcTransport::esplora_tx_json`]) touch `address` — an input
+/// prevout OR an output? The watch wallet is SHARED across every address
+/// ever queried (one `chain-notes-watch` wallet holds every imported
+/// `addr()` descriptor), so `listtransactions` returns other addresses'
+/// txs too; this filter is load-bearing exactly as the plan's §1.3 table
+/// notes — without it a gap-limit scan never finds an unused address and
+/// walks forever.
+fn tx_touches(tx: &serde_json::Value, address: &str) -> bool {
+    let touches_vin = tx.get("vin").and_then(|v| v.as_array()).is_some_and(|a| {
+        a.iter().any(|i| {
+            i.get("prevout").and_then(|p| p.get("scriptpubkey_address")).and_then(|x| x.as_str())
+                == Some(address)
+        })
+    });
+    if touches_vin {
+        return true;
+    }
+    tx.get("vout").and_then(|v| v.as_array()).is_some_and(|a| {
+        a.iter().any(|o| o.get("scriptpubkey_address").and_then(|x| x.as_str()) == Some(address))
+    })
 }
 
 impl CoreRpcTransport {
+    /// Watch-only wallet this transport creates/loads on the node, holding
+    /// every `addr()` descriptor imported so far. Blank + private-keys-
+    /// disabled, exactly like the reference `companion/server.py` shim's
+    /// `cn-watch`. Per-address descriptors are this unit's scope; a ranged
+    /// `tr(.../<0;1>/*)` import (fewer rescans) is U4.
+    const WATCH_WALLET: &'static str = "chain-notes-watch";
+
     /// `rest` is the base URL with the `bitcoind+` prefix already
     /// stripped by [`AnyTransport::new`] (e.g. `http://host:8332` or
     /// `http://user:pass@host:8332`).
@@ -457,17 +543,581 @@ impl CoreRpcTransport {
             port,
             // Explicit creds win over inline userinfo when both present.
             creds: creds.or(inline_creds),
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("client config is static"),
+            watched: Mutex::new(HashSet::new()),
+            invalid: Mutex::new(HashSet::new()),
+            wallet_ready: Mutex::new(false),
+            next_id: Mutex::new(0),
         })
+    }
+
+    /// The JSON-RPC endpoint for `wallet` (`None` = the node-level, non-
+    /// wallet endpoint — `getblockcount`, `getrawtransaction`,
+    /// `sendrawtransaction`, `testmempoolaccept`, `estimatesmartfee`,
+    /// `getdescriptorinfo`, `createwallet`/`loadwallet`; `Some(name)` =
+    /// `/wallet/<name>`, required for wallet RPCs once more than one
+    /// wallet exists on the node — never relies on a "default wallet").
+    fn rpc_url(&self, wallet: Option<&str>) -> String {
+        let base = match self.port {
+            Some(p) => format!("{}://{}:{p}", self.scheme, self.host),
+            None => format!("{}://{}", self.scheme, self.host),
+        };
+        match wallet {
+            Some(w) => format!("{base}/wallet/{w}"),
+            None => base,
+        }
+    }
+
+    /// One JSON-RPC 1.0 call. Auth is an HTTP Authorization header via
+    /// `basic_auth` — `self.creds` never touches the URL string, so
+    /// nothing here (nor `reqwest`'s own error `Display`, which can echo
+    /// the request URL) can leak a credential into an `Error`/log line.
+    fn call(&self, wallet: Option<&str>, method: &str, params: serde_json::Value) -> RpcOutcome {
+        let id = {
+            let mut n = self.next_id.lock().expect("rpc id mutex poisoned");
+            *n += 1;
+            *n
+        };
+        let url = self.rpc_url(wallet);
+        let mut req = self.client.post(&url).json(&serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }));
+        if let Some((user, pass)) = &self.creds {
+            req = req.basic_auth(user, Some(pass));
+        }
+        let resp = match req.send() {
+            Ok(r) => r,
+            Err(e) => return RpcOutcome::Transport(format!("bitcoind rpc: {e}")),
+        };
+        let status = resp.status();
+        let text = match resp.text() {
+            Ok(t) => t,
+            Err(e) => return RpcOutcome::Transport(format!("bitcoind rpc: {e}")),
+        };
+        // A well-formed RPC error comes back as HTTP 500 with a JSON body
+        // carrying {"result":null,"error":{code,message}}; a bad-auth
+        // response is a bare 401 with an EMPTY body. Parse JSON first so a
+        // genuine RPC error surfaces its message rather than a bare status
+        // number, and only fall back to the status-only shape when the
+        // body isn't JSON at all.
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => {
+                return RpcOutcome::BadResponse(format!(
+                    "{}: non-JSON response from bitcoind",
+                    status.as_u16()
+                ))
+            }
+        };
+        if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+            let code = err.get("code").and_then(|c| c.as_i64());
+            let message =
+                err.get("message").and_then(|m| m.as_str()).unwrap_or("bitcoind rpc error").to_string();
+            return RpcOutcome::RpcError { code, message };
+        }
+        if !status.is_success() {
+            return RpcOutcome::BadResponse(format!("{}: bitcoind rpc failed", status.as_u16()));
+        }
+        RpcOutcome::Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    }
+
+    /// [`Self::call`] collapsed to the crate-wide [`Error`] shape — what
+    /// every route handler below uses except [`Self::getrawtransaction`],
+    /// which needs the raw RPC code for the -5 → 404 mapping.
+    fn rpc(&self, wallet: Option<&str>, method: &str, params: serde_json::Value) -> Result<serde_json::Value, Error> {
+        match self.call(wallet, method, params) {
+            RpcOutcome::Ok(v) => Ok(v),
+            RpcOutcome::RpcError { code, message } => Err(Error::Http(format!(
+                "bitcoind{}: {message}",
+                code.map(|c| format!(" [{c}]")).unwrap_or_default()
+            ))),
+            RpcOutcome::Transport(m) => Err(Error::Transport(m)),
+            RpcOutcome::BadResponse(m) => Err(Error::Http(m)),
+        }
+    }
+
+    /// `getrawtransaction` with the ONE positively-established-absence
+    /// mapping this unit implements (plan §2.1): RPC code -5 ("No such
+    /// mempool or blockchain transaction") on a `txindex=1`, synced node
+    /// IS a definitive esplora 404 — verified directly against a live
+    /// node, not assumed. Everything else (auth failure, timeout, a
+    /// non-txindex node, a malformed response, ...) is a transient/unknown
+    /// failure and must NEVER be mistaken for absence, or a dropped-tx
+    /// verdict could fire on a mere hiccup. The `"404:"` prefix is
+    /// load-bearing: [`ChainClient::tx_lookup_status`] matches on it
+    /// verbatim, exactly as it does for a real esplora 404. U5 formalizes
+    /// broader error-code semantics on top of this one rule.
+    fn getrawtransaction(&self, txid: &str, verbosity: u8) -> Result<serde_json::Value, Error> {
+        match self.call(None, "getrawtransaction", serde_json::json!([txid, verbosity])) {
+            RpcOutcome::Ok(v) => Ok(v),
+            RpcOutcome::RpcError { code: Some(-5), .. } => {
+                Err(Error::Http(format!("404: no such transaction: {txid}")))
+            }
+            RpcOutcome::RpcError { code, message } => Err(Error::Http(format!(
+                "bitcoind{}: {message}",
+                code.map(|c| format!(" [{c}]")).unwrap_or_default()
+            ))),
+            RpcOutcome::Transport(m) => Err(Error::Transport(m)),
+            RpcOutcome::BadResponse(m) => Err(Error::Http(m)),
+        }
+    }
+
+    /// A prevout `getrawtransaction verbosity=2` did NOT inline (bitcoind
+    /// omits `prevout` when "block undo data is not available" — verified
+    /// live: a NOT-YET-MINED (mempool) input's prevout comes back missing
+    /// entirely, even though the parent tx is perfectly known) — resolved
+    /// by fetching the parent tx directly and reading its `vout[vout]`.
+    /// Mirrors `ChainClient::fetch_tx_io`'s own client-side fallback for
+    /// the identical gap, just applied server-side here so every OTHER
+    /// route (`utxos`, `address_stats`, `classify_tx_net`'s
+    /// `spends_from_self`, ...) — which all read `vin[].prevout` directly
+    /// with no fallback of their own — gets a populated prevout for a
+    /// mempool tx too. Best-effort: an unresolvable parent (shouldn't
+    /// happen for anything this transport itself watches) degrades to
+    /// `(None, 0)`, matching every esplora field's `#[serde(default)]`
+    /// tolerance on the client side rather than failing the whole tx.
+    fn resolve_prevout(&self, parent_txid: &str, vout: u64) -> (Option<String>, u64) {
+        let Ok(parent) = self.getrawtransaction(parent_txid, 1) else {
+            return (None, 0);
+        };
+        let out = parent.get("vout").and_then(|v| v.as_array()).and_then(|a| a.get(vout as usize));
+        let address = out
+            .and_then(|o| o.get("scriptPubKey"))
+            .and_then(|s| s.get("address"))
+            .and_then(|a| a.as_str())
+            .map(str::to_string);
+        let value = out.and_then(|o| o.get("value")).and_then(|v| v.as_f64()).map(btc_to_sats).unwrap_or(0);
+        (address, value)
+    }
+
+    /// `getrawtransaction txid 2` mapped onto the esplora tx shape
+    /// [`EsploraTx`] deserializes — mirrors `server.py`'s `esplora_tx`
+    /// (module doc, §1.3 of the plan) field-for-field: `confirmed` from
+    /// `confirmations > 0`, `block_height` derived from `tip`, `nulldata`
+    /// → `"op_return"` (esplora's own type name, load-bearing —
+    /// `classify_tx_inner` matches it literally), vin prevouts via
+    /// [`Self::resolve_prevout`] when Core didn't inline one.
+    fn esplora_tx_json(&self, txid: &str, tip: u64) -> Result<serde_json::Value, Error> {
+        let raw = self.getrawtransaction(txid, 2)?;
+        let confirmations = raw.get("confirmations").and_then(|c| c.as_u64()).unwrap_or(0);
+        let confirmed = confirmations > 0;
+        let mut status = serde_json::json!({"confirmed": confirmed});
+        if confirmed {
+            status["block_height"] = serde_json::json!(tip.saturating_sub(confirmations).saturating_add(1));
+            if let Some(bt) = raw.get("blocktime") {
+                status["block_time"] = bt.clone();
+            }
+        }
+        let vin: Vec<serde_json::Value> = raw
+            .get("vin")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| {
+                let txid_v = i.get("txid").cloned().unwrap_or(serde_json::Value::Null);
+                let vout_v = i.get("vout").cloned().unwrap_or(serde_json::Value::Null);
+                let (address, value) = match i.get("prevout").filter(|p| !p.is_null()) {
+                    Some(p) => {
+                        let addr = p
+                            .get("scriptPubKey")
+                            .and_then(|s| s.get("address"))
+                            .and_then(|a| a.as_str())
+                            .map(str::to_string);
+                        let v = p.get("value").and_then(|v| v.as_f64()).map(btc_to_sats).unwrap_or(0);
+                        (addr, v)
+                    }
+                    None => match (txid_v.as_str(), vout_v.as_u64()) {
+                        // Coinbase inputs carry neither — nothing to resolve.
+                        (Some(pt), Some(pv)) => self.resolve_prevout(pt, pv),
+                        _ => (None, 0),
+                    },
+                };
+                serde_json::json!({
+                    "txid": txid_v,
+                    "vout": vout_v,
+                    "prevout": {"scriptpubkey_address": address, "value": value},
+                })
+            })
+            .collect();
+        let vout: Vec<serde_json::Value> = raw
+            .get("vout")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|o| {
+                let spk = o.get("scriptPubKey");
+                let core_type = spk.and_then(|s| s.get("type")).and_then(|t| t.as_str());
+                let esplora_type = if core_type == Some("nulldata") { Some("op_return") } else { core_type };
+                let address = spk.and_then(|s| s.get("address")).and_then(|a| a.as_str());
+                let hex = spk.and_then(|s| s.get("hex")).and_then(|h| h.as_str());
+                let value = o.get("value").and_then(|v| v.as_f64()).map(btc_to_sats).unwrap_or(0);
+                serde_json::json!({
+                    "scriptpubkey": hex,
+                    "scriptpubkey_type": esplora_type,
+                    "scriptpubkey_address": address,
+                    "value": value,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({"txid": txid, "status": status, "vin": vin, "vout": vout}))
+    }
+
+    fn ensure_watch_wallet(&self) -> Result<(), Error> {
+        if *self.wallet_ready.lock().expect("wallet-ready mutex poisoned") {
+            return Ok(());
+        }
+        match self.rpc(None, "createwallet", serde_json::json!([Self::WATCH_WALLET, true, true])) {
+            Ok(_) => {}
+            // Verified live wording (bitcoind v30.2.0): "...Database
+            // already exists." A wallet already present on the node from
+            // an earlier session/transport instance — load it instead.
+            Err(Error::Http(msg)) if msg.contains("already exists") => {
+                match self.rpc(None, "loadwallet", serde_json::json!([Self::WATCH_WALLET])) {
+                    Ok(_) => {}
+                    // Verified live wording: `Wallet "..." is already
+                    // loaded.` — another instance/thread got there first.
+                    Err(Error::Http(msg2)) if msg2.contains("already loaded") => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        *self.wallet_ready.lock().expect("wallet-ready mutex poisoned") = true;
+        Ok(())
+    }
+
+    /// Per-address `addr()` descriptor import (this unit's scope — a
+    /// ranged `tr(.../<0;1>/*)` import, avoiding a rescan per address, is
+    /// U4). `timestamp: 0` triggers a rescan from genesis on a real
+    /// mainnet node; harmless on the short regtest chains this unit is
+    /// tested against, and U4's birthday work addresses it directly.
+    /// Ensures `address` is imported into the watch wallet. Returns `Ok(true)`
+    /// for a real, importable address; `Ok(false)` for a syntactically
+    /// INVALID one (bitcoind RPC code -5 — a garbage string, not decodable
+    /// on any network) — which can never have on-chain history, so a `false`
+    /// return is the caller's signal to short-circuit straight to an empty
+    /// answer rather than handing that string to an RPC that validates its
+    /// address argument (`listunspent` does; `listtransactions` takes no
+    /// address param at all, so it was never at risk). Esplora never
+    /// hard-errors an unusual address lookup either (only an unknown TXID
+    /// gets a definite 404 — see this file's `tx_lookup_status` contract),
+    /// so this keeps the same "never an `Err` the caller has to
+    /// special-case" shape. Verified live: this is exactly what
+    /// `assert_chain_contract`'s "an address never mentioned anywhere in
+    /// the scenario reads as definitively unused" check exercises.
+    fn ensure_address_watched(&self, address: &str) -> Result<bool, Error> {
+        if self.watched.lock().expect("watched-address mutex poisoned").contains(address) {
+            return Ok(true);
+        }
+        if self.invalid.lock().expect("invalid-address mutex poisoned").contains(address) {
+            return Ok(false);
+        }
+        self.ensure_watch_wallet()?;
+        let desc = match self.call(None, "getdescriptorinfo", serde_json::json!([format!("addr({address})")])) {
+            RpcOutcome::Ok(info) => info
+                .get("descriptor")
+                .and_then(|d| d.as_str())
+                .ok_or_else(|| Error::Json("getdescriptorinfo: missing descriptor".into()))?
+                .to_string(),
+            RpcOutcome::RpcError { code: Some(-5), .. } => {
+                self.invalid.lock().expect("invalid-address mutex poisoned").insert(address.to_string());
+                return Ok(false);
+            }
+            RpcOutcome::RpcError { code, message } => {
+                return Err(Error::Http(format!(
+                    "bitcoind{}: {message}",
+                    code.map(|c| format!(" [{c}]")).unwrap_or_default()
+                )))
+            }
+            RpcOutcome::Transport(m) => return Err(Error::Transport(m)),
+            RpcOutcome::BadResponse(m) => return Err(Error::Http(m)),
+        };
+        self.rpc(
+            Some(Self::WATCH_WALLET),
+            "importdescriptors",
+            serde_json::json!([[{"desc": desc, "timestamp": 0}]]),
+        )?;
+        self.watched.lock().expect("watched-address mutex poisoned").insert(address.to_string());
+        Ok(true)
+    }
+
+    fn tip_height_rpc(&self) -> Result<u64, Error> {
+        let v = self.rpc(None, "getblockcount", serde_json::json!([]))?;
+        v.as_u64().ok_or_else(|| Error::Json("getblockcount: not a number".into()))
+    }
+
+    /// Every wallet-known txid (mempool + confirmed), deduped, ordered
+    /// newest-first: mempool (by descending `time`) first, then confirmed
+    /// by ascending `confirmations` (= most-recently-confirmed first) —
+    /// same ordering `server.py`'s `address_txids` uses. `listtransactions
+    /// "*"` is wallet-WIDE (Core has no per-address filter — plan §2.2
+    /// flags the O(wallet) cost as a later-unit optimization); callers
+    /// filter down to one address via [`tx_touches`].
+    fn wallet_txid_order(&self) -> Result<Vec<String>, Error> {
+        let entries = self.rpc(
+            Some(Self::WATCH_WALLET),
+            "listtransactions",
+            serde_json::json!(["*", 100_000, 0, true]),
+        )?;
+        let mut list: Vec<serde_json::Value> = entries.as_array().cloned().unwrap_or_default();
+        list.sort_by(|a, b| {
+            let ca = a.get("confirmations").and_then(|c| c.as_i64()).unwrap_or(0);
+            let cb = b.get("confirmations").and_then(|c| c.as_i64()).unwrap_or(0);
+            ca.cmp(&cb).then_with(|| {
+                let ta = a.get("time").and_then(|t| t.as_i64()).unwrap_or(0);
+                let tb = b.get("time").and_then(|t| t.as_i64()).unwrap_or(0);
+                tb.cmp(&ta)
+            })
+        });
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for e in list {
+            if let Some(txid) = e.get("txid").and_then(|t| t.as_str()) {
+                if seen.insert(txid.to_string()) {
+                    out.push(txid.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `address`'s full esplora-shaped history (already touch-filtered),
+    /// newest-first. Backs `/address/:a`, `/address/:a/txs`, and
+    /// `/address/:a/txs/chain/:after`.
+    fn address_history_json(&self, address: &str) -> Result<Vec<serde_json::Value>, Error> {
+        let tip = self.tip_height_rpc()?;
+        let txids = self.wallet_txid_order()?;
+        let mut out = Vec::with_capacity(txids.len());
+        for txid in txids {
+            let tx = self.esplora_tx_json(&txid, tip)?;
+            if tx_touches(&tx, address) {
+                out.push(tx);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `GET /address/:a` — folds full history into chain/mempool buckets
+    /// exactly like `server.py`'s `/address` handler (plan §1.3, :220).
+    fn address_stats_route(&self, address: &str) -> Result<String, Error> {
+        let txs = self.address_history_json(address)?;
+        let (mut chain_n, mut chain_f, mut chain_s) = (0u64, 0u64, 0u64);
+        let (mut mem_n, mut mem_f, mut mem_s) = (0u64, 0u64, 0u64);
+        for tx in &txs {
+            let confirmed = tx.get("status").and_then(|s| s.get("confirmed")).and_then(|c| c.as_bool()).unwrap_or(false);
+            let mut funded = 0u64;
+            let mut spent = 0u64;
+            for o in tx.get("vout").and_then(|v| v.as_array()).into_iter().flatten() {
+                if o.get("scriptpubkey_address").and_then(|a| a.as_str()) == Some(address) {
+                    funded += o.get("value").and_then(|v| v.as_u64()).unwrap_or(0);
+                }
+            }
+            for i in tx.get("vin").and_then(|v| v.as_array()).into_iter().flatten() {
+                if i.get("prevout").and_then(|p| p.get("scriptpubkey_address")).and_then(|a| a.as_str()) == Some(address) {
+                    spent += i.get("prevout").and_then(|p| p.get("value")).and_then(|v| v.as_u64()).unwrap_or(0);
+                }
+            }
+            if confirmed {
+                chain_n += 1;
+                chain_f += funded;
+                chain_s += spent;
+            } else {
+                mem_n += 1;
+                mem_f += funded;
+                mem_s += spent;
+            }
+        }
+        Ok(serde_json::json!({
+            "chain_stats": {"tx_count": chain_n, "funded_txo_sum": chain_f, "spent_txo_sum": chain_s},
+            "mempool_stats": {"tx_count": mem_n, "funded_txo_sum": mem_f, "spent_txo_sum": mem_s},
+        })
+        .to_string())
+    }
+
+    /// `GET /address/:a/utxo` → `listunspent 0 9999999 [address]` (plan
+    /// §1.3, `server.py`:263).
+    fn utxo_route(&self, address: &str) -> Result<String, Error> {
+        let tip = self.tip_height_rpc()?;
+        let result =
+            self.rpc(Some(Self::WATCH_WALLET), "listunspent", serde_json::json!([0, 9_999_999, [address]]))?;
+        let items: Vec<serde_json::Value> = result
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|u| {
+                let confirmations = u.get("confirmations").and_then(|c| c.as_i64()).unwrap_or(0);
+                let value = u.get("amount").and_then(|a| a.as_f64()).map(btc_to_sats).unwrap_or(0);
+                let status = if confirmations > 0 {
+                    serde_json::json!({
+                        "confirmed": true,
+                        "block_height": tip.saturating_sub(confirmations as u64).saturating_add(1),
+                    })
+                } else {
+                    serde_json::json!({"confirmed": false})
+                };
+                serde_json::json!({
+                    "txid": u.get("txid").cloned().unwrap_or(serde_json::Value::Null),
+                    "vout": u.get("vout").cloned().unwrap_or(serde_json::Value::Null),
+                    "value": value,
+                    "status": status,
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string(&items).unwrap())
+    }
+
+    /// `GET /address/:a/txs[/chain/:after]` — `listtransactions "*" …`
+    /// filtered to txs touching `address` (plan §1.3, `server.py`:188,
+    /// :283). `chain_only` (the `/txs/chain/:after` form) drops mempool
+    /// entries and paginates 25-at-a-time by PATH-embedded cursor, exactly
+    /// what `ChainClient::full_history` sends and real esplora expects —
+    /// see the `EsploraFake` reference in `tests/common/mod.rs`; the
+    /// regtest `server.py` shim instead reads a query-string cursor it
+    /// never actually receives from this app (a pre-existing, out-of-scope
+    /// shim gap noted in `chain.rs`'s own doc comment), so it does not
+    /// double as a second worked example for this form.
+    fn txs_route(&self, address: &str, after: Option<&str>, chain_only: bool) -> Result<String, Error> {
+        let mut items = self.address_history_json(address)?;
+        if chain_only {
+            items.retain(|t| t.get("status").and_then(|s| s.get("confirmed")).and_then(|c| c.as_bool()).unwrap_or(false));
+        }
+        if let Some(after_txid) = after {
+            let idx = items.iter().position(|t| t.get("txid").and_then(|v| v.as_str()) == Some(after_txid));
+            items = match idx {
+                Some(i) => items.split_off(i + 1),
+                None => Vec::new(),
+            };
+        }
+        items.truncate(if chain_only { 25 } else { 50 });
+        Ok(serde_json::to_string(&items).unwrap())
+    }
+
+    /// `GET /v1/fees/recommended` → `estimatesmartfee` for 1/3/6/144
+    /// blocks, BTC/kvB → sat/vB (`* 100_000`, ceil, floor 1). Regtest (and
+    /// any node with too little fee history) always fails to estimate —
+    /// verified live (`estimatesmartfee` returns an `errors` array with no
+    /// `feerate` field, not an RPC error) — so each tier independently
+    /// falls back to a fixed sat/vB rather than propagating an error, per
+    /// the plan's "callers must never see this break" rule. Fee *policy*
+    /// (tier selection, rounding strategy) is U7; this is just "always
+    /// answer with the right shape."
+    fn fee_estimates_route(&self) -> Result<String, Error> {
+        let sat_vb = |blocks: u64| -> Option<u64> {
+            let v = self.rpc(None, "estimatesmartfee", serde_json::json!([blocks])).ok()?;
+            let btc_per_kvb = v.get("feerate")?.as_f64()?;
+            Some(((btc_per_kvb * 100_000.0).ceil() as u64).max(1))
+        };
+        let fastest = sat_vb(1).unwrap_or(3);
+        let half_hour = sat_vb(3).unwrap_or(2);
+        let hour = sat_vb(6).unwrap_or(1);
+        let economy = sat_vb(144).unwrap_or(1);
+        Ok(serde_json::json!({
+            "fastestFee": fastest,
+            "halfHourFee": half_hour,
+            "hourFee": hour,
+            "economyFee": economy,
+            "minimumFee": 1,
+        })
+        .to_string())
     }
 }
 
 impl Transport for CoreRpcTransport {
-    fn get_text(&self, _path: &str) -> Result<String, Error> {
-        Err(Error::Http("bitcoin core rpc backend not implemented yet".into()))
+    fn get_text(&self, path: &str) -> Result<String, Error> {
+        // stderr-only, debug builds only, path never carries credentials —
+        // same discipline as `HttpTransport::get_text`.
+        #[cfg(debug_assertions)]
+        eprintln!("cb: http GET {path}");
+
+        if path == "/blocks/tip/height" {
+            return Ok(self.tip_height_rpc()?.to_string());
+        }
+        if path == "/v1/fees/recommended" {
+            return self.fee_estimates_route();
+        }
+        if path == "/v1/prices" {
+            // No node knows the price (plan §2.6) — both call sites
+            // already degrade via `if let Ok(...)`, so any Err is fine.
+            return Err(Error::Http("bitcoind has no price oracle".into()));
+        }
+        if let Some(rest) = path.strip_prefix("/address/") {
+            let mut parts = rest.splitn(2, '/');
+            let address = parts.next().unwrap_or("");
+            if address.is_empty() {
+                return Err(Error::Http("404: address missing".into()));
+            }
+            let sub = parts.next();
+            if !self.ensure_address_watched(address)? {
+                // Syntactically invalid — short-circuit every route to its
+                // empty shape rather than handing a garbage address to an
+                // RPC that validates it (see `ensure_address_watched`'s
+                // doc comment).
+                return match sub {
+                    None => Ok(serde_json::json!({
+                        "chain_stats": {"tx_count": 0, "funded_txo_sum": 0, "spent_txo_sum": 0},
+                        "mempool_stats": {"tx_count": 0, "funded_txo_sum": 0, "spent_txo_sum": 0},
+                    })
+                    .to_string()),
+                    Some("utxo") | Some("txs") => Ok("[]".to_string()),
+                    Some(s) if s.starts_with("txs/chain/") => Ok("[]".to_string()),
+                    Some(other) => Err(Error::Http(format!("404: no route /address/.../{other}"))),
+                };
+            }
+            return match sub {
+                None => self.address_stats_route(address),
+                Some("utxo") => self.utxo_route(address),
+                Some("txs") => self.txs_route(address, None, false),
+                Some(s) if s.starts_with("txs/chain/") => {
+                    let after = &s["txs/chain/".len()..];
+                    self.txs_route(address, Some(after), true)
+                }
+                Some(other) => Err(Error::Http(format!("404: no route /address/.../{other}"))),
+            };
+        }
+        if let Some(rest) = path.strip_prefix("/tx/") {
+            if let Some(txid) = rest.strip_suffix("/hex") {
+                let raw = self.getrawtransaction(txid, 0)?;
+                return raw
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| Error::Json("getrawtransaction: hex not a string".into()));
+            }
+            let tip = self.tip_height_rpc()?;
+            return self.esplora_tx_json(rest, tip).map(|v| v.to_string());
+        }
+        Err(Error::Http(format!("404: no route for {path}")))
     }
 
-    fn post_text(&self, _path: &str, _body: String) -> Result<String, Error> {
-        Err(Error::Http("bitcoin core rpc backend not implemented yet".into()))
+    /// `POST /tx` → `testmempoolaccept` then `sendrawtransaction` (plan
+    /// §1.3, `server.py`:304) — deliberately does NOT auto-mine (unlike
+    /// `server.py`'s regtest convenience): this transport is meant to run
+    /// against a production node too, where silently mining a block on
+    /// every broadcast would be actively wrong.
+    fn post_text(&self, path: &str, body: String) -> Result<String, Error> {
+        #[cfg(debug_assertions)]
+        eprintln!("cb: http POST {path}");
+        if path != "/tx" {
+            return Err(Error::Http(format!("404: no POST route for {path}")));
+        }
+        let raw_hex = body.trim().to_string();
+        let accept = self.rpc(None, "testmempoolaccept", serde_json::json!([[raw_hex.clone()]]))?;
+        let first = accept.as_array().and_then(|a| a.first()).cloned().unwrap_or(serde_json::Value::Null);
+        let allowed = first.get("allowed").and_then(|a| a.as_bool()).unwrap_or(false);
+        if !allowed {
+            let reason = first.get("reject-reason").and_then(|r| r.as_str()).unwrap_or("rejected");
+            return Err(Error::Http(format!("400: sendrawtransaction RPC error: {reason}")));
+        }
+        let txid = self.rpc(None, "sendrawtransaction", serde_json::json!([raw_hex]))?;
+        txid.as_str().map(str::to_string).ok_or_else(|| Error::Json("sendrawtransaction: did not return a txid".into()))
     }
 }
 
@@ -2403,12 +3053,23 @@ mod tests {
     }
 
     #[test]
-    fn core_rpc_transport_is_a_stub_that_never_calls_out() {
-        let t = CoreRpcTransport::new("http://127.0.0.1:8332", None).unwrap();
+    fn core_rpc_transport_makes_a_genuine_network_call_and_fails_as_transport_with_nothing_listening() {
+        // U2 (the seam-only stub) locked in a canned "not implemented"
+        // `Error::Http` here with NO network call. U3 replaces the stub
+        // with a real JSON-RPC client — this test now locks in the
+        // OPPOSITE: with nothing listening, both methods genuinely attempt
+        // a connection and fail as `Error::Transport` (never `Error::Http`,
+        // which would imply a server actually answered). Port 1 rather
+        // than a real RPC port (8332/18443/...) so this never accidentally
+        // passes/behaves differently on a machine that happens to be
+        // running a real node. The full round-trip against a real
+        // `bitcoind` is `tests/core_rpc_conformance.rs` (skipped when
+        // bitcoind is absent from PATH).
+        let t = CoreRpcTransport::new("http://127.0.0.1:1", None).unwrap();
         let get_err = t.get_text("/blocks/tip/height").unwrap_err();
-        assert!(matches!(get_err, Error::Http(msg) if msg.contains("not implemented")));
+        assert!(matches!(get_err, Error::Transport(_)), "expected a transport failure, got {get_err:?}");
         let post_err = t.post_text("/tx", "deadbeef".into()).unwrap_err();
-        assert!(matches!(post_err, Error::Http(msg) if msg.contains("not implemented")));
+        assert!(matches!(post_err, Error::Transport(_)), "expected a transport failure, got {post_err:?}");
     }
 
     #[test]
