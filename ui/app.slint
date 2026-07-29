@@ -3528,49 +3528,78 @@ export component AppWindow inherits Window {
                 placeholder-text: "https://mempool.example/api  or  bitcoind+http://192.168.1.10:8332";
                 accepted(t) => { root.set-node-custom(t); }
             }
-            if root.node-is-core: VerticalLayout {
+            // FLATTENED (2026-07-29, U11): every row below used to live
+            // inside a single `if root.node-is-core: VerticalLayout { … }`
+            // — a nested layout whose OWN preferred-height didn't reliably
+            // propagate up to this SettingsCard's `height: l.preferred-
+            // height` binding when a row inside it changed size AFTER the
+            // settings screen's first layout pass (which is exactly what
+            // the node-health line does — it starts empty, then flips to
+            // a real result either synchronously from `set-node-custom`/
+            // `set-node-core-creds` or asynchronously from
+            // `refresh_node_health`'s worker thread). Symptom: a short
+            // one-line health result got ZERO visible height (fully
+            // invisible — the worst failure mode for text that tells a
+            // user their node is pruned or missing txindex), and a longer
+            // wrapped result was clipped mid-glyph, bleeding into the
+            // "Block explorer" card below. Nesting the health Caption one
+            // level deeper still (a second `if`) only made it worse — it
+            // landed on the SAME row as the "Save credentials" button
+            // instead of after it. Neither a sibling `if` at the card level
+            // NOR switching the innermost Caption to `visible:` (keeping it
+            // permanently in the tree) fixed the card's height — the bug
+            // lives in the NESTED VerticalLayout itself, not in how its
+            // last child is toggled. Removing that nested layout — making
+            // every row here a DIRECT child of the SettingsCard's own `l`
+            // layout, each individually gated by its own `if
+            // root.node-is-core: …` (repeating the condition, exactly the
+            // single-`if`-depth shape the iCloud-backup card's working
+            // `if !root.icloud-enabled: Caption` above already uses) — is
+            // what actually fixes it: `l` now sees every row as one of its
+            // own direct children, so its preferred-height always includes
+            // whichever are currently shown, at any point after the first
+            // paint. `l`'s own 8px spacing (SettingsCard) reproduces the
+            // nested layout's old `spacing: 8px` unchanged.
+            if root.node-is-core: Caption {
+                text: "RPC username and password — stored in the device Keychain, never in app settings. Credentials cross the network in plaintext over http:// — use Tailscale, Tor, or an SSH tunnel unless this node is on localhost.";
+                wrap: word-wrap;
+            }
+            if root.node-is-core: Caption {
+                text: "Your node has no price oracle — USD estimates stay hidden while it's active, so no third-party price lookup happens either.";
+                wrap: word-wrap;
+            }
+            if root.node-is-core: HorizontalLayout {
                 spacing: 8px;
-                Caption {
-                    text: "RPC username and password — stored in the device Keychain, never in app settings. Credentials cross the network in plaintext over http:// — use Tailscale, Tor, or an SSH tunnel unless this node is on localhost.";
-                    wrap: word-wrap;
+                EditField {
+                    text <=> root.node-core-user;
+                    placeholder-text: "RPC username";
+                    accepted(t) => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
                 }
-                Caption {
-                    text: "Your node has no price oracle — USD estimates stay hidden while it's active, so no third-party price lookup happens either.";
-                    wrap: word-wrap;
+                EditField {
+                    text <=> root.node-core-pass;
+                    placeholder-text: "RPC password";
+                    input-type: password;
+                    accepted(t) => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
                 }
-                HorizontalLayout {
-                    spacing: 8px;
-                    EditField {
-                        text <=> root.node-core-user;
-                        placeholder-text: "RPC username";
-                        accepted(t) => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
-                    }
-                    EditField {
-                        text <=> root.node-core-pass;
-                        placeholder-text: "RPC password";
-                        input-type: password;
-                        accepted(t) => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
-                    }
-                }
-                Switch {
-                    text: "Save credentials to Keychain";
-                    checked <=> root.node-core-save-creds;
-                    toggled => { root.set-node-core-save-creds(root.node-core-save-creds); }
-                }
-                if !root.node-core-save-creds: Caption {
-                    text: "Credentials stay in memory for this session only — you'll re-enter them next launch.";
-                    color: Pal.muted;
-                    wrap: word-wrap;
-                }
-                GhostButton {
-                    text: "Save credentials";
-                    clicked => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
-                }
-                if root.node-health-text != "": Caption {
-                    text: root.node-health-text;
-                    color: root.node-health-warn ? Pal.warn : Pal.muted;
-                    wrap: word-wrap;
-                }
+            }
+            if root.node-is-core: Switch {
+                text: "Save credentials to Keychain";
+                checked <=> root.node-core-save-creds;
+                toggled => { root.set-node-core-save-creds(root.node-core-save-creds); }
+            }
+            if root.node-is-core && !root.node-core-save-creds: Caption {
+                text: "Credentials stay in memory for this session only — you'll re-enter them next launch.";
+                color: Pal.muted;
+                wrap: word-wrap;
+            }
+            if root.node-is-core: GhostButton {
+                text: "Save credentials";
+                clicked => { root.set-node-core-creds(root.node-core-user, root.node-core-pass); }
+            }
+            if root.node-is-core && root.node-health-text != "": Caption {
+                text: root.node-health-text;
+                color: root.node-health-warn ? Pal.warn : Pal.muted;
+                wrap: word-wrap;
             }
         }
         SettingsCard {
