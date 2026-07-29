@@ -18,7 +18,7 @@
 //! retry-with-backoff (for the 429s that get through anyway). See the
 //! comment on `Transport for HttpTransport` below for the exact rules.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,7 @@ use notes_core::tx::op_return_payload;
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
 
+use crate::funding::FundingSource;
 use crate::Error;
 
 pub trait Transport {
@@ -407,19 +408,32 @@ pub fn node_backend_label(base: &str) -> &'static str {
 }
 
 /// Bitcoin Core JSON-RPC backend (`../../PLAN-chain-notes-app-core-rpc.md`
-/// §1.3/U3). A plain JSON-RPC 1.0 client over HTTP basic auth that receives
-/// an ESPLORA-shaped path (exactly what [`ChainClient`] already sends
-/// through [`Transport`]) and synthesizes an Esplora-shaped JSON body by
-/// calling `bitcoind` — no address index on Core, so a watch-only
-/// descriptor wallet ([`CoreRpcTransport::WATCH_WALLET`]) stands in for
-/// one, imported ONE `addr()` descriptor at a time as addresses are
-/// queried. Ported from the reference implementation,
-/// `prime-chain-notes/companion/server.py`, which does the identical
-/// translation against a real node and backs the whole regtest e2e +
-/// app↔Prime interop matrix.
+/// §1.3/U3, §2.2/§2.3/U4). A plain JSON-RPC 1.0 client over HTTP basic auth
+/// that receives an ESPLORA-shaped path (exactly what [`ChainClient`]
+/// already sends through [`Transport`]) and synthesizes an Esplora-shaped
+/// JSON body by calling `bitcoind` — no address index on Core, so a
+/// watch-only descriptor wallet ([`CoreRpcTransport::WATCH_WALLET`]) stands
+/// in for one. Two ways an address gets imported into it:
+///
+/// 1. **Ranged descriptor import** ([`CoreRpcTransport::watch_descriptors`],
+///    U4) — the app's own notebook/spending descriptors, configured
+///    OUT-OF-BAND before any of their addresses are queried (this transport
+///    only ever sees Esplora PATHS, never which descriptor an address came
+///    from). One `importdescriptors` call per family, both chains at once
+///    (Core's own multipath support), widened automatically
+///    ([`CoreRpcTransport::ranged_lookup_or_widen`]) as the gap window
+///    grows past the imported range.
+/// 2. **Per-address `addr()` fallback** (U3, unchanged) — for anything
+///    never configured this way (a contact, an external recipient, a
+///    custom change address, ...), imported one address at a time exactly
+///    as before. Also the ENTIRE behavior when nothing has been configured
+///    at all, so every existing test and caller stays green.
+///
+/// Ported from the reference implementation, `prime-chain-notes/companion/
+/// server.py`, which does the identical per-address translation against a
+/// real node and backs the whole regtest e2e + app↔Prime interop matrix.
 ///
 /// Deliberately OUT of scope for this unit (see the plan's unit table):
-/// ranged-descriptor import + birthday/prune/txindex preflight (U4),
 /// formal JSON-RPC error-code semantics + credential redaction beyond "never
 /// put creds in a URL or log line" (U5), fee/fiat *policy* refinement (U7).
 /// The ONE error-mapping rule this unit DOES implement is the load-bearing
@@ -453,7 +467,86 @@ pub struct CoreRpcTransport {
     invalid: Mutex<HashSet<String>>,
     /// Set once the watch wallet is confirmed created/loaded this session.
     wallet_ready: Mutex<bool>,
+    /// Ranged descriptor families configured via
+    /// [`CoreRpcTransport::watch_descriptors`] (U4) — empty until a caller
+    /// opts in, so this is strictly additive over the U3 per-address path.
+    ranged: Mutex<Vec<RangedWatch>>,
     next_id: Mutex<u64>,
+}
+
+/// One descriptor family imported as a RANGED batch (plan §2.2/U4) instead
+/// of one `addr()` descriptor per address — out-of-band configuration, set
+/// up via [`CoreRpcTransport::watch_descriptors`] before any of its
+/// addresses are queried. Typically one per notebook account's `tr(...)`
+/// chain and one for the BIP-84 spending wallet's `wpkh(...)` chain.
+#[derive(Debug, Clone)]
+pub struct WatchDescriptor {
+    /// A multipath (`.../<0;1>/*`) or single-chain output descriptor —
+    /// anything [`FundingSource::parse`] accepts (the SAME parser the
+    /// watch-only import path already uses, so this is not a second
+    /// hand-rolled derivation). A `#checksum` suffix, if present, is
+    /// stripped and recomputed — bitcoind rejects a stale/foreign one.
+    pub descriptor: String,
+    pub network: Network,
+    /// Unix epoch seconds to start rescanning from — the wallet's
+    /// birthday. `0` = genesis (a full rescan; on mainnet this can take
+    /// hours — plan §2.2). A notebook created in-app can pass its own
+    /// `created_at` (`store.rs:176`); **an IMPORTED SEED HAS NO KNOWN
+    /// BIRTHDAY**, and this type deliberately does not pick a default for
+    /// that case — silently substituting `now` would hide real history.
+    /// The caller (U6) surfaces the choice to the user instead.
+    pub timestamp: u64,
+    /// Initial `range` end (inclusive) to import for BOTH chains. Widened
+    /// automatically ([`CoreRpcTransport::ranged_lookup_or_widen`]) as the
+    /// gap window grows past it.
+    pub range_end: u32,
+}
+
+/// One configured [`WatchDescriptor`], parsed once and kept alongside its
+/// currently-imported range and a local address→(chain,index) cache built
+/// purely by derivation (no RPC) up to that range.
+struct RangedWatch {
+    spec: WatchDescriptor,
+    source: FundingSource,
+    /// Currently-imported `range` end (inclusive) on the node, for both
+    /// chains — what `import_ranged` last told bitcoind.
+    imported_end: u32,
+    /// address → (chain, index), populated up to `imported_end` — anything
+    /// NOT in here has never been told to bitcoind, so a lookup must never
+    /// report "already imported" for an address absent from this map even
+    /// if it happens to be `Ok` from a raw derivation (see
+    /// `ranged_lookup_or_widen`'s chunked widen, which keeps the two in
+    /// lock-step).
+    index: HashMap<String, (usize, u32)>,
+}
+
+/// Structured result of [`CoreRpcTransport::preflight`] (plan §2.2/§2.3/U4)
+/// — everything the UI (U6) needs to render an honest picture of the node
+/// the user pointed the app at. Never used to silently gate behavior here;
+/// this unit only reports.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeStatus {
+    /// `getblockchaininfo.pruned` — a pruned node CANNOT rescan below its
+    /// prune height at all. Report it; never silently return partial
+    /// history (plan §2.2).
+    pub pruned: bool,
+    /// `getblockchaininfo.pruneheight`, populated only when `pruned`.
+    pub prune_height: Option<u64>,
+    /// Does `getindexinfo` carry a `"txindex"` entry? Without it, prevout
+    /// lookup for EXTERNAL parents fails, so sender attribution degrades
+    /// (plan §2.3) — never a hard failure by itself.
+    pub txindex: bool,
+    /// `getblockchaininfo.initialblockdownload`.
+    pub initial_block_download: bool,
+    /// The watch wallet's `getwalletinfo.scanning` — `None` when the
+    /// wallet does not exist yet (nothing imported this session, not an
+    /// error); `Some(false)` idle; `Some(true)` a rescan is in progress
+    /// (bitcoind reports this as `{duration, progress}` rather than a bare
+    /// bool — either shape maps to `true` here). A rescan in progress must
+    /// be REPORTABLE, never look like an empty wallet (plan §2.2).
+    pub wallet_scanning: Option<bool>,
+    /// Chain tip height, for the UI's own "how far behind" arithmetic.
+    pub tip_height: u64,
 }
 
 /// The outcome of one JSON-RPC call, kept distinct from [`Error`] so
@@ -504,11 +597,23 @@ fn tx_touches(tx: &serde_json::Value, address: &str) -> bool {
 
 impl CoreRpcTransport {
     /// Watch-only wallet this transport creates/loads on the node, holding
-    /// every `addr()` descriptor imported so far. Blank + private-keys-
-    /// disabled, exactly like the reference `companion/server.py` shim's
-    /// `cn-watch`. Per-address descriptors are this unit's scope; a ranged
-    /// `tr(.../<0;1>/*)` import (fewer rescans) is U4.
+    /// every descriptor imported so far — one `addr()` at a time (U3
+    /// fallback) or ranged families (U4, [`Self::watch_descriptors`]).
+    /// Blank + private-keys-disabled, exactly like the reference
+    /// `companion/server.py` shim's `cn-watch`.
     const WATCH_WALLET: &'static str = "chain-notes-watch";
+
+    /// How many indices [`Self::ranged_lookup_or_widen`] derives (locally,
+    /// no RPC) per attempt while searching for a cache-miss address beyond
+    /// a descriptor's currently-imported range.
+    const WIDEN_CHUNK: u32 = 100;
+    /// How many [`Self::WIDEN_CHUNK`]-sized attempts before giving up on a
+    /// descriptor and moving to the next (or falling back to per-address
+    /// import) — bounds the cost of a query for an address that turns out
+    /// to belong to NONE of the configured families (a contact, an
+    /// external recipient, ...) to `WIDEN_CHUNK * MAX_WIDEN_CHUNKS * 2`
+    /// pure derivations, no bitcoind round trip.
+    const MAX_WIDEN_CHUNKS: u32 = 10;
 
     /// `rest` is the base URL with the `bitcoind+` prefix already
     /// stripped by [`AnyTransport::new`] (e.g. `http://host:8332` or
@@ -550,6 +655,7 @@ impl CoreRpcTransport {
             watched: Mutex::new(HashSet::new()),
             invalid: Mutex::new(HashSet::new()),
             wallet_ready: Mutex::new(false),
+            ranged: Mutex::new(Vec::new()),
             next_id: Mutex::new(0),
         })
     }
@@ -794,31 +900,43 @@ impl CoreRpcTransport {
         Ok(())
     }
 
-    /// Per-address `addr()` descriptor import (this unit's scope — a
-    /// ranged `tr(.../<0;1>/*)` import, avoiding a rescan per address, is
-    /// U4). `timestamp: 0` triggers a rescan from genesis on a real
-    /// mainnet node; harmless on the short regtest chains this unit is
-    /// tested against, and U4's birthday work addresses it directly.
-    /// Ensures `address` is imported into the watch wallet. Returns `Ok(true)`
-    /// for a real, importable address; `Ok(false)` for a syntactically
-    /// INVALID one (bitcoind RPC code -5 — a garbage string, not decodable
-    /// on any network) — which can never have on-chain history, so a `false`
-    /// return is the caller's signal to short-circuit straight to an empty
-    /// answer rather than handing that string to an RPC that validates its
-    /// address argument (`listunspent` does; `listtransactions` takes no
-    /// address param at all, so it was never at risk). Esplora never
-    /// hard-errors an unusual address lookup either (only an unknown TXID
-    /// gets a definite 404 — see this file's `tx_lookup_status` contract),
-    /// so this keeps the same "never an `Err` the caller has to
-    /// special-case" shape. Verified live: this is exactly what
-    /// `assert_chain_contract`'s "an address never mentioned anywhere in
-    /// the scenario reads as definitively unused" check exercises.
+    /// Per-address `addr()` descriptor import — the U3 fallback, still hit
+    /// for anything not covered by a configured [`WatchDescriptor`] family
+    /// (a contact, an external recipient, a custom change address, ...) and
+    /// the ENTIRE behavior when [`Self::watch_descriptors`] was never
+    /// called (every existing test and caller). `timestamp: 0` triggers a
+    /// rescan from genesis on a real mainnet node; harmless on the short
+    /// regtest chains U3 was tested against. Ensures `address` is imported
+    /// into the watch wallet — first by checking whether it belongs to a
+    /// ranged family already configured (U4, [`Self::ranged_lookup_or_widen`]),
+    /// widening that family's imported range instead of falling back here
+    /// when it does. Returns `Ok(true)` for a real, importable address;
+    /// `Ok(false)` for a syntactically INVALID one (bitcoind RPC code -5 —
+    /// a garbage string, not decodable on any network) — which can never
+    /// have on-chain history, so a `false` return is the caller's signal to
+    /// short-circuit straight to an empty answer rather than handing that
+    /// string to an RPC that validates its address argument (`listunspent`
+    /// does; `listtransactions` takes no address param at all, so it was
+    /// never at risk). Esplora never hard-errors an unusual address lookup
+    /// either (only an unknown TXID gets a definite 404 — see this file's
+    /// `tx_lookup_status` contract), so this keeps the same "never an `Err`
+    /// the caller has to special-case" shape. Verified live: this is
+    /// exactly what `assert_chain_contract`'s "an address never mentioned
+    /// anywhere in the scenario reads as definitively unused" check
+    /// exercises.
     fn ensure_address_watched(&self, address: &str) -> Result<bool, Error> {
         if self.watched.lock().expect("watched-address mutex poisoned").contains(address) {
             return Ok(true);
         }
         if self.invalid.lock().expect("invalid-address mutex poisoned").contains(address) {
             return Ok(false);
+        }
+        if self.ranged_lookup_or_widen(address)? {
+            // Already imported (at configure time or just now, widened) —
+            // cache the hit in `watched` too so the NEXT query for the same
+            // address takes the cheapest possible path.
+            self.watched.lock().expect("watched-address mutex poisoned").insert(address.to_string());
+            return Ok(true);
         }
         self.ensure_watch_wallet()?;
         let desc = match self.call(None, "getdescriptorinfo", serde_json::json!([format!("addr({address})")])) {
@@ -847,6 +965,156 @@ impl CoreRpcTransport {
         )?;
         self.watched.lock().expect("watched-address mutex poisoned").insert(address.to_string());
         Ok(true)
+    }
+
+    /// Configure ranged-descriptor watching (plan §2.2/U4) for one or more
+    /// descriptor families — additive and out-of-band: call this BEFORE any
+    /// address belonging to `specs` is queried through [`Transport::get_text`]/
+    /// [`Transport::post_text`]. Imports both chains of each descriptor in
+    /// ONE `importdescriptors` call — verified live against bitcoind
+    /// v30.2.0: a `<0;1>` multipath descriptor imports as two chains from a
+    /// single request, no manual `internal: true`/`false` split needed (that
+    /// split IS needed for the OLD per-address `addr()` path, which has no
+    /// chains to speak of — irrelevant there). A caller with nothing to
+    /// configure need not call this at all; every existing address query
+    /// keeps working through the U3 per-address fallback untouched.
+    pub fn watch_descriptors(&self, specs: Vec<WatchDescriptor>) -> Result<(), Error> {
+        if specs.is_empty() {
+            return Ok(());
+        }
+        self.ensure_watch_wallet()?;
+        let mut configured = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let source = FundingSource::parse(&spec.descriptor, spec.network)?;
+            self.import_ranged(&spec, spec.range_end)?;
+            let mut rw = RangedWatch { spec, source, imported_end: 0, index: HashMap::new() };
+            let end = rw.spec.range_end;
+            Self::populate_index(&mut rw, 0, end);
+            rw.imported_end = end;
+            configured.push(rw);
+        }
+        self.ranged.lock().expect("ranged-watch mutex poisoned").extend(configured);
+        Ok(())
+    }
+
+    /// Derive `[from..=to]` on both chains of `rw.source`, inserting every
+    /// result into its address→(chain,index) map. Pure computation — no
+    /// RPC — so calling this speculatively while widen-searching costs
+    /// nothing beyond CPU even when the address being searched for turns
+    /// out not to belong to this family at all.
+    fn populate_index(rw: &mut RangedWatch, from: u32, to: u32) {
+        for idx in from..=to {
+            for chain in [0usize, 1usize] {
+                if let Ok(d) = rw.source.derive(chain, idx) {
+                    rw.index.insert(d.address, (chain, idx));
+                }
+            }
+        }
+    }
+
+    /// `getdescriptorinfo` (bitcoind requires a `#checksum` suffix on every
+    /// `importdescriptors` request — verified live, "Missing checksum"
+    /// otherwise) then `importdescriptors` with `range: [0, end]` and
+    /// `spec`'s own birthday timestamp. Re-issuing the SAME descriptor
+    /// string with a wider `end` is how widening works — verified live
+    /// against bitcoind v30.2.0: a second `importdescriptors` call for an
+    /// already-imported descriptor simply extends its cached range; `next`
+    /// (the highest index already seen as used) and prior history are
+    /// untouched, so this is safe to call repeatedly.
+    fn import_ranged(&self, spec: &WatchDescriptor, end: u32) -> Result<(), Error> {
+        let bare = spec.descriptor.split('#').next().unwrap_or(&spec.descriptor);
+        let info = self.rpc(None, "getdescriptorinfo", serde_json::json!([bare]))?;
+        let checksum = info
+            .get("checksum")
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| Error::Json("getdescriptorinfo: missing checksum".into()))?;
+        let desc = format!("{bare}#{checksum}");
+        self.rpc(
+            Some(Self::WATCH_WALLET),
+            "importdescriptors",
+            serde_json::json!([[{"desc": desc, "timestamp": spec.timestamp, "range": [0, end]}]]),
+        )?;
+        Ok(())
+    }
+
+    /// Called from [`Self::ensure_address_watched`] on every query: `false`
+    /// immediately when nothing is configured (the common case today, and
+    /// the whole of U3's behavior). Otherwise checks every configured
+    /// family's cache first (cheap map lookup); on a miss across ALL of
+    /// them, widens each in turn — bounded, chunked local derivation
+    /// (`Self::WIDEN_CHUNK` indices at a time, up to `Self::MAX_WIDEN_CHUNKS`
+    /// attempts) — only calling `import_ranged` (an actual bitcoind
+    /// round-trip) once a chunk is confirmed to contain the address being
+    /// looked up. This ordering is load-bearing: a genuinely unrelated
+    /// address (a contact, an external recipient, ...) costs bounded local
+    /// CPU only, never an extra bitcoind rescan, and the local index cache
+    /// never claims an address is "imported" beyond what was actually just
+    /// told to bitcoind (the chunk import and the cache update happen
+    /// together, so the two can't drift apart).
+    fn ranged_lookup_or_widen(&self, address: &str) -> Result<bool, Error> {
+        let mut ranged = self.ranged.lock().expect("ranged-watch mutex poisoned");
+        if ranged.is_empty() {
+            return Ok(false);
+        }
+        for rw in ranged.iter() {
+            if rw.index.contains_key(address) {
+                return Ok(true);
+            }
+        }
+        for rw in ranged.iter_mut() {
+            let mut from = rw.imported_end.saturating_add(1);
+            for _ in 0..Self::MAX_WIDEN_CHUNKS {
+                let to = from.saturating_add(Self::WIDEN_CHUNK - 1);
+                let mut chunk = HashMap::new();
+                for idx in from..=to {
+                    for chain in [0usize, 1usize] {
+                        if let Ok(d) = rw.source.derive(chain, idx) {
+                            chunk.insert(d.address, (chain, idx));
+                        }
+                    }
+                }
+                if chunk.contains_key(address) {
+                    self.import_ranged(&rw.spec, to)?;
+                    rw.index.extend(chunk);
+                    rw.imported_end = to;
+                    return Ok(true);
+                }
+                if to == u32::MAX {
+                    break;
+                }
+                from = to + 1;
+            }
+        }
+        Ok(false)
+    }
+
+    /// `getblockchaininfo` + `getindexinfo` + the watch wallet's
+    /// `getwalletinfo` folded into one structured [`NodeStatus`] (plan
+    /// §2.2/§2.3/U4) — the UI's (U6) preflight before trusting this node's
+    /// answers. The watch wallet not existing yet (nothing imported this
+    /// session) is not an error — `wallet_scanning` is simply `None`.
+    pub fn preflight(&self) -> Result<NodeStatus, Error> {
+        let info = self.rpc(None, "getblockchaininfo", serde_json::json!([]))?;
+        let pruned = info.get("pruned").and_then(|v| v.as_bool()).unwrap_or(false);
+        let prune_height = if pruned { info.get("pruneheight").and_then(|v| v.as_u64()) } else { None };
+        let initial_block_download =
+            info.get("initialblockdownload").and_then(|v| v.as_bool()).unwrap_or(false);
+        let tip_height = info.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        let idx = self.rpc(None, "getindexinfo", serde_json::json!([]))?;
+        let txindex = idx.get("txindex").is_some();
+
+        let wallet_scanning =
+            match self.rpc(Some(Self::WATCH_WALLET), "getwalletinfo", serde_json::json!([])) {
+                Ok(wi) => Some(match wi.get("scanning") {
+                    Some(v) if v.is_object() => true,
+                    Some(v) => v.as_bool().unwrap_or(false),
+                    None => false,
+                }),
+                Err(_) => None,
+            };
+
+        Ok(NodeStatus { pruned, prune_height, txindex, initial_block_download, wallet_scanning, tip_height })
     }
 
     fn tip_height_rpc(&self) -> Result<u64, Error> {

@@ -56,9 +56,11 @@ mod common;
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use app_core::chain::{AnyTransport, ChainClient, TxLookupStatus};
+use app_core::chain::{AnyTransport, ChainClient, NodeStatus, TxLookupStatus, WatchDescriptor};
 use app_core::funding::FundingSource;
 use app_core::identity::{parse_key_material, realize, realize_change};
 use app_core::keyexport::export_formats;
@@ -253,13 +255,52 @@ impl Drop for Node {
     }
 }
 
+/// Distinguishes concurrently-running `#[test]` functions in this same
+/// binary (cargo test runs them in parallel threads of ONE process) — the
+/// original single-test suite derived its port/datadir from
+/// `std::process::id()` alone, which is fine for exactly one node per
+/// process but collides the instant a second test (U4's ranged/widening/
+/// preflight suites) starts its own. Folded into both the port and the
+/// datadir name so no two `Node`s this binary ever creates can collide.
+static NODE_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Serializes every `#[test]` in this file to run ONE bitcoind at a time.
+/// U4 added five more real-node tests alongside U3's original one; cargo's
+/// default test-thread parallelism starts them all concurrently, and six
+/// real regtest nodes competing for CPU on a loaded machine can starve
+/// each other badly enough that `Node::wait_ready`'s 60s budget trips —
+/// verified empirically while writing these tests (a `--test-threads=1`
+/// run of the exact same suite is reliably green; the default parallel run
+/// intermittently was not). That is a resource-contention flake, not a
+/// correctness failure, so tests take this lock as their first action and
+/// hold it for their whole body rather than risk it. Recovers from a
+/// poisoned lock (an earlier test panicking) so one failure doesn't
+/// cascade into every other test failing on the lock instead of its own
+/// assertions.
+static NODE_LOCK: Mutex<()> = Mutex::new(());
+
+fn serialize_nodes() -> std::sync::MutexGuard<'static, ()> {
+    NODE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn start_node() -> Node {
-    // Port derived from the process id to avoid colliding with a real
-    // node (default regtest RPC is 18443) or a concurrently-running one.
-    let rpcport = 19000 + (std::process::id() % 3000) as u16;
+    start_node_with("txindex=1\n")
+}
+
+/// Same as [`start_node`] but with `extra_conf` appended to the (non-
+/// `[regtest]`-sectioned) top of `bitcoin.conf` — used by the U4 preflight
+/// tests to start a node WITHOUT `txindex=1` or WITH `-prune`-equivalent
+/// settings, without duplicating the whole setup dance.
+fn start_node_with(extra_conf: &str) -> Node {
+    let seq = NODE_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Port derived from the process id (plus a per-node sequence offset,
+    // so multiple `Node`s in one test binary never collide) to avoid
+    // colliding with a real node (default regtest RPC is 18443) or a
+    // concurrently-running one.
+    let rpcport = 19000 + ((std::process::id().wrapping_add(seq.wrapping_mul(97))) % 3000) as u16;
     let rpcuser = "cnrpcuser".to_string();
-    let rpcpass = format!("cnrpcpass-{}", std::process::id());
-    let datadir = std::env::temp_dir().join(format!("chain-notes-core-rpc-{}", std::process::id()));
+    let rpcpass = format!("cnrpcpass-{}-{seq}", std::process::id());
+    let datadir = std::env::temp_dir().join(format!("chain-notes-core-rpc-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&datadir); // stale leftover from a prior crashed run
     std::fs::create_dir_all(&datadir).expect("create bitcoind datadir");
     // `rpcuser`/`rpcpassword`/`rpcport` are network-specific settings and
@@ -271,7 +312,7 @@ fn start_node() -> Node {
     std::fs::write(
         datadir.join("bitcoin.conf"),
         format!(
-            "regtest=1\nserver=1\ntxindex=1\nfallbackfee=0.0001\n\n[regtest]\nrpcuser={rpcuser}\nrpcpassword={rpcpass}\nrpcport={rpcport}\n"
+            "regtest=1\nserver=1\nfallbackfee=0.0001\n{extra_conf}\n[regtest]\nrpcuser={rpcuser}\nrpcpassword={rpcpass}\nrpcport={rpcport}\n"
         ),
     )
     .expect("write bitcoin.conf");
@@ -355,13 +396,29 @@ fn build_scenario_tx(node: &Node, txid: &str, tip: u64) -> ScenarioTx {
     ScenarioTx { txid: txid.to_string(), hex, confirmed_height, vin, vout }
 }
 
-#[test]
-fn core_rpc_conformance() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_conformance: bitcoind not found on PATH");
-        return;
-    }
+/// Everything the ranged-descriptor conformance tests (U4 test 1) need: a
+/// running node with the SAME 43-tx scenario `core_rpc_conformance` (U3)
+/// exercises, already built — factored out of that test so a SECOND test
+/// can configure `watch_descriptors` before `assert_chain_contract` runs
+/// against an otherwise-identical transport, proving the two paths are
+/// observationally identical (plan §3 step, U4 test 1). Each caller gets
+/// its OWN fresh node (`Node` owns a live child process — it can't be
+/// shared between two `#[test]` functions, and cargo runs this binary's
+/// tests in parallel threads of the SAME process, so a second node is
+/// unavoidable here regardless).
+struct ConformanceFixture {
+    node: Node,
+    scenario: Scenario,
+    network: Network,
+    /// The account-0 notebook's `tr(...)` multipath descriptor — the exact
+    /// string `export_formats` produces for a real caller.
+    notebook_descriptor: String,
+    /// The account-0 spending wallet's `wpkh(...)` multipath descriptor —
+    /// the exact string `spending::funding_descriptor` produces.
+    spending_descriptor: String,
+}
 
+fn build_conformance_fixture() -> ConformanceFixture {
     let node = start_node();
 
     // "sender" holds every test address's private key (so it can sign the
@@ -507,11 +564,14 @@ fn core_rpc_conformance() {
 
     let scenario_txs: Vec<ScenarioTx> = txids.iter().map(|t| build_scenario_tx(&node, t, tip)).collect();
 
-    let descriptor = export_formats(TEST_MNEMONIC, network, account, 0)
+    let notebook_descriptor = export_formats(TEST_MNEMONIC, network, account, 0)
         .expect("export_formats")
         .descriptor
         .expect("mnemonic yields a tr() descriptor");
-    let notebook_watch = FundingSource::parse(&descriptor, network).expect("parse notebook watch descriptor");
+    let notebook_watch =
+        FundingSource::parse(&notebook_descriptor, network).expect("parse notebook watch descriptor");
+    let spending_descriptor =
+        spending::funding_descriptor(&material, network, account).expect("spending descriptor string");
 
     let wallet = ScenarioWallet {
         material,
@@ -533,11 +593,27 @@ fn core_rpc_conformance() {
         broadcast_probe: Some((probe_hex, probe_txid)),
     };
 
+    ConformanceFixture { node, scenario, network, notebook_descriptor, spending_descriptor }
+}
+
+#[test]
+fn core_rpc_conformance() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_conformance: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    let fx = build_conformance_fixture();
+    let node = &fx.node;
+    let scenario = &fx.scenario;
+    let tip = scenario.tip_height;
+
     let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
     let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
-    let client = ChainClient::new(transport, network);
+    let client = ChainClient::new(transport, fx.network);
 
-    assert_chain_contract(&client, &scenario);
+    assert_chain_contract(&client, scenario);
 
     // Explicit, standalone demonstration of the plan's §2.1 requirement
     // (also exercised implicitly inside `assert_chain_contract`'s own
@@ -546,9 +622,295 @@ fn core_rpc_conformance() {
     let unknown_txid = "ff".repeat(32);
     assert_eq!(client.tx_lookup_status(&unknown_txid), TxLookupStatus::NotFound, "unknown txid must be NotFound");
 
+    // U4 preflight, exercised against this suite's own healthy (synced,
+    // txindex=1, unpruned) node as the positive-case companion to the
+    // dedicated pruned/no-txindex tests below. `transport` is already
+    // moved into `client` by now, so this opens a SECOND connection to the
+    // SAME already-running node — `preflight` is Core-specific (not part
+    // of the `Transport` trait), harmless to call from a fresh instance.
+    match AnyTransport::new(&base, None).expect("construct a second Core RPC transport for preflight") {
+        AnyTransport::Core(core) => {
+            let status = core.preflight().expect("preflight");
+            assert!(!status.pruned, "this node is never pruned");
+            assert!(status.txindex, "this node runs with txindex=1");
+            assert_eq!(status.tip_height, tip);
+            // The watch wallet DOES exist by now (every route above
+            // touched it), so scanning info must be reportable, not absent.
+            assert!(status.wallet_scanning.is_some(), "watch wallet exists — scanning info must be Some");
+        }
+        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+    }
+
     eprintln!(
         "core_rpc_conformance: PASS ({} scenario txs, tip={tip}, datadir {:?})",
         scenario.txs.len(),
+        node.datadir
+    );
+}
+
+/// U4 test 1 (`../../PLAN-chain-notes-app-core-rpc.md` §3 step, "Ranged
+/// import works"): the SAME 43-tx scenario `core_rpc_conformance` builds,
+/// this time with the notebook's `tr(...)` chain and the spending wallet's
+/// `wpkh(...)` chain configured as RANGED descriptor families
+/// (`CoreRpcTransport::watch_descriptors`) BEFORE `assert_chain_contract`
+/// runs — every address `assert_chain_contract`'s wallet legs touch
+/// (receive/change/spending-receive/spending-change, all account 0) is
+/// covered by one of these two families, so this run never falls back to
+/// the U3 per-address `addr()` path for them (the ad-hoc scenario
+/// addresses — `addr_a`, `addr_note`, the pager, the probe/mempool
+/// legs — belong to neither family and still go through that fallback,
+/// exactly as before). A PASS here is the "observationally identical"
+/// requirement: nothing about what the client sees may differ by backend
+/// wiring choice.
+#[test]
+fn core_rpc_conformance_ranged_descriptors() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_conformance_ranged_descriptors: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    let fx = build_conformance_fixture();
+    let node = &fx.node;
+
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+    match &transport {
+        AnyTransport::Core(core) => core
+            .watch_descriptors(vec![
+                WatchDescriptor {
+                    descriptor: fx.notebook_descriptor.clone(),
+                    network: fx.network,
+                    timestamp: 0,
+                    range_end: 10,
+                },
+                WatchDescriptor {
+                    descriptor: fx.spending_descriptor.clone(),
+                    network: fx.network,
+                    timestamp: 0,
+                    range_end: 10,
+                },
+            ])
+            .expect("configure ranged descriptors"),
+        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+    }
+
+    let client = ChainClient::new(transport, fx.network);
+    assert_chain_contract(&client, &fx.scenario);
+
+    eprintln!(
+        "core_rpc_conformance_ranged_descriptors: PASS ({} scenario txs, tip={}, datadir {:?})",
+        fx.scenario.txs.len(),
+        fx.scenario.tip_height,
+        node.datadir
+    );
+}
+
+/// U4 test 2 ("Range widening"): a notebook receive-chain address well
+/// PAST a descriptor's configured `range_end` still gets found — the
+/// transport widens (re-imports the SAME descriptor with a bigger range,
+/// `CoreRpcTransport::ranged_lookup_or_widen`) instead of ever falling back
+/// to the U3 per-address `addr()` path for an address that genuinely
+/// belongs to a configured family.
+#[test]
+fn core_rpc_range_widening_finds_address_beyond_initial_range() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_range_widening_finds_address_beyond_initial_range: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    let node = start_node();
+    node.rpc(None, "createwallet", serde_json::json!(["sender"]));
+
+    let network = Network::Regtest;
+    let material = parse_key_material(TEST_MNEMONIC, network).expect("valid mnemonic");
+    let account = 0u32;
+
+    let descriptor = export_formats(TEST_MNEMONIC, network, account, 0)
+        .expect("export_formats")
+        .descriptor
+        .expect("mnemonic yields a tr() descriptor");
+    // Configured range only covers 0..=2 — this index is well beyond it,
+    // but comfortably inside `CoreRpcTransport`'s widen search ceiling
+    // (`WIDEN_CHUNK * MAX_WIDEN_CHUNKS` = 1000 indices).
+    let far_index = 47u32;
+    let addr_far = realize(&material, network, account, far_index).unwrap().address;
+
+    let funding_txid = node.generate_single_capture(&addr_far);
+    let tip = node.tip_height();
+
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+    match &transport {
+        AnyTransport::Core(core) => core
+            .watch_descriptors(vec![WatchDescriptor { descriptor, network, timestamp: 0, range_end: 2 }])
+            .expect("configure ranged descriptor"),
+        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+    }
+
+    let client = ChainClient::new(transport, network);
+    // The whole point: BEFORE any widening this address is outside the
+    // imported range, yet the client still finds its coin — proving the
+    // transport widened internally on the cache miss rather than reporting
+    // a genuinely-owned address as unused.
+    let stats = client.address_stats(&addr_far).expect("address_stats");
+    assert_eq!(
+        stats.chain_tx_count, 1,
+        "the far-index ({far_index}) coinbase (txid {funding_txid}) must be found after widening"
+    );
+
+    eprintln!(
+        "core_rpc_range_widening_finds_address_beyond_initial_range: PASS (index={far_index}, tip={tip}, datadir {:?})",
+        node.datadir
+    );
+}
+
+/// U4 test 3 ("Pruned node"): a throwaway `-prune=550` node reports
+/// `pruned` (and SOME prune height) through `preflight()`. A pruned node
+/// CANNOT rescan below its prune height at all (plan §2.2) — the UI (U6)
+/// needs this reported so it can warn plainly rather than have the app
+/// silently return partial history.
+#[test]
+fn core_rpc_preflight_reports_pruned_node() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_preflight_reports_pruned_node: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    // `-txindex` and `-prune` are mutually exclusive in bitcoind — this
+    // node deliberately carries neither the default `start_node()` adds.
+    let node = start_node_with("prune=550\n");
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+    let core = match &transport {
+        AnyTransport::Core(c) => c,
+        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+    };
+
+    let status: NodeStatus = core.preflight().expect("preflight");
+    assert!(status.pruned, "a node started with -prune must report pruned=true");
+    assert!(status.prune_height.is_some(), "a pruned node must report SOME prune height, even 0");
+
+    eprintln!("core_rpc_preflight_reports_pruned_node: PASS (status={status:?}, datadir {:?})", node.datadir);
+}
+
+/// U4 test 4 ("No txindex"): a node started WITHOUT `-txindex` reports
+/// `txindex: false` through `preflight()`. Without it, prevout lookup for
+/// EXTERNAL parents fails, so sender attribution degrades (plan §2.3) —
+/// the UI (U6) needs this reported rather than silently mis-attributing.
+#[test]
+fn core_rpc_preflight_reports_missing_txindex() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_preflight_reports_missing_txindex: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    let node = start_node_with(""); // plain node: no -txindex, no -prune
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+    let core = match &transport {
+        AnyTransport::Core(c) => c,
+        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+    };
+
+    let status: NodeStatus = core.preflight().expect("preflight");
+    assert!(!status.txindex, "a node started without -txindex must report txindex=false");
+    assert!(!status.pruned, "this node was never pruned");
+
+    eprintln!("core_rpc_preflight_reports_missing_txindex: PASS (status={status:?}, datadir {:?})", node.datadir);
+}
+
+/// U4 test 5 ("Birthday handling"): a descriptor imported at a LATE
+/// timestamp (well past a real funding tx's own block time) must NOT
+/// report that earlier history — proving the birthday plumbing is honest
+/// (an imported seed with no known birthday must degrade visibly, never
+/// silently claim completeness — plan §2.2) rather than accidentally
+/// complete. Two independent accounts of the SAME test mnemonic run side
+/// by side against the SAME watch wallet: account 0 imported at timestamp
+/// 0 (sees everything) is the control proving the harness itself is sound,
+/// account 1 imported at a timestamp 4 hours past its own funding block is
+/// the case under test.
+///
+/// **Load-bearing regtest gotcha, verified live (bitcoind v30.2.0) while
+/// writing this test**: bitcoind's rescan-from-timestamp finds a starting
+/// HEIGHT by locating the earliest block whose time is >= (timestamp minus
+/// the documented 2-hour window). On a regtest chain freshly mined in the
+/// same second, EVERY block's time is real "now" — so a timestamp set even
+/// slightly in the FUTURE relative to the chain's actual tip has no
+/// qualifying block to start from, and bitcoind's fallback is to scan
+/// EVERYTHING, which would make this test pass for the wrong reason (or,
+/// as first written, fail outright — it found the "excluded" tx anyway).
+/// The fix: `setmocktime` the node forward past the intended import
+/// timestamp and mine a few more blocks BEFORE importing, so the chain's
+/// tip genuinely postdates the birthday and the exclusion is real.
+#[test]
+fn core_rpc_birthday_excludes_history_before_a_late_timestamp() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_birthday_excludes_history_before_a_late_timestamp: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    let node = start_node();
+    node.rpc(None, "createwallet", serde_json::json!(["sender"]));
+    let network = Network::Regtest;
+    let material = parse_key_material(TEST_MNEMONIC, network).expect("valid mnemonic");
+
+    let addr_full = realize(&material, network, 0, 0).unwrap().address;
+    let desc_full =
+        export_formats(TEST_MNEMONIC, network, 0, 0).unwrap().descriptor.expect("tr() descriptor");
+    let addr_late = realize(&material, network, 1, 0).unwrap().address;
+    let desc_late =
+        export_formats(TEST_MNEMONIC, network, 1, 0).unwrap().descriptor.expect("tr() descriptor");
+
+    node.generate_single_capture(&addr_full);
+    let late_funding_txid = node.generate_single_capture(&addr_late);
+    let funded_height = node.tip_height();
+    let block_hash = node.rpc(None, "getblockhash", serde_json::json!([funded_height]));
+    let block = node.rpc(None, "getblock", serde_json::json!([block_hash, 1]));
+    let funded_time = block.get("time").and_then(|t| t.as_u64()).expect("block time");
+    // bitcoind's own `importdescriptors` help text: blocks up to 2 HOURS
+    // before the earliest timestamp are ALSO scanned — clear that margin
+    // comfortably so this can't accidentally pass.
+    let late_timestamp = funded_time + 4 * 3600;
+
+    // Push the chain's actual tip time well past `late_timestamp` (see the
+    // doc comment above) — otherwise bitcoind can't find a scan-start
+    // height and conservatively scans everything, which would hide the
+    // very bug this test exists to catch.
+    node.rpc(None, "setmocktime", serde_json::json!([late_timestamp + 3600]));
+    node.generate(5, &node.fresh_addr());
+
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+    match &transport {
+        AnyTransport::Core(core) => core
+            .watch_descriptors(vec![
+                WatchDescriptor { descriptor: desc_full, network, timestamp: 0, range_end: 2 },
+                WatchDescriptor { descriptor: desc_late, network, timestamp: late_timestamp, range_end: 2 },
+            ])
+            .expect("configure ranged descriptors"),
+        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+    }
+
+    let client = ChainClient::new(transport, network);
+
+    let full_stats = client.address_stats(&addr_full).expect("address_stats (control)");
+    assert_eq!(full_stats.chain_tx_count, 1, "a timestamp=0 import must see its own funding tx");
+
+    let late_stats = client.address_stats(&addr_late).expect("address_stats (late birthday)");
+    assert_eq!(
+        late_stats.chain_tx_count, 0,
+        "a late-birthday import reported history from BEFORE its birthday (funding txid {late_funding_txid}) \
+         — that would be a silently-wrong wallet, not an honest gap"
+    );
+
+    eprintln!(
+        "core_rpc_birthday_excludes_history_before_a_late_timestamp: PASS \
+         (funded_time={funded_time}, late_timestamp={late_timestamp}, datadir {:?})",
         node.datadir
     );
 }
