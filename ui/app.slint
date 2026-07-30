@@ -1309,6 +1309,7 @@ component TxConfirmView inherits Flickable {
     in property <[PsbtRow]> inputs;
     in property <[PsbtRow]> outputs;
     in property <string> fee-line;
+    in property <string> lock-time-line;
     in property <string> warn;
     in property <string> txid;
     viewport-height: conf-col.preferred-height;
@@ -1431,6 +1432,24 @@ component TxConfirmView inherits Flickable {
                     horizontal-stretch: 1;
                 }
                 Mono { text: root.fee-line; color: Pal.text; }
+            }
+        }
+        if root.lock-time-line != "": Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: ltrow.preferred-height;
+            ltrow := HorizontalLayout {
+                padding: 14px;
+                Text {
+                    text: "Locktime";
+                    font-size: 13px;
+                    color: Pal.muted;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Mono { text: root.lock-time-line; color: Pal.text; }
             }
         }
     }
@@ -1600,6 +1619,18 @@ export component AppWindow inherits Window {
     in property <bool> directed;
     in-out property <string> gift-sats;
     in-out property <bool> gift-expanded;
+    // ---- per-tx locktime override (compose screen 6) ----
+    // An override of the device-default policy above (Settings), reset to
+    // that default every time compose is (re)opened — never persisted.
+    // Same "mode" values as Settings: "tip" | "zero" | "custom".
+    in-out property <string> compose-locktime-mode: "tip";
+    in-out property <string> compose-locktime-height;
+    in property <string> compose-locktime-effective;
+    in-out property <bool> compose-locktime-expanded;
+    // Non-empty when the chosen height is above the current chain tip —
+    // the transaction would be non-final and get rejected. Shown
+    // regardless of expanded state (safety content).
+    in property <string> compose-locktime-warn;
     // "Note too large to broadcast" dialog (per-tx ~100 kB ceiling).
     in-out property <bool> show-oversize-modal;
     in property <bool> oversize-offer-bump; // true → offer to switch to Standard
@@ -1628,6 +1659,10 @@ export component AppWindow inherits Window {
     in property <[PsbtRow]> confirm-outputs;
     in property <string> confirm-note;         // decoded note text (public) or placeholder
     in property <string> confirm-fee-line;
+    // Byte-truth: decoded from the SIGNED tx itself, never from policy —
+    // "Locktime 146209 · block height" / "Locktime 0 · none". A future-tip
+    // locktime warning rides the existing `confirm-warn` channel below.
+    in property <string> confirm-locktime-line;
     // ---- universal confirm screen (26), funding-unification follow-up ----
     in property <string> confirm-warn;         // amber warning banner text, "" = none
     in property <string> confirm-txid;         // decoded from the signed raw tx
@@ -1871,6 +1906,14 @@ export component AppWindow inherits Window {
     in-out property <bool> sweep-inputs-expanded;
     in property <[SpendCoin]> sweep-coins;
     in-out property <bool> sweep-fund-external;
+    // ---- per-tx locktime override (sweep/consolidate screen 16) ----
+    // Same contract as the compose panel above, reset to the device
+    // default every time this screen is (re)entered.
+    in-out property <string> sweep-locktime-mode: "tip";
+    in-out property <string> sweep-locktime-height;
+    in property <string> sweep-locktime-effective;
+    in-out property <bool> sweep-locktime-expanded;
+    in property <string> sweep-locktime-warn;
     // Screen 16 serves both flows: "sweep" (dest from the picker) and
     // "consolidate" (dest = self, opened from the Coins screen).
     in-out property <string> sweep-kind: "sweep";
@@ -2012,6 +2055,10 @@ export component AppWindow inherits Window {
     callback account-cancel();
     callback set-chunk(string);
     callback set-locktime(string, string); // (mode, custom-height)
+    // Per-tx overrides of the above — compose (screen 6) and
+    // sweep/consolidate (screen 16) panels, same (mode, custom-height) shape.
+    callback set-compose-locktime(string, string);
+    callback set-sweep-locktime(string, string);
     callback oversize-bump(); // raise chunk size to Standard from the compose dialog
     callback set-node-preset(int);
     callback set-node-custom(string);
@@ -3212,6 +3259,72 @@ export component AppWindow inherits Window {
                     horizontal-stretch: 1;
                 }
                 Text { text: "›"; font-size: 20px; color: Pal.muted; vertical-alignment: center; }
+            }
+        }
+        // ---- locktime override (collapsible), right before Sign ----
+        Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: cl-col.preferred-height;
+            cl-col := VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                Rectangle {
+                    height: 22px;
+                    TouchArea { clicked => { root.compose-locktime-expanded = !root.compose-locktime-expanded; } }
+                    HorizontalLayout {
+                        Text {
+                            text: "Locktime · " + (root.compose-locktime-mode == "tip" ? "chain height"
+                                : root.compose-locktime-mode == "zero" ? "zero"
+                                : "custom " + root.compose-locktime-height);
+                            font-size: 12px;
+                            color: Pal.muted;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { }
+                        Image {
+                            source: root.compose-locktime-expanded
+                                ? @image-url("icons/caret-up.svg")
+                                : @image-url("icons/caret-down.svg");
+                            colorize: Pal.muted;
+                            width: 16px;
+                            height: 16px;
+                        }
+                    }
+                }
+                if root.compose-locktime-expanded: HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    SelectPill {
+                        text: "Chain height";
+                        active: root.compose-locktime-mode == "tip";
+                        clicked => { root.set-compose-locktime("tip", root.compose-locktime-height); }
+                    }
+                    SelectPill {
+                        text: "Zero";
+                        active: root.compose-locktime-mode == "zero";
+                        clicked => { root.set-compose-locktime("zero", root.compose-locktime-height); }
+                    }
+                    SelectPill {
+                        text: "Custom";
+                        active: root.compose-locktime-mode == "custom";
+                        clicked => { root.set-compose-locktime("custom", root.compose-locktime-height); }
+                    }
+                }
+                if root.compose-locktime-expanded && root.compose-locktime-mode == "custom": HorizontalLayout {
+                    spacing: 8px;
+                    EditField {
+                        width: 130px;
+                        text <=> root.compose-locktime-height;
+                        placeholder-text: "block height";
+                        accepted(t) => { root.set-compose-locktime("custom", t); }
+                    }
+                    Caption { text: "height · press Return to apply"; vertical-alignment: center; }
+                }
+                if root.compose-locktime-expanded: Caption { text: root.compose-locktime-effective; }
+                if root.compose-locktime-warn != "": Caption { text: root.compose-locktime-warn; color: Pal.warn; }
             }
         }
         if root.mixed-linkage-hint: Caption {
@@ -4547,6 +4660,72 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                // ---- locktime override (collapsible), right before Sign ----
+                Rectangle {
+                    border-radius: 10px;
+                    background: Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    height: swlt-col.preferred-height;
+                    swlt-col := VerticalLayout {
+                        padding: 10px;
+                        spacing: 8px;
+                        Rectangle {
+                            height: 22px;
+                            TouchArea { clicked => { root.sweep-locktime-expanded = !root.sweep-locktime-expanded; } }
+                            HorizontalLayout {
+                                Text {
+                                    text: "Locktime · " + (root.sweep-locktime-mode == "tip" ? "chain height"
+                                        : root.sweep-locktime-mode == "zero" ? "zero"
+                                        : "custom " + root.sweep-locktime-height);
+                                    font-size: 12px;
+                                    color: Pal.muted;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { }
+                                Image {
+                                    source: root.sweep-locktime-expanded
+                                        ? @image-url("icons/caret-up.svg")
+                                        : @image-url("icons/caret-down.svg");
+                                    colorize: Pal.muted;
+                                    width: 16px;
+                                    height: 16px;
+                                }
+                            }
+                        }
+                        if root.sweep-locktime-expanded: HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            SelectPill {
+                                text: "Chain height";
+                                active: root.sweep-locktime-mode == "tip";
+                                clicked => { root.set-sweep-locktime("tip", root.sweep-locktime-height); }
+                            }
+                            SelectPill {
+                                text: "Zero";
+                                active: root.sweep-locktime-mode == "zero";
+                                clicked => { root.set-sweep-locktime("zero", root.sweep-locktime-height); }
+                            }
+                            SelectPill {
+                                text: "Custom";
+                                active: root.sweep-locktime-mode == "custom";
+                                clicked => { root.set-sweep-locktime("custom", root.sweep-locktime-height); }
+                            }
+                        }
+                        if root.sweep-locktime-expanded && root.sweep-locktime-mode == "custom": HorizontalLayout {
+                            spacing: 8px;
+                            EditField {
+                                width: 130px;
+                                text <=> root.sweep-locktime-height;
+                                placeholder-text: "block height";
+                                accepted(t) => { root.set-sweep-locktime("custom", t); }
+                            }
+                            Caption { text: "height · press Return to apply"; vertical-alignment: center; }
+                        }
+                        if root.sweep-locktime-expanded: Caption { text: root.sweep-locktime-effective; }
+                        if root.sweep-locktime-warn != "": Caption { text: root.sweep-locktime-warn; color: Pal.warn; }
+                    }
+                }
                 if !root.sweep-fund-external && !root.watch-only: PrimaryButton {
                     text: root.wallet-scan-busy ? "Syncing…"
                         : root.sweep-kind == "consolidate" ? "Consolidate — sign + review…" : "Sweep — sign + review…";
@@ -5321,6 +5500,7 @@ export component AppWindow inherits Window {
             inputs: root.confirm-inputs;
             outputs: root.confirm-outputs;
             fee-line: root.confirm-fee-line;
+            lock-time-line: root.confirm-locktime-line;
             warn: root.confirm-warn;
             txid: root.confirm-txid;
         }

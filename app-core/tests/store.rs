@@ -99,7 +99,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1000 },
+        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1000 },
     )
     .unwrap();
     assert_eq!(store.notes.len(), 1);
@@ -110,7 +110,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 2000 },
+        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 2000 },
     )
     .unwrap();
     assert_eq!(
@@ -168,7 +168,7 @@ fn directed_private_note_both_sides() {
             change_to: None,
             coins: None,
             fee_rate: 1.0,
-            gift_amount: None, now: 3000,
+            gift_amount: None, lock_time: None, now: 3000,
         },
     )
     .unwrap();
@@ -268,6 +268,7 @@ fn multi_recipient_note_recovers_recipients_on_rescan() {
             coins: None,
             fee_rate: 1.0,
             gift_amount: None,
+            lock_time: None,
             now: 1,
         },
     )
@@ -303,7 +304,7 @@ fn unconfirmed_scanned_utxo_is_spendable() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "spend unconfirmed", private: false, recipient: None, extra_recipients: &[],
-            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1,
+            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1,
         },
     )
     .unwrap();
@@ -330,7 +331,7 @@ fn coin_control_spends_exactly_selected() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "coin control", private: false, recipient: None, extra_recipients: &[],
-            change_to: None, coins: Some(&picks), fee_rate: 1.0, gift_amount: None, now: 1,
+            change_to: None, coins: Some(&picks), fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1,
         },
     )
     .unwrap();
@@ -356,7 +357,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "change goes to bob", private: false, recipient: None, extra_recipients: &[],
-            change_to: Some(&bob_addr), coins: None, fee_rate: 1.0, gift_amount: None, now: 1,
+            change_to: Some(&bob_addr), coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1,
         },
     )
     .unwrap();
@@ -373,7 +374,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
         &mut store2, &a, NET,
         &ComposeRequest {
             text: "change to self", private: false, recipient: None, extra_recipients: &[],
-            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1,
+            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1,
         },
     )
     .unwrap();
@@ -387,7 +388,7 @@ fn bump_fee_same_note_id_same_inputs_higher_fee() {
     let mut store = funded_store(&a);
     let n1 = compose_and_record(
         &mut store, &a, NET,
-        &ComposeRequest { text: "bump me", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1 },
+        &ComposeRequest { text: "bump me", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1 },
     )
     .unwrap();
     assert!(store.notes[0].raw_hex.is_some(), "raw kept for rebroadcast");
@@ -423,7 +424,7 @@ fn orphaned_when_inputs_spent_elsewhere() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "never broadcast", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1 },
+        &ComposeRequest { text: "never broadcast", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1 },
     )
     .unwrap();
 
@@ -538,6 +539,7 @@ fn directed_gift_amount_plumbs_through() {
             coins: None,
             fee_rate: 1.0,
             gift_amount: Some(gift),
+            lock_time: None,
             now: 1,
         },
     )
@@ -565,6 +567,7 @@ fn directed_gift_amount_plumbs_through() {
             coins: None,
             fee_rate: 1.0,
             gift_amount: None,
+            lock_time: None,
             now: 1,
         },
     )
@@ -584,14 +587,14 @@ fn watch_store_recovers_notebook_without_keys() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 1000 },
+        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1000 },
     )
     .unwrap();
     let n2 = compose_and_record(
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, now: 2000 },
+        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 2000 },
     )
     .unwrap();
     let b = bundle(
@@ -737,6 +740,7 @@ fn display_owner_dedup_keeps_note_only_in_first_notebook_input_scan() {
             coins: None,
             fee_rate: 1.0,
             gift_amount: None,
+            lock_time: None,
             now: 4000,
         },
     )
@@ -786,6 +790,7 @@ fn display_owner_dedup_archived_notebook_input_never_anchors() {
             coins: None,
             fee_rate: 1.0,
             gift_amount: None,
+            lock_time: None,
             now: 4100,
         },
     )
@@ -899,6 +904,7 @@ fn spending_window_spk_makes_funded_note_own() {
             coins: None,
             fee_rate: 1.0,
             gift_amount: None,
+            lock_time: None,
             now: 9000,
         },
     )
@@ -956,6 +962,7 @@ fn stale_received_twin_pruned_on_full_scan() {
             coins: None,
             fee_rate: 1.0,
             gift_amount: None,
+            lock_time: None,
             now: 9100,
         },
     )
@@ -1008,6 +1015,7 @@ fn third_party_received_note_never_pruned() {
             coins: None,
             fee_rate: 1.0,
             gift_amount: None,
+            lock_time: None,
             now: 9200,
         },
     )
@@ -1066,6 +1074,7 @@ fn stale_received_twin_not_pruned_on_incremental_bundle() {
             coins: None,
             fee_rate: 1.0,
             gift_amount: None,
+            lock_time: None,
             now: 9300,
         },
     )
