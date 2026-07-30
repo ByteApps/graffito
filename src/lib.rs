@@ -277,6 +277,15 @@ struct State {
     /// `chunk`: owned here + config.json, mirrored onto every store on
     /// activate so the Settings control is genuinely wallet-wide.
     lock_time_policy: app_core::notes_core::tx::LockTimePolicy,
+    /// Per-tx locktime OVERRIDE set on the compose (screen 6) or sweep/
+    /// consolidate (screen 16) collapsible panel — an override of
+    /// `lock_time_policy` for THIS transaction only, never a replacement
+    /// for it. `None` = use the device default; `Some(policy)` = the panel
+    /// picked one. Reset to `None` every time either flow is (re)opened
+    /// (`reset_tx_lock_time_override`), and NEVER written to config.json or
+    /// any store — `State` itself isn't serialized, so this can't survive
+    /// past the screen it was set on by construction, not by discipline.
+    tx_lock_time_override: Option<app_core::notes_core::tx::LockTimePolicy>,
     ident: Option<AppIdentity>,
     store: Option<Store>,
     fees: Option<FeeRates>,
@@ -1176,6 +1185,49 @@ impl State {
         self.store.as_ref().map(|st| st.lock_time()).unwrap_or(0)
     }
 
+    /// The resolved `nLockTime` override, if the compose/sweep panel set
+    /// one THIS session — `None` when no override is active, meaning the
+    /// caller should fall back to `lock_time()`. Resolved against the same
+    /// tip `lock_time()` itself uses, so an override of `LockTimePolicy::Tip`
+    /// (picking "Chain height" explicitly) behaves identically to leaving
+    /// the device default alone.
+    fn lock_time_override_value(&self) -> Option<u32> {
+        self.tx_lock_time_override.map(|policy| {
+            let tip = self.store.as_ref().and_then(|s| u32::try_from(s.tip_height).ok());
+            policy.resolve(tip)
+        })
+    }
+
+    /// The `nLockTime` THIS build should actually use: the per-tx override
+    /// if the compose/sweep panel set one, else the device default
+    /// (`lock_time()`) — every non-`ComposeRequest` builder call site
+    /// (spending-wallet/mixed/watch compose, keyed + watch sweep/
+    /// consolidate, watch bump) reads this instead of calling `lock_time()`
+    /// directly, so the override reaches every path the panel is shown on.
+    fn effective_lock_time(&self) -> u32 {
+        self.lock_time_override_value().unwrap_or_else(|| self.lock_time())
+    }
+
+    /// Drop any per-tx locktime override — called every time a compose or
+    /// sweep/consolidate flow is (re)opened, so the panel always starts
+    /// from the device default and an override can never survive past the
+    /// screen it was set on.
+    fn reset_tx_lock_time_override(&mut self) {
+        self.tx_lock_time_override = None;
+    }
+
+    /// The tip height to hand `ConfirmCtx.tip_height` — `None` when there's
+    /// no store loaded OR it has never scanned (`tip_height == 0`, the
+    /// fresh-`Store::new` default), same "never guess" filter
+    /// `locktime_caption` already applies to its own caption. A confirm
+    /// screen reached with a genuine tip of 0 is not realistically
+    /// reachable (building a tx needs a scanned UTXO set first), so this
+    /// only ever suppresses the warning on an honestly-unknown tip, never
+    /// a real one.
+    fn confirm_tip_height(&self) -> Option<u32> {
+        self.store.as_ref().and_then(|s| u32::try_from(s.tip_height).ok()).filter(|h| *h > 0)
+    }
+
     fn save_config(&self) {
         let _ = std::fs::write(
             self.data_dir.join("config.json"),
@@ -1662,7 +1714,7 @@ fn watch_spend_build(
         .map(|c| app_core::store::TxInput { txid: c.txid.clone(), vout: c.vout, value: c.value })
         .collect();
     let input_indexes: Vec<u32> = coins.iter().map(|c| c.index).collect();
-    match build_watch_spend_psbt(&src, &coins, dest_spk.clone(), rate, st.lock_time()) {
+    match build_watch_spend_psbt(&src, &coins, dest_spk.clone(), rate, st.effective_lock_time()) {
         Ok(built) => {
             let cost = format!(
                 "{kind} · {} sats · fee {} sats · {} input{} · sign with your external wallet",
@@ -1813,6 +1865,11 @@ fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
         w.set_bump_error("no output can absorb the fee bump".into());
         return;
     };
+    // Deliberately the DEVICE default, not `effective_lock_time()`: the
+    // bump dialog (Activity screen) has no locktime panel and nothing
+    // resets the compose/sweep override before it runs, so consulting it
+    // here could silently leak a stale override from an earlier, unrelated
+    // compose/sweep session into this replacement with no UI indication.
     match build_watch_bump_psbt(&src, &wb.coins, &wb.outputs, reduce, new_rate, st.lock_time()) {
         Ok(built) => {
             w.set_show_bump_dialog(false);
@@ -1861,6 +1918,8 @@ fn resolve_sweep_rate(w: &AppWindow, st: &State) -> f64 {
 /// every spendable coin), inputs title, and the live cost line for the
 /// current fee tier / funding mode.
 fn update_sweep_screen(w: &AppWindow, st: &mut State) {
+    // Same freshness rule as `refresh_compose`'s locktime-panel repaint.
+    refresh_sweep_locktime_panel(w, st);
     let net = st.network;
     let Some(store) = st.store.as_ref() else { return };
     let exb = st.explorer_base();
@@ -2905,6 +2964,12 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
     w.set_picking_extra(false);
     refresh_to_chips(w, st);
     resolve_payfrom_default(w, st);
+    // A fresh compose session — the locktime override never survives past
+    // the screen it was set on (see `reset_tx_lock_time_override`'s doc
+    // comment).
+    st.reset_tx_lock_time_override();
+    w.set_compose_locktime_expanded(false);
+    refresh_compose_locktime_panel(w, st);
     w.set_screen(6);
     refresh_compose(w, st);
 }
@@ -3215,6 +3280,12 @@ fn set_sweep_dest(w: &AppWindow, st: &mut State, a: String) {
     w.set_sweep_rate_text(format!("{rate}").into());
     w.set_sweep_fund_external(false);
     w.set_sweep_inputs_expanded(false);
+    // A fresh sweep session — the locktime override never survives past
+    // the screen it was set on (see `reset_tx_lock_time_override`'s doc
+    // comment).
+    st.reset_tx_lock_time_override();
+    w.set_sweep_locktime_expanded(false);
+    refresh_sweep_locktime_panel(w, st);
     w.set_status("".into());
     update_sweep_screen(w, st);
     w.set_screen(16);
@@ -3252,6 +3323,10 @@ fn open_notebook_consolidate(w: &AppWindow, st: &mut State) {
     w.set_sweep_rate_text(format!("{rate}").into());
     w.set_sweep_fund_external(false);
     w.set_sweep_inputs_expanded(false);
+    // A fresh consolidate session — same reset rule as `set_sweep_dest`.
+    st.reset_tx_lock_time_override();
+    w.set_sweep_locktime_expanded(false);
+    refresh_sweep_locktime_panel(w, st);
     w.set_status("".into());
     update_sweep_screen(w, st);
     w.set_screen(16);
@@ -3393,6 +3468,83 @@ fn locktime_caption(
         }
         LockTimePolicy::Custom { height } => format!("New transactions get locktime {height}."),
     }
+}
+
+/// Parse a locktime mode pill + custom-height text into a `LockTimePolicy`,
+/// the same validation `on_set_locktime` (device Settings) always used —
+/// factored out so the compose (screen 6) and sweep/consolidate (screen
+/// 16) override panels share IDENTICAL parsing/validation, not a second
+/// hand-copied version. `None` = invalid (a custom height that doesn't
+/// parse, or is `>= 500_000_000` — read by consensus as a UNIX timestamp,
+/// never what someone typing a block height means).
+fn parse_locktime_mode(mode: &str, height: &str) -> Option<app_core::notes_core::tx::LockTimePolicy> {
+    use app_core::notes_core::tx::LockTimePolicy;
+    match mode {
+        "zero" => Some(LockTimePolicy::Zero),
+        "custom" => match height.trim().parse::<u32>() {
+            Ok(h) if h < 500_000_000 => Some(LockTimePolicy::Custom { height: h }),
+            _ => None,
+        },
+        _ => Some(LockTimePolicy::Tip),
+    }
+}
+
+/// The compose (screen 6) and sweep/consolidate (screen 16) locktime
+/// panels' four display values for a given policy: the mode pill, the
+/// custom-height field text (ALWAYS the currently-effective resolved
+/// height, even outside Custom mode — mirrors `on_set_locktime`'s own
+/// `locktime_text` convention, so tapping Custom starts from a sensible
+/// seed instead of a blank field), the effective caption
+/// (`locktime_caption` — the ONE wording source, shared with Settings),
+/// and the future-tip warning (empty = none). This is the safety content
+/// of the whole feature: our inputs signal RBF (nSequence 0xfffffffd), so
+/// nLockTime is ENFORCED — a height above the tip makes the tx non-final
+/// and the node rejects it outright.
+fn locktime_panel_values(
+    policy: app_core::notes_core::tx::LockTimePolicy,
+    tip: Option<u64>,
+) -> (String, String, String, String) {
+    use app_core::notes_core::tx::LockTimePolicy;
+    let tip32 = tip.and_then(|t| u32::try_from(t).ok());
+    let resolved = policy.resolve(tip32);
+    let mode = policy.as_str().to_string();
+    let height_text = resolved.to_string();
+    let effective = locktime_caption(policy, tip);
+    let warn = match policy {
+        LockTimePolicy::Custom { height } if tip32.is_some_and(|t| height > t) => format!(
+            "Height {height} is above the current chain tip ({}) — this transaction won't be final, and the node will reject it until block {height}.",
+            tip32.unwrap()
+        ),
+        _ => String::new(),
+    };
+    (mode, height_text, effective, warn)
+}
+
+/// Repaint the compose screen's locktime panel from `st`'s current
+/// effective policy (override if the panel set one this session, else the
+/// device default) — called on every fresh compose session AND after
+/// every `on_set_compose_locktime` tap, so the panel always reflects
+/// exactly what the next Sign would build with.
+fn refresh_compose_locktime_panel(w: &AppWindow, st: &State) {
+    let policy = st.tx_lock_time_override.unwrap_or(st.lock_time_policy);
+    let tip = st.store.as_ref().map(|s| s.tip_height);
+    let (mode, height, effective, warn) = locktime_panel_values(policy, tip);
+    w.set_compose_locktime_mode(mode.into());
+    w.set_compose_locktime_height(height.into());
+    w.set_compose_locktime_effective(effective.into());
+    w.set_compose_locktime_warn(warn.into());
+}
+
+/// Same as [`refresh_compose_locktime_panel`], for the sweep/consolidate
+/// (screen 16) panel.
+fn refresh_sweep_locktime_panel(w: &AppWindow, st: &State) {
+    let policy = st.tx_lock_time_override.unwrap_or(st.lock_time_policy);
+    let tip = st.store.as_ref().map(|s| s.tip_height);
+    let (mode, height, effective, warn) = locktime_panel_values(policy, tip);
+    w.set_sweep_locktime_mode(mode.into());
+    w.set_sweep_locktime_height(height.into());
+    w.set_sweep_locktime_effective(effective.into());
+    w.set_sweep_locktime_warn(warn.into());
 }
 
 fn update_settings_identity(w: &AppWindow, st: &State) {
@@ -7209,6 +7361,11 @@ fn set_cost_status(w: &AppWindow, text: String) {
 }
 
 fn refresh_compose(w: &AppWindow, st: &mut State) {
+    // Keep the locktime panel's caption/warning fresh against the current
+    // tip even if the store's scan advances while compose stays open (the
+    // panel's mode/height reflect `st`, not the other way around, so
+    // recomputing here is always idempotent with whatever the user picked).
+    refresh_compose_locktime_panel(w, st);
     let net = st.network;
     let text = w.get_compose_text().to_string();
     let private = w.get_compose_private();
@@ -7720,9 +7877,9 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         network: net,
     };
     let build_result = if n_recipients >= 2 {
-        app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift, st.lock_time())
+        app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift, st.effective_lock_time())
     } else {
-        app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift, st.lock_time())
+        app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift, st.effective_lock_time())
     };
     match build_result {
         Ok(built) => {
@@ -7906,7 +8063,7 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         args.change_override.clone(),
         args.change_index,
         rate,
-        st.lock_time(),
+        st.effective_lock_time(),
     ) {
         Ok(built) => {
             // Sub-dust fold prediction — `built.change == 0` means the REAL
@@ -8668,17 +8825,19 @@ fn show_confirm(w: &AppWindow, st: &mut State, pending: PendingBroadcast, ctx: a
     w.set_confirm_outputs(VecModel::from_slice(&to_rows(&sum.outputs)));
     w.set_confirm_note(ctx.note_preview.clone().unwrap_or_default().into());
     w.set_confirm_fee_line(sum.fee_line.clone().into());
+    w.set_confirm_locktime_line(sum.lock_time_line.clone().into());
     w.set_confirm_warn(sum.warn.clone().unwrap_or_default().into());
     w.set_confirm_txid(sum.txid.clone().into());
     w.set_confirm_context(pending.context.clone().into());
     println!(
-        "cb: confirm show kind={} txid={} fee={} vsize={} inputs={} outputs={} warn={}",
+        "cb: confirm show kind={} txid={} fee={} vsize={} inputs={} outputs={} lock_time={} warn={}",
         pending.kind,
         sum.txid,
         sum.fee.map(|f| f.to_string()).unwrap_or_else(|| "?".to_string()),
         sum.vsize,
         sum.inputs.len(),
         sum.outputs.len(),
+        sum.lock_time,
         i32::from(sum.warn.is_some()),
     );
     let return_screen = w.get_screen();
@@ -8907,7 +9066,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
             Some((&material, net, s.account, &spending_coins_for_sweep)),
             recipient.spk.clone(),
             rate,
-            s.lock_time(),
+            s.effective_lock_time(),
         )
         .map_err(|e| format!("{e}"))
     } else {
@@ -8930,7 +9089,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
             &sources,
             recipient.spk.clone(),
             rate,
-            s.lock_time(),
+            s.effective_lock_time(),
             app_core::notes_core::keys::generate_aux_rand,
         )
         .map_err(|e| format!("{e}"))
@@ -8965,6 +9124,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
                 recipient_name: None,
                 recipients: Vec::new(),
                 note_preview: None,
+                tip_height: s.confirm_tip_height(),
             };
             let pending = PendingBroadcast {
                 kind: "sweep",
@@ -9018,7 +9178,7 @@ fn build_consolidate_confirm(w: &AppWindow, s: &mut State, rate: f64) {
         &identity.output_x,
         me.spk.clone(),
         rate,
-        s.lock_time(),
+        s.effective_lock_time(),
         &identity.tweaked_seckey,
         app_core::notes_core::keys::generate_aux_rand,
     );
@@ -9045,6 +9205,7 @@ fn build_consolidate_confirm(w: &AppWindow, s: &mut State, rate: f64) {
                 recipient_name: None,
                 recipients: Vec::new(),
                 note_preview: None,
+                tip_height: s.confirm_tip_height(),
             };
             let pending = PendingBroadcast {
                 kind: "consolidate",
@@ -9071,6 +9232,13 @@ fn build_consolidate_confirm(w: &AppWindow, s: &mut State, rate: f64) {
 /// `PendingBroadcast.context`, appended after the base context. Stage B
 /// (`on_confirm_broadcast`/`PendingPayload::WConsol`) is the pre-existing
 /// thread-spawn, moved verbatim.
+///
+/// Deliberately uses the plain DEVICE-DEFAULT `lock_time()` throughout,
+/// never `effective_lock_time()`: this flow is reached from the account
+/// picker (Settings → "Consolidate wallet…"), not compose (6) or
+/// sweep/consolidate (16) — nothing resets the per-tx override before it
+/// runs, so consulting it here could silently leak a stale override from
+/// an earlier, unrelated compose/sweep session with no UI indication.
 fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
     // The picker's own job is done the moment a destination is picked —
     // reset its mode now (regardless of watch/keyed outcome below), same
@@ -9266,6 +9434,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
         recipient_name: None,
         recipients: Vec::new(),
         note_preview: None,
+        tip_height: s.confirm_tip_height(),
     };
     let pending = PendingBroadcast {
         kind: "wconsol",
@@ -9304,6 +9473,7 @@ fn enter_rebroadcast_confirm(w: &AppWindow, st: &mut State, ref_id: String, is_n
         recipient_name: None,
         recipients: Vec::new(),
         note_preview: None,
+        tip_height: st.confirm_tip_height(),
     };
     let pending = PendingBroadcast {
         kind: "rebroadcast",
@@ -9457,6 +9627,7 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
         recipient_name,
         recipients: Vec::new(),
         note_preview,
+        tip_height: st.confirm_tip_height(),
     };
 
     st.signed_psbt = Some(psbt);
@@ -9627,6 +9798,7 @@ pub fn run() {
         account,
         nb_index,
         lock_time_policy,
+        tx_lock_time_override: None,
         node_urls,
         explorers,
         ident: None,
@@ -10917,6 +11089,7 @@ pub fn run() {
                 net,
                 &ref_id,
                 new_rate,
+                None, // device default — no override control on the bump dialog
             )
             .map(BumpedBuild::Note)
         } else if !owner_ids.is_empty() {
@@ -10956,6 +11129,7 @@ pub fn run() {
                     &idents,
                     &ref_id,
                     new_rate,
+                    None, // device default — no override control on the bump dialog
                 )
                 .map(BumpedBuild::Tx)
             })
@@ -10965,6 +11139,7 @@ pub fn run() {
                 &identity,
                 &ref_id,
                 new_rate,
+                None, // device default — no override control on the bump dialog
             )
             .map(BumpedBuild::Tx)
         };
@@ -10998,6 +11173,7 @@ pub fn run() {
                     recipient_name: None,
                     recipients: Vec::new(),
                     note_preview: None,
+                    tip_height: s.confirm_tip_height(),
                 };
                 let pending = PendingBroadcast {
                     kind: "bump",
@@ -11142,6 +11318,11 @@ pub fn run() {
         };
         let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
         let account = s.account;
+        // Deliberately the device default, not `effective_lock_time()`:
+        // this is the Coins screen's direct "Consolidate spending coins…"
+        // shortcut, not compose (6) or sweep/consolidate (16) — nothing
+        // resets the per-tx override before it runs (see
+        // `build_wconsol_confirm`'s doc comment for the same reasoning).
         let built = app_core::mixed::build_wallet_sweep_mixed(
             &[],
             Some((&material, net, account, &coins)),
@@ -11192,6 +11373,7 @@ pub fn run() {
                     recipient_name: None,
                     recipients: Vec::new(),
                     note_preview: None,
+                    tip_height: s.confirm_tip_height(),
                 };
                 let pending = PendingBroadcast {
                     kind: "spending-consolidate",
@@ -11371,7 +11553,7 @@ pub fn run() {
                 &notes_coins,
                 &plan,
                 recipient.spk.clone(),
-                s.lock_time(),
+                s.effective_lock_time(),
             ) {
                 Ok(mut built) => {
                     // Keyed identity: the app signs its own inputs here and
@@ -12252,7 +12434,7 @@ pub fn run() {
                 if recipients.len() >= 2 { recipients.iter().map(|rc| rc.address.clone()).collect() } else { Vec::new() };
             let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
             match app_core::psbt_build::build_watch_funded_note_psbt_multi(
-                &output_x, &plan, &text, &recipients_out, r, chunk, s.lock_time(),
+                &output_x, &plan, &text, &recipients_out, r, chunk, s.effective_lock_time(),
             ) {
                 Ok(built) => {
                     let payload_outputs = built
@@ -12313,7 +12495,7 @@ pub fn run() {
             max_op_return_bytes: DEFAULT_CHUNK,
             network: net,
         };
-        match build_funding_psbt(&plan, &np, s.lock_time()) {
+        match build_funding_psbt(&plan, &np, s.effective_lock_time()) {
             Ok(built) => {
                 let n = coins.len();
                 let cost =
@@ -12915,7 +13097,7 @@ pub fn run() {
             }
             let chunk = store.chunk_size;
             match build_watch_note_psbt_multi(
-                &src, &coins, &text, &recipients_out, note_id, chunk, rate, s.lock_time(),
+                &src, &coins, &text, &recipients_out, note_id, chunk, rate, s.effective_lock_time(),
             ) {
                 Ok(built) => {
                     let payload_outputs = built
@@ -12997,6 +13179,7 @@ pub fn run() {
             coins: (!coins_vec.is_empty()).then_some(coins_vec.as_slice()),
             fee_rate: rate,
             gift_amount,
+            lock_time: s.lock_time_override_value(),
             now: created_at,
         };
         let Some(store) = s.store.as_ref() else {
@@ -13035,6 +13218,7 @@ pub fn run() {
                     recipient_name,
                     recipients,
                     note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
+                    tip_height: s.confirm_tip_height(),
                 };
                 let (fchange, ffee, fvsize) = (composed.tx.change, composed.tx.fee, composed.tx.vsize);
                 let pending = PendingBroadcast {
@@ -13202,9 +13386,9 @@ pub fn run() {
             network: net,
         };
         let built = if recipients.len() >= 2 {
-            app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift, s.lock_time())
+            app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift, s.effective_lock_time())
         } else {
-            app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift, s.lock_time())
+            app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift, s.effective_lock_time())
         };
         let built = match built {
             Ok(b) => b,
@@ -13300,6 +13484,7 @@ pub fn run() {
             recipient_name,
             recipients: confirm_recipients,
             note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
+            tip_height: s.confirm_tip_height(),
         };
         let pending = PendingBroadcast {
             kind: "compose-spending",
@@ -13485,7 +13670,7 @@ pub fn run() {
             change_override,
             change_index,
             rate,
-            s.lock_time(),
+            s.effective_lock_time(),
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -13743,6 +13928,7 @@ pub fn run() {
             recipient_name,
             recipients: confirm_recipients,
             note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
+            tip_height: s.confirm_tip_height(),
         };
         let pending = PendingBroadcast {
             kind: "compose-mixed",
@@ -14074,17 +14260,7 @@ pub fn run() {
     });
 
     cb!(on_set_locktime, |w, s, mode: SharedString, height: SharedString| {
-        use app_core::notes_core::tx::LockTimePolicy;
-        let policy = match mode.as_str() {
-            "zero" => Some(LockTimePolicy::Zero),
-            "custom" => match height.trim().parse::<u32>() {
-                // >= 500_000_000 is read by consensus as a UNIX timestamp,
-                // never what someone typing a block height means.
-                Ok(h) if h < 500_000_000 => Some(LockTimePolicy::Custom { height: h }),
-                _ => None,
-            },
-            _ => Some(LockTimePolicy::Tip),
-        };
+        let policy = parse_locktime_mode(mode.as_str(), height.as_str());
         let Some(policy) = policy else {
             println!("cb: set-locktime err=range");
             w.set_status("locktime must be a block height below 500000000".into());
@@ -14101,6 +14277,40 @@ pub fn run() {
         w.set_locktime_mode(policy.as_str().into());
         w.set_locktime_text(effective.to_string().into());
         w.set_locktime_effective(locktime_caption(policy, s.store.as_ref().map(|st| st.tip_height)).into());
+        w.set_status("".into());
+    });
+
+    // Compose screen (6) locktime override panel — a per-tx override of
+    // the device policy above, NOT a new setting: never written to
+    // config.json/store, reset to the device default every time compose is
+    // (re)opened (`pick_contact_core`). Shares `parse_locktime_mode`'s
+    // validation and `locktime_caption`'s wording with Settings.
+    cb!(on_set_compose_locktime, |w, s, mode: SharedString, height: SharedString| {
+        let Some(policy) = parse_locktime_mode(mode.as_str(), height.as_str()) else {
+            println!("cb: compose-locktime err=range");
+            w.set_status("locktime must be a block height below 500000000".into());
+            return;
+        };
+        s.tx_lock_time_override = Some(policy);
+        let effective = s.effective_lock_time();
+        println!("cb: compose-locktime {} effective={effective} ok", policy.as_str());
+        refresh_compose_locktime_panel(&w, &s);
+        w.set_status("".into());
+    });
+
+    // Sweep/consolidate screen (16) locktime override panel — same
+    // contract as the compose one above, reset on `set_sweep_dest`/
+    // `open_notebook_consolidate`.
+    cb!(on_set_sweep_locktime, |w, s, mode: SharedString, height: SharedString| {
+        let Some(policy) = parse_locktime_mode(mode.as_str(), height.as_str()) else {
+            println!("cb: sweep-locktime err=range");
+            w.set_status("locktime must be a block height below 500000000".into());
+            return;
+        };
+        s.tx_lock_time_override = Some(policy);
+        let effective = s.effective_lock_time();
+        println!("cb: sweep-locktime {} effective={effective} ok", policy.as_str());
+        refresh_sweep_locktime_panel(&w, &s);
         w.set_status("".into());
     });
 
@@ -14672,6 +14882,7 @@ fn preview_mock(w: &AppWindow) {
     w.set_psbt_signed(true);
     w.set_confirm_note("Happy birthday! Paid from cold storage.".into());
     w.set_confirm_fee_line("360 sats · 2.0 sat/vB".into());
+    w.set_confirm_locktime_line("Locktime 146209 · block height".into());
     w.set_confirm_warn("".into());
     w.set_confirm_txid("aaaaaaaabbbbbbbbccccccccddddddddaaaaaaaabbbbbbbbccccccccdddddddd".into());
     w.set_confirm_context("Directed note · regtest".into());

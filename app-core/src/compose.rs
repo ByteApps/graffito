@@ -86,6 +86,14 @@ pub struct ComposeRequest<'a> {
     /// Directed notes only: sats to send EACH recipient (the "gift"). None =
     /// DUST_LIMIT (the minimum, and the default). Ignored for self-notes.
     pub gift_amount: Option<u64>,
+    /// Per-tx `nLockTime` override (compose screen's collapsible locktime
+    /// panel): `None` = fall back to `store.lock_time()` (the device
+    /// policy), exactly like `gift_amount`'s `None` = DUST_LIMIT. `Some(h)`
+    /// is used VERBATIM — never re-resolved against the device policy —
+    /// same "the caller's choice, passed through untouched" rule
+    /// `LockTimePolicy::Custom` documents. Never persisted: this is a
+    /// transient per-attempt override, not a new setting.
+    pub lock_time: Option<u32>,
     /// Local wall-clock seconds for created_at (display only).
     pub now: u64,
 }
@@ -132,6 +140,7 @@ pub fn compose_note(
     // parsed in that order), each paired with the SAME gift amount —
     // empty for a self-note.
     let gift = req.gift_amount.unwrap_or(notes_core::DUST_LIMIT);
+    let lock_time = req.lock_time.unwrap_or_else(|| store.lock_time());
     let mut recipients: Vec<(Recipient, u64)> = Vec::new();
     if let Some(addr) = req.recipient {
         recipients.push((Recipient::parse(network, addr)?, gift));
@@ -183,11 +192,11 @@ pub fn compose_note(
         match &selected {
             Some(ins) => compose_note_exact(
                 identity, ins, req.text, req.private, note_id, change_spk,
-                store.chunk_size, req.fee_rate, store.lock_time(), generate_aux_rand,
+                store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
             ),
             None => compose_note_with_change(
                 identity, &utxos, req.text, req.private, note_id, change_spk,
-                store.chunk_size, req.fee_rate, store.lock_time(), generate_aux_rand,
+                store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
             ),
         }
     } else {
@@ -201,11 +210,11 @@ pub fn compose_note(
         let result = match &selected {
             Some(ins) => compose_directed_note_multi_exact(
                 identity, ins, req.text, req.private, note_id, &recipients, content_key,
-                change_spk, store.chunk_size, req.fee_rate, store.lock_time(), generate_aux_rand,
+                change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
             ),
             None => compose_directed_note_multi_with_change(
                 identity, &utxos, req.text, req.private, note_id, &recipients, content_key,
-                change_spk, store.chunk_size, req.fee_rate, store.lock_time(), generate_aux_rand,
+                change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
             ),
         };
         content_key.zeroize();
@@ -318,12 +327,21 @@ pub fn compose_and_record(
 /// one step call [`bump_fee`]; the universal confirm screen calls this
 /// alone at Sign time and defers [`record_bumped_note`] to the user's
 /// Broadcast tap — a Cancel then leaves the store byte-identical.
+/// `lock_time`: `None` = re-resolve the device policy against the store's
+/// last-scanned tip (a replacement is the same logical transaction, so a
+/// fresher height just buys a bit more anti-fee-sniping protection) —
+/// `Some(h)` overrides it verbatim, same convention as
+/// [`ComposeRequest::lock_time`]. No caller passes `Some` today (the
+/// compose/sweep panels' override doesn't extend to fee-bumping in this
+/// milestone); the parameter exists so it can without another signature
+/// change.
 pub fn bump_fee_build(
     store: &Store,
     identity: &Identity,
     network: Network,
     note_id_hex: &str,
     new_rate: f64,
+    lock_time: Option<u32>,
 ) -> Result<ComposedNote, Error> {
     let rec = store
         .notes
@@ -373,14 +391,15 @@ pub fn bump_fee_build(
         None => None,
     };
     let change_spk = change_spk_vec.as_deref();
+    let lock_time = lock_time.unwrap_or_else(|| store.lock_time());
     let tx = match &recipient {
         Some(r) => compose_directed_note_with_change_amount(
             identity, &utxos, &text, private, note_id, r, gift, change_spk,
-            store.chunk_size, new_rate, store.lock_time(), generate_aux_rand,
+            store.chunk_size, new_rate, lock_time, generate_aux_rand,
         ),
         None => compose_note_with_change(
             identity, &utxos, &text, private, note_id, change_spk,
-            store.chunk_size, new_rate, store.lock_time(), generate_aux_rand,
+            store.chunk_size, new_rate, lock_time, generate_aux_rand,
         ),
     }?;
 
@@ -437,7 +456,7 @@ pub fn bump_fee(
     note_id_hex: &str,
     new_rate: f64,
 ) -> Result<ComposedNote, Error> {
-    let composed = bump_fee_build(store, identity, network, note_id_hex, new_rate)?;
+    let composed = bump_fee_build(store, identity, network, note_id_hex, new_rate, None)?;
     record_bumped_note(store, &composed);
     Ok(composed)
 }
@@ -446,11 +465,16 @@ pub fn bump_fee(
 /// PURE, no store mutation (universal confirm stage-A seam): re-sign the
 /// SAME inputs to the SAME destination at a higher rate. The one-shot
 /// [`bump_raw_tx`] is build + [`record_bumped_tx`] back to back.
+/// `lock_time`: `None` = re-resolve the device policy (same "fresher
+/// height" reasoning as [`bump_fee_build`]); `Some(h)` overrides it
+/// verbatim. No caller passes `Some` today — see `bump_fee_build`'s doc
+/// comment.
 pub fn bump_raw_tx_build(
     store: &Store,
     identity: &Identity,
     txid: &str,
     new_rate: f64,
+    lock_time: Option<u32>,
 ) -> Result<notes_core::tx::NoteTx, Error> {
     let rec = store
         .txs
@@ -478,7 +502,7 @@ pub fn bump_raw_tx_build(
         new_rate,
         // A replacement is the same logical transaction; re-resolving the
         // policy just gives it a fresher anti-fee-sniping height.
-        store.lock_time(),
+        lock_time.unwrap_or_else(|| store.lock_time()),
         &identity.tweaked_seckey,
         generate_aux_rand,
     )
@@ -511,7 +535,7 @@ pub fn bump_raw_tx(
     txid: &str,
     new_rate: f64,
 ) -> Result<notes_core::tx::NoteTx, Error> {
-    let tx = bump_raw_tx_build(store, identity, txid, new_rate)?;
+    let tx = bump_raw_tx_build(store, identity, txid, new_rate, None)?;
     record_bumped_tx(store, txid, &tx);
     Ok(tx)
 }
@@ -530,19 +554,22 @@ pub fn bump_raw_tx_multi(
     txid: &str,
     new_rate: f64,
 ) -> Result<notes_core::tx::NoteTx, Error> {
-    let tx = bump_raw_tx_multi_build(store, identities, txid, new_rate)?;
+    let tx = bump_raw_tx_multi_build(store, identities, txid, new_rate, None)?;
     record_bumped_tx(store, txid, &tx);
     Ok(tx)
 }
 
 /// [`bump_raw_tx_multi`]'s PURE build half (universal confirm stage-A
 /// seam) — no store mutation; the one-shot wrapper above records via the
-/// shared [`record_bumped_tx`].
+/// shared [`record_bumped_tx`]. `lock_time`: `None` = re-resolve the
+/// device policy; `Some(h)` overrides it verbatim — see `bump_fee_build`'s
+/// doc comment.
 pub fn bump_raw_tx_multi_build(
     store: &Store,
     identities: &[(u32, Identity)],
     txid: &str,
     new_rate: f64,
+    lock_time: Option<u32>,
 ) -> Result<notes_core::tx::NoteTx, Error> {
     let rec = store
         .txs
@@ -592,7 +619,7 @@ pub fn bump_raw_tx_multi_build(
         &sources,
         dest_spk,
         new_rate,
-        store.lock_time(),
+        lock_time.unwrap_or_else(|| store.lock_time()),
         generate_aux_rand,
     )
         .map_err(Into::into)
@@ -746,7 +773,7 @@ mod bump_tests {
 
         // Purity: a build-only call leaves the store byte-identical.
         let before = serde_json::to_string(&split).unwrap();
-        let built = bump_raw_tx_build(&split, &id, &"00".repeat(32), 5.0).unwrap();
+        let built = bump_raw_tx_build(&split, &id, &"00".repeat(32), 5.0, None).unwrap();
         assert_eq!(
             serde_json::to_string(&split).unwrap(),
             before,
@@ -787,6 +814,7 @@ mod bump_tests {
                 coins: None,
                 fee_rate: 1.0,
                 gift_amount: None,
+                lock_time: None,
                 now: 1,
             },
         )
@@ -796,7 +824,7 @@ mod bump_tests {
         let mut split = note_base.clone();
 
         let before = serde_json::to_string(&split).unwrap();
-        let built = bump_fee_build(&split, &id, Network::Regtest, &note_id, 5.0).unwrap();
+        let built = bump_fee_build(&split, &id, Network::Regtest, &note_id, 5.0, None).unwrap();
         assert_eq!(
             serde_json::to_string(&split).unwrap(),
             before,
@@ -868,6 +896,7 @@ mod multi_recipient_tests {
                 coins: None,
                 fee_rate: 1.0,
                 gift_amount: None,
+                lock_time: None,
                 now: 1,
             },
         )
@@ -929,6 +958,7 @@ mod multi_recipient_tests {
                 coins: None,
                 fee_rate: 1.0,
                 gift_amount: None,
+                lock_time: None,
                 now: 1,
             },
         )
@@ -966,6 +996,7 @@ mod multi_recipient_tests {
                 coins: None,
                 fee_rate: 1.0,
                 gift_amount: None,
+                lock_time: None,
                 now: 42,
             },
         )
@@ -1017,6 +1048,7 @@ mod multi_recipient_tests {
                 coins: None,
                 fee_rate: 1.0,
                 gift_amount: Some(5_000),
+                lock_time: None,
                 now: 1,
             },
         )
@@ -1052,6 +1084,7 @@ mod multi_recipient_tests {
                 coins: None,
                 fee_rate: 1.0,
                 gift_amount: None,
+                lock_time: None,
                 now: 1,
             },
         )
@@ -1083,12 +1116,268 @@ mod multi_recipient_tests {
                 coins: None,
                 fee_rate: 1.0,
                 gift_amount: None,
+                lock_time: None,
                 now: 1,
             },
         )
         .unwrap();
 
-        let err = bump_fee_build(&store, &a, NET, &composed.note_id, 5.0).unwrap_err();
+        let err = bump_fee_build(&store, &a, NET, &composed.note_id, 5.0, None).unwrap_err();
         assert!(format!("{err}").to_lowercase().contains("multi-recipient"), "got: {err}");
+    }
+}
+
+/// Mutation-test target: the per-tx locktime override must reach the
+/// SIGNED TRANSACTION BYTES, decoded independently via rust-bitcoin — not
+/// merely "the value was passed to a function somewhere". Dropping
+/// `req.lock_time` (or wiring it to the wrong builder parameter, e.g. the
+/// old bare `store.lock_time()` call) must fail these tests.
+#[cfg(test)]
+mod lock_time_tests {
+    use super::*;
+    use crate::store::{NoteStatus, Store, TxInput, TxRecord};
+    use bitcoin::consensus::encode::deserialize;
+    use notes_core::tx::LockTimePolicy;
+    use notes_core::Network;
+
+    const NET: Network = Network::Regtest;
+
+    fn funded_store(identity: &Identity) -> Store {
+        let mut store = Store::new(&identity.output_x, NET);
+        store.utxos.push(LedgerUtxo {
+            txid: "aa".repeat(32),
+            vout: 0,
+            value: 100_000,
+            height: Some(100),
+            pending_spend: false,
+        });
+        store
+    }
+
+    /// Decode nLockTime from raw signed tx hex via rust-bitcoin, completely
+    /// independent of whatever the app's own builders computed — this is
+    /// the byte-truth check, same discipline as `confirm.rs`.
+    fn decoded_lock_time(raw_hex: &str) -> u32 {
+        let bytes = hex::decode(raw_hex).unwrap();
+        let tx: bitcoin::Transaction = deserialize(&bytes).unwrap();
+        tx.lock_time.to_consensus_u32()
+    }
+
+    /// `ComposeRequest.lock_time: Some(h)` reaches the raw tx bytes exactly.
+    #[test]
+    fn compose_lock_time_override_reaches_raw_tx_bytes() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let store = funded_store(&a);
+        let composed = compose_note(
+            &store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "override test",
+                private: false,
+                recipient: None,
+                extra_recipients: &[],
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: None,
+                lock_time: Some(777_777),
+                now: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded_lock_time(&composed.tx.raw_hex), 777_777);
+    }
+
+    /// `lock_time: None` still resolves to `store.lock_time()` — default
+    /// behavior is UNCHANGED when no override is present. Uses a
+    /// non-default store policy so the assertion can't pass by coincidence
+    /// (e.g. both happening to be the Tip-with-no-scan 0 fallback).
+    #[test]
+    fn compose_lock_time_none_falls_back_to_store_default() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let mut store = funded_store(&a);
+        store.lock_time = LockTimePolicy::Custom { height: 555_555 };
+        let composed = compose_note(
+            &store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "default test",
+                private: false,
+                recipient: None,
+                extra_recipients: &[],
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: None,
+                lock_time: None,
+                now: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded_lock_time(&composed.tx.raw_hex), 555_555);
+        assert_eq!(decoded_lock_time(&composed.tx.raw_hex), store.lock_time());
+    }
+
+    /// The override WINS over a differing store default — proves it isn't
+    /// merely equal by coincidence (the previous test's default happened to
+    /// resolve to a fixed height too).
+    #[test]
+    fn compose_lock_time_override_wins_over_differing_store_default() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let mut store = funded_store(&a);
+        store.lock_time = LockTimePolicy::Zero; // the default would be 0
+        let composed = compose_note(
+            &store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "override wins",
+                private: false,
+                recipient: None,
+                extra_recipients: &[],
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: None,
+                lock_time: Some(123_456),
+                now: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded_lock_time(&composed.tx.raw_hex), 123_456);
+        assert_ne!(decoded_lock_time(&composed.tx.raw_hex), store.lock_time());
+    }
+
+    /// The coin-control (`compose_note_exact`) branch honors the override
+    /// too — a second builder path, so the plumbing at BOTH of
+    /// `compose_note`'s call sites is covered, not just the auto-select one.
+    #[test]
+    fn compose_lock_time_override_reaches_exact_coin_control_branch() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let store = funded_store(&a);
+        let picks = vec![("aa".repeat(32), 0u32)];
+        let composed = compose_note(
+            &store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "coin control override",
+                private: false,
+                recipient: None,
+                extra_recipients: &[],
+                change_to: None,
+                coins: Some(&picks),
+                fee_rate: 1.0,
+                gift_amount: None,
+                lock_time: Some(444_444),
+                now: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded_lock_time(&composed.tx.raw_hex), 444_444);
+    }
+
+    /// The RBF bump build (`bump_raw_tx_build`, sweep/consolidate
+    /// speed-up) accepts the same override-or-fallback contract.
+    #[test]
+    fn bump_raw_tx_build_override_reaches_raw_tx_bytes() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let dest_spk = notes_core::address::p2tr_script_pubkey(
+            &Identity::from_app_seed(&[11u8; 32]).unwrap().output_x,
+        );
+        let mut store = Store::new(&a.output_x, NET);
+        store.txs.push(TxRecord {
+            kind: "sweep".into(),
+            txids: vec!["00".repeat(32)],
+            status: NoteStatus::Pending,
+            value: 69_000,
+            fee: 100,
+            vsize: 160,
+            created_at: Some(1),
+            raw_hex: Some(String::new()),
+            dest: "ext".into(),
+            inputs: vec![TxInput { txid: "11".repeat(32), vout: 0, value: 40_000 }],
+            dest_spk_hex: hex::encode(&dest_spk),
+            input_accounts: Vec::new(),
+            input_indexes: Vec::new(),
+            mixed_inputs: false,
+            dropped: false,
+        });
+        let built = bump_raw_tx_build(&store, &a, &"00".repeat(32), 5.0, Some(999_999)).unwrap();
+        assert_eq!(decoded_lock_time(&built.raw_hex), 999_999);
+
+        // None still falls back to the store default.
+        store.lock_time = LockTimePolicy::Custom { height: 222_222 };
+        let built_default = bump_raw_tx_build(&store, &a, &"00".repeat(32), 5.0, None).unwrap();
+        assert_eq!(decoded_lock_time(&built_default.raw_hex), 222_222);
+    }
+
+    /// The note-fee-bump build (`bump_fee_build`) accepts the same
+    /// override-or-fallback contract.
+    #[test]
+    fn bump_fee_build_override_reaches_raw_tx_bytes() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let mut store = funded_store(&a);
+        let composed = compose_and_record(
+            &mut store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "bump me",
+                private: false,
+                recipient: None,
+                extra_recipients: &[],
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: None,
+                lock_time: None,
+                now: 1,
+            },
+        )
+        .unwrap();
+        let built = bump_fee_build(&store, &a, NET, &composed.note_id, 5.0, Some(333_333)).unwrap();
+        assert_eq!(decoded_lock_time(&built.tx.raw_hex), 333_333);
+    }
+
+    /// Round-trip half of the invariant: the per-tx override must NEVER
+    /// touch the persisted store policy. `compose_and_record` mutates the
+    /// store in plenty of ways (records the note, locks the spent coin) —
+    /// but its `lock_time` field, the ONE thing that would end up written
+    /// to `store-<net>-<fp8>.json` on the next save, stays byte-identical
+    /// to what it was before this compose, even though the compose itself
+    /// used a wildly different overridden height. If a future change ever
+    /// threaded the override into `Store.lock_time` instead of just the
+    /// one transaction, this test would catch it.
+    #[test]
+    fn compose_override_never_persists_into_store_policy() {
+        let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let mut store = funded_store(&a);
+        store.lock_time = LockTimePolicy::Tip; // the device default in force
+        let _composed = compose_and_record(
+            &mut store,
+            &a,
+            NET,
+            &ComposeRequest {
+                text: "override must not persist",
+                private: false,
+                recipient: None,
+                extra_recipients: &[],
+                change_to: None,
+                coins: None,
+                fee_rate: 1.0,
+                gift_amount: None,
+                lock_time: Some(999_999),
+                now: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(store.lock_time, LockTimePolicy::Tip, "device policy field must be untouched");
+        // The store's serialized shape carries only the device policy — no
+        // second locktime-shaped field exists for an override to hide in.
+        let policy_json = serde_json::to_value(store.lock_time).unwrap();
+        assert_eq!(policy_json, serde_json::json!({"mode": "tip"}));
     }
 }

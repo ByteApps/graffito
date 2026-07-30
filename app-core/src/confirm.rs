@@ -53,6 +53,13 @@ pub struct ConfirmCtx {
     pub recipients: Vec<(String, Option<String>)>,
     /// decoded note text to display (public notes) — display-only, pass-through
     pub note_preview: Option<String>,
+    /// The chain height this store last scanned to, if any — used ONLY to
+    /// decide whether the signed tx's OWN decoded locktime (never this
+    /// value itself) is above the current tip. `None` means "we don't know
+    /// the tip", which suppresses the future-locktime warning rather than
+    /// guessing (mirrors `LockTimePolicy::resolve`'s own "never guess"
+    /// rule) — a stale/absent tip must never manufacture a false warning.
+    pub tip_height: Option<u32>,
 }
 
 /// Mirrors the slint PsbtRow struct { title, subtitle, amount, kind }.
@@ -73,7 +80,34 @@ pub struct TxSummary {
     pub fee: Option<u64>, // total_in - total_out; None if total_in is None
     pub vsize: u64,
     pub fee_line: String, // "1,234 sats · 2.0 sat/vB" or "fee unknown — missing input data"
+    /// The signed tx's `nLockTime`, decoded from the raw bytes — NEVER from
+    /// policy/state (this module's whole reason to exist is byte-truth).
+    pub lock_time: u32,
+    /// Human-readable rendering of `lock_time`, e.g. "Locktime 146209 ·
+    /// block height" or "Locktime 0 · none". A value at/above the BIP-65
+    /// threshold (`bitcoin::absolute::LOCK_TIME_THRESHOLD`, 500_000_000) is
+    /// labeled a time, matching how consensus itself reads it.
+    pub lock_time_line: String,
     pub warn: Option<String>, // set when something needs user attention (see rules)
+}
+
+/// Render a decoded `nLockTime` the way the confirm screen shows it: the
+/// raw value plus what it MEANS, so "0" doesn't read as a mysterious
+/// omission and a large value doesn't read as an arbitrary number. Public
+/// so the compose/sweep panels can preview the SAME wording for the
+/// override they're about to build with (their own resolved height, not a
+/// decoded tx — same function, different input).
+pub fn lock_time_line(lock_time: u32) -> String {
+    if lock_time == 0 {
+        "Locktime 0 · none".to_string()
+    } else if lock_time >= bitcoin::absolute::LOCK_TIME_THRESHOLD {
+        // BIP-65: consensus reads a value at/above this threshold as a UNIX
+        // timestamp, never a block height — label it accordingly rather
+        // than let a huge "height" look like a typo.
+        format!("Locktime {lock_time} · time")
+    } else {
+        format!("Locktime {lock_time} · block height")
+    }
 }
 
 /// self_dust-ish threshold used to tell a "keep the note discoverable" dust
@@ -93,6 +127,28 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
     let tx: Transaction = deserialize(&bytes).map_err(|e| format!("not a valid transaction: {e}"))?;
 
     let mut warns: Vec<String> = Vec::new();
+
+    // Byte-truth locktime: decoded from the tx itself, never from policy or
+    // state. Our own inputs always signal RBF (nSequence 0xfffffffd < 0xffffffff),
+    // which is what makes nLockTime ENFORCED — a height above the current
+    // tip makes the transaction non-final and the node rejects it outright,
+    // rather than just mining it a block late. That is the one safety fact
+    // worth a warning here (see `src/lib.rs`'s `State::lock_time` doc
+    // comment for the same hazard on the build side); a future UNIX-
+    // timestamp locktime isn't checked against `tip_height` (a block height)
+    // — comparing the two would be meaningless, and this app never builds a
+    // time-based locktime itself.
+    let lock_time = tx.lock_time.to_consensus_u32();
+    if let bitcoin::absolute::LockTime::Blocks(h) = tx.lock_time {
+        let height = h.to_consensus_u32();
+        if let Some(tip) = ctx.tip_height {
+            if height > tip {
+                warns.push(format!(
+                    "locktime {height} is above the current chain tip ({tip}) — this transaction is NOT FINAL and will be rejected until block {height}"
+                ));
+            }
+        }
+    }
 
     // Resolve the "known destination" addresses to scriptPubKeys ONCE (spk
     // compare, never string compare, per the paranoid rule — a string
@@ -230,6 +286,8 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
         fee,
         vsize,
         fee_line,
+        lock_time,
+        lock_time_line: lock_time_line(lock_time),
         warn: if warns.is_empty() { None } else { Some(warns.join("; ")) },
     })
 }
@@ -308,6 +366,7 @@ mod tests {
             recipient_name: None,
             recipients: Vec::new(),
             note_preview: None,
+            tip_height: None,
         }
     }
 
@@ -571,5 +630,140 @@ mod tests {
         let full = raw_hex(&tx);
         let truncated = &full[..full.len() / 2];
         assert!(summarize_signed_tx(truncated, &ctx).is_err());
+    }
+
+    fn simple_tx(lock_time: bitcoin::absolute::LockTime) -> Transaction {
+        let (_, spk_a) = notebook_spk(7);
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time,
+            input: vec![txin(1, 0)],
+            output: vec![txout(0, pnte_op_return("locktime test")), txout(99_000, spk_a)],
+        }
+    }
+
+    fn ctx_with_prevout() -> ConfirmCtx {
+        let (_, spk_a) = notebook_spk(7);
+        let mut ctx = base_ctx(vec![spk_a.clone()], vec![]);
+        ctx.prevouts.insert(
+            prevout_key(1, 0),
+            PrevoutInfo { value: 100_000, address: Some(addr_of(&spk_a)), source: "Notebook · Alice".into() },
+        );
+        ctx
+    }
+
+    /// A zero locktime decodes as "none" — the pre-anti-fee-sniping default,
+    /// still perfectly valid, never a warning.
+    #[test]
+    fn lock_time_zero_decodes_as_none() {
+        let tx = simple_tx(bitcoin::absolute::LockTime::ZERO);
+        let hex_str = raw_hex(&tx);
+        let ctx = ctx_with_prevout();
+        let sum = summarize_signed_tx(&hex_str, &ctx).unwrap();
+        assert_eq!(sum.lock_time, 0);
+        assert_eq!(sum.lock_time_line, "Locktime 0 · none");
+        assert!(sum.warn.is_none());
+    }
+
+    /// An ordinary height-shaped locktime decodes + labels as a block
+    /// height — the anti-fee-sniping default shape.
+    #[test]
+    fn lock_time_height_decodes_and_labels_block_height() {
+        let height = 146_209u32;
+        let tx = simple_tx(bitcoin::absolute::LockTime::from_height(height).unwrap());
+        let hex_str = raw_hex(&tx);
+        let ctx = ctx_with_prevout();
+        let sum = summarize_signed_tx(&hex_str, &ctx).unwrap();
+        assert_eq!(sum.lock_time, height);
+        assert_eq!(sum.lock_time_line, format!("Locktime {height} · block height"));
+    }
+
+    /// A locktime AT/ABOVE the BIP-65 threshold (500_000_000) is consensus-
+    /// interpreted as a UNIX timestamp, not a height — the confirm screen
+    /// must say so rather than showing a nonsensical "block height".
+    #[test]
+    fn lock_time_at_threshold_labels_as_time() {
+        let ts = bitcoin::absolute::LOCK_TIME_THRESHOLD; // exactly the boundary
+        let tx = simple_tx(bitcoin::absolute::LockTime::from_time(ts).unwrap());
+        let hex_str = raw_hex(&tx);
+        let ctx = ctx_with_prevout();
+        let sum = summarize_signed_tx(&hex_str, &ctx).unwrap();
+        assert_eq!(sum.lock_time, ts);
+        assert_eq!(sum.lock_time_line, format!("Locktime {ts} · time"));
+    }
+
+    /// The safety content of the whole feature: a signed tx whose height
+    /// locktime is ABOVE the known tip warns — that tx is non-final and the
+    /// node will reject it until the wire catches up. This is the mutation
+    /// to guard: removing this check (or inverting the comparison) must
+    /// fail this test.
+    #[test]
+    fn future_height_locktime_warns_above_tip() {
+        let tip = 146_000u32;
+        let tx = simple_tx(bitcoin::absolute::LockTime::from_height(tip + 500).unwrap());
+        let hex_str = raw_hex(&tx);
+        let mut ctx = ctx_with_prevout();
+        ctx.tip_height = Some(tip);
+        let sum = summarize_signed_tx(&hex_str, &ctx).unwrap();
+        assert!(sum.warn.is_some(), "a future-height locktime must warn");
+        let warn = sum.warn.unwrap();
+        assert!(warn.to_lowercase().contains("above"), "got: {warn}");
+        assert!(warn.contains(&(tip + 500).to_string()), "got: {warn}");
+    }
+
+    /// At or below the tip, no warning — the transaction is already final.
+    #[test]
+    fn at_or_below_tip_locktime_stays_silent() {
+        let tip = 146_000u32;
+        for h in [tip, tip - 1, 0] {
+            let tx = simple_tx(bitcoin::absolute::LockTime::from_height(h).unwrap());
+            let hex_str = raw_hex(&tx);
+            let mut ctx = ctx_with_prevout();
+            ctx.tip_height = Some(tip);
+            let sum = summarize_signed_tx(&hex_str, &ctx).unwrap();
+            assert!(sum.warn.is_none(), "height {h} at/below tip {tip} must not warn");
+        }
+    }
+
+    /// An unknown tip (`tip_height: None`, e.g. nothing scanned yet) must
+    /// never guess — no warning, even for a very high locktime — mirroring
+    /// `LockTimePolicy::resolve`'s own "never guess, under-shoot instead"
+    /// rule on the build side.
+    #[test]
+    fn unknown_tip_never_warns() {
+        let tx = simple_tx(bitcoin::absolute::LockTime::from_height(600_000).unwrap());
+        let hex_str = raw_hex(&tx);
+        let ctx = ctx_with_prevout(); // tip_height: None
+        let sum = summarize_signed_tx(&hex_str, &ctx).unwrap();
+        assert!(sum.warn.is_none());
+    }
+
+    /// The future-locktime warning COMPOSES with an existing warning
+    /// (foreign output) rather than clobbering it — both facts must reach
+    /// the user in the one `warn` channel, joined, never one replacing the
+    /// other.
+    #[test]
+    fn future_locktime_warning_composes_with_existing_warning() {
+        let tip = 100u32;
+        let (_, spk_a) = notebook_spk(7);
+        let (_, spk_stranger) = notebook_spk(42);
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::from_height(tip + 1).unwrap(),
+            input: vec![txin(1, 0)],
+            output: vec![txout(0, pnte_op_return("uh oh")), txout(60_000, spk_stranger.clone())],
+        };
+        let hex_str = raw_hex(&tx);
+        let mut ctx = base_ctx(vec![spk_a.clone()], vec![]);
+        ctx.tip_height = Some(tip);
+        ctx.prevouts.insert(
+            prevout_key(1, 0),
+            PrevoutInfo { value: 100_000, address: Some(addr_of(&spk_a)), source: "Notebook · Alice".into() },
+        );
+
+        let sum = summarize_signed_tx(&hex_str, &ctx).unwrap();
+        let warn = sum.warn.expect("both warnings must surface");
+        assert!(warn.contains("doesn't recognize"), "foreign-output warning must survive: {warn}");
+        assert!(warn.to_lowercase().contains("above"), "locktime warning must also be present: {warn}");
     }
 }
