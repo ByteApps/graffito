@@ -11,17 +11,31 @@
 #
 # Requires the prime workspace layout: ../prime-chain-notes as a sibling.
 # Run inside the SDK nix shell (cargo): see CLAUDE.md.
+#
+# --core-rpc (opt-in, PLAN-chain-notes-app-core-rpc.md unit U8): runs the
+# IDENTICAL legs against a REAL `bitcoind -regtest` this script starts and
+# manages itself — NO companion shim in the loop at all. The app's base
+# becomes a `bitcoind+http://` URL (`app_core::chain::AnyTransport`'s Core
+# backend, U2/U3), and the two harness-only conveniences server.py's
+# /regtest/api/mine and /regtest/api/faucet provide are replaced with
+# direct `bitcoin-cli` calls — the app itself speaks ONLY Core RPC in this
+# mode, which is the whole point of the unit: proving the app needs no
+# shim. The default (no-arg) mode is byte-identical to before this unit.
 set -euo pipefail
 
 RED=$'\033[31m'; GRN=$'\033[32m'; NC=$'\033[0m'
 pass() { echo "${GRN}PASS${NC} $*"; }
 fail() { echo "${RED}FAIL${NC} $*"; exit 1; }
 
+CORE_RPC=0
+if [[ "${1:-}" == "--core-rpc" ]]; then
+    CORE_RPC=1
+fi
+
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 PRIME="$(cd "$REPO/../prime-chain-notes" && pwd)" || fail "needs ../prime-chain-notes"
 WORK="${E2E_WORK:-$(mktemp -d /tmp/chain-notes-app-e2e.XXXXXX)}"
 PORT="${E2E_PORT:-18791}"
-BASE="http://127.0.0.1:$PORT/regtest/api"
 
 echo "== build both host binaries =="
 ( cd "$REPO" && cargo build -q -p app-core --example cli )
@@ -29,16 +43,129 @@ APP="$REPO/target/debug/examples/cli"
 ( cd "$PRIME" && cargo build -q -p notes-core --example notes_cli )
 NOTES="$PRIME/target/debug/examples/notes_cli"
 
-echo "== start companion server + managed regtest node =="
-python3 "$PRIME/companion/server.py" "$PORT" --regtest >"$WORK/server.log" 2>&1 &
-SERVER_PID=$!
-cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
-trap cleanup EXIT
-for _ in $(seq 1 60); do
-    curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && break
-    sleep 1
-done
-curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || fail "server did not come up (see $WORK/server.log)"
+# ---------------------------------------------------------------------------
+# Backend setup: Esplora (server.py-managed regtest, default) or Core RPC
+# (a throwaway bitcoind THIS script starts/stops directly, no shim).
+#
+# Both branches define the same four harness verbs the rest of the script
+# calls: `mine_blocks N`, `faucet ADDR BTC`, `broadcast_raw HEX FAILMSG`,
+# `broadcast_raw_check HEX OUTFILE`. These are TEST-HARNESS conveniences —
+# server.py exposes the first two as HTTP routes and auto-mines on the last
+# two; the app itself never calls any of them. In --core-rpc mode every one
+# of the four is a direct `bitcoin-cli` call, and mining is EXPLICIT after
+# every broadcast (Core mode's transport deliberately does not auto-mine —
+# see chain.rs's `CoreRpcTransport::post_text` doc comment — so this script
+# must do what server.py's POST /tx handler used to do for it).
+if [[ "$CORE_RPC" == 1 ]]; then
+    echo "== start our OWN regtest bitcoind (no companion shim — Core RPC mode) =="
+    CORE_PORT="${E2E_CORE_PORT:-$((19000 + ($$ % 3000)))}"
+    export CORE_RPC_USER="cnrpcuser"
+    export CORE_RPC_PASS="cnrpcpass-$$"
+    CORE_DATADIR="$(mktemp -d /tmp/chain-notes-app-core-rpc.XXXXXX)"
+    # rpcuser/rpcpassword/rpcport are network-specific settings and MUST
+    # live under a [regtest] section (bitcoind refuses otherwise —
+    # verified in app-core/tests/core_rpc_conformance.rs's start_node()).
+    # Basic auth, deliberately NOT cookie auth: cookie files aren't
+    # readable from iOS (plan §2.4), so this genuinely exercises the auth
+    # path the app itself uses. txindex=1 + fallbackfee=0.0001 mirror
+    # server.py's managed-node config (companion/server.py:80-102).
+    cat > "$CORE_DATADIR/bitcoin.conf" <<CONF
+regtest=1
+server=1
+txindex=1
+fallbackfee=0.0001
+
+[regtest]
+rpcuser=$CORE_RPC_USER
+rpcpassword=$CORE_RPC_PASS
+rpcport=$CORE_PORT
+CONF
+    bitcoind -regtest -datadir="$CORE_DATADIR" -daemon=0 >"$WORK/bitcoind.log" 2>&1 &
+    BITCOIND_PID=$!
+
+    core_cli() { bitcoin-cli -regtest -datadir="$CORE_DATADIR" -rpcuser="$CORE_RPC_USER" -rpcpassword="$CORE_RPC_PASS" -rpcport="$CORE_PORT" "$@"; }
+    miner_cli() { core_cli -rpcwallet=miner "$@"; }
+
+    cleanup() {
+        if [[ -n "${BITCOIND_PID:-}" ]]; then
+            core_cli stop >/dev/null 2>&1 || true
+            for _ in $(seq 1 20); do
+                kill -0 "$BITCOIND_PID" 2>/dev/null || break
+                sleep 0.5
+            done
+            kill "$BITCOIND_PID" 2>/dev/null || true
+            wait "$BITCOIND_PID" 2>/dev/null || true
+        fi
+        [[ -n "${CORE_DATADIR:-}" ]] && rm -rf "$CORE_DATADIR"
+    }
+    trap cleanup EXIT
+
+    for _ in $(seq 1 60); do
+        core_cli getblockchaininfo >/dev/null 2>&1 && break
+        sleep 0.5
+    done
+    core_cli getblockchaininfo >/dev/null 2>&1 || fail "bitcoind did not come up (see $WORK/bitcoind.log, datadir $CORE_DATADIR)"
+
+    # `mine_blocks`/`faucet` are needed immediately (initial maturity), so
+    # define them before first use.
+    mine_blocks() { # n
+        local n="$1" addr
+        addr="$(miner_cli getnewaddress)"
+        miner_cli generatetoaddress "$n" "$addr" >/dev/null
+        # bitcoind's wallet block-processing is ASYNC (validation-interface
+        # callbacks drain on the scheduler thread after generatetoaddress
+        # returns) — without this sync, a listunspent/getrawtransaction
+        # served right after can answer from the PRE-block view. Same
+        # hazard server.py's mine() and the U3 conformance suite's
+        # Node::generate() both guard against.
+        core_cli syncwithvalidationinterfacequeue >/dev/null 2>&1 || true
+    }
+    faucet() { # addr amount_btc
+        miner_cli sendtoaddress "$1" "$2" >/dev/null
+        mine_blocks 1
+    }
+    broadcast_raw() { # hex failmsg
+        core_cli sendrawtransaction "$1" >/dev/null || fail "$2"
+        mine_blocks 1
+    }
+    broadcast_raw_check() { # hex outfile — never fails the script; writes
+                             # the txid (success) or bitcoind's error text
+                             # (rejection, contains "error") to outfile,
+                             # mirroring curl -s's "print the body either
+                             # way" behavior against server.py.
+        local hex="$1" outfile="$2" out
+        if out="$(core_cli sendrawtransaction "$hex" 2>&1)"; then
+            printf '%s' "$out" > "$outfile"
+            mine_blocks 1
+        else
+            printf '%s' "$out" > "$outfile"
+        fi
+    }
+
+    core_cli createwallet miner >/dev/null
+    mine_blocks 101   # mature coinbase, mirrors server.py's start_managed_node
+    echo "bitcoind up (datadir $CORE_DATADIR, port $CORE_PORT), 101 blocks mined"
+
+    BASE="bitcoind+http://127.0.0.1:$CORE_PORT"
+else
+    BASE="http://127.0.0.1:$PORT/regtest/api"
+
+    echo "== start companion server + managed regtest node =="
+    python3 "$PRIME/companion/server.py" "$PORT" --regtest >"$WORK/server.log" 2>&1 &
+    SERVER_PID=$!
+    cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
+    trap cleanup EXIT
+    for _ in $(seq 1 60); do
+        curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && break
+        sleep 1
+    done
+    curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || fail "server did not come up (see $WORK/server.log)"
+
+    mine_blocks() { curl -sf -X POST "$BASE/mine?blocks=$1" >/dev/null; }
+    faucet() { curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$1\",\"amount\":$2}" >/dev/null; }
+    broadcast_raw() { curl -sf -X POST "$BASE/tx" --data-binary "$1" >/dev/null || fail "$2"; }
+    broadcast_raw_check() { curl -s -X POST "$BASE/tx" --data-binary "$1" >"$2" || true; }
+fi
 
 # App identity: a BIP-39 mnemonic exercises the flagship import format.
 export APP_KEY="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
@@ -73,9 +200,9 @@ done
 pass "device seed words → app import: byte-identical addresses across seed/account/index"
 
 echo "== fund both identities =="
-curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$A_ADDR\",\"amount\":0.001}" >/dev/null
-curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$P_ADDR\",\"amount\":0.001}" >/dev/null
-curl -sf -X POST "$BASE/mine?blocks=100" >/dev/null   # mature coinbase for later mining fees
+faucet "$A_ADDR" 0.001
+faucet "$P_ADDR" 0.001
+mine_blocks 100   # mature coinbase for later mining fees
 
 STORE="$WORK/app-store.json"
 "$APP" init "$STORE" regtest | grep -q "kind=mnemonic" || fail "init"
@@ -85,6 +212,12 @@ pass "funded + scanned (100000 sats)"
 echo "== self-notes: public, then private CHAINED on unconfirmed change =="
 "$APP" compose "$STORE" "$BASE" public 1.0 "hello public from app" | grep -q broadcast=ok || fail "compose public"
 "$APP" compose "$STORE" "$BASE" private 1.0 "hello private from app" | grep -q broadcast=ok || fail "compose private (chained)"
+# Core mode does not auto-mine on broadcast, so mine ONCE here — AFTER both
+# composes, never between them — so the private tx's build genuinely spent
+# the public tx's still-unconfirmed change (app-core's local Store ledger
+# tracks that pending output the instant it signs, before any scan/mine),
+# and only the follow-up scan below needs both confirmed.
+if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
 "$APP" scan "$STORE" "$BASE" >/dev/null
 "$APP" notes "$STORE" | tee "$WORK/notes1" | grep -q "status=confirmed .*text=hello public from app" || fail "public note confirmed"
 grep -q "private=true .*text=hello private from app" "$WORK/notes1" || fail "private note confirmed"
@@ -118,8 +251,8 @@ external_funding() { # <tr|wpkh> <seed-hex> <note-text>
         tr) [[ "$F_ADDR" == bcrt1p* ]] || fail "[$kind] funding addr not taproot: $F_ADDR" ;;
         wpkh) [[ "$F_ADDR" == bcrt1q* ]] || fail "[$kind] funding addr not segwit v0: $F_ADDR" ;;
     esac
-    curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$F_ADDR\",\"amount\":0.002}" >/dev/null
-    curl -sf -X POST "$BASE/mine?blocks=1" >/dev/null
+    faucet "$F_ADDR" 0.002
+    mine_blocks 1
     # App identity AUTHORS a directed-private note to prime; the funding wallet pays.
     PSBT="$("$APP" fund-build "$BASE" regtest "$F_DESC" private 2.0 "$text" "$P_ADDR" 2>"$WORK/fb-$kind.log")"
     grep -q "fund-build txid=" "$WORK/fb-$kind.log" || fail "[$kind] fund-build: $(cat "$WORK/fb-$kind.log")"
@@ -128,6 +261,7 @@ external_funding() { # <tr|wpkh> <seed-hex> <note-text>
         || fail "[$kind] fund-sign signed no inputs: $(cat "$WORK/fs-$kind.log")"
     FTXID="$("$APP" fund-finalize "$BASE" regtest "$SIGNED" 2>"$WORK/ff-$kind.log")"
     grep -q "broadcast=ok" "$WORK/ff-$kind.log" || fail "[$kind] fund-finalize: $(cat "$WORK/ff-$kind.log")"
+    if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
     pass "[$kind] external-funded directed note built+signed+finalized+broadcast (txid=$FTXID)"
 
     # Prime decrypts it via the candidate-key path: the author key is not the
@@ -146,6 +280,7 @@ external_funding wpkh 2222222222222222222222222222222222222222222222222222222222
 
 echo "== app → prime: directed PRIVATE note =="
 "$APP" compose "$STORE" "$BASE" private 1.0 "psst prime, from the app" "$P_ADDR" | grep -q broadcast=ok || fail "directed compose"
+if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
 "$APP" bundle "$P_ADDR" regtest "$BASE" "$WORK/prime.json" >/dev/null
 "$NOTES" scan "$WORK/prime.json" >"$WORK/prime-scan.json"
 jq -e --arg from "$A_ADDR" \
@@ -156,7 +291,7 @@ pass "app → prime directed private: received, attributed, decrypted by prime-c
 echo "== prime → app: directed PRIVATE reply =="
 "$NOTES" send "$WORK/prime.json" "$A_ADDR" private 1.0 100000 "hello app, from the prime" >"$WORK/prime-send.json"
 RAW="$(jq -r .raw_hex "$WORK/prime-send.json")"
-curl -sf -X POST "$BASE/tx" --data-binary "$RAW" >/dev/null || fail "broadcast prime reply"
+broadcast_raw "$RAW" "broadcast prime reply"
 "$APP" scan "$STORE" "$BASE" >/dev/null
 "$APP" notes "$STORE" | tee "$WORK/notes3" | \
     grep -q "received=true from=$P_ADDR .*text=hello app, from the prime" || fail "app did not decrypt prime's directed note: $(cat "$WORK/notes3")"
@@ -176,7 +311,7 @@ APP_INDEX=1 "$APP" init "$NB1_STORE" regtest >/dev/null
 "$NOTES" scan "$WORK/prime.json" >/dev/null
 "$NOTES" send "$WORK/prime.json" "$NB1_ADDR" private 1.0 100000 "hello notebook one" >"$WORK/prime-send-nb1.json"
 RAW="$(jq -r .raw_hex "$WORK/prime-send-nb1.json")"
-curl -s -X POST "$BASE/tx" --data-binary "$RAW" >"$WORK/nb1-broadcast" || true
+broadcast_raw_check "$RAW" "$WORK/nb1-broadcast"
 grep -qi error "$WORK/nb1-broadcast" && fail "broadcast prime → nb1: $(cat "$WORK/nb1-broadcast")"
 APP_INDEX=1 "$APP" scan "$NB1_STORE" "$BASE" >/dev/null
 APP_INDEX=1 "$APP" notes "$NB1_STORE" | tee "$WORK/notes-nb1" | \
@@ -214,10 +349,11 @@ pass "fu: dedicated funding-unification identity $FU_ADDR (notebook stays dust-o
 echo "== fu leg 1: funded self-note (public) — self-spk-SET marks it OWN =="
 SPEND_ADDR1="$("$APP" spending-address "$FU_STORE" regtest | tail -1)"
 [[ "$SPEND_ADDR1" == bcrt1q* ]] || fail "fu leg1: spending address not segwit v0: $SPEND_ADDR1"
-curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$SPEND_ADDR1\",\"amount\":0.0005}" >/dev/null
-curl -sf -X POST "$BASE/mine?blocks=1" >/dev/null
+faucet "$SPEND_ADDR1" 0.0005
+mine_blocks 1
 "$APP" note-spend-funded "$FU_STORE" "$BASE" public 2.0 "funded self note" \
     | tee "$WORK/fu-leg1.log" | grep -q "broadcast=ok" || fail "fu leg1: note-spend-funded: $(cat "$WORK/fu-leg1.log")"
+if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
 pass "fu leg1: funded self-note composed + signed + broadcast entirely in-app via the spending wallet"
 
 "$APP" scan "$FU_STORE" "$BASE" >/dev/null
@@ -229,10 +365,11 @@ pass "fu leg1: a fresh scan classifies the spending-wallet-funded note as OWN (s
 echo "== fu leg 2: funded directed-private note → prime =="
 SPEND_ADDR2="$("$APP" spending-address "$FU_STORE" regtest | tail -1)"
 [ "$SPEND_ADDR2" != "$SPEND_ADDR1" ] || fail "fu leg2: spending wallet reused a receive address"
-curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$SPEND_ADDR2\",\"amount\":0.0005}" >/dev/null
-curl -sf -X POST "$BASE/mine?blocks=1" >/dev/null
+faucet "$SPEND_ADDR2" 0.0005
+mine_blocks 1
 "$APP" note-spend-funded "$FU_STORE" "$BASE" private 2.0 "funded directed note" "$P_ADDR" \
     | tee "$WORK/fu-leg2.log" | grep -q "broadcast=ok" || fail "fu leg2: note-spend-funded: $(cat "$WORK/fu-leg2.log")"
+if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
 pass "fu leg2: funded directed-private note composed + signed + broadcast entirely in-app via the spending wallet"
 
 "$APP" scan "$FU_STORE" "$BASE" >/dev/null
@@ -269,6 +406,7 @@ echo "== fu leg 5b: the EXISTING consolidate (sweep-to-self) path sweeps the acc
 "$APP" sweep "$FU_STORE" "$BASE" "$FU_ADDR" 1.0 \
     | tee "$WORK/fu-consolidate.log" | grep -q "^cli: sweep txid=" \
     || fail "fu leg5b: dust consolidate: $(cat "$WORK/fu-consolidate.log")"
+if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
 "$APP" scan "$FU_STORE" "$BASE" | tee "$WORK/fu-scan-post-consolidate" >/dev/null
 FU_BAL_POST="$(grep -o 'balance=[0-9]*' "$WORK/fu-scan-post-consolidate" | cut -d= -f2)"
 [[ "$FU_BAL_POST" -gt 0 && "$FU_BAL_POST" -lt 660 ]] \
@@ -316,8 +454,8 @@ export APP_KEY="$MFU_KEY"
 "$APP" init "$MFU_STORE" regtest | grep -q "kind=mnemonic" || fail "multi-fu: init"
 MFU_SPEND_ADDR="$("$APP" spending-address "$MFU_STORE" regtest | tail -1)"
 [[ "$MFU_SPEND_ADDR" == bcrt1q* ]] || fail "multi-fu: spending address not segwit v0: $MFU_SPEND_ADDR"
-curl -sf -X POST "$BASE/faucet" -d "{\"address\":\"$MFU_SPEND_ADDR\",\"amount\":0.0006}" >/dev/null
-curl -sf -X POST "$BASE/mine?blocks=1" >/dev/null
+faucet "$MFU_SPEND_ADDR" 0.0006
+mine_blocks 1
 
 # Three throwaway taproot recipients (any valid 32-byte hex key — none of
 # them need to sign anything, just be valid taproot regtest addresses).
@@ -329,6 +467,7 @@ export APP_KEY="$MFU_KEY"
     "$M_R1" "$M_R2" "$M_R3" \
     | tee "$WORK/multi-fu-leg.log" | grep -q "recipients=3 sent_to_recipient=1500 .*broadcast=ok" \
     || fail "multi leg: note-spend-funded-multi: $(cat "$WORK/multi-fu-leg.log")"
+if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
 pass "multi leg: 3-recipient spending-wallet-funded note (uniform 500-sat gift, 1500 sats total) composed + signed + broadcast entirely in-app"
 
 # Each recipient decrypts/decodes its own copy of the PUBLIC multi-recipient
@@ -347,3 +486,8 @@ for rk in 1111111111111111111111111111111111111111111111111111111111111111 \
         || fail "multi leg: recipient $rk did not receive the multi-recipient note: $(cat "$WORK/multi-recip-notes-$rk")"
 done
 pass "multi leg: all three recipients independently scan + read the multi-recipient public note"
+
+if [[ "$CORE_RPC" == 1 ]]; then
+    echo
+    pass "Core RPC mode (--core-rpc): every leg above ran against a real bitcoind with NO companion shim in the loop"
+fi

@@ -18,8 +18,9 @@ use std::rc::Rc;
 
 use app_core::bitcoin;
 use app_core::chain::{
-    default_base, explorer_presets, explorer_tx_url, node_presets, scan_change_chain,
-    scan_change_chain_watch, AddrStats, ChainClient, ChangeCoin, HttpTransport, TxLookupStatus,
+    default_base, explorer_presets, explorer_tx_url, node_backend_label, node_presets,
+    scan_change_chain, scan_change_chain_watch, AddrStats, AnyTransport, ChainClient, ChangeCoin,
+    NodeStatus, TxLookupStatus,
 };
 use app_core::compose::ComposeRequest;
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
@@ -268,6 +269,30 @@ struct State {
     /// default (mempool.space).
     node_urls: HashMap<String, String>,
     explorers: HashMap<String, String>,
+    /// Bitcoin Core RPC "Save credentials" switch (config.json, per network
+    /// — same device-level convention as `node_urls`/`explorers`): true
+    /// persists to the Keychain (today's unconditional default behavior);
+    /// false keeps credentials in `core_rpc_session_creds` only. An absent
+    /// key (every pre-U10 config, and every network never touched) means
+    /// true, so nobody who already saved credentials sees a change (plan
+    /// §2.4 / U10, `core_rpc_should_persist`).
+    core_rpc_save_creds: HashMap<String, bool>,
+    /// Session-only Bitcoin Core RPC credentials — populated ONLY while
+    /// `core_rpc_save_creds` is false for that network. Never serialized to
+    /// config.json and never read by the launch path; gone on relaunch.
+    /// `Zeroizing` wipes the password on drop (switch flipped back to
+    /// persist-on, replaced with new text, or process exit).
+    core_rpc_session_creds: HashMap<String, (String, Zeroizing<String>)>,
+    /// U11 defense-in-depth: networks whose config.json node URL carried
+    /// inline `user:pass@` userinfo when it was LOADED (a hand-edited,
+    /// migrated, or pre-`on_set_node_custom`-stripping config) —
+    /// `migrate_inline_node_creds` stashes the creds into
+    /// `core_rpc_session_creds` at load time (safe: in-memory only) and
+    /// records the network here; `flush_core_rpc_migration` (called from
+    /// `refresh_node_health`, a Settings-only lazy point, NEVER the launch
+    /// path) routes them to the Keychain if this network's "Save
+    /// credentials" switch is on, exactly like a freshly typed credential.
+    core_rpc_migrate_pending: std::collections::HashSet<String>,
     /// Device-level note-size limit (config.json). Some = the user chose
     /// one in Settings; applied to every notebook's store on activate, so
     /// the wallet-level Settings pill really is wallet-wide. None = each
@@ -1023,6 +1048,15 @@ impl State {
         self.explorers.get(self.network.as_str()).cloned()
     }
 
+    /// Whether the "Save credentials" switch is ON for `network` — default
+    /// true (an absent config key preserves today's unconditional-Keychain
+    /// behavior; only an explicit `false` opts a network out). Plan §2.4 /
+    /// U10. Delegates to the free function so the default-true rule is
+    /// testable without constructing a `State`.
+    fn core_rpc_should_persist(&self, network: Network) -> bool {
+        core_rpc_persist_default_true(&self.core_rpc_save_creds, network.as_str())
+    }
+
     fn save_store(&self) {
         if let (Some(s), Some(p)) = (&self.store, self.store_path()) {
             save_store_file(s, &p);
@@ -1228,22 +1262,132 @@ impl State {
         self.store.as_ref().and_then(|s| u32::try_from(s.tip_height).ok()).filter(|h| *h > 0)
     }
 
+    /// The exact `serde_json::Value` `save_config` writes to `config.json`
+    /// — extracted to its own method (rather than inlined in `save_config`)
+    /// so a test can assert on the REAL production payload instead of a
+    /// hand-built mirror that can silently drift from it (U10 review fix:
+    /// a mirror-based test kept passing after `save_config` was edited, in
+    /// a review experiment, to leak `core_rpc_session_creds` in plaintext
+    /// under a new key — see `core_rpc_settings_tests::
+    /// config_payload_never_carries_session_credentials`). Deliberately
+    /// does NOT take `core_rpc_session_creds` as a parameter anywhere in
+    /// this list — the absence is what keeps it out.
+    fn config_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "network": self.network.as_str(),
+            "account": self.account,
+            "index": self.nb_index,
+            "nodes": self.node_urls,
+            "explorers": self.explorers,
+            "core_rpc_save_creds": self.core_rpc_save_creds,
+            "chunk": self.chunk,
+            "terms_accepted": self.terms_accepted,
+            "auto_unlock": self.auto_unlock,
+            "locktime": self.lock_time_policy,
+        })
+    }
+
     fn save_config(&self) {
-        let _ = std::fs::write(
-            self.data_dir.join("config.json"),
-            serde_json::json!({
-                "network": self.network.as_str(),
-                "account": self.account,
-                "index": self.nb_index,
-                "nodes": self.node_urls,
-                "explorers": self.explorers,
-                "chunk": self.chunk,
-                "terms_accepted": self.terms_accepted,
-                "auto_unlock": self.auto_unlock,
-                "locktime": self.lock_time_policy,
-            })
-            .to_string(),
-        );
+        let _ = std::fs::write(self.data_dir.join("config.json"), self.config_payload().to_string());
+    }
+
+    /// Test-only full `State` builder — every field the config-payload
+    /// tests don't care about gets the same inert default `run()`'s own
+    /// boot literal uses (`None`/empty/`false`), so a fresh test `State`
+    /// behaves like a just-booted app with no identity loaded. Only the
+    /// fields `config_payload` (or a test wanting to poke at them) reads
+    /// are parameters. Kept out of production builds entirely.
+    #[cfg(test)]
+    fn test_stub(
+        network: Network,
+        node_urls: HashMap<String, String>,
+        explorers: HashMap<String, String>,
+        core_rpc_save_creds: HashMap<String, bool>,
+        core_rpc_session_creds: HashMap<String, (String, Zeroizing<String>)>,
+    ) -> State {
+        State {
+            data_dir: PathBuf::new(),
+            network,
+            account: 0,
+            nb_index: 0,
+            node_urls,
+            explorers,
+            core_rpc_save_creds,
+            core_rpc_session_creds,
+            core_rpc_migrate_pending: std::collections::HashSet::new(),
+            chunk: None,
+            lock_time_policy: Default::default(),
+            // Per-tx locktime override: always None in a stub. This builder
+            // enumerates every `State` field on purpose, so a new field is a
+            // COMPILE error here rather than a silently-defaulted one — which
+            // is how this merge (per-tx locktime × the core-rpc config_payload
+            // tests) surfaced at all.
+            tx_lock_time_override: None,
+            ident: None,
+            store: None,
+            fees: None,
+            usd: None,
+            fees_fetched_at: None,
+            to_address: None,
+            to_addresses_extra: Vec::new(),
+            picking_extra: false,
+            selected_coins: Vec::new(),
+            coins_overridden: false,
+            consolidate_coins: false,
+            material: None,
+            icloud_backup: false,
+            terms_accepted: false,
+            auto_unlock: false,
+            saved_key_present: false,
+            pending_import: None,
+            pending_mnemonic: None,
+            quiz_indices: Vec::new(),
+            compose_oversize: false,
+            compose_fold_shown: 0,
+            mixed_est_shown: None,
+            funding: None,
+            funding_coins: Vec::new(),
+            funding_change_index: 0,
+            built_psbt: None,
+            ur_frames: Vec::new(),
+            signed_psbt: None,
+            funding_wallets: Vec::new(),
+            active_funding_id: None,
+            watch_spend: None,
+            watch_bump: None,
+            watch_note: None,
+            notebooks: None,
+            notebooks_fp8: None,
+            nb_addrs: Vec::new(),
+            xacct_addrs: Vec::new(),
+            discovery_pending: false,
+            wconsol: None,
+            reveal_formats: None,
+            spending_capable: false,
+            spending_source: None,
+            spending_coins: Vec::new(),
+            spending_scanned: false,
+            change_coins: Vec::new(),
+            change_coins_ctx: None,
+            pending_spending_sweep_index: None,
+            mixed_selected: Vec::new(),
+            payfrom_expanded_source: String::new(),
+            nb_expanded: false,
+            sp_expanded: false,
+            payfrom_active_source: String::new(),
+            payfrom_wallet_coins: std::collections::HashMap::new(),
+            payfrom_aligning: false,
+            change_choice: String::new(),
+            compose_busy: false,
+            act_pending_ref: None,
+            payfrom_manual: false,
+            wallet_tx_busy: false,
+            scan_gate: app_core::scan_gate::ScanGate::new(),
+            pending_broadcast: None,
+            contacts: Vec::new(),
+            tombstones: Vec::new(),
+            last_sync: std::cell::Cell::new(SyncStatus::Unknown),
+        }
     }
 
     fn save_funding_wallets(&self) {
@@ -1798,7 +1942,14 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
     // rebuild derives every input's spk/key-origin from that index.
     let index_by_addr: HashMap<String, u32> =
         st.nb_addrs.iter().map(|(i, a, _)| (a.clone(), *i)).collect();
-    let client = ChainClient::new(HttpTransport::new(base), st.network);
+    let creds = core_rpc_creds_for(st, &base, st.network);
+    let client = match open_client(&base, st.network, creds) {
+        Ok(c) => c,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
     match client.fetch_tx_io(&txid, |a| index_by_addr.get(a).copied()) {
         Ok((coins, outputs, confirmed)) => {
             if confirmed {
@@ -2114,17 +2265,371 @@ fn load_backend_settings(w: &AppWindow, st: &State) {
     }
 
     let net = st.network;
-    let (n_opts, n_idx, n_custom) =
-        fill(node_presets(net), st.node_urls.get(net.as_str()).map(String::as_str));
+    let (n_opts, n_idx, n_custom, n_core_addr) =
+        fill_node(node_presets(net), st.node_urls.get(net.as_str()).map(String::as_str));
     w.set_node_options(VecModel::from_slice(&n_opts));
     w.set_node_index(n_idx);
     w.set_node_custom_text(n_custom);
+    w.set_node_address_text(n_core_addr);
 
     let (e_opts, e_idx, e_custom) =
         fill(explorer_presets(net), st.explorers.get(net.as_str()).map(String::as_str));
     w.set_explorer_options(VecModel::from_slice(&e_opts));
     w.set_explorer_index(e_idx);
     w.set_explorer_custom_text(e_custom);
+}
+
+/// [`load_backend_settings`]'s node-dropdown counterpart to its local
+/// `fill` — the node picker gets an extra UI-managed row `fill` doesn't
+/// (the explorer picker has no "Bitcoin Core" concept, so it stays on the
+/// plain two-row-tail `fill`): `<presets…>, "Bitcoin Core", "Custom…"`.
+/// U12 (`PLAN-chain-notes-app-core-rpc.md` §2.5) moves the `bitcoind+`
+/// storage prefix out of user-facing text — a stored Core base now selects
+/// the dedicated row and displays as bare `host:port` (`display_core_url`),
+/// never the raw prefixed string; anything else follows the original
+/// preset-or-Custom matching unchanged. Returns
+/// `(options, selected_index, esplora_custom_text, core_address_text)` —
+/// exactly one of the last two is ever non-empty.
+fn fill_node(
+    presets: Vec<(&'static str, Option<&'static str>)>,
+    cur: Option<&str>,
+) -> (Vec<SharedString>, i32, SharedString, SharedString) {
+    let mut opts: Vec<SharedString> = presets.iter().map(|(l, _)| (*l).into()).collect();
+    let core_row = presets.len();
+    let custom_row = presets.len() + 1;
+    opts.push("Bitcoin Core".into());
+    opts.push("Custom…".into());
+
+    if let Some(u) = cur {
+        if u.starts_with("bitcoind+") {
+            return (opts, core_row as i32, "".into(), display_core_url(u).into());
+        }
+    }
+    let idx = presets.iter().position(|(_, u)| match (u, cur) {
+        (None, None) => true,
+        (Some(a), Some(b)) => *a == b,
+        _ => false,
+    });
+    match idx {
+        Some(i) => (opts, i as i32, "".into(), "".into()),
+        None => (opts, custom_row as i32, cur.unwrap_or("").into(), "".into()),
+    }
+}
+
+/// Default Bitcoin Core `-rpcport` per network — confirmed against the
+/// installed `bitcoind` v30.2.0's own `-help-debug` text: `-rpcport=<port>
+/// … (default: 8332, testnet3: 18332, testnet4: 48332, signet: 38332,
+/// regtest: 18443)`. This app has no Testnet3 variant.
+fn core_rpc_default_port(network: Network) -> u16 {
+    match network {
+        Network::Mainnet => 8332,
+        Network::Testnet4 => 48332,
+        Network::Signet => 38332,
+        Network::Regtest => 18443,
+    }
+}
+
+/// Normalize what a person types into the Settings "Bitcoin Core" node-
+/// address field into the stored `bitcoind+http(s)://host:port` form (U12,
+/// `PLAN-chain-notes-app-core-rpc.md` §2.5) — the ONLY thing that changes is
+/// how the field is spelled; `AnyTransport::new`/`node_backend_label` in
+/// app-core/src/chain.rs still read/produce exactly this prefix, untouched.
+/// Strips inline `user:pass@` userinfo first, same authority-vs-path guard
+/// [`split_url_userinfo`] uses (that function needs a `://` to anchor on,
+/// so it can't be reused directly on a bare `host` or `host:port` input —
+/// this reimplements the same rule on the post-scheme authority instead),
+/// and returns it separately so the caller can route it through
+/// `route_core_rpc_creds` exactly like a typed credential — a credential
+/// pasted here must never reach `config.json` either.
+///
+/// Accepted shapes (network default port fills in whenever none is given):
+///   `host`                   -> `bitcoind+http://host:<default>`
+///   `host:port`               -> `bitcoind+http://host:port`
+///   `http://host[:port]`      -> `bitcoind+http://host:<port|default>`
+///   `https://host[:port]`     -> `bitcoind+https://host:<port|default>`
+///   `bitcoind+http(s)://…`    -> re-normalized the same way (paste-tolerant
+///                                — a Sparrow-style export, or the app's own
+///                                stored string, both still work if pasted)
+/// Anything else (empty, a path component, an unsupported scheme, a
+/// non-numeric port) is rejected with a message meant to be shown verbatim.
+fn compose_core_url(input: &str, network: Network) -> Result<(String, Option<(String, String)>), String> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:8332".to_string());
+    }
+    // Paste-tolerant: a full `bitcoind+…` base (this app's own stored
+    // shape, or a Sparrow-style export) re-normalizes the same as a bare
+    // host would.
+    let raw = raw.strip_prefix("bitcoind+").unwrap_or(raw);
+    if raw.is_empty() {
+        return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:8332".to_string());
+    }
+
+    let (scheme, rest) = if let Some(r) = raw.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = raw.strip_prefix("http://") {
+        ("http", r)
+    } else if let Some((s, _)) = raw.split_once("://") {
+        return Err(format!("unsupported scheme {s:?} — use http:// or https://"));
+    } else {
+        ("http", raw)
+    };
+
+    // Strip inline `user:pass@` userinfo before touching the authority —
+    // an '@' that belongs to a path segment is not userinfo (mirrors
+    // `split_url_userinfo`'s guard).
+    let (authority, creds) = match rest.find('@') {
+        Some(at) if !rest[..at].contains('/') => {
+            let (userinfo, hostpart) = rest.split_at(at);
+            let hostpart = &hostpart[1..]; // drop '@'
+            let creds = userinfo.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()));
+            (hostpart, creds)
+        }
+        _ => (rest, None),
+    };
+
+    let authority = authority.trim_end_matches('/');
+    if authority.is_empty() {
+        return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:8332".to_string());
+    }
+    if authority.contains('/') {
+        return Err("node address must be host[:port] only, no path".to_string());
+    }
+
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal, e.g. `[::1]:8332`.
+        let Some(end) = rest.find(']') else {
+            return Err("unterminated IPv6 literal — missing ']'".to_string());
+        };
+        let (h, after) = rest.split_at(end);
+        if h.is_empty() {
+            return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:8332".to_string());
+        }
+        let after = &after[1..]; // drop ']'
+        let port = if after.is_empty() {
+            None
+        } else if let Some(p) = after.strip_prefix(':') {
+            if p.is_empty() {
+                return Err("empty port after ':'".to_string());
+            }
+            Some(p.parse::<u16>().map_err(|_| format!("invalid port {p:?}"))?)
+        } else {
+            return Err(format!("unexpected text after IPv6 literal: {after:?}"));
+        };
+        (format!("[{h}]"), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() => {
+                let port = p.parse::<u16>().map_err(|_| format!("invalid port {p:?}"))?;
+                (h.to_string(), Some(port))
+            }
+            Some((h, _)) if h.is_empty() => {
+                return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:8332".to_string())
+            }
+            _ => (authority.to_string(), None),
+        }
+    };
+    let port = port.unwrap_or_else(|| core_rpc_default_port(network));
+    Ok((format!("bitcoind+{scheme}://{host}:{port}"), creds))
+}
+
+/// The inverse of [`compose_core_url`] for display: a stored `bitcoind+
+/// http(s)://host:port` base back into what the node-address field shows —
+/// bare `host:port` for the (default) `http` scheme, `https://host:port`
+/// when the scheme is `https` (kept explicit so redisplaying then
+/// resubmitting the SAME text round-trips to the SAME stored URL — eliding
+/// it would silently downgrade an https node back to http on next save).
+/// Never called with credentials still embedded: every producer of a stored
+/// node URL (`compose_core_url`, `migrate_inline_node_creds`) strips them
+/// first, so there is nothing left to redact here.
+fn display_core_url(base: &str) -> String {
+    let rest = base.strip_prefix("bitcoind+").unwrap_or(base);
+    if let Some(host_port) = rest.strip_prefix("http://") {
+        host_port.trim_end_matches('/').to_string()
+    } else if let Some(host_port) = rest.strip_prefix("https://") {
+        format!("https://{}", host_port.trim_end_matches('/'))
+    } else {
+        rest.to_string()
+    }
+}
+
+/// Populate the Bitcoin Core section of the node card (backend label + RPC
+/// credential fields) from the CURRENT node config — called only from
+/// Settings interactions (open, or a node/credentials edit while Settings
+/// is open), never from `update_home`/the refresh paths, which call
+/// [`load_backend_settings`] above on every repaint. That separation is
+/// what keeps RPC-credential Keychain reads off the hot path: this is the
+/// "Settings opened" lazy-load point the plan's §2.4 asks for
+/// (`PLAN-chain-notes-app-core-rpc.md`), not something that runs on boot or
+/// on every scan.
+fn update_node_backend_ui(w: &AppWindow, st: &State) {
+    let base = st.base_url();
+    let is_core = base.as_deref().is_some_and(|b| b.starts_with("bitcoind+"));
+    w.set_node_is_core(is_core);
+    w.set_node_backend_label(base.as_deref().map(node_backend_label).unwrap_or("Esplora").into());
+    // "Save credentials" switch (plan §2.4 / U10): a device-level per-network
+    // preference, so it's meaningful even for an Esplora base (set it before
+    // the early return) — the user may flip it before ever pointing at a
+    // Core node.
+    let persist = st.core_rpc_should_persist(st.network);
+    w.set_node_core_save_creds(persist);
+    if !is_core {
+        w.set_node_core_user("".into());
+        w.set_node_core_pass("".into());
+        w.set_node_health_text("".into());
+        w.set_node_health_warn(false);
+        return;
+    }
+    if persist {
+        match keychain::load_rpc_creds(st.network.as_str()) {
+            Ok(Some((user, pass))) => {
+                w.set_node_core_user(user.into());
+                w.set_node_core_pass(pass.into());
+            }
+            Ok(None) => {
+                w.set_node_core_user("".into());
+                w.set_node_core_pass("".into());
+            }
+            Err(e) => {
+                // Never expected — this item carries no ACL — but degrade to
+                // blank fields rather than propagate a Keychain error into
+                // Settings; the user can just retype credentials.
+                println!("cb: rpc-creds load err={e}");
+                w.set_node_core_user("".into());
+                w.set_node_core_pass("".into());
+            }
+        }
+    } else {
+        // Switch OFF: the Keychain is never consulted — fields reflect
+        // whatever this session's in-memory slot holds (empty if nothing
+        // was typed yet since launch).
+        match st.core_rpc_session_creds.get(st.network.as_str()) {
+            Some((user, pass)) => {
+                w.set_node_core_user(user.clone().into());
+                w.set_node_core_pass(pass.to_string().into());
+            }
+            None => {
+                w.set_node_core_user("".into());
+                w.set_node_core_pass("".into());
+            }
+        }
+    }
+}
+
+/// Render one [`app_core::chain::NodeStatus`] preflight (plan §2.2/§2.3) as
+/// a single honest caption line, plus whether it should use the warning
+/// tint. Every condition here is a WARNING, never something this app
+/// silently works around or hides — a pruned node's missing history, a
+/// missing txindex's degraded sender attribution, and an in-progress
+/// rescan (which must never be mistaken for an empty wallet) all get named
+/// explicitly. An all-clear reports the tip height so "it's actually
+/// talking to your node" is visible too.
+///
+/// `prune_height` of `0` (or absent while `pruned` is true) means the node
+/// is pruned-CAPABLE but hasn't actually deleted any blocks yet — a very
+/// common state right after `-prune` is turned on, since Core only starts
+/// deleting once it's past its target size. Telling the user "history
+/// before block 0 can't be recovered" there is nonsense (nothing is
+/// missing) and actively misleading, so that case gets an honest,
+/// non-alarming note instead of the strong warning; only a real nonzero
+/// prune height gets the "can't be recovered" wording and the warn tint.
+fn format_node_status(status: &NodeStatus) -> (String, bool) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut warn = false;
+    if status.pruned {
+        match status.prune_height {
+            Some(h) if h > 0 => {
+                warn = true;
+                parts.push(format!(
+                    "pruned below block {} — notes/history before it can't be recovered",
+                    commas(h)
+                ));
+            }
+            _ => parts.push(
+                "pruned-capable — nothing pruned yet, all history still available".to_string(),
+            ),
+        }
+    }
+    if !status.txindex {
+        warn = true;
+        parts.push("no txindex — sender names on external notes may be missing".to_string());
+    }
+    if status.initial_block_download {
+        warn = true;
+        parts.push("still syncing to the chain tip (initial block download)".to_string());
+    }
+    if status.wallet_scanning == Some(true) {
+        warn = true;
+        parts.push("rescanning — balances/notes may be incomplete until it finishes".to_string());
+    }
+    if parts.is_empty() {
+        parts.push(format!("connected · tip {}", commas(status.tip_height)));
+    }
+    // `parts` never contains an empty string, but filter defensively so a
+    // future condition that pushes "" can never leave a dangling `· `
+    // separator in the joined caption.
+    (
+        parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · "),
+        warn,
+    )
+}
+
+/// Preflight a configured Bitcoin Core node (plan §2.2/§2.3/U4,
+/// `CoreRpcTransport::preflight`) and render it honestly in Settings — a
+/// bonus courtesy, never a gate: the user is never blocked from proceeding
+/// on a pruned/scanning/no-txindex node, only told about it. A no-op for an
+/// Esplora base (`update_node_backend_ui` clears the health line and
+/// returns before any network call). Runs on a worker thread exactly like
+/// the account-picker's used/new probe (`show_notebook_picker`) — a
+/// one-off user-facing check, not a scan-lane job. Also the U11 lazy point
+/// for `flush_core_rpc_migration` — a config.json loaded with an inline
+/// credential still on it (see `migrate_inline_node_creds`) gets that
+/// credential routed to the Keychain/session slot here, never on the
+/// launch path.
+fn refresh_node_health(w: &AppWindow, st: &mut State) {
+    flush_core_rpc_migration(st);
+    update_node_backend_ui(w, st);
+    let Some(base) = st.base_url() else { return };
+    if !base.starts_with("bitcoind+") {
+        return;
+    }
+    let network = st.network;
+    // Honest UI when credentials are missing (plan §2.4 / U10 design point
+    // 5): with nothing to authenticate with, don't dial the node and let it
+    // 401 into a generic "couldn't reach the node" line — say so directly.
+    // Covers both the OFF-and-nothing-typed-this-session case and the
+    // pre-existing ON-but-never-saved case identically.
+    let creds = core_rpc_creds_for(st, &base, network);
+    if creds.is_none() {
+        w.set_node_health_text("enter RPC credentials to connect".into());
+        w.set_node_health_warn(true);
+        return;
+    }
+    w.set_node_health_text("checking node…".into());
+    w.set_node_health_warn(false);
+    let weak = w.as_weak();
+    std::thread::spawn(move || {
+        let _net_guard = NetOpGuard::new(weak.clone());
+        let (text, warn) = match open_client(&base, network, creds) {
+            Ok(client) => match &client.transport {
+                AnyTransport::Core(t) => match t.preflight() {
+                    Ok(status) => format_node_status(&status),
+                    Err(e) => (format!("couldn't reach the node — {e}"), true),
+                },
+                // Unreachable: `base` was checked above to start with
+                // "bitcoind+", which `AnyTransport::new` always maps to Core.
+                AnyTransport::Esplora(_) => (String::new(), false),
+            },
+            Err(e) => (format!("couldn't reach the node — {e}"), true),
+        };
+        NODE_HEALTH_RESULTS.lock().expect("node health mutex").push(NodeHealthResult {
+            network,
+            base: base.clone(),
+            text: text.into(),
+            warn,
+        });
+        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_node_health());
+    });
 }
 
 /// Build the unified activity list (note txs + sweep/consolidate),
@@ -2409,6 +2914,60 @@ mod net_err_tests {
     }
 }
 
+/// U5 (`../PLAN-chain-notes-app-core-rpc.md` §2.1/§2.4): Bitcoin Core's
+/// rejection vocabulary — `testmempoolaccept` reject-reason tokens
+/// (`"txn-already-known"`, `"min relay fee not met, ..."`,
+/// `"bad-txns-inputs-missingorspent"`, `"non-final"`) and
+/// `sendrawtransaction` RPC-error messages (codes -25/-26/-27, forwarded
+/// verbatim by [`app_core::chain::CoreRpcTransport`]'s generic `rpc()`
+/// path) — reads nothing like mempool.space's own rejection bodies. Left
+/// alone, the exact same underlying condition (already broadcast, fee too
+/// low, a missing input, a non-final locktime) would show the user two
+/// completely different raw strings depending purely on which backend
+/// they picked. This recognizes both vocabularies — real Esplora/
+/// mempool.space bodies already tend to embed plain English for these
+/// cases; Core's are short machine tokens or terse RPC messages — and
+/// collapses the common ones to ONE calm, backend-agnostic phrase, so the
+/// UI reads identically either way. Matched case-insensitively against the
+/// FULL error text (whatever prefix `Error`'s `Display`/`trim_error_body`
+/// put in front of it) rather than anchored to a position, since Core and
+/// Esplora don't even agree on where in the string the reason token sits.
+/// `None` for anything not recognized — the existing pass-through/
+/// [`friendly_net_err`] path handles those exactly as before.
+fn map_broadcast_rejection(e: &str) -> Option<&'static str> {
+    let lower = e.to_ascii_lowercase();
+    const ALREADY: &[&str] = &[
+        "txn-already-known",
+        "already-known",
+        "already in block chain",
+        "already have transaction",
+        "already in the mempool",
+        "already in mempool",
+    ];
+    const LOW_FEE: &[&str] = &[
+        "min relay fee not met",
+        "insufficient fee",
+        "min-relay-fee-not-met",
+        "mempool min fee not met",
+    ];
+    const MISSING_INPUTS: &[&str] =
+        &["missing inputs", "missingorspent", "bad-txns-inputs-missingorspent"];
+    const NON_FINAL: &[&str] =
+        &["non-final", "non-bip68-final", "bad-txns-nonfinal", "transaction is not final"];
+
+    if ALREADY.iter().any(|s| lower.contains(s)) {
+        Some("already broadcast — this transaction is already on the network")
+    } else if LOW_FEE.iter().any(|s| lower.contains(s)) {
+        Some("fee too low — increase the fee and try again")
+    } else if MISSING_INPUTS.iter().any(|s| lower.contains(s)) {
+        Some("inputs missing or already spent — this transaction can't be sent")
+    } else if NON_FINAL.iter().any(|s| lower.contains(s)) {
+        Some("not final yet — try again once its timelock has passed")
+    } else {
+        None
+    }
+}
+
 /// Broadcast-failure sites see a stringified `app_core::Error` (workers
 /// already `.map_err(|e| format!("{e}"))` before crossing the thread
 /// boundary — see the `client.broadcast()` call sites). A TRANSPORT-class
@@ -2417,11 +2976,14 @@ mod net_err_tests {
 /// didn't reach a server) reads as raw reqwest text like `error sending
 /// request for url (...)`, which is Greek to a user on a weak connection;
 /// swap it for a plain-language message naming the node host instead.
-/// Anything else — a real server rejection (`Error::Http`, e.g. "400 Bad
-/// Request: ..."), a local build/sign error, ... — goes through
-/// [`friendly_net_err`] (a plain rejection like "400 Bad Request: foo"
-/// passes through that untouched too; it only bites on a 429 or a stray
-/// HTML body).
+/// A recognized rejection condition (U5: already-broadcast, fee too low, a
+/// missing input, a non-final locktime — [`map_broadcast_rejection`]) gets
+/// ONE calm phrase regardless of which backend produced it. Anything else
+/// — an unrecognized server rejection (`Error::Http`, e.g. "400 Bad
+/// Request: bad-txns-in-belowout"), a local build/sign error, ... — goes
+/// through [`friendly_net_err`] (a plain rejection like "400 Bad Request:
+/// foo" passes through that untouched too; it only bites on a 429 or a
+/// stray HTML body).
 ///
 /// Applied ONLY at user-facing `set_status`/toast broadcast-failure sites;
 /// every `cb:`/println! log line keeps the raw error verbatim (the
@@ -2429,7 +2991,10 @@ mod net_err_tests {
 fn friendly_broadcast_err(e: &str, base_url: &str) -> String {
     match e.strip_prefix("transport: ") {
         Some(_raw) => format!("network error reaching {} — check your connection", host_of(base_url)),
-        None => friendly_net_err(e),
+        None => match map_broadcast_rejection(e) {
+            Some(msg) => msg.to_string(),
+            None => friendly_net_err(e),
+        },
     }
 }
 
@@ -2465,6 +3030,65 @@ mod broadcast_err_tests {
     fn non_broadcast_errors_pass_through_untouched() {
         let e = "no signed PSBT";
         assert_eq!(friendly_broadcast_err(e, "https://mempool.space/api"), e);
+    }
+
+    /// U5 (plan §2.1/§2.4): the four common rejection categories must read
+    /// IDENTICALLY whether the raw text came from Core's short
+    /// `testmempoolaccept` reject-reason tokens or from a
+    /// `sendrawtransaction` RPC-error message forwarded verbatim — proving
+    /// the mapping is keyed on the CONDITION, not on which backend's exact
+    /// wording happened to arrive.
+    #[test]
+    fn already_broadcast_reads_identically_regardless_of_wording() {
+        let core_testmempoolaccept = "http: 400: txn-already-known";
+        let core_sendraw_rpc_error = "http: bitcoind [-27]: Transaction already in block chain";
+        let esplora_like = "http: 400 Bad Request: already in mempool";
+        let expected = "already broadcast — this transaction is already on the network";
+        assert_eq!(friendly_broadcast_err(core_testmempoolaccept, "bitcoind+http://127.0.0.1:8332"), expected);
+        assert_eq!(friendly_broadcast_err(core_sendraw_rpc_error, "bitcoind+http://127.0.0.1:8332"), expected);
+        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
+    }
+
+    #[test]
+    fn fee_too_low_reads_identically_regardless_of_wording() {
+        let core = "http: 400: min relay fee not met, 300 < 1000";
+        let esplora_like = "http: 400 Bad Request: insufficient fee, rejecting replacement";
+        let expected = "fee too low — increase the fee and try again";
+        assert_eq!(friendly_broadcast_err(core, "bitcoind+http://127.0.0.1:8332"), expected);
+        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
+    }
+
+    #[test]
+    fn missing_inputs_reads_identically_regardless_of_wording() {
+        let core = "http: 400: bad-txns-inputs-missingorspent";
+        let esplora_like = "http: 400 Bad Request: missing inputs";
+        let expected = "inputs missing or already spent — this transaction can't be sent";
+        assert_eq!(friendly_broadcast_err(core, "bitcoind+http://127.0.0.1:8332"), expected);
+        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
+    }
+
+    #[test]
+    fn non_final_reads_identically_regardless_of_wording() {
+        let core = "http: 400: non-final";
+        let esplora_like = "http: 400 Bad Request: transaction is not final";
+        let expected = "not final yet — try again once its timelock has passed";
+        assert_eq!(friendly_broadcast_err(core, "bitcoind+http://127.0.0.1:8332"), expected);
+        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
+    }
+
+    /// The pre-existing 429-in-a-fee-body guard ([`friendly_net_err`]'s own
+    /// `a_429_sat_amount_in_a_rejection_is_not_a_rate_limit` test) must
+    /// stay intact through this new layer too: a literal "429" sat amount
+    /// inside a min-relay-fee rejection must land on the FEE message, never
+    /// the "server is busy" one — `map_broadcast_rejection` runs BEFORE
+    /// `friendly_net_err`'s 429 check ever sees this text.
+    #[test]
+    fn a_429_sat_amount_in_a_fee_rejection_still_maps_to_fee_too_low_not_rate_limit() {
+        let e = "http: 400: sendrawtransaction min relay fee not met, 429 < 1000";
+        assert_eq!(
+            friendly_broadcast_err(e, "bitcoind+http://127.0.0.1:8332"),
+            "fee too low — increase the fee and try again"
+        );
     }
 }
 
@@ -2705,16 +3329,20 @@ fn show_notebook_picker(w: &AppWindow, st: &State, page: u32, mode: &str) {
     }
     let network = st.network;
     let account = st.account;
+    let creds = core_rpc_creds_for(st, &base, network);
     let weak = w.as_weak();
     std::thread::spawn(move || {
         let _net_guard = NetOpGuard::new(weak.clone());
-        let client = ChainClient::new(HttpTransport::new(base), network);
         let mut results: Vec<(u32, &'static str, String)> = Vec::new();
-        for (index, addr) in &to_probe {
-            if let Ok((used, balance)) = client.address_probe(addr) {
-                let pill = if used { "used" } else { "new" };
-                let bal = if used { format!("{} sats", commas(balance)) } else { String::new() };
-                results.push((*index, pill, bal));
+        // A malformed node URL degrades exactly like "offline" below (empty
+        // results → plain rows) rather than a new error path.
+        if let Ok(client) = open_client(&base, network, creds) {
+            for (index, addr) in &to_probe {
+                if let Ok((used, balance)) = client.address_probe(addr) {
+                    let pill = if used { "used" } else { "new" };
+                    let bal = if used { format!("{} sats", commas(balance)) } else { String::new() };
+                    results.push((*index, pill, bal));
+                }
             }
         }
         PICKER_PROBE_RESULTS
@@ -3869,6 +4497,1011 @@ struct DroppedCheck {
     first_input: (String, u32),
 }
 
+/// Build a `ChainClient` against `base`, picking the Esplora or Bitcoin
+/// Core RPC backend by URL scheme (`app_core::chain::AnyTransport`, the
+/// backend seam of `../PLAN-chain-notes-app-core-rpc.md`). `creds` is
+/// resolved by the caller — via [`core_rpc_creds_for`] on the UI thread for
+/// a synchronous call, or snapshotted onto a worker thread before it spawns
+/// (same convention every other per-request State read already follows
+/// here) — so this function itself never touches the Keychain or `State`.
+/// Every `base` an Esplora identity stores is unchanged: `creds` is simply
+/// unused by `AnyTransport::new` for a non-`bitcoind+` base. Returns `Err`
+/// only for a malformed `bitcoind+` URL — callers surface it exactly like
+/// any other chain error (never `unwrap`/`expect`).
+fn open_client(
+    base: &str,
+    network: Network,
+    creds: Option<(String, String)>,
+) -> Result<ChainClient<AnyTransport>, app_core::Error> {
+    Ok(ChainClient::new(AnyTransport::new(base, creds)?, network))
+}
+
+/// Pure form of `State::core_rpc_should_persist`: default true (an absent
+/// entry — every pre-U10 config, and every network nobody has touched the
+/// switch for) else whatever was explicitly stored. A free function so the
+/// default rule is testable without constructing a `State` (plan §2.4 /
+/// U10).
+fn core_rpc_persist_default_true(save_creds: &HashMap<String, bool>, network_key: &str) -> bool {
+    save_creds.get(network_key).copied().unwrap_or(true)
+}
+
+/// Parse the "Save credentials" per-network preference map out of a loaded
+/// config.json `Value` — mirrors the boot loader's `str_map` closure for
+/// `node_urls`/`explorers` but for booleans, factored into a free function
+/// so the config round-trip is unit-testable (plan §2.4 / U10). An absent
+/// or malformed key yields an empty map, matching `core_rpc_persist_default_true`'s
+/// default-true-when-absent behavior for every entry.
+fn parse_core_rpc_save_creds(config: &serde_json::Value) -> HashMap<String, bool> {
+    config
+        .get("core_rpc_save_creds")
+        .and_then(|v| v.as_object())
+        .map(|o| o.iter().filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b))).collect())
+        .unwrap_or_default()
+}
+
+/// Pure decision: resolve Bitcoin Core RPC credentials for a `base` given
+/// the "Save credentials" switch state and both possible sources —
+/// extracted from [`core_rpc_creds_for`] so the switch logic is testable
+/// without a live Keychain (plan §2.4 / U10). A non-`bitcoind+` base always
+/// resolves to `None`, regardless of either input (Esplora never touches
+/// either source). Otherwise: `persist == true` returns whatever the
+/// Keychain lookup found (today's unconditional behavior, byte-identical
+/// for every user who never touches the new switch); `persist == false`
+/// returns the in-session slot instead — the Keychain is not consulted at
+/// all in that branch, by construction of the caller only doing the lookup
+/// when `persist` is true (see `core_rpc_creds_for`).
+fn resolve_core_rpc_creds(
+    base: &str,
+    persist: bool,
+    keychain_creds: Option<(String, String)>,
+    session_creds: Option<(String, String)>,
+) -> Option<(String, String)> {
+    if !base.starts_with("bitcoind+") {
+        return None;
+    }
+    if persist { keychain_creds } else { session_creds }
+}
+
+/// Source Bitcoin Core RPC credentials for a `bitcoind+` base, honoring the
+/// per-network "Save credentials" switch (`State::core_rpc_should_persist`,
+/// plan §2.4 / U10). ON (the default — every pre-U10 install and every
+/// network nobody has touched the switch for) reads the Keychain lazily,
+/// exactly as before: this runs on every call, i.e. on every network
+/// request against a Core backend, NOT once at boot or once at
+/// Settings-open — deliberately, so caching the credential in `State`
+/// itself never becomes tempting (the mistake that cost two shipped builds
+/// on the identity item, builds 42/44). A plain, no-ACL keychain read has
+/// no prompt to block on, so re-reading per request costs a little I/O and
+/// nothing else. OFF reads the session-only slot on `State` instead and
+/// the Keychain is never touched. Never called for an Esplora base (this
+/// function's first check short-circuits before either source is
+/// consulted). A Keychain error (never expected — this item carries no
+/// ACL) degrades to no creds rather than failing the request outright; an
+/// auth-required node then answers 401, which the caller already surfaces
+/// as an ordinary network error — never a panic, never a credential in a
+/// log line either way.
+fn core_rpc_creds_for(st: &State, base: &str, network: Network) -> Option<(String, String)> {
+    if !base.starts_with("bitcoind+") {
+        return None;
+    }
+    let persist = st.core_rpc_should_persist(network);
+    let keychain_creds =
+        if persist { keychain::load_rpc_creds(network.as_str()).ok().flatten() } else { None };
+    let session_creds = if !persist {
+        st.core_rpc_session_creds.get(network.as_str()).map(|(u, p)| (u.clone(), p.to_string()))
+    } else {
+        None
+    };
+    resolve_core_rpc_creds(base, persist, keychain_creds, session_creds)
+}
+
+/// Where a freshly typed/pasted RPC credential is written, given the
+/// current "Save credentials" switch state (plan §2.4 / U10) — shared by
+/// `on_set_node_core_creds` and `on_set_node_custom`'s inline-userinfo
+/// path so a pasted `user:pass@host` can't become a persisted credential
+/// behind the user's back just because it arrived via a different field.
+/// `store`/`delete` are the Keychain operations, injected so this is
+/// testable without a live Keychain: for `persist == false` neither is
+/// ever called — the credential goes straight into `session_creds`
+/// instead, and clearing both fields removes the session entry the same
+/// way it deletes the Keychain item on the `persist == true` side.
+fn route_core_rpc_creds(
+    persist: bool,
+    network_key: &str,
+    user: &str,
+    pass: &str,
+    session_creds: &mut HashMap<String, (String, Zeroizing<String>)>,
+    store: impl FnOnce(&str, &str) -> Result<(), String>,
+    delete: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if persist {
+        if user.is_empty() && pass.is_empty() { delete() } else { store(user, pass) }
+    } else {
+        if user.is_empty() && pass.is_empty() {
+            session_creds.remove(network_key);
+        } else {
+            session_creds
+                .insert(network_key.to_string(), (user.to_string(), Zeroizing::new(pass.to_string())));
+        }
+        Ok(())
+    }
+}
+
+/// Core logic for flipping the "Save credentials" switch for one network —
+/// factored out of the `on_set_node_core_save_creds` UI callback so the
+/// ON→OFF deletion (design invariant: leaving a stale secret behind after
+/// the user says "don't save" is worse than not having the feature) is
+/// testable without a live Keychain. `delete`/`store` are injected exactly
+/// like [`route_core_rpc_creds`]. Turning OFF unconditionally deletes
+/// whatever the Keychain holds for this network and returns the fields
+/// currently on screen so the caller can seed the session slot with them
+/// (continuity — the user doesn't lose what they just typed, only where
+/// it lives); turning ON persists those same fields if either is non-empty
+/// and returns `None` (nothing left to hold in session). Returns the
+/// delete/store `Err` untouched so the caller can revert the UI toggle
+/// rather than claim success.
+fn apply_core_rpc_persist_toggle(
+    enabled: bool,
+    current_user: &str,
+    current_pass: &str,
+    delete: impl FnOnce() -> Result<(), String>,
+    store: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<Option<(String, Zeroizing<String>)>, String> {
+    if enabled {
+        if !current_user.is_empty() || !current_pass.is_empty() {
+            store(current_user, current_pass)?;
+        }
+        Ok(None)
+    } else {
+        delete()?;
+        if current_user.is_empty() && current_pass.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((current_user.to_string(), Zeroizing::new(current_pass.to_string()))))
+        }
+    }
+}
+
+/// Strip an inline `user:pass@` userinfo out of a node URL before it can
+/// reach `config.json`, a `cb:` log line, or the Settings text field (plan
+/// §2.4 — "the stored node URL must contain NO credentials"). Handles both
+/// `bitcoind+http(s)://user:pass@host:port` (the Sparrow-style paste this
+/// app's Custom field should tolerate) and a plain `http(s)://` Esplora URL
+/// (unusual, but stripping it is still correct — this app never sends an
+/// Esplora request with basic auth). Returns the creds-free URL plus the
+/// parsed `(user, pass)` if any were present.
+fn split_url_userinfo(url: &str) -> (String, Option<(String, String)>) {
+    let Some(scheme_end) = url.find("://") else { return (url.to_string(), None) };
+    let (scheme, rest) = url.split_at(scheme_end + 3);
+    let Some(at) = rest.find('@') else { return (url.to_string(), None) };
+    // An '@' that belongs to a PATH segment (after the authority) is not
+    // userinfo — bail rather than mis-parse.
+    if rest[..at].contains('/') {
+        return (url.to_string(), None);
+    }
+    let (userinfo, hostpart) = rest.split_at(at);
+    let hostpart = &hostpart[1..]; // drop the '@' itself
+    let creds = userinfo.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()));
+    (format!("{scheme}{hostpart}"), creds)
+}
+
+/// U11 defense-in-depth: `on_set_node_custom`'s inline-userinfo stripping
+/// only ran on a URL typed/pasted THIS session — a `config.json` already
+/// on disk (hand-edited, migrated from an older build, or written before
+/// that stripping shipped) can still carry `bitcoind+http://user:pass@
+/// host:port` verbatim, and would otherwise be loaded, used, and displayed
+/// in the Settings field with the credential in plain sight. Applies
+/// [`split_url_userinfo`] to every entry of a just-loaded `node_urls` map,
+/// rewriting it in place to the creds-free form, and returns the
+/// `(network, user, pass)` triples found — in the SAME shape
+/// `on_set_node_custom` routes through `route_core_rpc_creds`, so the
+/// caller can treat a migrated credential exactly like a freshly typed
+/// one. Pure / host-testable; does not touch the Keychain (the boot path
+/// must make zero Keychain calls — see `flush_core_rpc_migration`).
+fn migrate_inline_node_creds(node_urls: &mut HashMap<String, String>) -> Vec<(String, String, String)> {
+    let mut found = Vec::new();
+    for (net, url) in node_urls.iter_mut() {
+        let (clean, creds) = split_url_userinfo(url);
+        if let Some((user, pass)) = creds {
+            found.push((net.clone(), user, pass));
+            *url = clean;
+        }
+    }
+    found
+}
+
+/// The Keychain-touching follow-through to [`migrate_inline_node_creds`]:
+/// route every network in `core_rpc_migrate_pending` to the Keychain (if
+/// that network's "Save credentials" switch is on) or leave it in the
+/// session-only slot (if it's off) — exactly like `on_set_node_custom`'s
+/// inline-creds branch, reusing the same [`route_core_rpc_creds`]. Called
+/// from `refresh_node_health`, which only ever runs from a Settings-screen
+/// UI callback — NEVER the launch path, so a migrated credential's
+/// Keychain write happens well after the first frame, never during boot
+/// (the same "defer to a lazy point" rule U6/U10 already follow for their
+/// own Keychain calls). A no-op (drains nothing) once the pending set is
+/// empty, so repeat calls from every `refresh_node_health` invocation cost
+/// nothing.
+fn flush_core_rpc_migration(s: &mut State) {
+    if s.core_rpc_migrate_pending.is_empty() {
+        return;
+    }
+    let pending: Vec<String> = s.core_rpc_migrate_pending.drain().collect();
+    for net in pending {
+        let Some((user, pass)) =
+            s.core_rpc_session_creds.get(&net).map(|(u, p)| (u.clone(), p.to_string()))
+        else {
+            continue;
+        };
+        let persist = core_rpc_persist_default_true(&s.core_rpc_save_creds, &net);
+        let net_for_store = net.clone();
+        let result = route_core_rpc_creds(
+            persist,
+            &net,
+            &user,
+            &pass,
+            &mut s.core_rpc_session_creds,
+            |u, p| keychain::store_rpc_creds(&net_for_store, u, p),
+            || Ok(()), // never reached: user/pass are non-empty by construction
+        );
+        match result {
+            Ok(()) => {
+                // route_core_rpc_creds only touches session_creds on the
+                // persist==false branch — a successful persist==true store
+                // leaves our load-time stash sitting in memory uselessly
+                // (never read once persisted — see `core_rpc_creds_for`),
+                // so drop it explicitly, same as `on_set_node_core_save_creds`
+                // does on its own ON transition.
+                if persist {
+                    s.core_rpc_session_creds.remove(&net);
+                }
+                println!("cb: core-rpc-migrate net={net} persist={persist} ok");
+            }
+            Err(e) => println!("cb: core-rpc-migrate net={net} persist={persist} err={e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod core_rpc_settings_tests {
+    use super::{
+        apply_core_rpc_persist_toggle, compose_core_url, core_rpc_default_port,
+        core_rpc_persist_default_true, display_core_url, fill_node, format_node_status,
+        migrate_inline_node_creds, parse_core_rpc_save_creds, resolve_core_rpc_creds,
+        route_core_rpc_creds, split_url_userinfo, Network, State,
+    };
+    use app_core::chain::node_presets;
+    use app_core::chain::NodeStatus;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use zeroize::Zeroizing;
+
+    #[test]
+    fn strips_inline_userinfo_from_core_url() {
+        let (url, creds) = split_url_userinfo("bitcoind+http://alice:s3cr3t@192.168.1.10:8332");
+        assert_eq!(url, "bitcoind+http://192.168.1.10:8332");
+        assert_eq!(creds, Some(("alice".to_string(), "s3cr3t".to_string())));
+    }
+
+    #[test]
+    fn leaves_a_plain_url_untouched() {
+        let (url, creds) = split_url_userinfo("bitcoind+http://192.168.1.10:8332");
+        assert_eq!(url, "bitcoind+http://192.168.1.10:8332");
+        assert_eq!(creds, None);
+    }
+
+    #[test]
+    fn leaves_esplora_urls_untouched() {
+        let (url, creds) = split_url_userinfo("https://mempool.example/api");
+        assert_eq!(url, "https://mempool.example/api");
+        assert_eq!(creds, None);
+    }
+
+    #[test]
+    fn does_not_confuse_a_path_at_sign_for_userinfo() {
+        // No userinfo here — the '@' (if any) would sit after a '/', which
+        // this function must not treat as an authority separator.
+        let (url, creds) = split_url_userinfo("http://127.0.0.1:3002/api@weird");
+        assert_eq!(url, "http://127.0.0.1:3002/api@weird");
+        assert_eq!(creds, None);
+    }
+
+    #[test]
+    fn empty_and_malformed_inputs_pass_through() {
+        assert_eq!(split_url_userinfo(""), (String::new(), None));
+        assert_eq!(split_url_userinfo("not-a-url"), ("not-a-url".to_string(), None));
+    }
+
+    // ---- U10: "Save credentials" switch ----
+
+    #[test]
+    fn persist_default_true_when_absent() {
+        let map: HashMap<String, bool> = HashMap::new();
+        assert!(core_rpc_persist_default_true(&map, "testnet4"));
+    }
+
+    #[test]
+    fn persist_default_respects_explicit_value() {
+        let mut map = HashMap::new();
+        map.insert("testnet4".to_string(), false);
+        map.insert("mainnet".to_string(), true);
+        assert!(!core_rpc_persist_default_true(&map, "testnet4"));
+        assert!(core_rpc_persist_default_true(&map, "mainnet"));
+        // A network never mentioned still defaults true.
+        assert!(core_rpc_persist_default_true(&map, "signet"));
+    }
+
+    #[test]
+    fn resolve_creds_persist_on_uses_keychain_source() {
+        let keychain = Some(("alice".to_string(), "s3cr3t".to_string()));
+        let session = Some(("bob".to_string(), "wrongsource".to_string()));
+        let got = resolve_core_rpc_creds("bitcoind+http://10.0.0.1:8332", true, keychain, session);
+        assert_eq!(got, Some(("alice".to_string(), "s3cr3t".to_string())));
+    }
+
+    #[test]
+    fn resolve_creds_persist_off_uses_session_source() {
+        let keychain = Some(("alice".to_string(), "s3cr3t".to_string()));
+        let session = Some(("bob".to_string(), "sess-pass".to_string()));
+        let got = resolve_core_rpc_creds("bitcoind+http://10.0.0.1:8332", false, keychain, session);
+        assert_eq!(got, Some(("bob".to_string(), "sess-pass".to_string())));
+    }
+
+    #[test]
+    fn resolve_creds_esplora_base_short_circuits_regardless_of_switch() {
+        // Neither source is consulted for a non-`bitcoind+` base — proves
+        // Esplora never touches either the Keychain-shaped input or the
+        // session-shaped input, whichever the switch would otherwise pick.
+        let some_creds = Some(("alice".to_string(), "s3cr3t".to_string()));
+        assert_eq!(
+            resolve_core_rpc_creds(
+                "https://mempool.example/api",
+                true,
+                some_creds.clone(),
+                some_creds.clone()
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_core_rpc_creds("https://mempool.example/api", false, some_creds.clone(), some_creds),
+            None
+        );
+    }
+
+    #[test]
+    fn route_creds_persist_on_calls_keychain_store_not_session() {
+        let mut session: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
+        let stored: Cell<Option<(String, String)>> = Cell::new(None);
+        let deleted = Cell::new(false);
+        let result = route_core_rpc_creds(
+            true,
+            "testnet4",
+            "alice",
+            "s3cr3t",
+            &mut session,
+            |u, p| {
+                stored.set(Some((u.to_string(), p.to_string())));
+                Ok(())
+            },
+            || {
+                deleted.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(stored.into_inner(), Some(("alice".to_string(), "s3cr3t".to_string())));
+        assert!(!deleted.get());
+        assert!(session.is_empty(), "persist-on must never touch the session slot");
+    }
+
+    #[test]
+    fn route_creds_persist_on_clearing_both_fields_deletes() {
+        let mut session: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
+        let stored = Cell::new(false);
+        let deleted = Cell::new(false);
+        let result = route_core_rpc_creds(
+            true,
+            "testnet4",
+            "",
+            "",
+            &mut session,
+            |_, _| {
+                stored.set(true);
+                Ok(())
+            },
+            || {
+                deleted.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert!(deleted.get());
+        assert!(!stored.get());
+    }
+
+    #[test]
+    fn route_creds_persist_off_never_touches_keychain() {
+        let mut session: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
+        let touched = Cell::new(false);
+        let result = route_core_rpc_creds(
+            false,
+            "testnet4",
+            "alice",
+            "s3cr3t",
+            &mut session,
+            |_, _| {
+                touched.set(true);
+                Ok(())
+            },
+            || {
+                touched.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert!(!touched.get(), "persist-off must never call a Keychain op");
+        let entry = session.get("testnet4").expect("session slot populated");
+        assert_eq!(entry.0, "alice");
+        assert_eq!(entry.1.as_str(), "s3cr3t");
+    }
+
+    #[test]
+    fn route_creds_persist_off_clearing_both_fields_clears_session_only() {
+        let mut session: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
+        session.insert("testnet4".to_string(), ("alice".to_string(), Zeroizing::new("s3cr3t".to_string())));
+        let touched = Cell::new(false);
+        let result = route_core_rpc_creds(
+            false,
+            "testnet4",
+            "",
+            "",
+            &mut session,
+            |_, _| {
+                touched.set(true);
+                Ok(())
+            },
+            || {
+                touched.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert!(!touched.get());
+        assert!(session.get("testnet4").is_none());
+    }
+
+    /// The load-bearing invariant: turning the switch OFF must
+    /// unconditionally delete whatever the Keychain holds — this is what a
+    /// mutation test should catch first. Also proves `store` is never
+    /// called on the OFF path.
+    #[test]
+    fn toggle_off_always_deletes_the_stored_keychain_item() {
+        let deleted = Cell::new(false);
+        let stored = Cell::new(false);
+        let result = apply_core_rpc_persist_toggle(
+            false,
+            "alice",
+            "s3cr3t",
+            || {
+                deleted.set(true);
+                Ok(())
+            },
+            |_, _| {
+                stored.set(true);
+                Ok(())
+            },
+        );
+        assert!(deleted.get(), "OFF must delete the stored Keychain item");
+        assert!(!stored.get());
+        match result {
+            Ok(Some((u, p))) => {
+                assert_eq!(u, "alice");
+                assert_eq!(p.as_str(), "s3cr3t");
+            }
+            other => panic!("expected the on-screen fields handed back for the session slot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_off_with_blank_fields_still_deletes_and_leaves_session_empty() {
+        // Blank on-screen fields don't imply "nothing to delete" — a
+        // previously saved credential from an earlier session could still
+        // be sitting in the Keychain (this app never pre-populates the
+        // fields from anywhere but Settings-open), so deletion must fire
+        // unconditionally on every ON→OFF transition.
+        let deleted = Cell::new(false);
+        let result = apply_core_rpc_persist_toggle(
+            false,
+            "",
+            "",
+            || {
+                deleted.set(true);
+                Ok(())
+            },
+            |_, _| Ok(()),
+        );
+        assert!(deleted.get());
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn toggle_off_propagates_a_keychain_delete_error() {
+        let result = apply_core_rpc_persist_toggle(
+            false,
+            "alice",
+            "s3cr3t",
+            || Err("keychain busy".to_string()),
+            |_, _| Ok(()),
+        );
+        assert_eq!(result, Err("keychain busy".to_string()));
+    }
+
+    #[test]
+    fn toggle_on_persists_the_on_screen_fields_and_clears_session() {
+        let stored: Cell<Option<(String, String)>> = Cell::new(None);
+        let deleted = Cell::new(false);
+        let result = apply_core_rpc_persist_toggle(
+            true,
+            "alice",
+            "s3cr3t",
+            || {
+                deleted.set(true);
+                Ok(())
+            },
+            |u, p| {
+                stored.set(Some((u.to_string(), p.to_string())));
+                Ok(())
+            },
+        );
+        assert!(!deleted.get());
+        assert_eq!(stored.into_inner(), Some(("alice".to_string(), "s3cr3t".to_string())));
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn toggle_on_with_nothing_typed_stores_nothing() {
+        let stored = Cell::new(false);
+        let result = apply_core_rpc_persist_toggle(
+            true,
+            "",
+            "",
+            || Ok(()),
+            |_, _| {
+                stored.set(true);
+                Ok(())
+            },
+        );
+        assert!(!stored.get());
+        assert_eq!(result.unwrap(), None);
+    }
+
+    /// `parse_core_rpc_save_creds` round trip in isolation — a hand-built
+    /// `Value`, not the real `State::config_payload()`. This is READ-side
+    /// coverage only (the boot-time parse); the actual WRITE side is
+    /// covered by `config_payload_never_carries_session_credentials`
+    /// below, which drives the production method instead of mirroring its
+    /// shape.
+    #[test]
+    fn save_creds_preference_round_trips_through_config_json_never_carrying_secrets() {
+        let mut before: HashMap<String, bool> = HashMap::new();
+        before.insert("testnet4".to_string(), false);
+        before.insert("mainnet".to_string(), true);
+        let json = serde_json::json!({ "core_rpc_save_creds": before.clone() });
+        let text = json.to_string();
+        assert!(!text.contains("s3cr3t"));
+        assert!(!text.contains("core_rpc_session_creds"));
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        let after = parse_core_rpc_save_creds(&parsed);
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn save_creds_preference_absent_key_parses_to_empty_map() {
+        let parsed: serde_json::Value = serde_json::json!({ "network": "testnet4" });
+        assert!(parse_core_rpc_save_creds(&parsed).is_empty());
+    }
+
+    /// The load-bearing regression test: drives the REAL
+    /// `State::config_payload()` (what `save_config` actually serializes,
+    /// after this review's extraction) with a distinctive username AND
+    /// password sitting in `core_rpc_session_creds` — the exact plaintext
+    /// a leak would carry — and asserts neither appears anywhere in the
+    /// output, while the boolean preference map and the other expected
+    /// keys still do. A hand-built mirror of the payload shape (as the
+    /// prior version of this test was) cannot catch `save_config` drifting
+    /// to leak a new field; this asserts on bytes the production method
+    /// itself produced.
+    #[test]
+    fn config_payload_never_carries_session_credentials() {
+        let mut save_creds: HashMap<String, bool> = HashMap::new();
+        save_creds.insert("testnet4".to_string(), false);
+        let mut session_creds: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
+        session_creds.insert(
+            "testnet4".to_string(),
+            (
+                "SENTINEL_USER_do_not_leak".to_string(),
+                Zeroizing::new("SENTINEL_PASS_do_not_leak".to_string()),
+            ),
+        );
+        let state = State::test_stub(
+            Network::Testnet4,
+            HashMap::new(),
+            HashMap::new(),
+            save_creds,
+            session_creds,
+        );
+        let text = state.config_payload().to_string();
+        assert!(!text.contains("SENTINEL_USER_do_not_leak"), "leaked the session username: {text}");
+        assert!(!text.contains("SENTINEL_PASS_do_not_leak"), "leaked the session password: {text}");
+        assert!(!text.contains("core_rpc_session_creds"), "leaked the session-creds field name: {text}");
+        // The boolean preference map DOES round-trip (it's a preference,
+        // not a secret) — and a couple of the other expected keys, so this
+        // test would also fail loudly if `config_payload` lost fields
+        // rather than gained one.
+        assert!(text.contains("core_rpc_save_creds"));
+        assert!(text.contains("testnet4"));
+        assert!(text.contains("\"network\":\"testnet4\""));
+    }
+
+    // ---- U11: node-health caption copy (defect 2) ----
+
+    /// The exact nonsense the review caught: `prune_height` of `Some(0)`
+    /// used to render "pruned below block 0 — notes/history before it
+    /// can't be recovered", which claims something is unrecoverable when
+    /// NOTHING has actually been pruned yet. Zero must read as informational
+    /// (no warn tint), not the strong warning.
+    #[test]
+    fn prune_height_zero_is_not_alarming() {
+        let status = NodeStatus { pruned: true, prune_height: Some(0), txindex: true, ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(!warn, "prune height 0 must not set the warn tint: {text}");
+        assert!(!text.contains("can't be recovered"), "prune height 0 must not claim data is lost: {text}");
+        assert!(text.contains("nothing pruned"), "expected an honest not-yet-pruned note: {text}");
+    }
+
+    /// Same honesty rule for the ABSENT case (`prune_height: None` while
+    /// `pruned` is true) — bitcoind only populates `pruneheight` once it has
+    /// pruned at least once, so `None` means the same "nothing pruned yet"
+    /// state as `Some(0)`, never "unknown, assume the worst."
+    #[test]
+    fn prune_height_absent_is_not_alarming() {
+        let status = NodeStatus { pruned: true, prune_height: None, txindex: true, ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(!warn, "absent prune height must not set the warn tint: {text}");
+        assert!(!text.contains("can't be recovered"), "absent prune height must not claim data is lost: {text}");
+    }
+
+    /// A REAL nonzero prune height keeps the strong wording and the warn
+    /// tint — the fix must narrow the false-positive case, not silence the
+    /// real one.
+    #[test]
+    fn prune_height_nonzero_still_warns() {
+        let status = NodeStatus { pruned: true, prune_height: Some(500), txindex: true, ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(warn, "a real prune height must still warn: {text}");
+        assert!(text.contains("pruned below block 500"), "expected the real height named: {text}");
+        assert!(text.contains("can't be recovered"), "expected the strong wording for a real prune: {text}");
+    }
+
+    /// The exact scenario a locally-running pruned bitcoind hits moments
+    /// after `-prune` is turned on: pruned (height 0, not yet alarming) AND
+    /// no txindex (a real warning) in the SAME status. The overall `warn`
+    /// flag must still be true (txindex alone earns it), the join must not
+    /// leave a dangling `· ` separator, and the non-alarming prune note must
+    /// still be present alongside the real txindex warning.
+    #[test]
+    fn pruned_zero_plus_no_txindex_warns_from_txindex_only() {
+        let status = NodeStatus { pruned: true, prune_height: Some(0), txindex: false, ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(warn, "missing txindex alone must still warn: {text}");
+        assert!(text.contains("nothing pruned"));
+        assert!(text.contains("no txindex"));
+        assert!(!text.trim_end().ends_with('·'), "no dangling separator: {text:?}");
+        assert!(!text.contains("  "), "no doubled-up spacing from an empty joined part: {text:?}");
+    }
+
+    /// A fully healthy node — the "previously invisible" one-line case
+    /// (defect 1's UI symptom): no parts pushed at all, so the fallback
+    /// "connected · tip N" line is used, and it must never warn.
+    #[test]
+    fn healthy_node_reports_connected_and_never_warns() {
+        let status = NodeStatus { tip_height: 123_456, txindex: true, ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(!warn);
+        assert_eq!(text, "connected · tip 123,456");
+    }
+
+    /// A rescanning wallet must never look like a quiet/empty one — still
+    /// warns.
+    #[test]
+    fn wallet_scanning_warns() {
+        let status = NodeStatus { txindex: true, wallet_scanning: Some(true), ..Default::default() };
+        let (text, warn) = format_node_status(&status);
+        assert!(warn, "{text}");
+        assert!(text.contains("rescanning"));
+    }
+
+    // ---- U11: strip inline creds from a LOADED config.json (defect 3) ----
+
+    #[test]
+    fn migrate_strips_inline_creds_from_a_loaded_node_url() {
+        let mut node_urls = HashMap::new();
+        node_urls.insert(
+            "mainnet".to_string(),
+            "bitcoind+http://alice:s3cr3t@203.0.113.5:8332".to_string(),
+        );
+        let found = migrate_inline_node_creds(&mut node_urls);
+        assert_eq!(found, vec![("mainnet".to_string(), "alice".to_string(), "s3cr3t".to_string())]);
+        assert_eq!(node_urls.get("mainnet").map(String::as_str), Some("bitcoind+http://203.0.113.5:8332"));
+    }
+
+    #[test]
+    fn migrate_leaves_a_clean_loaded_url_untouched() {
+        let mut node_urls = HashMap::new();
+        node_urls.insert("testnet4".to_string(), "bitcoind+http://10.0.0.5:8332".to_string());
+        let found = migrate_inline_node_creds(&mut node_urls);
+        assert!(found.is_empty());
+        assert_eq!(node_urls.get("testnet4").map(String::as_str), Some("bitcoind+http://10.0.0.5:8332"));
+    }
+
+    #[test]
+    fn migrate_handles_multiple_networks_independently() {
+        let mut node_urls = HashMap::new();
+        node_urls.insert(
+            "mainnet".to_string(),
+            "bitcoind+http://alice:s3cr3t@203.0.113.5:8332".to_string(),
+        );
+        node_urls.insert("testnet4".to_string(), "https://mempool.example/api".to_string());
+        node_urls.insert(
+            "signet".to_string(),
+            "bitcoind+http://bob:hunter2@198.51.100.9:8332".to_string(),
+        );
+        let mut found = migrate_inline_node_creds(&mut node_urls);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("mainnet".to_string(), "alice".to_string(), "s3cr3t".to_string()),
+                ("signet".to_string(), "bob".to_string(), "hunter2".to_string()),
+            ]
+        );
+        assert_eq!(node_urls.get("mainnet").map(String::as_str), Some("bitcoind+http://203.0.113.5:8332"));
+        assert_eq!(node_urls.get("testnet4").map(String::as_str), Some("https://mempool.example/api"));
+        assert_eq!(node_urls.get("signet").map(String::as_str), Some("bitcoind+http://198.51.100.9:8332"));
+    }
+
+    #[test]
+    fn migrate_on_an_empty_map_is_a_noop() {
+        let mut node_urls: HashMap<String, String> = HashMap::new();
+        assert!(migrate_inline_node_creds(&mut node_urls).is_empty());
+        assert!(node_urls.is_empty());
+    }
+
+    // ---- U12: node picker — "Bitcoin Core" row, prefix-free UI ----
+
+    #[test]
+    fn confirmed_default_rpc_ports_per_network() {
+        // Straight from the installed bitcoind v30.2.0's own
+        // `-help-debug` text (verified 2026-07-29):
+        //   -rpcport=<port> … (default: 8332, testnet3: 18332,
+        //   testnet4: 48332, signet: 38332, regtest: 18443)
+        // This app has no Testnet3 variant, so only the other four apply.
+        assert_eq!(core_rpc_default_port(Network::Mainnet), 8332);
+        assert_eq!(core_rpc_default_port(Network::Testnet4), 48332);
+        assert_eq!(core_rpc_default_port(Network::Signet), 38332);
+        assert_eq!(core_rpc_default_port(Network::Regtest), 18443);
+    }
+
+    #[test]
+    fn compose_core_url_normalization_table() {
+        // (input, network, expected stored URL, expected inline creds)
+        let cases: &[(&str, Network, &str, Option<(&str, &str)>)] = &[
+            // bare host -> default scheme + default port for the network
+            ("192.168.1.10", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
+            ("umbrel.local", Network::Testnet4, "bitcoind+http://umbrel.local:48332", None),
+            ("node.example", Network::Signet, "bitcoind+http://node.example:38332", None),
+            ("127.0.0.1", Network::Regtest, "bitcoind+http://127.0.0.1:18443", None),
+            // host:port -> default scheme, given port honored verbatim
+            ("192.168.1.10:8332", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
+            ("umbrel.local:9998", Network::Testnet4, "bitcoind+http://umbrel.local:9998", None),
+            // explicit http:// / https:// -> scheme honored, port defaults
+            // or is honored the same way
+            ("http://192.168.1.10", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
+            (
+                "https://node.example:8332",
+                Network::Mainnet,
+                "bitcoind+https://node.example:8332",
+                None,
+            ),
+            ("https://umbrel.local", Network::Signet, "bitcoind+https://umbrel.local:38332", None),
+            // whitespace tolerated
+            ("  192.168.1.10:8332  ", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
+            // pasted `bitcoind+…` (backward compat / Sparrow-style paste)
+            // re-normalizes exactly like the bare forms above
+            (
+                "bitcoind+http://192.168.1.10:8332",
+                Network::Mainnet,
+                "bitcoind+http://192.168.1.10:8332",
+                None,
+            ),
+            (
+                "bitcoind+https://node.example",
+                Network::Signet,
+                "bitcoind+https://node.example:38332",
+                None,
+            ),
+            (
+                "bitcoind+http://alice:s3cr3t@192.168.1.10:8332",
+                Network::Mainnet,
+                "bitcoind+http://192.168.1.10:8332",
+                Some(("alice", "s3cr3t")),
+            ),
+            // inline creds on a bare paste (no bitcoind+, no scheme)
+            (
+                "alice:s3cr3t@192.168.1.10:8332",
+                Network::Mainnet,
+                "bitcoind+http://192.168.1.10:8332",
+                Some(("alice", "s3cr3t")),
+            ),
+        ];
+        for (input, net, expect_url, expect_creds) in cases {
+            let (url, creds) = compose_core_url(input, *net)
+                .unwrap_or_else(|e| panic!("expected {input:?} to parse, got err {e:?}"));
+            assert_eq!(url, *expect_url, "input={input:?}");
+            assert_eq!(
+                creds,
+                expect_creds.map(|(u, p)| (u.to_string(), p.to_string())),
+                "input={input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_core_url_rejects_malformed_input() {
+        let bad: &[&str] = &[
+            "",
+            "   ",
+            "bitcoind+",
+            "192.168.1.10:not-a-port",
+            "192.168.1.10:99999999",
+            "ftp://192.168.1.10:8332",
+            "192.168.1.10:8332/wallet/foo", // path not allowed on this field
+            "http://",
+            "http://:8332", // empty host
+        ];
+        for input in bad {
+            assert!(
+                compose_core_url(input, Network::Mainnet).is_err(),
+                "expected {input:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_core_url_error_messages_are_useful() {
+        let err = compose_core_url("ftp://host:21", Network::Mainnet).unwrap_err();
+        assert!(err.contains("scheme"), "message should mention the bad scheme: {err}");
+        let err = compose_core_url("", Network::Mainnet).unwrap_err();
+        assert!(err.contains("host"), "message should ask for a host: {err}");
+    }
+
+    #[test]
+    fn display_core_url_elides_default_http_scheme_but_keeps_https() {
+        assert_eq!(display_core_url("bitcoind+http://192.168.1.10:8332"), "192.168.1.10:8332");
+        assert_eq!(
+            display_core_url("bitcoind+https://node.example:8332"),
+            "https://node.example:8332"
+        );
+    }
+
+    #[test]
+    fn compose_then_display_round_trips_to_the_same_text() {
+        // What gets shown after a successful commit must, if resubmitted
+        // unchanged, reproduce the exact same stored URL — an elided
+        // scheme must never silently flip http<->https on a second save.
+        for (typed, net) in [
+            ("192.168.1.10:8332", Network::Mainnet),
+            ("umbrel.local", Network::Testnet4),
+            ("https://node.example:8332", Network::Mainnet),
+            ("https://umbrel.local", Network::Signet),
+        ] {
+            let (stored1, _) = compose_core_url(typed, net).unwrap();
+            let shown = display_core_url(&stored1);
+            let (stored2, _) = compose_core_url(&shown, net).unwrap();
+            assert_eq!(stored1, stored2, "typed={typed:?} shown={shown:?}");
+        }
+    }
+
+    #[test]
+    fn fill_node_round_trip_core_base_selects_core_row_no_prefix_no_creds() {
+        let net = Network::Mainnet;
+        let presets = node_presets(net);
+        let (opts, idx, esplora_text, core_text) =
+            fill_node(presets.clone(), Some("bitcoind+http://192.168.1.10:8332"));
+        // Row order: <presets…>, "Bitcoin Core", "Custom…" — Core is
+        // second-to-last regardless of how many presets a network has.
+        assert_eq!(opts[opts.len() - 2], "Bitcoin Core");
+        assert_eq!(opts[opts.len() - 1], "Custom…");
+        assert_eq!(idx as usize, presets.len()); // the "Bitcoin Core" row
+        assert_eq!(esplora_text, "");
+        assert_eq!(core_text, "192.168.1.10:8332"); // no prefix, no creds
+    }
+
+    #[test]
+    fn fill_node_round_trip_preset_esplora_base_selects_that_preset() {
+        let net = Network::Mainnet;
+        let presets = node_presets(net);
+        // Blockstream is a real preset on mainnet with an explicit URL.
+        let (label, url) =
+            presets.iter().find(|(_, u)| u.is_some()).expect("mainnet has an explicit preset");
+        let (opts, idx, esplora_text, core_text) = fill_node(presets.clone(), *url);
+        assert_eq!(opts[idx as usize], *label);
+        assert_eq!(esplora_text, "");
+        assert_eq!(core_text, "");
+    }
+
+    #[test]
+    fn fill_node_round_trip_custom_esplora_base_selects_custom_row() {
+        let net = Network::Mainnet;
+        let presets = node_presets(net);
+        let (opts, idx, esplora_text, core_text) =
+            fill_node(presets.clone(), Some("https://my-own-node.example/api"));
+        assert_eq!(opts[idx as usize], "Custom…");
+        assert_eq!(idx as usize, presets.len() + 1);
+        assert_eq!(esplora_text, "https://my-own-node.example/api");
+        assert_eq!(core_text, "");
+    }
+
+    #[test]
+    fn fill_node_regtest_has_exactly_core_then_custom() {
+        // node_presets(Regtest) is empty — the dropdown must still resolve
+        // to exactly "Bitcoin Core", "Custom…" with correct index math.
+        let net = Network::Regtest;
+        let presets = node_presets(net);
+        assert!(presets.is_empty());
+        let (opts, idx, _, core_text) =
+            fill_node(presets.clone(), Some("bitcoind+http://127.0.0.1:18443"));
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0], "Bitcoin Core");
+        assert_eq!(opts[1], "Custom…");
+        assert_eq!(idx, 0);
+        assert_eq!(core_text, "127.0.0.1:18443");
+
+        // No configured value at all (default network base, None) selects
+        // Custom on regtest — there is no Esplora preset for it to match.
+        let (opts2, idx2, esplora_text2, core_text2) = fill_node(presets, None);
+        assert_eq!(opts2.len(), 2);
+        assert_eq!(idx2, 1); // "Custom…"
+        assert_eq!(esplora_text2, "");
+        assert_eq!(core_text2, "");
+    }
+
+    #[test]
+    fn credentials_typed_into_node_address_field_never_reach_the_stored_url() {
+        // The node-address field's own composer must never let a
+        // credential survive into the value that gets written to
+        // config.json — same invariant `split_url_userinfo` enforces for
+        // the Custom field's paste path, proven here end-to-end through
+        // `compose_core_url` for every accepted input shape that could
+        // carry one.
+        for input in [
+            "alice:s3cr3t@192.168.1.10:8332",
+            "http://alice:s3cr3t@192.168.1.10:8332",
+            "https://alice:s3cr3t@192.168.1.10",
+            "bitcoind+http://alice:s3cr3t@192.168.1.10:8332",
+        ] {
+            let (url, creds) = compose_core_url(input, Network::Mainnet).unwrap();
+            assert!(!url.contains("s3cr3t"), "stored url leaked a credential: {url}");
+            assert!(!url.contains('@'), "stored url carries userinfo syntax: {url}");
+            assert_eq!(creds, Some(("alice".to_string(), "s3cr3t".to_string())));
+            // And the round-trip display of that stored URL is equally
+            // creds-free (belt and suspenders — display never re-derives
+            // creds from anywhere, but prove it never echoes the input).
+            assert!(!display_core_url(&url).contains("s3cr3t"));
+        }
+    }
+}
+
 /// Snapshot every PENDING record (sweep/consolidate txs AND notes) in
 /// `store` into the (current-txid, first-input) pairs a worker thread needs
 /// — shared by both the async and synchronous refresh paths so they exhibit
@@ -3894,7 +5527,7 @@ fn gather_dropped_checks(store: &Store) -> Vec<DroppedCheck> {
 /// `NotFound` (the common "still pending"/"confirmed" cases never pay for
 /// the extra round trip).
 fn fetch_dropped_checks(
-    client: &ChainClient<HttpTransport>,
+    client: &ChainClient<AnyTransport>,
     address: &str,
     checks: &[DroppedCheck],
 ) -> (HashMap<String, TxLookupStatus>, HashMap<(String, u32), bool>) {
@@ -4086,10 +5719,44 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
     let is_watch = st.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
     let watch_src_for_change = st.ident.as_ref().and_then(|i| i.watch_source()).cloned();
     let key = format!("wstores/{fp8}/{}/{account}", network.as_str());
+    let creds = core_rpc_creds_for(st, &base, network);
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
-        let client = ChainClient::new(HttpTransport::new(base), network);
+        let client = match open_client(&base, network, creds) {
+            Ok(c) => c,
+            Err(e) => {
+                // A malformed node URL fails the whole scan — every notebook's
+                // bundle fetch reports the same error, matching an entirely
+                // offline backend rather than inventing a new error path.
+                let msg = e.to_string();
+                let results: Vec<NotebookBundleResult> = all
+                    .into_iter()
+                    .map(|(index, _)| NotebookBundleResult { index, bundle: Err(msg.clone()) })
+                    .collect();
+                let current_statuses = pending_txids.iter().map(|t| (t.clone(), None)).collect();
+                drop(material_for_change); // Zeroizing, same as the success path.
+                WALLET_STORES_REFRESH_RESULTS
+                    .lock()
+                    .expect("wallet stores refresh mutex")
+                    .push(WalletStoresRefreshResult {
+                        purpose,
+                        fp8,
+                        network,
+                        account,
+                        current_index,
+                        current_address,
+                        current_statuses,
+                        current_dropped_lookup: HashMap::new(),
+                        current_dropped_unspent: HashMap::new(),
+                        results,
+                        change: Err(msg),
+                    });
+                let _ =
+                    weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_stores_refresh());
+                return;
+            }
+        };
         let results: Vec<NotebookBundleResult> = all
             .into_iter()
             .map(|(index, address)| NotebookBundleResult {
@@ -5306,6 +6973,21 @@ struct PickerProbeResult {
 static PICKER_PROBE_RESULTS: std::sync::Mutex<Vec<PickerProbeResult>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Finished Bitcoin Core preflight check (`PLAN-chain-notes-app-core-rpc.md`
+/// §2.2/§2.3/U4, surfaced §3/U6). `network`+`base` are the snapshot the
+/// worker started against — `on_apply_pending_node_health` drops a stale
+/// result (network switched, or the node URL changed) rather than paint it
+/// over a config the user has since moved on from.
+struct NodeHealthResult {
+    network: Network,
+    base: String,
+    text: SharedString,
+    warn: bool,
+}
+
+static NODE_HEALTH_RESULTS: std::sync::Mutex<Vec<NodeHealthResult>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Kick off receive-chain notebook gap discovery on a worker thread when
 /// activate() flagged a fresh index file (seed re-import; rev-3
 /// follow-up 2). Needs a configured node — with none the flag stays
@@ -5336,18 +7018,29 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
     let known: Vec<u32> =
         st.notebooks.as_ref().map(|ix| ix.active(account).map(|m| m.index).collect()).unwrap_or_default();
     let key = format!("discovery/{fp8}/{account}");
+    let creds = core_rpc_creds_for(st, &base, network);
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
         let found = parse_key_material(&material_str, network)
             .map(|material| {
-                let client = ChainClient::new(HttpTransport::new(base), network);
-                // gap=1 (Sal 2026-07-23): notebooks are used sequentially from
-                // index 0, so stop at the first unused receive index. Misses
-                // only a FUNDED notebook stranded behind a skipped-empty one
-                // (recover by manually creating a notebook at that index); an
-                // unfunded notebook has no on-chain trace to discover anyway.
-                app_core::chain::discover_indexes(&client, &material, network, account, &known, 1)
+                // A malformed node URL degrades exactly like any other
+                // transport error here — best-effort, empty result.
+                match open_client(&base, network, creds) {
+                    Ok(client) => {
+                        // gap=1 (Sal 2026-07-23): notebooks are used
+                        // sequentially from index 0, so stop at the first
+                        // unused receive index. Misses only a FUNDED notebook
+                        // stranded behind a skipped-empty one (recover by
+                        // manually creating a notebook at that index); an
+                        // unfunded notebook has no on-chain trace to discover
+                        // anyway.
+                        app_core::chain::discover_indexes(
+                            &client, &material, network, account, &known, 1,
+                        )
+                    }
+                    Err(_) => Vec::new(),
+                }
             })
             .unwrap_or_default();
         drop(material_str); // Zeroizing — wiped as soon as the walk is done
@@ -5404,10 +7097,25 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
     let prev_stats = st.store.as_ref().unwrap().addr_stats.clone();
     let key = format!("nbscan/{address}");
+    let creds = core_rpc_creds_for(st, &base, network);
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
-        let client = ChainClient::new(HttpTransport::new(base), network);
+        let client = match open_client(&base, network, creds) {
+            Ok(c) => c,
+            Err(e) => {
+                REFRESH_RESULTS.lock().expect("refresh results mutex").push(RefreshResult {
+                    address,
+                    bundle: Some(Err(e.to_string())),
+                    new_stats: None,
+                    statuses: Vec::new(),
+                    dropped_lookup: HashMap::new(),
+                    dropped_unspent: HashMap::new(),
+                });
+                let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_refresh());
+                return;
+            }
+        };
         // 429 politeness (2026-07-20): ONE cheap `/address/:a` fingerprint
         // first — if nothing moved since the last applied scan (chain AND
         // mempool stats identical, so a pending tx confirming/dropping
@@ -5718,7 +7426,16 @@ fn refresh(w: &AppWindow, st: &mut State) {
         w.set_status("no Bitcoin node for this network — set one in Settings".into());
         return;
     };
-    let client = ChainClient::new(HttpTransport::new(base), st.network);
+    let creds = core_rpc_creds_for(st, &base, st.network);
+    let client = match open_client(&base, st.network, creds) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("cb: refresh err={e}");
+            w.set_status("couldn't reach the network — tap refresh to retry".into());
+            update_home(w, st);
+            return;
+        }
+    };
     let address = st.ident.as_ref().unwrap().address.clone();
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
     match client.build_bundle(&address, None) {
@@ -5812,7 +7529,8 @@ fn refresh_fees_price(_w: &AppWindow, st: &mut State) {
         }
     }
     let Some(base) = st.base_url() else { return };
-    let client = ChainClient::new(HttpTransport::new(base), st.network);
+    let creds = core_rpc_creds_for(st, &base, st.network);
+    let Ok(client) = open_client(&base, st.network, creds) else { return };
     let mut fetched = false;
     if let Ok(fees) = client.fee_rates() {
         st.fees = Some(fees);
@@ -5935,6 +7653,7 @@ fn spending_scan_async(w: &AppWindow, st: &mut State, gap: u32) {
     let account = st.account;
     let Some(fp8) = st.notebooks_fp8.clone() else { return };
     let key = format!("spscan/{fp8}/{}/{account}", network.as_str());
+    let creds = core_rpc_creds_for(st, &base, network);
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
@@ -5943,7 +7662,7 @@ fn spending_scan_async(w: &AppWindow, st: &mut State, gap: u32) {
             .as_ref()
             .map_err(|e| e.to_string())
             .and_then(|m| app_core::spending::funding_source(m, network, account).map_err(|e| e.to_string()));
-        let client = ChainClient::new(HttpTransport::new(base), network);
+        let client = open_client(&base, network, creds).map_err(|e| e.to_string());
         // ONE merged walk (network-efficiency, 2026-07-23): `scan_funding`
         // now reports used addresses (receive AND change — so OWN-detection
         // on rescan covers coins this app never explicitly "handed out",
@@ -5951,7 +7670,9 @@ fn spending_scan_async(w: &AppWindow, st: &mut State, gap: u32) {
         // spendable coins in the same pass — no separate `discover_spending`
         // gap-walk needed. `gap` is SPENDING_GAP_SHALLOW for the automatic
         // scan or SPENDING_GAP_DEEP for the manual deep scan.
-        let scan = source.and_then(|src| client.scan_funding(&src, gap).map_err(|e| e.to_string()));
+        let scan = source.and_then(|src| {
+            client.and_then(|c| c.scan_funding(&src, gap).map_err(|e| e.to_string()))
+        });
         drop(material); // Zeroizing — wiped as soon as the scan is done
         SPENDING_REFRESH_RESULTS
             .lock()
@@ -6639,7 +8360,14 @@ fn payfrom_scan_wallet_for_display(w: &AppWindow, st: &mut State, id: &str) {
         return;
     };
     w.set_status("scanning funding wallet…".into());
-    let client = ChainClient::new(HttpTransport::new(&base), net);
+    let creds = core_rpc_creds_for(st, &base, net);
+    let client = match open_client(&base, net, creds) {
+        Ok(c) => c,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
     match client.scan_funding(&src, 20) {
         Ok(scan) => {
             st.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
@@ -8230,7 +9958,14 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
         return;
     };
     w.set_status("scanning funding wallet…".into());
-    let client = ChainClient::new(HttpTransport::new(&base), net);
+    let creds = core_rpc_creds_for(st, &base, net);
+    let client = match open_client(&base, net, creds) {
+        Ok(c) => c,
+        Err(e) => {
+            w.set_status(format!("{e}").into());
+            return;
+        }
+    };
     match client.scan_funding(&src, 20) {
         Ok(scan) => {
             st.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
@@ -9781,8 +11516,32 @@ pub fn run() {
             })
             .unwrap_or_default()
     };
-    let node_urls = str_map("nodes");
+    let mut node_urls = str_map("nodes");
     let explorers = str_map("explorers");
+    // "Save credentials" switch per network (plan §2.4 / U10) — a preference,
+    // not a secret, so it lives in config.json exactly like `nodes`/
+    // `explorers` above. Absent key (every pre-U10 config) => true per
+    // network via `core_rpc_should_persist`'s default, so this map can stay
+    // empty rather than needing every known network pre-filled.
+    let core_rpc_save_creds = parse_core_rpc_save_creds(&config);
+    // U11 defense-in-depth: a `config.json` written by an older build (or
+    // hand-edited/migrated) can still carry `bitcoind+http://user:pass@
+    // host:port` verbatim — `on_set_node_custom`'s stripping only ever ran
+    // on a URL typed/pasted THIS session. Clean every loaded entry now; the
+    // extracted creds go straight into the in-memory session slot (safe,
+    // zero Keychain calls) and their network into
+    // `core_rpc_migrate_pending` for `flush_core_rpc_migration` to route to
+    // the Keychain LATER, from `refresh_node_health` — never here, or the
+    // boot/launch path would make a Keychain call (the exact mistake that
+    // crashed builds 42/44).
+    let migrated_core_rpc_creds = migrate_inline_node_creds(&mut node_urls);
+    let mut core_rpc_session_creds: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
+    let mut core_rpc_migrate_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (net, user, pass) in migrated_core_rpc_creds {
+        core_rpc_migrate_pending.insert(net.clone());
+        core_rpc_session_creds.insert(net, (user, Zeroizing::new(pass)));
+    }
+    let core_rpc_migrated = !core_rpc_migrate_pending.is_empty();
     let funding_wallets = load_funding_wallets(&data_dir);
     // Device-level contacts (iCloud-contacts feature): load or, on an
     // existing install's first boot under this scheme, migrate from every
@@ -9801,6 +11560,9 @@ pub fn run() {
         tx_lock_time_override: None,
         node_urls,
         explorers,
+        core_rpc_save_creds,
+        core_rpc_session_creds,
+        core_rpc_migrate_pending,
         ident: None,
         store: None,
         fees: None,
@@ -9869,6 +11631,16 @@ pub fn run() {
         // see the sync-status init just after this block.
         last_sync: std::cell::Cell::new(SyncStatus::Unknown),
     }));
+    // U11 defense-in-depth, continued: `node_urls` above was already
+    // cleaned of inline creds before `State` was built, but the ON-DISK
+    // config.json still has the old (credential-carrying) text until it's
+    // rewritten — do that now. A plain file write, not a Keychain/network
+    // call, so it's safe on the launch path; the Keychain side
+    // (`flush_core_rpc_migration`) is deliberately NOT called here.
+    if core_rpc_migrated {
+        st.borrow().save_config();
+        println!("cb: core-rpc-migrate config-resaved");
+    }
     // Contacts boot sequence (iCloud-contacts feature): persist a fresh
     // migration (so `contacts.json` exists from here on and the union is
     // never redone), then merge in whatever the OTHER device last synced to
@@ -10670,6 +12442,23 @@ pub fn run() {
         }
     });
 
+    // Trampoline: a finished Bitcoin Core preflight check (`refresh_node_health`).
+    // Dropped when stale — the network or the configured node changed since
+    // the check started (e.g. the user switched networks, or edited the
+    // node URL again before the first check returned).
+    cb!(on_apply_pending_node_health, |w, s| {
+        let results: Vec<NodeHealthResult> =
+            NODE_HEALTH_RESULTS.lock().expect("node health mutex").drain(..).collect();
+        for r in results {
+            if s.network != r.network || s.base_url().as_deref() != Some(r.base.as_str()) {
+                println!("cb: node-health stale-drop");
+                continue;
+            }
+            w.set_node_health_text(r.text);
+            w.set_node_health_warn(r.warn);
+        }
+    });
+
     // Trampoline: a finished notebook gap-discovery walk (seed re-import).
     // Discovery is the sanctioned exception to deliberate notebook
     // creation — every found index has on-chain history, so recovering it
@@ -10933,15 +12722,16 @@ pub fn run() {
         };
         let net = s.network;
         let identity_addr = s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
+        let creds = core_rpc_creds_for(&s, &base, net);
         s.act_pending_ref = Some(ref_id_s.clone());
         update_activity(&w, &s);
         let weak = w.as_weak();
         std::thread::spawn(move || {
             let _net_guard = NetOpGuard::new(weak.clone());
-            let client = ChainClient::new(HttpTransport::new(base), net);
+            let client = open_client(&base, net, creds).map_err(|e| e.to_string());
             let result = last_txid
                 .ok_or_else(|| "nothing to rebroadcast".to_string())
-                .and_then(|t| client.fetch_tx_hex(&t).map_err(|e| format!("{e}")));
+                .and_then(|t| client.and_then(|c| c.fetch_tx_hex(&t).map_err(|e| format!("{e}"))));
             REBROADCAST_FETCH_RESULTS.lock().expect("rebroadcast fetch results mutex").push(
                 RebroadcastFetchResult { ref_id: ref_id_s, is_note, identity_addr, result },
             );
@@ -12233,13 +14023,15 @@ pub fn run() {
         };
         let Ok(src) = FundingSource::parse(&descriptor, net) else { return };
         w.set_status("scanning…".into());
-        let client = ChainClient::new(HttpTransport::new(&base), net);
-        if let Ok(scan) = client.scan_funding(&src, 20) {
-            s.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
-            s.funding_wallets[idx].coins = scan.utxos.len();
-            s.funding_wallets[idx].scanned = true;
-            s.funding_wallets[idx].next_change_index = scan.next_change_index;
-            s.save_funding_wallets();
+        let creds = core_rpc_creds_for(&s, &base, net);
+        if let Ok(client) = open_client(&base, net, creds) {
+            if let Ok(scan) = client.scan_funding(&src, 20) {
+                s.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
+                s.funding_wallets[idx].coins = scan.utxos.len();
+                s.funding_wallets[idx].scanned = true;
+                s.funding_wallets[idx].next_change_index = scan.next_change_index;
+                s.save_funding_wallets();
+            }
         }
         w.set_status("".into());
         refresh_funding_list(&w, &s);
@@ -12579,11 +14371,13 @@ pub fn run() {
         };
         s.wallet_tx_busy = true;
         w.set_wallet_tx_busy(true);
+        let creds = core_rpc_creds_for(&s, &base, net);
         let weak = w.as_weak();
         std::thread::spawn(move || {
             let _net_guard = NetOpGuard::new(weak.clone());
-            let client = ChainClient::new(HttpTransport::new(&base), net);
-            let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+            let result = open_client(&base, net, creds)
+                .map_err(|e| e.to_string())
+                .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
             PSBT_BROADCAST_RESULTS
                 .lock()
                 .expect("psbt broadcast results mutex")
@@ -12668,11 +14462,13 @@ pub fn run() {
                 let fee = composed.tx.fee;
                 let vsize = composed.tx.vsize;
                 let raw = pending.raw_hex.clone();
+                let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     NOTEBOOK_COMPOSE_RESULTS.lock().expect("notebook compose results mutex").push(
                         NotebookComposeResult { note_id, fee, vsize, to, private, result },
                     );
@@ -12704,11 +14500,13 @@ pub fn run() {
                 let raw = pending.raw_hex.clone();
                 let txid = pending.txid.clone();
                 let vsize = pending.vsize;
+                let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     SPENDING_COMPOSE_RESULTS.lock().expect("spending compose results mutex").push(
                         SpendingComposeResult {
                             note_id,
@@ -12761,11 +14559,13 @@ pub fn run() {
                 let raw = pending.raw_hex.clone();
                 let txid = pending.txid.clone();
                 let vsize = pending.vsize;
+                let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     MIXED_COMPOSE_RESULTS.lock().expect("mixed compose results mutex").push(
                         MixedComposeResult {
                             note_id,
@@ -12813,11 +14613,13 @@ pub fn run() {
                 s.wallet_tx_busy = true;
                 w.set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
+                let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     SWEEP_BROADCAST_RESULTS
                         .lock()
                         .expect("sweep broadcast results mutex")
@@ -12836,11 +14638,13 @@ pub fn run() {
                 s.wallet_tx_busy = true;
                 w.set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
+                let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     CONSOLIDATE_BROADCAST_RESULTS
                         .lock()
                         .expect("consolidate broadcast results mutex")
@@ -12859,11 +14663,13 @@ pub fn run() {
                 s.wallet_tx_busy = true;
                 w.set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
+                let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     WCONSOL_BROADCAST_RESULTS
                         .lock()
                         .expect("wconsol broadcast results mutex")
@@ -12882,11 +14688,13 @@ pub fn run() {
                 s.wallet_tx_busy = true;
                 w.set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
+                let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     SPENDING_CONSOLIDATE_RESULTS
                         .lock()
                         .expect("spending consolidate results mutex")
@@ -12927,11 +14735,13 @@ pub fn run() {
                 update_activity(&w, &s);
                 let raw = pending.raw_hex.clone();
                 let txid = pending.txid.clone();
+                let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     ACT_BUMP_RESULTS
                         .lock()
                         .expect("act-bump results mutex")
@@ -12950,11 +14760,13 @@ pub fn run() {
                 s.act_pending_ref = Some(ref_id.clone());
                 update_activity(&w, &s);
                 let raw = pending.raw_hex.clone();
+                let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
-                    let client = ChainClient::new(HttpTransport::new(&base), net);
-                    let result = client.broadcast(&raw).map_err(|e| format!("{e}"));
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     ACT_RETRY_RESULTS
                         .lock()
                         .expect("act-retry results mutex")
@@ -13967,6 +15779,7 @@ pub fn run() {
         w.set_status("".into());
         w.set_chunk_custom(false);
         load_backend_settings(&w, &s);
+        refresh_node_health(&w, &mut s);
         // Settings shows identity/network/note-size fields that used to be set
         // only by update_home; onboarding now lands on the list (not a home),
         // so populate them here too or the "Change account…" row (gated on
@@ -14329,9 +16142,11 @@ pub fn run() {
     });
 
     // Bitcoin node dropdown: a preset row writes its base (None = network
-    // default) to the device config for this network; the trailing "Custom…"
-    // row just reveals the text field (the Slint side already moved node-index)
-    // — the value follows when the user submits it via set-node-custom.
+    // default) to the device config for this network; the two trailing
+    // UI-managed rows — "Bitcoin Core" then "Custom…" (U12) — just reveal
+    // their own text field (the Slint side already moved node-index) and
+    // write nothing yet; the value follows when the user submits it via
+    // set-node-address / set-node-custom respectively.
     cb!(on_set_node_preset, |w, s, i: i32| {
         let net = s.network.as_str().to_string();
         let presets = node_presets(s.network);
@@ -14343,23 +16158,185 @@ pub fn run() {
             }
             s.save_config();
             println!("cb: set-node-preset {}", presets[i].0);
+        } else if i == presets.len() {
+            println!("cb: set-node-preset core");
         } else {
             println!("cb: set-node-preset custom");
         }
         w.set_status("".into());
+        // Every preset is Esplora — this both clears a previously-active
+        // Core node's credential fields/health line and is a no-op (no
+        // network call) whenever the picker was already on Esplora.
+        refresh_node_health(&w, &mut s);
+    });
+
+    // Bitcoin Core node-address field (U12): normalizes whatever a person
+    // typed (bare host, host:port, http(s)://…, or a pasted `bitcoind+…`)
+    // into the stored `bitcoind+http(s)://host:port` form via
+    // `compose_core_url` — the `bitcoind+` scheme prefix is a storage
+    // detail now, never something the user has to type or see. Inline
+    // credentials are stripped and routed exactly like `set-node-custom`'s
+    // paste path (never stored in the URL). On success the field is
+    // rewritten to the canonical `display_core_url` form so what's on
+    // screen always matches what got stored; on a malformed input nothing
+    // is written and the field is left as typed so the user can fix it.
+    cb!(on_set_node_address, |w, s, t: SharedString| {
+        let net = s.network.as_str().to_string();
+        match compose_core_url(t.trim(), s.network) {
+            Ok((v, inline_creds)) => {
+                s.node_urls.insert(net.clone(), v.clone());
+                s.save_config();
+                println!("cb: set-node-address {v}");
+                if let Some((user, pass)) = &inline_creds {
+                    let persist = s.core_rpc_should_persist(s.network);
+                    let result = route_core_rpc_creds(
+                        persist,
+                        &net,
+                        user,
+                        pass,
+                        &mut s.core_rpc_session_creds,
+                        |u, p| keychain::store_rpc_creds(&net, u, p),
+                        || keychain::delete_rpc_creds(&net),
+                    );
+                    match result {
+                        Ok(()) => println!(
+                            "cb: set-node-address inline-creds redacted stored=ok persist={persist}"
+                        ),
+                        Err(e) => {
+                            println!("cb: set-node-address inline-creds redacted stored=err ({e})")
+                        }
+                    }
+                }
+                w.set_node_address_text(display_core_url(&v).into());
+                w.set_status("".into());
+            }
+            Err(msg) => {
+                println!("cb: set-node-address err={msg}");
+                w.set_status(format!("Bitcoin node address: {msg}").into());
+            }
+        }
+        refresh_node_health(&w, &mut s);
     });
 
     cb!(on_set_node_custom, |w, s, t: SharedString| {
         let net = s.network.as_str().to_string();
-        let v = t.trim().to_string();
+        // Strip any inline `user:pass@` userinfo BEFORE it ever reaches
+        // config.json or this `cb:` log line (plan §2.4 — "the stored node
+        // URL must contain NO credentials"). A pasted
+        // `bitcoind+http://user:pass@host:8332` is routed exactly like the
+        // credential fields below (`route_core_rpc_creds` — Keychain when
+        // the "Save credentials" switch is on, the session-only slot when
+        // it's off, so a pasted credential can't become a persisted one
+        // behind the user's back); the value that gets
+        // stored/logged/displayed is always the creds-free form.
+        let (v, inline_creds) = split_url_userinfo(t.trim());
         if v.is_empty() {
             s.node_urls.remove(&net);
         } else {
-            s.node_urls.insert(net, v.clone());
+            s.node_urls.insert(net.clone(), v.clone());
         }
         s.save_config();
         println!("cb: set-node-custom {}", if v.is_empty() { "default" } else { &v });
+        if let Some((user, pass)) = &inline_creds {
+            let persist = s.core_rpc_should_persist(s.network);
+            let result = route_core_rpc_creds(
+                persist,
+                &net,
+                user,
+                pass,
+                &mut s.core_rpc_session_creds,
+                |u, p| keychain::store_rpc_creds(&net, u, p),
+                || keychain::delete_rpc_creds(&net),
+            );
+            match result {
+                Ok(()) => println!(
+                    "cb: set-node-custom inline-creds redacted stored=ok persist={persist}"
+                ),
+                Err(e) => println!("cb: set-node-custom inline-creds redacted stored=err ({e})"),
+            }
+        }
         w.set_status("".into());
+        refresh_node_health(&w, &mut s);
+    });
+
+    // Bitcoin Core RPC credentials (plan §2.4/U6, extended by U10's "Save
+    // credentials" switch): persisted in the Keychain ONLY while the switch
+    // is on for this network — `keychain::{store,load,delete}_rpc_creds`,
+    // under a distinct account namespace from the identity key. Off routes
+    // to the session-only slot instead (`route_core_rpc_creds`); the
+    // Keychain is never touched in that branch. Never written to
+    // config.json, never logged (length only). Clearing both fields
+    // deletes/clears the stored or session credential instead of writing
+    // an empty one.
+    cb!(on_set_node_core_creds, |w, s, user: SharedString, pass: SharedString| {
+        let net = s.network.as_str().to_string();
+        let user = user.trim().to_string();
+        let pass = pass.to_string();
+        let persist = s.core_rpc_should_persist(s.network);
+        let result = route_core_rpc_creds(
+            persist,
+            &net,
+            &user,
+            &pass,
+            &mut s.core_rpc_session_creds,
+            |u, p| keychain::store_rpc_creds(&net, u, p),
+            || keychain::delete_rpc_creds(&net),
+        );
+        match &result {
+            Ok(()) => println!(
+                "cb: set-node-core-creds ok user_len={} pass_len={} persist={persist}",
+                user.len(),
+                pass.len()
+            ),
+            Err(e) => println!("cb: set-node-core-creds err={e}"),
+        }
+        w.set_status(if result.is_ok() { "".into() } else { "couldn't save RPC credentials".into() });
+        refresh_node_health(&w, &mut s);
+    });
+
+    // "Save credentials" switch (plan §2.4 / U10): default ON, so nobody who
+    // already saved credentials sees a change. Turning it OFF immediately
+    // deletes any stored Keychain item for this network — leaving a stale
+    // secret behind after the user says "don't save" would be worse than
+    // not having the feature — and keeps today's on-screen fields in the
+    // session-only slot instead, so the user doesn't lose what they just
+    // typed. Turning it back ON persists whatever is in hand (session slot
+    // or the on-screen fields) and clears the session copy. A failed
+    // Keychain op reverts the on-screen toggle rather than claiming
+    // success.
+    cb!(on_set_node_core_save_creds, |w, s, enabled: bool| {
+        let net = s.network.as_str().to_string();
+        let net_key = net.clone();
+        let user = w.get_node_core_user().to_string();
+        let pass = w.get_node_core_pass().to_string();
+        let result = apply_core_rpc_persist_toggle(
+            enabled,
+            &user,
+            &pass,
+            || keychain::delete_rpc_creds(&net),
+            |u, p| keychain::store_rpc_creds(&net, u, p),
+        );
+        match result {
+            Ok(session) => {
+                s.core_rpc_save_creds.insert(net_key.clone(), enabled);
+                match session {
+                    Some(entry) => {
+                        s.core_rpc_session_creds.insert(net_key, entry);
+                    }
+                    None => {
+                        s.core_rpc_session_creds.remove(&net_key);
+                    }
+                }
+                s.save_config();
+                println!("cb: set-node-core-save-creds {enabled} ok");
+            }
+            Err(e) => {
+                w.set_node_core_save_creds(!enabled);
+                println!("cb: set-node-core-save-creds {enabled} err={e}");
+            }
+        }
+        update_node_backend_ui(&w, &s);
+        refresh_node_health(&w, &mut s);
     });
 
     cb!(on_set_explorer_preset, |w, s, i: i32| {
