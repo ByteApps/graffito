@@ -228,6 +228,45 @@ fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<u64
     value?.to_str().ok()?.trim().parse().ok()
 }
 
+/// U6 (`../../PLAN-chain-notes-app-core-rpc.md`, "unusable against a real
+/// node" fix, 2026-07-30): process-global watch cache, shared across every
+/// `CoreRpcTransport` instance — belt-and-braces on TOP of
+/// [`CoreRpcTransport::ensure_address_watched`]'s node-truth
+/// `getaddressinfo` check, never a replacement for it (a process restart,
+/// or simply the first call this process ever makes for an address, finds
+/// this empty; the `getaddressinfo` check is what makes correctness never
+/// depend on this cache being warm). It exists purely as an optimization —
+/// `src/lib.rs` builds a FRESH `ChainClient`/`AnyTransport` per operation
+/// (`open_client`, 24 call sites), so a per-instance `HashSet` (the
+/// pre-existing `CoreRpcTransport::watched` field) is empty on essentially
+/// every call and cannot skip even the cheap `getaddressinfo` round trip;
+/// this can. Keyed by (node identity, address) — see
+/// `CoreRpcTransport::node_key` — so switching the node URL (Settings, or a
+/// network switch) never serves a stale hit for a DIFFERENT node's wallet.
+static GLOBAL_WATCH_CACHE: std::sync::LazyLock<Mutex<HashSet<(String, String)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// U6: process-global count of real `importdescriptors` RPC round-trips
+/// this process has sent, across every node and every `CoreRpcTransport`
+/// instance — test visibility only, exactly mirroring how
+/// `CoreRpcTransport::probe_calls`/`preflight_probe_count` prove the
+/// `status_cache` is load-bearing, but at PROCESS granularity: since
+/// `src/lib.rs` builds a fresh transport (and therefore fresh, empty
+/// per-instance caches) on nearly every operation, only a process-wide
+/// counter can distinguish "this address was imported once, ever" from
+/// "this address gets re-imported on every single operation" (the bug this
+/// unit fixes). See `core_rpc_conformance.rs`'s
+/// `core_rpc_import_is_idempotent_across_fresh_transports` test, which
+/// reverts to N (not 1) the instant the `getaddressinfo` idempotence check
+/// in `ensure_address_watched` is disabled — that's the point of it.
+static IMPORT_DESCRIPTORS_CALLS: AtomicU32 = AtomicU32::new(0);
+
+/// Real calls to `importdescriptors` so far this process. Test visibility
+/// only — see [`IMPORT_DESCRIPTORS_CALLS`].
+pub fn core_rpc_import_descriptors_call_count() -> u32 {
+    IMPORT_DESCRIPTORS_CALLS.load(Ordering::Relaxed)
+}
+
 /// Trims a response body down to something fit for a UI status line: an
 /// HTML error page (mempool.space's 429 body is one) gets its markup
 /// stripped, everything is whitespace-collapsed, and the whole thing is
@@ -546,6 +585,98 @@ pub struct WatchDescriptor {
     pub range_end: u32,
 }
 
+/// Initial `range_end` a freshly-configured [`WatchDescriptor`] family gets
+/// (U7, the wiring unit — `../../PLAN-chain-notes-app-core-rpc.md` §2.2's
+/// "ranged descriptor import" finally gets a caller). 20 addresses per
+/// chain (0 through 19) mirrors the standard BIP-44-style gap limit this
+/// app already uses elsewhere for a FIRST look (`SPENDING_GAP_SHALLOW`-style
+/// sizing in `src/lib.rs`, `chain::discover_indexes`'s stop-after-5-unused
+/// rule) — enough that an ordinary notebook/spending wallet's real usage is
+/// covered by the FIRST import (no immediate widen round-trip). Note this
+/// does NOT bound the actual RPC cost tightly: `bitcoind` itself pads any
+/// requested ranged-descriptor span up to a minimum of ~999 (verified live
+/// — see `core_rpc_conformance.rs`'s `core_rpc_range_widening_finds_
+/// address_beyond_initial_range` test), so the node ends up scanning a
+/// similarly-sized window regardless of exactly what's requested here — the
+/// real savings this unit delivers is ONE rescan pass per FAMILY instead of
+/// one per ADDRESS, not a smaller per-family range.
+/// [`CoreRpcTransport::ranged_lookup_or_widen`] grows this further (in
+/// `CoreRpcTransport::WIDEN_CHUNK`-sized steps) the moment a real query
+/// needs an index beyond whatever the node actually imported.
+const RANGED_WATCH_INITIAL_RANGE_END: u32 = 19;
+
+/// Bitcoin Core ranged-watch [`WatchDescriptor`]s for one identity's active
+/// (account, network) — U7, the wiring unit: this is the ONLY place the app
+/// (`src/lib.rs`'s `open_client`) and its CLI proxy (`examples/cli.rs`)
+/// derive them, so both stay byte-identical and neither hand-rolls a second
+/// derivation. Reuses the SAME functions the Settings "Reveal keys" screen
+/// and the spending wallet already call — [`crate::keyexport::export_formats`]
+/// for the notebook `tr(...)` (or watch-only) descriptor and
+/// [`crate::spending::funding_descriptor`] for the BIP-84 `wpkh(...)`
+/// spending descriptor — so this is purely ADDITIVE wiring, never a new
+/// derivation path to keep byte-identical with anything.
+///
+/// **Birthday is always genesis (`timestamp: 0`).** This app has no field
+/// anywhere that records "when was this identity's seed first generated" —
+/// `store.rs`'s `NoteRecord`/`TxRecord.created_at` are per-transaction
+/// compose times, not a wallet birthday — so there is no honest non-zero
+/// value to offer here. [`WatchDescriptor::timestamp`]'s own doc comment
+/// and the per-address `addr()` fallback (`CoreRpcTransport::
+/// ensure_address_watched`) both already treat "substituting a recent
+/// default would silently miss real history" as strictly worse than being
+/// slow; this function makes the identical call for the ranged path. The
+/// win over the per-address fallback is NOT "skip the rescan" — it's
+/// collapsing what used to be one full-chain rescan PER ADDRESS into one
+/// full-chain rescan PER FAMILY (both chains, `RANGED_WATCH_INITIAL_RANGE_END`
+/// indexes, in a single `importdescriptors` call) — see
+/// `core_rpc_import_descriptors_call_count` and the U6 commit this unit
+/// builds on. A future unit could special-case a freshly-CREATED-in-app
+/// identity (provably no history before its generation instant) with a
+/// real non-zero birthday; nothing here does that yet.
+///
+/// Returns one entry per capability the identity actually has: none for
+/// single-key material (WIF/hex — one address each, no range to speak of,
+/// the per-address fallback already covers it byte-for-byte), one
+/// (notebook) entry for hierarchical (mnemonic/xprv) or watch-only
+/// (xpub/descriptor) material, plus a second (spending) entry when the
+/// material can also derive the BIP-84 spending wallet
+/// ([`crate::spending::can_derive_spending`] — watch-only never can, no
+/// private key to derive it from). Every derivation here is a handful of
+/// secp256k1 scalar multiplications (account-level, not per-address) —
+/// cheap, but still real CPU, which is why callers configure this ONCE per
+/// (identity, account, network) rather than on every `open_client` call
+/// (24 call sites in `src/lib.rs` alone).
+pub fn identity_watch_descriptors(
+    material_str: &str,
+    network: Network,
+    account: u32,
+) -> Vec<WatchDescriptor> {
+    let mut out = Vec::with_capacity(2);
+    if let Ok(formats) = crate::keyexport::export_formats(material_str, network, account, 0) {
+        if let Some(descriptor) = formats.descriptor {
+            out.push(WatchDescriptor {
+                descriptor,
+                network,
+                timestamp: 0,
+                range_end: RANGED_WATCH_INITIAL_RANGE_END,
+            });
+        }
+    }
+    if let Ok(material) = crate::identity::parse_key_material(material_str, network) {
+        if crate::spending::can_derive_spending(&material) {
+            if let Ok(descriptor) = crate::spending::funding_descriptor(&material, network, account) {
+                out.push(WatchDescriptor {
+                    descriptor,
+                    network,
+                    timestamp: 0,
+                    range_end: RANGED_WATCH_INITIAL_RANGE_END,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// One configured [`WatchDescriptor`], parsed once and kept alongside its
 /// currently-imported range and a local address→(chain,index) cache built
 /// purely by derivation (no RPC) up to that range.
@@ -647,6 +778,33 @@ impl CoreRpcTransport {
     /// `companion/server.py` shim's `cn-watch`.
     const WATCH_WALLET: &'static str = "chain-notes-watch";
 
+    /// Default timeout for ordinary RPC calls (everything except
+    /// [`Self::import_descriptors`] — see [`Self::RESCAN_TIMEOUT`]'s doc
+    /// comment for why that one needs its own, much longer, budget). Kept
+    /// short and unchanged from the pre-U6 behavior: a dead/unreachable
+    /// node should fail a UI action quickly, not hang it.
+    const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// U6: timeout for RPC calls that can legitimately trigger bitcoind's
+    /// own background wallet rescan (`importdescriptors`) — verified LIVE
+    /// against a real, synced testnet4 node (~146k blocks, 2026-07-30): a
+    /// genesis (`timestamp: 0`) rescan of a single freshly-imported address
+    /// took **~309s** end to end (`getwalletinfo.scanning.duration`,
+    /// polled to completion). [`Self::RPC_TIMEOUT`] would abort the HTTP
+    /// request at 30s while the rescan keeps running on the node
+    /// regardless — verified live too: `curl --max-time 30` against the
+    /// identical call returns exit 28 (timed out) at 30s, but a follow-up
+    /// `getwalletinfo` on the SAME wallet moments later still shows
+    /// `scanning.progress` climbing. That is not merely slow, it is
+    /// actively worse than a plain failure: the caller has no idea whether
+    /// the import it might retry already landed, and the orphaned rescan
+    /// goes on consuming the node's disk I/O regardless. 10 minutes is
+    /// comfortably above the observed real-world duration (leaves room for
+    /// a slower disk or mainnet's much longer chain) while still bounding
+    /// the worst case — a genuinely wedged node — to something finite
+    /// rather than forever.
+    const RESCAN_TIMEOUT: Duration = Duration::from_secs(600);
+
     /// How many indices [`Self::ranged_lookup_or_widen`] derives (locally,
     /// no RPC) per attempt while searching for a cache-miss address beyond
     /// a descriptor's currently-imported range.
@@ -741,7 +899,7 @@ impl CoreRpcTransport {
             // it's wiped on drop (plan §2.4).
             creds: creds.or(inline_creds).map(|(u, p)| (u, Zeroizing::new(p))),
             client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(Self::RPC_TIMEOUT)
                 .build()
                 .expect("client config is static"),
             watched: Mutex::new(HashSet::new()),
@@ -778,11 +936,37 @@ impl CoreRpcTransport {
         }
     }
 
+    /// Identifies "this node's watch wallet" for [`GLOBAL_WATCH_CACHE`] —
+    /// scheme+host+port is enough: two different `CoreRpcTransport`s
+    /// pointed at the same node (e.g. two `open_client` calls a second
+    /// apart) always compute an identical key, and two different nodes
+    /// (a Settings node-URL change, a network switch) never share one.
+    fn node_key(&self) -> String {
+        format!("{}://{}:{}", self.scheme, self.host, self.port.map(|p| p.to_string()).unwrap_or_default())
+    }
+
     /// One JSON-RPC 1.0 call. Auth is an HTTP Authorization header via
     /// `basic_auth` — `self.creds` never touches the URL string, so
     /// nothing here (nor `reqwest`'s own error `Display`, which can echo
     /// the request URL) can leak a credential into an `Error`/log line.
     fn call(&self, wallet: Option<&str>, method: &str, params: serde_json::Value) -> RpcOutcome {
+        self.call_timeout(wallet, method, params, None)
+    }
+
+    /// [`Self::call`], with an optional PER-REQUEST timeout override
+    /// (`reqwest::blocking::RequestBuilder::timeout` — when set, it wins
+    /// over the client's own default set at construction, exactly for this
+    /// one request). U6: [`Self::import_descriptors`] is the sole caller
+    /// that passes `Some(_)`, using [`Self::RESCAN_TIMEOUT`] — every other
+    /// call site keeps going through [`Self::call`] and therefore the
+    /// short [`Self::RPC_TIMEOUT`] default, unchanged.
+    fn call_timeout(
+        &self,
+        wallet: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Option<Duration>,
+    ) -> RpcOutcome {
         let id = {
             let mut n = self.next_id.lock().expect("rpc id mutex poisoned");
             *n += 1;
@@ -795,6 +979,9 @@ impl CoreRpcTransport {
             "method": method,
             "params": params,
         }));
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
         if let Some((user, pass)) = &self.creds {
             // `.as_str()` derefs through `Zeroizing<String>` — `reqwest`
             // needs `P: Display`, which `Zeroizing` deliberately does not
@@ -842,6 +1029,36 @@ impl CoreRpcTransport {
     /// which needs the raw RPC code for the -5 → 404 mapping.
     fn rpc(&self, wallet: Option<&str>, method: &str, params: serde_json::Value) -> Result<serde_json::Value, Error> {
         match self.call(wallet, method, params) {
+            RpcOutcome::Ok(v) => Ok(v),
+            RpcOutcome::RpcError { code, message } => Err(Error::Http(format!(
+                "bitcoind{}: {message}",
+                code.map(|c| format!(" [{c}]")).unwrap_or_default()
+            ))),
+            RpcOutcome::Transport(m) => Err(Error::Transport(m)),
+            RpcOutcome::BadResponse(m) => Err(Error::Http(m)),
+        }
+    }
+
+    /// U6: sends ONE `importdescriptors` call for `requests` (an array of
+    /// already-built `{"desc":…, "timestamp":…[, "range":…]}` objects)
+    /// against the watch wallet. The SOLE place either real caller — the
+    /// per-address `addr()` fallback in [`Self::ensure_address_watched`]
+    /// and the ranged-descriptor path in [`Self::import_ranged`] — actually
+    /// triggers a real bitcoind rescan, so it's factored out to be the SOLE
+    /// place that (a) uses [`Self::RESCAN_TIMEOUT`] instead of the ordinary
+    /// short budget (a rescan can legitimately run for minutes — see that
+    /// constant's doc comment) and (b) increments the process-global
+    /// [`IMPORT_DESCRIPTORS_CALLS`] test-visibility counter, so a
+    /// regression test can prove EITHER call site's idempotence by asserting
+    /// on this ONE number rather than needing two.
+    fn import_descriptors(&self, requests: serde_json::Value) -> Result<serde_json::Value, Error> {
+        IMPORT_DESCRIPTORS_CALLS.fetch_add(1, Ordering::Relaxed);
+        match self.call_timeout(
+            Some(Self::WATCH_WALLET),
+            "importdescriptors",
+            serde_json::json!([requests]),
+            Some(Self::RESCAN_TIMEOUT),
+        ) {
             RpcOutcome::Ok(v) => Ok(v),
             RpcOutcome::RpcError { code, message } => Err(Error::Http(format!(
                 "bitcoind{}: {message}",
@@ -1112,13 +1329,49 @@ impl CoreRpcTransport {
     /// for anything not covered by a configured [`WatchDescriptor`] family
     /// (a contact, an external recipient, a custom change address, ...) and
     /// the ENTIRE behavior when [`Self::watch_descriptors`] was never
-    /// called (every existing test and caller). `timestamp: 0` triggers a
-    /// rescan from genesis on a real mainnet node; harmless on the short
-    /// regtest chains U3 was tested against. Ensures `address` is imported
-    /// into the watch wallet — first by checking whether it belongs to a
-    /// ranged family already configured (U4, [`Self::ranged_lookup_or_widen`]),
-    /// widening that family's imported range instead of falling back here
-    /// when it does. Returns `Ok(true)` for a real, importable address;
+    /// called — which today means EVERY call the shipped app ever makes
+    /// (`watch_descriptors` is exercised by this crate's own tests but has
+    /// no caller anywhere in `src/lib.rs` or `examples/cli.rs`). Ensures
+    /// `address` is imported into the watch wallet — first by checking
+    /// whether it belongs to a ranged family already configured (U4,
+    /// [`Self::ranged_lookup_or_widen`]), widening that family's imported
+    /// range instead of falling back here when it does.
+    ///
+    /// **U6 (the "unusable against a real node" fix, 2026-07-30) rewrote
+    /// the middle of this function; read this before touching it again.**
+    /// The bug: `self.watched` (checked first, below) is a PER-INSTANCE
+    /// cache, but `src/lib.rs` constructs a fresh `ChainClient`/
+    /// `AnyTransport` — and therefore a fresh, empty `CoreRpcTransport` —
+    /// on nearly every single operation (`open_client`, 24 call sites,
+    /// none of which persist a transport across calls). So the cache was
+    /// empty on essentially every call, and this function used to run its
+    /// `importdescriptors` unconditionally on every miss — with
+    /// `timestamp: 0` (scan from genesis). Verified LIVE against a real,
+    /// synced testnet4 node (~146k blocks): that single call took ~309s,
+    /// while the shared `reqwest::blocking::Client`'s timeout was a flat
+    /// 30s — so in production this doesn't just run needlessly often, it
+    /// TIMES OUT on every single address lookup against any real (non-toy)
+    /// chain, while the orphaned rescan keeps running server-side
+    /// regardless (only regtest's ~100-block chain made a genesis rescan
+    /// fast enough to hide this — which is exactly why nothing in this
+    /// crate's regtest-backed test suite ever caught it).
+    ///
+    /// Three independent fixes, all present below: (1) idempotence is now
+    /// checked AGAINST THE NODE itself (`getaddressinfo`'s `ismine`), which
+    /// is stateless and therefore survives the per-operation transport
+    /// churn that defeats any in-memory cache — this is what actually
+    /// makes the import run AT MOST ONCE per address ever, not per
+    /// instance; (2) [`GLOBAL_WATCH_CACHE`] is a process-global cache on
+    /// top of that check, purely to skip even the one cheap
+    /// `getaddressinfo` round trip on a hot-path repeat; (3) the
+    /// `importdescriptors` call itself (factored into
+    /// [`Self::import_descriptors`]) now runs under [`Self::RESCAN_TIMEOUT`]
+    /// (minutes), not [`Self::RPC_TIMEOUT`] (30s) — belt-and-braces on top
+    /// of (1)/(2), for the one time per address this import is still
+    /// genuinely supposed to happen. `timestamp: 0` itself is UNCHANGED —
+    /// see the comment at the actual call site below for why that is still
+    /// the only honest choice for this particular fallback. Returns
+    /// `Ok(true)` for a real, importable address;
     /// `Ok(false)` for a syntactically INVALID one (bitcoind RPC code -5 —
     /// a garbage string, not decodable on any network) — which can never
     /// have on-chain history, so a `false` return is the caller's signal to
@@ -1166,14 +1419,70 @@ impl CoreRpcTransport {
         if self.invalid.lock().expect("invalid-address mutex poisoned").contains(address) {
             return Ok(false);
         }
-        if self.ranged_lookup_or_widen(address)? {
-            // Already imported (at configure time or just now, widened) —
-            // cache the hit in `watched` too so the NEXT query for the same
-            // address takes the cheapest possible path.
+        // U6: process-global cache hit — some EARLIER `CoreRpcTransport`
+        // instance (this process may have constructed dozens by now, one
+        // per `open_client` call) already confirmed this address is
+        // imported. Cheapest possible path: no RPC at all. See
+        // `GLOBAL_WATCH_CACHE`'s doc comment — this is an optimization on
+        // top of the node-truth check below, never a substitute for it.
+        let node_key = self.node_key();
+        let cache_key = (node_key.clone(), address.to_string());
+        if GLOBAL_WATCH_CACHE.lock().expect("global watch-cache mutex poisoned").contains(&cache_key) {
             self.watched.lock().expect("watched-address mutex poisoned").insert(address.to_string());
             return Ok(true);
         }
+        if self.ranged_lookup_or_widen(address)? {
+            // Already imported (at configure time or just now, widened) —
+            // cache the hit in `watched`/`GLOBAL_WATCH_CACHE` too so the
+            // NEXT query for the same address (this instance or a later
+            // one) takes the cheapest possible path.
+            self.watched.lock().expect("watched-address mutex poisoned").insert(address.to_string());
+            GLOBAL_WATCH_CACHE.lock().expect("global watch-cache mutex poisoned").insert(cache_key);
+            return Ok(true);
+        }
         self.ensure_watch_wallet()?;
+
+        // U6: idempotence AGAINST THE NODE, not process memory.
+        // `getaddressinfo` is a stateless, authoritative answer to "did
+        // SOME earlier transport instance (possibly in an earlier process,
+        // possibly seconds ago) already import this address" — it survives
+        // the per-operation transport churn that defeats every in-memory
+        // cache above. For this transport's blank, private-keys-disabled
+        // watch wallet, `ismine` is exactly the right field: an
+        // `addr()`-imported scriptPubKey reads back `ismine: true`
+        // (verified live against bitcoind v30.2.0, both regtest and a real
+        // testnet4 node) whether or not the wallet holds a spending key for
+        // it — which it never does here. A syntactically invalid or
+        // wrong-network address answers with the SAME RPC code -5
+        // `getdescriptorinfo` below already special-cases (verified live),
+        // so this call subsumes that check for the common case;
+        // `getdescriptorinfo` stays below as defense in depth for whatever
+        // this one doesn't cover.
+        match self.call(Some(Self::WATCH_WALLET), "getaddressinfo", serde_json::json!([address])) {
+            RpcOutcome::Ok(info) => {
+                if info.get("ismine").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    self.watched.lock().expect("watched-address mutex poisoned").insert(address.to_string());
+                    GLOBAL_WATCH_CACHE.lock().expect("global watch-cache mutex poisoned").insert(cache_key);
+                    return Ok(true);
+                }
+                // A syntactically valid address the node has genuinely
+                // never seen before — fall through and import it, exactly
+                // once, below.
+            }
+            RpcOutcome::RpcError { code: Some(-5), .. } => {
+                self.invalid.lock().expect("invalid-address mutex poisoned").insert(address.to_string());
+                return Ok(false);
+            }
+            RpcOutcome::RpcError { code, message } => {
+                return Err(Error::Http(format!(
+                    "bitcoind{}: {message}",
+                    code.map(|c| format!(" [{c}]")).unwrap_or_default()
+                )))
+            }
+            RpcOutcome::Transport(m) => return Err(Error::Transport(m)),
+            RpcOutcome::BadResponse(m) => return Err(Error::Http(m)),
+        }
+
         let desc = match self.call(None, "getdescriptorinfo", serde_json::json!([format!("addr({address})")])) {
             RpcOutcome::Ok(info) => info
                 .get("descriptor")
@@ -1193,12 +1502,28 @@ impl CoreRpcTransport {
             RpcOutcome::Transport(m) => return Err(Error::Transport(m)),
             RpcOutcome::BadResponse(m) => return Err(Error::Http(m)),
         };
-        self.rpc(
-            Some(Self::WATCH_WALLET),
-            "importdescriptors",
-            serde_json::json!([[{"desc": desc, "timestamp": 0}]]),
-        )?;
+        // `timestamp: 0` (scan from genesis) is UNCHANGED by U6, and
+        // deliberately so — this call is reached only for an address that
+        // belongs to no configured ranged family (today: EVERY address,
+        // since nothing calls `watch_descriptors` — see this function's
+        // doc comment) and this transport has no way to know when such an
+        // address might first have been used. Substituting anything else
+        // (e.g. "now") would silently miss real pre-existing history,
+        // which this project treats as strictly worse than being slow —
+        // the identical call `WatchDescriptor::timestamp`'s own doc
+        // comment makes for the ranged path's "imported seed, no known
+        // birthday" case. What U6 actually changed is not this value, it's
+        // that the surrounding `getaddressinfo`/`GLOBAL_WATCH_CACHE` checks
+        // above now make this import run AT MOST ONCE per address ever
+        // (per node), instead of once per `open_client` call as before —
+        // and that it now runs under `Self::RESCAN_TIMEOUT`
+        // ([`Self::import_descriptors`]) instead of the ordinary 30s
+        // budget, since a genesis rescan on a real chain measures in
+        // minutes, not seconds (verified live: ~309s against a real,
+        // synced testnet4 node).
+        self.import_descriptors(serde_json::json!([{"desc": desc, "timestamp": 0}]))?;
         self.watched.lock().expect("watched-address mutex poisoned").insert(address.to_string());
+        GLOBAL_WATCH_CACHE.lock().expect("global watch-cache mutex poisoned").insert(cache_key);
         Ok(true)
     }
 
@@ -1213,6 +1538,20 @@ impl CoreRpcTransport {
     /// chains to speak of — irrelevant there). A caller with nothing to
     /// configure need not call this at all; every existing address query
     /// keeps working through the U3 per-address fallback untouched.
+    ///
+    /// U7 (the wiring unit): `src/lib.rs`'s `open_client` now calls this on
+    /// EVERY `ChainClient`/transport it builds (24 call sites, one fresh
+    /// `CoreRpcTransport` per call — see U6's commit message) whenever the
+    /// active identity has at least one descriptor to configure, so this
+    /// runs far more often than U4's own tests ever called it. Each spec is
+    /// therefore checked against the NODE (`Self::ranged_family_imported_end`,
+    /// a `listdescriptors` read) before importing — the exact same
+    /// node-truth idempotence `Self::ensure_address_watched` already applies
+    /// to the per-address path (U6), for the identical reason: an in-memory
+    /// "already configured" flag on `self` cannot survive the per-call
+    /// transport churn, but `listdescriptors` can. A family already imported
+    /// with a range covering what's requested costs one cheap read, never a
+    /// re-`importdescriptors`/re-rescan.
     pub fn watch_descriptors(&self, specs: Vec<WatchDescriptor>) -> Result<(), Error> {
         if specs.is_empty() {
             return Ok(());
@@ -1221,15 +1560,67 @@ impl CoreRpcTransport {
         let mut configured = Vec::with_capacity(specs.len());
         for spec in specs {
             let source = FundingSource::parse(&spec.descriptor, spec.network)?;
-            self.import_ranged(&spec, spec.range_end)?;
+            let requested_end = spec.range_end;
+            let imported_end = match self.ranged_family_imported_end(&spec)? {
+                // The node already covers (or exceeds) what's requested —
+                // no RPC round trip, no rescan. A wider PRIOR import (e.g. a
+                // previous session's widen) is preserved rather than
+                // narrowed back down.
+                Some(existing) if existing >= requested_end => existing,
+                // Absent, or imported with a narrower range than requested —
+                // (re-)import up to `requested_end`. Safe to repeat: a
+                // second `importdescriptors` for an already-imported
+                // descriptor simply extends its cached range (verified live,
+                // see `Self::import_ranged`'s doc comment).
+                _ => {
+                    self.import_ranged(&spec, requested_end)?;
+                    requested_end
+                }
+            };
             let mut rw = RangedWatch { spec, source, imported_end: 0, index: HashMap::new() };
-            let end = rw.spec.range_end;
-            Self::populate_index(&mut rw, 0, end);
-            rw.imported_end = end;
+            Self::populate_index(&mut rw, 0, imported_end);
+            rw.imported_end = imported_end;
             configured.push(rw);
         }
         self.ranged.lock().expect("ranged-watch mutex poisoned").extend(configured);
         Ok(())
+    }
+
+    /// The `xpub`/`tpub` token inside a descriptor string, or `None` when it
+    /// carries neither. The production counterpart to
+    /// `core_rpc_conformance.rs`'s test-only `xpub_of` helper (kept
+    /// independent — a test file must never depend on crate-internal
+    /// production code, and vice versa) — same reasoning: bitcoind
+    /// normalizes `'` to `h` and splits a `<0;1>` multipath import into two
+    /// single-path `listdescriptors` entries, but the xpub/tpub token itself
+    /// survives both untouched, so it's the one thing safe to match a
+    /// caller-supplied descriptor against a `listdescriptors` response with.
+    fn descriptor_xpub_token(descriptor: &str) -> Option<&str> {
+        descriptor.split(['(', ')', '[', ']', '/']).find(|s| s.starts_with("xpub") || s.starts_with("tpub"))
+    }
+
+    /// U7: node-truth idempotence for the ranged path — `listdescriptors`
+    /// against the watch wallet, filtered to entries whose descriptor
+    /// carries `spec`'s own xpub/tpub token. Returns the SMALLER of the two
+    /// chains' `range[1]` when BOTH are found (an interrupted prior import
+    /// that only landed one chain must still be treated as needing a fresh
+    /// import, so the other chain gets covered too); `None` when the node
+    /// doesn't have both chains configured yet, or `spec`'s descriptor
+    /// carries no xpub/tpub token at all (nothing to safely match on — treat
+    /// as unconfigured, same as a fresh node).
+    fn ranged_family_imported_end(&self, spec: &WatchDescriptor) -> Result<Option<u32>, Error> {
+        let Some(token) = Self::descriptor_xpub_token(&spec.descriptor) else { return Ok(None) };
+        let v = self.rpc(Some(Self::WATCH_WALLET), "listdescriptors", serde_json::json!([]))?;
+        let entries = v.get("descriptors").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+        let ends: Vec<u32> = entries
+            .iter()
+            .filter(|d| d.get("desc").and_then(|s| s.as_str()).is_some_and(|desc| desc.contains(token)))
+            .map(|d| d.get("range").and_then(|r| r.get(1)).and_then(|e| e.as_u64()).unwrap_or(0) as u32)
+            .collect();
+        if ends.len() < 2 {
+            return Ok(None);
+        }
+        Ok(ends.into_iter().min())
     }
 
     /// Derive `[from..=to]` on both chains of `rw.source`, inserting every
@@ -1264,11 +1655,17 @@ impl CoreRpcTransport {
             .and_then(|c| c.as_str())
             .ok_or_else(|| Error::Json("getdescriptorinfo: missing checksum".into()))?;
         let desc = format!("{bare}#{checksum}");
-        self.rpc(
-            Some(Self::WATCH_WALLET),
-            "importdescriptors",
-            serde_json::json!([[{"desc": desc, "timestamp": spec.timestamp, "range": [0, end]}]]),
-        )?;
+        // U6: routed through `Self::import_descriptors` (was a direct
+        // `self.rpc` call) so this path — which CAN also trigger a real
+        // rescan whenever `spec.timestamp` is 0 or old (an imported seed
+        // with no known birthday, exactly like the per-address fallback) —
+        // gets `Self::RESCAN_TIMEOUT` instead of the ordinary 30s budget,
+        // and is covered by the same process-global call-count test hook.
+        // `spec.timestamp` itself is untouched: this is the ranged path,
+        // which already receives a real caller-supplied birthday whenever
+        // one is known (see `WatchDescriptor::timestamp`'s doc comment) —
+        // nothing here defaults it to genesis.
+        self.import_descriptors(serde_json::json!([{"desc": desc, "timestamp": spec.timestamp, "range": [0, end]}]))?;
         Ok(())
     }
 

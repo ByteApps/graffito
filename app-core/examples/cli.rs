@@ -55,6 +55,37 @@ fn open_client(base: &str, network: Network) -> ChainClient<AnyTransport> {
     ChainClient::new(AnyTransport::new(base, creds).expect("<base-url> parse"), network)
 }
 
+/// [`open_client`] plus Bitcoin Core ranged-watch configuration — this
+/// CLI's mirror of `src/lib.rs`'s `open_client_watched` (U7,
+/// `../../PLAN-chain-notes-app-core-rpc.md` §2.2's "ranged descriptor
+/// import" finally gets a caller, both here and in the shipped app).
+/// `app_core::chain::identity_watch_descriptors` derives the SAME
+/// descriptors `export_formats`/`spending::funding_descriptor` already
+/// produce for the Settings "Reveal keys" screen and the spending wallet —
+/// no second derivation. This CLI is a one-shot process (unlike the app's
+/// ~24 `open_client` call sites spread across a whole session), so there's
+/// no cross-call caching to do here: compute once per invocation, from the
+/// SAME `material`/`account` this command already resolved its own
+/// identity from. Used by `scan` — this app's own identity's rescan,
+/// exactly the operation `src/lib.rs`'s `refresh`/`refresh_async` mirror.
+/// `bundle` deliberately does NOT use this: it looks up an ARBITRARY
+/// address (the e2e scripts feed it the Prime app's own address, unrelated
+/// to this process's APP_KEY), so there is no descriptor family to
+/// configure and the per-address fallback is the correct — and only —
+/// path there.
+fn open_client_watched(base: &str, network: Network, material: &str, account: u32) -> ChainClient<AnyTransport> {
+    let client = open_client(base, network);
+    if let AnyTransport::Core(t) = &client.transport {
+        let descriptors = app_core::chain::identity_watch_descriptors(material, network, account);
+        if !descriptors.is_empty() {
+            if let Err(e) = t.watch_descriptors(descriptors) {
+                eprintln!("cli: watch-descriptors err={e}");
+            }
+        }
+    }
+    client
+}
+
 fn load(path: &str) -> Store {
     Store::load(std::path::Path::new(path)).expect("store load")
 }
@@ -197,7 +228,7 @@ fn main() {
                 spending_window =
                     app_core::spending::window_spks(&material, net, account, upto).unwrap_or_default();
             }
-            let client = open_client(&args[3], net);
+            let client = open_client_watched(&args[3], net, &key, account);
             let bundle = client.build_bundle(&store.address, None).expect("build bundle");
             let stats = match ident.full() {
                 Some(id) => store

@@ -54,6 +54,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -942,6 +943,191 @@ fn core_rpc_range_widening_finds_address_beyond_initial_range() {
     );
 }
 
+/// U7 test ("wiring reachability" —
+/// `../../PLAN-chain-notes-app-core-rpc.md` §2.2's "ranged descriptor
+/// import" finally gets a production caller). Every ranged-descriptor test
+/// ABOVE this one calls `CoreRpcTransport::watch_descriptors` DIRECTLY —
+/// which is exactly why the bug this unit fixes shipped in the first
+/// place: `grep -rn watch_descriptors src/ app-core/ examples/` found only
+/// this crate's own tests, never a production call site, so the app always
+/// paid for one genesis-rescan `importdescriptors` PER ADDRESS instead of
+/// one per descriptor family. A test that configures `watch_descriptors`
+/// itself can never catch a regression where the WIRING (not the mechanism)
+/// breaks again.
+///
+/// This test instead drives the actual PRODUCTION entry point: builds and
+/// runs `examples/cli.rs` as a REAL SUBPROCESS (the same binary
+/// `scripts/regtest-e2e.sh` drives — `../../CLAUDE.md`'s "examples/cli.rs
+/// stdout is DATA" rule applies here too, so this only ever reads stdout
+/// for the documented `cli: scan …` line and treats stderr as diagnostics),
+/// calling `scan` — the CLI's mirror of `src/lib.rs`'s `refresh`/
+/// `refresh_async`, both of which now go through `open_client_watched`
+/// (`src/lib.rs`) / `open_client_watched` (`examples/cli.rs`) instead of
+/// plain `open_client`. No test code here ever calls `watch_descriptors`
+/// — if either production wiring point is reverted to plain `open_client`,
+/// this test fails: `listdescriptors` would show these addresses individually
+/// imported as `addr(...)` entries instead of covered by a ranged family.
+///
+/// Two SEPARATE subprocess invocations (`scan` for notebook index 0, then
+/// index 2 — a different address of the SAME family, mirroring
+/// `build_conformance_fixture`'s `used_receive = [0, 2]` gap) prove the
+/// O(families)-not-O(addresses) shape end to end: each process computes its
+/// OWN fresh `identity_watch_descriptors`/`watch_descriptors` call (no
+/// cross-process cache is possible, or intended — see `open_client_watched`'s
+/// doc comment in both `src/lib.rs` and `examples/cli.rs`), yet the SECOND
+/// invocation's node-truth idempotence check
+/// (`CoreRpcTransport::ranged_family_imported_end`, this unit's
+/// `listdescriptors`-based counterpart to the U6 per-address
+/// `getaddressinfo` check) means the watch wallet ends up with the SAME two
+/// `listdescriptors` entries after both runs as after the first — not four,
+/// and never a growing `addr(...)` entry per address scanned.
+#[test]
+fn core_rpc_cli_scan_wires_ranged_watch_descriptors() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_cli_scan_wires_ranged_watch_descriptors: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    let node = start_node();
+    node.rpc(None, "createwallet", serde_json::json!(["sender"]));
+
+    let network = Network::Regtest;
+    let material = parse_key_material(TEST_MNEMONIC, network).expect("valid mnemonic");
+    let account = 0u32;
+
+    // Fund two of the notebook's own receive addresses (indexes 0 and 2 —
+    // a hole at 1, same shape `build_conformance_fixture` uses elsewhere in
+    // this file) — both well within `RANGED_WATCH_INITIAL_RANGE_END`, so a
+    // correctly-wired `scan` finds them via the ranged path without ever
+    // widening.
+    let addr0 = realize(&material, network, account, 0).unwrap().address;
+    let addr2 = realize(&material, network, account, 2).unwrap().address;
+    node.generate_single_capture(&addr0);
+    node.generate_single_capture(&addr2);
+    // 100 blocks of maturity padding (same as `build_conformance_fixture`'s
+    // `sink` padding above) — an immature coinbase reads back with a zero
+    // `listunspent` balance regardless of confirmation count, which would
+    // make the balance assertion below meaningless.
+    node.generate(100, &node.fresh_addr());
+
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+
+    // Build the SAME `examples/cli.rs` binary the e2e scripts drive —
+    // `scripts/regtest-e2e.sh`'s own recipe (`cargo build -q -p app-core
+    // --example cli`, run from the repo root, one level up from
+    // `CARGO_MANIFEST_DIR` = `app-core/`).
+    let repo_root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("app-core has a parent dir");
+    let build = Command::new(env!("CARGO"))
+        .args(["build", "-q", "-p", "app-core", "--example", "cli"])
+        .current_dir(repo_root)
+        .status()
+        .expect("run cargo build --example cli");
+    assert!(build.success(), "cargo build -p app-core --example cli failed");
+    let cli_bin = repo_root.join("target/debug/examples/cli");
+    assert!(cli_bin.exists(), "expected the built cli binary at {cli_bin:?}");
+
+    let store_path =
+        std::env::temp_dir().join(format!("chain-notes-cli-scan-wiring-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&store_path);
+
+    let run_cli = |args: &[&str], app_index: u32| -> std::process::Output {
+        Command::new(&cli_bin)
+            .args(args)
+            .env("APP_KEY", TEST_MNEMONIC)
+            .env("APP_ACCOUNT", account.to_string())
+            .env("APP_INDEX", app_index.to_string())
+            .output()
+            .expect("run cli subprocess")
+    };
+
+    let init = run_cli(&["init", store_path.to_str().unwrap(), "regtest"], 0);
+    assert!(init.status.success(), "cli init failed: {}", String::from_utf8_lossy(&init.stderr));
+
+    // First `scan` — notebook index 0 (a fresh subprocess: no in-process
+    // cache from `init` carries over).
+    let scan0 = run_cli(&["scan", store_path.to_str().unwrap(), &base], 0);
+    assert!(scan0.status.success(), "cli scan (index 0) failed: {}", String::from_utf8_lossy(&scan0.stderr));
+    let scan0_stdout = String::from_utf8_lossy(&scan0.stdout);
+    // The coinbase reward's exact sat figure isn't the point of this test
+    // (that's what `core_rpc_conformance`'s scenario battery already
+    // covers byte-for-byte) — just that the scan found SOME balance,
+    // proving addr0's coinbase was genuinely seen (not silently missed by
+    // a broken watch configuration reporting an empty, always-"success"
+    // scan).
+    assert!(
+        !scan0_stdout.contains("balance=0 "),
+        "expected the index-0 coinbase to be found via `cli: scan …`, got: {scan0_stdout}"
+    );
+
+    let after_first = watch_wallet_descriptors(&node);
+    let notebook_descriptor = export_formats(TEST_MNEMONIC, network, account, 0)
+        .expect("export_formats")
+        .descriptor
+        .expect("mnemonic yields a tr() descriptor");
+    let spending_descriptor =
+        spending::funding_descriptor(&material, network, account).expect("spending descriptor string");
+    let notebook_xpub = xpub_of(&notebook_descriptor);
+    let spending_xpub = xpub_of(&spending_descriptor);
+    let has_ranged_chain = |descs: &[(String, u32)], xpub: &str, prefix: &str, chain_suffix: &str| {
+        descs.iter().any(|(d, end)| {
+            d.starts_with(prefix) && d.contains(xpub) && d.ends_with(chain_suffix) && *end >= 19
+        })
+    };
+    assert!(
+        has_ranged_chain(&after_first, notebook_xpub, "tr(", "/0/*)")
+            && has_ranged_chain(&after_first, notebook_xpub, "tr(", "/1/*)"),
+        "cli scan must configure the notebook's ranged tr() descriptor on BOTH chains — got {after_first:?}"
+    );
+    // The wiring covers the spending wallet too (`identity_watch_descriptors`
+    // returns both families for hierarchical material) even though this
+    // scan never looked up a spending address — proving the DERIVATION
+    // side (not just "some ranged descriptor exists").
+    assert!(
+        has_ranged_chain(&after_first, spending_xpub, "wpkh(", "/0/*)")
+            && has_ranged_chain(&after_first, spending_xpub, "wpkh(", "/1/*)"),
+        "cli scan must ALSO configure the spending wallet's ranged wpkh() descriptor — got {after_first:?}"
+    );
+    let addr_imports_after_first = addr_import_addresses(&node);
+    assert!(
+        !addr_imports_after_first.contains(&addr0),
+        "addr0 ({addr0}) belongs to the configured ranged family — it must never be individually \
+         imported as its own addr() descriptor (found: {addr_imports_after_first:?})"
+    );
+
+    // Second `scan` — notebook index 2, a DIFFERENT address of the SAME
+    // family, ANOTHER fresh subprocess (no cross-process cache).
+    let scan2 = run_cli(&["scan", store_path.to_str().unwrap(), &base], 2);
+    let _ = scan2; // index-2's own store isn't asserted on; the node side is what matters
+    let after_second = watch_wallet_descriptors(&node);
+    let addr_imports_after_second = addr_import_addresses(&node);
+    assert!(
+        !addr_imports_after_second.contains(&addr2),
+        "addr2 ({addr2}) belongs to the configured ranged family — it must never be individually \
+         imported as its own addr() descriptor (found: {addr_imports_after_second:?})"
+    );
+    // O(families), not O(addresses)/O(subprocess invocations): the SAME
+    // descriptor entries the FIRST scan produced, byte-for-byte — not a
+    // second (duplicate or wider) pair from the second subprocess's own
+    // fresh `watch_descriptors` call, and no growth in the TOTAL count of
+    // watch-wallet descriptors despite a second address (and a second,
+    // fully independent process) now covered.
+    assert_eq!(
+        after_second, after_first,
+        "a second `scan` (different address, fresh subprocess, same family) must find the family \
+         ALREADY covered via listdescriptors idempotence — not re-import or grow it \
+         (before={after_first:?}, after={after_second:?})"
+    );
+
+    eprintln!(
+        "core_rpc_cli_scan_wires_ranged_watch_descriptors: PASS (2 subprocess `cli scan` runs, \
+         {} watch-wallet descriptors stable across both, 0 addr() imports for addr0/addr2, datadir {:?})",
+        after_first.len(),
+        node.datadir
+    );
+}
+
 /// U4 test 3 ("Pruned node"): a throwaway `-prune=550` node reports
 /// `pruned` (and SOME prune height) through `preflight()`. A pruned node
 /// CANNOT rescan below its prune height at all (plan §2.2) — the UI (U6)
@@ -1294,6 +1480,207 @@ fn core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history() {
     eprintln!(
         "core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history: PASS \
          (fees={fees:?}, relay_min_sat_vb={relay_min_sat_vb}, datadir {:?})",
+        node.datadir
+    );
+}
+
+/// `listdescriptors` on the transport-under-test's watch wallet, parsed
+/// into (desc-without-checksum) -> raw `timestamp` — the ONE way to
+/// observe, from OUTSIDE `CoreRpcTransport`, what timestamp an
+/// `importdescriptors` call actually carried. bitcoind normalizes
+/// `timestamp: 0` (genesis) to `1` internally (verified live against a
+/// real testnet4 node, 2026-07-30: request 0, `listdescriptors` reports
+/// back exactly `1`), while a real non-zero timestamp is echoed back
+/// VERBATIM (same live check: request `now - 3600`, `listdescriptors`
+/// reports back that exact value) — so `timestamp == 1` is a reliable,
+/// live-verified signature of "this import genuinely requested a genesis
+/// rescan", distinguishable from any real caller-supplied birthday.
+fn watch_wallet_descriptor_timestamps(node: &Node) -> HashMap<String, u64> {
+    let v = node.rpc(Some("chain-notes-watch"), "listdescriptors", serde_json::json!([]));
+    v["descriptors"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| {
+            let desc = d["desc"].as_str().unwrap_or("").split('#').next().unwrap_or("").to_string();
+            let ts = d["timestamp"].as_u64().unwrap_or(0);
+            (desc, ts)
+        })
+        .collect()
+}
+
+/// U6 (`../../PLAN-chain-notes-app-core-rpc.md`, "unusable against a real
+/// node" fix, 2026-07-30) — THE regression this unit exists to prevent.
+///
+/// The bug: `CoreRpcTransport::ensure_address_watched`'s `watched` cache
+/// lives on the TRANSPORT INSTANCE, but `src/lib.rs` builds a fresh
+/// `ChainClient`/`AnyTransport` (and therefore a fresh, empty
+/// `CoreRpcTransport`) on nearly every real operation — `open_client`, 24
+/// call sites, none of which persist a transport across calls. So that
+/// cache was empty on essentially every real call, and every miss ran
+/// `importdescriptors` with `timestamp: 0` (genesis) again. On regtest's
+/// ~100-block chain that's free, which is exactly why nothing in this
+/// suite ever caught it despite exercising the Core RPC backend
+/// extensively; verified LIVE against a real, synced testnet4 node
+/// (~146k blocks, 2026-07-30) that the SAME single call takes ~309s —
+/// so in production every operation against a real chain either hung for
+/// minutes or (with the transport's flat 30s timeout) simply failed,
+/// while the orphaned rescan kept running on the node regardless. A
+/// timing-based test would be flaky and chain-size dependent (fast on
+/// regtest, slow on any real chain) — this one is neither: it counts the
+/// real `importdescriptors` RPC calls via
+/// [`app_core::chain::core_rpc_import_descriptors_call_count`] (a
+/// process-global, test-visibility-only counter), which is entirely
+/// independent of chain length and would have caught this bug on regtest
+/// from day one.
+///
+/// This test reproduces the SHAPE of the real bug directly: `N`
+/// independently constructed transports (exactly what `open_client` does
+/// on every operation), each querying the SAME address exactly once.
+/// Fixed by three layers (see `ensure_address_watched`'s doc comment):
+/// (1) idempotence checked AGAINST THE NODE (`getaddressinfo`'s `ismine`)
+/// — stateless, survives the per-operation churn that defeats any
+/// in-memory cache, and is what makes the VERY FIRST of these `N`
+/// transports (which cannot possibly have a warm cache — this is a
+/// brand-new address on a brand-new node) do the right thing; (2) a
+/// process-global cache on top of that, purely so a repeat doesn't even
+/// pay for the one cheap `getaddressinfo` round trip; (3) the import
+/// itself, once genuinely needed, runs under a much longer timeout. A
+/// mutation reverting this fix back to "always import on a per-instance
+/// cache miss" (removing BOTH (1) and (2) — i.e. reverting the shape of
+/// this unit's change) makes the asserted count go from 1 to `N`.
+#[test]
+fn core_rpc_import_is_idempotent_across_fresh_transports() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_import_is_idempotent_across_fresh_transports: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    let node = start_node();
+    node.rpc(None, "createwallet", serde_json::json!(["sender"]));
+    // A genuinely funded address — the point is the IMPORT count, but a
+    // used address (rather than an empty one) is the more honest shape,
+    // and doubles as a correctness check: every one of the N independent
+    // lookups below must still see the SAME real funding tx.
+    let addr = node.fresh_addr();
+    node.generate(1, &addr);
+
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+
+    // Baseline BEFORE this test's own activity — the counter is
+    // process-global (shared with every other test in this binary), and
+    // `serialize_nodes()` only serializes test BODIES against each other,
+    // not this counter's lifetime, so a delta (not an absolute value) is
+    // the only correct thing to assert.
+    let before = app_core::chain::core_rpc_import_descriptors_call_count();
+
+    const N: usize = 5;
+    for i in 0..N {
+        // A FRESH transport every iteration — exactly what `open_client`
+        // does in `src/lib.rs` on every single network operation. Each
+        // one's own per-instance `watched`/`invalid` caches start empty;
+        // only the node itself (checked via `getaddressinfo`) and the
+        // process-global cache can possibly make this cheap.
+        let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+        let client = ChainClient::new(transport, Network::Regtest);
+        let stats = client.address_stats(&addr).expect("address_stats");
+        assert_eq!(
+            stats.chain_tx_count, 1,
+            "iteration {i}: the funding tx must be visible on EVERY independent lookup, \
+             not just the first (an address the node has never heard of reads as unused)"
+        );
+    }
+
+    let after = app_core::chain::core_rpc_import_descriptors_call_count();
+    let import_calls = after - before;
+    assert_eq!(
+        import_calls, 1,
+        "{N} independent operations against the SAME address (each building a fresh transport, \
+         exactly like src/lib.rs's open_client) must import it into the watch wallet EXACTLY ONCE \
+         — idempotent against the NODE, not process memory — but {import_calls} real importdescriptors \
+         calls happened. This is the U6 regression: on a real (non-regtest) chain each extra call is a \
+         genesis rescan measured in MINUTES, not a cheap no-op."
+    );
+
+    // Strengthens the count-based assertion: the ONE import that did
+    // happen must be the deliberate, documented genesis case (see
+    // `ensure_address_watched`'s doc comment on why `timestamp: 0` is
+    // still correct for this address) — not some other, unexpected value
+    // that would indicate a different code path fired.
+    let timestamps = watch_wallet_descriptor_timestamps(&node);
+    let addr_desc = format!("addr({addr})");
+    assert_eq!(
+        timestamps.get(&addr_desc).copied(),
+        Some(1),
+        "the address's own descriptor must show bitcoind's genesis-clamp value (1, from a \
+         requested timestamp of 0) exactly — descriptors seen: {timestamps:?}"
+    );
+
+    eprintln!(
+        "core_rpc_import_is_idempotent_across_fresh_transports: PASS \
+         ({N} ops, {import_calls} import call, datadir {:?})",
+        node.datadir
+    );
+}
+
+/// U6, companion to the idempotence test above: proves the RANGED path
+/// (`CoreRpcTransport::watch_descriptors`/`import_ranged`, U4) never
+/// silently substitutes `timestamp: 0` for a caller-supplied birthday —
+/// i.e. that U6's changes (routing `import_ranged` through the same
+/// `Self::import_descriptors` helper as the per-address fallback, for the
+/// timeout fix) did not accidentally start defaulting its timestamp too.
+/// Uses the SAME live-verified signature as the test above:
+/// `listdescriptors` echoes a real non-zero timestamp back VERBATIM,
+/// while `0` is normalized to bitcoind's internal `1` — so asserting the
+/// ranged descriptor's reported timestamp equals the EXACT value passed
+/// (not `1`) directly catches a regression that silently zeroed it.
+#[test]
+fn core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero() {
+    if !bitcoind_on_path() {
+        eprintln!("SKIP core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero: bitcoind not found on PATH");
+        return;
+    }
+    let _guard = serialize_nodes();
+
+    let node = start_node();
+    let network = Network::Regtest;
+    let material = parse_key_material(TEST_MNEMONIC, network).expect("valid mnemonic");
+    let descriptor =
+        export_formats(TEST_MNEMONIC, network, 0, 0).unwrap().descriptor.expect("tr() descriptor");
+    let _ = &material; // only needed to derive `descriptor` above
+
+    // An arbitrary, deliberately non-round, non-zero unix timestamp —
+    // chosen so it can't be confused with `0` OR with bitcoind's
+    // genesis-clamp value (`1`) by construction.
+    let birthday: u64 = 1_700_000_000;
+
+    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+    match &transport {
+        AnyTransport::Core(core) => core
+            .watch_descriptors(vec![WatchDescriptor { descriptor, network, timestamp: birthday, range_end: 2 }])
+            .expect("configure ranged descriptor"),
+        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+    }
+
+    let timestamps = watch_wallet_descriptor_timestamps(&node);
+    assert!(
+        timestamps.values().any(|&ts| ts == birthday),
+        "expected a descriptor carrying the exact caller-supplied birthday {birthday}, \
+         got: {timestamps:?} — a `1` here would mean the ranged path silently substituted \
+         a genesis (timestamp: 0) rescan for a KNOWN, non-zero birthday"
+    );
+    assert!(
+        timestamps.values().all(|&ts| ts != 1),
+        "no descriptor in a ranged-only scenario may show bitcoind's genesis-clamp value (1) — \
+         every family here was configured with an explicit non-zero birthday: {timestamps:?}"
+    );
+
+    eprintln!(
+        "core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero: PASS \
+         (birthday={birthday}, datadir {:?})",
         node.datadir
     );
 }

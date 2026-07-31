@@ -346,6 +346,19 @@ struct State {
     /// true = consolidate (smallest-first).
     consolidate_coins: bool,
     material: Option<Zeroizing<String>>, // session cache: avoids re-prompting Touch ID
+    /// Bitcoin Core RPC ranged-watch descriptors (U7,
+    /// `../PLAN-chain-notes-app-core-rpc.md` §2.2's "ranged descriptor
+    /// import" finally gets a caller) for the ACTIVE (identity, account,
+    /// network) — computed ONCE by `activate()` from `material` via
+    /// `app_core::chain::identity_watch_descriptors` and cloned into every
+    /// `open_client_watched` call from here, rather than re-derived (a
+    /// handful of secp256k1 scalar multiplications each) on every one of
+    /// `open_client`'s ~24 call sites. Empty for single-key (WIF/hex)
+    /// material or when nothing is active — those addresses/identities are
+    /// unaffected: `open_client_watched` degrades to the plain per-address
+    /// `addr()` fallback exactly like `open_client` always has. Irrelevant
+    /// (never read) for an Esplora backend.
+    core_rpc_watch: Vec<app_core::chain::WatchDescriptor>,
     /// iCloud Keychain backup opt-in: when true the key is stored as a
     /// synchronizable Keychain item (syncs across the user's Apple devices and
     /// survives reinstall). Reflects the current stored item's sync state.
@@ -1335,6 +1348,7 @@ impl State {
             coins_overridden: false,
             consolidate_coins: false,
             material: None,
+            core_rpc_watch: Vec::new(),
             icloud_backup: false,
             terms_accepted: false,
             auto_unlock: false,
@@ -3111,6 +3125,16 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
         }
     }
     st.material = Some(Zeroizing::new(material_str.trim().to_string()));
+    // U7 (Bitcoin Core RPC ranged-watch wiring): (re)computed HERE, the
+    // established choke point for every (identity, account, network)
+    // change (boot, import, restore, network switch, account switch —
+    // `activate()` is the sole place all of those funnel through), so the
+    // account-level EC derivation this does runs once per such change
+    // rather than on every one of `open_client_watched`'s call sites.
+    // Cheap to always compute regardless of the active backend — it's only
+    // READ when `open_client_watched` finds a Core transport underneath.
+    st.core_rpc_watch =
+        app_core::chain::identity_watch_descriptors(material_str.trim(), st.network, st.account);
     // Funding-unification M3: the spending wallet is per (identity,
     // account) — reset session state on every activate() (boot, network/
     // account switch, identity reset→reimport) and recompute capability
@@ -3238,6 +3262,91 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     Ok(())
 }
 
+/// Complementary to `core_rpc_wiring_contract` (below `open_client_watched`,
+/// further down this file): that module guards every CALL SITE reaching for
+/// `st.core_rpc_watch`; this one guards where the value itself comes from —
+/// `activate()`'s one-line delegation to `app_core::chain::identity_watch_descriptors`
+/// two screens up. A real `State` (via the existing `State::test_stub`,
+/// which enumerates every field on purpose — see its own doc comment) with
+/// a throwaway temp `data_dir` so `save_store`/`save_config` have somewhere
+/// to write; `persist: false` so this never touches the Keychain.
+#[cfg(test)]
+mod activate_core_rpc_watch_tests {
+    use super::*;
+
+    const MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const WIF: &str = "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn";
+    const WATCH_XPUB: &str = "xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ";
+
+    fn activated_stub(tag: &str, material: &str) -> State {
+        let mut st =
+            State::test_stub(Network::Mainnet, HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
+        let dir = std::env::temp_dir().join(format!("cn-activate-watch-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        st.data_dir = dir;
+        activate(&mut st, material, false).unwrap_or_else(|e| panic!("activate({tag}) failed: {e}"));
+        st
+    }
+
+    /// A hierarchical (mnemonic) identity gets BOTH families: the account's
+    /// notebook `tr()` descriptor and its `wpkh()` spending descriptor
+    /// (`can_derive_spending` is true for any hierarchical material) — this
+    /// is the len == 2 case every one of the 6 watched call sites relies on
+    /// actually being non-empty, or `open_client_watched` degrades to the
+    /// exact same per-address fallback the plain constructor uses (its own
+    /// doc comment: `if !descriptors.is_empty()`).
+    #[test]
+    fn hierarchical_mnemonic_populates_both_descriptor_families() {
+        let st = activated_stub("mnemonic", MNEMONIC);
+        assert_eq!(
+            st.core_rpc_watch.len(),
+            2,
+            "activate() must populate core_rpc_watch with the notebook + spending \
+             descriptor families for hierarchical material — got {:?}",
+            st.core_rpc_watch
+        );
+        assert!(st.core_rpc_watch[0].descriptor.starts_with("tr("));
+        assert!(st.core_rpc_watch[1].descriptor.starts_with("wpkh("));
+    }
+
+    /// A single-key (WIF) identity has exactly ONE address — nothing to
+    /// range over — so `core_rpc_watch` must stay empty and every lookup
+    /// keeps going through the per-address `addr()` fallback, unchanged.
+    /// An accidental non-empty result here would be silently harmless today
+    /// (the fallback still works) but would mean `identity_watch_descriptors`
+    /// no longer matches its own doc comment's single-key case.
+    #[test]
+    fn single_key_wif_leaves_core_rpc_watch_empty() {
+        let st = activated_stub("wif", WIF);
+        assert!(
+            st.core_rpc_watch.is_empty(),
+            "single-key (WIF) material must not populate core_rpc_watch — got {:?}",
+            st.core_rpc_watch
+        );
+    }
+
+    /// Watch-only (ranged xpub) gets exactly the ONE notebook family — no
+    /// spending descriptor, since `can_derive_spending` requires a private
+    /// hierarchical key this identity doesn't have. The descriptor text
+    /// itself is the bare xpub verbatim (`keyexport::export_formats`'s
+    /// `watch_only_yields_descriptor_no_private` test pins the same
+    /// behavior) — `FundingSource::parse`/`watch_descriptors` wrap a bare
+    /// xpub in `tr(.../<0;1>/*)` themselves, so this is not re-wrapped here.
+    #[test]
+    fn watch_only_xpub_populates_exactly_one_descriptor_family() {
+        let st = activated_stub("xpub", WATCH_XPUB);
+        assert_eq!(
+            st.core_rpc_watch.len(),
+            1,
+            "watch-only xpub material must populate exactly one (notebook) descriptor \
+             family — got {:?}",
+            st.core_rpc_watch
+        );
+        assert_eq!(st.core_rpc_watch[0].descriptor, WATCH_XPUB);
+    }
+}
+
 fn is_hierarchical(material_str: &str, network: Network) -> bool {
     parse_key_material(material_str, network).map(|m| m.is_hierarchical()).unwrap_or(false)
 }
@@ -3330,13 +3439,14 @@ fn show_notebook_picker(w: &AppWindow, st: &State, page: u32, mode: &str) {
     let network = st.network;
     let account = st.account;
     let creds = core_rpc_creds_for(st, &base, network);
+    let watch = st.core_rpc_watch.clone();
     let weak = w.as_weak();
     std::thread::spawn(move || {
         let _net_guard = NetOpGuard::new(weak.clone());
         let mut results: Vec<(u32, &'static str, String)> = Vec::new();
         // A malformed node URL degrades exactly like "offline" below (empty
         // results → plain rows) rather than a new error path.
-        if let Ok(client) = open_client(&base, network, creds) {
+        if let Ok(client) = open_client_watched(&base, network, creds, &watch) {
             for (index, addr) in &to_probe {
                 if let Ok((used, balance)) = client.address_probe(addr) {
                     let pill = if used { "used" } else { "new" };
@@ -4514,6 +4624,299 @@ fn open_client(
     creds: Option<(String, String)>,
 ) -> Result<ChainClient<AnyTransport>, app_core::Error> {
     Ok(ChainClient::new(AnyTransport::new(base, creds)?, network))
+}
+
+/// [`open_client`] plus Bitcoin Core ranged-watch configuration (U7 —
+/// `../PLAN-chain-notes-app-core-rpc.md` §2.2's "ranged descriptor import"
+/// finally gets a caller; previously `CoreRpcTransport::watch_descriptors`
+/// had none anywhere in this crate, so the app always paid for one
+/// genesis-rescan `importdescriptors` PER ADDRESS instead of one per
+/// descriptor family). `descriptors` is `State.core_rpc_watch` — computed
+/// ONCE per (identity, account, network) by `activate()`, cloned onto the
+/// caller's stack (or into a worker-thread closure, same convention as
+/// `base`/`network`/`creds`) BEFORE calling this, never re-derived here.
+///
+/// For an Esplora base this is byte-identical to `open_client` — the
+/// `AnyTransport::Esplora` arm below never touches `descriptors` at all,
+/// so the Esplora path (`HttpTransport`, pacing, 429 retry, error
+/// classification) is untouched by construction, not merely by
+/// convention. For a Bitcoin Core base with at least one descriptor
+/// configured, this calls `CoreRpcTransport::watch_descriptors` on the
+/// freshly-built transport before handing it back, so every subsequent
+/// `/address/...` lookup through it prefers the ranged path
+/// (`CoreRpcTransport::ranged_lookup_or_widen`) over the per-address
+/// `addr()` fallback. A `watch_descriptors` failure (a flaky node, a
+/// malformed descriptor) is logged and swallowed rather than failing the
+/// whole operation: configuring the fast path is an optimization, and the
+/// per-address fallback remains fully correct on its own — exactly the
+/// same "additive, never a correctness requirement" relationship the U4
+/// doc comments already describe.
+///
+/// NOT every `open_client` call site needs this — only ones that go on to
+/// look up one of the identity's OWN addresses (`build_bundle`,
+/// `scan_funding` against the identity's own spending source,
+/// `address_probe`/`address_used`). Broadcast-only calls
+/// (`client.broadcast`), `fetch_tx_io`/`fetch_tx_hex`/`fetch_tx_status`
+/// (keyed by txid, not address), and `preflight`/`fee_rates`/`btc_usd`/
+/// `tip_height` never touch `/address/...` at all (see `Transport for
+/// CoreRpcTransport::get_text`), so configuring descriptors ahead of one
+/// of those would be pure overhead — those call sites keep using
+/// `open_client` directly. Third-party funding-wallet scans
+/// (`State.funding_wallets`) are a DIFFERENT descriptor than this
+/// identity's own and are out of scope here too — they keep using the
+/// per-address fallback, unchanged.
+fn open_client_watched(
+    base: &str,
+    network: Network,
+    creds: Option<(String, String)>,
+    descriptors: &[app_core::chain::WatchDescriptor],
+) -> Result<ChainClient<AnyTransport>, app_core::Error> {
+    let client = open_client(base, network, creds)?;
+    if !descriptors.is_empty() {
+        if let AnyTransport::Core(t) = &client.transport {
+            if let Err(_e) = t.watch_descriptors(descriptors.to_vec()) {
+                #[cfg(debug_assertions)]
+                eprintln!("cb: core-rpc watch-descriptors err={_e}");
+            }
+        }
+    }
+    Ok(client)
+}
+
+/// Source-contract test guarding the U7 ranged-descriptor wiring
+/// (`open_client_watched`, above) — the GUI app's counterpart to
+/// `core_rpc_cli_scan_wires_ranged_watch_descriptors`
+/// (`app-core/tests/core_rpc_conformance.rs`), which proves the SAME
+/// mechanism end-to-end but only for `examples/cli.rs`; it never touches
+/// this file's own production call sites, so a regression here (a 7th
+/// address-resolving site added on the plain constructor, or one of the
+/// 6 existing sites reverted to it) stays green forever otherwise — that
+/// gap is what this module closes.
+///
+/// This can't run against a live node (`cargo test --lib` has none, by
+/// design — see the workspace CLAUDE.md), so it inspects the SOURCE TEXT
+/// of this very file instead (`include_str!`, so it always sees the
+/// CURRENT contents, mutation and all). Brittle by nature — same
+/// tradeoff as the `cb:`/`cli:` log-grep contracts already documented in
+/// the workspace CLAUDE.md — but it is what turns red on exactly the two
+/// regressions the U7 gap allows: (1) reverting one of the 6 named sites
+/// below to plain `open_client`, and (2) swapping any of their
+/// descriptor arguments for an empty slice (`&[]`) — which calls
+/// `open_client_watched` but is behaviorally identical to the plain
+/// constructor, since `watch_descriptors` is a no-op on an empty list.
+///
+/// Why not make `open_client` itself always configure watching (the
+/// stronger fix that would remove this choice entirely)? Evaluated and
+/// rejected: `watch_descriptors` is NOT free per call — a fresh
+/// `CoreRpcTransport` is built on every `open_client`, `wallet_ready`
+/// starts false, so `ensure_watch_wallet` (`createwallet`/`loadwallet`)
+/// and `ranged_family_imported_end` (`listdescriptors`, one per
+/// descriptor family) are REAL round trips EVERY call —
+/// `GLOBAL_WATCH_CACHE` only ever short-circuits the per-address `addr()`
+/// fallback, never `watch_descriptors` itself. Forcing that onto the 9
+/// broadcast-only call sites (money-movement critical, and exactly the
+/// kind of avoidable request this app's whole network-politeness effort
+/// — see the workspace CLAUDE.md's "Network efficiency" section — exists
+/// to eliminate) and the 3 third-party-funding-wallet `scan_funding`
+/// sites (a DIFFERENT descriptor family than this identity's own —
+/// configuring ours ahead of one of those helps nothing) would silently
+/// reverse the U7 commit's own deliberate, tested, documented split. A
+/// type-level split (a wrapper type the plain constructor can't expose
+/// address-resolving methods from) is ALSO not viable without touching
+/// the FROZEN `ChainClient` API: `scan_funding` itself is legitimately
+/// called through BOTH constructors today (identity-own, at
+/// `spending_scan_async`, vs. third-party, at the 3 sites above) — which
+/// constructor is correct depends on which descriptor is being scanned,
+/// a runtime fact no static method-based split can see.
+///
+/// **If you add a new call site that resolves one of the identity's OWN
+/// addresses** (a new `.address_probe(`/`.build_bundle(` call — caught
+/// automatically below, no list to update — or a new helper like
+/// `discover_indexes` that takes a `ChainClient` and walks this
+/// identity's own addresses/descriptors, which this test can't detect
+/// generically): wire it through `open_client_watched` with a real
+/// descriptor snapshot (`st.core_rpc_watch.clone()` before a worker-
+/// thread spawn, same as every site here), and add its enclosing
+/// function's name to `NAMED_WATCH_SITES` below.
+#[cfg(test)]
+mod core_rpc_wiring_contract {
+    /// The current text of this very file — re-read at every compile, so
+    /// this test always judges the ACTUAL source, mutation included.
+    const SRC: &str = include_str!("lib.rs");
+
+    /// Top-level functions whose reason for existing includes resolving
+    /// the identity's OWN addresses via something this test can't detect
+    /// by method name alone:
+    /// - `maybe_start_discovery` hands its client to
+    ///   `app_core::chain::discover_indexes`, not a `ChainClient` method
+    ///   call in this file.
+    /// - `spending_scan_async` calls `.scan_funding(`, which is ALSO
+    ///   legitimately called with a THIRD-PARTY descriptor (the funding-
+    ///   wallet sites, correctly on the plain constructor) — the two
+    ///   uses are textually identical calls, distinguishable only by
+    ///   which function they're in.
+    const NAMED_WATCH_SITES: &[&str] = &["maybe_start_discovery", "spending_scan_async"];
+
+    /// The full text of the top-level `fn <name>` in `src` (its
+    /// signature through its matching closing brace), found by scanning
+    /// for the first subsequent line that is EXACTLY `}` at column 0 —
+    /// every top-level item in this rustfmt'd file closes that way, and
+    /// unlike counting every `{`/`}` byte in the body this is immune to
+    /// the (unbalanced, in general) braces that show up inside string
+    /// literals and prose comments. Panics — a hard test failure, never
+    /// a silent skip — when `name` no longer exists as a top-level `fn`:
+    /// a rename must update `NAMED_WATCH_SITES` (or whatever call site
+    /// added it), not go unnoticed.
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let marker = format!("\nfn {name}(");
+        let rel = src.find(&marker).unwrap_or_else(|| {
+            panic!(
+                "core-rpc wiring contract: `fn {name}` not found as a top-level function in \
+                 src/lib.rs (renamed or removed?) — update NAMED_WATCH_SITES / this test to match."
+            )
+        });
+        let start = rel + 1; // land exactly on "fn ", past the newline we matched on
+        let mut end = start;
+        for line in src[start..].split_inclusive('\n') {
+            end += line.len();
+            if line.trim_end_matches('\n') == "}" {
+                return &src[start..end];
+            }
+        }
+        panic!("core-rpc wiring contract: no top-level closing `{{`}}` found for fn {name}");
+    }
+
+    /// Every occurrence of `needle` (a call like `"open_client_watched("`)
+    /// inside `body`, each returned as its full call text from the callee
+    /// name through the matching closing paren (depth-tracked, so a
+    /// nested call in an argument wouldn't confuse it, though none of the
+    /// call sites here actually nest one).
+    fn find_calls<'a>(body: &'a str, needle: &str) -> Vec<&'a str> {
+        let bytes = body.as_bytes();
+        let mut calls = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = body[from..].find(needle) {
+            let start = from + rel;
+            let paren = start + needle.len() - 1; // index of the call's '('
+            let mut depth = 0i32;
+            let mut i = paren;
+            loop {
+                match bytes[i] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            calls.push(&body[start..=i]);
+            from = i + 1;
+        }
+        calls
+    }
+
+    /// The nearest enclosing top-level `fn NAME` before byte offset `pos`
+    /// in `src` — the last `"\nfn "` before it, name read up to the next
+    /// `(`/whitespace. Closures (`move || { .. }`) never match `"\nfn "`
+    /// (they're never at column 0 as `fn`), so this always resolves to
+    /// the real enclosing function even when `pos` is inside a
+    /// worker-thread closure's body.
+    fn enclosing_fn_name(src: &str, pos: usize) -> String {
+        let prefix = &src[..pos];
+        let idx = prefix.rfind("\nfn ").unwrap_or_else(|| {
+            panic!("core-rpc wiring contract: no enclosing top-level fn found before byte {pos}")
+        });
+        let after_fn = &prefix[idx + 4..]; // skip "\nfn "
+        let end = after_fn.find(|c: char| c == '(' || c.is_whitespace()).unwrap_or(after_fn.len());
+        after_fn[..end].to_string()
+    }
+
+    /// A descriptor-list ARGUMENT that's a literal empty slice — the
+    /// second regression this contract exists to catch. `open_client_watched`
+    /// treats `descriptors.is_empty()` as "nothing to configure" (its own
+    /// doc comment above), so a call like
+    /// `open_client_watched(&base, network, creds, &[])` calls the right
+    /// FUNCTION but is behaviorally byte-identical to plain `open_client`
+    /// — the exact silent regression a reviewer skimming for
+    /// "does it say `_watched`" would miss.
+    fn passes_empty_descriptor_list(call: &str) -> bool {
+        let trimmed = call.trim_end();
+        let trimmed = trimmed.strip_suffix(')').unwrap_or(trimmed);
+        trimmed.trim_end().ends_with("&[]")
+    }
+
+    /// The 6 sites the U7 commit wired deliberately (per its own commit
+    /// message — "Wired at the 6 call sites that actually look up the
+    /// identity's own addresses"). 4 of them (`.address_probe`/
+    /// `.build_bundle`, unambiguous method names) are caught generically
+    /// by `every_address_probe_and_build_bundle_call_uses_the_watched_client`
+    /// below; the other 2 need `NAMED_WATCH_SITES` because what makes
+    /// them "identity-own" isn't visible in the method name alone (see
+    /// its doc comment).
+    #[test]
+    fn named_watch_sites_use_watched_client_with_a_real_descriptor_list() {
+        for &name in NAMED_WATCH_SITES {
+            let body = fn_body(SRC, name);
+            assert!(
+                body.contains("open_client_watched("),
+                "core-rpc wiring contract: fn {name} no longer calls open_client_watched — it \
+                 resolves one of the identity's OWN addresses (see the U7 commit / \
+                 PLAN-chain-notes-app-core-rpc.md) and must build its ChainClient through the \
+                 watched constructor with a real descriptor list, or every address it touches \
+                 pays for a per-address genesis rescan instead of one ranged import per \
+                 descriptor family.",
+            );
+            assert!(
+                !body.contains("open_client("),
+                "core-rpc wiring contract: fn {name} ALSO calls the plain open_client — this \
+                 function resolves identity-owned addresses and must do so exclusively through \
+                 open_client_watched.",
+            );
+            for call in find_calls(body, "open_client_watched(") {
+                assert!(
+                    !passes_empty_descriptor_list(call),
+                    "core-rpc wiring contract: fn {name}'s open_client_watched call passes an \
+                     EMPTY descriptor list — `{call}` — which is behaviorally identical to the \
+                     plain open_client (watch_descriptors no-ops on an empty list). Pass the \
+                     real `core_rpc_watch`/`st.core_rpc_watch` snapshot instead.",
+                );
+            }
+        }
+    }
+
+    /// Generalizes past `NAMED_WATCH_SITES`: EVERY call to
+    /// `.address_probe(`/`.build_bundle(` anywhere in this file — present
+    /// or future, no list to keep in sync — must live in a function that
+    /// configures ranged watching via `open_client_watched`. Unlike
+    /// `scan_funding`, these two methods are never legitimately called
+    /// against a third-party descriptor anywhere in this app (only ever
+    /// against the active identity's own address), so the method name
+    /// alone is enough signal here.
+    #[test]
+    fn every_address_probe_and_build_bundle_call_uses_the_watched_client() {
+        for needle in [".address_probe(", ".build_bundle("] {
+            let mut from = 0usize;
+            while let Some(rel) = SRC[from..].find(needle) {
+                let pos = from + rel;
+                from = pos + needle.len();
+                let fname = enclosing_fn_name(SRC, pos);
+                let body = fn_body(SRC, &fname);
+                assert!(
+                    body.contains("open_client_watched("),
+                    "core-rpc wiring contract: fn {fname} calls {needle} (an identity-own \
+                     address lookup) but never configures ranged-descriptor watching via \
+                     open_client_watched — build its ChainClient with \
+                     open_client_watched(..., &st.core_rpc_watch) instead of the plain \
+                     open_client, or every address it resolves pays for a per-address genesis \
+                     rescan instead of one ranged import per descriptor family.",
+                );
+            }
+        }
+    }
 }
 
 /// Pure form of `State::core_rpc_should_persist`: default true (an absent
@@ -5720,10 +6123,11 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
     let watch_src_for_change = st.ident.as_ref().and_then(|i| i.watch_source()).cloned();
     let key = format!("wstores/{fp8}/{}/{account}", network.as_str());
     let creds = core_rpc_creds_for(st, &base, network);
+    let core_watch = st.core_rpc_watch.clone();
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
-        let client = match open_client(&base, network, creds) {
+        let client = match open_client_watched(&base, network, creds, &core_watch) {
             Ok(c) => c,
             Err(e) => {
                 // A malformed node URL fails the whole scan — every notebook's
@@ -7019,6 +7423,7 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
         st.notebooks.as_ref().map(|ix| ix.active(account).map(|m| m.index).collect()).unwrap_or_default();
     let key = format!("discovery/{fp8}/{account}");
     let creds = core_rpc_creds_for(st, &base, network);
+    let core_watch = st.core_rpc_watch.clone();
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
@@ -7026,7 +7431,7 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
             .map(|material| {
                 // A malformed node URL degrades exactly like any other
                 // transport error here — best-effort, empty result.
-                match open_client(&base, network, creds) {
+                match open_client_watched(&base, network, creds, &core_watch) {
                     Ok(client) => {
                         // gap=1 (Sal 2026-07-23): notebooks are used
                         // sequentially from index 0, so stop at the first
@@ -7098,10 +7503,11 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
     let prev_stats = st.store.as_ref().unwrap().addr_stats.clone();
     let key = format!("nbscan/{address}");
     let creds = core_rpc_creds_for(st, &base, network);
+    let core_watch = st.core_rpc_watch.clone();
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
-        let client = match open_client(&base, network, creds) {
+        let client = match open_client_watched(&base, network, creds, &core_watch) {
             Ok(c) => c,
             Err(e) => {
                 REFRESH_RESULTS.lock().expect("refresh results mutex").push(RefreshResult {
@@ -7427,7 +7833,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
         return;
     };
     let creds = core_rpc_creds_for(st, &base, st.network);
-    let client = match open_client(&base, st.network, creds) {
+    let client = match open_client_watched(&base, st.network, creds, &st.core_rpc_watch) {
         Ok(c) => c,
         Err(e) => {
             println!("cb: refresh err={e}");
@@ -7654,6 +8060,7 @@ fn spending_scan_async(w: &AppWindow, st: &mut State, gap: u32) {
     let Some(fp8) = st.notebooks_fp8.clone() else { return };
     let key = format!("spscan/{fp8}/{}/{account}", network.as_str());
     let creds = core_rpc_creds_for(st, &base, network);
+    let core_watch = st.core_rpc_watch.clone();
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
@@ -7662,7 +8069,7 @@ fn spending_scan_async(w: &AppWindow, st: &mut State, gap: u32) {
             .as_ref()
             .map_err(|e| e.to_string())
             .and_then(|m| app_core::spending::funding_source(m, network, account).map_err(|e| e.to_string()));
-        let client = open_client(&base, network, creds).map_err(|e| e.to_string());
+        let client = open_client_watched(&base, network, creds, &core_watch).map_err(|e| e.to_string());
         // ONE merged walk (network-efficiency, 2026-07-23): `scan_funding`
         // now reports used addresses (receive AND change — so OWN-detection
         // on rescan covers coins this app never explicitly "handed out",
@@ -11575,6 +11982,7 @@ pub fn run() {
         coins_overridden: false,
         consolidate_coins: false,
         material: None,
+        core_rpc_watch: Vec::new(),
         icloud_backup: false,
         terms_accepted,
         auto_unlock,
