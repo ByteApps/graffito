@@ -21,6 +21,27 @@
 # direct `bitcoin-cli` calls — the app itself speaks ONLY Core RPC in this
 # mode, which is the whole point of the unit: proving the app needs no
 # shim. The default (no-arg) mode is byte-identical to before this unit.
+#
+# --pi-regtest (validation for PLAN-chain-notes-app-core-rpc.md's "prove it
+# against a REAL node" gap): runs the SAME legs, over the Core RPC backend
+# like --core-rpc, but against a real, PERSISTENT, SHARED `bitcoind -regtest`
+# this script does NOT own (reached over an already-up SSH tunnel, e.g. a
+# Raspberry Pi — see chain-notes-app's task history). It never starts,
+# stops, wipes, reindexes, or assumes a fresh chain: mining is allowed
+# (regtest coins are worthless, and it's how the harness confirms), but
+# every balance this script asserts must belong to an address THIS RUN
+# derived and nothing else has ever touched. Since the node/chain persist
+# across runs, reusing this script's usual FIXED test mnemonics unmodified
+# would make every absolute "balance=N" assertion flaky (accumulating
+# leftovers from earlier runs) — so this mode threads one random
+# `APP_ACCOUNT` (BIP-86/BIP-84 hardened account index, same master
+# mnemonics, byte-identical derivation code) through the whole script, and
+# randomizes the two external-funding seeds (raw entropy, no mnemonic
+# checksum to preserve) — giving every chain-touching identity a
+# never-before-seen address on the shared chain without changing a single
+# assertion. Requires `CORE_RPC_USER`/`CORE_RPC_PASS` in the environment
+# (the same vars the CLI itself reads) — this script never reads or prints
+# the credential values, only forwards the env.
 set -euo pipefail
 
 RED=$'\033[31m'; GRN=$'\033[32m'; NC=$'\033[0m'
@@ -28,9 +49,13 @@ pass() { echo "${GRN}PASS${NC} $*"; }
 fail() { echo "${RED}FAIL${NC} $*"; exit 1; }
 
 CORE_RPC=0
-if [[ "${1:-}" == "--core-rpc" ]]; then
-    CORE_RPC=1
-fi
+PI_REGTEST=0
+case "${1:-}" in
+    --core-rpc) CORE_RPC=1 ;;
+    --pi-regtest) PI_REGTEST=1 ;;
+    "") ;;
+    *) fail "unknown arg ${1:-}: usage: $0 [--core-rpc|--pi-regtest]" ;;
+esac
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 PRIME="$(cd "$REPO/../prime-chain-notes" && pwd)" || fail "needs ../prime-chain-notes"
@@ -44,18 +69,21 @@ APP="$REPO/target/debug/examples/cli"
 NOTES="$PRIME/target/debug/examples/notes_cli"
 
 # ---------------------------------------------------------------------------
-# Backend setup: Esplora (server.py-managed regtest, default) or Core RPC
-# (a throwaway bitcoind THIS script starts/stops directly, no shim).
+# Backend setup: Esplora (server.py-managed regtest, default), Core RPC
+# (a throwaway bitcoind THIS script starts/stops directly, no shim), or
+# --pi-regtest (Core RPC against a real, PERSISTENT, SHARED bitcoind this
+# script does not own — see the file-header comment).
 #
-# Both branches define the same four harness verbs the rest of the script
-# calls: `mine_blocks N`, `faucet ADDR BTC`, `broadcast_raw HEX FAILMSG`,
-# `broadcast_raw_check HEX OUTFILE`. These are TEST-HARNESS conveniences —
-# server.py exposes the first two as HTTP routes and auto-mines on the last
-# two; the app itself never calls any of them. In --core-rpc mode every one
-# of the four is a direct `bitcoin-cli` call, and mining is EXPLICIT after
-# every broadcast (Core mode's transport deliberately does not auto-mine —
-# see chain.rs's `CoreRpcTransport::post_text` doc comment — so this script
-# must do what server.py's POST /tx handler used to do for it).
+# All three branches define the same four harness verbs the rest of the
+# script calls: `mine_blocks N`, `faucet ADDR BTC`, `broadcast_raw HEX
+# FAILMSG`, `broadcast_raw_check HEX OUTFILE`. These are TEST-HARNESS
+# conveniences — server.py exposes the first two as HTTP routes and
+# auto-mines on the last two; the app itself never calls any of them. In
+# both direct-bitcoind modes every one of the four is a direct
+# `bitcoin-cli` call, and mining is EXPLICIT after every broadcast (Core
+# mode's transport deliberately does not auto-mine — see chain.rs's
+# `CoreRpcTransport::post_text` doc comment — so this script must do what
+# server.py's POST /tx handler used to do for it).
 if [[ "$CORE_RPC" == 1 ]]; then
     echo "== start our OWN regtest bitcoind (no companion shim — Core RPC mode) =="
     CORE_PORT="${E2E_CORE_PORT:-$((19000 + ($$ % 3000)))}"
@@ -147,6 +175,84 @@ CONF
     echo "bitcoind up (datadir $CORE_DATADIR, port $CORE_PORT), 101 blocks mined"
 
     BASE="bitcoind+http://127.0.0.1:$CORE_PORT"
+elif [[ "$PI_REGTEST" == 1 ]]; then
+    echo "== targeting the tunnelled PERSISTENT regtest bitcoind (Core RPC mode, no shim) =="
+    : "${CORE_RPC_USER:?--pi-regtest needs CORE_RPC_USER in the environment}"
+    : "${CORE_RPC_PASS:?--pi-regtest needs CORE_RPC_PASS in the environment}"
+    export CORE_RPC_USER CORE_RPC_PASS
+    PI_HOST="${E2E_PI_HOST:-127.0.0.1}"
+    PI_PORT="${E2E_PI_PORT:-18443}"
+
+    core_cli() { bitcoin-cli -regtest -rpcconnect="$PI_HOST" -rpcport="$PI_PORT" -rpcuser="$CORE_RPC_USER" -rpcpassword="$CORE_RPC_PASS" "$@"; }
+    # The node's OWN pre-existing funded wallet (~899 BTC per the task
+    # brief) — we spend FROM it (sendtoaddress/generatetoaddress) but never
+    # create, load, rename, or reset it. It is not ours.
+    miner_cli() { core_cli -rpcwallet=testwallet "$@"; }
+
+    # No process to start/stop, no datadir to make or clean up — this is
+    # someone else's persistent node, reached over an already-up tunnel.
+    # NOT wiped, NOT reset, NOT reindexed, NOT assumed fresh.
+    core_cli getblockchaininfo >/dev/null 2>&1 \
+        || fail "cannot reach the tunnelled regtest node at $PI_HOST:$PI_PORT (is the SSH tunnel up?)"
+    miner_cli getwalletinfo >/dev/null 2>&1 \
+        || fail "testwallet is not loaded on the tunnelled node — this script does not load/create it"
+
+    mine_blocks() { # n — same async wallet-drain guard as --core-rpc
+        local n="$1" addr
+        addr="$(miner_cli getnewaddress)"
+        miner_cli generatetoaddress "$n" "$addr" >/dev/null
+        core_cli syncwithvalidationinterfacequeue >/dev/null 2>&1 || true
+    }
+    faucet() { # addr amount_btc
+        miner_cli sendtoaddress "$1" "$2" >/dev/null
+        mine_blocks 1
+    }
+    broadcast_raw() { # hex failmsg
+        core_cli sendrawtransaction "$1" >/dev/null || fail "$2"
+        mine_blocks 1
+    }
+    broadcast_raw_check() { # hex outfile
+        local hex="$1" outfile="$2" out
+        if out="$(core_cli sendrawtransaction "$hex" 2>&1)"; then
+            printf '%s' "$out" > "$outfile"
+            mine_blocks 1
+        else
+            printf '%s' "$out" > "$outfile"
+        fi
+    }
+
+    PI_TIP_BEFORE="$(core_cli getblockcount)"
+    echo "tunnelled node reachable: tip=$PI_TIP_BEFORE (persistent chain — untouched, no reset/wipe/mine-101)"
+
+    BASE="bitcoind+http://$PI_HOST:$PI_PORT"
+
+    # This node/chain is SHARED and outlives this script — re-running it
+    # with the other modes' FIXED test mnemonics would make every absolute
+    # "balance=N" assertion below flaky (accumulating leftovers from
+    # earlier runs against the same addresses). So every chain-touching
+    # identity gets a fresh, never-before-seen derivation this run only:
+    # one random hardened BIP-86/BIP-84 account index (same mnemonics, same
+    # derivation code — `identity()`/`realize()` already take APP_ACCOUNT
+    # from the environment, so no app-core change was needed) for every
+    # mnemonic-keyed identity below, plus two random raw-entropy seeds for
+    # the external-funding legs (`fund-keygen` derives straight from raw
+    # seed bytes, no BIP-39 checksum to preserve, so a fresh random hex
+    # string is enough). Override any of these via env for a reproducible
+    # re-run against a KNOWN-fresh account/seed.
+    PI_ACCOUNT="${E2E_PI_ACCOUNT:-$(( $(date +%s) % 1000000 ))}"
+    export APP_ACCOUNT="$PI_ACCOUNT"
+    PI_FUND_SEED_TR="${E2E_PI_FUND_SEED_TR:-$(openssl rand -hex 32)}"
+    PI_FUND_SEED_WPKH="${E2E_PI_FUND_SEED_WPKH:-$(openssl rand -hex 32)}"
+    # The "prime" role's identity (notes_cli) is normally the SAME fixed
+    # built-in test seed on every mode/run — fine for the other modes'
+    # throwaway chains, but on the shared persistent chain a fixed P_ADDR
+    # accumulates NOTE TEXT across runs too (not just balance): several
+    # assertions below check "exactly one note with THIS exact text",
+    # which a second run against the same P_ADDR would violate (the text
+    # strings are fixed literals, not per-run-unique). Fresh seed = fresh
+    # P_ADDR = fresh note history every run.
+    PI_PRIME_SEED="${E2E_PI_PRIME_SEED:-$(openssl rand -hex 32)}"
+    echo "pi-regtest: APP_ACCOUNT=$PI_ACCOUNT (fresh this run — never reused against the shared chain)"
 else
     BASE="http://127.0.0.1:$PORT/regtest/api"
 
@@ -167,14 +273,28 @@ else
     broadcast_raw_check() { curl -s -X POST "$BASE/tx" --data-binary "$1" >"$2" || true; }
 fi
 
+# Both direct-bitcoind modes (--core-rpc and --pi-regtest) share the same
+# "Core mode's transport deliberately does not auto-mine" property, so
+# every post-broadcast mine step below is gated on this instead of
+# `$CORE_RPC` alone.
+MINE_AFTER_BROADCAST=0
+[[ "$CORE_RPC" == 1 || "$PI_REGTEST" == 1 ]] && MINE_AFTER_BROADCAST=1
+
 # App identity: a BIP-39 mnemonic exercises the flagship import format.
 export APP_KEY="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 A_ADDR="$("$APP" address regtest)"
 [[ "$A_ADDR" == bcrt1p* ]] || fail "app address not taproot: $A_ADDR"
 pass "app address $A_ADDR"
 
-# Prime identity (notes_cli's fixed test-seed default).
-unset NOTES_APP_SEED
+# Prime identity: the fixed test-seed default everywhere EXCEPT
+# --pi-regtest, which needs a fresh one every run (see the pi-regtest
+# setup comment above — accumulated note TEXT on the shared chain, not
+# just balance, would otherwise collide across runs).
+if [[ "$PI_REGTEST" == 1 ]]; then
+    export NOTES_APP_SEED="$PI_PRIME_SEED"
+else
+    unset NOTES_APP_SEED
+fi
 P_ADDR="$("$NOTES" address regtest)"
 [[ "$P_ADDR" == bcrt1p* ]] || fail "prime address not taproot: $P_ADDR"
 pass "prime address $P_ADDR"
@@ -217,7 +337,7 @@ echo "== self-notes: public, then private CHAINED on unconfirmed change =="
 # the public tx's still-unconfirmed change (app-core's local Store ledger
 # tracks that pending output the instant it signs, before any scan/mine),
 # and only the follow-up scan below needs both confirmed.
-if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
+if [[ "$MINE_AFTER_BROADCAST" == 1 ]]; then mine_blocks 1; fi
 "$APP" scan "$STORE" "$BASE" >/dev/null
 "$APP" notes "$STORE" | tee "$WORK/notes1" | grep -q "status=confirmed .*text=hello public from app" || fail "public note confirmed"
 grep -q "private=true .*text=hello private from app" "$WORK/notes1" || fail "private note confirmed"
@@ -261,7 +381,7 @@ external_funding() { # <tr|wpkh> <seed-hex> <note-text>
         || fail "[$kind] fund-sign signed no inputs: $(cat "$WORK/fs-$kind.log")"
     FTXID="$("$APP" fund-finalize "$BASE" regtest "$SIGNED" 2>"$WORK/ff-$kind.log")"
     grep -q "broadcast=ok" "$WORK/ff-$kind.log" || fail "[$kind] fund-finalize: $(cat "$WORK/ff-$kind.log")"
-    if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
+    if [[ "$MINE_AFTER_BROADCAST" == 1 ]]; then mine_blocks 1; fi
     pass "[$kind] external-funded directed note built+signed+finalized+broadcast (txid=$FTXID)"
 
     # Prime decrypts it via the candidate-key path: the author key is not the
@@ -275,12 +395,20 @@ external_funding() { # <tr|wpkh> <seed-hex> <note-text>
         || fail "[$kind] prime did not decrypt externally-funded note: $(cat "$WORK/prime-$kind-scan.json")"
     pass "[$kind] prime decrypted externally-funded note via candidate key, attributed to the app identity"
 }
-external_funding tr 1111111111111111111111111111111111111111111111111111111111111111 "funded by cold storage"
-external_funding wpkh 2222222222222222222222222222222222222222222222222222222222222222 "funded by a segwit wallet"
+if [[ "$PI_REGTEST" == 1 ]]; then
+    # Fresh per-run seeds (see the pi-regtest setup comment above) — the
+    # OTHER modes' fixed seeds would reuse the same funding addresses
+    # across runs against the shared persistent chain.
+    external_funding tr "$PI_FUND_SEED_TR" "funded by cold storage"
+    external_funding wpkh "$PI_FUND_SEED_WPKH" "funded by a segwit wallet"
+else
+    external_funding tr 1111111111111111111111111111111111111111111111111111111111111111 "funded by cold storage"
+    external_funding wpkh 2222222222222222222222222222222222222222222222222222222222222222 "funded by a segwit wallet"
+fi
 
 echo "== app → prime: directed PRIVATE note =="
 "$APP" compose "$STORE" "$BASE" private 1.0 "psst prime, from the app" "$P_ADDR" | grep -q broadcast=ok || fail "directed compose"
-if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
+if [[ "$MINE_AFTER_BROADCAST" == 1 ]]; then mine_blocks 1; fi
 "$APP" bundle "$P_ADDR" regtest "$BASE" "$WORK/prime.json" >/dev/null
 "$NOTES" scan "$WORK/prime.json" >"$WORK/prime-scan.json"
 jq -e --arg from "$A_ADDR" \
@@ -353,7 +481,7 @@ faucet "$SPEND_ADDR1" 0.0005
 mine_blocks 1
 "$APP" note-spend-funded "$FU_STORE" "$BASE" public 2.0 "funded self note" \
     | tee "$WORK/fu-leg1.log" | grep -q "broadcast=ok" || fail "fu leg1: note-spend-funded: $(cat "$WORK/fu-leg1.log")"
-if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
+if [[ "$MINE_AFTER_BROADCAST" == 1 ]]; then mine_blocks 1; fi
 pass "fu leg1: funded self-note composed + signed + broadcast entirely in-app via the spending wallet"
 
 "$APP" scan "$FU_STORE" "$BASE" >/dev/null
@@ -369,7 +497,7 @@ faucet "$SPEND_ADDR2" 0.0005
 mine_blocks 1
 "$APP" note-spend-funded "$FU_STORE" "$BASE" private 2.0 "funded directed note" "$P_ADDR" \
     | tee "$WORK/fu-leg2.log" | grep -q "broadcast=ok" || fail "fu leg2: note-spend-funded: $(cat "$WORK/fu-leg2.log")"
-if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
+if [[ "$MINE_AFTER_BROADCAST" == 1 ]]; then mine_blocks 1; fi
 pass "fu leg2: funded directed-private note composed + signed + broadcast entirely in-app via the spending wallet"
 
 "$APP" scan "$FU_STORE" "$BASE" >/dev/null
@@ -406,7 +534,7 @@ echo "== fu leg 5b: the EXISTING consolidate (sweep-to-self) path sweeps the acc
 "$APP" sweep "$FU_STORE" "$BASE" "$FU_ADDR" 1.0 \
     | tee "$WORK/fu-consolidate.log" | grep -q "^cli: sweep txid=" \
     || fail "fu leg5b: dust consolidate: $(cat "$WORK/fu-consolidate.log")"
-if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
+if [[ "$MINE_AFTER_BROADCAST" == 1 ]]; then mine_blocks 1; fi
 "$APP" scan "$FU_STORE" "$BASE" | tee "$WORK/fu-scan-post-consolidate" >/dev/null
 FU_BAL_POST="$(grep -o 'balance=[0-9]*' "$WORK/fu-scan-post-consolidate" | cut -d= -f2)"
 [[ "$FU_BAL_POST" -gt 0 && "$FU_BAL_POST" -lt 660 ]] \
@@ -467,7 +595,7 @@ export APP_KEY="$MFU_KEY"
     "$M_R1" "$M_R2" "$M_R3" \
     | tee "$WORK/multi-fu-leg.log" | grep -q "recipients=3 sent_to_recipient=1500 .*broadcast=ok" \
     || fail "multi leg: note-spend-funded-multi: $(cat "$WORK/multi-fu-leg.log")"
-if [[ "$CORE_RPC" == 1 ]]; then mine_blocks 1; fi
+if [[ "$MINE_AFTER_BROADCAST" == 1 ]]; then mine_blocks 1; fi
 pass "multi leg: 3-recipient spending-wallet-funded note (uniform 500-sat gift, 1500 sats total) composed + signed + broadcast entirely in-app"
 
 # Each recipient decrypts/decodes its own copy of the PUBLIC multi-recipient
@@ -490,4 +618,9 @@ pass "multi leg: all three recipients independently scan + read the multi-recipi
 if [[ "$CORE_RPC" == 1 ]]; then
     echo
     pass "Core RPC mode (--core-rpc): every leg above ran against a real bitcoind with NO companion shim in the loop"
+fi
+if [[ "$PI_REGTEST" == 1 ]]; then
+    PI_TIP_AFTER="$(core_cli getblockcount)"
+    echo
+    pass "pi-regtest mode: every leg above ran against the tunnelled PERSISTENT regtest node (Core RPC, no shim) — tip $PI_TIP_BEFORE -> $PI_TIP_AFTER, account=$PI_ACCOUNT, node never reset/wiped/reindexed"
 fi
