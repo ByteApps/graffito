@@ -585,6 +585,98 @@ pub struct WatchDescriptor {
     pub range_end: u32,
 }
 
+/// Initial `range_end` a freshly-configured [`WatchDescriptor`] family gets
+/// (U7, the wiring unit — `../../PLAN-chain-notes-app-core-rpc.md` §2.2's
+/// "ranged descriptor import" finally gets a caller). 20 addresses per
+/// chain (0 through 19) mirrors the standard BIP-44-style gap limit this
+/// app already uses elsewhere for a FIRST look (`SPENDING_GAP_SHALLOW`-style
+/// sizing in `src/lib.rs`, `chain::discover_indexes`'s stop-after-5-unused
+/// rule) — enough that an ordinary notebook/spending wallet's real usage is
+/// covered by the FIRST import (no immediate widen round-trip). Note this
+/// does NOT bound the actual RPC cost tightly: `bitcoind` itself pads any
+/// requested ranged-descriptor span up to a minimum of ~999 (verified live
+/// — see `core_rpc_conformance.rs`'s `core_rpc_range_widening_finds_
+/// address_beyond_initial_range` test), so the node ends up scanning a
+/// similarly-sized window regardless of exactly what's requested here — the
+/// real savings this unit delivers is ONE rescan pass per FAMILY instead of
+/// one per ADDRESS, not a smaller per-family range.
+/// [`CoreRpcTransport::ranged_lookup_or_widen`] grows this further (in
+/// `CoreRpcTransport::WIDEN_CHUNK`-sized steps) the moment a real query
+/// needs an index beyond whatever the node actually imported.
+const RANGED_WATCH_INITIAL_RANGE_END: u32 = 19;
+
+/// Bitcoin Core ranged-watch [`WatchDescriptor`]s for one identity's active
+/// (account, network) — U7, the wiring unit: this is the ONLY place the app
+/// (`src/lib.rs`'s `open_client`) and its CLI proxy (`examples/cli.rs`)
+/// derive them, so both stay byte-identical and neither hand-rolls a second
+/// derivation. Reuses the SAME functions the Settings "Reveal keys" screen
+/// and the spending wallet already call — [`crate::keyexport::export_formats`]
+/// for the notebook `tr(...)` (or watch-only) descriptor and
+/// [`crate::spending::funding_descriptor`] for the BIP-84 `wpkh(...)`
+/// spending descriptor — so this is purely ADDITIVE wiring, never a new
+/// derivation path to keep byte-identical with anything.
+///
+/// **Birthday is always genesis (`timestamp: 0`).** This app has no field
+/// anywhere that records "when was this identity's seed first generated" —
+/// `store.rs`'s `NoteRecord`/`TxRecord.created_at` are per-transaction
+/// compose times, not a wallet birthday — so there is no honest non-zero
+/// value to offer here. [`WatchDescriptor::timestamp`]'s own doc comment
+/// and the per-address `addr()` fallback (`CoreRpcTransport::
+/// ensure_address_watched`) both already treat "substituting a recent
+/// default would silently miss real history" as strictly worse than being
+/// slow; this function makes the identical call for the ranged path. The
+/// win over the per-address fallback is NOT "skip the rescan" — it's
+/// collapsing what used to be one full-chain rescan PER ADDRESS into one
+/// full-chain rescan PER FAMILY (both chains, `RANGED_WATCH_INITIAL_RANGE_END`
+/// indexes, in a single `importdescriptors` call) — see
+/// `core_rpc_import_descriptors_call_count` and the U6 commit this unit
+/// builds on. A future unit could special-case a freshly-CREATED-in-app
+/// identity (provably no history before its generation instant) with a
+/// real non-zero birthday; nothing here does that yet.
+///
+/// Returns one entry per capability the identity actually has: none for
+/// single-key material (WIF/hex — one address each, no range to speak of,
+/// the per-address fallback already covers it byte-for-byte), one
+/// (notebook) entry for hierarchical (mnemonic/xprv) or watch-only
+/// (xpub/descriptor) material, plus a second (spending) entry when the
+/// material can also derive the BIP-84 spending wallet
+/// ([`crate::spending::can_derive_spending`] — watch-only never can, no
+/// private key to derive it from). Every derivation here is a handful of
+/// secp256k1 scalar multiplications (account-level, not per-address) —
+/// cheap, but still real CPU, which is why callers configure this ONCE per
+/// (identity, account, network) rather than on every `open_client` call
+/// (24 call sites in `src/lib.rs` alone).
+pub fn identity_watch_descriptors(
+    material_str: &str,
+    network: Network,
+    account: u32,
+) -> Vec<WatchDescriptor> {
+    let mut out = Vec::with_capacity(2);
+    if let Ok(formats) = crate::keyexport::export_formats(material_str, network, account, 0) {
+        if let Some(descriptor) = formats.descriptor {
+            out.push(WatchDescriptor {
+                descriptor,
+                network,
+                timestamp: 0,
+                range_end: RANGED_WATCH_INITIAL_RANGE_END,
+            });
+        }
+    }
+    if let Ok(material) = crate::identity::parse_key_material(material_str, network) {
+        if crate::spending::can_derive_spending(&material) {
+            if let Ok(descriptor) = crate::spending::funding_descriptor(&material, network, account) {
+                out.push(WatchDescriptor {
+                    descriptor,
+                    network,
+                    timestamp: 0,
+                    range_end: RANGED_WATCH_INITIAL_RANGE_END,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// One configured [`WatchDescriptor`], parsed once and kept alongside its
 /// currently-imported range and a local address→(chain,index) cache built
 /// purely by derivation (no RPC) up to that range.
@@ -1446,6 +1538,20 @@ impl CoreRpcTransport {
     /// chains to speak of — irrelevant there). A caller with nothing to
     /// configure need not call this at all; every existing address query
     /// keeps working through the U3 per-address fallback untouched.
+    ///
+    /// U7 (the wiring unit): `src/lib.rs`'s `open_client` now calls this on
+    /// EVERY `ChainClient`/transport it builds (24 call sites, one fresh
+    /// `CoreRpcTransport` per call — see U6's commit message) whenever the
+    /// active identity has at least one descriptor to configure, so this
+    /// runs far more often than U4's own tests ever called it. Each spec is
+    /// therefore checked against the NODE (`Self::ranged_family_imported_end`,
+    /// a `listdescriptors` read) before importing — the exact same
+    /// node-truth idempotence `Self::ensure_address_watched` already applies
+    /// to the per-address path (U6), for the identical reason: an in-memory
+    /// "already configured" flag on `self` cannot survive the per-call
+    /// transport churn, but `listdescriptors` can. A family already imported
+    /// with a range covering what's requested costs one cheap read, never a
+    /// re-`importdescriptors`/re-rescan.
     pub fn watch_descriptors(&self, specs: Vec<WatchDescriptor>) -> Result<(), Error> {
         if specs.is_empty() {
             return Ok(());
@@ -1454,15 +1560,67 @@ impl CoreRpcTransport {
         let mut configured = Vec::with_capacity(specs.len());
         for spec in specs {
             let source = FundingSource::parse(&spec.descriptor, spec.network)?;
-            self.import_ranged(&spec, spec.range_end)?;
+            let requested_end = spec.range_end;
+            let imported_end = match self.ranged_family_imported_end(&spec)? {
+                // The node already covers (or exceeds) what's requested —
+                // no RPC round trip, no rescan. A wider PRIOR import (e.g. a
+                // previous session's widen) is preserved rather than
+                // narrowed back down.
+                Some(existing) if existing >= requested_end => existing,
+                // Absent, or imported with a narrower range than requested —
+                // (re-)import up to `requested_end`. Safe to repeat: a
+                // second `importdescriptors` for an already-imported
+                // descriptor simply extends its cached range (verified live,
+                // see `Self::import_ranged`'s doc comment).
+                _ => {
+                    self.import_ranged(&spec, requested_end)?;
+                    requested_end
+                }
+            };
             let mut rw = RangedWatch { spec, source, imported_end: 0, index: HashMap::new() };
-            let end = rw.spec.range_end;
-            Self::populate_index(&mut rw, 0, end);
-            rw.imported_end = end;
+            Self::populate_index(&mut rw, 0, imported_end);
+            rw.imported_end = imported_end;
             configured.push(rw);
         }
         self.ranged.lock().expect("ranged-watch mutex poisoned").extend(configured);
         Ok(())
+    }
+
+    /// The `xpub`/`tpub` token inside a descriptor string, or `None` when it
+    /// carries neither. The production counterpart to
+    /// `core_rpc_conformance.rs`'s test-only `xpub_of` helper (kept
+    /// independent — a test file must never depend on crate-internal
+    /// production code, and vice versa) — same reasoning: bitcoind
+    /// normalizes `'` to `h` and splits a `<0;1>` multipath import into two
+    /// single-path `listdescriptors` entries, but the xpub/tpub token itself
+    /// survives both untouched, so it's the one thing safe to match a
+    /// caller-supplied descriptor against a `listdescriptors` response with.
+    fn descriptor_xpub_token(descriptor: &str) -> Option<&str> {
+        descriptor.split(['(', ')', '[', ']', '/']).find(|s| s.starts_with("xpub") || s.starts_with("tpub"))
+    }
+
+    /// U7: node-truth idempotence for the ranged path — `listdescriptors`
+    /// against the watch wallet, filtered to entries whose descriptor
+    /// carries `spec`'s own xpub/tpub token. Returns the SMALLER of the two
+    /// chains' `range[1]` when BOTH are found (an interrupted prior import
+    /// that only landed one chain must still be treated as needing a fresh
+    /// import, so the other chain gets covered too); `None` when the node
+    /// doesn't have both chains configured yet, or `spec`'s descriptor
+    /// carries no xpub/tpub token at all (nothing to safely match on — treat
+    /// as unconfigured, same as a fresh node).
+    fn ranged_family_imported_end(&self, spec: &WatchDescriptor) -> Result<Option<u32>, Error> {
+        let Some(token) = Self::descriptor_xpub_token(&spec.descriptor) else { return Ok(None) };
+        let v = self.rpc(Some(Self::WATCH_WALLET), "listdescriptors", serde_json::json!([]))?;
+        let entries = v.get("descriptors").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+        let ends: Vec<u32> = entries
+            .iter()
+            .filter(|d| d.get("desc").and_then(|s| s.as_str()).is_some_and(|desc| desc.contains(token)))
+            .map(|d| d.get("range").and_then(|r| r.get(1)).and_then(|e| e.as_u64()).unwrap_or(0) as u32)
+            .collect();
+        if ends.len() < 2 {
+            return Ok(None);
+        }
+        Ok(ends.into_iter().min())
     }
 
     /// Derive `[from..=to]` on both chains of `rw.source`, inserting every

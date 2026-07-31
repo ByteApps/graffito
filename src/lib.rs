@@ -346,6 +346,19 @@ struct State {
     /// true = consolidate (smallest-first).
     consolidate_coins: bool,
     material: Option<Zeroizing<String>>, // session cache: avoids re-prompting Touch ID
+    /// Bitcoin Core RPC ranged-watch descriptors (U7,
+    /// `../PLAN-chain-notes-app-core-rpc.md` §2.2's "ranged descriptor
+    /// import" finally gets a caller) for the ACTIVE (identity, account,
+    /// network) — computed ONCE by `activate()` from `material` via
+    /// `app_core::chain::identity_watch_descriptors` and cloned into every
+    /// `open_client_watched` call from here, rather than re-derived (a
+    /// handful of secp256k1 scalar multiplications each) on every one of
+    /// `open_client`'s ~24 call sites. Empty for single-key (WIF/hex)
+    /// material or when nothing is active — those addresses/identities are
+    /// unaffected: `open_client_watched` degrades to the plain per-address
+    /// `addr()` fallback exactly like `open_client` always has. Irrelevant
+    /// (never read) for an Esplora backend.
+    core_rpc_watch: Vec<app_core::chain::WatchDescriptor>,
     /// iCloud Keychain backup opt-in: when true the key is stored as a
     /// synchronizable Keychain item (syncs across the user's Apple devices and
     /// survives reinstall). Reflects the current stored item's sync state.
@@ -1335,6 +1348,7 @@ impl State {
             coins_overridden: false,
             consolidate_coins: false,
             material: None,
+            core_rpc_watch: Vec::new(),
             icloud_backup: false,
             terms_accepted: false,
             auto_unlock: false,
@@ -3111,6 +3125,16 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
         }
     }
     st.material = Some(Zeroizing::new(material_str.trim().to_string()));
+    // U7 (Bitcoin Core RPC ranged-watch wiring): (re)computed HERE, the
+    // established choke point for every (identity, account, network)
+    // change (boot, import, restore, network switch, account switch —
+    // `activate()` is the sole place all of those funnel through), so the
+    // account-level EC derivation this does runs once per such change
+    // rather than on every one of `open_client_watched`'s call sites.
+    // Cheap to always compute regardless of the active backend — it's only
+    // READ when `open_client_watched` finds a Core transport underneath.
+    st.core_rpc_watch =
+        app_core::chain::identity_watch_descriptors(material_str.trim(), st.network, st.account);
     // Funding-unification M3: the spending wallet is per (identity,
     // account) — reset session state on every activate() (boot, network/
     // account switch, identity reset→reimport) and recompute capability
@@ -3330,13 +3354,14 @@ fn show_notebook_picker(w: &AppWindow, st: &State, page: u32, mode: &str) {
     let network = st.network;
     let account = st.account;
     let creds = core_rpc_creds_for(st, &base, network);
+    let watch = st.core_rpc_watch.clone();
     let weak = w.as_weak();
     std::thread::spawn(move || {
         let _net_guard = NetOpGuard::new(weak.clone());
         let mut results: Vec<(u32, &'static str, String)> = Vec::new();
         // A malformed node URL degrades exactly like "offline" below (empty
         // results → plain rows) rather than a new error path.
-        if let Ok(client) = open_client(&base, network, creds) {
+        if let Ok(client) = open_client_watched(&base, network, creds, &watch) {
             for (index, addr) in &to_probe {
                 if let Ok((used, balance)) = client.address_probe(addr) {
                     let pill = if used { "used" } else { "new" };
@@ -4514,6 +4539,63 @@ fn open_client(
     creds: Option<(String, String)>,
 ) -> Result<ChainClient<AnyTransport>, app_core::Error> {
     Ok(ChainClient::new(AnyTransport::new(base, creds)?, network))
+}
+
+/// [`open_client`] plus Bitcoin Core ranged-watch configuration (U7 —
+/// `../PLAN-chain-notes-app-core-rpc.md` §2.2's "ranged descriptor import"
+/// finally gets a caller; previously `CoreRpcTransport::watch_descriptors`
+/// had none anywhere in this crate, so the app always paid for one
+/// genesis-rescan `importdescriptors` PER ADDRESS instead of one per
+/// descriptor family). `descriptors` is `State.core_rpc_watch` — computed
+/// ONCE per (identity, account, network) by `activate()`, cloned onto the
+/// caller's stack (or into a worker-thread closure, same convention as
+/// `base`/`network`/`creds`) BEFORE calling this, never re-derived here.
+///
+/// For an Esplora base this is byte-identical to `open_client` — the
+/// `AnyTransport::Esplora` arm below never touches `descriptors` at all,
+/// so the Esplora path (`HttpTransport`, pacing, 429 retry, error
+/// classification) is untouched by construction, not merely by
+/// convention. For a Bitcoin Core base with at least one descriptor
+/// configured, this calls `CoreRpcTransport::watch_descriptors` on the
+/// freshly-built transport before handing it back, so every subsequent
+/// `/address/...` lookup through it prefers the ranged path
+/// (`CoreRpcTransport::ranged_lookup_or_widen`) over the per-address
+/// `addr()` fallback. A `watch_descriptors` failure (a flaky node, a
+/// malformed descriptor) is logged and swallowed rather than failing the
+/// whole operation: configuring the fast path is an optimization, and the
+/// per-address fallback remains fully correct on its own — exactly the
+/// same "additive, never a correctness requirement" relationship the U4
+/// doc comments already describe.
+///
+/// NOT every `open_client` call site needs this — only ones that go on to
+/// look up one of the identity's OWN addresses (`build_bundle`,
+/// `scan_funding` against the identity's own spending source,
+/// `address_probe`/`address_used`). Broadcast-only calls
+/// (`client.broadcast`), `fetch_tx_io`/`fetch_tx_hex`/`fetch_tx_status`
+/// (keyed by txid, not address), and `preflight`/`fee_rates`/`btc_usd`/
+/// `tip_height` never touch `/address/...` at all (see `Transport for
+/// CoreRpcTransport::get_text`), so configuring descriptors ahead of one
+/// of those would be pure overhead — those call sites keep using
+/// `open_client` directly. Third-party funding-wallet scans
+/// (`State.funding_wallets`) are a DIFFERENT descriptor than this
+/// identity's own and are out of scope here too — they keep using the
+/// per-address fallback, unchanged.
+fn open_client_watched(
+    base: &str,
+    network: Network,
+    creds: Option<(String, String)>,
+    descriptors: &[app_core::chain::WatchDescriptor],
+) -> Result<ChainClient<AnyTransport>, app_core::Error> {
+    let client = open_client(base, network, creds)?;
+    if !descriptors.is_empty() {
+        if let AnyTransport::Core(t) = &client.transport {
+            if let Err(_e) = t.watch_descriptors(descriptors.to_vec()) {
+                #[cfg(debug_assertions)]
+                eprintln!("cb: core-rpc watch-descriptors err={_e}");
+            }
+        }
+    }
+    Ok(client)
 }
 
 /// Pure form of `State::core_rpc_should_persist`: default true (an absent
@@ -5720,10 +5802,11 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
     let watch_src_for_change = st.ident.as_ref().and_then(|i| i.watch_source()).cloned();
     let key = format!("wstores/{fp8}/{}/{account}", network.as_str());
     let creds = core_rpc_creds_for(st, &base, network);
+    let core_watch = st.core_rpc_watch.clone();
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
-        let client = match open_client(&base, network, creds) {
+        let client = match open_client_watched(&base, network, creds, &core_watch) {
             Ok(c) => c,
             Err(e) => {
                 // A malformed node URL fails the whole scan — every notebook's
@@ -7019,6 +7102,7 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
         st.notebooks.as_ref().map(|ix| ix.active(account).map(|m| m.index).collect()).unwrap_or_default();
     let key = format!("discovery/{fp8}/{account}");
     let creds = core_rpc_creds_for(st, &base, network);
+    let core_watch = st.core_rpc_watch.clone();
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
@@ -7026,7 +7110,7 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
             .map(|material| {
                 // A malformed node URL degrades exactly like any other
                 // transport error here — best-effort, empty result.
-                match open_client(&base, network, creds) {
+                match open_client_watched(&base, network, creds, &core_watch) {
                     Ok(client) => {
                         // gap=1 (Sal 2026-07-23): notebooks are used
                         // sequentially from index 0, so stop at the first
@@ -7098,10 +7182,11 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
     let prev_stats = st.store.as_ref().unwrap().addr_stats.clone();
     let key = format!("nbscan/{address}");
     let creds = core_rpc_creds_for(st, &base, network);
+    let core_watch = st.core_rpc_watch.clone();
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
-        let client = match open_client(&base, network, creds) {
+        let client = match open_client_watched(&base, network, creds, &core_watch) {
             Ok(c) => c,
             Err(e) => {
                 REFRESH_RESULTS.lock().expect("refresh results mutex").push(RefreshResult {
@@ -7427,7 +7512,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
         return;
     };
     let creds = core_rpc_creds_for(st, &base, st.network);
-    let client = match open_client(&base, st.network, creds) {
+    let client = match open_client_watched(&base, st.network, creds, &st.core_rpc_watch) {
         Ok(c) => c,
         Err(e) => {
             println!("cb: refresh err={e}");
@@ -7654,6 +7739,7 @@ fn spending_scan_async(w: &AppWindow, st: &mut State, gap: u32) {
     let Some(fp8) = st.notebooks_fp8.clone() else { return };
     let key = format!("spscan/{fp8}/{}/{account}", network.as_str());
     let creds = core_rpc_creds_for(st, &base, network);
+    let core_watch = st.core_rpc_watch.clone();
     let weak = w.as_weak();
     let job = move || {
         let _net_guard = NetOpGuard::new(weak.clone());
@@ -7662,7 +7748,7 @@ fn spending_scan_async(w: &AppWindow, st: &mut State, gap: u32) {
             .as_ref()
             .map_err(|e| e.to_string())
             .and_then(|m| app_core::spending::funding_source(m, network, account).map_err(|e| e.to_string()));
-        let client = open_client(&base, network, creds).map_err(|e| e.to_string());
+        let client = open_client_watched(&base, network, creds, &core_watch).map_err(|e| e.to_string());
         // ONE merged walk (network-efficiency, 2026-07-23): `scan_funding`
         // now reports used addresses (receive AND change — so OWN-detection
         // on rescan covers coins this app never explicitly "handed out",
@@ -11575,6 +11661,7 @@ pub fn run() {
         coins_overridden: false,
         consolidate_coins: false,
         material: None,
+        core_rpc_watch: Vec::new(),
         icloud_backup: false,
         terms_accepted,
         auto_unlock,
