@@ -1214,6 +1214,42 @@ fn main() {
             eprintln!("cli: fund-finalize txid={txid} vsize={vsize} broadcast=ok");
             println!("{}", got.trim());
         }
+        Some("preflight") => {
+            // preflight <base-url> <network> — surfaces
+            // `CoreRpcTransport::preflight` (PLAN-chain-notes-app-core-rpc.md
+            // §2.2/§2.3/U4) for a `bitcoind+http(s)://` base so scripts can
+            // assert node health (txindex/pruned/IBD/tip) without going
+            // through the UI. Esplora bases don't have this notion — usage
+            // error, same as every other `.expect()` in this CLI.
+            let net = network(&args[3]);
+            let transport = app_core::chain::AnyTransport::new(
+                &args[2],
+                match (std::env::var("CORE_RPC_USER"), std::env::var("CORE_RPC_PASS")) {
+                    (Ok(user), Ok(pass)) => Some((user, pass)),
+                    _ => None,
+                },
+            )
+            .expect("<base-url> parse");
+            let status = match transport {
+                app_core::chain::AnyTransport::Core(t) => t.preflight().expect("preflight"),
+                app_core::chain::AnyTransport::Esplora(_) => {
+                    panic!("preflight only supported for bitcoind+http(s):// bases")
+                }
+            };
+            let _ = net;
+            println!(
+                "cli: preflight pruned={} prune_height={} txindex={} ibd={} wallet_scanning={} tip={}",
+                status.pruned,
+                status.prune_height.map(|h| h.to_string()).unwrap_or_else(|| "-".to_string()),
+                status.txindex,
+                status.initial_block_download,
+                status
+                    .wallet_scanning
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                status.tip_height
+            );
+        }
         _ => {
             eprintln!(
                 "usage: cli address <net> | init <store> <net> | scan <store> <base> | \
@@ -1225,7 +1261,8 @@ fn main() {
                  note-spend-funded <store> <base> <public|private> <rate> <text> [to] | \
                  fund-keygen <net> <seed-hex> [tr|wpkh] | \
                  fund-build <base> <net> <desc> <public|private> <rate> <text> [to] | \
-                 fund-sign <psbt> <xprv> | fund-finalize <base> <net> <psbt>   \
+                 fund-sign <psbt> <xprv> | fund-finalize <base> <net> <psbt> | \
+                 preflight <base> <net>   \
                  (identity from APP_KEY)"
             );
             std::process::exit(2);
