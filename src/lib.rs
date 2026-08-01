@@ -12521,7 +12521,14 @@ pub fn run() {
         let Some(phrase) = s.pending_mnemonic.clone() else { return };
         let count = phrase.split(' ').count();
         let mut idx = [0u8; 3];
-        let _ = getrandom_fill(&mut idx);
+        // `idx` is NOT key material — it only selects which 3 of the
+        // already-generated words the backup quiz asks the user to
+        // retype. A failure here still leaves a valid (if predictable,
+        // zeroed) selection, so we log and carry on rather than fail the
+        // backup flow or reach for a fallback RNG.
+        if getrandom_fill(&mut idx).is_err() {
+            println!("cb: backup-quiz entropy err");
+        }
         let mut picks: Vec<usize> = idx.iter().map(|b| (*b as usize) % count).collect();
         picks.sort();
         picks.dedup();
