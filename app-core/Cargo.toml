@@ -44,3 +44,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # REAL prime-bip85 outputs (mnemonic/WIF/XPRV/hex + SeedQR digits)
 # through our importer — no hand-copied vectors.
 bip85-core = { git = "ssh://git@github.com/ObjSal/prime-bip85.git", rev = "dbc446534e67314d40c06c3261812fccede3ec29" }
+# tests/entropy.rs drives the raw OS source directly (integration tests
+# can't see a crate's normal `[dependencies]`) — pinned to the same 0.2
+# major already resolved above, so it's the SAME getrandom, not a second
+# copy.
+getrandom = "0.2"
