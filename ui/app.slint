@@ -1812,6 +1812,21 @@ export component AppWindow inherits Window {
     // an address is submitted — see `update_node_backend_ui` in lib.rs).
     property <bool> node-core-row-selected: root.node-index == root.node-options.length - 2;
     in-out property <string> node-address-text;
+    // The three URL fields below (Core address, custom Esplora URL, custom
+    // explorer URL) used to submit ONLY on `accepted` — Return, or Done on
+    // the mobile keyboard. Typing an address and then tapping somewhere
+    // else silently threw it away, which the global keyboard-dismiss layer
+    // (2026-08-01) made much easier to hit: tapping the background is now
+    // the natural way to put the keyboard down, and it is not a commit.
+    // Sal hit exactly this — RPC credentials came back on the next Settings
+    // visit but the node address didn't, because only the credentials had
+    // actually been stored. Each field now also commits when it LOSES
+    // FOCUS, gated on these dirty flags so a field that was merely tapped
+    // (or committed already, since the handler rewrites it to canonical
+    // form) doesn't re-submit and re-run a node health check.
+    property <bool> node-address-dirty: false;
+    property <bool> node-custom-dirty: false;
+    property <bool> explorer-custom-dirty: false;
     // True when the CONFIGURED node (not just the row being browsed) is a
     // Bitcoin Core RPC base — drives the "Bitcoin node · Bitcoin Core" title
     // suffix via `node-backend-label` below.
@@ -3686,12 +3701,30 @@ export component AppWindow inherits Window {
             if root.node-core-row-selected: EditField {
                 text <=> root.node-address-text;
                 placeholder-text: "192.168.1.10:8332  or  umbrel.local";
-                accepted(t) => { root.set-node-address(t); }
+                edited(t) => { root.node-address-dirty = true; }
+                accepted(t) => { root.node-address-dirty = false; root.set-node-address(t); }
+                // Commit on focus loss too — see node-address-dirty above.
+                // Empty is never auto-committed: clearing the field and
+                // pressing Return stays the explicit way to unset it, so
+                // tabbing through an empty field can't wipe a stored node.
+                changed has-focus => {
+                    if (!self.has-focus && root.node-address-dirty && self.text != "") {
+                        root.node-address-dirty = false;
+                        root.set-node-address(self.text);
+                    }
+                }
             }
             if root.node-index == root.node-options.length - 1: EditField {
                 text <=> root.node-custom-text;
                 placeholder-text: "https://mempool.example/api";
-                accepted(t) => { root.set-node-custom(t); }
+                edited(t) => { root.node-custom-dirty = true; }
+                accepted(t) => { root.node-custom-dirty = false; root.set-node-custom(t); }
+                changed has-focus => {
+                    if (!self.has-focus && root.node-custom-dirty && self.text != "") {
+                        root.node-custom-dirty = false;
+                        root.set-node-custom(self.text);
+                    }
+                }
             }
             // FLATTENED (2026-07-29, U11): every row below used to live
             // inside a single `if root.node-is-core: VerticalLayout { … }`
@@ -3783,7 +3816,14 @@ export component AppWindow inherits Window {
             if root.explorer-index == root.explorer-options.length - 1: EditField {
                 text <=> root.explorer-custom-text;
                 placeholder-text: "https://your-mempool-host  (no trailing /tx)";
-                accepted(t) => { root.set-explorer-custom(t); }
+                edited(t) => { root.explorer-custom-dirty = true; }
+                accepted(t) => { root.explorer-custom-dirty = false; root.set-explorer-custom(t); }
+                changed has-focus => {
+                    if (!self.has-focus && root.explorer-custom-dirty && self.text != "") {
+                        root.explorer-custom-dirty = false;
+                        root.set-explorer-custom(self.text);
+                    }
+                }
             }
         }
         SettingsCard {
