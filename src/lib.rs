@@ -16447,6 +16447,11 @@ pub fn run() {
         s.network = n;
         println!("cb: set-network {}", s.network.as_str());
         s.save_config();
+        // Notebooks are PER-NETWORK (`notebooks-<net>-<fp8>.json`), so a
+        // network is a wallet context exactly like an account is — reset to
+        // notebook 0 the same way the Settings account switch does, or the
+        // active index would carry over to a chain that may not list it.
+        s.nb_index = 0;
         // Same key material, new network: re-derive + reload store.
         let material = std::env::var("APP_KEY")
             .ok()
@@ -16454,7 +16459,25 @@ pub fn run() {
         if let Some(m) = material {
             match activate(&mut s, &m, false) {
                 Ok(()) => {
+                    // A network this key has never touched starts with an
+                    // EMPTY index, so the switch used to land on an empty
+                    // notebook list (Sal 2026-08-01). Auto-create its first
+                    // notebook, same guard and same wording as the account
+                    // switch above. Safe w.r.t. gap discovery: activate()
+                    // already decided `discovery_pending` from whether the
+                    // index FILE existed, so writing an entry now cannot
+                    // suppress the probe that recovers a used seed's other
+                    // notebooks — it just means index 0 is listed first.
+                    let empty = s
+                        .notebooks
+                        .as_ref()
+                        .map(|ix| ix.active(s.account).count() == 0)
+                        .unwrap_or(true);
+                    if empty {
+                        ensure_first_onboarded_notebook(&mut s);
+                    }
                     update_home(&w, &s);
+                    update_notebook_list(&w, &s);
                     refresh_async(&w, &mut s);
                     spending_refresh_async(&w, &mut s); // CHANGE 5
                 }
