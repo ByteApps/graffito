@@ -1946,6 +1946,32 @@ export component AppWindow inherits Window {
     callback restore-saved-key();
     callback door-import();
     callback door-create(int);
+    // ---- dice-roll entropy (screens 27 + 28) ----
+    // The word count chosen on the onboarding door, carried through the
+    // entropy-source screen so both paths know what to build.
+    in-out property <int> new-word-count: 12;
+    // Rolls typed so far, the live SHA256 of them, and how many are still
+    // needed. `dice-hash` is shown deliberately: it is what makes the mode
+    // verifiable — the user can run the same digits through any SHA-256 tool
+    // and get this exact value. Rust never logs the rolls themselves.
+    in property <int> dice-count: 0;
+    in property <int> dice-needed: 50;
+    in property <string> dice-hash;
+    in property <string> dice-hash2;
+    // Set once enough rolls are in AND the distribution isn't obviously
+    // skewed; drives the Continue button.
+    in property <bool> dice-ready: false;
+    in property <string> dice-warning;
+    // True when the pending seed came from dice — the backup screen hides its
+    // reroll/extra-entropy panel then, because rerolling would silently swap
+    // the user's verifiable dice seed for a device-random one.
+    in-out property <bool> seed-from-dice: false;
+    in-out property <bool> show-dice-clear-confirm: false;
+    callback pick-entropy-source(string);
+    callback dice-roll(int);
+    callback dice-undo();
+    callback dice-clear();
+    callback dice-continue();
     callback import-changed(string);
     callback import-confirm(string);
     callback import-scan();
@@ -2196,6 +2222,7 @@ export component AppWindow inherits Window {
     function nav-back() -> bool {
         // Overlays first, topmost (= last window child) before the rest —
         // back closes the same thing a tap on Cancel / the dim would.
+        if (root.show-dice-clear-confirm) { root.show-dice-clear-confirm = false; return true; }
         if (root.qr-zoom-open) { root.qr-zoom-open = false; return true; }
         if (root.show-bump-dialog) { root.show-bump-dialog = false; return true; }
         if (root.show-oversize-modal) { root.show-oversize-modal = false; return true; }
@@ -2207,6 +2234,10 @@ export component AppWindow inherits Window {
         if (root.scanning) { root.cancel-scan(); return true; }
         // Screens: one branch per header chevron.
         if (root.screen == 1 || root.screen == 2) { root.screen = 0; return true; }
+        // Entropy-source door → back to onboarding; dice entry → back to the
+        // door (so "This device" is still one tap away mid-roll).
+        if (root.screen == 27) { root.screen = 0; return true; }
+        if (root.screen == 28) { root.screen = 27; return true; }
         if (root.screen == 4) { root.open-notebooks(); return true; }
         if (root.screen == 3) { root.screen = 2; return true; }
         if (root.screen == 5) { root.go-home(); return true; }
@@ -2486,13 +2517,26 @@ export component AppWindow inherits Window {
                 clicked => { root.copy-text("backup-words", root.backup-words); }
             }
         }
+        // Honest about provenance: the standard caption says the device
+        // generated this, which is exactly what a dice user chose NOT to do.
+        // The hot-wallet warning still applies either way — the key lives on
+        // an online phone regardless of where its randomness came from.
         Caption {
             color: Pal.muted;
-            text: "Generated on this online device, so treat it as a hot wallet — keep only note-fee amounts here. For real savings, use a hardware wallet and import it as watch-only. You can also view these words again later in Settings.";
+            text: root.seed-from-dice
+                ? "Built from your dice rolls alone — this device added nothing. It still lives on an online device, so treat it as a hot wallet and keep only note-fee amounts here. You can view these words again later in Settings."
+                : "Generated on this online device, so treat it as a hot wallet — keep only note-fee amounts here. For real savings, use a hardware wallet and import it as watch-only. You can also view these words again later in Settings.";
         }
         // Advanced (collapsible, styled like the compose panels so it clearly
         // reads as tappable): optional user-supplied entropy ("salt").
-        Rectangle {
+        //
+        // HIDDEN for a dice seed. Both controls in here would destroy the
+        // property the user chose dice for: the reroll button replaces the
+        // seed with a device-random one, and the salt field re-derives it as
+        // SHA256(csprng ‖ salt). Either would silently make the words stop
+        // matching the hash they just watched being built, with no way to
+        // reproduce them off-device. To reroll dice, go back and roll again.
+        if !root.seed-from-dice: Rectangle {
             border-radius: 10px;
             background: Pal.card;
             border-width: 1px;
@@ -5555,6 +5599,153 @@ export component AppWindow inherits Window {
         }
     }
 
+    // ---------- 27 · where does the entropy come from? ----------
+    // Two doors, same pattern as onboarding. Reached from every "Create a new
+    // N-word seed" door — creation no longer generates immediately, because
+    // "the device rolled it for you, trust us" is exactly the thing a bitcoin
+    // user may not want to trust.
+    if screen == 27: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "New " + root.new-word-count + "-word seed";
+            back => { root.nav-back(); }
+        }
+        Caption {
+            text: "Your seed is just a very large random number. Choose where that randomness comes from.";
+        }
+        Rectangle { height: 6px; }
+        DoorCard {
+            highlight: true;
+            title: "This device";
+            subtitle: "Uses the device's secure random number generator. Fast, and the right choice for almost everyone.";
+            clicked => { root.pick-entropy-source("device"); }
+        }
+        DoorCard {
+            title: "Dice rolls";
+            subtitle: "You roll a real die and type each result. The seed is built from your rolls alone — nothing from this device is mixed in — so you can reproduce it yourself with any SHA-256 tool and confirm we didn't cheat.";
+            clicked => { root.pick-entropy-source("dice"); }
+        }
+        Rectangle { height: 4px; }
+        Caption {
+            color: Pal.muted;
+            text: "Dice take a few minutes and the rolls become your entire seed, so a fair die and honest rolls matter. If that sounds like more responsibility than you want, use this device.";
+        }
+    }
+
+    // ---------- 28 · dice entry ----------
+    // The roll counter and the LIVE hash are the point of this screen: the
+    // same two things a hardware signer shows while you roll, for the same
+    // reason — at any moment you can check the number on screen against
+    // `echo -n <rolls> | shasum -a 256` and see the device isn't inventing
+    // anything.
+    if screen == 28: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 10px;
+        alignment: start;
+        Header {
+            title: "Roll the dice";
+            back => { root.nav-back(); }
+        }
+        HorizontalLayout {
+            alignment: center;
+            spacing: 8px;
+            Text {
+                text: root.dice-count;
+                font-size: 40px;
+                font-weight: 700;
+                color: root.dice-ready ? Pal.accent : Pal.text;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.dice-count == 1 ? "roll" : "rolls";
+                font-size: 15px;
+                color: Pal.muted;
+                vertical-alignment: center;
+            }
+        }
+        Caption {
+            horizontal-alignment: center;
+            color: root.dice-ready ? Pal.muted : Pal.warn;
+            text: root.dice-ready
+                ? "Enough for " + root.new-word-count + " words. Keep going if you like — more rolls never hurt."
+                : (root.dice-needed - root.dice-count) + " more needed for " + root.new-word-count + " words";
+        }
+        if root.dice-warning != "": Caption {
+            horizontal-alignment: center;
+            color: Pal.warn;
+            text: root.dice-warning;
+        }
+        // Live entropy. Two lines of 32 hex chars, exactly how a hardware
+        // signer renders it, so a side-by-side comparison is easy.
+        Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: hl.preferred-height;
+            hl := VerticalLayout {
+                padding: 12px;
+                spacing: 2px;
+                Text {
+                    text: "SHA-256 of your rolls so far";
+                    font-size: 11px;
+                    color: Pal.muted;
+                }
+                Text { text: root.dice-hash; font-size: 12px; color: Pal.text; }
+                Text { text: root.dice-hash2; font-size: 12px; color: Pal.text; }
+            }
+        }
+        // 1-6 keypad. Digits are plain ASCII, so no icon-rule problem here.
+        for row in [[1, 2, 3], [4, 5, 6]]: HorizontalLayout {
+            spacing: 8px;
+            for n in row: Rectangle {
+                height: 54px;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: Pal.line;
+                background: dta.pressed ? Pal.accent.with-alpha(0.25)
+                          : (dta.has-hover ? Pal.card-hover : Pal.card);
+                dta := TouchArea { clicked => { root.dice-roll(n); } }
+                Text {
+                    text: n;
+                    font-size: 22px;
+                    font-weight: 700;
+                    color: Pal.text;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            GhostButton {
+                text: "Undo";
+                clicked => { root.dice-undo(); }
+            }
+            GhostButton {
+                text: "Start over";
+                clicked => {
+                    if (root.dice-count > 5) { root.show-dice-clear-confirm = true; }
+                    else { root.dice-clear(); }
+                }
+            }
+        }
+        // Gated the same way compose gates Sign: faint tint + an inert
+        // handler, rather than a disabled property PrimaryButton doesn't have.
+        PrimaryButton {
+            text: "Create seed from these rolls";
+            tint: root.dice-ready ? Pal.accent : Pal.faint;
+            tint-hover: root.dice-ready ? Pal.accent-hover : Pal.faint;
+            clicked => { if (root.dice-ready) { root.dice-continue(); } }
+        }
+        Caption {
+            color: Pal.muted;
+            text: "Check it yourself: type the same digits into any SHA-256 tool — the result is the number above, and that number is your seed.";
+        }
+    }
+
     // ---------- 26 · Confirm & broadcast (universal) ----------
     // Every broadcast path (compose/spending/mixed/signed-PSBT) lands here
     // before anything hits the wire — full decoded tx, Broadcast is the
@@ -5908,6 +6099,57 @@ export component AppWindow inherits Window {
     }
 
     // ---------- reset-identity confirmation (modal overlay) ----------
+    // Clearing dice rolls is unrecoverable and can throw away several minutes
+    // of physical rolling, so it confirms — same rule as every other
+    // destructive action here. Only armed above a handful of rolls; nagging
+    // about discarding three of them would just be noise.
+    if root.show-dice-clear-confirm: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.show-dice-clear-confirm = false; } }
+        Rectangle {
+            width: 400px;
+            height: dcl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { clicked => { back-scope.focus(); } }
+            dcl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Discard " + root.dice-count + " rolls?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Body {
+                    text: "You'll start again from zero and have to re-roll them.";
+                    font-size: 12px;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton {
+                        text: "Keep rolling";
+                        clicked => { root.show-dice-clear-confirm = false; }
+                    }
+                    PrimaryButton {
+                        text: "Discard";
+                        tint: Pal.bad;
+                        clicked => {
+                            root.show-dice-clear-confirm = false;
+                            root.dice-clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if root.show-reset-confirm: Rectangle {
         width: 100%;
         height: 100%;

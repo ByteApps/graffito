@@ -314,6 +314,107 @@ pub fn generate_mnemonic_with_salt(word_count: usize, salt: &str) -> Result<bip3
         .map_err(|e| Error::Mnemonic(e.to_string()))
 }
 
+// ---------------------------------------------------------------------------
+// Dice-roll entropy
+// ---------------------------------------------------------------------------
+//
+// The seed is `SHA256(the ASCII digits you rolled)`, truncated to the entropy
+// length the word count needs, then run through BIP-39 exactly like any other
+// entropy. Nothing else is mixed in — deliberately.
+//
+// That last point is the whole feature. Every other path in this file folds in
+// the device CSPRNG, and `generate_mnemonic_with_salt` in particular hashes the
+// FULL CSPRNG draw together with any user salt so the salt can only ever ADD
+// randomness. Dice mode is the one place we do NOT do that, because a user who
+// distrusts the device's RNG needs to be able to reproduce the result off the
+// device with nothing but a hash function:
+//
+//     echo -n 3245351523... | shasum -a 256      # == dice_entropy()
+//
+// If we stirred in device randomness that check would be impossible, and the
+// mode would be pointless. The tradeoff is explicit: with dice, the rolls ARE
+// the entropy, so too few rolls is a real weakness — hence `dice_min_rolls`
+// and the fact that `mnemonic_from_dice` refuses below it rather than warning.
+//
+// This is the same construction the widely published `rolls.py` / `rolls12.py`
+// dice tools implement, and `dice_vectors_match_published_tools` pins our
+// output against values produced by them (and cross-checked against a hardware
+// signer that also uses it) so a refactor here cannot silently diverge.
+
+/// Bits of entropy one six-sided die roll contributes: log2(6).
+pub const BITS_PER_ROLL: f64 = 2.584_962_500_721_156;
+
+fn entropy_len_for(word_count: usize) -> Result<usize, Error> {
+    match word_count {
+        12 => Ok(16),
+        18 => Ok(24),
+        24 => Ok(32),
+        n => Err(Error::MnemonicWordCount(n)),
+    }
+}
+
+/// Rolls needed before a `word_count` seed carries its nominal security level.
+///
+/// 50 (128-bit) and 99 (256-bit) are the published thresholds and are hardcoded
+/// so we match the reference tools exactly; note 99 rolls is 255.9 bits, i.e.
+/// the published number rounds DOWN at 256. 75 for 18 words is that same rule
+/// applied to 192 bits (192 / log2(6) = 74.3).
+pub fn dice_min_rolls(word_count: usize) -> Result<usize, Error> {
+    match word_count {
+        12 => Ok(50),
+        18 => Ok(75),
+        24 => Ok(99),
+        n => Err(Error::MnemonicWordCount(n)),
+    }
+}
+
+/// How many times each face 1..=6 appears. Drives the "these don't look random"
+/// warning; a heavily skewed sequence usually means a loaded die or a human
+/// making the numbers up rather than rolling.
+pub fn dice_face_counts(rolls: &str) -> [usize; 6] {
+    let mut counts = [0usize; 6];
+    for c in rolls.chars() {
+        if let Some(d) = c.to_digit(10) {
+            if (1..=6).contains(&d) {
+                counts[(d - 1) as usize] += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Running `SHA256` over the rolls entered so far — what the UI shows live so
+/// the user can compare it against `shasum -a 256` on another machine.
+///
+/// Unenforced on purpose: it is display-only, and must render for the partial
+/// sequence at every keystroke (including zero rolls, where it is the
+/// well-known hash of the empty string).
+pub fn dice_entropy(rolls: &str) -> Result<[u8; 32], Error> {
+    use sha2::{Digest, Sha256};
+    if let Some(bad) = rolls.chars().find(|c| !('1'..='6').contains(c)) {
+        return Err(Error::Dice(format!("{bad:?} is not a roll — use 1 to 6")));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(rolls.as_bytes()));
+    Ok(out)
+}
+
+/// Dice rolls → BIP-39 mnemonic. Refuses below [`dice_min_rolls`].
+pub fn mnemonic_from_dice(rolls: &str, word_count: usize) -> Result<bip39::Mnemonic, Error> {
+    let entropy_len = entropy_len_for(word_count)?;
+    let need = dice_min_rolls(word_count)?;
+    let entropy = Zeroizing::new(dice_entropy(rolls)?);
+    // Checked AFTER the charset so a typo reports the typo, not the length.
+    if rolls.len() < need {
+        return Err(Error::Dice(format!(
+            "{} rolls is not enough for {word_count} words — roll {need}",
+            rolls.len()
+        )));
+    }
+    bip39::Mnemonic::from_entropy_in(bip39::Language::English, &entropy[..entropy_len])
+        .map_err(|e| Error::Mnemonic(e.to_string()))
+}
+
 /// Material → leaf secret → Identity + address on `network`.
 /// `account` = BIP-86 account index for mnemonic / master-xprv imports;
 /// `index` = the notebook's receive-chain address index within that
@@ -493,5 +594,130 @@ mod tests {
         );
         assert_eq!(spks.len(), 1, "only account 0's notebook");
         assert!(!spks.contains(&acct1_spk), "account 1's notebook must not appear");
+    }
+
+    // ----- dice-roll entropy -------------------------------------------------
+
+    /// The 100 rolls verified end-to-end on 2026-08-02: typed into a hardware
+    /// signer's dice flow, whose screen rendered this exact SHA256 live, and
+    /// cross-checked against the published `rolls.py` / `rolls12.py` tools and
+    /// an independent BIP-39 implementation. If this test ever fails, our
+    /// derivation has diverged from the thing users verify against by hand.
+    const DICE_100: &str = "3245351523344141152223146445164562513143564522445342664341333225131663413444265643634225653623453213";
+    const DICE_100_SHA256: &str =
+        "0b729af1cadf8aefd0c7dfbdf6ce32f6337f9ab85e9e8bf1ac675d8194c0cd74";
+    const DICE_100_W24: &str = "arena network round noble weather jewel drink winner sadness reopen million unaware dawn snap thumb stable message miracle border roast bone gather cupboard network";
+    const DICE_100_W12: &str = "arena network round noble weather jewel drink winner sadness reopen million umbrella";
+
+    #[test]
+    fn dice_vectors_match_published_tools() {
+        assert_eq!(hex::encode(dice_entropy(DICE_100).unwrap()), DICE_100_SHA256);
+        assert_eq!(mnemonic_from_dice(DICE_100, 24).unwrap().to_string(), DICE_100_W24);
+        assert_eq!(mnemonic_from_dice(DICE_100, 12).unwrap().to_string(), DICE_100_W12);
+    }
+
+    #[test]
+    fn dice_entropy_is_plain_sha256_of_the_digits() {
+        // The property the whole mode rests on: reproducible off-device with
+        // nothing but a hash function. No CSPRNG, no salt, no device state.
+        use sha2::{Digest, Sha256};
+        for rolls in ["1", "123456", DICE_100] {
+            assert_eq!(
+                dice_entropy(rolls).unwrap().to_vec(),
+                Sha256::digest(rolls.as_bytes()).to_vec(),
+                "dice entropy must be exactly sha256(ascii digits)"
+            );
+        }
+        // Zero rolls is the empty-string hash — the same value a hardware
+        // signer shows before the first roll, which is what proves it starts
+        // from nothing rather than from device randomness.
+        assert_eq!(
+            hex::encode(dice_entropy("").unwrap()),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn dice_is_deterministic_unlike_the_csprng_path() {
+        // Positive control, mirroring how this was proven on the device: the
+        // same rolls twice must be identical, AND the CSPRNG path must not be
+        // — otherwise "deterministic" would be a property of the test, not of
+        // the dice derivation.
+        let a = mnemonic_from_dice(DICE_100, 24).unwrap().to_string();
+        let b = mnemonic_from_dice(DICE_100, 24).unwrap().to_string();
+        assert_eq!(a, b);
+        let r1 = generate_mnemonic(24).unwrap().to_string();
+        let r2 = generate_mnemonic(24).unwrap().to_string();
+        assert_ne!(r1, r2, "CSPRNG path repeated itself — the control is broken");
+        assert_ne!(a, r1);
+    }
+
+    #[test]
+    fn dice_12_is_the_24_entropy_truncated() {
+        // Same rolls, both lengths: 12 words is the first 16 bytes of the same
+        // hash, so the leading words coincide and only the checksum word
+        // differs. (Observed on the device; asserted here so the truncation
+        // rule can't drift.)
+        let w24: Vec<_> = DICE_100_W24.split(' ').collect();
+        let w12: Vec<_> = DICE_100_W12.split(' ').collect();
+        assert_eq!(w24[..11], w12[..11]);
+        assert_ne!(w24[11], w12[11]);
+    }
+
+    #[test]
+    fn dice_min_rolls_matches_published_thresholds() {
+        assert_eq!(dice_min_rolls(12).unwrap(), 50);
+        assert_eq!(dice_min_rolls(18).unwrap(), 75);
+        assert_eq!(dice_min_rolls(24).unwrap(), 99);
+        // 99 rolls is 255.9 bits: the published 24-word threshold rounds DOWN
+        // at 256. Guard the constant so nobody "fixes" it to 100.
+        assert!((99.0 * BITS_PER_ROLL) < 256.0);
+        assert!((100.0 * BITS_PER_ROLL) > 256.0);
+        assert!((50.0 * BITS_PER_ROLL) > 128.0);
+        assert!((75.0 * BITS_PER_ROLL) > 192.0);
+    }
+
+    #[test]
+    fn dice_rejects_short_and_bad_input() {
+        // Too few rolls is refused, not warned about: with dice the rolls ARE
+        // the entropy.
+        let short = "123456".repeat(8); // 48 rolls
+        assert!(matches!(mnemonic_from_dice(&short, 12), Err(Error::Dice(_))));
+        assert!(mnemonic_from_dice(&"123456".repeat(9), 12).is_ok()); // 54
+        // A typo reports the character, not the length, even when both are wrong.
+        match mnemonic_from_dice("127", 12) {
+            Err(Error::Dice(m)) => assert!(m.contains('7'), "{m}"),
+            other => panic!("expected a charset error, got {other:?}"),
+        }
+        assert!(matches!(mnemonic_from_dice(DICE_100, 15), Err(Error::MnemonicWordCount(15))));
+    }
+
+    #[test]
+    fn dice_face_counts_tally() {
+        assert_eq!(dice_face_counts("123456"), [1, 1, 1, 1, 1, 1]);
+        assert_eq!(dice_face_counts("111"), [3, 0, 0, 0, 0, 0]);
+        let c = dice_face_counts(DICE_100);
+        assert_eq!(c.iter().sum::<usize>(), 100);
+    }
+
+    #[test]
+    fn dice_covers_18_words_too() {
+        // 18 words isn't in the published dice tools (they only ship 12/24),
+        // but the app offers an 18-word door so it must work — same rule,
+        // truncated to 24 bytes. Pinned so the truncation can't drift.
+        let m = mnemonic_from_dice(DICE_100, 18).unwrap();
+        assert_eq!(m.word_count(), 18);
+        let entropy = dice_entropy(DICE_100).unwrap();
+        let expect = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &entropy[..24])
+            .unwrap()
+            .to_string();
+        assert_eq!(m.to_string(), expect);
+        // Shares the leading words with 12/24 for the same rolls, since all
+        // three truncate one hash.
+        let w18: Vec<_> = m.to_string().split(' ').map(String::from).collect();
+        assert_eq!(w18[..11], DICE_100_W12.split(' ').collect::<Vec<_>>()[..11]);
+        // And its own threshold is enforced.
+        assert!(matches!(mnemonic_from_dice(&"123456".repeat(12), 18), Err(Error::Dice(_)))); // 72
+        assert!(mnemonic_from_dice(&"123456".repeat(13), 18).is_ok()); // 78
     }
 }
