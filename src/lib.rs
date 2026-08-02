@@ -2488,12 +2488,24 @@ fn update_node_backend_ui(w: &AppWindow, st: &State) {
     let persist = st.core_rpc_should_persist(st.network);
     w.set_node_core_save_creds(persist);
     if !is_core {
-        w.set_node_core_user("".into());
-        w.set_node_core_pass("".into());
+        // Only the HEALTH line is about the active backend. The credential
+        // fields are NOT: U12 reveals them as soon as "Bitcoin Core" is
+        // picked in the dropdown (`node-core-row-selected`), which is
+        // before any address has been submitted — so `is_core` is still
+        // false while the user is filling them in. Blanking them here
+        // wiped what they had just typed the moment anything called this,
+        // most visibly the "Save credentials" button (Sal 2026-08-01):
+        // it saves, then refreshes health, and the refresh emptied both
+        // fields even though the save had succeeded.
         w.set_node_health_text("".into());
         w.set_node_health_warn(false);
-        return;
     }
+    // Credentials are per-NETWORK and independent of which backend is
+    // currently active, so they are resolved the same way either way.
+    // Safe w.r.t. the zero-launch-path-keychain-calls rule: every caller of
+    // this function is a Settings tap (settings-open, the node preset /
+    // address / custom-URL handlers, and the two credential callbacks) —
+    // none runs before the first frame.
     if persist {
         match keychain::load_rpc_creds(st.network.as_str()) {
             Ok(Some((user, pass))) => {
@@ -16730,6 +16742,16 @@ pub fn run() {
         }
         w.set_status(if result.is_ok() { "".into() } else { "couldn't save RPC credentials".into() });
         refresh_node_health(&w, &mut s);
+        if result.is_err() {
+            // A FAILED save stored nothing, so the refresh above resolves
+            // this network's credentials as absent and empties the fields —
+            // destroying what the user typed on top of not saving it. Put
+            // it back so they can fix the cause and press Save again
+            // (reproducible on any unsigned dev build, where SecItemAdd
+            // returns -34018).
+            w.set_node_core_user(user.as_str().into());
+            w.set_node_core_pass(pass.as_str().into());
+        }
     });
 
     // "Save credentials" switch (plan §2.4 / U10): default ON, so nobody who
