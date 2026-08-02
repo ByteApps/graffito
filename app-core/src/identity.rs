@@ -699,4 +699,25 @@ mod tests {
         let c = dice_face_counts(DICE_100);
         assert_eq!(c.iter().sum::<usize>(), 100);
     }
+
+    #[test]
+    fn dice_covers_18_words_too() {
+        // 18 words isn't in the published dice tools (they only ship 12/24),
+        // but the app offers an 18-word door so it must work — same rule,
+        // truncated to 24 bytes. Pinned so the truncation can't drift.
+        let m = mnemonic_from_dice(DICE_100, 18).unwrap();
+        assert_eq!(m.word_count(), 18);
+        let entropy = dice_entropy(DICE_100).unwrap();
+        let expect = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &entropy[..24])
+            .unwrap()
+            .to_string();
+        assert_eq!(m.to_string(), expect);
+        // Shares the leading words with 12/24 for the same rolls, since all
+        // three truncate one hash.
+        let w18: Vec<_> = m.to_string().split(' ').map(String::from).collect();
+        assert_eq!(w18[..11], DICE_100_W12.split(' ').collect::<Vec<_>>()[..11]);
+        // And its own threshold is enforced.
+        assert!(matches!(mnemonic_from_dice(&"123456".repeat(12), 18), Err(Error::Dice(_)))); // 72
+        assert!(mnemonic_from_dice(&"123456".repeat(13), 18).is_ok()); // 78
+    }
 }
