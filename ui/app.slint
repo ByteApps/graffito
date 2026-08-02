@@ -2309,6 +2309,22 @@ export component AppWindow inherits Window {
     // whitespace-insensitive, and re-indenting ~2200 lines would bury the
     // file's history).
 
+    // GLOBAL keyboard-dismiss layer (Sal 2026-08-01: "keyboard should always
+    // be dismissable when tapping other parts of the app"). It is the FIRST
+    // child of back-scope, so it fills the window and sits UNDER every screen
+    // — later siblings win input in slint, so any interactive child (field,
+    // button, pill, modal) still grabs its own tap and this only ever fires
+    // on genuinely empty space. Moving focus to back-scope is what drops the
+    // on-screen keyboard; never clear-focus(), which would leave Android's
+    // Back key undeliverable (see the system-back note above).
+    //
+    // This covers every screen whose root is a plain VerticalLayout — screen
+    // 2's extra-entropy field and screen 3's quiz answer among them. It does
+    // NOT reach inside a Flickable, which intercepts pointer events across
+    // its own region, so each Flickable holding a text field carries its own
+    // copy of this layer (screens 6, 8, 16, 21 — search "dismiss layer").
+    TouchArea { clicked => { back-scope.focus(); } }
+
     // ---------- 0 · onboarding ----------
     if screen == 0: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 24px;
@@ -3537,6 +3553,15 @@ export component AppWindow inherits Window {
         Flickable {
             viewport-height: settings-col.preferred-height;
             viewport-y <=> root.settings-scroll-y;
+            // Dismiss layer (see the global one under back-scope): the
+            // Flickable intercepts its whole region, so the global layer
+            // can't reach the gaps between these cards — the node-URL and
+            // explorer-URL fields below would otherwise trap the keyboard.
+            TouchArea {
+                width: parent.width;
+                height: settings-col.preferred-height;
+                clicked => { back-scope.focus(); }
+            }
             settings-col := VerticalLayout {
                 spacing: 12px;
                 alignment: start;
@@ -4479,6 +4504,13 @@ export component AppWindow inherits Window {
         }
         Flickable {
             viewport-height: sweep-col.preferred-height;
+            // Dismiss layer (see the global one under back-scope) — the
+            // custom-fee and custom-change fields live in here.
+            TouchArea {
+                width: parent.width;
+                height: sweep-col.preferred-height;
+                clicked => { back-scope.focus(); }
+            }
             sweep-col := VerticalLayout {
                 spacing: 12px;
                 Rectangle {
@@ -5024,6 +5056,13 @@ export component AppWindow inherits Window {
         }
         Flickable {
             viewport-height: change-scr-col.preferred-height;
+            // Dismiss layer (see the global one under back-scope) — the
+            // custom change-address field lives in here.
+            TouchArea {
+                width: parent.width;
+                height: change-scr-col.preferred-height;
+                clicked => { back-scope.focus(); }
+            }
             change-scr-col := VerticalLayout {
                 spacing: 10px;
                 alignment: start;
@@ -5625,7 +5664,9 @@ export component AppWindow inherits Window {
             background: Pal.card;
             border-width: 1px;
             border-color: Pal.line;
-            TouchArea { }
+            // Swallow clicks on the card body so they don't reach the dim
+            // (which cancels) — and drop the keyboard while we're here.
+            TouchArea { clicked => { back-scope.focus(); } }
             frl := VerticalLayout {
                 padding: 20px;
                 spacing: 12px;
@@ -5668,7 +5709,8 @@ export component AppWindow inherits Window {
             background: Pal.card;
             border-width: 1px;
             border-color: Pal.line;
-            TouchArea { } // swallow clicks on the card body
+            // Swallow clicks on the card body; also drops the keyboard.
+            TouchArea { clicked => { back-scope.focus(); } }
             dl := VerticalLayout {
                 padding: 20px;
                 spacing: 12px;
@@ -5747,7 +5789,8 @@ export component AppWindow inherits Window {
             background: Pal.card;
             border-width: 1px;
             border-color: Pal.line;
-            TouchArea { } // swallow clicks on the card body
+            // Swallow clicks on the card body; also drops the keyboard.
+            TouchArea { clicked => { back-scope.focus(); } }
             nbl := VerticalLayout {
                 padding: 20px;
                 spacing: 12px;
@@ -5934,7 +5977,8 @@ export component AppWindow inherits Window {
             background: Pal.card;
             border-width: 1px;
             border-color: Pal.line;
-            TouchArea { }
+            // Swallow clicks on the card body; also drops the keyboard.
+            TouchArea { clicked => { back-scope.focus(); } }
             bl := VerticalLayout {
                 padding: 20px;
                 spacing: 12px;
