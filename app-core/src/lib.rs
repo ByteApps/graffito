@@ -66,6 +66,9 @@ pub enum Error {
     UnrecognizedFormat,
     SeedQr(&'static str),
     Entropy,
+    /// Dice-roll entropy input was rejected (bad character, or too few rolls
+    /// for the requested word count). Carries a user-facing reason.
+    Dice(String),
     /// HTTP transport failure (network, status, body).
     Http(String),
     /// The request never reached a server at all — connection refused/reset,
@@ -113,6 +116,7 @@ impl core::fmt::Display for Error {
             }
             Error::SeedQr(m) => write!(f, "SeedQR: {m}"),
             Error::Entropy => write!(f, "entropy source failure"),
+            Error::Dice(m) => write!(f, "dice rolls: {m}"),
             Error::Http(m) => write!(f, "http: {m}"),
             Error::Transport(m) => write!(f, "transport: {m}"),
             Error::Json(m) => write!(f, "response: {m}"),
