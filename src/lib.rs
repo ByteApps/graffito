@@ -377,6 +377,12 @@ struct State {
     saved_key_present: bool,
     pending_import: Option<Zeroizing<String>>, // hierarchical import awaiting account pick
     pending_mnemonic: Option<String>,
+    /// Dice rolls typed on screen 28. These ARE the seed for a dice
+    /// identity, so they are held Zeroizing and never logged — only the
+    /// count and the (public, on-screen) hash ever reach a log line.
+    dice_rolls: Zeroizing<String>,
+    /// Word count picked on the onboarding door, carried through screen 27.
+    new_word_count: usize,
     quiz_indices: Vec<usize>,
     /// Edge-tracks whether the current compose draft is over the broadcast
     /// ceiling, so the "too large" dialog pops once on crossing — not on
@@ -1355,6 +1361,8 @@ impl State {
             saved_key_present: false,
             pending_import: None,
             pending_mnemonic: None,
+            dice_rolls: Zeroizing::new(String::new()),
+            new_word_count: 12,
             quiz_indices: Vec::new(),
             compose_oversize: false,
             compose_fold_shown: 0,
@@ -3869,6 +3877,67 @@ fn ensure_notebook(st: &mut State, index: u32) {
 /// (`notebooks::default_name`) — same as every other creation path since
 /// 2026-07-26. (The pre-notebooks migration path names its first notebook
 /// "Main" — see notebooks::FIRST_NOTEBOOK_NAME — that path is untouched.)
+/// Everything both create paths (device RNG and dice) do once they have a
+/// phrase: render the numbered grid, stash it as pending, default the iCloud
+/// backup, and open the write-it-down screen. Factored out when dice landed so
+/// the two paths can never drift on the iCloud default or the grid format.
+fn stage_new_mnemonic(w: &AppWindow, s: &mut State, phrase: String) {
+    let grid: String = phrase
+        .split(' ')
+        .enumerate()
+        .map(|(i, wd)| format!("{:>2}. {:<9}{}", i + 1, wd, if i % 3 == 2 { "\n" } else { " " }))
+        .collect();
+    if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
+        // TEST ONLY (env-gated): lets the UI e2e complete the backup quiz.
+        // Never set outside automation.
+        println!("cb-test: words={phrase}");
+    }
+    w.set_backup_words(grid.into());
+    s.pending_mnemonic = Some(phrase);
+    // New key on an online device → default the iCloud backup ON when iCloud
+    // is available (the user can still turn it off).
+    let avail = keychain::icloud_available();
+    s.icloud_backup = avail;
+    w.set_icloud_backup(avail);
+    w.set_icloud_enabled(avail);
+    w.set_screen(2);
+}
+
+/// Repaint the dice screen: counter, remaining, the LIVE hash, and whether
+/// Continue is allowed.
+///
+/// The hash is shown deliberately and is not a secret leak in itself — it is
+/// the seed entropy, but the user is staring at it, and being able to compare
+/// it to `shasum -a 256` is the entire reason this mode exists. It is never
+/// written to a log.
+fn update_dice_ui(w: &AppWindow, s: &State) {
+    use app_core::identity::{dice_face_counts, dice_entropy, dice_min_rolls};
+    let rolls: &str = &s.dice_rolls;
+    let count = rolls.len();
+    let need = dice_min_rolls(s.new_word_count).unwrap_or(99);
+    let hex_all = dice_entropy(rolls).map(hex::encode).unwrap_or_default();
+    let (a, b) = hex_all.split_at(hex_all.len().min(32));
+    w.set_dice_count(count as i32);
+    w.set_dice_needed(need as i32);
+    w.set_dice_hash(a.into());
+    w.set_dice_hash2(b.into());
+
+    // Distribution sanity, same spirit as the reference implementations: a
+    // face appearing far more than its 1/6 share usually means a loaded die or
+    // invented numbers. Only meaningful once there are enough rolls to judge,
+    // and it WARNS rather than blocks — an honest 100 rolls really can be
+    // lopsided, and refusing would just teach people to fake a nicer-looking
+    // sequence.
+    let counts = dice_face_counts(rolls);
+    let skewed = count >= 20 && counts.iter().any(|&c| c * 10 > count * 3);
+    w.set_dice_warning(if skewed {
+        "One number is coming up more than 30% of the time — if that's a real die, keep rolling.".into()
+    } else {
+        "".into()
+    });
+    w.set_dice_ready(count >= need);
+}
+
 fn ensure_first_onboarded_notebook(s: &mut State) {
     ensure_notebook(s, 0);
     let account = s.account;
@@ -12001,6 +12070,8 @@ pub fn run() {
         saved_key_present: false,
         pending_import: None,
         pending_mnemonic: None,
+        dice_rolls: Zeroizing::new(String::new()),
+        new_word_count: 12,
         quiz_indices: Vec::new(),
         compose_oversize: false,
         compose_fold_shown: 0,
@@ -12412,34 +12483,89 @@ pub fn run() {
         w.set_screen(1);
     });
 
+    // Creating a seed is now TWO steps: this door only records the length and
+    // opens the entropy-source screen (27). Generating immediately would deny
+    // the user the one choice they may actually care about — where the
+    // randomness came from.
     cb!(on_door_create, |w, s, words: i32| {
         println!("cb: door=create words={words}");
-        match generate_mnemonic(words as usize) {
-            Ok(m) => {
-                let phrase = m.to_string();
-                let grid: String = phrase
-                    .split(' ')
-                    .enumerate()
-                    .map(|(i, wd)| {
-                        format!("{:>2}. {:<9}{}", i + 1, wd, if i % 3 == 2 { "\n" } else { " " })
-                    })
-                    .collect();
-                if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
-                    // TEST ONLY (env-gated): lets the UI e2e complete the
-                    // backup quiz. Never set outside automation.
-                    println!("cb-test: words={phrase}");
-                }
-                w.set_backup_words(grid.into());
-                s.pending_mnemonic = Some(phrase);
-                // New key on an online device → default the iCloud backup ON
-                // when iCloud is available (the user can still turn it off).
-                let avail = keychain::icloud_available();
-                s.icloud_backup = avail;
-                w.set_icloud_backup(avail);
-                w.set_icloud_enabled(avail);
-                w.set_screen(2);
+        s.new_word_count = words as usize;
+        s.dice_rolls = Zeroizing::new(String::new());
+        w.set_new_word_count(words);
+        w.set_seed_from_dice(false);
+        w.set_screen(27);
+    });
+
+    cb!(on_pick_entropy_source, |w, s, kind: SharedString| {
+        let words = s.new_word_count;
+        println!("cb: entropy-source {kind} words={words}");
+        match kind.as_str() {
+            "dice" => {
+                // Deliberately does NOT reset the rolls: the back chevron on
+                // the dice screen lands here, so wiping on entry meant a
+                // mis-tap silently destroyed several minutes of rolling with
+                // no warning and no undo. A fresh sequence starts at
+                // `door_create` (a genuinely new seed) or via "Start over",
+                // which now confirms.
+                w.set_seed_from_dice(true);
+                update_dice_ui(&w, &s);
+                w.set_screen(28);
             }
-            Err(e) => w.set_status(format!("{e}").into()),
+            _ => match generate_mnemonic(words) {
+                Ok(m) => {
+                    w.set_seed_from_dice(false);
+                    stage_new_mnemonic(&w, &mut s, m.to_string());
+                }
+                Err(e) => w.set_status(format!("{e}").into()),
+            },
+        }
+    });
+
+    cb!(on_dice_roll, |w, s, face: i32| {
+        if (1..=6).contains(&face) {
+            s.dice_rolls.push(char::from_digit(face as u32, 10).expect("1..=6 is a digit"));
+            update_dice_ui(&w, &s);
+        }
+    });
+
+    cb!(on_dice_undo, |w, s| {
+        s.dice_rolls.pop();
+        update_dice_ui(&w, &s);
+    });
+
+    cb!(on_dice_clear, |w, s| {
+        s.dice_rolls = Zeroizing::new(String::new());
+        println!("cb: dice-clear");
+        update_dice_ui(&w, &s);
+    });
+
+    cb!(on_dice_continue, |w, s| {
+        let words = s.new_word_count;
+        let rolls = s.dice_rolls.clone();
+        match app_core::identity::mnemonic_from_dice(&rolls, words) {
+            Ok(m) => {
+                // Count + the (already on-screen, therefore non-secret) hash
+                // only — never the rolls, which are the seed itself.
+                println!(
+                    "cb: dice-continue rolls={} words={words} entropy={}",
+                    rolls.len(),
+                    hex::encode(
+                        &app_core::identity::dice_entropy(&rolls).unwrap_or([0u8; 32])[..4]
+                    )
+                );
+                stage_new_mnemonic(&w, &mut s, m.to_string());
+                // The rolls ARE the seed, so drop them the moment the mnemonic
+                // exists — holding them for the rest of the session would keep
+                // a second copy of the secret in memory for no reason. Nothing
+                // can navigate back to the dice screen from here (back on the
+                // words screen goes to onboarding), so there is nothing to
+                // preserve them for.
+                s.dice_rolls = Zeroizing::new(String::new());
+            }
+            Err(e) => {
+                println!("cb: dice-continue err");
+                w.set_status(format!("{e}").into());
+            }
         }
     });
 
