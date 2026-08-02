@@ -12501,7 +12501,12 @@ pub fn run() {
         println!("cb: entropy-source {kind} words={words}");
         match kind.as_str() {
             "dice" => {
-                s.dice_rolls = Zeroizing::new(String::new());
+                // Deliberately does NOT reset the rolls: the back chevron on
+                // the dice screen lands here, so wiping on entry meant a
+                // mis-tap silently destroyed several minutes of rolling with
+                // no warning and no undo. A fresh sequence starts at
+                // `door_create` (a genuinely new seed) or via "Start over",
+                // which now confirms.
                 w.set_seed_from_dice(true);
                 update_dice_ui(&w, &s);
                 w.set_screen(28);
