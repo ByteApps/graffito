@@ -1,10 +1,68 @@
 //! U3 conformance suite (`PLAN-chain-notes-app-core-rpc.md` §3 step 3):
 //! replays the SAME backend-agnostic contract battery `chain_contract.rs`
-//! runs against `EsploraFake` (U1), this time against a REAL `bitcoind
-//! -regtest` through `ChainClient<AnyTransport>`'s Core RPC backend (U3).
+//! runs against `EsploraFake` (U1), this time against the workspace's ONE
+//! shared regtest node (`PLAN-one-regtest-node.md`) through
+//! `ChainClient<AnyTransport>`'s Core RPC backend (U3).
 //!
-//! Skips gracefully (prints and returns — NOT a failure) when `bitcoind`
-//! isn't on PATH, so this suite still passes on a machine without it.
+//! **This suite no longer spawns its own `bitcoind`.** It connects to the
+//! shared node over the "one regtest node" contract:
+//!
+//!   | env var | meaning | default |
+//!   |---|---|---|
+//!   | `CN_NETWORK` | `regtest` \| `testnet4` | `regtest` |
+//!   | `CN_NODE_HOST` | RPC host | `127.0.0.1` |
+//!   | `CN_NODE_PORT` | RPC port | 18443 / 48332 by network |
+//!   | `CORE_RPC_USER` / `CORE_RPC_PASS` | credentials | none — required |
+//!
+//! Get real values by running (from the `prime` workspace root)
+//! `ui-automation/node-env.sh <network> cargo test -p app-core --test
+//! core_rpc_conformance -- --nocapture --test-threads=1`, or export the vars
+//! yourself. The node is reached through Sal's SSH tunnel — bring it up with
+//! `ssh -f -N -o ExitOnForwardFailure=yes -L 18443:127.0.0.1:18443
+//! satoshi@raspberrypi.local` (regtest) if it isn't already. **Absence of a
+//! reachable node or credentials is a HARD FAILURE with fix instructions,
+//! never a silent skip** — a missing/broken node used to make this whole
+//! suite report a false green in well under a second; see the
+//! `silent-green-test-hazards` memory. A genuine run against the real node
+//! takes on the order of a minute; a sub-second "pass" means something is
+//! wrong, not that the suite is fast.
+//!
+//! **The chain is shared, persistent, and not ours.** Every fixture-building
+//! test funds its OWN freshly generated, single-purpose addresses straight
+//! from a coinbase reward (`generatetoaddress` targeting the address
+//! itself) — never `testwallet` (the node owner's wallet, ~14,096 BTC, never
+//! created/loaded/renamed/reset by us) and never an assumption about the
+//! chain's starting height or the production `chain-notes-watch` wallet's
+//! prior contents (both grow underneath every run). Any throwaway wallet
+//! this suite creates gets a per-run-random name and is `unloadwallet`d
+//! (best effort) before the test returns, so repeated runs don't pile up
+//! loaded wallets on the shared node forever. Tests that build a fixture by
+//! mining are regtest-only by construction (there is no way to mine on
+//! testnet4) and fail loudly, via [`require_regtest`], if pointed at any
+//! other network.
+//!
+//! **Four tests that used to need a differently-configured (or
+//! differently-clocked) node are RESTRUCTURED, not `#[ignore]`d**, against
+//! `common::mock_rpc` — a local-only bitcoind-JSON-RPC-shaped HTTP stub
+//! (NOT bitcoind, NOT the shared node; see its own doc comment). What each
+//! of them actually verifies is how `CoreRpcTransport` INTERPRETS an RPC
+//! response or WHAT it SENDS on the wire, not anything that genuinely needs
+//! a real pruned/no-txindex/clock-skewed node:
+//! `core_rpc_preflight_reports_pruned_node` and
+//! `core_rpc_preflight_reports_missing_txindex` feed `preflight()` a
+//! synthetic `getblockchaininfo`/`getindexinfo` body instead of starting a
+//! node with different flags;
+//! `core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5` is now a
+//! TABLE-DRIVEN battery over synthetic `txindex`/IBD/mempool/RPC-error
+//! combinations (the shared node always runs `txindex=1`, so the negative
+//! cases can no longer come from a real node at all); and
+//! `core_rpc_ranged_import_sends_the_caller_birthday_not_zero` (renamed
+//! from `core_rpc_birthday_excludes_history_before_a_late_timestamp`)
+//! captures the exact `importdescriptors` request bitcoind would receive
+//! and asserts the caller's birthday is on it verbatim, instead of relying
+//! on a real rescan to prove exclusion — which needed `setmocktime`, global
+//! state on the shared node this suite has no business touching. See each
+//! test's doc comment for the specific reasoning and what changed.
 //!
 //! Two traps this file exists to avoid (see the plan's U3 brief):
 //!
@@ -55,13 +113,12 @@
 mod common;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use app_core::chain::{AnyTransport, ChainClient, NodeStatus, TxLookupStatus, WatchDescriptor};
+use app_core::chain::{AnyTransport, ChainClient, TxLookupStatus, WatchDescriptor};
 use app_core::funding::FundingSource;
 use app_core::identity::{parse_key_material, realize, realize_change};
 use app_core::keyexport::export_formats;
@@ -91,50 +148,98 @@ fn data_output(payload: &[u8]) -> serde_json::Value {
     serde_json::json!({"data": hex::encode(payload)})
 }
 
-/// True when a `bitcoind` executable exists on PATH. A pure filesystem
-/// lookup — it deliberately does NOT execute anything.
-///
-/// This replaces a `Command::new("bitcoind").arg("-version").status()`
-/// probe whose `Err(_) => false` / `!status.success() => false` arms were a
-/// silent-green hazard. Every one of the six tests here calls this BEFORE
-/// taking `NODE_LOCK`, so all six probes fire concurrently while other
-/// nodes are still live; under that process pressure `bitcoind -version`
-/// intermittently exits 1 even though the very same command exits 0 when
-/// run by hand. The old code read that as "not installed" and returned
-/// `ok` without running a thing — a deliberately-broken build was observed
-/// passing all six in 0.56s where a real run takes ~60s, which is exactly
-/// how a genuine regression ships behind a green suite.
-///
-/// Answering "is it on PATH" by *reading PATH* is both what the function
-/// name claims and immune to load: no subprocess, no flake, no silent
-/// pass. A node that is present but genuinely broken now surfaces where it
-/// should — in `start_node`, which fails loudly.
-fn bitcoind_on_path() -> bool {
-    let Some(path) = std::env::var_os("PATH") else { return false };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join("bitcoind");
-        std::fs::metadata(&candidate).map(|m| m.is_file()).unwrap_or(false)
-    })
+// ---------------------------------------------------------------------
+// The shared-node contract (PLAN-one-regtest-node.md, "the shared
+// contract"). No suite invents its own — this is it.
+// ---------------------------------------------------------------------
+
+/// Connection details for the ONE shared regtest/testnet4 node, read from
+/// the environment. Credentials carry no default: their absence is a HARD
+/// FAILURE (via [`node_env`]'s panic), never a silent skip.
+struct NodeEnv {
+    network: String,
+    host: String,
+    port: u16,
+    user: String,
+    pass: String,
 }
 
-/// A throwaway `bitcoind -regtest` this suite starts, drives via raw
-/// JSON-RPC (basic auth — same shape the transport-under-test uses, but a
-/// SEPARATE client: this struct is test SETUP, never the code under test),
-/// and tears down on drop — including on a test panic, since Rust unwinds
-/// through `Drop` by default and this crate's test profile doesn't set
-/// `panic = "abort"`.
+fn node_env() -> NodeEnv {
+    let network = std::env::var("CN_NETWORK").unwrap_or_else(|_| "regtest".to_string());
+    if network != "regtest" && network != "testnet4" {
+        panic!(
+            "CN_NETWORK={network:?} is not one of \"regtest\"/\"testnet4\" — see the shared contract \
+             table in PLAN-one-regtest-node.md."
+        );
+    }
+    let host = std::env::var("CN_NODE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let default_port: u16 = if network == "testnet4" { 48332 } else { 18443 };
+    let port = match std::env::var("CN_NODE_PORT") {
+        Ok(p) => p.parse::<u16>().unwrap_or_else(|_| panic!("CN_NODE_PORT={p:?} is not a valid port number")),
+        Err(_) => default_port,
+    };
+    let user = std::env::var("CORE_RPC_USER").unwrap_or_else(|_| {
+        panic!(
+            "CORE_RPC_USER is not set. This suite talks to the ONE shared {network} node — it never \
+             spawns its own bitcoind (PLAN-one-regtest-node.md). Fix: export CN_NETWORK, CN_NODE_HOST, \
+             CN_NODE_PORT, CORE_RPC_USER, CORE_RPC_PASS yourself (or run through the workspace wrapper \
+             `ui-automation/node-env.sh {network} cargo test -p app-core ...` once it exists), and make \
+             sure the SSH tunnel is up: `ssh -f -N -o ExitOnForwardFailure=yes -L {default_port}:\
+             127.0.0.1:{default_port} satoshi@raspberrypi.local`."
+        )
+    });
+    let pass = std::env::var("CORE_RPC_PASS").unwrap_or_else(|_| {
+        panic!("CORE_RPC_PASS is not set — see the CORE_RPC_USER panic message above for the full fix.")
+    });
+    NodeEnv { network, host, port, user, pass }
+}
+
+fn network_of(env: &NodeEnv) -> Network {
+    match env.network.as_str() {
+        "regtest" => Network::Regtest,
+        "testnet4" => Network::Testnet4,
+        other => panic!("unsupported CN_NETWORK={other:?}"),
+    }
+}
+
+/// Fails loudly (never silently skips) when the configured network isn't
+/// regtest. Every fixture-building test in this file mines blocks to set up
+/// its scenario, and there is no testnet4 equivalent — you cannot mine
+/// there (`PLAN-one-regtest-node.md`'s hard constraint).
+fn require_regtest(test_name: &str, env: &NodeEnv) {
+    assert_eq!(
+        env.network, "regtest",
+        "{test_name} is regtest-only: it mines blocks to build its fixture, and there is no testnet4 \
+         equivalent (mining isn't possible there). Set CN_NETWORK=regtest (the default) — got \
+         CN_NETWORK={:?}.",
+        env.network
+    );
+}
+
+/// A connection to the shared node this suite talks to — never a locally
+/// spawned process. `Node::connect` is the only constructor; it fails
+/// loudly if the node can't be reached or the reported chain doesn't match
+/// what was asked for.
 struct Node {
-    datadir: PathBuf,
-    rpcuser: String,
-    rpcpass: String,
-    rpcport: u16,
+    env: NodeEnv,
     client: reqwest::blocking::Client,
-    child: Option<Child>,
 }
 
 impl Node {
     fn base(&self) -> String {
-        format!("http://127.0.0.1:{}", self.rpcport)
+        format!("http://{}:{}", self.env.host, self.env.port)
+    }
+
+    /// The `bitcoind+http://user:pass@host:port` URL for the real node —
+    /// kept ONLY as a manual-debugging escape hatch (bypasses
+    /// `common::count_proxy::CountingProxy`); every test in this file now
+    /// routes its transport-under-test through the counting proxy instead,
+    /// which is why nothing here calls this. **Never print or embed this
+    /// string in a panic/assert message** — it carries the real shared
+    /// node's credentials (`chain-notes-app` is a PUBLIC repo).
+    #[allow(dead_code)]
+    fn core_rpc_url(&self) -> String {
+        format!("bitcoind+http://{}:{}@{}:{}", self.env.user, self.env.pass, self.env.host, self.env.port)
     }
 
     fn try_rpc(&self, wallet: Option<&str>, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -145,7 +250,7 @@ impl Node {
         let resp = self
             .client
             .post(&url)
-            .basic_auth(&self.rpcuser, Some(&self.rpcpass))
+            .basic_auth(&self.env.user, Some(&self.env.pass))
             .json(&serde_json::json!({"jsonrpc": "1.0", "id": "setup", "method": method, "params": params}))
             .send()
             .map_err(|e| e.to_string())?;
@@ -161,18 +266,42 @@ impl Node {
         self.try_rpc(wallet, method, params).unwrap_or_else(|e| panic!("setup rpc {method} failed: {e}"))
     }
 
+    /// Connect to the shared node and verify it answers AND reports the
+    /// chain we asked for — never a 60s "boot" retry loop (this node is
+    /// already running; if it's unreachable, that's a tunnel/creds problem,
+    /// not a startup race), just a short tolerance for a transient blip
+    /// over the SSH tunnel before failing loudly with fix instructions.
     fn wait_ready(&self) {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if self.try_rpc(None, "getblockchaininfo", serde_json::json!([])).is_ok() {
-                return;
+            match self.try_rpc(None, "getblockchaininfo", serde_json::json!([])) {
+                Ok(v) => {
+                    let chain = v.get("chain").and_then(|c| c.as_str()).unwrap_or("?").to_string();
+                    let expected = if self.env.network == "testnet4" { "testnet4" } else { "regtest" };
+                    assert_eq!(
+                        chain, expected,
+                        "connected to a node at {}:{} but it reports chain={chain:?}, not {expected:?} — \
+                         the tunnel/CN_NODE_HOST/CN_NODE_PORT is pointed at the wrong node",
+                        self.env.host, self.env.port
+                    );
+                    return;
+                }
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "cannot reach the shared {} node at {}:{} after 10s: {e}\n\
+                             Fix: bring up the SSH tunnel — `ssh -f -N -o ExitOnForwardFailure=yes \
+                             -L {port}:127.0.0.1:{port} satoshi@raspberrypi.local` — and confirm \
+                             CN_NODE_HOST/CN_NODE_PORT/CORE_RPC_USER/CORE_RPC_PASS are correct for the \
+                             {} node (PLAN-one-regtest-node.md's shared contract). This suite never \
+                             spawns its own bitcoind, so there is no local fallback.",
+                            self.env.network, self.env.host, self.env.port, self.env.network,
+                            port = self.env.port,
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
             }
-            assert!(
-                Instant::now() < deadline,
-                "bitcoind did not become ready within 60s (datadir {:?})",
-                self.datadir
-            );
-            std::thread::sleep(Duration::from_millis(300));
         }
     }
 
@@ -217,8 +346,8 @@ impl Node {
             .to_string()
     }
 
-    fn fresh_addr(&self) -> String {
-        self.rpc(Some("sender"), "getnewaddress", serde_json::json!(["", "bech32m"]))
+    fn fresh_addr(&self, wallet: &str) -> String {
+        self.rpc(Some(wallet), "getnewaddress", serde_json::json!(["", "bech32m"]))
             .as_str()
             .expect("getnewaddress: not a string")
             .to_string()
@@ -252,110 +381,153 @@ impl Node {
     fn tip_height(&self) -> u64 {
         self.rpc(None, "getblockcount", serde_json::json!([])).as_u64().expect("getblockcount: not a number")
     }
-}
 
-impl Drop for Node {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = self.try_rpc(None, "stop", serde_json::json!([]));
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
-                    _ => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                }
-            }
-        }
-        let _ = std::fs::remove_dir_all(&self.datadir);
+    /// Best-effort cleanup for a throwaway signing wallet THIS RUN created
+    /// (never `testwallet`, never `chain-notes-watch` — production state
+    /// this suite doesn't own). Doesn't delete wallet files on the node,
+    /// just unloads it so repeated runs don't leave an ever-growing pile of
+    /// loaded wallets on a shared, persistent node.
+    fn unload_wallet(&self, name: &str) {
+        let _ = self.try_rpc(None, "unloadwallet", serde_json::json!([name]));
     }
 }
 
-/// Distinguishes concurrently-running `#[test]` functions in this same
-/// binary (cargo test runs them in parallel threads of ONE process) — the
-/// original single-test suite derived its port/datadir from
-/// `std::process::id()` alone, which is fine for exactly one node per
-/// process but collides the instant a second test (U4's ranged/widening/
-/// preflight suites) starts its own. Folded into both the port and the
-/// datadir name so no two `Node`s this binary ever creates can collide.
-static NODE_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Connect to the shared node named by the environment (the "one regtest
+/// node" contract) — the sole replacement for the old `start_node()`, which
+/// used to spawn a throwaway local `bitcoind`. No local process is ever
+/// started by this suite anymore.
+fn connect_node() -> Node {
+    let env = node_env();
+    let node = Node { client: reqwest::blocking::Client::builder().timeout(Duration::from_secs(30)).build().unwrap(), env };
+    node.wait_ready();
+    node
+}
 
-/// Serializes every `#[test]` in this file to run ONE bitcoind at a time.
-/// U4 added five more real-node tests alongside U3's original one; cargo's
-/// default test-thread parallelism starts them all concurrently, and six
-/// real regtest nodes competing for CPU on a loaded machine can starve
-/// each other badly enough that `Node::wait_ready`'s 60s budget trips —
-/// verified empirically while writing these tests (a `--test-threads=1`
-/// run of the exact same suite is reliably green; the default parallel run
-/// intermittently was not). That is a resource-contention flake, not a
-/// correctness failure, so tests take this lock as their first action and
-/// hold it for their whole body rather than risk it. Recovers from a
-/// poisoned lock (an earlier test panicking) so one failure doesn't
-/// cascade into every other test failing on the lock instead of its own
-/// assertions.
+/// Waits (bounded) for the shared node's `chain-notes-watch` wallet to
+/// finish any IN-PROGRESS rescan before this test starts touching it.
+/// Purely test-harness courtesy for a genuinely observed hazard on the
+/// shared, multi-consumer node (`PLAN-one-regtest-node.md`): bitcoind
+/// refuses ANY concurrent operation on a wallet mid-rescan (RPC code -4,
+/// "Wallet is currently rescanning. Abort existing rescan or wait.")  — and
+/// on a node other agents/suites/the real app may be touching at the same
+/// moment, SOMEONE ELSE'S rescan can already be running the instant this
+/// test makes its very first touch of `chain-notes-watch`. Observed live
+/// (2026-08-02): four tests in one run each hit -4 on their FIRST touch of
+/// the wallet, and a direct `getwalletinfo` moments after that run ended
+/// showed `scanning: false` — i.e. genuinely external, transient
+/// contention (from a concurrently-running sibling suite/unit against this
+/// same Pi node), not anything this suite's own logic caused.
+///
+/// This is NOT "retry and hope a race resolves in our favor" — it waits
+/// for an OBSERVABLE, well-defined condition (`getwalletinfo().scanning`)
+/// before letting the test proceed with its own deterministic operations,
+/// the same courtesy bitcoind's own error message asks for ("wait").
+/// Best-effort: if the wallet doesn't exist yet (nothing has imported into
+/// it this session), `getwalletinfo` errors and this treats that as
+/// "nothing to wait for" and returns immediately. Bounded at 5 minutes —
+/// past that, something is genuinely stuck and the test should fail
+/// loudly on its own next real RPC call rather than hang here forever.
+fn wait_for_watch_wallet_idle(node: &Node) {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let info = match node.try_rpc(Some("chain-notes-watch"), "getwalletinfo", serde_json::json!([])) {
+            Ok(v) => v,
+            Err(_) => return, // wallet doesn't exist yet — nothing to wait for
+        };
+        let scanning = match info.get("scanning") {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::Object(_)) => true,
+            _ => false,
+        };
+        if !scanning {
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("cb: test-harness gave up waiting for chain-notes-watch to finish rescanning after 300s");
+            return;
+        }
+        eprintln!("cb: test-harness waiting for a concurrent chain-notes-watch rescan to clear (shared node)");
+        std::thread::sleep(Duration::from_secs(3));
+    }
+}
+
+/// U5 measurement addition (`regtest-hides-cost-bugs` memory: assert on
+/// call counts, not elapsed time — a per-operation genesis rescan shipped
+/// in build 52 because a 118-block regtest made it free and elapsed time
+/// never caught it). Prints ONE line per real-node test: wall-clock
+/// elapsed AND, from `proxy` (a [`common::count_proxy::CountingProxy`]
+/// sitting between the transport-under-test and the real node), the exact
+/// per-RPC-method call counts the CODE UNDER TEST issued — independent of
+/// chain height, node latency, or how long any individual call took. This
+/// is the chain-length-independent signal; the elapsed time is printed
+/// alongside it only for human context, never as a pass/fail signal.
+fn report_timing(name: &str, t0: Instant, proxy: &common::count_proxy::CountingProxy) {
+    let mut counts: Vec<(String, u32)> = proxy.snapshot().into_iter().collect();
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    eprintln!(
+        "TIMING {name}: {:?} elapsed, {} total RPC calls via proxy, breakdown={counts:?}",
+        t0.elapsed(),
+        proxy.total()
+    );
+}
+
+/// Per-run-unique name for a throwaway signing wallet THIS test creates on
+/// the shared node — never reused across runs (the node is persistent, so a
+/// fixed name would collide with a previous run's leftovers or a
+/// concurrently running instance of this same suite).
+static WALLET_SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn unique_wallet_name(role: &str) -> String {
+    let seq = WALLET_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    format!("cn-test-{role}-{}-{nanos}-{seq}", std::process::id())
+}
+
+/// A per-run-random BIP-32 account number for deriving HD (notebook/
+/// spending) addresses from [`TEST_MNEMONIC`]. **Load-bearing on a shared,
+/// persistent node**: `TEST_MNEMONIC` is a well-known PUBLIC BIP-39 test
+/// vector reused across this whole codebase's test suites (host tests,
+/// other e2e harnesses, quite possibly a concurrently-running sibling unit
+/// of this very migration) — every one of them that fixes `account = 0`
+/// derives the EXACT SAME addresses, and against a throwaway local node
+/// that never mattered. Against the ONE shared node it means two
+/// completely unrelated test runs can fund the identical taproot address
+/// at different chain heights, which is precisely what happened the first
+/// time this suite ran here: `client.utxos()` (real node truth) showed TWO
+/// coinbases at account-0/index-0 while this run's own `Scenario` only
+/// recorded the one IT mined. Randomizing the account index (the
+/// `regtest-e2e.sh --pi-regtest` technique — see
+/// `PLAN-one-regtest-node.md`'s "Assertions become deltas" section) makes
+/// every HD-derived address in this run unique across all of history, past
+/// and future, without touching how `TEST_MNEMONIC` itself is used.
+static ACCOUNT_SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn random_account() -> u32 {
+    let seq = ACCOUNT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u32;
+    let pid = std::process::id();
+    // Never 0 (every OTHER consumer of this public mnemonic defaults to
+    // account 0) and comfortably under the hardened-derivation ceiling
+    // (2^31).
+    1 + ((nanos ^ pid.wrapping_mul(2_654_435_761) ^ seq.wrapping_mul(40_503)) % 1_000_000)
+}
+
+/// Serializes every `#[test]` in this file against each other. Unlike the
+/// old local-node version of this suite (where each test owned its own
+/// throwaway `bitcoind` process and this lock only existed to avoid
+/// resource contention between them), this now guards CORRECTNESS: every
+/// test shares the SAME shared node and, more specifically, the SAME
+/// production `chain-notes-watch` wallet the code under test creates
+/// lazily — two tests racing on it concurrently (cargo's default
+/// `#[test]` parallelism) could see each other's descriptor imports
+/// mid-assertion. Recovers from a poisoned lock (an earlier test panicking)
+/// so one failure doesn't cascade into every other test failing on the lock
+/// instead of its own assertions.
 static NODE_LOCK: Mutex<()> = Mutex::new(());
 
 fn serialize_nodes() -> std::sync::MutexGuard<'static, ()> {
     NODE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn start_node() -> Node {
-    start_node_with("txindex=1\n")
-}
-
-/// Same as [`start_node`] but with `extra_conf` appended to the (non-
-/// `[regtest]`-sectioned) top of `bitcoin.conf` — used by the U4 preflight
-/// tests to start a node WITHOUT `txindex=1` or WITH `-prune`-equivalent
-/// settings, without duplicating the whole setup dance.
-fn start_node_with(extra_conf: &str) -> Node {
-    let seq = NODE_SEQ.fetch_add(1, Ordering::Relaxed);
-    // Port derived from the process id (plus a per-node sequence offset,
-    // so multiple `Node`s in one test binary never collide) to avoid
-    // colliding with a real node (default regtest RPC is 18443) or a
-    // concurrently-running one.
-    let rpcport = 19000 + ((std::process::id().wrapping_add(seq.wrapping_mul(97))) % 3000) as u16;
-    let rpcuser = "cnrpcuser".to_string();
-    let rpcpass = format!("cnrpcpass-{}-{seq}", std::process::id());
-    let datadir = std::env::temp_dir().join(format!("chain-notes-core-rpc-{}-{seq}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&datadir); // stale leftover from a prior crashed run
-    std::fs::create_dir_all(&datadir).expect("create bitcoind datadir");
-    // `rpcuser`/`rpcpassword`/`rpcport` are network-specific settings and
-    // MUST live under a `[regtest]` section (verified live: bitcoind
-    // refuses to start otherwise — "Config setting for -rpcport only
-    // applied on regtest network when in [regtest] section"). Basic auth,
-    // deliberately NOT cookie auth (cookie files aren't readable from iOS
-    // — plan §2.4) — so this exercises the real auth path.
-    std::fs::write(
-        datadir.join("bitcoin.conf"),
-        format!(
-            "regtest=1\nserver=1\nfallbackfee=0.0001\n{extra_conf}\n[regtest]\nrpcuser={rpcuser}\nrpcpassword={rpcpass}\nrpcport={rpcport}\n"
-        ),
-    )
-    .expect("write bitcoin.conf");
-
-    let child = Command::new("bitcoind")
-        .arg("-regtest")
-        .arg(format!("-datadir={}", datadir.display()))
-        .arg("-daemon=0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn bitcoind");
-
-    let node = Node {
-        datadir,
-        rpcuser,
-        rpcpass,
-        rpcport,
-        client: reqwest::blocking::Client::builder().timeout(Duration::from_secs(30)).build().unwrap(),
-        child: Some(child),
-    };
-    node.wait_ready();
-    node
 }
 
 /// Maps ONE txid into a [`ScenarioTx`] from `bitcoind`'s own
@@ -477,14 +649,17 @@ fn xpub_of(descriptor: &str) -> &str {
 /// can configure `watch_descriptors` before `assert_chain_contract` runs
 /// against an otherwise-identical transport, proving the two paths are
 /// observationally identical (plan §3 step, U4 test 1). Each caller gets
-/// its OWN fresh node (`Node` owns a live child process — it can't be
-/// shared between two `#[test]` functions, and cargo runs this binary's
-/// tests in parallel threads of the SAME process, so a second node is
-/// unavoidable here regardless).
+/// its OWN connection and its OWN uniquely-named throwaway signing wallet
+/// (`sender_wallet`) — cargo runs this binary's tests in parallel threads
+/// of the SAME process, so two independent fixtures built at once must
+/// never share a wallet name.
 struct ConformanceFixture {
     node: Node,
     scenario: Scenario,
     network: Network,
+    /// The throwaway signing wallet this fixture created — the caller
+    /// unloads it (best effort) once done with the fixture.
+    sender_wallet: String,
     /// The account-0 notebook's `tr(...)` multipath descriptor — the exact
     /// string `export_formats` produces for a real caller.
     notebook_descriptor: String,
@@ -494,25 +669,27 @@ struct ConformanceFixture {
 }
 
 fn build_conformance_fixture() -> ConformanceFixture {
-    let node = start_node();
+    let node = connect_node();
+    wait_for_watch_wallet_idle(&node);
 
-    // "sender" holds every test address's private key (so it can sign the
-    // spend-with-change / OP_RETURN-note / broadcast-probe legs). The
-    // watch-only "chain-notes-watch" wallet is created LAZILY by the
-    // CoreRpcTransport under test, never here.
-    node.rpc(None, "createwallet", serde_json::json!(["sender"]));
+    // The throwaway signing wallet holds every test address's private key
+    // (so it can sign the spend-with-change / OP_RETURN-note / broadcast-
+    // probe legs). The watch-only "chain-notes-watch" wallet is created
+    // LAZILY by the CoreRpcTransport under test, never here.
+    let sender = unique_wallet_name("sender");
+    node.rpc(None, "createwallet", serde_json::json!([sender]));
 
-    let addr_a = node.fresh_addr();
-    let addr_note = node.fresh_addr();
-    let mempool_funder = node.fresh_addr();
-    let addr_probe_src = node.fresh_addr();
-    let addr_pager = node.fresh_addr();
-    let ext_recipient = node.fresh_addr();
-    let sink = node.fresh_addr(); // maturity padding + probe's own destination — NEVER recorded/queried
+    let addr_a = node.fresh_addr(&sender);
+    let addr_note = node.fresh_addr(&sender);
+    let mempool_funder = node.fresh_addr(&sender);
+    let addr_probe_src = node.fresh_addr(&sender);
+    let addr_pager = node.fresh_addr(&sender);
+    let ext_recipient = node.fresh_addr(&sender);
+    let sink = node.fresh_addr(&sender); // maturity padding + probe's own destination — NEVER recorded/queried
 
     let network = Network::Regtest;
     let material = parse_key_material(TEST_MNEMONIC, network).expect("valid mnemonic");
-    let account = 0u32;
+    let account = random_account();
     let gap = 3u32;
     let used_receive = vec![0u32, 2u32]; // a hole at index 1
     let used_change = vec![0u32];
@@ -551,16 +728,16 @@ fn build_conformance_fixture() -> ConformanceFixture {
     node.generate(30, &addr_pager);
     node.generate(100, &sink);
 
-    txids.extend(node.utxo_txids("sender", &addr_pager));
+    txids.extend(node.utxo_txids(&sender, &addr_pager));
 
     // ---- Phase 2: addr_note spend-with-change — input = its funding
     // coin, one paying output to a fresh one-shot address, change back to
     // addr_note itself (verified live pattern: explicit `inputs` +
     // `change_address`). ----
-    let (note_txid0, note_vout0, note_amount0) = node.sole_utxo("sender", &addr_note);
+    let (note_txid0, note_vout0, note_amount0) = node.sole_utxo(&sender, &addr_note);
     let pay_amount = note_amount0 / 2;
     let spend_result = node.rpc(
-        Some("sender"),
+        Some(&sender),
         "send",
         serde_json::json!([
             [pay_output(&ext_recipient, pay_amount)],
@@ -577,9 +754,9 @@ fn build_conformance_fixture() -> ConformanceFixture {
     // change coin from phase 2, an OP_RETURN-only output list with NO
     // separate paying output means the ENTIRE remainder becomes change
     // back to addr_note (verified live: exactly 2 outputs result). ----
-    let (note_txid1, note_vout1, _) = node.sole_utxo("sender", &addr_note);
+    let (note_txid1, note_vout1, _) = node.sole_utxo(&sender, &addr_note);
     let note_result = node.rpc(
-        Some("sender"),
+        Some(&sender),
         "send",
         serde_json::json!([
             [data_output(b"hello from the core-rpc conformance suite")],
@@ -598,9 +775,9 @@ fn build_conformance_fixture() -> ConformanceFixture {
     // call is this tx's very first appearance on the node. Deliberately
     // NOT pushed into `txids` — it's asserted only via
     // `Scenario::broadcast_probe`. ----
-    let (probe_in_txid, probe_in_vout, probe_in_amount) = node.sole_utxo("sender", &addr_probe_src);
+    let (probe_in_txid, probe_in_vout, probe_in_amount) = node.sole_utxo(&sender, &addr_probe_src);
     let probe_result = node.rpc(
-        Some("sender"),
+        Some(&sender),
         "send",
         serde_json::json!([
             [pay_output(&sink, probe_in_amount)],
@@ -621,9 +798,9 @@ fn build_conformance_fixture() -> ConformanceFixture {
     // second, genuinely UNCONFIRMED coin, relayed in FULL from
     // `mempool_funder` (whose own complete history is now exactly its two
     // recorded txs). Never mined — this is the scenario's mempool leg. ----
-    let (mf_txid, mf_vout, mf_amount) = node.sole_utxo("sender", &mempool_funder);
+    let (mf_txid, mf_vout, mf_amount) = node.sole_utxo(&sender, &mempool_funder);
     let mempool_result = node.rpc(
-        Some("sender"),
+        Some(&sender),
         "send",
         serde_json::json!([
             [pay_output(&addr_a, mf_amount)],
@@ -668,23 +845,23 @@ fn build_conformance_fixture() -> ConformanceFixture {
         broadcast_probe: Some((probe_hex, probe_txid)),
     };
 
-    ConformanceFixture { node, scenario, network, notebook_descriptor, spending_descriptor }
+    ConformanceFixture { node, scenario, network, sender_wallet: sender, notebook_descriptor, spending_descriptor }
 }
 
 #[test]
 fn core_rpc_conformance() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_conformance: bitcoind not found on PATH");
-        return;
-    }
     let _guard = serialize_nodes();
+    require_regtest("core_rpc_conformance", &node_env());
 
     let fx = build_conformance_fixture();
     let node = &fx.node;
     let scenario = &fx.scenario;
     let tip = scenario.tip_height;
 
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let t0 = Instant::now();
+    let proxy =
+        common::count_proxy::CountingProxy::start(node.env.host.clone(), node.env.port, node.env.user.clone(), node.env.pass.clone());
+    let base = proxy.base_url();
     let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
     let client = ChainClient::new(transport, fx.network);
 
@@ -706,9 +883,20 @@ fn core_rpc_conformance() {
     match AnyTransport::new(&base, None).expect("construct a second Core RPC transport for preflight") {
         AnyTransport::Core(core) => {
             let status = core.preflight().expect("preflight");
-            assert!(!status.pruned, "this node is never pruned");
-            assert!(status.txindex, "this node runs with txindex=1");
-            assert_eq!(status.tip_height, tip);
+            assert!(!status.pruned, "the shared node is never pruned");
+            assert!(status.txindex, "the shared node runs with txindex=1");
+            // NEVER an exact tip-height equality (PLAN-one-regtest-node.md)
+            // — `tip` was captured back when the fixture finished building,
+            // and everything `assert_chain_contract` just did in between
+            // gave the shared node's automine plenty of wall-clock time to
+            // mine another block underneath this test. Only forward
+            // movement is a bug (a block cannot un-mine itself).
+            assert!(
+                status.tip_height >= tip,
+                "preflight tip_height must be >= the fixture's own recorded tip (a shared node only \
+                 ever advances): preflight={}, fixture={tip}",
+                status.tip_height
+            );
             // The watch wallet DOES exist by now (every route above
             // touched it), so scanning info must be reportable, not absent.
             assert!(status.wallet_scanning.is_some(), "watch wallet exists — scanning info must be Some");
@@ -716,11 +904,9 @@ fn core_rpc_conformance() {
         AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
 
-    eprintln!(
-        "core_rpc_conformance: PASS ({} scenario txs, tip={tip}, datadir {:?})",
-        scenario.txs.len(),
-        node.datadir
-    );
+    node.unload_wallet(&fx.sender_wallet);
+    report_timing("core_rpc_conformance", t0, &proxy);
+    eprintln!("core_rpc_conformance: PASS ({} scenario txs, tip={tip})", scenario.txs.len());
 }
 
 /// U4 test 1 (`../../PLAN-chain-notes-app-core-rpc.md` §3 step, "Ranged
@@ -739,16 +925,16 @@ fn core_rpc_conformance() {
 /// wiring choice.
 #[test]
 fn core_rpc_conformance_ranged_descriptors() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_conformance_ranged_descriptors: bitcoind not found on PATH");
-        return;
-    }
     let _guard = serialize_nodes();
+    require_regtest("core_rpc_conformance_ranged_descriptors", &node_env());
 
     let fx = build_conformance_fixture();
     let node = &fx.node;
 
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let t0 = Instant::now();
+    let proxy =
+        common::count_proxy::CountingProxy::start(node.env.host.clone(), node.env.port, node.env.user.clone(), node.env.pass.clone());
+    let base = proxy.base_url();
     let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
     match &transport {
         AnyTransport::Core(core) => core
@@ -823,14 +1009,15 @@ fn core_rpc_conformance_ranged_descriptors() {
         );
     }
 
+    node.unload_wallet(&fx.sender_wallet);
+    report_timing("core_rpc_conformance_ranged_descriptors", t0, &proxy);
     eprintln!(
         "core_rpc_conformance_ranged_descriptors: PASS ({} scenario txs, tip={}, {} watch-wallet \
-         descriptors, 0 addr() imports among the {} ranged-covered addresses, datadir {:?})",
+         descriptors, 0 addr() imports among the {} ranged-covered addresses)",
         fx.scenario.txs.len(),
         fx.scenario.tip_height,
         descriptors.len(),
         ranged_addrs.len(),
-        node.datadir
     );
 }
 
@@ -842,18 +1029,15 @@ fn core_rpc_conformance_ranged_descriptors() {
 /// belongs to a configured family.
 #[test]
 fn core_rpc_range_widening_finds_address_beyond_initial_range() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_range_widening_finds_address_beyond_initial_range: bitcoind not found on PATH");
-        return;
-    }
     let _guard = serialize_nodes();
+    require_regtest("core_rpc_range_widening_finds_address_beyond_initial_range", &node_env());
 
-    let node = start_node();
-    node.rpc(None, "createwallet", serde_json::json!(["sender"]));
+    let node = connect_node();
+    wait_for_watch_wallet_idle(&node);
 
     let network = Network::Regtest;
     let material = parse_key_material(TEST_MNEMONIC, network).expect("valid mnemonic");
-    let account = 0u32;
+    let account = random_account();
 
     let descriptor = export_formats(TEST_MNEMONIC, network, account, 0)
         .expect("export_formats")
@@ -887,7 +1071,10 @@ fn core_rpc_range_widening_finds_address_beyond_initial_range() {
     let funding_txid = node.generate_single_capture(&addr_far);
     let tip = node.tip_height();
 
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let t0 = Instant::now();
+    let proxy =
+        common::count_proxy::CountingProxy::start(node.env.host.clone(), node.env.port, node.env.user.clone(), node.env.pass.clone());
+    let base = proxy.base_url();
     let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
     match &transport {
         AnyTransport::Core(core) => core
@@ -936,10 +1123,10 @@ fn core_rpc_range_widening_finds_address_beyond_initial_range() {
          not imported as its own addr() descriptor (found: {addr_imports:?})"
     );
 
+    report_timing("core_rpc_range_widening_finds_address_beyond_initial_range", t0, &proxy);
     eprintln!(
         "core_rpc_range_widening_finds_address_beyond_initial_range: PASS \
-         (index={far_index}, tip={tip}, range {range_before} -> {range_after:?}, datadir {:?})",
-        node.datadir
+         (index={far_index}, tip={tip}, range {range_before} -> {range_after:?})"
     );
 }
 
@@ -981,20 +1168,29 @@ fn core_rpc_range_widening_finds_address_beyond_initial_range() {
 /// `getaddressinfo` check) means the watch wallet ends up with the SAME two
 /// `listdescriptors` entries after both runs as after the first — not four,
 /// and never a growing `addr(...)` entry per address scanned.
+///
+/// **Env passing note**: the shared node's real `CORE_RPC_USER`/
+/// `CORE_RPC_PASS` end up embedded in the `bitcoind+http://user:pass@…`
+/// argument handed to the `cli` subprocess (same calling convention
+/// `scripts/regtest-e2e.sh --core-rpc` already uses) — that argument is
+/// visible via `ps` to other LOCAL users on this machine for the
+/// subprocess's lifetime. That was harmless when the credentials were
+/// per-run throwaway values; it is a real, if minor, local exposure now
+/// that they are the shared node's real credentials. `examples/cli.rs`
+/// would need to grow env-var credential support to close this — noted as
+/// a production-code follow-up, not fixed here (out of this unit's file
+/// scope).
 #[test]
 fn core_rpc_cli_scan_wires_ranged_watch_descriptors() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_cli_scan_wires_ranged_watch_descriptors: bitcoind not found on PATH");
-        return;
-    }
     let _guard = serialize_nodes();
+    require_regtest("core_rpc_cli_scan_wires_ranged_watch_descriptors", &node_env());
 
-    let node = start_node();
-    node.rpc(None, "createwallet", serde_json::json!(["sender"]));
+    let node = connect_node();
+    wait_for_watch_wallet_idle(&node);
 
     let network = Network::Regtest;
     let material = parse_key_material(TEST_MNEMONIC, network).expect("valid mnemonic");
-    let account = 0u32;
+    let account = random_account();
 
     // Fund two of the notebook's own receive addresses (indexes 0 and 2 —
     // a hole at 1, same shape `build_conformance_fixture` uses elsewhere in
@@ -1008,10 +1204,16 @@ fn core_rpc_cli_scan_wires_ranged_watch_descriptors() {
     // 100 blocks of maturity padding (same as `build_conformance_fixture`'s
     // `sink` padding above) — an immature coinbase reads back with a zero
     // `listunspent` balance regardless of confirmation count, which would
-    // make the balance assertion below meaningless.
-    node.generate(100, &node.fresh_addr());
+    // make the balance assertion below meaningless. Mined to a fresh
+    // address of a THROWAWAY wallet (not testwallet).
+    let pad_wallet = unique_wallet_name("pad");
+    node.rpc(None, "createwallet", serde_json::json!([pad_wallet]));
+    node.generate(100, &node.fresh_addr(&pad_wallet));
 
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let t0 = Instant::now();
+    let proxy =
+        common::count_proxy::CountingProxy::start(node.env.host.clone(), node.env.port, node.env.user.clone(), node.env.pass.clone());
+    let base = proxy.base_url();
 
     // Build the SAME `examples/cli.rs` binary the e2e scripts drive —
     // `scripts/regtest-e2e.sh`'s own recipe (`cargo build -q -p app-core
@@ -1120,238 +1322,292 @@ fn core_rpc_cli_scan_wires_ranged_watch_descriptors() {
          (before={after_first:?}, after={after_second:?})"
     );
 
+    node.unload_wallet(&pad_wallet);
+    report_timing("core_rpc_cli_scan_wires_ranged_watch_descriptors", t0, &proxy);
     eprintln!(
         "core_rpc_cli_scan_wires_ranged_watch_descriptors: PASS (2 subprocess `cli scan` runs, \
-         {} watch-wallet descriptors stable across both, 0 addr() imports for addr0/addr2, datadir {:?})",
+         {} watch-wallet descriptors stable across both, 0 addr() imports for addr0/addr2)",
         after_first.len(),
-        node.datadir
     );
 }
 
-/// U4 test 3 ("Pruned node"): a throwaway `-prune=550` node reports
-/// `pruned` (and SOME prune height) through `preflight()`. A pruned node
-/// CANNOT rescan below its prune height at all (plan §2.2) — the UI (U6)
-/// needs this reported so it can warn plainly rather than have the app
-/// silently return partial history.
+/// U4 test 3 ("Pruned node"), RESTRUCTURED for the "one regtest node"
+/// migration (`PLAN-one-regtest-node.md`): the shared node is permanently
+/// unpruned and not ours to restart with `-prune=550`, but what this test
+/// actually verifies is `preflight()`'s INTERPRETATION of a
+/// `getblockchaininfo` response — nothing about that needs a real pruned
+/// node, only a controlled one. Driven against `common::mock_rpc`, a
+/// local-only bitcoind-JSON-RPC-shaped stub (see its doc comment) scripted
+/// with a synthetic `pruned: true, pruneheight: 550` body.
 #[test]
 fn core_rpc_preflight_reports_pruned_node() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_preflight_reports_pruned_node: bitcoind not found on PATH");
-        return;
-    }
-    let _guard = serialize_nodes();
+    let mock = common::mock_rpc::MockRpcServer::start();
+    mock.set(
+        "getblockchaininfo",
+        common::mock_rpc::MockResponse::Ok(
+            serde_json::json!({"pruned": true, "pruneheight": 550, "initialblockdownload": false, "blocks": 800}),
+        ),
+    );
+    mock.set(
+        "getindexinfo",
+        common::mock_rpc::MockResponse::Ok(serde_json::json!({"txindex": {"synced": true, "best_block_height": 800}})),
+    );
+    mock.set(
+        "getwalletinfo",
+        common::mock_rpc::MockResponse::Err { code: -18, message: "Requested wallet does not exist or is not loaded".into() },
+    );
 
-    // `-txindex` and `-prune` are mutually exclusive in bitcoind — this
-    // node deliberately carries neither the default `start_node()` adds.
-    let node = start_node_with("prune=550\n");
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
-    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
-    let core = match &transport {
-        AnyTransport::Core(c) => c,
+    let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
+    let status = match &transport {
+        AnyTransport::Core(core) => core.preflight().expect("preflight"),
         AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
     };
+    assert!(status.pruned, "a getblockchaininfo.pruned=true response must report pruned=true");
+    assert_eq!(status.prune_height, Some(550), "pruneheight must be threaded through when pruned");
 
-    let status: NodeStatus = core.preflight().expect("preflight");
-    assert!(status.pruned, "a node started with -prune must report pruned=true");
-    assert!(status.prune_height.is_some(), "a pruned node must report SOME prune height, even 0");
-
-    eprintln!("core_rpc_preflight_reports_pruned_node: PASS (status={status:?}, datadir {:?})", node.datadir);
+    eprintln!("core_rpc_preflight_reports_pruned_node: PASS (synthetic — status={status:?})");
 }
 
-/// U4 test 4 ("No txindex"): a node started WITHOUT `-txindex` reports
-/// `txindex: false` through `preflight()`. Without it, prevout lookup for
-/// EXTERNAL parents fails, so sender attribution degrades (plan §2.3) —
-/// the UI (U6) needs this reported rather than silently mis-attributing.
+/// U4 test 4 ("No txindex"), RESTRUCTURED the same way as the pruned test
+/// above: a synthetic `getindexinfo` response carrying no `"txindex"` key
+/// at all — real bitcoind's own shape for a node started without
+/// `-txindex` — must report `txindex: false`.
 #[test]
 fn core_rpc_preflight_reports_missing_txindex() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_preflight_reports_missing_txindex: bitcoind not found on PATH");
-        return;
-    }
-    let _guard = serialize_nodes();
+    let mock = common::mock_rpc::MockRpcServer::start();
+    mock.set(
+        "getblockchaininfo",
+        common::mock_rpc::MockResponse::Ok(serde_json::json!({"pruned": false, "initialblockdownload": false, "blocks": 800})),
+    );
+    // No "txindex" key at all — bitcoind's real `getindexinfo` shape when
+    // no index is enabled.
+    mock.set("getindexinfo", common::mock_rpc::MockResponse::Ok(serde_json::json!({})));
+    mock.set(
+        "getwalletinfo",
+        common::mock_rpc::MockResponse::Err { code: -18, message: "Requested wallet does not exist or is not loaded".into() },
+    );
 
-    let node = start_node_with(""); // plain node: no -txindex, no -prune
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
-    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
-    let core = match &transport {
-        AnyTransport::Core(c) => c,
+    let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
+    let status = match &transport {
+        AnyTransport::Core(core) => core.preflight().expect("preflight"),
         AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
     };
+    assert!(!status.txindex, "an empty getindexinfo response (no txindex key) must report txindex=false");
+    assert!(!status.pruned, "this synthetic node was never pruned");
 
-    let status: NodeStatus = core.preflight().expect("preflight");
-    assert!(!status.txindex, "a node started without -txindex must report txindex=false");
-    assert!(!status.pruned, "this node was never pruned");
-
-    eprintln!("core_rpc_preflight_reports_missing_txindex: PASS (status={status:?}, datadir {:?})", node.datadir);
+    eprintln!("core_rpc_preflight_reports_missing_txindex: PASS (synthetic — status={status:?})");
 }
 
-/// U4 test 5 ("Birthday handling"): a descriptor imported at a LATE
-/// timestamp (well past a real funding tx's own block time) must NOT
-/// report that earlier history — proving the birthday plumbing is honest
-/// (an imported seed with no known birthday must degrade visibly, never
-/// silently claim completeness — plan §2.2) rather than accidentally
-/// complete. Two independent accounts of the SAME test mnemonic run side
-/// by side against the SAME watch wallet: account 0 imported at timestamp
-/// 0 (sees everything) is the control proving the harness itself is sound,
-/// account 1 imported at a timestamp 4 hours past its own funding block is
-/// the case under test.
-///
-/// **Load-bearing regtest gotcha, verified live (bitcoind v30.2.0) while
-/// writing this test**: bitcoind's rescan-from-timestamp finds a starting
-/// HEIGHT by locating the earliest block whose time is >= (timestamp minus
-/// the documented 2-hour window). On a regtest chain freshly mined in the
-/// same second, EVERY block's time is real "now" — so a timestamp set even
-/// slightly in the FUTURE relative to the chain's actual tip has no
-/// qualifying block to start from, and bitcoind's fallback is to scan
-/// EVERYTHING, which would make this test pass for the wrong reason (or,
-/// as first written, fail outright — it found the "excluded" tx anyway).
-/// The fix: `setmocktime` the node forward past the intended import
-/// timestamp and mine a few more blocks BEFORE importing, so the chain's
-/// tip genuinely postdates the birthday and the exclusion is real.
+/// U4 test 5 ("Birthday handling"), RESTRUCTURED per the coordinator's
+/// review: the original version needed `setmocktime` to push the node's
+/// clock hours ahead of "now" so a REAL block would clear bitcoind's
+/// 2-hour rescan margin — global state on the shared, persistent node this
+/// suite has no business touching. What the birthday plumbing actually
+/// needs to prove is much narrower and needs no clock at all: that
+/// `watch_descriptors` sends the CALLER'S OWN birthday on the wire to
+/// `importdescriptors`, never silently substituting genesis (`timestamp:
+/// 0`) for a known, non-zero value. Captured directly via
+/// `common::mock_rpc::MockRpcServer::calls_for` — the exact request bitcoind
+/// would receive, with no need for it to actually act on that timestamp.
 #[test]
-fn core_rpc_birthday_excludes_history_before_a_late_timestamp() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_birthday_excludes_history_before_a_late_timestamp: bitcoind not found on PATH");
-        return;
-    }
-    let _guard = serialize_nodes();
+fn core_rpc_ranged_import_sends_the_caller_birthday_not_zero() {
+    let mock = common::mock_rpc::MockRpcServer::start();
+    mock.set("createwallet", common::mock_rpc::MockResponse::Ok(serde_json::json!({"name": "chain-notes-watch"})));
+    // No descriptors configured yet on this fresh synthetic wallet —
+    // `ranged_family_imported_end` must see nothing and fall through to a
+    // real `import_ranged` call.
+    mock.set("listdescriptors", common::mock_rpc::MockResponse::Ok(serde_json::json!({"descriptors": []})));
+    mock.set(
+        "getdescriptorinfo",
+        common::mock_rpc::MockResponse::Ok(serde_json::json!({"checksum": "abcd1234"})),
+    );
+    mock.set("importdescriptors", common::mock_rpc::MockResponse::Ok(serde_json::json!([{"success": true}])));
 
-    let node = start_node();
-    node.rpc(None, "createwallet", serde_json::json!(["sender"]));
     let network = Network::Regtest;
-    let material = parse_key_material(TEST_MNEMONIC, network).expect("valid mnemonic");
-
-    let addr_full = realize(&material, network, 0, 0).unwrap().address;
-    let desc_full =
+    let descriptor =
         export_formats(TEST_MNEMONIC, network, 0, 0).unwrap().descriptor.expect("tr() descriptor");
-    let addr_late = realize(&material, network, 1, 0).unwrap().address;
-    let desc_late =
-        export_formats(TEST_MNEMONIC, network, 1, 0).unwrap().descriptor.expect("tr() descriptor");
+    // An arbitrary, deliberately non-round, non-zero unix timestamp —
+    // chosen so it can't be confused with `0` by construction.
+    let birthday: u64 = 1_700_000_000;
 
-    node.generate_single_capture(&addr_full);
-    let late_funding_txid = node.generate_single_capture(&addr_late);
-    let funded_height = node.tip_height();
-    let block_hash = node.rpc(None, "getblockhash", serde_json::json!([funded_height]));
-    let block = node.rpc(None, "getblock", serde_json::json!([block_hash, 1]));
-    let funded_time = block.get("time").and_then(|t| t.as_u64()).expect("block time");
-    // bitcoind's own `importdescriptors` help text: blocks up to 2 HOURS
-    // before the earliest timestamp are ALSO scanned — clear that margin
-    // comfortably so this can't accidentally pass.
-    let late_timestamp = funded_time + 4 * 3600;
-
-    // Push the chain's actual tip time well past `late_timestamp` (see the
-    // doc comment above) — otherwise bitcoind can't find a scan-start
-    // height and conservatively scans everything, which would hide the
-    // very bug this test exists to catch.
-    node.rpc(None, "setmocktime", serde_json::json!([late_timestamp + 3600]));
-    node.generate(5, &node.fresh_addr());
-
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
-    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
+    let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
     match &transport {
         AnyTransport::Core(core) => core
-            .watch_descriptors(vec![
-                WatchDescriptor { descriptor: desc_full, network, timestamp: 0, range_end: 2 },
-                WatchDescriptor { descriptor: desc_late, network, timestamp: late_timestamp, range_end: 2 },
-            ])
-            .expect("configure ranged descriptors"),
+            .watch_descriptors(vec![WatchDescriptor { descriptor, network, timestamp: birthday, range_end: 2 }])
+            .expect("configure ranged descriptor"),
         AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
 
-    let client = ChainClient::new(transport, network);
-
-    let full_stats = client.address_stats(&addr_full).expect("address_stats (control)");
-    assert_eq!(full_stats.chain_tx_count, 1, "a timestamp=0 import must see its own funding tx");
-
-    let late_stats = client.address_stats(&addr_late).expect("address_stats (late birthday)");
+    let sent = mock.calls_for("importdescriptors");
+    assert_eq!(sent.len(), 1, "expected exactly one importdescriptors call, got {}: {sent:?}", sent.len());
+    let items = sent[0][0].as_array().expect("importdescriptors params[0] must be an array of request objects");
+    assert_eq!(items.len(), 1, "expected exactly one descriptor request in the batch: {items:?}");
+    let ts = items[0].get("timestamp").and_then(|t| t.as_u64());
     assert_eq!(
-        late_stats.chain_tx_count, 0,
-        "a late-birthday import reported history from BEFORE its birthday (funding txid {late_funding_txid}) \
-         — that would be a silently-wrong wallet, not an honest gap"
+        ts,
+        Some(birthday),
+        "the exact caller-supplied birthday must be sent on the wire to importdescriptors, \
+         never silently substituted with 0/genesis — sent: {items:?}"
     );
 
-    eprintln!(
-        "core_rpc_birthday_excludes_history_before_a_late_timestamp: PASS \
-         (funded_time={funded_time}, late_timestamp={late_timestamp}, datadir {:?})",
-        node.datadir
-    );
+    eprintln!("core_rpc_ranged_import_sends_the_caller_birthday_not_zero: PASS (birthday={birthday})");
 }
 
-/// U5 test 1 (plan §2.1, THE regression this unit exists to prevent): on a
-/// node started WITHOUT `-txindex`, a genuinely unknown txid must map to
-/// `TxLookupStatus::Unknown`, NEVER `NotFound` — the RPC code (-5) is
-/// identical to the txindex=1 case (`core_rpc_conformance` above already
-/// proves the POSITIVE case: NotFound on a healthy, synced, txindex=1
-/// node), but without txindex bitcoind genuinely cannot tell "this tx
-/// doesn't exist" apart from "this tx exists, confirmed, but I have no way
-/// to look it up" — treating the two identically would make the app
-/// declare a live, on-chain transaction dropped, which is the single worst
-/// failure mode `TxLookupStatus`'s own doc comment calls out.
+/// U5 test 1 (plan §2.1, THE regression this unit exists to prevent), a
+/// TABLE-DRIVEN battery over synthetic responses
+/// (`common::mock_rpc::MockRpcServer`, RESTRUCTURED for the "one regtest
+/// node" migration — the shared node always runs `txindex=1`, so the
+/// negative cases below can no longer come from a real differently-
+/// configured node, only from controlled inputs).
+///
+/// `TxLookupStatus::NotFound` may fire ONLY on POSITIVELY established
+/// absence — txindex ∧ ¬IBD ∧ mempool-miss, from `established_absent`
+/// (`app-core/src/chain.rs`) — because the RPC code for "genuinely doesn't
+/// exist" (-5) is IDENTICAL to "this tx exists, confirmed, but I have no
+/// way to look it up" on a node missing txindex, and to "haven't gotten
+/// there yet" mid-IBD. Getting this wrong means the app declares a live,
+/// on-chain transaction dropped — the single worst failure mode
+/// `TxLookupStatus`'s own doc comment calls out, and a documented
+/// invariant in this repo's CLAUDE.md.
+fn synthetic_tx_lookup_status(
+    txindex: bool,
+    ibd: bool,
+    mempool_present: bool,
+    getrawtransaction: common::mock_rpc::MockResponse,
+) -> TxLookupStatus {
+    let mock = common::mock_rpc::MockRpcServer::start();
+    mock.set("getblockcount", common::mock_rpc::MockResponse::Ok(serde_json::json!(800)));
+    mock.set(
+        "getblockchaininfo",
+        common::mock_rpc::MockResponse::Ok(serde_json::json!({"pruned": false, "initialblockdownload": ibd, "blocks": 800})),
+    );
+    mock.set(
+        "getindexinfo",
+        common::mock_rpc::MockResponse::Ok(if txindex {
+            serde_json::json!({"txindex": {"synced": true, "best_block_height": 800}})
+        } else {
+            serde_json::json!({})
+        }),
+    );
+    mock.set(
+        "getwalletinfo",
+        common::mock_rpc::MockResponse::Err { code: -18, message: "Requested wallet does not exist or is not loaded".into() },
+    );
+    mock.set("getrawtransaction", getrawtransaction);
+    mock.set(
+        "getmempoolentry",
+        if mempool_present {
+            common::mock_rpc::MockResponse::Ok(serde_json::json!({"vsize": 200}))
+        } else {
+            common::mock_rpc::MockResponse::Err { code: -5, message: "Transaction not in mempool".into() }
+        },
+    );
+
+    let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
+    let client = ChainClient::new(transport, Network::Regtest);
+    client.tx_lookup_status(&"ff".repeat(32))
+}
+
 #[test]
 fn core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5: bitcoind not found on PATH");
-        return;
-    }
-    let _guard = serialize_nodes();
+    let not_found = || common::mock_rpc::MockResponse::Err {
+        code: -5,
+        message: "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.".into(),
+    };
 
-    // No `-txindex` (mirrors `core_rpc_preflight_reports_missing_txindex`).
-    let node = start_node_with("");
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
-    let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
-    let client = ChainClient::new(transport, Network::Regtest);
-
-    let unknown_txid = "ff".repeat(32);
+    // 1. Fully established absence: txindex present, not IBD, absent from
+    //    the mempool too — THE positive case, must be NotFound.
     assert_eq!(
-        client.tx_lookup_status(&unknown_txid),
+        synthetic_tx_lookup_status(true, false, false, not_found()),
+        TxLookupStatus::NotFound,
+        "txindex ∧ ¬IBD ∧ mempool-miss must be NotFound"
+    );
+
+    // 2. No txindex: the node genuinely cannot tell "gone" from "can't look
+    //    up" — must NEVER read as NotFound. THE regression this test exists
+    //    to prevent.
+    assert_eq!(
+        synthetic_tx_lookup_status(false, false, false, not_found()),
         TxLookupStatus::Unknown,
-        "a no-txindex node must NEVER report NotFound for an unresolvable txid — \
-         that would read a live transaction as dropped"
+        "missing txindex must downgrade to Unknown, never NotFound"
     );
 
-    // Same node, `fetch_tx_status`/`fetch_tx_hex` (the other two
-    // `getrawtransaction`-backed routes) must degrade the SAME way — no
-    // caller anywhere may see a bare "confirmed" verdict manufactured out
-    // of an unresolved absence either.
+    // 3. In IBD: "not found yet" can just mean "haven't gotten there yet".
     assert_eq!(
-        client.fetch_tx_status(&unknown_txid),
-        None,
-        "fetch_tx_status must also read this as unknown, not confirmed/unconfirmed"
+        synthetic_tx_lookup_status(true, true, false, not_found()),
+        TxLookupStatus::Unknown,
+        "a node still in initial block download must downgrade to Unknown"
     );
 
-    eprintln!(
-        "core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5: PASS (datadir {:?})",
-        node.datadir
+    // 4. txindex present, not IBD, but the mempool check ITSELF says
+    //    present — `established_absent`'s second, INDEPENDENT signal must
+    //    be honored even though getrawtransaction alone said -5.
+    assert_eq!(
+        synthetic_tx_lookup_status(true, false, true, not_found()),
+        TxLookupStatus::Unknown,
+        "a mempool hit must block the NotFound verdict even when getrawtransaction itself returned -5"
     );
+
+    // 5. A non-(-5) RPC error must never be read as absence either.
+    assert_eq!(
+        synthetic_tx_lookup_status(
+            true,
+            false,
+            false,
+            common::mock_rpc::MockResponse::Err { code: -1, message: "some other bitcoind error".into() }
+        ),
+        TxLookupStatus::Unknown,
+        "a non-(-5) RPC error code must be Unknown, not NotFound"
+    );
+
+    // 6. Found, confirmed — the healthy positive case on the OTHER side of
+    //    the table (getrawtransaction succeeds at all).
+    assert_eq!(
+        synthetic_tx_lookup_status(
+            true,
+            false,
+            false,
+            common::mock_rpc::MockResponse::Ok(serde_json::json!({"confirmations": 3}))
+        ),
+        TxLookupStatus::Found(true),
+        "a genuinely confirmed tx must read Found(true)"
+    );
+
+    // 7. Found, still in the mempool (0/absent confirmations).
+    assert_eq!(
+        synthetic_tx_lookup_status(true, false, false, common::mock_rpc::MockResponse::Ok(serde_json::json!({}))),
+        TxLookupStatus::Found(false),
+        "a mempool (unconfirmed) tx must read Found(false)"
+    );
+
+    eprintln!("core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5: PASS (synthetic table, 7 cases)");
 }
 
 /// U5 test 2 (plan §2.1, "cache it; do not re-probe per call"): several
 /// lookups of DIFFERENT unknown txids against the SAME transport instance
 /// must trigger exactly ONE real `getblockchaininfo`/`getindexinfo` probe,
 /// not one per lookup — proven via `CoreRpcTransport::preflight_probe_count`,
-/// a counter incremented only by the raw uncached probe. A reviewer's
-/// mutation that made the absence check bypass the cache would make this
-/// counter grow with every lookup instead of staying at 1.
+/// a counter incremented only by the raw uncached probe (per-INSTANCE, so
+/// it starts at 0 for this test's own fresh transport regardless of what
+/// any other test in this binary already did against the shared node).
+/// A reviewer's mutation that made the absence check bypass the cache
+/// would make this counter grow with every lookup instead of staying at 1.
 #[test]
 fn core_rpc_established_absence_caches_node_status_across_lookups() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_established_absence_caches_node_status_across_lookups: bitcoind not found on PATH");
-        return;
-    }
     let _guard = serialize_nodes();
+    require_regtest("core_rpc_established_absence_caches_node_status_across_lookups", &node_env());
 
-    let node = start_node(); // txindex=1 — the positive case.
-    // A brand-new regtest node's tip is still the genesis block (an
-    // ancient timestamp), so `initialblockdownload` reports true until a
-    // RECENT block exists — mine a few (system-clock timestamps, no
-    // `setmocktime` needed, same as every other test here) so this test
-    // exercises the "fully synced" case `established_absent` requires,
-    // not an accidental IBD-driven `Unknown`.
-    node.rpc(None, "createwallet", serde_json::json!(["sender"]));
-    let addr = node.fresh_addr();
+    let node = connect_node(); // txindex=1 (the shared node always is) — the positive case.
+    wait_for_watch_wallet_idle(&node);
+    let sender = unique_wallet_name("sender");
+    node.rpc(None, "createwallet", serde_json::json!([sender]));
+    let addr = node.fresh_addr(&sender);
     node.generate(3, &addr);
 
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let t0 = Instant::now();
+    let proxy =
+        common::count_proxy::CountingProxy::start(node.env.host.clone(), node.env.port, node.env.user.clone(), node.env.pass.clone());
+    let base = proxy.base_url();
     let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
     let client = ChainClient::new(transport, Network::Regtest);
 
@@ -1360,7 +1616,7 @@ fn core_rpc_established_absence_caches_node_status_across_lookups() {
         assert_eq!(
             client.tx_lookup_status(&txid),
             TxLookupStatus::NotFound,
-            "each of these txids is genuinely unknown on this fresh node"
+            "each of these txids is genuinely unknown on this node"
         );
     }
 
@@ -1373,10 +1629,9 @@ fn core_rpc_established_absence_caches_node_status_across_lookups() {
         AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
 
-    eprintln!(
-        "core_rpc_established_absence_caches_node_status_across_lookups: PASS (datadir {:?})",
-        node.datadir
-    );
+    node.unload_wallet(&sender);
+    report_timing("core_rpc_established_absence_caches_node_status_across_lookups", t0, &proxy);
+    eprintln!("core_rpc_established_absence_caches_node_status_across_lookups: PASS");
 }
 
 /// U5 test 3 (plan §2.4, "the garbage-address silent-success path — make
@@ -1387,18 +1642,20 @@ fn core_rpc_established_absence_caches_node_status_across_lookups() {
 /// stable against a live node: `getdescriptorinfo`/`listunspent` are never
 /// handed the garbage string (which would itself error), and every
 /// affected route answers with its empty shape instead of an `Error`.
+///
+/// Network-agnostic (no mining, no wallet, no fixture) — runs against
+/// whatever network is configured, so no `require_regtest` guard.
 #[test]
 fn core_rpc_invalid_address_reads_as_never_used_not_error() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_invalid_address_reads_as_never_used_not_error: bitcoind not found on PATH");
-        return;
-    }
     let _guard = serialize_nodes();
-
-    let node = start_node();
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let node = connect_node();
+    wait_for_watch_wallet_idle(&node);
+    let t0 = Instant::now();
+    let proxy =
+        common::count_proxy::CountingProxy::start(node.env.host.clone(), node.env.port, node.env.user.clone(), node.env.pass.clone());
+    let base = proxy.base_url();
     let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
-    let client = ChainClient::new(transport, Network::Regtest);
+    let client = ChainClient::new(transport, network_of(&node.env));
 
     let garbage = "not-a-real-bitcoin-address";
     let stats = client.address_stats(garbage).expect("address_stats must be Ok, not Err, for a garbage address");
@@ -1409,43 +1666,40 @@ fn core_rpc_invalid_address_reads_as_never_used_not_error() {
     let history = client.full_history(garbage).expect("full_history must be Ok, not Err, for a garbage address");
     assert!(history.is_empty());
 
-    eprintln!("core_rpc_invalid_address_reads_as_never_used_not_error: PASS (datadir {:?})", node.datadir);
+    report_timing("core_rpc_invalid_address_reads_as_never_used_not_error", t0, &proxy);
+    eprintln!("core_rpc_invalid_address_reads_as_never_used_not_error: PASS");
 }
 
-/// U7: `/v1/fees/recommended` against a REAL, freshly-started regtest node
-/// — which is exactly the "`estimatesmartfee` genuinely has nothing to
-/// estimate from" case the plan calls out by name (a brand-new regtest
-/// chain has coinbase-only blocks, never a real fee market), so this
-/// exercises the fallback path for real rather than merely asserting a
-/// mock never called. A live assertion, not a "did it not crash" smoke
-/// test: every tier must be present, non-zero, correctly ORDERED
-/// (fastest >= half_hour >= hour >= economy — the U7 ordering invariant),
-/// and `minimumFee` must reflect this node's OWN live
-/// `getmempoolinfo().mempoolminfee` (a plain regtest node's default, 1
-/// sat/vB) rather than a hardcoded stand-in.
+/// U7: `/v1/fees/recommended` against the shared regtest node — the
+/// "`estimatesmartfee` genuinely has nothing to estimate from" case the
+/// plan calls out by name (a fresh regtest chain has coinbase-only blocks,
+/// never a real fee market). On a FRESH local node that was always true;
+/// on the shared, long-running Pi node it may or may not still be true
+/// (cumulative fee-paying activity from every suite/person that has ever
+/// used it could have given `estimatesmartfee` real data to work with) —
+/// so this checks which case it's actually in and asserts accordingly,
+/// rather than assuming: either way, `fee_rates()` must return sane,
+/// correctly ORDERED tiers (fastest >= half_hour >= hour >= economy) whose
+/// `minimum` reflects this node's OWN live `getmempoolinfo().mempoolminfee`
+/// — that invariant holds regardless of whether the numbers came from the
+/// fallback or from genuine fee-market data. The fallback-specific
+/// "stays sane, nowhere near a spike rate" bound is only asserted in the
+/// no-history case, since a real fee market's `fastest` estimate is
+/// legitimately allowed to be whatever the mempool says.
 #[test]
 fn core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history: bitcoind not found on PATH");
-        return;
-    }
     let _guard = serialize_nodes();
-
-    let node = start_node();
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let node = connect_node();
+    wait_for_watch_wallet_idle(&node);
+    let t0 = Instant::now();
+    let proxy =
+        common::count_proxy::CountingProxy::start(node.env.host.clone(), node.env.port, node.env.user.clone(), node.env.pass.clone());
+    let base = proxy.base_url();
     let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
-    let client = ChainClient::new(transport, Network::Regtest);
+    let client = ChainClient::new(transport, network_of(&node.env));
 
-    // Independently confirm THIS node's `estimatesmartfee` really has
-    // nothing to estimate from right now — if a future bitcoind version
-    // ever changes that, this test should fail loudly here (with a clear
-    // reason) rather than silently exercising the "happy path" instead of
-    // the fallback path it claims to.
     let estimate = node.rpc(None, "estimatesmartfee", serde_json::json!([1]));
-    assert!(
-        estimate.get("feerate").is_none(),
-        "expected a fresh regtest node to have no fee estimate yet, got {estimate:?}"
-    );
+    let has_real_estimate = estimate.get("feerate").is_some();
 
     let fees = client.fee_rates().expect("fee_rates");
 
@@ -1453,17 +1707,10 @@ fn core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history() {
     assert!(fees.half_hour >= fees.hour, "half_hour {} must be >= hour {}", fees.half_hour, fees.hour);
     assert!(fees.hour >= fees.economy, "hour {} must be >= economy {}", fees.hour, fees.economy);
     assert!(fees.economy >= 1.0, "economy fee must never be zero (or negative), got {}", fees.economy);
-    assert!(
-        fees.fastest < 1000.0,
-        "fastest fallback must stay sane, nowhere near a real fee-spike rate: {}",
-        fees.fastest
-    );
 
     // The node's own relay floor, read independently via `getmempoolinfo`
     // (never trusting this driver's own conversion helper — the whole
-    // point is proving the ROUTE reads it from the live node) — a plain
-    // regtest node with no mempool pressure reports the network default,
-    // 0.00001 BTC/kvB = 1 sat/vB.
+    // point is proving the ROUTE reads it from the live node).
     let mempool_info = node.rpc(None, "getmempoolinfo", serde_json::json!([]));
     let relay_min_btc_per_kvb =
         mempool_info.get("mempoolminfee").and_then(|v| v.as_f64()).expect("getmempoolinfo: no mempoolminfee");
@@ -1477,11 +1724,25 @@ fn core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history() {
     // will actually accept.
     assert!(fees.economy >= relay_min_sat_vb, "economy {} must be >= relay minimum {relay_min_sat_vb}", fees.economy);
 
-    eprintln!(
-        "core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history: PASS \
-         (fees={fees:?}, relay_min_sat_vb={relay_min_sat_vb}, datadir {:?})",
-        node.datadir
-    );
+    report_timing("core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history", t0, &proxy);
+    if !has_real_estimate {
+        assert!(
+            fees.fastest < 1000.0,
+            "fastest fallback must stay sane, nowhere near a real fee-spike rate: {}",
+            fees.fastest
+        );
+        eprintln!(
+            "core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history: PASS \
+             (fees={fees:?}, relay_min_sat_vb={relay_min_sat_vb}, genuine no-fee-history fallback exercised)"
+        );
+    } else {
+        eprintln!(
+            "core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history: PASS \
+             (fees={fees:?}, relay_min_sat_vb={relay_min_sat_vb}, shared node already had real fee \
+             history — ordering/minimum-floor invariants checked, fallback-specific path not exercised \
+             this run)"
+        );
+    }
 }
 
 /// `listdescriptors` on the transport-under-test's watch wallet, parsed
@@ -1533,7 +1794,10 @@ fn watch_wallet_descriptor_timestamps(node: &Node) -> HashMap<String, u64> {
 /// [`app_core::chain::core_rpc_import_descriptors_call_count`] (a
 /// process-global, test-visibility-only counter), which is entirely
 /// independent of chain length and would have caught this bug on regtest
-/// from day one.
+/// from day one. Now that regtest itself is a real, ever-growing shared
+/// chain (`PLAN-one-regtest-node.md`), that independence matters even
+/// more: a call-count assertion is exactly as meaningful at height 726 as
+/// at height 72,600.
 ///
 /// This test reproduces the SHAPE of the real bug directly: `N`
 /// independently constructed transports (exactly what `open_client` does
@@ -1543,7 +1807,7 @@ fn watch_wallet_descriptor_timestamps(node: &Node) -> HashMap<String, u64> {
 /// — stateless, survives the per-operation churn that defeats any
 /// in-memory cache, and is what makes the VERY FIRST of these `N`
 /// transports (which cannot possibly have a warm cache — this is a
-/// brand-new address on a brand-new node) do the right thing; (2) a
+/// brand-new address on the shared node) do the right thing; (2) a
 /// process-global cache on top of that, purely so a repeat doesn't even
 /// pay for the one cheap `getaddressinfo` round trip; (3) the import
 /// itself, once genuinely needed, runs under a much longer timeout. A
@@ -1552,22 +1816,24 @@ fn watch_wallet_descriptor_timestamps(node: &Node) -> HashMap<String, u64> {
 /// this unit's change) makes the asserted count go from 1 to `N`.
 #[test]
 fn core_rpc_import_is_idempotent_across_fresh_transports() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_import_is_idempotent_across_fresh_transports: bitcoind not found on PATH");
-        return;
-    }
     let _guard = serialize_nodes();
+    require_regtest("core_rpc_import_is_idempotent_across_fresh_transports", &node_env());
 
-    let node = start_node();
-    node.rpc(None, "createwallet", serde_json::json!(["sender"]));
+    let node = connect_node();
+    wait_for_watch_wallet_idle(&node);
+    let sender = unique_wallet_name("sender");
+    node.rpc(None, "createwallet", serde_json::json!([sender]));
     // A genuinely funded address — the point is the IMPORT count, but a
     // used address (rather than an empty one) is the more honest shape,
     // and doubles as a correctness check: every one of the N independent
     // lookups below must still see the SAME real funding tx.
-    let addr = node.fresh_addr();
+    let addr = node.fresh_addr(&sender);
     node.generate(1, &addr);
 
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let t0 = Instant::now();
+    let proxy =
+        common::count_proxy::CountingProxy::start(node.env.host.clone(), node.env.port, node.env.user.clone(), node.env.pass.clone());
+    let base = proxy.base_url();
 
     // Baseline BEFORE this test's own activity — the counter is
     // process-global (shared with every other test in this binary), and
@@ -1618,11 +1884,9 @@ fn core_rpc_import_is_idempotent_across_fresh_transports() {
          requested timestamp of 0) exactly — descriptors seen: {timestamps:?}"
     );
 
-    eprintln!(
-        "core_rpc_import_is_idempotent_across_fresh_transports: PASS \
-         ({N} ops, {import_calls} import call, datadir {:?})",
-        node.datadir
-    );
+    node.unload_wallet(&sender);
+    report_timing("core_rpc_import_is_idempotent_across_fresh_transports", t0, &proxy);
+    eprintln!("core_rpc_import_is_idempotent_across_fresh_transports: PASS ({N} ops, {import_calls} import call)");
 }
 
 /// U6, companion to the idempotence test above: proves the RANGED path
@@ -1638,17 +1902,16 @@ fn core_rpc_import_is_idempotent_across_fresh_transports() {
 /// (not `1`) directly catches a regression that silently zeroed it.
 #[test]
 fn core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero() {
-    if !bitcoind_on_path() {
-        eprintln!("SKIP core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero: bitcoind not found on PATH");
-        return;
-    }
     let _guard = serialize_nodes();
+    require_regtest("core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero", &node_env());
 
-    let node = start_node();
+    let node = connect_node();
+    wait_for_watch_wallet_idle(&node);
     let network = Network::Regtest;
     let material = parse_key_material(TEST_MNEMONIC, network).expect("valid mnemonic");
+    let account = random_account();
     let descriptor =
-        export_formats(TEST_MNEMONIC, network, 0, 0).unwrap().descriptor.expect("tr() descriptor");
+        export_formats(TEST_MNEMONIC, network, account, 0).unwrap().descriptor.expect("tr() descriptor");
     let _ = &material; // only needed to derive `descriptor` above
 
     // An arbitrary, deliberately non-round, non-zero unix timestamp —
@@ -1656,7 +1919,10 @@ fn core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero() {
     // genesis-clamp value (`1`) by construction.
     let birthday: u64 = 1_700_000_000;
 
-    let base = format!("bitcoind+http://{}:{}@127.0.0.1:{}", node.rpcuser, node.rpcpass, node.rpcport);
+    let t0 = Instant::now();
+    let proxy =
+        common::count_proxy::CountingProxy::start(node.env.host.clone(), node.env.port, node.env.user.clone(), node.env.pass.clone());
+    let base = proxy.base_url();
     let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
     match &transport {
         AnyTransport::Core(core) => core
@@ -1666,21 +1932,29 @@ fn core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero() {
     }
 
     let timestamps = watch_wallet_descriptor_timestamps(&node);
+    // Separate from the call-count question (`report_timing` below): the
+    // WATCH WALLET ITSELF accumulates descriptors forever across every run
+    // of this suite, every other unit's suite, and the real app — a single
+    // `listdescriptors` response therefore grows in BYTES over time even
+    // though it is always exactly one RPC call. Not a call-count defect,
+    // but the same "grows without bound" family the coordinator flagged;
+    // logging the count here is a cheap trend signal for future runs.
+    eprintln!("cb: chain-notes-watch now carries {} total descriptor entries", timestamps.len());
     assert!(
         timestamps.values().any(|&ts| ts == birthday),
         "expected a descriptor carrying the exact caller-supplied birthday {birthday}, \
          got: {timestamps:?} — a `1` here would mean the ranged path silently substituted \
          a genesis (timestamp: 0) rescan for a KNOWN, non-zero birthday"
     );
-    assert!(
-        timestamps.values().all(|&ts| ts != 1),
-        "no descriptor in a ranged-only scenario may show bitcoind's genesis-clamp value (1) — \
-         every family here was configured with an explicit non-zero birthday: {timestamps:?}"
-    );
+    // NOTE: unlike the old locally-spawned-node version of this test, this
+    // can no longer also assert "no descriptor anywhere carries the
+    // genesis-clamp value `1`" — the shared `chain-notes-watch` wallet may
+    // already carry OTHER descriptors (from earlier runs of this suite, or
+    // other consumers of the shared node) imported at genesis. The
+    // targeted assertion above (the caller-supplied birthday shows up
+    // verbatim) is what this test actually needs to prove and is
+    // unaffected by that.
 
-    eprintln!(
-        "core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero: PASS \
-         (birthday={birthday}, datadir {:?})",
-        node.datadir
-    );
+    report_timing("core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero", t0, &proxy);
+    eprintln!("core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero: PASS (birthday={birthday})");
 }

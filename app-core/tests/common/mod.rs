@@ -36,6 +36,21 @@
 
 #![allow(dead_code)]
 
+/// U5 (`PLAN-one-regtest-node.md`) addition: a local-only bitcoind-JSON-RPC
+/// stub for driving `CoreRpcTransport`'s response-interpretation logic with
+/// synthetic bodies a shared, persistent, not-ours node cannot be coerced
+/// into producing on demand (pruned/no-txindex reporting, the NotFound
+/// decision table, the ranged-import birthday timestamp). See its own doc
+/// comment. Unrelated to the `Scenario`/`EsploraFake` machinery below.
+pub mod mock_rpc;
+
+/// U5 measurement addition: a forwarding, per-method-counting proxy for
+/// distinguishing "this suite got slower because chain-length-independent
+/// per-call latency accumulated" from "this suite got slower because it is
+/// issuing MORE calls, or a call that costs more, as the shared chain/
+/// wallet grow" — see its own doc comment.
+pub mod count_proxy;
+
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet};
 use std::str::FromStr;
@@ -718,22 +733,79 @@ pub fn build_unsigned_spend_hex(network: Network, from_txid: &str, from_vout: u3
 // The contract battery
 // ---------------------------------------------------------------------
 
+/// Compares two UTXO tuple-lists `(txid, vout, value, height)`, tolerating
+/// exactly ONE shared-node hazard (`PLAN-one-regtest-node.md`): a coin the
+/// scenario recorded UNCONFIRMED (`height: None`) may have since been
+/// mined by `regtest-automine.service` during a long test run against the
+/// Pi's persistent chain — that's fine, `got`'s height for it may be
+/// `Some(_)` too. This is a NO-OP against `EsploraFake` (nothing there ever
+/// mines anything mid-test, so a recorded `None` always comes back `None`)
+/// — the tolerance only ever matters, and only ever loosens the exact
+/// case, against a real live backend. Everything else must still match
+/// exactly: the coin SET (by txid/vout — sorted on that alone, never on
+/// height, so a since-confirmed coin's changed height can't desync the
+/// pairing), every value, and any ALREADY-confirmed height (never
+/// regresses, never silently changes to a different height — that would be
+/// a genuine bug, not a race). `sc_tip` is the scenario's own recorded tip
+/// height — a legitimate "since confirmed" height must be at or after it,
+/// since mining only ever moves forward.
+fn assert_utxos_match_tolerant(
+    label: &str,
+    mut expected: Vec<(String, u32, u64, Option<u64>)>,
+    mut got: Vec<(String, u32, u64, Option<u64>)>,
+    sc_tip: u64,
+) {
+    expected.sort_by(|a, b| (a.0.clone(), a.1).cmp(&(b.0.clone(), b.1)));
+    got.sort_by(|a, b| (a.0.clone(), a.1).cmp(&(b.0.clone(), b.1)));
+    assert_eq!(
+        got.iter().map(|u| (u.0.clone(), u.1)).collect::<Vec<_>>(),
+        expected.iter().map(|u| (u.0.clone(), u.1)).collect::<Vec<_>>(),
+        "{label}: utxo (txid,vout) set"
+    );
+    for ((et, ev, eval, eh), (_gt, _gv, gval, gh)) in expected.iter().zip(got.iter()) {
+        assert_eq!(gval, eval, "{label}: value for {et}:{ev}");
+        match eh {
+            Some(_) => assert_eq!(
+                gh, eh,
+                "{label}: {et}:{ev} was already confirmed at a specific height and must not change"
+            ),
+            None => assert!(
+                gh.is_none() || gh.unwrap() >= sc_tip,
+                "{label}: {et}:{ev} recorded unconfirmed — if it has since confirmed (shared node, \
+                 PLAN-one-regtest-node.md), the height must be >= the scenario's own tip ({sc_tip}), \
+                 got {gh:?}"
+            ),
+        }
+    }
+}
+
 /// Backend-agnostic semantics battery: "given this chain state, this method
 /// returns this." Contains NO Esplora-specific assertions (no request-path
 /// or raw-JSON checks — see `tests/esplora_paths.rs` for those) so it can
 /// later be called VERBATIM against `ChainClient<CoreRpcTransport>` pointed
 /// at a real `bitcoind` holding the same scenario.
+///
+/// **Never asserts an exact tip height or an exact confirmed-vs-mempool
+/// split** (`PLAN-one-regtest-node.md`: the shared regtest node this may be
+/// checked against grows underneath a long test run) — every height/
+/// confirmation-state comparison below is a `>=`/tolerant check instead,
+/// see [`assert_utxos_match_tolerant`] and the inline comments at each
+/// remaining site.
 pub fn assert_chain_contract<T: Transport>(client: &ChainClient<T>, sc: &Scenario) {
-    assert_eq!(client.tip_height().unwrap(), sc.tip_height, "tip_height");
+    let live_tip = client.tip_height().unwrap();
+    assert!(
+        live_tip >= sc.tip_height,
+        "tip_height must be >= what the scenario recorded (a shared node only ever advances): \
+         live={live_tip}, scenario={}",
+        sc.tip_height
+    );
 
     for address in sc.all_addresses() {
         // utxos: values, confirmed flag (via height), block_height.
-        let mut expected = sc.utxos_for(&address);
-        expected.sort();
-        let mut got: Vec<(String, u32, u64, Option<u64>)> =
+        let expected = sc.utxos_for(&address);
+        let got: Vec<(String, u32, u64, Option<u64>)> =
             client.utxos(&address).unwrap().into_iter().map(|u| (u.txid, u.vout, u.value, u.height)).collect();
-        got.sort();
-        assert_eq!(got, expected, "utxos({address})");
+        assert_utxos_match_tolerant(&format!("utxos({address})"), expected, got, sc.tip_height);
 
         // full_history: complete address history, deduped, regardless of
         // page count.
@@ -748,13 +820,34 @@ pub fn assert_chain_contract<T: Transport>(client: &ChainClient<T>, sc: &Scenari
         exp_ids.sort();
         assert_eq!(got_ids, exp_ids, "full_history({address}) txid set");
 
-        // address_stats: chain vs mempool funded/spent/tx_count.
+        // address_stats: chain vs mempool funded/spent/tx_count. The
+        // CHAIN/MEMPOOL SPLIT is tolerant of the same shared-node hazard as
+        // the utxos check above — a scenario-recorded mempool tx may have
+        // since been mined, moving its contribution from the mempool
+        // bucket to the chain bucket. The TOTALS must still match exactly
+        // (nothing may appear/disappear), and the mempool bucket may only
+        // ever SHRINK relative to what was recorded (coins graduate
+        // mempool -> chain during a long run, never the reverse).
         let (ctc, cf, cs, mtc, mf, ms) = sc.stats_for(&address);
         let stats = client.address_stats(&address).unwrap();
         assert_eq!(
-            (stats.chain_tx_count, stats.chain_funded, stats.chain_spent, stats.mempool_tx_count, stats.mempool_funded, stats.mempool_spent),
-            (ctc, cf, cs, mtc, mf, ms),
-            "address_stats({address})"
+            stats.chain_tx_count + stats.mempool_tx_count,
+            ctc + mtc,
+            "address_stats({address}) total tx_count"
+        );
+        assert_eq!(stats.chain_funded + stats.mempool_funded, cf + mf, "address_stats({address}) total funded");
+        assert_eq!(stats.chain_spent + stats.mempool_spent, cs + ms, "address_stats({address}) total spent");
+        assert!(
+            stats.mempool_tx_count <= mtc,
+            "address_stats({address}) mempool_tx_count must only shrink (mempool -> chain confirmation), \
+             never grow: expected <= {mtc}, got {}",
+            stats.mempool_tx_count
+        );
+        assert!(
+            stats.chain_tx_count >= ctc,
+            "address_stats({address}) chain_tx_count must never be fewer than what was already recorded \
+             confirmed: expected >= {ctc}, got {}",
+            stats.chain_tx_count
         );
 
         // address_used / address_probe.
@@ -774,18 +867,39 @@ pub fn assert_chain_contract<T: Transport>(client: &ChainClient<T>, sc: &Scenari
         assert!(client.utxos(never_used).unwrap().is_empty());
     }
 
-    // fetch_tx_hex / fetch_tx_status for every tx in the scenario.
+    // fetch_tx_hex / fetch_tx_status for every tx in the scenario. A tx
+    // recorded CONFIRMED must stay confirmed (exact); one recorded
+    // UNCONFIRMED may read back either way (still mempool, or since mined
+    // by the shared node's automine — same tolerance as the utxos check
+    // above) but must never vanish entirely (`None`).
     for tx in &sc.txs {
         assert_eq!(client.fetch_tx_hex(&tx.txid).unwrap(), tx.hex, "fetch_tx_hex({})", tx.txid);
-        assert_eq!(client.fetch_tx_status(&tx.txid), Some(tx.confirmed_height.is_some()), "fetch_tx_status({})", tx.txid);
+        let status = client.fetch_tx_status(&tx.txid);
+        if tx.confirmed_height.is_some() {
+            assert_eq!(status, Some(true), "fetch_tx_status({}) recorded confirmed must stay confirmed", tx.txid);
+        } else {
+            assert!(
+                status.is_some(),
+                "fetch_tx_status({}) recorded as mempool must still be known (Some), never disappear \
+                 — got None",
+                tx.txid
+            );
+        }
     }
 
-    // tx_lookup_status: Found(true), Found(false), NotFound.
+    // tx_lookup_status: Found(true), Found(false)-or-since-confirmed,
+    // NotFound.
     if let Some(t) = sc.txs.iter().find(|t| t.confirmed_height.is_some()) {
         assert_eq!(client.tx_lookup_status(&t.txid), TxLookupStatus::Found(true), "tx_lookup_status confirmed");
     }
     if let Some(t) = sc.txs.iter().find(|t| t.confirmed_height.is_none()) {
-        assert_eq!(client.tx_lookup_status(&t.txid), TxLookupStatus::Found(false), "tx_lookup_status mempool");
+        let status = client.tx_lookup_status(&t.txid);
+        assert!(
+            matches!(status, TxLookupStatus::Found(_)),
+            "tx_lookup_status({}) recorded as mempool must still be Found — confirmed=true is fine, it \
+             may have been mined since the scenario snapshot (shared node) — got {status:?}",
+            t.txid
+        );
     }
     let unknown_txid = "ff".repeat(32);
     assert_eq!(client.tx_lookup_status(&unknown_txid), TxLookupStatus::NotFound, "tx_lookup_status unknown");
@@ -835,7 +949,12 @@ pub fn assert_chain_contract<T: Transport>(client: &ChainClient<T>, sc: &Scenari
     // build_bundle: an address with at least one OP_RETURN-carrying tx.
     if let Some(address) = sc.all_addresses().into_iter().find(|a| sc.history_desc(a).iter().any(|t| t.vout.iter().any(|o| o.is_op_return))) {
         let bundle = client.build_bundle(&address, None).unwrap();
-        assert_eq!(bundle.tip_height, sc.tip_height, "build_bundle tip_height");
+        assert!(
+            bundle.tip_height >= sc.tip_height,
+            "build_bundle tip_height must be >= what the scenario recorded: live={}, scenario={}",
+            bundle.tip_height,
+            sc.tip_height
+        );
         assert!(bundle.full, "build_bundle(since_height=None).full");
         let expected_note_txids: HashSet<String> = sc
             .history_desc(&address)
@@ -845,12 +964,10 @@ pub fn assert_chain_contract<T: Transport>(client: &ChainClient<T>, sc: &Scenari
             .collect();
         let got_note_txids: HashSet<String> = bundle.notes_onchain.iter().map(|t| t.txid.clone()).collect();
         assert_eq!(got_note_txids, expected_note_txids, "build_bundle notes_onchain for {address}");
-        let mut exp_utxo = sc.utxos_for(&address);
-        exp_utxo.sort();
-        let mut got_utxo: Vec<(String, u32, u64, Option<u64>)> =
+        let exp_utxo = sc.utxos_for(&address);
+        let got_utxo: Vec<(String, u32, u64, Option<u64>)> =
             bundle.utxos.iter().map(|u| (u.txid.clone(), u.vout, u.value, u.height)).collect();
-        got_utxo.sort();
-        assert_eq!(got_utxo, exp_utxo, "build_bundle utxos for {address}");
+        assert_utxos_match_tolerant(&format!("build_bundle utxos for {address}"), exp_utxo, got_utxo, sc.tip_height);
     }
 
     // broadcast: the backend must accept a real tx and echo the txid a
