@@ -5619,18 +5619,18 @@ export component AppWindow inherits Window {
         DoorCard {
             highlight: true;
             title: "This device";
-            subtitle: "Uses the device's secure random number generator. Fast, and the right choice for almost everyone.";
+            subtitle: "Uses the device's secure random number generator.";
             clicked => { root.pick-entropy-source("device"); }
         }
         DoorCard {
             title: "Dice rolls";
-            subtitle: "You roll a real die and type each result. The seed is built from your rolls alone — nothing from this device is mixed in — so you can reproduce it yourself with any SHA-256 tool and confirm we didn't cheat.";
+            subtitle: "You roll a real die and enter each result. The seed is built from your rolls alone — nothing from this device is mixed in — so you can reproduce it yourself with any SHA-256 tool and check it matches.";
             clicked => { root.pick-entropy-source("dice"); }
         }
         Rectangle { height: 4px; }
         Caption {
             color: Pal.muted;
-            text: "Dice take a few minutes and the rolls become your entire seed, so a fair die and honest rolls matter. If that sounds like more responsibility than you want, use this device.";
+            text: "Dice take a few minutes, and they are more responsibility: the seed rests entirely on your rolls rather than on this device's randomness, so a fair die and honest rolls are what keep it strong.";
         }
     }
 
@@ -5697,7 +5697,12 @@ export component AppWindow inherits Window {
                 Text { text: root.dice-hash2; font-size: 12px; color: Pal.text; }
             }
         }
-        // 1-6 keypad. Digits are plain ASCII, so no icon-rule problem here.
+        // Keypad of actual die faces (icons/die-N.svg). These are the ONE
+        // place we deliberately don't `colorize`: a die reads as a die
+        // because the face is light and the pips are dark, and tinting it
+        // flat would just give six indistinguishable blobs. Row height is
+        // unchanged from the digits version so the calibrated e2e taps in
+        // ui-automation still land.
         for row in [[1, 2, 3], [4, 5, 6]]: HorizontalLayout {
             spacing: 8px;
             for n in row: Rectangle {
@@ -5708,13 +5713,16 @@ export component AppWindow inherits Window {
                 background: dta.pressed ? Pal.accent.with-alpha(0.25)
                           : (dta.has-hover ? Pal.card-hover : Pal.card);
                 dta := TouchArea { clicked => { root.dice-roll(n); } }
-                Text {
-                    text: n;
-                    font-size: 22px;
-                    font-weight: 700;
-                    color: Pal.text;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+                Image {
+                    width: 34px;
+                    height: 34px;
+                    image-fit: contain;
+                    source: n == 1 ? @image-url("icons/die-1.svg")
+                          : n == 2 ? @image-url("icons/die-2.svg")
+                          : n == 3 ? @image-url("icons/die-3.svg")
+                          : n == 4 ? @image-url("icons/die-4.svg")
+                          : n == 5 ? @image-url("icons/die-5.svg")
+                          :          @image-url("icons/die-6.svg");
                 }
             }
         }
@@ -5742,7 +5750,7 @@ export component AppWindow inherits Window {
         }
         Caption {
             color: Pal.muted;
-            text: "Check it yourself: type the same digits into any SHA-256 tool — the result is the number above, and that number is your seed.";
+            text: "Check it yourself: put the same digits through any SHA-256 tool — the result is the number above, and that number is your seed.";
         }
     }
 
