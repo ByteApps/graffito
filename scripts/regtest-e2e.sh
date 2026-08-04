@@ -235,13 +235,50 @@ TIP_BEFORE="$(core_cli getblockcount)"
 echo "$NETWORK node reachable at $CN_NODE_HOST:$CN_NODE_PORT, tip=$TIP_BEFORE (persistent chain — untouched, no reset/wipe/reindex)"
 
 # --- The rescan trap: shared infrastructure (rules 1 + 2) ------------------
-# `chain-notes-watch` is the SAME wallet name app-core (CoreRpcTransport::
-# WATCH_WALLET) and server.py both use on this node — registering an
-# address here BEFORE either of them lazily imports it makes their own
-# `ensure_address_watched`/getaddressinfo check see it as already known
-# and skip their per-address `timestamp: 0` fallback entirely.
-CN_WATCH_WALLET="chain-notes-watch"
+# Registering an address BEFORE server.py lazily imports it makes its
+# `ensure_address_watched`/getaddressinfo check see it as already known and
+# skip the per-address `timestamp: 0` fallback entirely.
+#
+# The wallet is PER RUN, and that is the whole point. A rescan costs
+# O(blocks x descriptors), so a long-lived shared watch wallet gets
+# monotonically slower as every run imports more addresses into it: measured
+# 2026-08-04 on the shared `chain-notes-watch`, one `timestamp: 0` import
+# took **130 seconds** (630 txs, hundreds of descriptors) against **0.5s**
+# for the identical import into a fresh wallet on the same chain. At 130s
+# the app's own 30s HTTP timeout fires first, which is exactly how this
+# suite died at the external-funding leg: `fund-keygen` mints an address
+# mid-run that nothing could have pre-registered, so it paid full price.
+#
+# Exported so the server.py this script launches uses the same wallet
+# (server.py reads CN_WATCH_WALLET, defaulting to `chain-notes-watch`).
+# NOTE this only covers the Esplora path: in --core-rpc mode the app talks
+# to the node directly and uses app-core's own WATCH_WALLET constant, which
+# is correct for production (a real user has one wallet, holding only their
+# own addresses) but means pre-registration here is invisible to it.
+CN_WATCH_WALLET="cn-e2e-$$-$(date +%s)"
+export CN_WATCH_WALLET
 RUN_START_TS=$(( $(date +%s) - 3600 ))  # 1h buffer for clock skew — NOT 0
+
+# The per-run watch wallet holds no keys and no funds (disable_private_keys),
+# so there is nothing to sweep — but unload it so repeated runs don't pile up
+# loaded wallets on the shared node. Best effort: never fail a run over it.
+# ONE EXIT trap for the whole script. bash REPLACES an EXIT trap rather than
+# chaining, so three separate `trap ... EXIT` registrations meant only the
+# last one ever ran: `trap 'unset FUND_WIF' EXIT` inside the testnet4 funding
+# path silently disabled the server.py kill, leaking the shim on every
+# funded run. Everything that must happen on exit goes in here.
+e2e_cleanup() {
+    if [[ -n "${SERVER_PID:-}" ]]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    unset FUND_WIF
+    # The per-run watch wallet holds no keys and no funds
+    # (disable_private_keys), so there is nothing to sweep — just unload it so
+    # repeated runs don't pile up loaded wallets. Best effort, never fatal.
+    core_cli unloadwallet "$CN_WATCH_WALLET" >/dev/null 2>&1 || true
+}
+trap e2e_cleanup EXIT
 
 ensure_cn_watch_wallet() {
     core_cli createwallet "$CN_WATCH_WALLET" true true >/dev/null 2>&1 \
@@ -299,8 +336,7 @@ if [[ "$BACKEND" == esplora ]]; then
     python3 "$PRIME/companion/server.py" "$PORT" --node "$CN_NODE_HOST:$CN_NODE_PORT" --network "$NETWORK" \
         >"$WORK/server.log" 2>&1 &
     SERVER_PID=$!
-    cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
-    trap cleanup EXIT
+    # server.py is killed by e2e_cleanup (the single EXIT trap above).
     for _ in $(seq 1 60); do
         curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && break
         sleep 1
@@ -479,7 +515,7 @@ else
             [[ -r "$GIFT_WIF_FILE" ]] || err "gift-wallet WIF file not readable: $GIFT_WIF_FILE"
             FUND_WIF="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['env']['TESTNET4_WIF'])" "$GIFT_WIF_FILE")"
             [[ -n "$FUND_WIF" ]] || err "could not read TESTNET4_WIF from $GIFT_WIF_FILE"
-            trap 'unset FUND_WIF' EXIT
+            # FUND_WIF is unset by e2e_cleanup (the single EXIT trap above).
         fi
         local scan cand txid vout sats live
         scan="$(core_cli scantxoutset start "[\"addr($FUND_ADDR)\"]")" || err "gift-wallet scantxoutset failed"
