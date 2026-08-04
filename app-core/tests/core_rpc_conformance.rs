@@ -27,19 +27,43 @@
 //! takes on the order of a minute; a sub-second "pass" means something is
 //! wrong, not that the suite is fast.
 //!
-//! **The chain is shared, persistent, and not ours.** Every fixture-building
-//! test funds its OWN freshly generated, single-purpose addresses straight
-//! from a coinbase reward (`generatetoaddress` targeting the address
-//! itself) — never `testwallet` (the node owner's wallet, ~14,096 BTC, never
-//! created/loaded/renamed/reset by us) and never an assumption about the
-//! chain's starting height or the production `chain-notes-watch` wallet's
-//! prior contents (both grow underneath every run). Any throwaway wallet
-//! this suite creates gets a per-run-random name and is `unloadwallet`d
-//! (best effort) before the test returns, so repeated runs don't pile up
-//! loaded wallets on the shared node forever. Tests that build a fixture by
-//! mining are regtest-only by construction (there is no way to mine on
-//! testnet4) and fail loudly, via [`require_regtest`], if pointed at any
-//! other network.
+//! **The chain is shared, persistent, and not ours — and coinbase funding
+//! is FINISHED, not merely degraded.** Regtest halves every 150 blocks
+//! (`50 × 150 × 2` = a 15,000 BTC total supply cap); the shared node passed
+//! height 4300 in mid-2026 with 27+ halvings behind it, the subsidy is 18
+//! sats (below the 330-sat P2TR dust limit), and only a few thousand more
+//! sats will EVER be mineable across every future block combined. Directly
+//! mining a coinbase reward to a fresh test address — this file's ORIGINAL
+//! funding strategy — permanently strands that reward the instant the
+//! address is discarded (nothing will ever load that throwaway wallet
+//! again): 58 such wallets once accumulated 505 BTC of dead coin this way,
+//! 3.4% of the chain's entire supply, and the 100-block coinbase-maturity
+//! padding that pattern needed was the single biggest driver of the
+//! chain's own growth — the funding strategy caused its own extinction.
+//!
+//! **Every fixture-building test now funds itself from a [`Faucet`] —
+//! `testwallet` (the node owner's wallet, holding essentially all of the
+//! chain's ~15,000 BTC final supply) spent from via `sendtoaddress`/`send`,
+//! NEVER created/loaded/renamed/reset — and every throwaway wallet this
+//! suite creates (a faucet, or a `sender` signing wallet) is wrapped in a
+//! [`WalletGuard`]/[`Faucet`] RAII guard that sweeps its balance back to a
+//! fresh `testwallet` address via `sendall` on `Drop`, success OR test
+//! failure** (the guard is held for the FIXTURE's whole lifetime, not
+//! unloaded at the bottom of a function, precisely so it still fires if an
+//! assertion panics partway through — proven directly by
+//! `core_rpc_wallet_guard_returns_funds_even_on_panic`). Mining is used
+//! ONLY to confirm an already-broadcast tx now, never to fund one — every
+//! confirm block's reward goes to a FRESH `testwallet` address, so even
+//! that stays fully recovered rather than stranded on a throwaway sink. A
+//! wallet holding only a sub-dust leftover fails `sendall` with -6 ("Total
+//! value of UTXO pool too low") — expected, and swallowed by the guard, not
+//! a bug (fee genuinely exceeds the dust). Any throwaway wallet still gets
+//! a per-run-random name so repeated runs never collide; each is also
+//! `unloadwallet`d (best effort) once its guard fires, so nothing piles up
+//! loaded on the shared node forever. Tests that build a fixture by mining
+//! confirm blocks are regtest-only by construction (there is no way to
+//! mine on testnet4) and fail loudly, via [`require_regtest`], if pointed
+//! at any other network.
 //!
 //! **Four tests that used to need a differently-configured (or
 //! differently-clocked) node are RESTRUCTURED, not `#[ignore]`d**, against
@@ -82,33 +106,60 @@
 //!    verified live against bitcoind v30.2.0 while writing this, not
 //!    guessed from docs alone — see the prevout-fallback note below).
 //!
-//! A THIRD, non-obvious trap this file avoids on its own: every test
-//! address here is funded by a coinbase reward paid DIRECTLY to it
-//! (`generatetoaddress` targeting the address itself), never relayed
-//! through a shared "miner" wallet address. A shared funder's own
-//! accumulated coin-selection history is NOT something this driver fully
-//! tracks, and `Scenario::all_addresses()` pulls in every address that
-//! appears as an input's resolved prevout — so if a shared funder ever
-//! leaked into a recorded tx's vin, its FULL real history (visible to the
-//! live node, but not represented in this file's hand-built `Scenario`)
-//! would silently desync from what `assert_chain_contract` expects. Every
-//! address here is therefore single-purpose and its complete real history
-//! is exactly what this file records: a "funder" address either (a) never
-//! appears in any RECORDED tx (the 100-block maturity padding sink, the
-//! probe's own destination) or (b) has its own coinbase-funding tx
-//! recorded too, alongside whatever it later spends (`addr_note`, the
-//! `mempool_funder` relay).
+//! A THIRD, non-obvious trap this file avoids on its own — and the one the
+//! faucet redesign above had to answer empirically before it could be
+//! safe: a shared funder's own accumulated coin-selection history is NOT
+//! something this driver fully tracks, and `Scenario::all_addresses()`
+//! pulls in every address that appears as an input's resolved prevout — so
+//! if `testwallet` (or any address it touches) ever leaked into a recorded
+//! tx's vin, its FULL real history (visible to the live node, ~14,919 BTC
+//! and untold prior operations, but not represented in this file's
+//! hand-built `Scenario`) would silently desync from what
+//! `assert_chain_contract` expects. **The prevout-depth question this
+//! migration answered live**: does `Scenario::all_addresses()`/
+//! `assert_chain_contract` follow a prevout more than one hop? No — it only
+//! ever inspects the vin of a tx THIS FILE ITSELF chose to record, never
+//! walks further back into THAT tx's own inputs. So a ONE-HOP funder is
+//! provably safe to hide, and [`Faucet`] is built to stay exactly one hop:
+//! `testwallet` funds a throwaway faucet wallet's addresses (never
+//! recorded), each of which pays a single test address in FULL — no change,
+//! `subtract_fee_from_outputs` — so it never appears as a vout anywhere
+//! either. `hide_vin` then clears that ONE recorded tx's `vin` before it
+//! joins the `Scenario`, keeping the faucet address (and `testwallet`
+//! behind it) out of `all_addresses()` entirely — not merely inconvenient
+//! to desync, but structurally unreachable. This is the SAME choice as
+//! option (a) over option (b) in `PLAN-one-regtest-node.md`'s design
+//! writeup: scoping the contract assertion down to "addresses this file
+//! itself funded" (option b) would have removed the concern too, but at
+//! the cost of the "complete real history" property `assert_chain_contract`
+//! otherwise proves for every address it touches — the one-hop faucet gets
+//! to keep that property AND avoid the trap. Every test address here is
+//! therefore still single-purpose and its complete real history is exactly
+//! what this file records: a "funder" address (the faucet, or a confirm-
+//! mining `testwallet` address) either (a) never appears in any RECORDED
+//! tx at all, or (b) has its own faucet-funding tx recorded too — WITH ITS
+//! `vin` HIDDEN — alongside whatever it later spends (`addr_note`, the
+//! `mempool_funder` relay, both of which keep their REAL vin since it
+//! correctly references another already-tracked test address, not the
+//! faucet).
 //!
-//! Note on coinbase representation: a coinbase input has no real prevout
-//! (`getrawtransaction`'s vin entry carries a `"coinbase"` hex field
-//! instead of `txid`/`vout`/`prevout`) — this file represents every
-//! coinbase-funded tx with an EMPTY `vin` in its `ScenarioTx`, which is
-//! behaviorally identical to a `None`-prevout entry for every pure
-//! address-matching computation in `common/mod.rs` (none of them ever
-//! match a coinbase's nonexistent prevout address), and is what keeps
+//! Note on vin representation: no genuinely coinbase tx is EVER recorded
+//! into this file's `Scenario` anymore (every faucet-fund/mining split
+//! goes to `testwallet`/faucet addresses that are never converted to a
+//! `ScenarioTx` at all — see the funding-model paragraphs above), so the
+//! ORIGINAL reason this file needed to represent a coinbase input's
+//! nonexistent prevout (`getrawtransaction`'s vin entry carries a
+//! `"coinbase"` hex field instead of `txid`/`vout`/`prevout`) as an EMPTY
+//! `ScenarioTx.vin` no longer applies. The SAME empty-`vin` representation
+//! is still produced today, deliberately, by `hide_vin`/
+//! `build_scenario_tx` for every faucet-funded tx — a genuine, non-coinbase
+//! spend whose real vin is simply not recorded (see the THIRD trap above).
+//! Either way the shape is behaviorally identical to a `None`-prevout entry
+//! for every pure address-matching computation in `common/mod.rs` (none of
+//! them ever match a nonexistent prevout address), and it's what keeps
 //! `assert_chain_contract`'s ONE vin-COUNT-sensitive check (`fetch_tx_io`,
-//! which only ever inspects the FIRST tx with a non-empty `vin`) landing
-//! on a real spend (`addr_note`'s own legs) instead of a coinbase tx.
+//! which only ever inspects the FIRST tx with a non-empty `vin`) landing on
+//! a real spend (`addr_note`'s own legs) instead of a faucet-funding tx.
 
 mod common;
 
@@ -155,7 +206,12 @@ fn data_output(payload: &[u8]) -> serde_json::Value {
 
 /// Connection details for the ONE shared regtest/testnet4 node, read from
 /// the environment. Credentials carry no default: their absence is a HARD
-/// FAILURE (via [`node_env`]'s panic), never a silent skip.
+/// FAILURE (via [`node_env`]'s panic), never a silent skip. `Clone` so a
+/// [`Node`] can be cheaply duplicated into a [`WalletGuard`]/[`Faucet`]
+/// that outlives the function that opened the original connection (an RAII
+/// guard can't borrow `&Node` from a sibling field of the SAME struct it
+/// lives in — see `ConformanceFixture`).
+#[derive(Clone)]
 struct NodeEnv {
     network: String,
     host: String,
@@ -219,7 +275,11 @@ fn require_regtest(test_name: &str, env: &NodeEnv) {
 /// A connection to the shared node this suite talks to — never a locally
 /// spawned process. `Node::connect` is the only constructor; it fails
 /// loudly if the node can't be reached or the reported chain doesn't match
-/// what was asked for.
+/// what was asked for. `Clone` (both fields are — `reqwest::blocking::
+/// Client` is `Arc`-backed, cheap to duplicate) so [`WalletGuard`]/
+/// [`Faucet`] can own their own handle to the same node instead of
+/// borrowing one with a lifetime.
+#[derive(Clone)]
 struct Node {
     env: NodeEnv,
     client: reqwest::blocking::Client,
@@ -318,34 +378,6 @@ impl Node {
         let _ = self.try_rpc(None, "syncwithvalidationinterfacequeue", serde_json::json!([]));
     }
 
-    /// Mine exactly ONE block, coinbase to `address`, and return that
-    /// block's coinbase txid — read from the BLOCK itself (`getblock`
-    /// verbosity 1), never from any wallet's `listunspent`. Load-bearing:
-    /// several of this suite's funded addresses (the HD notebook/spending
-    /// leaves) are never imported into ANY bitcoind wallet at all — only
-    /// the transport-under-test's own `chain-notes-watch` wallet ever
-    /// sees them — so a wallet-`listunspent`-based txid lookup would
-    /// wrongly report them as coin-less even though the coinbase reward
-    /// genuinely landed on-chain (verified live: this was the suite's
-    /// first real failure while writing it).
-    fn generate_single_capture(&self, address: &str) -> String {
-        let hashes = self.rpc(None, "generatetoaddress", serde_json::json!([1, address]));
-        let block_hash = hashes
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|h| h.as_str())
-            .expect("generatetoaddress: no block hash")
-            .to_string();
-        let _ = self.try_rpc(None, "syncwithvalidationinterfacequeue", serde_json::json!([]));
-        let block = self.rpc(None, "getblock", serde_json::json!([block_hash, 1]));
-        block["tx"]
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|t| t.as_str())
-            .expect("getblock: no coinbase txid")
-            .to_string()
-    }
-
     fn fresh_addr(&self, wallet: &str) -> String {
         self.rpc(Some(wallet), "getnewaddress", serde_json::json!(["", "bech32m"]))
             .as_str()
@@ -367,15 +399,6 @@ impl Node {
             u["vout"].as_u64().expect("utxo vout") as u32,
             u["amount"].as_f64().map(sats).expect("utxo amount"),
         )
-    }
-
-    fn utxo_txids(&self, wallet: &str, address: &str) -> Vec<String> {
-        let v = self.rpc(Some(wallet), "listunspent", serde_json::json!([0, 9_999_999, [address]]));
-        v.as_array()
-            .expect("listunspent: not an array")
-            .iter()
-            .map(|u| u["txid"].as_str().expect("utxo txid").to_string())
-            .collect()
     }
 
     fn tip_height(&self) -> u64 {
@@ -483,6 +506,176 @@ fn unique_wallet_name(role: &str) -> String {
     format!("cn-test-{role}-{}-{nanos}-{seq}", std::process::id())
 }
 
+// ---------------------------------------------------------------------
+// Faucet funding (`PLAN-one-regtest-node.md`'s "value must circulate, not
+// be mined" fix). See the module doc's "Fixture funding" section for the
+// full design writeup — this is the mechanism.
+// ---------------------------------------------------------------------
+
+/// How much every faucet-issued single-purpose coin carries. Comfortably
+/// above dust (~330 sats for a P2TR output) after paying a 5 sat/vB fee
+/// through up to two further hops (`addr_note`'s phase-2/phase-3 spends),
+/// and utterly negligible against `testwallet`'s ~14,919 BTC balance.
+const FAUCET_FUND_SATS: u64 = 50_000;
+
+/// Best-effort: sweep whatever `wallet` still holds back to a FRESH
+/// `testwallet` address via `sendall`, then unload it. Called from every
+/// throwaway wallet's `Drop` (`WalletGuard`, `Faucet`) — **must never
+/// panic**, because a panic during unwind ABORTS THE PROCESS (Rust only
+/// runs `Drop`s during a panic if nothing ELSE panics on the way out),
+/// which would destroy the very test failure this cleanup exists to run
+/// alongside. Every fallible step here is swallowed, logged at most.
+///
+/// A wallet holding only a sub-dust leftover (or nothing at all — every
+/// `Faucet`-issued coin is fully drained by `Faucet::fund`'s
+/// `subtract_fee_from_outputs`, so its wallet is normally already empty
+/// by the time this runs) fails `sendall` with -6 "Total value of UTXO
+/// pool too low to pay for transaction" — EXPECTED, verified live against
+/// the real shared node while designing this, and not a bug: the fee
+/// would genuinely exceed the value being swept.
+fn sweep_wallet_to_testwallet(node: &Node, wallet: &str) {
+    let dest = match node.try_rpc(Some("testwallet"), "getnewaddress", serde_json::json!(["", "bech32m"])) {
+        Ok(v) => v.as_str().map(str::to_string),
+        Err(e) => {
+            eprintln!("cb: wallet-guard[{wallet}] could not get a testwallet return address: {e}");
+            None
+        }
+    };
+    if let Some(dest) = dest {
+        // sendall's recipients argument is a BARE array of addresses
+        // (`["addr"]`), never `{"addr": amount}` — verified live: the
+        // object shape is for PARTIAL sendall (a mix of fixed-amount and
+        // remainder recipients), and passing one address as a bare
+        // string means "send it everything".
+        match node.try_rpc(Some(wallet), "sendall", serde_json::json!([[dest], serde_json::Value::Null, "unset", 5, {}])) {
+            Ok(v) => eprintln!("cb: wallet-guard[{wallet}] swept funds back to testwallet: {v}"),
+            Err(e) => eprintln!(
+                "cb: wallet-guard[{wallet}] sweep skipped (expected for an empty/dust-only wallet): {e}"
+            ),
+        }
+    }
+    let _ = node.try_rpc(None, "unloadwallet", serde_json::json!([wallet]));
+}
+
+/// RAII guard for a throwaway SIGNING wallet (a `sender`-role wallet this
+/// suite created — NEVER `testwallet`/`chain-notes-watch`, production
+/// state this suite doesn't own): on `Drop`, sweeps its balance back to
+/// `testwallet` and unloads it — success OR failure. Rust's default test
+/// profile is `panic = "unwind"` (verified: neither this repo's
+/// `Cargo.toml` nor its `.cargo/config.toml` sets `panic = "abort"` for
+/// any profile, so an assertion failure unwinds the stack instead of
+/// aborting the process), and `Drop` runs during unwind exactly like it
+/// does on a normal return — that is the entire point of holding this
+/// guard for the FULL lifetime of a test's fixture, not just calling an
+/// unload at the bottom of the function. Proven directly by
+/// `core_rpc_wallet_guard_returns_funds_even_on_panic` below.
+struct WalletGuard {
+    node: Node,
+    name: String,
+}
+
+impl WalletGuard {
+    fn new(node: &Node, name: impl Into<String>) -> Self {
+        WalletGuard { node: node.clone(), name: name.into() }
+    }
+}
+
+impl Drop for WalletGuard {
+    fn drop(&mut self) {
+        sweep_wallet_to_testwallet(&self.node, &self.name);
+    }
+}
+
+/// A per-fixture-build, ONE-HOP faucet: `n` freshly generated single-use
+/// addresses in their own throwaway wallet, each funded with
+/// [`FAUCET_FUND_SATS`] from `testwallet` in ONE combined `send` (never
+/// recorded into any `Scenario`, exactly like the coinbase-maturity
+/// padding it replaces — see the module doc). Constructing it also mines
+/// ONE confirm block (reward to a FRESH `testwallet` address, so nothing
+/// is ever stranded) so all `n` coins are simultaneously spendable with
+/// zero unconfirmed-ancestor limit to worry about — the shared node's
+/// default `-limitdescendantcount=25` would otherwise cap how many of
+/// these can be spent onward while the split tx itself is still
+/// unconfirmed. `fund(i, dest)` then spends faucet address `i`'s ENTIRE
+/// balance (minus fee, `subtract_fee_from_outputs`, an explicit `inputs`
+/// entry, NO change) onward to `dest` — the exact no-change single-hop
+/// shape this file's `mempool_funder`/broadcast-probe legs already use
+/// live — and returns the resulting tx's own txid (left in the mempool;
+/// the caller mines its own confirm block, exactly matching this file's
+/// existing phase-by-phase confirm rhythm).
+///
+/// **Why one hop, never `testwallet` directly** (the prevout-depth
+/// question this migration had to answer empirically — see the module
+/// doc's "Fixture funding" section): a funding tx's REAL `vin` carries
+/// its funder's address as prevout. Recording that verbatim would drag
+/// whoever paid for the fixture into `Scenario::all_addresses()` — and
+/// `testwallet`'s own real history (~14,919 BTC, uncounted prior
+/// operations on a node this suite doesn't administer) can never be
+/// represented by this file's hand-built bookkeeping; this is Trap 3 the
+/// module doc already documents for a shared miner address, and it
+/// applies identically to a shared FUNDER address. A faucet address makes
+/// hiding that safe rather than merely convenient: because every payout
+/// drains it to EXACTLY zero (no change output is ever produced), it
+/// never appears as a vout anywhere either, so clearing `vin` on the one
+/// tx that references it (`hide_funder`) is airtight — there is no SECOND
+/// tx anywhere that could still expose it.
+struct Faucet {
+    node: Node,
+    wallet: String,
+    addrs: Vec<String>,
+}
+
+impl Faucet {
+    /// Builds `n` faucet addresses and funds all of them in one shared
+    /// `testwallet` send + one confirm block.
+    fn new(node: &Node, n: usize) -> Self {
+        let wallet = unique_wallet_name("faucet");
+        node.rpc(None, "createwallet", serde_json::json!([wallet]));
+        let addrs: Vec<String> = (0..n).map(|_| node.fresh_addr(&wallet)).collect();
+
+        let mut outputs = serde_json::Map::new();
+        for a in &addrs {
+            outputs.insert(a.clone(), serde_json::Value::String(btc_str(FAUCET_FUND_SATS)));
+        }
+        node.rpc(
+            Some("testwallet"),
+            "send",
+            serde_json::json!([serde_json::Value::Object(outputs), serde_json::Value::Null, "unset", 5, {}]),
+        );
+
+        node.generate(1, &node.fresh_addr("testwallet"));
+
+        Faucet { node: node.clone(), wallet, addrs }
+    }
+
+    /// Fund address index `i`'s ENTIRE balance (minus fee) onward to
+    /// `dest`, no change. Returns the funding tx's own txid — a mempool
+    /// tx the caller confirms in its own time, mirroring how every other
+    /// funding step in this file already works.
+    fn fund(&self, i: usize, dest: &str) -> String {
+        let addr = &self.addrs[i];
+        let (txid, vout, amount) = self.node.sole_utxo(&self.wallet, addr);
+        let result = self.node.rpc(
+            Some(&self.wallet),
+            "send",
+            serde_json::json!([
+                [pay_output(dest, amount)],
+                serde_json::Value::Null,
+                "unset",
+                5,
+                {"inputs": [{"txid": txid, "vout": vout}], "subtract_fee_from_outputs": [0]},
+            ]),
+        );
+        result["txid"].as_str().expect("send: no txid").to_string()
+    }
+}
+
+impl Drop for Faucet {
+    fn drop(&mut self) {
+        sweep_wallet_to_testwallet(&self.node, &self.wallet);
+    }
+}
+
 /// A per-run-random BIP-32 account number for deriving HD (notebook/
 /// spending) addresses from [`TEST_MNEMONIC`]. **Load-bearing on a shared,
 /// persistent node**: `TEST_MNEMONIC` is a well-known PUBLIC BIP-39 test
@@ -550,7 +743,7 @@ fn build_scenario_tx(node: &Node, txid: &str, tip: u64) -> ScenarioTx {
     let mut vin = Vec::new();
     for i in raw["vin"].as_array().cloned().unwrap_or_default() {
         // A coinbase input has neither `txid` nor `vout` — see the module
-        // doc's "Note on coinbase representation". Skipped entirely.
+        // doc's "Note on vin representation". Skipped entirely.
         let (Some(prev_txid), Some(prev_vout)) =
             (i.get("txid").and_then(|t| t.as_str()), i.get("vout").and_then(|v| v.as_u64()))
         else {
@@ -650,16 +843,20 @@ fn xpub_of(descriptor: &str) -> &str {
 /// against an otherwise-identical transport, proving the two paths are
 /// observationally identical (plan §3 step, U4 test 1). Each caller gets
 /// its OWN connection and its OWN uniquely-named throwaway signing wallet
-/// (`sender_wallet`) — cargo runs this binary's tests in parallel threads
-/// of the SAME process, so two independent fixtures built at once must
-/// never share a wallet name.
+/// (guarded by `_sender_guard`, which sweeps it back to `testwallet` on
+/// `Drop` — success OR failure) — cargo runs this binary's tests in
+/// parallel threads of the SAME process, so two independent fixtures
+/// built at once must never share a wallet name.
 struct ConformanceFixture {
     node: Node,
     scenario: Scenario,
     network: Network,
-    /// The throwaway signing wallet this fixture created — the caller
-    /// unloads it (best effort) once done with the fixture.
-    sender_wallet: String,
+    /// RAII cleanup for the throwaway signing wallet this fixture
+    /// created. Held for the fixture's WHOLE lifetime (not just unloaded
+    /// at the bottom of a test function) so it still fires if
+    /// `assert_chain_contract` itself panics — see `WalletGuard`'s doc
+    /// comment.
+    _sender_guard: WalletGuard,
     /// The account-0 notebook's `tr(...)` multipath descriptor — the exact
     /// string `export_formats` produces for a real caller.
     notebook_descriptor: String,
@@ -675,9 +872,13 @@ fn build_conformance_fixture() -> ConformanceFixture {
     // The throwaway signing wallet holds every test address's private key
     // (so it can sign the spend-with-change / OP_RETURN-note / broadcast-
     // probe legs). The watch-only "chain-notes-watch" wallet is created
-    // LAZILY by the CoreRpcTransport under test, never here.
+    // LAZILY by the CoreRpcTransport under test, never here. Guarded from
+    // this point on — a panic anywhere below (fixture building OR the
+    // caller's own `assert_chain_contract` run) still sweeps it back to
+    // `testwallet`.
     let sender = unique_wallet_name("sender");
     node.rpc(None, "createwallet", serde_json::json!([sender]));
+    let sender_guard = WalletGuard::new(&node, sender.clone());
 
     let addr_a = node.fresh_addr(&sender);
     let addr_note = node.fresh_addr(&sender);
@@ -685,7 +886,12 @@ fn build_conformance_fixture() -> ConformanceFixture {
     let addr_probe_src = node.fresh_addr(&sender);
     let addr_pager = node.fresh_addr(&sender);
     let ext_recipient = node.fresh_addr(&sender);
-    let sink = node.fresh_addr(&sender); // maturity padding + probe's own destination — NEVER recorded/queried
+    // Confirm-mining target and the broadcast-probe's own destination —
+    // a FRESH `testwallet` address (never a throwaway sink this suite
+    // would otherwise strand): every coinbase reward this fixture mines
+    // is a pure settle/confirm step, never a funding one, so it belongs
+    // to the node owner, not to an address nothing will ever sweep.
+    let testwallet_confirm_addr = node.fresh_addr("testwallet");
 
     let network = Network::Regtest;
     let material = parse_key_material(TEST_MNEMONIC, network).expect("valid mnemonic");
@@ -705,12 +911,21 @@ fn build_conformance_fixture() -> ConformanceFixture {
     let addr_spchg0 = spending_src.derive(1, 0).unwrap().address;
 
     let mut txids: Vec<String> = Vec::new();
+    // Every txid whose RECORDED `vin` must be forced empty — see
+    // `Faucet`'s doc comment ("Why one hop, never testwallet directly").
+    // Populated only by faucet-funded legs; the addr_note/mempool_funder
+    // spends below keep their REAL vin (it correctly references another
+    // TRACKED test address, not the faucet).
+    let mut hide_vin: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    // ---- Phase 1: one coinbase coin straight to each single-use address
+    // ---- Phase 1: one faucet coin straight to each single-use address
     // (the funding-source isolation the module doc explains), plus 30 on
-    // addr_pager (>25-tx pagination), then 100 blocks of maturity padding
-    // to `sink` — never recorded, never queried. ----
-    let single_coinbase_addrs = [
+    // addr_pager (>25-tx pagination) — all drawn from the SAME `Faucet`
+    // (`testwallet` -> 40 one-shot addresses -> these 40 test addresses),
+    // replacing the old direct-coinbase funding + 100-block maturity
+    // padding: a faucet coin is an ordinary spend, never a coinbase, so it
+    // needs no maturity wait at all. ----
+    let faucet_main_addrs = [
         &addr_a,
         &addr_note,
         &mempool_funder,
@@ -722,13 +937,19 @@ fn build_conformance_fixture() -> ConformanceFixture {
         &addr_sprecv1,
         &addr_spchg0,
     ];
-    for addr in single_coinbase_addrs {
-        txids.push(node.generate_single_capture(addr));
+    let pager_n = 30usize;
+    let faucet = Faucet::new(&node, faucet_main_addrs.len() + pager_n);
+    for (i, addr) in faucet_main_addrs.iter().enumerate() {
+        let txid = faucet.fund(i, addr);
+        hide_vin.insert(txid.clone());
+        txids.push(txid);
     }
-    node.generate(30, &addr_pager);
-    node.generate(100, &sink);
-
-    txids.extend(node.utxo_txids(&sender, &addr_pager));
+    for i in 0..pager_n {
+        let txid = faucet.fund(faucet_main_addrs.len() + i, &addr_pager);
+        hide_vin.insert(txid.clone());
+        txids.push(txid);
+    }
+    node.generate(1, &testwallet_confirm_addr);
 
     // ---- Phase 2: addr_note spend-with-change — input = its funding
     // coin, one paying output to a fresh one-shot address, change back to
@@ -748,7 +969,7 @@ fn build_conformance_fixture() -> ConformanceFixture {
         ]),
     );
     txids.push(spend_result["txid"].as_str().expect("send: no txid").to_string());
-    node.generate(1, &sink);
+    node.generate(1, &testwallet_confirm_addr);
 
     // ---- Phase 3: addr_note's self-authored OP_RETURN note — spends the
     // change coin from phase 2, an OP_RETURN-only output list with NO
@@ -767,20 +988,21 @@ fn build_conformance_fixture() -> ConformanceFixture {
         ]),
     );
     txids.push(note_result["txid"].as_str().expect("send: no txid").to_string());
-    node.generate(1, &sink);
+    node.generate(1, &testwallet_confirm_addr);
 
     // ---- Phase 4 (Trap 1): the genuinely SIGNED broadcast-probe tx.
     // `add_to_wallet: false` returns signed hex WITHOUT touching the
     // wallet or the mempool — the transport-under-test's `broadcast()`
     // call is this tx's very first appearance on the node. Deliberately
     // NOT pushed into `txids` — it's asserted only via
-    // `Scenario::broadcast_probe`. ----
+    // `Scenario::broadcast_probe`. Pays back to a fresh testwallet
+    // address (never a stranded sink) once actually broadcast. ----
     let (probe_in_txid, probe_in_vout, probe_in_amount) = node.sole_utxo(&sender, &addr_probe_src);
     let probe_result = node.rpc(
         Some(&sender),
         "send",
         serde_json::json!([
-            [pay_output(&sink, probe_in_amount)],
+            [pay_output(&testwallet_confirm_addr, probe_in_amount)],
             serde_json::Value::Null,
             "unset",
             5,
@@ -814,7 +1036,16 @@ fn build_conformance_fixture() -> ConformanceFixture {
 
     let tip = node.tip_height();
 
-    let scenario_txs: Vec<ScenarioTx> = txids.iter().map(|t| build_scenario_tx(&node, t, tip)).collect();
+    let scenario_txs: Vec<ScenarioTx> = txids
+        .iter()
+        .map(|t| {
+            let mut st = build_scenario_tx(&node, t, tip);
+            if hide_vin.contains(t) {
+                st.vin.clear();
+            }
+            st
+        })
+        .collect();
 
     let notebook_descriptor = export_formats(TEST_MNEMONIC, network, account, 0)
         .expect("export_formats")
@@ -845,7 +1076,11 @@ fn build_conformance_fixture() -> ConformanceFixture {
         broadcast_probe: Some((probe_hex, probe_txid)),
     };
 
-    ConformanceFixture { node, scenario, network, sender_wallet: sender, notebook_descriptor, spending_descriptor }
+    // `faucet` is dropped here (end of scope) — by now every one of its
+    // coins has been drained to exactly zero by `fund`'s
+    // `subtract_fee_from_outputs`, so its own `Drop` sweep is expected to
+    // no-op (rule 4: tolerate an uneconomical/empty sweep).
+    ConformanceFixture { node, scenario, network, _sender_guard: sender_guard, notebook_descriptor, spending_descriptor }
 }
 
 #[test]
@@ -904,7 +1139,9 @@ fn core_rpc_conformance() {
         AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
 
-    node.unload_wallet(&fx.sender_wallet);
+    // `fx`'s `_sender_guard` sweeps the throwaway signing wallet back to
+    // testwallet on Drop (end of this function, success OR panic) — no
+    // explicit unload call needed here anymore.
     report_timing("core_rpc_conformance", t0, &proxy);
     eprintln!("core_rpc_conformance: PASS ({} scenario txs, tip={tip})", scenario.txs.len());
 }
@@ -1009,7 +1246,8 @@ fn core_rpc_conformance_ranged_descriptors() {
         );
     }
 
-    node.unload_wallet(&fx.sender_wallet);
+    // `fx`'s `_sender_guard` sweeps the throwaway signing wallet back to
+    // testwallet on Drop — no explicit unload call needed here anymore.
     report_timing("core_rpc_conformance_ranged_descriptors", t0, &proxy);
     eprintln!(
         "core_rpc_conformance_ranged_descriptors: PASS ({} scenario txs, tip={}, {} watch-wallet \
@@ -1068,7 +1306,14 @@ fn core_rpc_range_widening_finds_address_beyond_initial_range() {
     let far_index = 1050u32;
     let addr_far = realize(&material, network, account, far_index).unwrap().address;
 
-    let funding_txid = node.generate_single_capture(&addr_far);
+    // No Scenario/all_addresses() tracking happens in this test (it only
+    // ever calls `client.address_stats` directly), so there's nothing to
+    // hide here — a one-address Faucet funds+confirms addr_far in a
+    // single hop; its wallet (guaranteed empty afterward — `fund` drains
+    // it to zero) is swept on Drop at the end of this function.
+    let faucet = Faucet::new(&node, 1);
+    let funding_txid = faucet.fund(0, &addr_far);
+    node.generate(1, &node.fresh_addr("testwallet"));
     let tip = node.tip_height();
 
     let t0 = Instant::now();
@@ -1199,16 +1444,18 @@ fn core_rpc_cli_scan_wires_ranged_watch_descriptors() {
     // widening.
     let addr0 = realize(&material, network, account, 0).unwrap().address;
     let addr2 = realize(&material, network, account, 2).unwrap().address;
-    node.generate_single_capture(&addr0);
-    node.generate_single_capture(&addr2);
-    // 100 blocks of maturity padding (same as `build_conformance_fixture`'s
-    // `sink` padding above) — an immature coinbase reads back with a zero
-    // `listunspent` balance regardless of confirmation count, which would
-    // make the balance assertion below meaningless. Mined to a fresh
-    // address of a THROWAWAY wallet (not testwallet).
-    let pad_wallet = unique_wallet_name("pad");
-    node.rpc(None, "createwallet", serde_json::json!([pad_wallet]));
-    node.generate(100, &node.fresh_addr(&pad_wallet));
+    // Faucet-funded (`testwallet` -> 2 one-shot addresses -> addr0/addr2),
+    // never coinbase — so unlike the old direct-coinbase version of this
+    // test, NO maturity-wait padding is needed at all: a faucet coin is an
+    // ordinary confirmed spend, immediately spendable and immediately
+    // visible in `listunspent` the moment it's mined. This test never
+    // builds a Scenario (only reads CLI stdout / listdescriptors), so no
+    // vin-hiding is needed either. The faucet's own (guaranteed-empty)
+    // wallet sweeps itself on Drop at the end of this function.
+    let faucet = Faucet::new(&node, 2);
+    faucet.fund(0, &addr0);
+    faucet.fund(1, &addr2);
+    node.generate(1, &node.fresh_addr("testwallet"));
 
     let t0 = Instant::now();
     let proxy =
@@ -1322,7 +1569,8 @@ fn core_rpc_cli_scan_wires_ranged_watch_descriptors() {
          (before={after_first:?}, after={after_second:?})"
     );
 
-    node.unload_wallet(&pad_wallet);
+    // `faucet`'s Drop sweeps its (already-empty) wallet at the end of this
+    // function — no `pad_wallet` exists anymore to unload.
     report_timing("core_rpc_cli_scan_wires_ranged_watch_descriptors", t0, &proxy);
     eprintln!(
         "core_rpc_cli_scan_wires_ranged_watch_descriptors: PASS (2 subprocess `cli scan` runs, \
@@ -1777,8 +2025,13 @@ fn core_rpc_established_absence_caches_node_status_across_lookups() {
     wait_for_watch_wallet_idle(&node);
     let sender = unique_wallet_name("sender");
     node.rpc(None, "createwallet", serde_json::json!([sender]));
+    let _sender_guard = WalletGuard::new(&node, sender.clone());
     let addr = node.fresh_addr(&sender);
-    node.generate(3, &addr);
+    // Real (non-coinbase) chain activity funded from testwallet, not
+    // mined — mining here is a pure settle/confirm step (1 block,
+    // reward to a fresh testwallet address), never a funding one.
+    node.rpc(Some("testwallet"), "sendtoaddress", serde_json::json!([addr, btc_str(FAUCET_FUND_SATS)]));
+    node.generate(1, &node.fresh_addr("testwallet"));
 
     let t0 = Instant::now();
     let proxy =
@@ -1805,7 +2058,8 @@ fn core_rpc_established_absence_caches_node_status_across_lookups() {
         AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
 
-    node.unload_wallet(&sender);
+    // `_sender_guard` sweeps `sender`'s balance back to testwallet on
+    // Drop — no explicit unload call needed here anymore.
     report_timing("core_rpc_established_absence_caches_node_status_across_lookups", t0, &proxy);
     eprintln!("core_rpc_established_absence_caches_node_status_across_lookups: PASS");
 }
@@ -1999,12 +2253,16 @@ fn core_rpc_import_is_idempotent_across_fresh_transports() {
     wait_for_watch_wallet_idle(&node);
     let sender = unique_wallet_name("sender");
     node.rpc(None, "createwallet", serde_json::json!([sender]));
+    let _sender_guard = WalletGuard::new(&node, sender.clone());
     // A genuinely funded address — the point is the IMPORT count, but a
     // used address (rather than an empty one) is the more honest shape,
     // and doubles as a correctness check: every one of the N independent
-    // lookups below must still see the SAME real funding tx.
+    // lookups below must still see the SAME real funding tx. Funded from
+    // testwallet (not mined directly) — the confirm block's reward goes
+    // to a fresh testwallet address, so nothing here is stranded.
     let addr = node.fresh_addr(&sender);
-    node.generate(1, &addr);
+    node.rpc(Some("testwallet"), "sendtoaddress", serde_json::json!([addr, btc_str(FAUCET_FUND_SATS)]));
+    node.generate(1, &node.fresh_addr("testwallet"));
 
     let t0 = Instant::now();
     let proxy =
@@ -2060,7 +2318,8 @@ fn core_rpc_import_is_idempotent_across_fresh_transports() {
          requested timestamp of 0) exactly — descriptors seen: {timestamps:?}"
     );
 
-    node.unload_wallet(&sender);
+    // `_sender_guard` sweeps `sender`'s balance back to testwallet on
+    // Drop — no explicit unload call needed here anymore.
     report_timing("core_rpc_import_is_idempotent_across_fresh_transports", t0, &proxy);
     eprintln!("core_rpc_import_is_idempotent_across_fresh_transports: PASS ({N} ops, {import_calls} import call)");
 }
@@ -2133,4 +2392,61 @@ fn core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero() {
 
     report_timing("core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero", t0, &proxy);
     eprintln!("core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero: PASS (birthday={birthday})");
+}
+
+/// The whole faucet/guard redesign above (`PLAN-one-regtest-node.md`'s
+/// "value must circulate, not be mined" fix) rests on ONE claim: a
+/// throwaway wallet's funds return to `testwallet` even when the test body
+/// PANICS, not just on a clean return. An untested cleanup path is not a
+/// cleanup path — this proves it directly rather than trusting the
+/// reasoning in `WalletGuard`'s doc comment.
+///
+/// Funds a throwaway wallet from `testwallet`, constructs a `WalletGuard`
+/// for it INSIDE a `catch_unwind` closure that then deliberately panics —
+/// mirroring exactly how `ConformanceFixture`'s `_sender_guard` would be
+/// dropped if `assert_chain_contract` panicked partway through a real
+/// test. Rust only skips a scope's `Drop`s on unwind if the process itself
+/// aborts (`panic = "abort"`); neither this repo's `Cargo.toml` nor its
+/// `.cargo/config.toml` sets that for any profile (grepped while writing
+/// this test), so the default `test`/`dev` profile unwinds — `Drop` runs
+/// on the way out — and this test would FAIL (balance != 0) if that ever
+/// changed. After the panic is caught, reload the wallet (best effort,
+/// just to read its balance) and assert it's genuinely empty — the sweep
+/// actually happened, not merely "didn't crash the process".
+#[test]
+fn core_rpc_wallet_guard_returns_funds_even_on_panic() {
+    let _guard = serialize_nodes();
+    let node = connect_node();
+
+    let sender = unique_wallet_name("panic-guard-check");
+    node.rpc(None, "createwallet", serde_json::json!([sender]));
+    let addr = node.fresh_addr(&sender);
+    node.rpc(Some("testwallet"), "sendtoaddress", serde_json::json!([addr, btc_str(FAUCET_FUND_SATS)]));
+    node.generate(1, &node.fresh_addr("testwallet"));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = WalletGuard::new(&node, sender.clone());
+        panic!(
+            "deliberate — proving WalletGuard's Drop runs during unwind, not only on a clean return \
+             (core_rpc_wallet_guard_returns_funds_even_on_panic)"
+        );
+    }));
+    assert!(result.is_err(), "the inner closure was supposed to panic");
+
+    // The guard's Drop already unloaded the wallet — reload it (best
+    // effort) purely to read its balance back and confirm the sweep
+    // genuinely happened, then leave it unloaded again.
+    let _ = node.try_rpc(None, "loadwallet", serde_json::json!([sender]));
+    let balances = node.rpc(Some(&sender), "getbalances", serde_json::json!([]));
+    let confirmed = balances["mine"]["trusted"].as_f64().unwrap_or(-1.0);
+    let pending = balances["mine"]["untrusted_pending"].as_f64().unwrap_or(-1.0);
+    assert_eq!(
+        confirmed, 0.0,
+        "WalletGuard must have swept the wallet's confirmed balance back to testwallet during unwind, \
+         got balances={balances:?}"
+    );
+    assert_eq!(pending, 0.0, "no pending balance should remain either, got balances={balances:?}");
+    node.unload_wallet(&sender);
+
+    eprintln!("core_rpc_wallet_guard_returns_funds_even_on_panic: PASS (Drop-on-panic sweep verified live)");
 }
