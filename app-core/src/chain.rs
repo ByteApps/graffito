@@ -267,6 +267,82 @@ pub fn core_rpc_import_descriptors_call_count() -> u32 {
     IMPORT_DESCRIPTORS_CALLS.load(Ordering::Relaxed)
 }
 
+/// Process-global cache of fully-resolved esplora-shaped tx JSON, keyed by
+/// (node identity, txid) — the fix for the measured O(wallet)
+/// `getrawtransaction` defect (`PLAN-one-regtest-node.md`'s "The rescan
+/// trap" / "Two things now grow without bound"): `listtransactions "*"`
+/// ([`CoreRpcTransport::wallet_txid_order`]) has no per-address filter, so
+/// resolving history for ONE address means fetching EVERY wallet-wide
+/// txid via `getrawtransaction` — and, before this cache, doing so again
+/// from scratch on every single call. Measured with
+/// `tests/common/count_proxy.rs`: 5 identical `address_stats` calls issued
+/// 2090 `getrawtransaction` round trips (~418 each), with NO decrease
+/// across repetition.
+///
+/// See [`CoreRpcTransport::esplora_tx_json`] for the one place this is
+/// populated: **only a CONFIRMED transaction's fully-built JSON is ever
+/// inserted.** This is the load-bearing safety rule, not a stylistic
+/// choice — an UNCONFIRMED (mempool) transaction's status can change on
+/// the very next call (mined, dropped, replaced by a fee bump), so caching
+/// it would risk exactly the failure mode this project treats as worst:
+/// telling the user a live transaction was dropped, or hiding a fresh
+/// confirmation (`TxLookupStatus::NotFound`'s own doc comment). A
+/// CONFIRMED transaction's content — including the `status` object's
+/// `block_height`/`block_time`, computed once from an ABSOLUTE block
+/// height (`tip - confirmations + 1`), not a relative "N confirmations
+/// ago" — cannot change short of a deep reorg, a risk this crate already
+/// accepts elsewhere with no special handling (`tx_lookup_status`, the
+/// dropped-tx detector, ...). Keyed by node identity exactly like
+/// [`GLOBAL_WATCH_CACHE`], so a Settings node-URL change or network switch
+/// can never serve a stale hit from a different chain's history.
+static TX_JSON_CACHE: std::sync::LazyLock<Mutex<HashMap<(String, String), serde_json::Value>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Hard cap on [`TX_JSON_CACHE`]'s entry count, enforced at insert time
+/// (see [`CoreRpcTransport::esplora_tx_json`]). Left unbounded, the cache
+/// would trade an O(wallet-history) NETWORK cost for an O(wallet-history)
+/// MEMORY cost — the same "nothing may be O(chain length)/O(wallet
+/// history)" rule `PLAN-one-regtest-node.md` states for the node side
+/// ("Two things now grow without bound"), just moved into this process
+/// instead, on a platform (a phone) that can least afford it.
+///
+/// Arithmetic: one cache entry is a confirmed transaction's fully-built
+/// esplora-shaped JSON. A typical chain-notes tx (1-2 inputs, a recipient
+/// output, an OP_RETURN chunk or two, maybe a taproot change output)
+/// serializes to roughly 0.5-1 KB; an outlier — a wallet sweep/consolidate
+/// pulling in many inputs — runs a few KB. At [`TX_JSON_CACHE_MAX_ENTRIES`]
+/// = 5,000, that is ~2.5-5 MB in the ordinary case and comfortably under
+/// 20 MB even if EVERY entry were an outlier — trivial next to a mobile
+/// app's normal memory budget (a handful of decoded images), and it
+/// already covers a wallet used HEAVILY (10+ notes/day) for several
+/// YEARS, since this is one entry per distinct historical txid ever
+/// resolved, not per operation.
+///
+/// The policy on reaching the cap is deliberately the crudest one that is
+/// still correct: **stop inserting.** Existing entries are never evicted
+/// (so there is no thrashing, and everything already cached keeps serving
+/// hits) — the cache just stops growing. A fixed ceiling with a dumb
+/// policy beats an eviction scheme clever enough to need its own tests;
+/// the cost of understating the cap is a few more `getrawtransaction`
+/// calls once a node's shared history is already enormous, a regime this
+/// crate already tolerates elsewhere (`PLAN-one-regtest-node.md`'s
+/// accepted unbounded chain/wallet growth).
+const TX_JSON_CACHE_MAX_ENTRIES: usize = 5_000;
+
+/// Test visibility only — see [`TX_JSON_CACHE_MAX_ENTRIES`]'s doc comment
+/// for the reasoning behind the exact number, so a test can assert against
+/// it by name instead of a hardcoded duplicate.
+pub fn core_rpc_tx_json_cache_max_entries() -> usize {
+    TX_JSON_CACHE_MAX_ENTRIES
+}
+
+/// Current entry count of [`TX_JSON_CACHE`] — test visibility only, proves
+/// the cap in [`CoreRpcTransport::esplora_tx_json`] is genuinely enforced
+/// rather than merely documented.
+pub fn core_rpc_tx_json_cache_len() -> usize {
+    TX_JSON_CACHE.lock().expect("tx-json cache mutex poisoned").len()
+}
+
 /// Trims a response body down to something fit for a UI status line: an
 /// HTML error page (mempool.space's 429 body is one) gets its markup
 /// stripped, everything is whitespace-collapsed, and the whole thing is
@@ -1234,7 +1310,21 @@ impl CoreRpcTransport {
     /// → `"op_return"` (esplora's own type name, load-bearing —
     /// `classify_tx_inner` matches it literally), vin prevouts via
     /// [`Self::resolve_prevout`] when Core didn't inline one.
+    ///
+    /// Checks [`TX_JSON_CACHE`] first and, when this call ends up building
+    /// a CONFIRMED result, populates it before returning — see that
+    /// static's doc comment for the exact safety rule (unconfirmed results
+    /// are never cached, never read from cache). A cache hit skips the
+    /// `getrawtransaction` round trip (and any [`Self::resolve_prevout`]
+    /// follow-ups) entirely; `tip` is only used to (re)compute
+    /// `status.block_height` on a miss, since a confirmed tx's own block
+    /// height is fixed the moment it's first resolved and does not need
+    /// recomputing against a later, higher tip.
     fn esplora_tx_json(&self, txid: &str, tip: u64) -> Result<serde_json::Value, Error> {
+        let cache_key = (self.node_key(), txid.to_string());
+        if let Some(cached) = TX_JSON_CACHE.lock().expect("tx-json cache mutex poisoned").get(&cache_key) {
+            return Ok(cached.clone());
+        }
         let raw = self.getrawtransaction(txid, 2)?;
         let confirmations = raw.get("confirmations").and_then(|c| c.as_u64()).unwrap_or(0);
         let confirmed = confirmations > 0;
@@ -1298,7 +1388,21 @@ impl CoreRpcTransport {
                 })
             })
             .collect();
-        Ok(serde_json::json!({"txid": txid, "status": status, "vin": vin, "vout": vout}))
+        let result = serde_json::json!({"txid": txid, "status": status, "vin": vin, "vout": vout});
+        if confirmed {
+            // See `TX_JSON_CACHE`'s doc comment: ONLY a confirmed result is
+            // ever inserted. An unconfirmed one is returned as-is, every
+            // time, with no cache write — its status can still change.
+            // See `TX_JSON_CACHE_MAX_ENTRIES`'s doc comment for the bound
+            // enforced here: once full, stop inserting rather than evict —
+            // existing entries keep serving hits, the cache just stops
+            // growing.
+            let mut cache = TX_JSON_CACHE.lock().expect("tx-json cache mutex poisoned");
+            if cache.len() < TX_JSON_CACHE_MAX_ENTRIES {
+                cache.insert(cache_key, result.clone());
+            }
+        }
+        Ok(result)
     }
 
     fn ensure_watch_wallet(&self) -> Result<(), Error> {
