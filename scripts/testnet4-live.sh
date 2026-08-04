@@ -207,10 +207,14 @@ echo "== step 3: fund the sim identity ($SIM_ADDR) from the gift wallet =="
 # transaction that way, because its stop mechanism raced a faucet() that had
 # already signed. The gate goes BEFORE the file is read, not after, so a run
 # without the grant never holds key material at all.
-GIFT_WIF_FILE="${E2E_GIFT_WIF_FILE:-/Users/sal/Projects/Gifts/bitcoin-gift-wallet/.claude/settings.local.json}"
+GIFT_WIF_FILE="${E2E_GIFT_WIF_FILE:-}"   # no default: public repo, no machine-specific path
 FUND_WIF=""
 if [[ "${E2E_ALLOW_TESTNET4_SPEND:-}" != 1 ]]; then
     fail "refusing to spend: set E2E_ALLOW_TESTNET4_SPEND=1 to authorize this run to read the gift-wallet WIF and broadcast real testnet4 funding transactions (currently unset or not '1')"
+    FAIL_N=$((FAIL_N+1))
+    STEP345_OK=0
+elif [[ -z "$GIFT_WIF_FILE" ]]; then
+    fail "set E2E_GIFT_WIF_FILE to the JSON file holding the gift-wallet TESTNET4_WIF"
     FAIL_N=$((FAIL_N+1))
     STEP345_OK=0
 elif [[ ! -r "$GIFT_WIF_FILE" ]]; then
