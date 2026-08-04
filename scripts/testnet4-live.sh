@@ -199,9 +199,25 @@ echo
 echo "== step 3: fund the sim identity ($SIM_ADDR) from the gift wallet =="
 # The WIF lives in a project the user explicitly approved reading from
 # (never argv, never printed/logged — same discipline as CORE_RPC_USER/PASS).
-GIFT_WIF_FILE="${E2E_GIFT_WIF_FILE:-/Users/sal/Projects/Gifts/bitcoin-gift-wallet/.claude/settings.local.json}"
+#
+# Spending real testnet4 funds requires an explicit, out-of-band grant.
+# Merely RUNNING this script used to acquire spending authority over the
+# gift wallet, with no prompt and no opt-in: on 2026-08-03 an agent doing a
+# DRY RUN of the sibling regtest-e2e.sh broadcast a real 20,000-sat
+# transaction that way, because its stop mechanism raced a faucet() that had
+# already signed. The gate goes BEFORE the file is read, not after, so a run
+# without the grant never holds key material at all.
+GIFT_WIF_FILE="${E2E_GIFT_WIF_FILE:-}"   # no default: public repo, no machine-specific path
 FUND_WIF=""
-if [[ ! -r "$GIFT_WIF_FILE" ]]; then
+if [[ "${E2E_ALLOW_TESTNET4_SPEND:-}" != 1 ]]; then
+    fail "refusing to spend: set E2E_ALLOW_TESTNET4_SPEND=1 to authorize this run to read the gift-wallet WIF and broadcast real testnet4 funding transactions (currently unset or not '1')"
+    FAIL_N=$((FAIL_N+1))
+    STEP345_OK=0
+elif [[ -z "$GIFT_WIF_FILE" ]]; then
+    fail "set E2E_GIFT_WIF_FILE to the JSON file holding the gift-wallet TESTNET4_WIF"
+    FAIL_N=$((FAIL_N+1))
+    STEP345_OK=0
+elif [[ ! -r "$GIFT_WIF_FILE" ]]; then
     fail "gift-wallet WIF file not readable: $GIFT_WIF_FILE"
     FAIL_N=$((FAIL_N+1))
     STEP345_OK=0
