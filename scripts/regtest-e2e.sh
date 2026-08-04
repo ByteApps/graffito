@@ -235,13 +235,122 @@ TIP_BEFORE="$(core_cli getblockcount)"
 echo "$NETWORK node reachable at $CN_NODE_HOST:$CN_NODE_PORT, tip=$TIP_BEFORE (persistent chain — untouched, no reset/wipe/reindex)"
 
 # --- The rescan trap: shared infrastructure (rules 1 + 2) ------------------
-# `chain-notes-watch` is the SAME wallet name app-core (CoreRpcTransport::
-# WATCH_WALLET) and server.py both use on this node — registering an
-# address here BEFORE either of them lazily imports it makes their own
-# `ensure_address_watched`/getaddressinfo check see it as already known
-# and skip their per-address `timestamp: 0` fallback entirely.
-CN_WATCH_WALLET="chain-notes-watch"
+# Registering an address BEFORE server.py lazily imports it makes its
+# `ensure_address_watched`/getaddressinfo check see it as already known and
+# skip the per-address `timestamp: 0` fallback entirely.
+#
+# The wallet is PER RUN, and that is the whole point. A rescan costs
+# O(blocks x descriptors), so a long-lived shared watch wallet gets
+# monotonically slower as every run imports more addresses into it: measured
+# 2026-08-04 on the shared `chain-notes-watch`, one `timestamp: 0` import
+# took **130 seconds** (630 txs, hundreds of descriptors) against **0.5s**
+# for the identical import into a fresh wallet on the same chain. At 130s
+# the app's own 30s HTTP timeout fires first, which is exactly how this
+# suite died at the external-funding leg: `fund-keygen` mints an address
+# mid-run that nothing could have pre-registered, so it paid full price.
+#
+# Exported so the server.py this script launches uses the same wallet
+# (server.py reads CN_WATCH_WALLET, defaulting to `chain-notes-watch`).
+# NOTE this only covers the Esplora path: in --core-rpc mode the app talks
+# to the node directly and uses app-core's own WATCH_WALLET constant, which
+# is correct for production (a real user has one wallet, holding only their
+# own addresses) but means pre-registration here is invisible to it.
+CN_WATCH_WALLET="cn-e2e-$$-$(date +%s)"
+export CN_WATCH_WALLET
 RUN_START_TS=$(( $(date +%s) - 3600 ))  # 1h buffer for clock skew — NOT 0
+# Every address this suite touches is created DURING the run, so nothing it
+# scans can have history older than RUN_START_TS. Telling server.py that
+# turns each lazily-imported address from a genesis rescan (146,900 blocks on
+# testnet4, minutes — well past the app's 30s HTTP timeout) into a no-op.
+# Pre-registering addresses one at a time does not work here: the app derives
+# them dynamically, so the first one nobody enumerated still pays full price.
+export CN_IMPORT_TIMESTAMP="$RUN_START_TS"
+
+# The per-run watch wallet holds no keys and no funds (disable_private_keys),
+# so there is nothing to sweep — but unload it so repeated runs don't pile up
+# loaded wallets on the shared node. Best effort: never fail a run over it.
+# ONE EXIT trap for the whole script. bash REPLACES an EXIT trap rather than
+# chaining, so three separate `trap ... EXIT` registrations meant only the
+# last one ever ran: `trap 'unset FUND_WIF' EXIT` inside the testnet4 funding
+# path silently disabled the server.py kill, leaking the shim on every
+# funded run. Everything that must happen on exit goes in here.
+# Addresses this run funded, by which identity owns them. Registered as they
+# are funded so the EXIT trap can give the coins back — the shell counterpart
+# of the RAII guard in app-core's conformance suite.
+E2E_APP_FUNDED=()
+E2E_PRIME_FUNDED=()
+
+# Sweep one app-identity address back. Deliberately builds the store from
+# `scantxoutset` rather than `cli scan`: a scan makes app-core import the
+# identity's ranged descriptors at timestamp 0, i.e. a genesis rescan
+# (146,900 blocks on testnet4) that outlives any sane cleanup budget.
+# scantxoutset needs no wallet and no import at all.
+e2e_sweep_app_addr() { # addr dest
+    local addr="$1" dest="$2" utxos store
+    utxos="$(core_cli scantxoutset start "[\"addr($addr)\"]" 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(json.dumps([{'txid':u['txid'],'vout':u['vout'],'value':int(u['amount']*1e8),
+                   'height':u.get('height'),'pending_spend':False} for u in d.get('unspents',[])]))
+" 2>/dev/null)" || return 0
+    [[ -n "$utxos" && "$utxos" != "[]" ]] || return 0
+    store="$(mktemp "${TMPDIR:-/tmp}/e2e-return.XXXXXX")"
+    "$APP" init "$store" "$NETWORK" >/dev/null 2>&1 || { rm -f "$store"; return 0; }
+    python3 -c "
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['utxos']=json.loads(sys.argv[2]); json.dump(d,open(p,'w'))
+" "$store" "$utxos" 2>/dev/null || { rm -f "$store"; return 0; }
+    if "$APP" sweep "$store" "$BASE" "$dest" 2.0 >/dev/null 2>&1; then
+        echo "e2e_fund_return: swept app address ${addr:0:16}... back to $dest" >&2
+    else
+        echo "e2e_fund_return: app sweep skipped for ${addr:0:16}... (empty/dust)" >&2
+    fi
+    rm -f "$store"
+}
+
+e2e_sweep_prime_addr() { # addr dest
+    local addr="$1" dest="$2" bundle
+    bundle="$(mktemp "${TMPDIR:-/tmp}/e2e-return-b.XXXXXX")"
+    if "$APP" bundle "$addr" "$NETWORK" "$BASE" "$bundle" >/dev/null 2>&1 \
+       && "$NOTES" sweep "$bundle" "$NETWORK" "$dest" 2.0 >/dev/null 2>&1; then
+        echo "e2e_fund_return: swept prime address ${addr:0:16}... back to $dest" >&2
+    else
+        echo "e2e_fund_return: prime sweep skipped for ${addr:0:16}... (empty/dust/unreachable)" >&2
+    fi
+    rm -f "$bundle"
+}
+
+# Give every funded coin back, on success AND on failure. Best-effort
+# throughout: a cleanup problem must never mask the real result.
+e2e_fund_return() {
+    [[ "$DRY_RUN" == 1 ]] && return 0
+    [[ ${#E2E_APP_FUNDED[@]} -eq 0 && ${#E2E_PRIME_FUNDED[@]} -eq 0 ]] && return 0
+    local dest a
+    if [[ "$NETWORK" == regtest ]]; then
+        dest="$(miner_cli getnewaddress 2>/dev/null)"
+    else
+        dest="$FUND_ADDR"        # back to the gift wallet it came from
+    fi
+    [[ -n "$dest" ]] || { echo "e2e_fund_return: no destination — skipping" >&2; return 0; }
+    for a in ${E2E_APP_FUNDED[@]+"${E2E_APP_FUNDED[@]}"}; do e2e_sweep_app_addr "$a" "$dest" || true; done
+    for a in ${E2E_PRIME_FUNDED[@]+"${E2E_PRIME_FUNDED[@]}"}; do e2e_sweep_prime_addr "$a" "$dest" || true; done
+}
+
+e2e_cleanup() {
+    # BEFORE killing server.py: in esplora mode $BASE points at it, and the
+    # sweeps need it alive.
+    e2e_fund_return || true
+    if [[ -n "${SERVER_PID:-}" ]]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    unset FUND_WIF
+    # The per-run watch wallet holds no keys and no funds
+    # (disable_private_keys), so there is nothing to sweep — just unload it so
+    # repeated runs don't pile up loaded wallets. Best effort, never fatal.
+    core_cli unloadwallet "$CN_WATCH_WALLET" >/dev/null 2>&1 || true
+}
+trap e2e_cleanup EXIT
 
 ensure_cn_watch_wallet() {
     core_cli createwallet "$CN_WATCH_WALLET" true true >/dev/null 2>&1 \
@@ -258,6 +367,34 @@ wait_for_wallet_scan() { # rule 2 — poll getwalletinfo.scanning to false
     done
     echo "wait_for_wallet_scan: still scanning after 20 minutes, giving up" >&2
     return 1
+}
+
+pre_watch_descriptor() { # desc — register a RANGED descriptor, not one address.
+    # `fund-build`'s scan_funding walks the funding descriptor's whole address
+    # window, so registering only index 0 leaves every other derived address
+    # unknown — and the first one the app touches pays a genesis rescan
+    # (146,900 blocks on testnet4, well past the app's 30s HTTP timeout).
+    # One ranged import covers the entire window; this is the same shape
+    # app-core uses for its own identity (open_client_watched).
+    # Best-effort, exactly like pre_watch_fresh: the app's slow per-address
+    # fallback still yields a CORRECT run, just a much slower one.
+    local desc="$1" checksummed import_json
+    [[ -z "$desc" ]] && return 0
+    if [[ "$DRY_RUN" == 1 ]]; then
+        echo "[DRY-RUN] would pre-watch descriptor: $desc" >&2
+        return 0
+    fi
+    wait_for_wallet_scan || true
+    ensure_cn_watch_wallet
+    checksummed="$(core_cli getdescriptorinfo "$desc" 2>/dev/null \
+        | python3 -c "import json,sys; print(json.load(sys.stdin)['descriptor'])" 2>/dev/null)" || return 0
+    [[ -n "$checksummed" ]] || return 0
+    import_json="$(python3 -c "
+import json,sys
+print(json.dumps([{'desc': sys.argv[1], 'timestamp': int(sys.argv[2]), 'range': [0, 50]}]))
+" "$checksummed" "$RUN_START_TS")" || return 0
+    core_cli -rpcwallet="$CN_WATCH_WALLET" importdescriptors "$import_json" >/dev/null 2>&1 || true
+    wait_for_wallet_scan || true
 }
 
 pre_watch_fresh() { # addr... — rule 1: no-op for any address the shared
@@ -299,8 +436,7 @@ if [[ "$BACKEND" == esplora ]]; then
     python3 "$PRIME/companion/server.py" "$PORT" --node "$CN_NODE_HOST:$CN_NODE_PORT" --network "$NETWORK" \
         >"$WORK/server.log" 2>&1 &
     SERVER_PID=$!
-    cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
-    trap cleanup EXIT
+    # server.py is killed by e2e_cleanup (the single EXIT trap above).
     for _ in $(seq 1 60); do
         curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && break
         sleep 1
@@ -463,9 +599,15 @@ else
     # authority over the gift wallet.
     GIFT_WIF_FILE="${E2E_GIFT_WIF_FILE:-}"   # no default: public repo, no machine-specific path
 
-    T4_FUND_UTXO_TXID=""; T4_FUND_UTXO_VOUT=""; T4_FUND_UTXO_SATS=""
+    # The input SET this run funds from (JSON array for createrawtransaction),
+    # and how much it holds. Combining inputs is what lets a run start while a
+    # previous run's change is still unconfirmed.
+    T4_FUND_INPUTS=""; T4_FUND_UTXO_SATS=""
+    # Enough for this suite's several ~20k fundings plus fees, gathered once
+    # up front so later faucet calls just chain off the change.
+    T4_FUND_TARGET_SATS="${E2E_T4_FUND_TARGET_SATS:-120000}"
     t4_fund_init() {
-        [[ -n "$T4_FUND_UTXO_TXID" ]] && return 0
+        [[ -n "$T4_FUND_INPUTS" ]] && return 0
         # Spending real testnet4 funds requires an explicit, out-of-band
         # grant. A dry-run test that raced past its own kill signal turned
         # "run the script on testnet4" into "spend the gift wallet" on
@@ -479,7 +621,7 @@ else
             [[ -r "$GIFT_WIF_FILE" ]] || err "gift-wallet WIF file not readable: $GIFT_WIF_FILE"
             FUND_WIF="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['env']['TESTNET4_WIF'])" "$GIFT_WIF_FILE")"
             [[ -n "$FUND_WIF" ]] || err "could not read TESTNET4_WIF from $GIFT_WIF_FILE"
-            trap 'unset FUND_WIF' EXIT
+            # FUND_WIF is unset by e2e_cleanup (the single EXIT trap above).
         fi
         local scan cand txid vout sats live
         scan="$(core_cli scantxoutset start "[\"addr($FUND_ADDR)\"]")" || err "gift-wallet scantxoutset failed"
@@ -490,27 +632,48 @@ u = sorted(d.get('unspents', []), key=lambda x: -x['amount'])
 for c in u:
     print(c['txid'], c['vout'], round(c['amount'] * 1e8))
 " <<<"$scan")"
+        # COMBINE utxos rather than demanding a single big one. A previous
+        # run's change sits unconfirmed for ~10 minutes on testnet4, and
+        # `gettxout` correctly skips anything already spent in the mempool —
+        # so after a couple of runs the only LIVE outputs can each be too
+        # small even while the wallet holds plenty in aggregate. Requiring one
+        # large utxo made the suite unrunnable until blocks confirmed.
+        local acc_total=0 acc_inputs=""
         while read -r txid vout sats; do
             [[ -z "$txid" ]] && continue
             live="$(core_cli gettxout "$txid" "$vout" 2>/dev/null)"
-            if [[ -n "$live" && "$live" != "null" ]]; then
-                T4_FUND_UTXO_TXID="$txid"; T4_FUND_UTXO_VOUT="$vout"; T4_FUND_UTXO_SATS="$sats"
+            [[ -n "$live" && "$live" != "null" ]] || continue
+            acc_inputs="$acc_inputs{\"txid\":\"$txid\",\"vout\":$vout,\"sequence\":4294967293},"
+            acc_total=$(( acc_total + sats ))
+            if (( acc_total >= T4_FUND_TARGET_SATS )); then
+                T4_FUND_INPUTS="[${acc_inputs%,}]"
+                T4_FUND_UTXO_SATS="$acc_total"
                 return 0
             fi
         done <<<"$cand"
+        if [[ -n "$acc_inputs" ]]; then
+            # Everything live, still short of target: proceed anyway and let
+            # the per-faucet arithmetic below fail with the real numbers.
+            T4_FUND_INPUTS="[${acc_inputs%,}]"
+            T4_FUND_UTXO_SATS="$acc_total"
+            return 0
+        fi
         err "no usable (unspent, not mempool-conflicted) gift-wallet UTXO found for $FUND_ADDR"
     }
     faucet() { # addr amount_btc -> echoes txid
         local addr="$1" amt_btc="$2" amt_sats fee_sats change_sats amt_fmt change_fmt raw signed complete hex txid change_vout
         t4_fund_init
         amt_sats="$(python3 -c "print(round($amt_btc*1e8))")"
-        fee_sats=300
+        # Fee must cover EVERY input we are spending, not just one.
+        local n_in
+        n_in="$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$T4_FUND_INPUTS")"
+        fee_sats=$(( 200 + n_in * 120 ))
         change_sats=$(( T4_FUND_UTXO_SATS - amt_sats - fee_sats ))
         (( change_sats >= 1000 )) || err "faucet $addr: gift-wallet utxo too small (${T4_FUND_UTXO_SATS} sats) for ${amt_sats}+fee"
         amt_fmt="$(python3 -c "print(format($amt_sats/1e8,'.8f'))")"
         change_fmt="$(python3 -c "print(format($change_sats/1e8,'.8f'))")"
         raw="$(core_cli createrawtransaction \
-            "[{\"txid\":\"$T4_FUND_UTXO_TXID\",\"vout\":$T4_FUND_UTXO_VOUT,\"sequence\":4294967293}]" \
+            "$T4_FUND_INPUTS" \
             "{\"$addr\":$amt_fmt,\"$FUND_ADDR\":$change_fmt}")" || err "faucet $addr: createrawtransaction failed"
         signed="$(printf '%s\n%s\n' "$raw" "[\"$FUND_WIF\"]" | core_cli -stdin signrawtransactionwithkey)" \
             || err "faucet $addr: sign failed"
@@ -526,7 +689,9 @@ for o in d['vout']:
     if a == '$FUND_ADDR':
         print(o['n']); break
 ")"
-        T4_FUND_UTXO_TXID="$txid"; T4_FUND_UTXO_VOUT="$change_vout"; T4_FUND_UTXO_SATS="$change_sats"
+        # Chain the next faucet off this tx's change: one input from here on.
+        T4_FUND_INPUTS="[{\"txid\":\"$txid\",\"vout\":$change_vout,\"sequence\":4294967293}]"
+        T4_FUND_UTXO_SATS="$change_sats"
         echo "$txid"
     }
 fi
@@ -585,17 +750,25 @@ RUN_FUND_SEED_WPKH="${E2E_FUND_SEED_WPKH:-$(openssl rand -hex 32)}"
 RUN_PRIME_SEED="${E2E_PRIME_SEED:-$(openssl rand -hex 32)}"
 export NOTES_APP_SEED="$RUN_PRIME_SEED"
 echo "run identity: backend=$BACKEND network=$NETWORK APP_ACCOUNT=$RUN_ACCOUNT (fresh — never reused against the shared chain)"
+# Log the prime seed too. It is throwaway per-run test material, and without
+# it a crashed run's prime-side funds are UNRECOVERABLE: four aborted
+# testnet4 runs stranded 60,000 sats permanently that way, while the app side
+# survived only because APP_ACCOUNT happened to be printed. The fund-return
+# below is the real fix; this is the recovery path when that cannot run.
+echo "run identity: NOTES_APP_SEED=$RUN_PRIME_SEED (throwaway, logged so an aborted run stays recoverable)"
 
 # App identity: a BIP-39 mnemonic exercises the flagship import format.
 export APP_KEY="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 A_ADDR="$("$APP" address "$NETWORK")"
 [[ "$A_ADDR" == "$TAP_HRP"* ]] || fail "app address not taproot: $A_ADDR"
 pre_watch_fresh "$A_ADDR"
+E2E_APP_FUNDED+=("$A_ADDR")     # give it back on exit (e2e_fund_return)
 pass "app address $A_ADDR"
 
 P_ADDR="$("$NOTES" address "$NETWORK")"
 [[ "$P_ADDR" == "$TAP_HRP"* ]] || fail "prime address not taproot: $P_ADDR"
 pre_watch_fresh "$P_ADDR"
+E2E_PRIME_FUNDED+=("$P_ADDR")   # give it back on exit (e2e_fund_return)
 pass "prime address $P_ADDR"
 
 echo "== recovery-seeds interop: a Prime bip86 seed's 24 words import identically =="
@@ -699,6 +872,17 @@ external_funding() { # <tr|wpkh> <seed-hex> <note-text>
         tr) [[ "$F_ADDR" == "$TAP_HRP"* ]] || fail "[$kind] funding addr not taproot: $F_ADDR" ;;
         wpkh) [[ "$F_ADDR" == "$SEG_HRP"* ]] || fail "[$kind] funding addr not segwit v0: $F_ADDR" ;;
     esac
+    # `fund-keygen` mints this address DURING the run, so no earlier
+    # pre-registration could have covered it — and an unregistered address is
+    # exactly what costs a genesis rescan (146,900 blocks on testnet4; the
+    # app's 30s HTTP timeout loses that race and the leg dies with a bare
+    # Transport error). Register it before anything queries it. It was
+    # generated moments ago, so it provably has no history before this run.
+    # Register the funding descriptor's whole RANGE, not just $F_ADDR:
+    # scan_funding walks the window, and one unregistered address in it costs
+    # a genesis rescan that outlives the app's HTTP timeout.
+    pre_watch_descriptor "$F_DESC"
+    pre_watch_fresh "$F_ADDR"
     FUND_TXID="$(faucet "$F_ADDR" "$FUND_EXTERNAL_BTC")"
     settle "$FUND_TXID"
     PSBT="$("$APP" fund-build "$BASE" "$NETWORK" "$F_DESC" private 2.0 "$text" "$P_ADDR" 2>"$WORK/fb-$kind.log")"
