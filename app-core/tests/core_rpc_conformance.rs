@@ -1583,6 +1583,182 @@ fn core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5() {
     eprintln!("core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5: PASS (synthetic table, 7 cases)");
 }
 
+/// Later unit (`PLAN-one-regtest-node.md`'s "Two things now grow without
+/// bound" / the workspace CLAUDE.md's "Core has no per-address filter —
+/// plan §2.2 flags the O(wallet) cost as a later-unit optimization"): a
+/// `getrawtransaction`-result cache in `esplora_tx_json`
+/// (`app_core::chain::TX_JSON_CACHE`, process-global, keyed by node +
+/// txid) — proven with `common::mock_rpc` because the mechanism this test
+/// verifies is exactly "did a SECOND call skip the RPC round trip", which
+/// a mock's own `call_count` answers directly and deterministically,
+/// unlike the real shared node (whose `getrawtransaction` count for a
+/// fixed txid set can't be pinned to an exact number across runs).
+///
+/// This is the MUTATION test the cache's safety rule demands: caching a
+/// transaction's `confirmed`/`status` shape is only safe once it can never
+/// change again. The three-call sequence below is deliberately shaped to
+/// catch BOTH wrong directions:
+///
+/// 1. First call — the tx is UNCONFIRMED. Must be a real RPC call (nothing
+///    to hit yet), and the result must NOT be cached (a mutation that
+///    cached unconditionally, on every result including pending ones,
+///    would still pass call 1 by definition but fail call 2 below).
+/// 2. Second call — the SAME txid has now CONFIRMED (the mock is
+///    re-scripted between calls 1 and 2, simulating a block landing).
+///    Must ALSO be a real RPC call (proving call 1's unconfirmed result
+///    was genuinely never cached — a mutation that cached indiscriminately
+///    would serve the STALE unconfirmed answer here, which is precisely
+///    the "the app tells the user a live transaction was dropped" failure
+///    mode this project treats as its worst) — the fresh confirmation
+///    must be visible.
+/// 3. Third call — same confirmed txid, mock left unchanged. Must be
+///    served from cache: the `getrawtransaction` call count must NOT grow
+///    a third time. A mutation that removed the cache entirely (or that
+///    forgot to cache the confirmed branch) fails ONLY here, by regressing
+///    the call count from 2 back up to 3 — this is the assertion that
+///    proves the fix is doing anything at all, not just that it's safe.
+#[test]
+fn core_rpc_confirmed_tx_json_is_cached_but_a_pending_one_is_never_served_stale() {
+    let mock = common::mock_rpc::MockRpcServer::start();
+    let txid = "ab".repeat(32);
+    let addr = "bcrt1pmockaddressfortxcachetest0000000000000000000000000000";
+
+    mock.set("createwallet", common::mock_rpc::MockResponse::Ok(serde_json::json!({"name": "chain-notes-watch"})));
+    mock.set("getaddressinfo", common::mock_rpc::MockResponse::Ok(serde_json::json!({"ismine": true})));
+    mock.set("getblockcount", common::mock_rpc::MockResponse::Ok(serde_json::json!(800)));
+
+    let vout = serde_json::json!([{
+        "scriptPubKey": {"address": addr, "type": "witness_v1_taproot"},
+        "value": 0.0001,
+    }]);
+
+    // Call 1: unconfirmed.
+    mock.set(
+        "listtransactions",
+        common::mock_rpc::MockResponse::Ok(serde_json::json!([{"txid": txid, "confirmations": 0, "time": 1}])),
+    );
+    mock.set(
+        "getrawtransaction",
+        common::mock_rpc::MockResponse::Ok(serde_json::json!({"txid": txid, "confirmations": 0, "vin": [], "vout": vout})),
+    );
+
+    let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
+    let client = ChainClient::new(transport, Network::Regtest);
+
+    let stats1 = client.address_stats(addr).expect("address_stats (unconfirmed)");
+    assert_eq!(stats1.mempool_tx_count, 1, "the pending tx must be visible as mempool activity");
+    assert_eq!(stats1.chain_tx_count, 0);
+    assert_eq!(mock.call_count("getrawtransaction"), 1, "call 1 must be a genuine RPC round trip");
+
+    // Call 2: the SAME txid has now confirmed — re-script both endpoints
+    // the way a real node's answers would change once a block lands.
+    mock.set(
+        "listtransactions",
+        common::mock_rpc::MockResponse::Ok(serde_json::json!([{"txid": txid, "confirmations": 6, "time": 1}])),
+    );
+    mock.set(
+        "getrawtransaction",
+        common::mock_rpc::MockResponse::Ok(serde_json::json!({"txid": txid, "confirmations": 6, "vin": [], "vout": vout})),
+    );
+
+    let stats2 = client.address_stats(addr).expect("address_stats (freshly confirmed)");
+    assert_eq!(
+        stats2.chain_tx_count, 1,
+        "the fresh confirmation must be visible — a cache that served call 1's stale unconfirmed \
+         result here would leave this at 0, exactly the 'live tx reads as dropped/pending forever' \
+         failure this project treats as its worst"
+    );
+    assert_eq!(stats2.mempool_tx_count, 0);
+    assert_eq!(
+        mock.call_count("getrawtransaction"),
+        2,
+        "call 2 must ALSO be a genuine RPC round trip — proof call 1's unconfirmed result was never cached"
+    );
+
+    // Call 3: same confirmed txid, mock script unchanged — THIS is where
+    // the cache must actually pay off.
+    let stats3 = client.address_stats(addr).expect("address_stats (repeat, confirmed)");
+    assert_eq!(stats3.chain_tx_count, 1);
+    assert_eq!(stats3.mempool_tx_count, 0);
+    assert_eq!(
+        mock.call_count("getrawtransaction"),
+        2,
+        "call 3 must be served entirely from the confirmed-tx cache — a mutation that disabled \
+         or bypassed TX_JSON_CACHE would regress this back to 3"
+    );
+
+    eprintln!(
+        "core_rpc_confirmed_tx_json_is_cached_but_a_pending_one_is_never_served_stale: PASS \
+         (3 address_stats calls, 2 real getrawtransaction round trips)"
+    );
+}
+
+/// Companion to the cache test above: `app_core::chain::TX_JSON_CACHE_MAX_ENTRIES`
+/// (exposed for tests via `core_rpc_tx_json_cache_max_entries`) is a HARD cap,
+/// not a documented aspiration — an unbounded cache would trade the fixed
+/// O(wallet-history) NETWORK cost this unit removes for an O(wallet-history)
+/// MEMORY cost instead, on a platform (a phone) that can least afford it.
+/// Drives ONE `address_stats` call against a synthetic wallet history of
+/// `cap + 50` distinct, already-confirmed txids — comfortably past the
+/// cap — and proves two things at once: the cache genuinely stops growing at
+/// the documented ceiling (a mutation that dropped the `cache.len() <
+/// TX_JSON_CACHE_MAX_ENTRIES` guard would let this regress unboundedly), and
+/// the cap bounds MEMORY only, never correctness — every one of the `cap +
+/// 50` txids must still be resolved via a real `getrawtransaction` call on
+/// this first pass (nothing is silently skipped just because the cache is
+/// full).
+#[test]
+fn core_rpc_tx_json_cache_is_bounded() {
+    let mock = common::mock_rpc::MockRpcServer::start();
+    let addr = "bcrt1pmockaddressforcachecaptest0000000000000000000000000000000";
+
+    mock.set("createwallet", common::mock_rpc::MockResponse::Ok(serde_json::json!({"name": "chain-notes-watch"})));
+    mock.set("getaddressinfo", common::mock_rpc::MockResponse::Ok(serde_json::json!({"ismine": true})));
+    mock.set("getblockcount", common::mock_rpc::MockResponse::Ok(serde_json::json!(800)));
+    // Every txid resolves to the SAME confirmed, empty-vin/vout body — the
+    // mock scripts per METHOD, not per param, and content doesn't matter
+    // here; only the DISTINCT txid strings (the cache key) do.
+    mock.set(
+        "getrawtransaction",
+        common::mock_rpc::MockResponse::Ok(serde_json::json!({"confirmations": 6, "vin": [], "vout": []})),
+    );
+
+    let cap = app_core::chain::core_rpc_tx_json_cache_max_entries();
+    let n = cap + 50;
+    let entries: Vec<serde_json::Value> = (0..n)
+        .map(|i| serde_json::json!({"txid": format!("{i:064x}"), "confirmations": 6, "time": 1}))
+        .collect();
+    mock.set("listtransactions", common::mock_rpc::MockResponse::Ok(serde_json::json!(entries)));
+
+    let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
+    let client = ChainClient::new(transport, Network::Regtest);
+
+    let before_len = app_core::chain::core_rpc_tx_json_cache_len();
+    client.address_stats(addr).expect("address_stats over a large synthetic wallet history");
+    let after_len = app_core::chain::core_rpc_tx_json_cache_len();
+
+    assert!(
+        after_len <= cap,
+        "TX_JSON_CACHE must never exceed its documented cap of {cap} entries — landed at {after_len} \
+         after offering {n} distinct confirmed txids"
+    );
+    assert!(
+        after_len > before_len,
+        "the cache must still have grown from this test's own activity (before={before_len}, after={after_len})"
+    );
+    assert_eq!(
+        mock.call_count("getrawtransaction"),
+        n,
+        "the cap bounds MEMORY only — every one of the {n} distinct wallet-wide txids must still be \
+         resolved via a real getrawtransaction call on this first pass, cap or no cap"
+    );
+
+    eprintln!(
+        "core_rpc_tx_json_cache_is_bounded: PASS (cap={cap}, offered {n} distinct confirmed txids, \
+         cache landed at {after_len} entries, before={before_len})"
+    );
+}
+
 /// U5 test 2 (plan §2.1, "cache it; do not re-probe per call"): several
 /// lookups of DIFFERENT unknown txids against the SAME transport instance
 /// must trigger exactly ONE real `getblockchaininfo`/`getindexinfo` probe,
