@@ -461,7 +461,7 @@ else
     # actually about to run (see t4_fund_init below). Merely running this
     # script on --network testnet4 must not, by itself, acquire spending
     # authority over the gift wallet.
-    GIFT_WIF_FILE="${E2E_GIFT_WIF_FILE:-/Users/sal/Projects/Gifts/bitcoin-gift-wallet/.claude/settings.local.json}"
+    GIFT_WIF_FILE="${E2E_GIFT_WIF_FILE:-}"   # no default: public repo, no machine-specific path
 
     T4_FUND_UTXO_TXID=""; T4_FUND_UTXO_VOUT=""; T4_FUND_UTXO_SATS=""
     t4_fund_init() {
@@ -475,6 +475,7 @@ else
             err "refusing to spend: set E2E_ALLOW_TESTNET4_SPEND=1 to authorize this run to read the gift-wallet WIF and broadcast real testnet4 funding transactions (currently unset or not '1')"
         fi
         if [[ -z "${FUND_WIF:-}" ]]; then
+            [[ -n "$GIFT_WIF_FILE" ]] || err "set E2E_GIFT_WIF_FILE to the JSON file holding the gift-wallet TESTNET4_WIF"
             [[ -r "$GIFT_WIF_FILE" ]] || err "gift-wallet WIF file not readable: $GIFT_WIF_FILE"
             FUND_WIF="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['env']['TESTNET4_WIF'])" "$GIFT_WIF_FILE")"
             [[ -n "$FUND_WIF" ]] || err "could not read TESTNET4_WIF from $GIFT_WIF_FILE"
