@@ -4539,7 +4539,7 @@ mod tests {
             CoreRpcTransport::watch_wallet(),
             "chain-notes-watch",
             "the default watch wallet name is production state — harnesses \
-             override it via CN_APP_WATCH_WALLET, they do not change this"
+             override it via CN_WATCH_WALLET, they do not change this"
         );
         assert_eq!(CoreRpcTransport::WATCH_WALLET, "chain-notes-watch");
     }
