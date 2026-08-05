@@ -556,7 +556,23 @@ mod android_jni {
 
     /// context.getSystemService("clipboard").setPrimaryClip(
     ///     ClipData.newPlainText("chain-notes", text))
-    pub fn set_clipboard(text: &str) -> Result<(), String> {
+    ///
+    /// `sensitive` additionally marks the clip with
+    /// `ClipDescription.EXTRA_IS_SENSITIVE` (honored from API 33) so the
+    /// system suppresses the paste-preview toast and clipboard managers skip
+    /// it — Android's counterpart to iOS's `localOnly` + expiring pasteboard
+    /// and macOS's `ConcealedType`.
+    ///
+    /// The extra's key is written out rather than read off `ClipDescription`,
+    /// because reading a static field that does not exist on an older device
+    /// throws, whereas `setExtras` (API 24) carrying an extra the platform has
+    /// not heard of is simply ignored — so this degrades quietly on API 26-32
+    /// instead of failing the copy.
+    ///
+    /// Marking is a preview/manager hint, NOT secrecy: the value is still on
+    /// the system clipboard and any app may read it. iOS's expiry has no
+    /// Android equivalent to mirror.
+    fn set_clipboard_impl(text: &str, sensitive: bool) -> Result<(), String> {
         with_env_ctx(|env, context| {
             let name = env.new_string("clipboard")?;
             let cm = env
@@ -577,6 +593,31 @@ mod android_jni {
                     &[JValue::Object(&label), JValue::Object(&value)],
                 )?
                 .l()?;
+            if sensitive {
+                // clip.getDescription().setExtras(bundle{IS_SENSITIVE: true})
+                let desc = env
+                    .call_method(
+                        &clip,
+                        "getDescription",
+                        "()Landroid/content/ClipDescription;",
+                        &[],
+                    )?
+                    .l()?;
+                let bundle = env.new_object("android/os/PersistableBundle", "()V", &[])?;
+                let key = env.new_string("android.content.extra.IS_SENSITIVE")?;
+                env.call_method(
+                    &bundle,
+                    "putBoolean",
+                    "(Ljava/lang/String;Z)V",
+                    &[JValue::Object(&key), JValue::Bool(1)],
+                )?;
+                env.call_method(
+                    &desc,
+                    "setExtras",
+                    "(Landroid/os/PersistableBundle;)V",
+                    &[JValue::Object(&bundle)],
+                )?;
+            }
             env.call_method(
                 &cm,
                 "setPrimaryClip",
@@ -587,69 +628,14 @@ mod android_jni {
         })
     }
 
-    /// Like [`set_clipboard`], but marks the clip SENSITIVE so the system
-    /// suppresses the content preview in the clipboard toast/overlay and
-    /// clipboard managers know to skip it — Android's counterpart to iOS's
-    /// `localOnly` + expiring pasteboard and macOS's `ConcealedType`.
-    ///
-    /// The flag is `ClipDescription.EXTRA_IS_SENSITIVE`, honored from API 33.
-    /// The string constant is written out rather than read off the class,
-    /// because reading a static field that does not exist on an older device
-    /// throws, whereas `setExtras` (API 24) carrying an extra the platform has
-    /// not heard of is simply ignored. So this degrades quietly on older
-    /// devices instead of failing the copy — and a failed copy would be the
-    /// worse outcome, since the user is trying to back up a recovery phrase.
-    ///
-    /// This is a preview/manager hint, NOT secrecy: the value is still on the
-    /// system clipboard and any app may read it. iOS's expiry has no Android
-    /// equivalent to mirror.
+    pub fn set_clipboard(text: &str) -> Result<(), String> {
+        set_clipboard_impl(text, false)
+    }
+
+    /// Spending material — see [`set_clipboard_impl`] for what "sensitive"
+    /// buys and what it does not.
     pub fn set_clipboard_sensitive(text: &str) -> Result<(), String> {
-        with_env_ctx(|env, context| {
-            let name = env.new_string("clipboard")?;
-            let cm = env
-                .call_method(
-                    context,
-                    "getSystemService",
-                    "(Ljava/lang/String;)Ljava/lang/Object;",
-                    &[JValue::Object(&name)],
-                )?
-                .l()?;
-            let label = env.new_string("chain-notes")?;
-            let value = env.new_string(text)?;
-            let clip = env
-                .call_static_method(
-                    "android/content/ClipData",
-                    "newPlainText",
-                    "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;",
-                    &[JValue::Object(&label), JValue::Object(&value)],
-                )?
-                .l()?;
-            // clip.getDescription().setExtras(bundle{IS_SENSITIVE: true})
-            let desc = env
-                .call_method(&clip, "getDescription", "()Landroid/content/ClipDescription;", &[])?
-                .l()?;
-            let bundle = env.new_object("android/os/PersistableBundle", "()V", &[])?;
-            let key = env.new_string("android.content.extra.IS_SENSITIVE")?;
-            env.call_method(
-                &bundle,
-                "putBoolean",
-                "(Ljava/lang/String;Z)V",
-                &[JValue::Object(&key), JValue::Bool(1)],
-            )?;
-            env.call_method(
-                &desc,
-                "setExtras",
-                "(Landroid/os/PersistableBundle;)V",
-                &[JValue::Object(&bundle)],
-            )?;
-            env.call_method(
-                &cm,
-                "setPrimaryClip",
-                "(Landroid/content/ClipData;)V",
-                &[JValue::Object(&clip)],
-            )?;
-            Ok(())
-        })
+        set_clipboard_impl(text, true)
     }
 
     /// clipboard.getPrimaryClip().getItemAt(0).coerceToText(context)
