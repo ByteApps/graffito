@@ -9,14 +9,27 @@
 //! JavaVM comes from `ndk_context`, populated by Slint's android-activity
 //! backend at startup.
 //!
-//! Deferred to the Kotlin/Gradle layer (tracked in the phase-4 PLAN):
-//! `setUserAuthenticationRequired` + BiometricPrompt so `reveal_secret`
-//! shows a fingerprint/face gate. Today boot and reveal both decrypt
-//! silently — the file is still keystore-protected at rest.
+//! `reveal_secret` and `load_secret_gated` now show the system
+//! BiometricPrompt first (`user_presence_check`), matching Apple. BOOT STILL
+//! DECRYPTS SILENTLY, deliberately — a launch path that waits on a human is
+//! what killed iOS builds 42 and 44.
+//!
+//! This is the APP-LEVEL gate, option (a) of
+//! `PLAN-chain-notes-app-android-biometric.md`. The Keystore key is NOT
+//! auth-bound (`setUserAuthenticationRequired`), because that permanently
+//! invalidates it when the user removes their screen lock — destroying the
+//! wrapped seed for anyone who never wrote the phrase down. So the honest
+//! claim is "must satisfy the system prompt", not "the OS enforces it": code
+//! already running in this process can skip it. Apple's unentitled builds give
+//! exactly the same guarantee through their LAContext fallback.
+//!
+//! The doc above says the key is hardware-backed; note the code requests
+//! neither `setIsStrongBoxBacked` nor verifies `KeyInfo.getSecurityLevel()`,
+//! so TEE backing is what devices do in practice, not something asserted here.
 
 use std::path::PathBuf;
 
-use jni::objects::{JByteArray, JObject, JString, JValue};
+use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
 use jni::JNIEnv;
 
 // KeyProperties.PURPOSE_ENCRYPT (1) | PURPOSE_DECRYPT (2)
@@ -272,18 +285,150 @@ pub fn load_secret_protected(account: &str, _prompt: &str) -> Result<Option<Stri
     Ok(Some(s))
 }
 
-/// Reveal path. Biometric gating (BiometricPrompt) is deferred to the
-/// Kotlin layer; for now this decrypts through the keystore like boot.
+// --- User-presence gate (app-level, PLAN-chain-notes-app-android-biometric.md
+// option (a)) ------------------------------------------------------------
+//
+// The dex is EMBEDDED rather than shipped as an asset: `InMemoryDexClassLoader`
+// takes a direct ByteBuffer, so there is no AssetManager plumbing and no
+// packaging step to forget. Regenerate with `scripts/gen-biometric-dex.sh`
+// after editing android/biometric/*.java — it is a committed build artifact,
+// like the generated icons.
+const BIOMETRIC_DEX: &[u8] = include_bytes!("../../assets/android/biometric.dex");
+
+/// How long to leave the prompt up before treating silence as refusal. Long
+/// enough for a real person to notice and react, short enough that a wedged
+/// prompt cannot hang the reveal forever.
+const BIOMETRIC_TIMEOUT_MS: i64 = 60_000;
+
+/// `Build.VERSION.SDK_INT`. `BiometricPrompt` is API 28 while this app's
+/// min_sdk is 26, so the two-version gap has to be checked at runtime.
+fn sdk_int(env: &mut JNIEnv) -> jni::errors::Result<i32> {
+    env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i()
+}
+
+/// Show the system biometric prompt and block until it resolves.
+///
+/// This is option (a) from the plan: an APP-LEVEL gate over the existing
+/// Keystore key. It does NOT make the key itself auth-bound
+/// (`setUserAuthenticationRequired`), because that permanently invalidates the
+/// key if the user removes their screen lock — losing the wrapped seed for
+/// anyone who never wrote the phrase down. So the honest claim is: this raises
+/// the bar from "no authentication at all" to "must satisfy the system prompt",
+/// and an attacker already executing code in this process can bypass it. That
+/// is the same guarantee iOS gives on an unentitled build via its LAContext
+/// fallback.
+///
+/// Blocking is safe here: `android_main` runs on its own native thread, NOT the
+/// Java main thread, so the ANR watchdog is unaffected and the prompt stays
+/// responsive while this waits.
+fn user_presence_check(reason: &str) -> Result<(), String> {
+    let title = "Reveal secret";
+    let negative = "Cancel";
+    let outcome = with_env(|env| {
+        if sdk_int(env)? < 28 {
+            // Nothing to fall back to that is worth the risk: a
+            // KeyguardManager confirm-credential Intent needs an activity
+            // result, which NativeActivity does not forward to native code.
+            // Report it and let the caller decide, rather than silently
+            // pretending the user was verified.
+            return Ok(-1i32);
+        }
+        // MUST be the Activity, not ndk_context's context — that one is the
+        // APPLICATION, which has no runOnUiThread and no window for the prompt
+        // to attach to. Verified the hard way on the emulator:
+        // `NoSuchMethodError: no non-static method
+        // "Landroid/app/Application;.runOnUiThread"`. `activity_as_ptr` is the
+        // ANativeActivity's own Java object, stashed by android_main.
+        let app = crate::android_app().ok_or_else(|| {
+            jni::errors::Error::JniCall(jni::errors::JniError::Other(-1))
+        })?;
+        let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
+
+        // parent loader = the activity's own, so framework classes resolve
+        let act_class = env.call_method(&activity, "getClass", "()Ljava/lang/Class;", &[])?.l()?;
+        let parent = env
+            .call_method(&act_class, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+            .l()?;
+        let buf = unsafe {
+            env.new_direct_byte_buffer(BIOMETRIC_DEX.as_ptr() as *mut u8, BIOMETRIC_DEX.len())?
+        };
+        let loader = env.new_object(
+            "dalvik/system/InMemoryDexClassLoader",
+            "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+            &[JValue::Object(&buf), JValue::Object(&parent)],
+        )?;
+        let name = jstr(env, "xyz.foundation.chainnotes.BiometricBridge")?;
+        let class = env
+            .call_method(
+                &loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&name)],
+            )?
+            .l()?;
+
+        let t = jstr(env, title)?;
+        let s = jstr(env, reason)?;
+        let n = jstr(env, negative)?;
+        let bridge = env.new_object(
+            &JClass::from(class),
+            "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Object(&activity),
+                JValue::Object(&t),
+                JValue::Object(&s),
+                JValue::Object(&n),
+            ],
+        )?;
+
+        // The prompt must be built and shown on the UI thread.
+        env.call_method(
+            &activity,
+            "runOnUiThread",
+            "(Ljava/lang/Runnable;)V",
+            &[JValue::Object(&bridge)],
+        )?;
+
+        env.call_method(&bridge, "await", "(J)I", &[JValue::Long(BIOMETRIC_TIMEOUT_MS)])?.i()
+    })?;
+
+    match outcome {
+        1 => {
+            eprintln!("cb: keychain user-presence ok");
+            Ok(())
+        }
+        -1 => {
+            eprintln!("cb: keychain user-presence unavailable=api<28");
+            Err("biometric prompt needs Android 9 or newer".into())
+        }
+        other => {
+            eprintln!("cb: keychain user-presence denied result={other}");
+            Err("not authenticated".into())
+        }
+    }
+}
+
+/// Reveal path — gated on the system biometric prompt, like Apple's.
+///
+/// The gate runs BEFORE the decrypt and a refusal propagates, so a cancelled
+/// or failed prompt returns Err and the caller never sees the secret. That
+/// ordering is the whole feature: checking afterwards would decrypt the seed
+/// into memory first and only then ask.
 pub fn reveal_secret(account: &str, prompt: &str) -> Result<Option<String>, String> {
+    user_presence_check(prompt)?;
     load_secret_protected(account, prompt)
 }
 
 /// Apple's counterpart gates a SYNCED (ACL-less) item behind LAContext before
-/// a user-initiated restore. Android has no synced shape (`is_synced` is
-/// always false) and no biometric layer yet — the BiometricPrompt reveal is
-/// still pending — so this is the plain load, and restore here is as
-/// unauthenticated as `reveal_secret` is.
+/// a user-initiated restore; Android has no synced shape (`is_synced` is always
+/// false), but the restore tap hands over the same seed, so it takes the same
+/// prompt.
+///
+/// TAP PATHS ONLY, exactly as on Apple: never call this from boot. It blocks
+/// waiting for a human, and a launch path that blocks on a prompt is what
+/// killed iOS builds 42 and 44.
 pub fn load_secret_gated(account: &str, prompt: &str) -> Result<Option<String>, String> {
+    user_presence_check(prompt)?;
     load_secret_protected(account, prompt)
 }
 
