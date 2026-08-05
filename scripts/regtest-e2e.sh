@@ -229,6 +229,16 @@ core_cli() {
         return "$rc"
     done
 }
+# The node's own funded wallet — the faucet source, and where regtest coins
+# go back to (FAUCET.md). Same one-liner ui-automation/node-suite-lib.sh
+# defines; this script cannot source that library (it lives in the private
+# workspace and this repo is public), so it carries its own copy. It was
+# MISSING until 2026-08-04, and `e2e_fund_return`'s only regtest destination
+# was `miner_cli getnewaddress` — an undefined command, so `dest` came back
+# empty and the whole return path printed "no destination — skipping" and did
+# nothing, on every regtest run there has ever been.
+miner_cli() { core_cli -rpcwallet=testwallet "$@"; }
+
 core_cli getblockchaininfo >/dev/null 2>&1 \
     || fail "cannot reach the $NETWORK node at $CN_NODE_HOST:$CN_NODE_PORT (tunnel/tailnet up? credentials correct?)"
 TIP_BEFORE="$(core_cli getblockcount)"
@@ -279,28 +289,45 @@ export CN_IMPORT_TIMESTAMP="$RUN_START_TS"
 # of the RAII guard in app-core's conformance suite.
 E2E_APP_FUNDED=()
 E2E_PRIME_FUNDED=()
+# Stores whose BIP-84 SPENDING wallet was funded. These are NOT coverable by
+# e2e_sweep_app_addr: that sweeps a notebook's taproot utxos, while spending
+# coins live on a separate m/84' branch with its own keys, so they used to be
+# stranded on every run (the recorded fund-return gap). Each entry is
+# "<store-path>|<APP_KEY>|<APP_ACCOUNT>" — the key travels with the store
+# because these suites use several identities and the shell must sweep each
+# with the right one.
+E2E_SPENDING_FUNDED=()
 
 # Sweep one app-identity address back. Deliberately builds the store from
 # `scantxoutset` rather than `cli scan`: a scan makes app-core import the
 # identity's ranged descriptors at timestamp 0, i.e. a genesis rescan
 # (146,900 blocks on testnet4) that outlives any sane cleanup budget.
 # scantxoutset needs no wallet and no import at all.
-e2e_sweep_app_addr() { # addr dest
-    local addr="$1" dest="$2" utxos store
+e2e_sweep_app_addr() { # addr|key dest
+    local entry="$1" dest="$2" addr key utxos store
+    addr="${entry%%|*}"
+    key="${entry#*|}"
+    [[ "$key" == "$addr" ]] && key="${APP_KEY:-}"    # legacy entry with no key
     utxos="$(core_cli scantxoutset start "[\"addr($addr)\"]" 2>/dev/null | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 print(json.dumps([{'txid':u['txid'],'vout':u['vout'],'value':int(u['amount']*1e8),
                    'height':u.get('height'),'pending_spend':False} for u in d.get('unspents',[])]))
-" 2>/dev/null)" || return 0
-    [[ -n "$utxos" && "$utxos" != "[]" ]] || return 0
+" 2>/dev/null)" || { echo "e2e_fund_return: app scan FAILED for ${addr:0:16}... (coins may be stranded)" >&2; return 0; }
+    # Account for every registered identity out loud. A silent "nothing here"
+    # is indistinguishable from a broken return path, which is precisely how
+    # an undefined miner_cli disabled this entire function unnoticed.
+    if [[ -z "$utxos" || "$utxos" == "[]" ]]; then
+        echo "e2e_fund_return: app address ${addr:0:16}... already empty (nothing to return)" >&2
+        return 0
+    fi
     store="$(mktemp "${TMPDIR:-/tmp}/e2e-return.XXXXXX")"
-    "$APP" init "$store" "$NETWORK" >/dev/null 2>&1 || { rm -f "$store"; return 0; }
+    APP_KEY="$key" "$APP" init "$store" "$NETWORK" >/dev/null 2>&1 || { echo "e2e_fund_return: app init FAILED for ${addr:0:16}..." >&2; rm -f "$store"; return 0; }
     python3 -c "
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d['utxos']=json.loads(sys.argv[2]); json.dump(d,open(p,'w'))
 " "$store" "$utxos" 2>/dev/null || { rm -f "$store"; return 0; }
-    if "$APP" sweep "$store" "$BASE" "$dest" 2.0 >/dev/null 2>&1; then
+    if APP_KEY="$key" "$APP" sweep "$store" "$BASE" "$dest" 2.0 >/dev/null 2>&1; then
         echo "e2e_fund_return: swept app address ${addr:0:16}... back to $dest" >&2
     else
         echo "e2e_fund_return: app sweep skipped for ${addr:0:16}... (empty/dust)" >&2
@@ -320,18 +347,45 @@ e2e_sweep_prime_addr() { # addr dest
     rm -f "$bundle"
 }
 
+# Sweep a store's BIP-84 spending wallet back. Unlike the two above this
+# cannot work from an address list: spending coins are spread across a gap-
+# walked branch, so the sweep discovers them live (`cli spending-sweep`, which
+# scans and then uses the SAME mixed builder the UI's wallet sweep does).
+e2e_sweep_spending() { # store|key|account dest
+    local entry="$1" dest="$2" store key acct out
+    store="${entry%%|*}"; entry="${entry#*|}"
+    key="${entry%%|*}"; acct="${entry##*|}"
+    [[ -r "$store" ]] || return 0
+    if out="$(APP_KEY="$key" APP_ACCOUNT="$acct" "$APP" spending-sweep "$store" "$BASE" "$dest" 2.0 2>&1)"; then
+        echo "e2e_fund_return: spending wallet -> $(echo "$out" | grep -o 'utxos=[0-9]* value=[0-9]*' | head -1)" >&2
+    else
+        echo "e2e_fund_return: spending sweep skipped for $(basename "$store") (empty/dust/unreachable)" >&2
+    fi
+}
+
 # Give every funded coin back, on success AND on failure. Best-effort
 # throughout: a cleanup problem must never mask the real result.
 e2e_fund_return() {
     [[ "$DRY_RUN" == 1 ]] && return 0
-    [[ ${#E2E_APP_FUNDED[@]} -eq 0 && ${#E2E_PRIME_FUNDED[@]} -eq 0 ]] && return 0
+    [[ ${#E2E_APP_FUNDED[@]} -eq 0 && ${#E2E_PRIME_FUNDED[@]} -eq 0 \
+       && ${#E2E_SPENDING_FUNDED[@]} -eq 0 ]] && return 0
     local dest a
     if [[ "$NETWORK" == regtest ]]; then
         dest="$(miner_cli getnewaddress 2>/dev/null)"
     else
         dest="$FUND_ADDR"        # back to the gift wallet it came from
     fi
-    [[ -n "$dest" ]] || { echo "e2e_fund_return: no destination — skipping" >&2; return 0; }
+    # LOUD, not quiet. This exact branch silently swallowed the entire regtest
+    # return path for as long as it has existed, because `miner_cli` was
+    # undefined and an empty dest reads the same as "nothing to do". On a
+    # chain at its supply ceiling a skipped return is lost coins, so say so.
+    if [[ -z "$dest" ]]; then
+        echo "e2e_fund_return: WARNING no destination on $NETWORK — ${#E2E_APP_FUNDED[@]} app + ${#E2E_PRIME_FUNDED[@]} prime + ${#E2E_SPENDING_FUNDED[@]} spending identity(ies) will NOT be returned" >&2
+        return 0
+    fi
+    # Spending wallets FIRST: their sweep needs server.py alive and is the leg
+    # most likely to hold real value (the fu legs fund it repeatedly).
+    for a in ${E2E_SPENDING_FUNDED[@]+"${E2E_SPENDING_FUNDED[@]}"}; do e2e_sweep_spending "$a" "$dest" || true; done
     for a in ${E2E_APP_FUNDED[@]+"${E2E_APP_FUNDED[@]}"}; do e2e_sweep_app_addr "$a" "$dest" || true; done
     for a in ${E2E_PRIME_FUNDED[@]+"${E2E_PRIME_FUNDED[@]}"}; do e2e_sweep_prime_addr "$a" "$dest" || true; done
 }
@@ -855,7 +909,11 @@ export APP_KEY="abandon abandon abandon abandon abandon abandon abandon abandon 
 A_ADDR="$("$APP" address "$NETWORK")"
 [[ "$A_ADDR" == "$TAP_HRP"* ]] || fail "app address not taproot: $A_ADDR"
 pre_watch_fresh "$A_ADDR"
-E2E_APP_FUNDED+=("$A_ADDR")     # give it back on exit (e2e_fund_return)
+E2E_APP_FUNDED+=("$A_ADDR|$APP_KEY")   # addr|key — give it back on exit.
+# The KEY travels with the address because later legs `export APP_KEY` to
+# other identities (fu, multi), so by the time the EXIT trap runs the
+# ambient APP_KEY is NOT this address's owner. Sweeping with it would
+# derive the wrong key and fail as a quiet "skipped".
 pass "app address $A_ADDR"
 
 P_ADDR="$("$NOTES" address "$NETWORK")"
@@ -1074,6 +1132,9 @@ SPEND_ADDR1="$("$APP" spending-address "$FU_STORE" "$NETWORK" | tail -1)"
 [[ "$SPEND_ADDR1" == "$SEG_HRP"* ]] || fail "fu leg1: spending address not segwit v0: $SPEND_ADDR1"
 pre_watch_fresh "$SPEND_ADDR1"
 FU1_FUND_TXID="$(faucet "$SPEND_ADDR1" "$FUND_FU_BTC")"
+# Register ONCE per store: spending-sweep discovers every coin on the branch
+# by scanning, so a second entry would just re-sweep an emptied wallet.
+E2E_SPENDING_FUNDED+=("$FU_STORE|$FU_KEY|${APP_ACCOUNT:-0}")
 settle "$FU1_FUND_TXID"
 FU1_LOG="$("$APP" note-spend-funded "$FU_STORE" "$BASE" public 2.0 "funded self note")"
 echo "$FU1_LOG" | tee "$WORK/fu-leg1.log" | grep -q "broadcast=ok" || fail "fu leg1: note-spend-funded: $FU1_LOG"
@@ -1180,6 +1241,7 @@ MFU_SPEND_ADDR="$("$APP" spending-address "$MFU_STORE" "$NETWORK" | tail -1)"
 [[ "$MFU_SPEND_ADDR" == "$SEG_HRP"* ]] || fail "multi-fu: spending address not segwit v0: $MFU_SPEND_ADDR"
 pre_watch_fresh "$MFU_SPEND_ADDR"
 MULTI_FUND_TXID="$(faucet "$MFU_SPEND_ADDR" "$FUND_MULTI_BTC")"
+E2E_SPENDING_FUNDED+=("$MFU_STORE|$MFU_KEY|${APP_ACCOUNT:-0}")
 settle "$MULTI_FUND_TXID"
 
 # Three throwaway taproot recipients (any valid 32-byte hex key — none of
