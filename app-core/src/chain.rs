@@ -854,6 +854,41 @@ impl CoreRpcTransport {
     /// `companion/server.py` shim's `cn-watch`.
     const WATCH_WALLET: &'static str = "chain-notes-watch";
 
+    /// Environment override for [`Self::WATCH_WALLET`], for HARNESSES ONLY.
+    ///
+    /// **Deliberately the SAME variable `companion/server.py` reads**, with
+    /// the same semantics and the same default. The shim and this transport
+    /// are the two implementations of one wire contract, so a harness that
+    /// exports one per-run wallet name must reach both; two variable names for
+    /// one concept would mean a run that redirected the shim while quietly
+    /// leaving the real transport on the shared wallet.
+    ///
+    /// A real user has one app and one node, so a single stable wallet is
+    /// right for them and this is unset in production. Harnesses are the
+    /// opposite: many throwaway identities against ONE shared node, every run
+    /// importing more ranged descriptors into the same wallet forever. The
+    /// shared regtest wallet reached 642 transactions and 404 descriptors that
+    /// way, and a rescan is O(blocks x descriptors) while holding the wallet
+    /// lock — a `timestamp: 0` import into it cost ~130s versus ~0.5s into a
+    /// fresh one, and every other suite then queued behind that lock.
+    ///
+    /// The default is deliberately unchanged, and
+    /// `watch_wallet_defaults_to_production_name` pins it — the point is to
+    /// keep harnesses OFF the production wallet, not to move production.
+    const WATCH_WALLET_ENV: &'static str = "CN_WATCH_WALLET";
+
+    /// Resolved watch-wallet name: the env override if set and non-empty,
+    /// else [`Self::WATCH_WALLET`]. Read per call rather than cached because
+    /// `src/lib.rs` builds a fresh transport per operation anyway, so there is
+    /// no cache to be stale — and a harness that exports the var mid-process
+    /// (the CLI does, per subcommand) gets the value it just set.
+    fn watch_wallet() -> String {
+        match std::env::var(Self::WATCH_WALLET_ENV) {
+            Ok(name) if !name.trim().is_empty() => name,
+            _ => Self::WATCH_WALLET.to_string(),
+        }
+    }
+
     /// Default timeout for ordinary RPC calls (everything except
     /// [`Self::import_descriptors`] — see [`Self::RESCAN_TIMEOUT`]'s doc
     /// comment for why that one needs its own, much longer, budget). Kept
@@ -1130,7 +1165,7 @@ impl CoreRpcTransport {
     fn import_descriptors(&self, requests: serde_json::Value) -> Result<serde_json::Value, Error> {
         IMPORT_DESCRIPTORS_CALLS.fetch_add(1, Ordering::Relaxed);
         match self.call_timeout(
-            Some(Self::WATCH_WALLET),
+            Some(&Self::watch_wallet()),
             "importdescriptors",
             serde_json::json!([requests]),
             Some(Self::RESCAN_TIMEOUT),
@@ -1235,7 +1270,7 @@ impl CoreRpcTransport {
         let txindex = idx.get("txindex").is_some();
 
         let wallet_scanning =
-            match self.rpc(Some(Self::WATCH_WALLET), "getwalletinfo", serde_json::json!([])) {
+            match self.rpc(Some(&Self::watch_wallet()), "getwalletinfo", serde_json::json!([])) {
                 Ok(wi) => Some(match wi.get("scanning") {
                     Some(v) if v.is_object() => true,
                     Some(v) => v.as_bool().unwrap_or(false),
@@ -1409,13 +1444,13 @@ impl CoreRpcTransport {
         if *self.wallet_ready.lock().expect("wallet-ready mutex poisoned") {
             return Ok(());
         }
-        match self.rpc(None, "createwallet", serde_json::json!([Self::WATCH_WALLET, true, true])) {
+        match self.rpc(None, "createwallet", serde_json::json!([Self::watch_wallet(), true, true])) {
             Ok(_) => {}
             // Verified live wording (bitcoind v30.2.0): "...Database
             // already exists." A wallet already present on the node from
             // an earlier session/transport instance — load it instead.
             Err(Error::Http(msg)) if msg.contains("already exists") => {
-                match self.rpc(None, "loadwallet", serde_json::json!([Self::WATCH_WALLET])) {
+                match self.rpc(None, "loadwallet", serde_json::json!([Self::watch_wallet()])) {
                     Ok(_) => {}
                     // Verified live wording: `Wallet "..." is already
                     // loaded.` — another instance/thread got there first.
@@ -1562,7 +1597,7 @@ impl CoreRpcTransport {
         // so this call subsumes that check for the common case;
         // `getdescriptorinfo` stays below as defense in depth for whatever
         // this one doesn't cover.
-        match self.call(Some(Self::WATCH_WALLET), "getaddressinfo", serde_json::json!([address])) {
+        match self.call(Some(&Self::watch_wallet()), "getaddressinfo", serde_json::json!([address])) {
             RpcOutcome::Ok(info) => {
                 if info.get("ismine").and_then(|v| v.as_bool()).unwrap_or(false) {
                     self.watched.lock().expect("watched-address mutex poisoned").insert(address.to_string());
@@ -1714,7 +1749,7 @@ impl CoreRpcTransport {
     /// as unconfigured, same as a fresh node).
     fn ranged_family_imported_end(&self, spec: &WatchDescriptor) -> Result<Option<u32>, Error> {
         let Some(token) = Self::descriptor_xpub_token(&spec.descriptor) else { return Ok(None) };
-        let v = self.rpc(Some(Self::WATCH_WALLET), "listdescriptors", serde_json::json!([]))?;
+        let v = self.rpc(Some(&Self::watch_wallet()), "listdescriptors", serde_json::json!([]))?;
         let entries = v.get("descriptors").and_then(|d| d.as_array()).cloned().unwrap_or_default();
         let ends: Vec<u32> = entries
             .iter()
@@ -1854,7 +1889,7 @@ impl CoreRpcTransport {
     /// filter down to one address via [`tx_touches`].
     fn wallet_txid_order(&self) -> Result<Vec<String>, Error> {
         let entries = self.rpc(
-            Some(Self::WATCH_WALLET),
+            Some(&Self::watch_wallet()),
             "listtransactions",
             serde_json::json!(["*", 100_000, 0, true]),
         )?;
@@ -1938,7 +1973,7 @@ impl CoreRpcTransport {
     fn utxo_route(&self, address: &str) -> Result<String, Error> {
         let tip = self.tip_height_rpc()?;
         let result =
-            self.rpc(Some(Self::WATCH_WALLET), "listunspent", serde_json::json!([0, 9_999_999, [address]]))?;
+            self.rpc(Some(&Self::watch_wallet()), "listunspent", serde_json::json!([0, 9_999_999, [address]]))?;
         let items: Vec<serde_json::Value> = result
             .as_array()
             .cloned()
@@ -4489,5 +4524,23 @@ mod tests {
         let client = ChainClient::new(t, Network::Regtest);
         let err = client.btc_usd().unwrap_err();
         assert!(matches!(err, Error::Http(_)), "expected Error::Http, got {err:?}");
+    }
+
+    /// The override exists for harnesses; production must be unaffected.
+    /// Without this, "stop the suites bloating the shared wallet" could
+    /// silently become "move every user's wallet", which would orphan the
+    /// descriptors already imported on their node.
+    #[test]
+    fn watch_wallet_defaults_to_production_name() {
+        // Not using std::env::set_var here: tests share a process, and
+        // mutating the environment races every other test that reads it.
+        // The default path is what matters, and it is what ships.
+        assert_eq!(
+            CoreRpcTransport::watch_wallet(),
+            "chain-notes-watch",
+            "the default watch wallet name is production state — harnesses \
+             override it via CN_APP_WATCH_WALLET, they do not change this"
+        );
+        assert_eq!(CoreRpcTransport::WATCH_WALLET, "chain-notes-watch");
     }
 }
