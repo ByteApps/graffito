@@ -707,6 +707,61 @@ fn main() {
             println!("cli: spending-address index={index} address={}", addr.address);
             println!("{}", addr.address);
         }
+        Some("spending-sweep") => {
+            // spending-sweep <store.json> <base-url> <dest-address> <fee_rate> [gap]
+            //
+            // Sweep the BIP-84 SPENDING wallet to an arbitrary address. The
+            // plain `sweep` command above only moves the notebook's TAPROOT
+            // utxos (`store.available_utxos()`), so a suite that funded a
+            // spending wallet had no way to give those coins back — the
+            // documented fund-return gap. On a regtest chain at its supply
+            // ceiling every stranded coin is gone for good, so "no CLI
+            // command exists" is a leak, not a missing convenience.
+            //
+            // Coins come from a live `scan_funding` rather than any local
+            // index, so this works for a fresh store or after a words-only
+            // recovery, and the sweep is the SAME builder the UI's mixed
+            // wallet sweep uses — no second code path to keep honest.
+            let store = load(&args[2]);
+            let net = network(&store.network.clone());
+            let key = std::env::var("APP_KEY").expect("APP_KEY: mnemonic | master xprv");
+            let account: u32 =
+                std::env::var("APP_ACCOUNT").ok().and_then(|a| a.parse().ok()).unwrap_or(0);
+            let material = parse_key_material(&key, net).expect("APP_KEY parse");
+            let source = app_core::spending::funding_source(&material, net, account)
+                .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
+            let dest = app_core::notes_core::address::Recipient::parse(net, &args[4])
+                .expect("dest address");
+            let rate: f64 = args[5].parse().expect("fee rate");
+            let gap: u32 = args.get(6).and_then(|g| g.parse().ok()).unwrap_or(20);
+            // Identity-own address resolution -> the WATCHED constructor
+            // (see the core_rpc wiring contract; scan_funding is one of the
+            // calls that falls back to per-address genesis rescans otherwise).
+            let client = open_client_watched(&args[3], net, &key, account);
+            let scan = client.scan_funding(&source, gap).expect("spending scan");
+            let total: u64 = scan.utxos.iter().map(|u| u.value).sum();
+            if scan.utxos.is_empty() {
+                // Not a failure: a cleanup path must be callable unconditionally.
+                println!("cli: spending-sweep utxos=0 value=0 (nothing to sweep)");
+                return;
+            }
+            let tx = app_core::mixed::build_wallet_sweep_mixed(
+                &[],
+                Some((&material, net, account, &scan.utxos)),
+                dest.spk,
+                rate,
+                0,
+            )
+            .expect("spending sweep build");
+            let txid = client.broadcast(&tx.raw_hex).expect("broadcast");
+            println!(
+                "cli: spending-sweep txid={} utxos={} value={} fee={}",
+                txid.trim(),
+                scan.utxos.len(),
+                total,
+                tx.fee
+            );
+        }
         Some("spending-discover") => {
             // spending-discover <store.json> <base-url> [gap]
             // Words-only recovery leg (funding-unification M4): gap-scan
