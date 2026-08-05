@@ -803,15 +803,16 @@ fi
 echo "== fund both identities =="
 FUND_A_TXID="$(faucet "$A_ADDR" "$FUND_MAIN_BTC")"
 FUND_P_TXID="$(faucet "$P_ADDR" "$FUND_MAIN_BTC")"
-if [[ "$NETWORK" == regtest ]]; then
-    mine_n 100   # chain-height margin, kept from the reviewed --pi-regtest
-                 # run — testwallet already has ample spendable balance, so
-                 # this isn't a coinbase-maturity requirement, just extra
-                 # confirmations for what follows.
-else
-    settle "$FUND_A_TXID"
-    settle "$FUND_P_TXID"
-fi
+# One settle, not a height margin. Faucet coins are already mature (they
+# come from testwallet, not a fresh coinbase — FAUCET.md), and nothing
+# downstream asks for more than confirmations>=1, so the old `mine_n 100`
+# bought nothing while burning 100 blocks of a chain that has ~10,000 sats
+# left to mine ever. Both funding txs are in the mempool together, so on
+# regtest the first settle already confirms both and the second just adds a
+# harmless second block — worth staying branch-free for, at 2 blocks instead
+# of 100. On testnet4 each settle is the per-txid visibility wait it has to be.
+settle "$FUND_A_TXID"
+settle "$FUND_P_TXID"
 
 STORE="$WORK/app-store.json"
 "$APP" init "$STORE" "$NETWORK" | grep -q "kind=mnemonic" || fail "init"
