@@ -247,7 +247,39 @@ fn node_env() -> NodeEnv {
     let pass = std::env::var("CORE_RPC_PASS").unwrap_or_else(|_| {
         panic!("CORE_RPC_PASS is not set — see the CORE_RPC_USER panic message above for the full fix.")
     });
+    // A per-run watch wallet is REQUIRED against the shared node, and its
+    // absence is a hard failure for the same reason missing credentials are:
+    // the alternative is quietly doing the wrong thing. Without it the code
+    // under test creates and imports into the PRODUCTION `chain-notes-watch`
+    // wallet, which every run then grows — it reached 642 txs / 404
+    // descriptors that way, and since a rescan is O(blocks x descriptors)
+    // under the wallet lock, a `timestamp: 0` import cost ~130s against ~0.5s
+    // into a fresh wallet, with every other suite queued behind it.
+    //
+    // Set by the environment rather than by the suite: `std::env::set_var`
+    // from inside a multi-threaded test process races every concurrent reader
+    // of the environment, and this transport reads the variable on each RPC.
+    if std::env::var("CN_WATCH_WALLET").map(|v| v.trim().is_empty()).unwrap_or(true) {
+        panic!(
+            "CN_WATCH_WALLET is not set. This suite drives the PRODUCTION Core transport, so without \
+             a per-run wallet name it creates and bloats the shared `chain-notes-watch` wallet on the \
+             {network} node (PLAN-one-regtest-node.md, \"Two things now grow\"). Fix: export a unique \
+             name first, e.g. `export CN_WATCH_WALLET=\"cn-conf-$$-$(date +%s)\"`, alongside the \
+             CN_NETWORK/CN_NODE_* and CORE_RPC_* variables."
+        );
+    }
     NodeEnv { network, host, port, user, pass }
+}
+
+/// The watch wallet this run's assertions must target — the same name the code
+/// under test resolves (`CoreRpcTransport::WATCH_WALLET_ENV`). Asserting
+/// against a hardcoded "chain-notes-watch" while the transport wrote somewhere
+/// else would check an empty wallet and pass for the wrong reason.
+fn watch_wallet() -> String {
+    std::env::var("CN_WATCH_WALLET")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "chain-notes-watch".to_string())
 }
 
 fn network_of(env: &NodeEnv) -> Network {
@@ -453,7 +485,7 @@ fn connect_node() -> Node {
 fn wait_for_watch_wallet_idle(node: &Node) {
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
-        let info = match node.try_rpc(Some("chain-notes-watch"), "getwalletinfo", serde_json::json!([])) {
+        let info = match node.try_rpc(Some(&watch_wallet()), "getwalletinfo", serde_json::json!([])) {
             Ok(v) => v,
             Err(_) => return, // wallet doesn't exist yet — nothing to wait for
         };
@@ -795,7 +827,7 @@ fn build_scenario_tx(node: &Node, txid: &str, tip: u64) -> ScenarioTx {
 /// `CoreRpcTransport::WATCH_WALLET` (private to app-core, so this test
 /// hardcodes the string it must match).
 fn watch_wallet_descriptors(node: &Node) -> Vec<(String, u32)> {
-    let v = node.rpc(Some("chain-notes-watch"), "listdescriptors", serde_json::json!([]));
+    let v = node.rpc(Some(&watch_wallet()), "listdescriptors", serde_json::json!([]));
     v["descriptors"]
         .as_array()
         .cloned()
@@ -2187,7 +2219,7 @@ fn core_rpc_fee_route_falls_back_well_formed_on_a_node_with_no_fee_history() {
 /// live-verified signature of "this import genuinely requested a genesis
 /// rescan", distinguishable from any real caller-supplied birthday.
 fn watch_wallet_descriptor_timestamps(node: &Node) -> HashMap<String, u64> {
-    let v = node.rpc(Some("chain-notes-watch"), "listdescriptors", serde_json::json!([]));
+    let v = node.rpc(Some(&watch_wallet()), "listdescriptors", serde_json::json!([]));
     v["descriptors"]
         .as_array()
         .cloned()
