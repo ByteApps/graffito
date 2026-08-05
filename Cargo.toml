@@ -126,6 +126,13 @@ name = "android.permission.INTERNET"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.CAMERA"
 
+# Reveal gate. Without this BiometricPrompt.authenticate throws a
+# SecurityException, which the bridge catches and reports as a denial — so the
+# symptom is "reveal always refused, no dialog ever appears", not a crash.
+# Found exactly that way on the emulator.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.USE_BIOMETRIC"
+
 [[package.metadata.android.uses_feature]]
 name = "android.hardware.camera.any"
 required = false
