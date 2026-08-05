@@ -585,6 +585,20 @@ else
     # call this run cannot re-query it to find the first call's change —
     # it isn't confirmed yet. T4_FUND_UTXO_* tracks the current spendable
     # outpoint locally across calls, exactly like a real wallet would.
+    #
+    # THE CHAIN STATE LIVES IN A FILE, NOT A SHELL VARIABLE, and it must
+    # stay that way. Every faucet call site is `$(faucet …)` — a command
+    # substitution, i.e. a SUBSHELL — because faucet echoes the txid. A
+    # variable assigned at the end of faucet therefore dies with that
+    # subshell and never reaches the next call, so the chaining above was
+    # dead code from the start: each call fell back to scantxoutset and
+    # spent FRESH CONFIRMED outputs. That silently turned "needs one
+    # confirmed utxo" into "needs one per funding leg", which is why a
+    # testnet4 run had never once completed — it exhausted the confirmed
+    # set around the sixth leg and failed with "no usable UTXO" while the
+    # wallet still held ~900k sats in unconfirmed change. Diagnosed
+    # 2026-08-04 after a run that mined zero blocks start to finish.
+    T4_FUND_STATE="$WORK/t4-fund-state"
     FUND_ADDR="${E2E_T4_FUND_ADDR:-tb1q2ylq48ne37ng9clds23xjcrxp8hmn707j5vpyk}"
     FORBIDDEN_ADDRS=(
         "tb1pev690svkjfgl86ps4ptv47tuuclgg9ajdkexg43rctq0msr6692qr6zksz"
@@ -622,8 +636,36 @@ else
             FUND_WIF="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['env']['TESTNET4_WIF'])" "$GIFT_WIF_FILE")"
             [[ -n "$FUND_WIF" ]] || err "could not read TESTNET4_WIF from $GIFT_WIF_FILE"
             # FUND_WIF is unset by e2e_cleanup (the single EXIT trap above).
+            # NB it is re-read on EVERY faucet call, because each one is its
+            # own subshell and cannot see a sibling's assignment — the same
+            # reason the input chain lives in a file.
         fi
-        local scan cand txid vout sats live
+
+        # Resume the chain a previous faucet call left behind. Re-VALIDATE it
+        # against the node rather than trusting the file: gettxout (mempool
+        # included by default) answers "still unspent?" for an UNCONFIRMED
+        # change output, which is exactly the thing scantxoutset cannot see.
+        # A stale or spent outpoint just falls through to a fresh scan.
+        #
+        # THIS MUST STAY BELOW THE AUTH GATE AND THE WIF READ. Sitting above
+        # them, its early return skipped both: the spend authorization stopped
+        # being checked per call, and faucet #2 onward built transactions with
+        # an EMPTY signing key (bitcoin-cli answered with its usage text, which
+        # the script reported as the misleading "sign failed").
+        if [[ -s "$T4_FUND_STATE" ]]; then
+            local s_txid s_vout s_sats s_live
+            IFS=$'\t' read -r s_txid s_vout s_sats < "$T4_FUND_STATE" || true
+            if [[ -n "${s_txid:-}" && -n "${s_vout:-}" && -n "${s_sats:-}" ]]; then
+                s_live="$(core_cli gettxout "$s_txid" "$s_vout" 2>/dev/null || true)"
+                if [[ -n "$s_live" && "$s_live" != "null" ]]; then
+                    T4_FUND_INPUTS="[{\"txid\":\"$s_txid\",\"vout\":$s_vout,\"sequence\":4294967293}]"
+                    T4_FUND_UTXO_SATS="$s_sats"
+                    return 0
+                fi
+                echo "t4_fund_init: chained outpoint ${s_txid:0:12}...:$s_vout is gone, rescanning" >&2
+            fi
+        fi
+        local scan cand mem_cand txid vout sats live
         scan="$(core_cli scantxoutset start "[\"addr($FUND_ADDR)\"]")" || err "gift-wallet scantxoutset failed"
         cand="$(python3 -c "
 import json, sys
@@ -632,12 +674,54 @@ u = sorted(d.get('unspents', []), key=lambda x: -x['amount'])
 for c in u:
     print(c['txid'], c['vout'], round(c['amount'] * 1e8))
 " <<<"$scan")"
-        # COMBINE utxos rather than demanding a single big one. A previous
-        # run's change sits unconfirmed for ~10 minutes on testnet4, and
-        # `gettxout` correctly skips anything already spent in the mempool —
-        # so after a couple of runs the only LIVE outputs can each be too
-        # small even while the wallet holds plenty in aggregate. Requiring one
-        # large utxo made the suite unrunnable until blocks confirmed.
+        # TESTNET4 IS A LIVE CHAIN WE DO NOT CONTROL, so a block may be 10
+        # minutes away or an hour, and a run that can only spend CONFIRMED
+        # coins is hostage to that. scantxoutset is confirmed-only by
+        # definition, so a previous run's change — frequently the entire
+        # value of the wallet — is invisible to it. Add the mempool as a
+        # candidate source: unconfirmed outputs paying FUND_ADDR are just as
+        # spendable (the chain below already relies on exactly that), and it
+        # is what makes a cold start possible while every confirmed output
+        # sits spent in the mempool. Verified 2026-08-04: a run failed at
+        # "no usable UTXO" with 0 live confirmed outputs and 842,333 sats of
+        # its own change waiting in the mempool.
+        mem_cand=""
+        local mp_ids mp_n id raw
+        mp_ids="$(core_cli getrawmempool 2>/dev/null || true)"
+        if [[ -n "$mp_ids" ]]; then
+            mp_n="$(python3 -c "import json,sys; print(len(json.load(sys.stdin)))" <<<"$mp_ids" 2>/dev/null || echo 0)"
+            # Bounded: one RPC per mempool tx. Testnet4's mempool is normally
+            # tens of txs; refuse to grind through a flood rather than hang.
+            if (( mp_n > 0 && mp_n <= 3000 )); then
+                for id in $(python3 -c "
+import json,sys
+for t in json.load(sys.stdin): print(t)
+" <<<"$mp_ids" 2>/dev/null); do
+                    raw="$(core_cli getrawtransaction "$id" true 2>/dev/null || true)"
+                    [[ -z "$raw" ]] && continue
+                    mem_cand="$mem_cand$(python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for o in d.get('vout', []):
+    if (o.get('scriptPubKey') or {}).get('address') == '$FUND_ADDR':
+        print(d['txid'], o['n'], round(o['value'] * 1e8))
+" <<<"$raw" 2>/dev/null)
+"
+                done
+            elif (( mp_n > 3000 )); then
+                echo "t4_fund_init: mempool has $mp_n txs — skipping the unconfirmed sweep this run" >&2
+            fi
+        fi
+        # Confirmed first (cheapest to reason about), then unconfirmed; the
+        # accumulate loop below sorts out liveness and sufficiency either way.
+        cand="$(printf '%s\n%s\n' "$cand" "$mem_cand" | awk 'NF' | sort -u -k1,2)"
+        # COMBINE utxos rather than demanding a single big one, and note that
+        # `gettxout` is the liveness oracle for BOTH sources: it includes the
+        # mempool by default, so it accepts an unconfirmed output that is
+        # still unspent and rejects a confirmed one that is already spent
+        # there. That is precisely the distinction scantxoutset cannot make,
+        # and reading a confirmed-but-mempool-spent output as available is
+        # what made a run fail after five successful funding legs.
         local acc_total=0 acc_inputs=""
         while read -r txid vout sats; do
             [[ -z "$txid" ]] && continue
@@ -675,6 +759,10 @@ for c in u:
         raw="$(core_cli createrawtransaction \
             "$T4_FUND_INPUTS" \
             "{\"$addr\":$amt_fmt,\"$FUND_ADDR\":$change_fmt}")" || err "faucet $addr: createrawtransaction failed"
+        # Assert the key BEFORE signing: with FUND_WIF empty, bitcoin-cli
+        # answers with its usage text and the failure reads as "sign failed",
+        # which points at the transaction instead of at the missing key.
+        [[ -n "${FUND_WIF:-}" ]] || err "faucet $addr: no signing key in scope (t4_fund_init must run, and must not return before reading the WIF)"
         signed="$(printf '%s\n%s\n' "$raw" "[\"$FUND_WIF\"]" | core_cli -stdin signrawtransactionwithkey)" \
             || err "faucet $addr: sign failed"
         complete="$(python3 -c "import json,sys; print(json.load(sys.stdin).get('complete', False))" <<<"$signed")"
@@ -690,8 +778,13 @@ for o in d['vout']:
         print(o['n']); break
 ")"
         # Chain the next faucet off this tx's change: one input from here on.
+        # Through the FILE — this function always runs in a command-substitution
+        # subshell (see T4_FUND_STATE above), so these two assignments are only
+        # good for the rest of THIS call; the file is what the next one reads.
         T4_FUND_INPUTS="[{\"txid\":\"$txid\",\"vout\":$change_vout,\"sequence\":4294967293}]"
         T4_FUND_UTXO_SATS="$change_sats"
+        [[ -n "$change_vout" ]] \
+            && printf '%s\t%s\t%s\n' "$txid" "$change_vout" "$change_sats" > "$T4_FUND_STATE"
         echo "$txid"
     }
 fi
