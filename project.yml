@@ -40,7 +40,7 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: Chain Notes
+        CFBundleDisplayName: Graffito
         CFBundleExecutable: chain-notes-app
         # xcodegen regenerates Info.plist from these properties on every
         # `generate` — without an explicit entry here it defaults
@@ -86,10 +86,10 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.objsal.chainnotes
-        # Bundle is "Chain Notes.app" (user-visible in Finder/switcher). The
+        # Bundle is "Graffito.app" (user-visible in Finder/switcher). The
         # Unix executable stays chain-notes-app so build_mac.bash keeps copying
         # the Rust binary to Contents/MacOS/chain-notes-app.
-        PRODUCT_NAME: Chain Notes
+        PRODUCT_NAME: Graffito
         EXECUTABLE_NAME: chain-notes-app
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
@@ -113,8 +113,8 @@ targets:
     info:
       path: Info-mac.plist
       properties:
-        CFBundleDisplayName: Chain Notes
-        CFBundleName: Chain Notes
+        CFBundleDisplayName: Graffito
+        CFBundleName: Graffito
         CFBundleExecutable: chain-notes-app
         CFBundlePackageType: APPL
         NSCameraUsageDescription: "Scan QR codes (keys, addresses, PSBTs, sync bundles)."
