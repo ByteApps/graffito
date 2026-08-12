@@ -1460,7 +1460,7 @@ export component AppWindow inherits Window {
     preferred-height: 780px;
     min-width: 440px;
     min-height: 620px;
-    title: "Chain Notes";
+    title: "Graffito";
     background: Pal.bg;
     init => { EditOps.win-width = self.width; }
     changed width => { EditOps.win-width = self.width; }
@@ -2173,7 +2173,7 @@ export component AppWindow inherits Window {
     in-out property <bool> show-archived;
     in-out property <string> archived-toggle-label;   // "Archived (2)" — preformatted
     in-out property <bool> can-create-notebook;       // hierarchical identities only
-    in-out property <string> notebook-title: "Chain Notes"; // home header = open notebook's name
+    in-out property <string> notebook-title: "Graffito"; // home header = open notebook's name
     // -1 = rename dialog closed · >= 0 = renaming that account. (Creation
     // never dialogs — the picker's inline name field covers it.)
     in-out property <int> nb-rename-index: -1;
@@ -2388,7 +2388,7 @@ export component AppWindow inherits Window {
                 height: 34px;
             }
         }
-        H1 { text: "Chain Notes"; horizontal-alignment: center; }
+        H1 { text: "Graffito"; horizontal-alignment: center; }
         Caption {
             text: "Personal notes on the bitcoin blockchain — permanent, and yours.";
             horizontal-alignment: center;
@@ -2855,7 +2855,7 @@ export component AppWindow inherits Window {
             spacing: 8px;
             height: 40px;
             Text {
-                text: "Chain Notes";
+                text: "Graffito";
                 font-size: 19px;
                 font-weight: 700;
                 color: Pal.text;
@@ -3990,7 +3990,7 @@ export component AppWindow inherits Window {
         }
         SettingsCard {
             title: "About & help";
-            subtitle: "What Chain Notes is, how it handles your privacy, how to use it, and the terms you accepted.";
+            subtitle: "What Graffito is, how it handles your privacy, how to use it, and the terms you accepted.";
             GhostButton { text: "About"; clicked => { root.open-info("about"); } }
             GhostButton { text: "Help"; clicked => { root.open-info("help"); } }
             GhostButton { text: "Q & A"; clicked => { root.open-info("faq"); } }
