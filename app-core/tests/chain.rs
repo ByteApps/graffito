@@ -92,8 +92,23 @@ fn foreign_identity() -> app_core::notes_core::bundle::Identity {
     identity_from_leaf(&[0x33u8; 32]).unwrap()
 }
 
+/// PLAN-pnte-redesign.md (2026-08-11): these recorded LIVE testnet4
+/// fixtures predate the wire redesign — the sim identity's standing
+/// private note (and the throwaway's public one, next test) were both
+/// composed under the OLD binary PNTE envelope (magic `PNTE` + a binary
+/// version byte `0x01`). The redesigned decoder's version check requires
+/// printable ASCII `'1'` (0x31) and — envelope.rs's module doc, "FROZEN
+/// FORMAT... liberal decoding, never a panic" — rejects anything else as
+/// plain foreign data. There is deliberately no migration/dual-decode
+/// (PLAN-pnte-redesign.md, "nothing is in production"), so this old
+/// real-chain note is now PERMANENTLY invisible to `extract_notes`: not
+/// merely undecryptable, it never becomes a `RecoveredNote` at all. Pinned
+/// here (superseding the old `sim_identity_private_note_surfaces_
+/// undecrypted`, which asserted the note WAS recovered with a sealed
+/// body) so a decoder regression that silently widened version
+/// acceptance gets caught immediately.
 #[test]
-fn sim_identity_private_note_surfaces_undecrypted() {
+fn old_format_sim_identity_private_note_is_no_longer_decodable() {
     let fx = Fixture::for_address(SIM_ADDR, "sim-txs.json", "sim-utxo.json");
     let client = ChainClient::new(fx, Network::Testnet4);
     let bundle = client.build_bundle(SIM_ADDR, None).unwrap();
@@ -113,35 +128,38 @@ fn sim_identity_private_note_surfaces_undecrypted() {
     assert!(bundle.btc_usd.is_none());
     assert!(bundle.utxos.is_empty(), "sim funds were swept");
 
+    // The tx is still visible as a PNTE-shaped OP_RETURN candidate (its
+    // envelope MAGIC still matches) alongside the sim's other standing
+    // OP_RETURN tx...
+    assert_eq!(bundle.notes_onchain.len(), 2);
+    assert!(bundle.notes_onchain.iter().any(|t| t.txid == SIM_PRIVATE_TXID));
+
+    // ...but its old binary version byte makes it undecodable under the
+    // redesigned envelope — it never surfaces as a RecoveredNote, not even
+    // as a sealed-placeholder one.
     let notes = extract_notes(&bundle, &foreign_identity(), Network::Testnet4);
-    let private = notes
-        .iter()
-        .find(|n| n.txids.contains(&SIM_PRIVATE_TXID.to_string()))
-        .expect("the standing private note");
-    assert!(private.private);
-    assert!(!private.received, "spends_from_self ⇒ own note");
-    assert_eq!(private.text, None, "foreign key must not decrypt it");
-    assert!(private.height.is_some());
+    assert!(notes.iter().find(|n| n.id == SIM_PRIVATE_TXID).is_none());
+    assert!(notes.is_empty(), "the bundle's only OP_RETURN tx carries the old-format envelope");
 }
 
+/// See `old_format_sim_identity_private_note_is_no_longer_decodable`'s doc
+/// comment — same story for the throwaway's PUBLIC note (superseding the
+/// old `throwaway_public_note_reads_without_any_key`, which asserted the
+/// text decoded with no key at all).
 #[test]
-fn throwaway_public_note_reads_without_any_key() {
+fn old_format_throwaway_public_note_is_no_longer_decodable() {
     let fx = Fixture::for_address(THROWAWAY_ADDR, "throwaway-txs.json", "throwaway-utxo.json");
     let client = ChainClient::new(fx, Network::Testnet4);
     let bundle = client.build_bundle(THROWAWAY_ADDR, None).unwrap();
 
-    let notes = extract_notes(&bundle, &foreign_identity(), Network::Testnet4);
-    let public = notes
-        .iter()
-        .find(|n| n.txids.contains(&THROWAWAY_PUBLIC_TXID.to_string()))
-        .expect("the 224-byte relay-probe note");
-    assert!(!public.private);
-    assert!(!public.received);
-    let text = public.text.as_ref().expect("public notes decode with no key");
-    assert!(!text.is_empty());
-
-    // Funding/sweep txs carry no OP_RETURN — they must not appear.
+    // Funding/sweep txs carry no OP_RETURN — they must not appear; the
+    // one PNTE-shaped candidate is the old-format relay-probe note.
     assert_eq!(bundle.notes_onchain.len(), 1);
+    assert_eq!(bundle.notes_onchain[0].txid, THROWAWAY_PUBLIC_TXID);
+
+    let notes = extract_notes(&bundle, &foreign_identity(), Network::Testnet4);
+    assert!(notes.iter().find(|n| n.id == THROWAWAY_PUBLIC_TXID).is_none());
+    assert!(notes.is_empty(), "the old binary envelope version byte is rejected outright");
 }
 
 #[test]
@@ -227,31 +245,28 @@ fn default_bases() {
     assert!(default_base(Network::Regtest).is_none());
 }
 
-/// The stage-1 watch-only story on real recorded chain data: a key-less
-/// scan of the sim identity sees the standing private note's metadata
-/// with its body sealed — identical shape to the foreign-key view.
+/// The stage-1 watch-only story on real recorded chain data — PLAN-pnte-
+/// redesign.md: same old-format-is-now-undecodable story as
+/// `old_format_sim_identity_private_note_is_no_longer_decodable`, just
+/// through the key-less scan entry point (`extract_notes_watch`) instead
+/// of the keyed one. Superseded the old `watch_scan_of_sim_identity_
+/// seals_private_note`, which asserted both notes recovered with sealed/
+/// plain bodies respectively.
 #[test]
-fn watch_scan_of_sim_identity_seals_private_note() {
+fn old_format_watch_scan_finds_neither_recorded_note() {
     let fx = Fixture::for_address(SIM_ADDR, "sim-txs.json", "sim-utxo.json");
     let client = ChainClient::new(fx, Network::Testnet4);
     let bundle = client.build_bundle(SIM_ADDR, None).unwrap();
 
     let notes = extract_notes_watch(&bundle, Network::Testnet4);
-    let private = notes
-        .iter()
-        .find(|n| n.txids.contains(&SIM_PRIVATE_TXID.to_string()))
-        .expect("the standing private note");
-    assert!(private.private);
-    assert!(!private.received, "spends_from_self ⇒ own note");
-    assert_eq!(private.text, None, "watch scan must not decrypt");
+    assert!(notes.iter().find(|n| n.id == SIM_PRIVATE_TXID).is_none());
+    assert!(notes.is_empty());
 
-    // And the throwaway's public note still reads keylessly.
+    // And the throwaway's public note is equally invisible now.
     let fx = Fixture::for_address(THROWAWAY_ADDR, "throwaway-txs.json", "throwaway-utxo.json");
     let client = ChainClient::new(fx, Network::Testnet4);
     let bundle = client.build_bundle(THROWAWAY_ADDR, None).unwrap();
-    let public = extract_notes_watch(&bundle, Network::Testnet4)
-        .into_iter()
-        .find(|n| n.txids.contains(&THROWAWAY_PUBLIC_TXID.to_string()))
-        .expect("the relay-probe note");
-    assert!(public.text.is_some(), "public notes decode with no key");
+    let notes = extract_notes_watch(&bundle, Network::Testnet4);
+    assert!(notes.iter().find(|n| n.id == THROWAWAY_PUBLIC_TXID).is_none());
+    assert!(notes.is_empty());
 }

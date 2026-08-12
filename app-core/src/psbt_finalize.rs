@@ -81,20 +81,20 @@ fn addr_of_spk(spk: &bitcoin::ScriptBuf, network: Network) -> Option<String> {
     Address::from_script(spk, btc_network(network)).ok().map(|a| a.to_string())
 }
 
-/// Decode consecutive OP_RETURN chunks into note text (public) or a chunk
-/// count (private / undecodable).
+/// Decode the tx's OP_RETURN outputs into note text (public) or `None`
+/// (private / undecodable) — PLAN-pnte-redesign.md: one note = one tx, so
+/// `envelope::decode_note` either decodes the WHOLE set of payloads or
+/// nothing at all (no more per-chunk decode + reassemble).
 fn note_role(payloads: &[Vec<u8>]) -> OutputRole {
-    let chunks: Vec<_> = payloads.iter().filter_map(|p| envelope::decode(p)).collect();
-    if chunks.is_empty() {
+    let Some(decoded) = envelope::decode_note(payloads) else {
         return OutputRole::Note { text: None, chunks: payloads.len() };
-    }
-    let private = chunks[0].flags & envelope::FLAG_PRIVATE != 0;
-    let text = if private {
+    };
+    let text = if decoded.is_private() {
         None
     } else {
-        envelope::reassemble(&chunks).ok().and_then(|b| String::from_utf8(b).ok())
+        String::from_utf8(decoded.body).ok()
     };
-    OutputRole::Note { text, chunks: chunks.len() }
+    OutputRole::Note { text, chunks: payloads.len() }
 }
 
 /// Build a `PsbtSummary`. Requires every input's `witness_utxo` (present in a
@@ -217,7 +217,6 @@ mod tests {
             text: "public hi",
             private: false,
             recipient: Some(&to_bob),
-            note_id: [1, 2, 3, 4],
             max_op_return_bytes: 80,
             network: NET,
         };
@@ -298,7 +297,6 @@ mod tests {
             text: "paid by an external wallet",
             private: false,
             recipient: None,
-            note_id: [9, 9, 9, 9],
             max_op_return_bytes: 80,
             network: NET,
         };

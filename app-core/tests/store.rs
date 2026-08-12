@@ -42,6 +42,18 @@ fn funded_store(identity: &Identity) -> Store {
     store
 }
 
+/// PLAN-pnte-redesign.md: the tx's FIRST input's outpoint, display-order
+/// `"<txid>:<vout>"` — every private body's AAD binds this, so a bundle
+/// fixture must carry it for `extract_notes*` to decrypt anything. Shared
+/// by every `OnchainTx` fixture builder below; independent of which
+/// identity is viewing the tx (own or received), since the outpoint is a
+/// property of the tx itself.
+fn first_input_outpoint_of(tx: &NoteTx) -> Option<String> {
+    tx.spent_outpoints
+        .first()
+        .map(|(txid, vout)| app_core::notes_core::bundle::format_outpoint(txid, *vout))
+}
+
 /// Synthetic chain view of a signed note tx, as the chain client would
 /// report it after confirmation.
 fn onchain(tx: &NoteTx, height: u64, from_self: bool, sender: Option<&str>, recipient: Option<&str>) -> OnchainTx {
@@ -62,6 +74,7 @@ fn onchain(tx: &NoteTx, height: u64, from_self: bool, sender: Option<&str>, reci
         recipient: recipient.map(String::from),
         input_prevout_spks: Vec::new(),
         output_addrs: Vec::new(),
+        first_input_outpoint: first_input_outpoint_of(tx),
     }
 }
 
@@ -239,6 +252,7 @@ fn onchain_own_multi(tx: &NoteTx, height: u64) -> OnchainTx {
         recipient: None,
         input_prevout_spks: Vec::new(),
         output_addrs,
+        first_input_outpoint: first_input_outpoint_of(tx),
     }
 }
 
@@ -381,8 +395,14 @@ fn custom_change_address_not_tracked_as_own_coin() {
     assert_eq!(store2.utxos.iter().filter(|u| !u.pending_spend).count(), 1);
 }
 
+/// PLAN-pnte-redesign.md: the note id IS the txid, so an RBF bump — a
+/// DIFFERENT tx (same inputs, higher fee) — gets a DIFFERENT id, and the
+/// stored record is renamed/rekeyed to it (superseding the old
+/// `bump_fee_same_note_id_same_inputs_higher_fee`'s "identity survives
+/// RBF" assumption, which was true only under the old synthetic-4-byte-id
+/// scheme). The id only stabilizes once the note confirms.
 #[test]
-fn bump_fee_same_note_id_same_inputs_higher_fee() {
+fn bump_fee_renames_note_id_to_replacement_txid_same_inputs_higher_fee() {
     use app_core::compose::bump_fee;
     let a = alice();
     let mut store = funded_store(&a);
@@ -392,20 +412,24 @@ fn bump_fee_same_note_id_same_inputs_higher_fee() {
     )
     .unwrap();
     assert!(store.notes[0].raw_hex.is_some(), "raw kept for rebroadcast");
+    assert_eq!(n1.note_id, n1.tx.txid_hex, "the note id IS the just-built tx's txid");
 
     let bumped = bump_fee(&mut store, &a, NET, &n1.note_id, 5.0).unwrap();
-    assert_eq!(bumped.note_id, n1.note_id, "note identity survives RBF");
+    assert_ne!(bumped.note_id, n1.note_id, "a fee-bump is a DIFFERENT tx, so a DIFFERENT id");
+    assert_eq!(bumped.note_id, bumped.tx.txid_hex, "the new id IS the replacement's txid");
     assert_ne!(bumped.tx.txid_hex, n1.tx.txid_hex, "txid changes");
     assert!(bumped.tx.fee > n1.tx.fee, "fee actually higher");
     assert_eq!(bumped.tx.spent_outpoints, n1.tx.spent_outpoints, "same inputs");
     let rec = &store.notes[0];
+    assert_eq!(rec.note_id, bumped.note_id, "the stored record was RENAMED to the replacement's txid");
     assert_eq!(rec.txids, vec![n1.tx.txid_hex.clone(), bumped.tx.txid_hex.clone()]);
     assert_eq!(rec.raw_hex.as_deref(), Some(bumped.tx.raw_hex.as_str()));
     // Old change gone from the ledger, new change present.
     assert!(!store.utxos.iter().any(|u| u.txid == n1.tx.txid_hex));
     assert!(store.utxos.iter().any(|u| u.txid == bumped.tx.txid_hex));
 
-    // Confirmation of the bumped tx clears raw_hex and confirms the note.
+    // Confirmation of the bumped tx clears raw_hex and confirms the note
+    // under the RENAMED id — post-confirmation ids never change again.
     let b = bundle(
         vec![onchain(&bumped.tx, 120, true, None, None)],
         vec![change_utxo(&bumped.tx, Some(120))],
@@ -413,6 +437,7 @@ fn bump_fee_same_note_id_same_inputs_higher_fee() {
     );
     store.apply_bundle(&b, &a, NET, &[], &[]).unwrap();
     assert_eq!(store.notes[0].status, NoteStatus::Confirmed);
+    assert_eq!(store.notes[0].note_id, bumped.tx.txid_hex);
     assert!(store.notes[0].raw_hex.is_none());
 }
 
@@ -713,6 +738,7 @@ fn onchain_multi_notebook_input(tx: &NoteTx, height: u64, input_notebooks: &[&Id
         recipient: None,
         input_prevout_spks: input_notebooks.iter().map(|id| hex::encode(notebook_spk(id))).collect(),
         output_addrs: Vec::new(),
+        first_input_outpoint: first_input_outpoint_of(tx),
     }
 }
 
@@ -848,6 +874,7 @@ fn onchain_spending_funded(tx: &NoteTx, height: u64, spending_spk: &[u8]) -> Onc
         recipient: None,
         input_prevout_spks: vec![hex::encode(spending_spk)],
         output_addrs: Vec::new(),
+        first_input_outpoint: first_input_outpoint_of(tx),
     }
 }
 
