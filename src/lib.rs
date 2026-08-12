@@ -52,7 +52,7 @@ slint::include_modules!();
 const KEYCHAIN_ACCOUNT: &str = "identity-key";
 
 /// Opened by Settings → About & help → "Source code".
-const SOURCE_URL: &str = "https://github.com/ObjSal/chain-notes-app";
+const SOURCE_URL: &str = "https://github.com/ObjSal/graffito";
 /// Minimum (and default) sats sent to a directed-note recipient.
 const DUST_SATS: u64 = app_core::notes_core::DUST_LIMIT;
 
