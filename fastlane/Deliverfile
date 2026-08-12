@@ -10,7 +10,7 @@ overwrite_screenshots(true)   # replace the set on every run
 force(true)                   # skip the HTML preview / confirmation prompt
 run_precheck_before_submit(false)
 
-# Export compliance + content-rights answers. Chain Notes ships no proprietary
+# Export compliance + content-rights answers. Graffito ships no proprietary
 # encryption beyond exempt system crypto (ITSAppUsesNonExemptEncryption=false in
 # Info.plist), holds only the user's own keys, and embeds no third-party content.
 submission_information({

@@ -95,7 +95,7 @@ min_sdk_version = 26
 target_sdk_version = 34
 
 [package.metadata.android.application]
-label = "Chain Notes"
+label = "Graffito"
 icon = "@mipmap/ic_launcher"
 # NoActionBar: the device-default theme carries a 56dp ActionBar the GL
 # surface never draws, but it still inflates the NativeActivity content rect —
