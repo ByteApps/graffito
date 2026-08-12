@@ -57,7 +57,7 @@ platform :ios do
     produce(
       username: ENV["APPLE_ID"],
       app_identifier: ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes",
-      app_name: "Chain Notes",
+      app_name: "Graffito",
       language: "English",
       app_version: "0.1.0",
       sku: ENV["ASC_SKU"] || "chainnotes-0001",
@@ -77,7 +77,7 @@ platform :ios do
       UI.success("Bundle ID already registered: #{identifier} (#{bid.id})")
     else
       bid = Spaceship::ConnectAPI::BundleId.create(
-        name: "Chain Notes", identifier: identifier,
+        name: "Graffito", identifier: identifier,
         platform: "UNIVERSAL", seed_id: ENV["TEAM_ID"]
       )
       UI.success("Registered Bundle ID: #{identifier} (#{bid.id})")

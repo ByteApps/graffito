@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Wrap the release binary in a minimal .app bundle — required for macOS
 # TCC to attribute the camera permission (NSCameraUsageDescription) to
-# the app rather than the terminal. Output: target/Chain Notes.app
+# the app rather than the terminal. Output: target/Graffito.app
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 cargo build --release
-APP="$REPO/target/Chain Notes.app"
+APP="$REPO/target/Graffito.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/chain-notes-app "$APP/Contents/MacOS/"
@@ -17,12 +17,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key><string>com.objsal.chainnotes</string>
-    <key>CFBundleName</key><string>Chain Notes</string>
+    <key>CFBundleName</key><string>Graffito</string>
     <key>CFBundleExecutable</key><string>chain-notes-app</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>NSCameraUsageDescription</key>
-    <string>Chain Notes scans QR codes: key imports (SeedQR) and contact addresses.</string>
+    <string>Graffito scans QR codes: key imports (SeedQR) and contact addresses.</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
