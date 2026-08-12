@@ -13071,14 +13071,21 @@ pub fn run() {
         if let Some(n) = store.notes.iter().find(|n| n.note_id.as_str() == id.as_str()) {
             println!("cb: open-note id={} status={:?}", n.note_id, n.status);
             let watch = s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
+            // PLAN-pnte-redesign.md: the note id IS the txid now (64 hex
+            // chars, not the old synthetic hex8) — the inline "id:" quick-
+            // view line shows just the first 8 chars, same footprint as
+            // before; the full id is still available verbatim via the
+            // "Copy text" button (copies this whole block) and the
+            // dedicated "Copy txid" button (`note-txid`, set below).
+            let short_id = &n.note_id[..8.min(n.note_id.len())];
             let detail = format!(
-                "{}\n\nid: {}\nkind: {}{}{}\ntxids: {}\nheight: {}\n{}{}",
+                "{}\n\nid: {}…\nkind: {}{}{}\ntxids: {}\nheight: {}\n{}{}",
                 n.text.as_deref().unwrap_or(if watch && n.private {
                     "(private — the key that reads this note isn't on this device)"
                 } else {
                     "(not decryptable)"
                 }),
-                n.note_id,
+                short_id,
                 if n.received { "received" } else { "own" },
                 if n.directed { " · directed" } else { "" },
                 if n.private { " · private" } else { " · public" },
