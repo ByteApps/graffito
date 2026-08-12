@@ -26,7 +26,7 @@
 # local throwaway bitcoind (PLAN-one-regtest-node.md). Run it through the
 # workspace wrapper so CN_NETWORK/CN_NODE_HOST/CN_NODE_PORT/CORE_RPC_USER/
 # CORE_RPC_PASS reach it:
-#   ui-automation/node-env.sh regtest chain-notes-app/scripts/regtest-spending-self-notes.sh
+#   ui-automation/node-env.sh regtest graffito/scripts/regtest-spending-self-notes.sh
 # Regtest-only by construction — every leg needs POST .../faucet and
 # .../mine, both 409 on testnet4 (the plan's "two verbs, not one"); a
 # CN_NETWORK naming anything else makes this script print a loud SKIP and

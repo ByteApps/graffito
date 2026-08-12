@@ -31,7 +31,17 @@ pub const DEFAULT_CHUNK: usize = 100_000;
 /// 1 = the spending-window + stale-received-twin fix (a note funded from
 /// the identity's own spending wallet was filed `received` with an
 /// "unknown" sender).
-pub const CLASSIFY_VERSION: u32 = 1;
+///
+/// 2 = the PNTE v1 wire redesign (`PLAN-pnte-redesign.md`, 2026-08-11):
+/// one note = one transaction, and the note id IS the txid — there is no
+/// more synthetic 4-byte `note_id`. Old-format `NoteRecord`s (hex8 ids)
+/// are structurally incompatible with the new scanner (which keys by
+/// full txid and no longer emits a `txids` list to merge against), so
+/// there is no migration/dual-decode: [`Store::migrate_classification`]
+/// drops every note this store holds when crossing this threshold —
+/// nothing was in production, so old-format rows simply vanish and a
+/// full rescan repopulates the store in the new format.
+pub const CLASSIFY_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutPointRef {
@@ -53,7 +63,14 @@ pub enum NoteStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteRecord {
-    pub note_id: String, // hex8, canonical identity
+    /// The note's canonical identity — PLAN-pnte-redesign.md: one note =
+    /// one tx, and the note id IS the txid (display-order hex). Always
+    /// equal to `txids.last()`. A Pending note's id CHANGES when it is
+    /// RBF-bumped (a new tx = a new txid = a new id; see
+    /// `compose::record_bumped_note`, which renames/rekeys this field to
+    /// the replacement's txid) — once Confirmed the id never changes
+    /// again.
+    pub note_id: String,
     pub status: NoteStatus,
     pub text: Option<String>, // plaintext cache; None = undecryptable
     pub private: bool,
@@ -454,6 +471,27 @@ impl Store {
     /// disk), not just the active one.
     fn migrate_classification(&mut self) {
         if self.classify_version < CLASSIFY_VERSION {
+            // PNTE v1 wire redesign (classify_version 2): old-format notes
+            // (synthetic hex8 ids) are structurally incompatible with the
+            // new txid-keyed scanner — no migration/dual-decode, they
+            // simply vanish. Unlock any coins a since-dropped Pending note
+            // had locked, and drop the unread-tracking keys that named
+            // them, so nothing references a note that no longer exists.
+            if self.classify_version < 2 {
+                let spent: std::collections::HashSet<(String, u32)> = self
+                    .notes
+                    .iter()
+                    .filter(|n| n.status == NoteStatus::Pending)
+                    .flat_map(|n| n.spent.iter().map(|s| (s.txid.clone(), s.vout)))
+                    .collect();
+                for u in &mut self.utxos {
+                    if spent.contains(&(u.txid.clone(), u.vout)) {
+                        u.pending_spend = false;
+                    }
+                }
+                self.notes.clear();
+                self.seen_received.clear();
+            }
             self.addr_stats = None;
             self.classify_version = CLASSIFY_VERSION;
         }
@@ -494,11 +532,6 @@ impl Store {
 
     pub fn balance(&self) -> u64 {
         self.utxos.iter().filter(|u| !u.pending_spend).map(|u| u.value).sum()
-    }
-
-    pub fn note_id_taken(&self, id: &[u8; 4]) -> bool {
-        let hex_id = hex::encode(id);
-        self.notes.iter().any(|n| n.note_id == hex_id)
     }
 
     /// Record a freshly signed note: note enters Pending, its inputs are
@@ -681,11 +714,11 @@ impl Store {
     /// function only ever deletes `received` rows, never touches or creates
     /// an own one, and only in response to independently-proven ownership.
     fn prune_stale_received_twins(&mut self, recovered: &[RecoveredNote], stats: &mut ApplyStats) {
-        let own: Vec<(String, &[String])> = recovered
-            .iter()
-            .filter(|n| !n.received)
-            .map(|n| (hex::encode(n.note_id), n.txids.as_slice()))
-            .collect();
+        // One note = one tx (PLAN-pnte-redesign.md): `RecoveredNote::id` IS
+        // the txid, so "the same transaction recovered as own" is just
+        // txid membership — no more (note_id, txids-list) cross-matching.
+        let own: std::collections::HashSet<&str> =
+            recovered.iter().filter(|n| !n.received).map(|n| n.id.as_str()).collect();
         if own.is_empty() {
             return;
         }
@@ -694,9 +727,7 @@ impl Store {
             if !n.received {
                 return true; // only ever prunes the received bucket
             }
-            !own.iter().any(|(id, txids)| {
-                *id == n.note_id && n.txids.iter().any(|t| txids.contains(t))
-            })
+            !(own.contains(n.note_id.as_str()) || n.txids.iter().any(|t| own.contains(t.as_str())))
         });
         stats.reclassified += before - self.notes.len();
     }
@@ -828,19 +859,29 @@ impl Store {
 
     /// Returns true if the note was new.
     fn upsert_note(&mut self, note: &RecoveredNote) -> bool {
-        let id = hex::encode(note.note_id);
+        // PLAN-pnte-redesign.md: one note = one tx, and a txid can never
+        // collide across two genuinely different transactions — so a
+        // scanned note matches an existing record purely by id (its
+        // CURRENT canonical txid) or by appearing anywhere in that
+        // record's RBF history (`txids`), never by the old
+        // (note_id, received, sender) triple, which existed only to guard
+        // against a collision in the old synthetic 4-byte id space.
+        let id = &note.id;
         let existing = self
             .notes
             .iter_mut()
-            .find(|n| n.note_id == id && n.received == note.received && n.sender == note.sender);
+            .find(|n| &n.note_id == id || n.txids.iter().any(|t| t == id));
         match existing {
             Some(n) => {
-                for t in &note.txids {
-                    if !n.txids.contains(t) {
-                        n.txids.push(t.clone());
-                    }
+                if !n.txids.contains(id) {
+                    n.txids.push(id.clone());
                 }
                 if note.height.is_some() {
+                    // This exact txid is the one that confirmed — it is the
+                    // record's permanent id from here on (post-confirmation
+                    // ids never change), even if a since-superseded RBF
+                    // attempt was the last-known id locally.
+                    n.note_id = id.clone();
                     n.status = NoteStatus::Confirmed;
                     n.height = note.height;
                     n.blocktime = note.blocktime;
@@ -866,7 +907,7 @@ impl Store {
             }
             None => {
                 self.notes.push(NoteRecord {
-                    note_id: id,
+                    note_id: id.clone(),
                     status: if note.height.is_some() {
                         NoteStatus::Confirmed
                     } else {
@@ -879,7 +920,7 @@ impl Store {
                     sender: note.sender.clone(),
                     recipient: note.recipient.clone(),
                     recipients: note.recipients.clone(),
-                    txids: note.txids.clone(),
+                    txids: vec![id.clone()],
                     height: note.height,
                     blocktime: note.blocktime,
                     created_at: None,
@@ -1595,8 +1636,7 @@ mod tests {
         store.notes.push(poisoned);
 
         let mut rec = RecoveredNote {
-            note_id: [0xaa, 0xaa, 0x11, 0x11],
-            txids: vec!["t1".into()],
+            id: "aaaa1111".into(),
             height: None,
             blocktime: None,
             private: false,

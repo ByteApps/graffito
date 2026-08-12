@@ -728,7 +728,6 @@ enum PendingPayload {
     /// fields `SpendingComposeResult` needs minus `result`/`raw`/`txid`/
     /// `vsize` (those live on `PendingBroadcast` itself).
     ComposeSpending {
-        note_id: [u8; 4],
         text: String,
         private: bool,
         to: Option<String>,
@@ -749,7 +748,6 @@ enum PendingPayload {
     /// shape as spending — stage B is the pre-existing thread-spawn
     /// verbatim.
     ComposeMixed {
-        note_id: [u8; 4],
         text: String,
         private: bool,
         to: Option<String>,
@@ -840,7 +838,6 @@ struct WConsol {
 /// Watch-mode compose in progress on the sign screen: everything needed
 /// to record the (public) note after the externally signed broadcast.
 struct WatchNote {
-    note_id: [u8; 4],
     text: String,
     recipient: Option<String>,
     /// Multi-recipient (2+ only) — see `PendingPayload::ComposeSpending.
@@ -1605,7 +1602,8 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
     });
     store.record_signed(
         app_core::store::NoteRecord {
-            note_id: hex::encode(wn.note_id),
+            // PLAN-pnte-redesign.md: the note id IS the txid.
+            note_id: txid.to_string(),
             status: NoteStatus::Pending,
             text: Some(wn.text.clone()),
             private: wn.private,
@@ -6849,9 +6847,9 @@ fn apply_psbt_broadcast_result(w: &AppWindow, st: &mut State, r: PsbtBroadcastRe
                 // store as Pending exactly like a keyed compose (inputs
                 // locked, change spendable, raw hex kept for rebroadcast).
                 record_watch_note(st, &wn, txid, raw, vsize as u64);
+                // PLAN-pnte-redesign.md: the note id IS the txid.
                 println!(
-                    "cb: compose id={} txid={txid} fee={} vsize={vsize} to={} private={} gift={} watch={} broadcast=ok",
-                    hex::encode(wn.note_id),
+                    "cb: compose id={txid} txid={txid} fee={} vsize={vsize} to={} private={} gift={} watch={} broadcast=ok",
                     wn.fee,
                     wn.recipient.as_deref().unwrap_or("self"),
                     wn.private,
@@ -7131,7 +7129,6 @@ fn apply_notebook_compose_result(w: &AppWindow, st: &mut State, r: NotebookCompo
 /// leaves the draft exactly as it was, so staying on compose to retry is
 /// safe (no double-compose risk, nothing was locked).
 struct SpendingComposeResult {
-    note_id: [u8; 4],
     text: String,
     private: bool,
     to: Option<String>,
@@ -7180,7 +7177,8 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
             if let Some(store) = st.store.as_mut() {
                 store.record_signed(
                     app_core::store::NoteRecord {
-                        note_id: hex::encode(r.note_id),
+                        // PLAN-pnte-redesign.md: the note id IS the txid.
+                        note_id: r.txid.clone(),
                         status: NoteStatus::Pending,
                         text: Some(r.text.clone()),
                         private: r.private,
@@ -7222,7 +7220,7 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
             st.save_contacts();
             println!(
                 "cb: compose id={} txid={} fee={} vsize={} to={} private={} funded=spending{} broadcast=ok",
-                hex::encode(r.note_id), r.txid, r.built_fee, r.vsize,
+                r.txid, r.txid, r.built_fee, r.vsize,
                 r.to.as_deref().unwrap_or("self"), r.private,
                 if r.recipients.len() > 1 { format!(" recipients={}", r.recipients.len()) } else { String::new() }
             );
@@ -7257,7 +7255,6 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
 /// broadcast succeeds" shape as spending — a failure is safe to retry from
 /// compose.
 struct MixedComposeResult {
-    note_id: [u8; 4],
     text: String,
     private: bool,
     to: Option<String>,
@@ -7310,7 +7307,8 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                     });
                 store.record_signed(
                     app_core::store::NoteRecord {
-                        note_id: hex::encode(r.note_id),
+                        // PLAN-pnte-redesign.md: the note id IS the txid.
+                        note_id: r.txid.clone(),
                         status: NoteStatus::Pending,
                         text: Some(r.text.clone()),
                         private: r.private,
@@ -7385,7 +7383,7 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
             }
             println!(
                 "cb: compose id={} txid={} fee={} vsize={} to={} private={} funded=mixed{}{} broadcast=ok",
-                hex::encode(r.note_id), r.txid, r.built_fee, r.vsize,
+                r.txid, r.txid, r.built_fee, r.vsize,
                 r.to.as_deref().unwrap_or("self"), r.private,
                 if change_n > 0 { format!(" change={change_n}") } else { String::new() },
                 if r.recipients.len() > 1 { format!(" recipients={}", r.recipients.len()) } else { String::new() }
@@ -8361,17 +8359,18 @@ fn note_est_at(
 }
 
 /// Multi-recipient (2+ chips) analog of `note_est`: notes-core's
-/// `estimate_note_cost` only takes a single optional recipient spk length,
-/// and doesn't expose the intermediate payload-chunk LENGTHS it computes
-/// internally (only a total count + a <=1-recipient vsize) — so this
-/// reimplements that same chunking arithmetic from notes-core's own public
-/// size constants (`envelope::HEADER_LEN`, `crypt::SEAL_OVERHEAD`,
-/// `dm::WRAP_LEN`, matching `multi_body`'s framing exactly: `count(u8) ||
-/// text` public, `count(u8) || count×WRAP_LEN || SEAL_OVERHEAD+text`
-/// private) and feeds the result to `tx::estimate_vsize_multi`. This is a
-/// PREVIEW convenience only — the universal confirm screen prices the
-/// ACTUAL signed tx regardless, so an approximation here can never desync
-/// what gets broadcast from what the user confirmed.
+/// `estimate_note_cost` only takes a single optional recipient spk length
+/// (and is hardwired to `multi_count: None`) — so this computes the body
+/// length matching `multi_body`'s framing (PLAN-pnte-redesign.md: the
+/// recipient count lives in the envelope HEADER now, not a body-leading
+/// byte — `text` verbatim public, `count×WRAP_LEN || SEAL_OVERHEAD+text`
+/// private) and calls notes-core's own public `envelope::payload_lens_for`
+/// for the chunking arithmetic (never reimplemented here — that's exactly
+/// the drift `estimate_note_cost` itself avoids by doing the same), then
+/// feeds the result to `tx::estimate_vsize_multi`. This is a PREVIEW
+/// convenience only — the universal confirm screen prices the ACTUAL
+/// signed tx regardless, so an approximation here can never desync what
+/// gets broadcast from what the user confirmed.
 fn multi_note_est(
     text_len: usize,
     private: bool,
@@ -8380,26 +8379,16 @@ fn multi_note_est(
     recipient_spk_lens: &[usize],
     change_spk_len: Option<usize>,
 ) -> Result<(usize, usize), app_core::notes_core::Error> {
-    use app_core::notes_core::{crypt, dm, envelope, tx, Error};
+    use app_core::notes_core::{crypt, dm, envelope, tx};
     let n = recipient_spk_lens.len();
-    let body_len = if private { 1 + n * dm::WRAP_LEN + crypt::SEAL_OVERHEAD + text_len } else { 1 + text_len };
-    if body_len == 0 {
-        return Err(Error::Envelope("empty body"));
-    }
-    if chunk_size <= envelope::HEADER_LEN {
-        return Err(Error::Envelope("max_payload smaller than header"));
-    }
-    let inner = chunk_size - envelope::HEADER_LEN;
-    let total = body_len.div_ceil(inner);
-    if total > u8::MAX as usize {
-        return Err(Error::PayloadTooLarge);
-    }
-    let mut payload_lens = vec![chunk_size; total.saturating_sub(1)];
-    let tail = body_len - (total - 1) * inner;
-    payload_lens.push(envelope::HEADER_LEN + tail);
+    let body_len = if private { n * dm::WRAP_LEN + crypt::SEAL_OVERHEAD + text_len } else { text_len };
+    let flags = envelope::FLAG_DIRECTED
+        | envelope::FLAG_MULTI
+        | if private { envelope::FLAG_PRIVATE } else { 0 };
+    let payload_lens = envelope::payload_lens_for(flags, Some(n as u8), body_len, chunk_size)?;
     let vsize = tx::estimate_vsize_multi(n_inputs.max(1), &payload_lens, recipient_spk_lens, true);
     let vsize = change_spk_len.map_or(vsize, |l| (vsize as i64 + l as i64 - 34).max(0) as usize);
-    Ok((total, vsize))
+    Ok((payload_lens.len(), vsize))
 }
 
 /// Single call site for the compose preview's cost estimate: delegates to
@@ -9105,13 +9094,13 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
                 app_core::compose::parse_dedupe_recipients(net, st.to_address.as_deref(), &extra_recipients).ok()?;
             let content_key = [0u8; 32]; // preview only — lengths don't depend on the seal
             app_core::notes_core::bundle::sealed_note_payloads_multi(
-                &identity, &text_for_est, private, &recipients, [0u8, 0, 0, 0], content_key, chunk,
+                &identity, &text_for_est, private, &recipients, [0u8; 36], content_key, chunk,
             )
             .ok()?
             .0
         } else {
             app_core::notes_core::bundle::sealed_note_payloads(
-                &identity, &text_for_est, private, recipient.as_ref(), [0u8, 0, 0, 0], chunk,
+                &identity, &text_for_est, private, recipient.as_ref(), [0u8; 36], chunk,
             )
             .ok()?
             .0
@@ -10088,7 +10077,6 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         text,
         private: w.get_compose_private(),
         recipient: recipient.as_ref(),
-        note_id: [0, 0, 0, 0], // preview only — the real send draws a fresh id
         max_op_return_bytes: store.chunk_size,
         network: net,
     };
@@ -10112,7 +10100,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                 let payload_and_lens = if n_recipients >= 2 {
                     let mut content_key = [0u8; 32]; // preview only — lengths don't depend on the seal
                     app_core::notes_core::bundle::sealed_note_payloads_multi(
-                        &identity, text, w.get_compose_private(), &recipients, [0u8, 0, 0, 0], content_key,
+                        &identity, text, w.get_compose_private(), &recipients, [0u8; 36], content_key,
                         store.chunk_size,
                     )
                     .ok()
@@ -10120,7 +10108,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                     .inspect(|_| content_key.zeroize())
                 } else {
                     app_core::notes_core::bundle::sealed_note_payloads(
-                        &identity, text, w.get_compose_private(), recipient.as_ref(), [0u8, 0, 0, 0],
+                        &identity, text, w.get_compose_private(), recipient.as_ref(), [0u8; 36],
                         store.chunk_size,
                     )
                     .ok()
@@ -10248,16 +10236,16 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     let n_recipients = recipients.len();
     let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
     let chunk = st.store.as_ref().map(|s| s.chunk_size).unwrap_or(DEFAULT_CHUNK);
-    // Preview note id is all-zero, like every other preview dry-run —
-    // payload LENGTHS (all the fee math consumes) don't depend on the id.
+    // Preview outpoint is all-zero, like every other preview dry-run —
+    // payload LENGTHS (all the fee math consumes) don't depend on the AAD.
     let sealed = if n_recipients >= 2 {
         let content_key = [0u8; 32]; // preview only — lengths don't depend on the seal
         app_core::notes_core::bundle::sealed_note_payloads_multi(
-            &identity, text, w.get_compose_private(), &recipients, [0u8, 0, 0, 0], content_key, chunk,
+            &identity, text, w.get_compose_private(), &recipients, [0u8; 36], content_key, chunk,
         )
     } else {
         app_core::notes_core::bundle::sealed_note_payloads(
-            &identity, text, w.get_compose_private(), recipient.as_ref(), [0u8, 0, 0, 0], chunk,
+            &identity, text, w.get_compose_private(), recipient.as_ref(), [0u8; 36], chunk,
         )
         .map(|(p, spk)| (p, spk.into_iter().collect::<Vec<Vec<u8>>>()))
     };
@@ -13083,14 +13071,21 @@ pub fn run() {
         if let Some(n) = store.notes.iter().find(|n| n.note_id.as_str() == id.as_str()) {
             println!("cb: open-note id={} status={:?}", n.note_id, n.status);
             let watch = s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
+            // PLAN-pnte-redesign.md: the note id IS the txid now (64 hex
+            // chars, not the old synthetic hex8) — the inline "id:" quick-
+            // view line shows just the first 8 chars, same footprint as
+            // before; the full id is still available verbatim via the
+            // "Copy text" button (copies this whole block) and the
+            // dedicated "Copy txid" button (`note-txid`, set below).
+            let short_id = &n.note_id[..8.min(n.note_id.len())];
             let detail = format!(
-                "{}\n\nid: {}\nkind: {}{}{}\ntxids: {}\nheight: {}\n{}{}",
+                "{}\n\nid: {}…\nkind: {}{}{}\ntxids: {}\nheight: {}\n{}{}",
                 n.text.as_deref().unwrap_or(if watch && n.private {
                     "(private — the key that reads this note isn't on this device)"
                 } else {
                     "(not decryptable)"
                 }),
-                n.note_id,
+                short_id,
                 if n.received { "received" } else { "own" },
                 if n.directed { " · directed" } else { "" },
                 if n.private { " · private" } else { " · public" },
@@ -14744,9 +14739,6 @@ pub fn run() {
         let src = s.funding.clone().unwrap();
         let coins = s.funding_coins.clone();
         let change_index = s.funding_change_index;
-        let r = app_core::notes_core::keys::generate_aux_rand()
-            .map(|x| [x[0], x[1], x[2], x[3]])
-            .unwrap_or([1, 2, 3, 4]);
         let plan =
             FundingPlan { source: &src, coins: &coins, change_index, fee_rate: rate, change_override };
         if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
@@ -14779,7 +14771,7 @@ pub fn run() {
                 if recipients.len() >= 2 { recipients.iter().map(|rc| rc.address.clone()).collect() } else { Vec::new() };
             let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
             match app_core::psbt_build::build_watch_funded_note_psbt_multi(
-                &output_x, &plan, &text, &recipients_out, r, chunk, s.effective_lock_time(),
+                &output_x, &plan, &text, &recipients_out, chunk, s.effective_lock_time(),
             ) {
                 Ok(built) => {
                     let payload_outputs = built
@@ -14791,7 +14783,6 @@ pub fn run() {
                         .count();
                     s.watch_spend = None;
                     s.watch_note = Some(WatchNote {
-                        note_id: r,
                         text: text.clone(),
                         recipient: to.clone(),
                         recipients: recipient_addrs,
@@ -14814,9 +14805,10 @@ pub fn run() {
                         if n == 1 { "" } else { "s" },
                         gift_cost_suffix(nr, gift),
                     );
+                    // PLAN-pnte-redesign.md: the note id IS the txid.
                     println!(
                         "cb: watch-note-build id={} txid={} fee={} chunks={payload_outputs} funded=1{}",
-                        hex::encode(r),
+                        built.txid,
                         built.txid,
                         built.fee,
                         if nr >= 2 { format!(" recipients={nr}") } else { String::new() }
@@ -14836,7 +14828,6 @@ pub fn run() {
             text: &text,
             private,
             recipient: recipient.as_ref(),
-            note_id: r,
             max_op_return_bytes: DEFAULT_CHUNK,
             network: net,
         };
@@ -15029,7 +15020,6 @@ pub fn run() {
                 });
             }
             PendingPayload::ComposeSpending {
-                note_id,
                 text,
                 private,
                 to,
@@ -15062,7 +15052,6 @@ pub fn run() {
                         .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     SPENDING_COMPOSE_RESULTS.lock().expect("spending compose results mutex").push(
                         SpendingComposeResult {
-                            note_id,
                             text,
                             private,
                             to,
@@ -15084,7 +15073,6 @@ pub fn run() {
                 });
             }
             PendingPayload::ComposeMixed {
-                note_id,
                 text,
                 private,
                 to,
@@ -15121,7 +15109,6 @@ pub fn run() {
                         .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
                     MIXED_COMPOSE_RESULTS.lock().expect("mixed compose results mutex").push(
                         MixedComposeResult {
-                            note_id,
                             text,
                             private,
                             to,
@@ -15273,9 +15260,17 @@ pub fn run() {
                 // swap — then save, exactly like the Compose arm. A failed
                 // POST leaves a retryable record with the replacement hex
                 // in hand (`apply_act_bump_results` behavior, unchanged).
+                // PLAN-pnte-redesign.md: a note bump RENAMES the record's
+                // id to the replacement's txid (the note id IS the txid),
+                // so the busy-row marker below must follow the rename — a
+                // sweep/consolidate bump keeps using `ref_id` (its identity
+                // is the whole `txids` history, never renamed).
+                let mut renamed_note_id: Option<String> = None;
                 if let Some(store) = s.store.as_mut() {
                     match &bumped {
-                        BumpedBuild::Note(c) => app_core::compose::record_bumped_note(store, c),
+                        BumpedBuild::Note(c) => {
+                            renamed_note_id = app_core::compose::record_bumped_note(store, &ref_id, c);
+                        }
                         BumpedBuild::Tx(tx) => {
                             app_core::compose::record_bumped_tx(store, &ref_id, tx)
                         }
@@ -15284,7 +15279,7 @@ pub fn run() {
                 s.save_store();
                 s.pending_broadcast = None;
                 w.set_screen(pending.return_screen);
-                s.act_pending_ref = Some(ref_id.clone());
+                s.act_pending_ref = Some(renamed_note_id.clone().unwrap_or_else(|| ref_id.clone()));
                 update_activity(&w, &s);
                 let raw = pending.raw_hex.clone();
                 let txid = pending.txid.clone();
@@ -15450,19 +15445,9 @@ pub fn run() {
                 w.set_status("no coins selected".into());
                 return;
             }
-            let mut note_id = [0u8; 4];
-            loop {
-                let r = app_core::notes_core::keys::generate_aux_rand()
-                    .map(|x| [x[0], x[1], x[2], x[3]])
-                    .unwrap_or([1, 2, 3, 4]);
-                note_id = r;
-                if !store.note_id_taken(&note_id) {
-                    break;
-                }
-            }
             let chunk = store.chunk_size;
             match build_watch_note_psbt_multi(
-                &src, &coins, &text, &recipients_out, note_id, chunk, rate, s.effective_lock_time(),
+                &src, &coins, &text, &recipients_out, chunk, rate, s.effective_lock_time(),
             ) {
                 Ok(built) => {
                     let payload_outputs = built
@@ -15474,7 +15459,6 @@ pub fn run() {
                         .count();
                     s.watch_spend = None;
                     s.watch_note = Some(WatchNote {
-                        note_id,
                         text: text.clone(),
                         recipient: to.clone(),
                         recipients: recipient_addrs,
@@ -15498,9 +15482,10 @@ pub fn run() {
                         built.fee,
                         gift_cost_suffix(n, gift)
                     );
+                    // PLAN-pnte-redesign.md: the note id IS the txid.
                     println!(
                         "cb: watch-note-build id={} txid={} fee={} chunks={payload_outputs}{}",
-                        hex::encode(note_id),
+                        built.txid,
                         built.txid,
                         built.fee,
                         if n >= 2 { format!(" recipients={n}") } else { String::new() }
@@ -15724,16 +15709,6 @@ pub fn run() {
         } else {
             0
         };
-        let mut note_id = [1u8, 2, 3, 4];
-        for _ in 0..8 {
-            let r = app_core::notes_core::keys::generate_aux_rand()
-                .map(|x| [x[0], x[1], x[2], x[3]])
-                .unwrap_or(note_id);
-            note_id = r;
-            if !s.store.as_ref().map(|st| st.note_id_taken(&note_id)).unwrap_or(false) {
-                break;
-            }
-        }
         let plan = FundingPlan {
             source: &source,
             coins: &selected_spending_coins,
@@ -15746,7 +15721,6 @@ pub fn run() {
             text: &text,
             private,
             recipient: recipient.as_ref(),
-            note_id,
             max_op_return_bytes: chunk,
             network: net,
         };
@@ -15859,7 +15833,6 @@ pub fn run() {
             context: note_context(to.is_some(), private, net),
             return_screen: 6, // overwritten by show_confirm
             payload: PendingPayload::ComposeSpending {
-                note_id,
                 text: text.clone(),
                 private,
                 to: to.clone(),
@@ -15977,16 +15950,26 @@ pub fn run() {
         }
         let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
 
-        let mut note_id = [2u8, 0, 1, 6];
-        for _ in 0..8 {
-            let r = app_core::notes_core::keys::generate_aux_rand()
-                .map(|x| [x[0], x[1], x[2], x[3]])
-                .unwrap_or(note_id);
-            note_id = r;
-            if !s.store.as_ref().map(|st| st.note_id_taken(&note_id)).unwrap_or(false) {
-                break;
+        // PLAN-pnte-redesign.md: a private body's AAD binds the tx's FIRST
+        // input's outpoint, not a synthetic id — `coins[0]` becomes that
+        // input by construction (`assemble_mixed_note_psbt_multi_ext`
+        // iterates `coins` in caller order with no reordering), so it's
+        // known before the tx itself is built. `coins` was checked
+        // non-empty above.
+        let outpoint: [u8; 36] = {
+            let c = &coins[0];
+            let mut txid = [0u8; 32];
+            if let Err(e) = hex::decode_to_slice(&c.txid, &mut txid) {
+                w.set_status(format!("bad coin txid: {e}").into());
+                return;
             }
-        }
+            txid.reverse();
+            app_core::notes_core::tx::outpoint_bytes(&app_core::notes_core::tx::Utxo {
+                txid,
+                vout: c.vout,
+                value: c.value,
+            })
+        };
 
         // Fresh one-shot content key for a private multi-recipient body
         // (notes-core's hybrid seal) — OS TRNG, never persisted/logged,
@@ -16003,13 +15986,13 @@ pub fn run() {
             };
             let mut content_key = content_key;
             let result = app_core::notes_core::bundle::sealed_note_payloads_multi(
-                &identity, &text, private, &recipients, note_id, content_key, chunk,
+                &identity, &text, private, &recipients, outpoint, content_key, chunk,
             );
             content_key.zeroize();
             result.map_err(app_core::Error::from)
         } else {
             app_core::notes_core::bundle::sealed_note_payloads(
-                &identity, &text, private, recipient.as_ref(), note_id, chunk,
+                &identity, &text, private, recipient.as_ref(), outpoint, chunk,
             )
             .map(|(p, spk)| (p, spk.into_iter().collect::<Vec<Vec<u8>>>()))
             .map_err(app_core::Error::from)
@@ -16139,7 +16122,6 @@ pub fn run() {
             // external wallet to complete its own via screens 13/14.
             s.watch_spend = None;
             s.watch_note = Some(WatchNote {
-                note_id,
                 text: text.clone(),
                 recipient: to.clone(),
                 recipients: recipient_addrs.clone(),
@@ -16303,7 +16285,6 @@ pub fn run() {
             context: note_context(to.is_some(), private, net),
             return_screen: 6, // overwritten by show_confirm
             payload: PendingPayload::ComposeMixed {
-                note_id,
                 text: text.clone(),
                 private,
                 to: to.clone(),

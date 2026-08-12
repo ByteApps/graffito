@@ -483,23 +483,22 @@ fn main() {
                 .collect();
             let recipient = args.get(6).map(|a| Recipient::parse(net, a).expect("dest address"));
             let gift: u64 = args.get(7).and_then(|g| g.parse().ok()).unwrap_or(330);
-            let aux = app_core::notes_core::keys::generate_aux_rand().expect("rng");
-            let note_id = [aux[0], aux[1], aux[2], aux[3]];
             let built = build_watch_note_psbt(
                 &src,
                 &coins,
                 text,
                 recipient.as_ref().map(|r| r.spk.clone()),
                 if recipient.is_some() { gift } else { 0 },
-                note_id,
                 store.chunk_size,
                 rate,
                 0)
             .expect("build note psbt");
             std::fs::write(&args[5], built.to_bytes()).expect("write psbt");
+            // PLAN-pnte-redesign.md: the note id IS the txid — no separate
+            // id to generate or print.
             println!(
                 "cli: note-build id={} txid={} fee={} gift={} inputs={} -> {}",
-                hex::encode(note_id),
+                built.txid,
                 built.txid,
                 built.fee,
                 built.sent_to_recipient,
@@ -524,8 +523,6 @@ fn main() {
             let rate: f64 = args[6].parse().expect("fee rate");
             let recipient = args.get(8).map(|a| Recipient::parse(net, a).expect("dest address"));
             let gift: u64 = args.get(9).and_then(|g| g.parse().ok()).unwrap_or(330);
-            let aux = app_core::notes_core::keys::generate_aux_rand().expect("rng");
-            let note_id = [aux[0], aux[1], aux[2], aux[3]];
             let plan = FundingPlan {
                 source: &fund_src,
                 coins: &scan.utxos,
@@ -539,14 +536,15 @@ fn main() {
                 text,
                 recipient.as_ref().map(|r| r.spk.clone()),
                 if recipient.is_some() { gift } else { 0 },
-                note_id,
                 store.chunk_size,
                 0)
             .expect("build funded note psbt");
             std::fs::write(&args[7], built.to_bytes()).expect("write psbt");
+            // PLAN-pnte-redesign.md: the note id IS the txid — no separate
+            // id to generate or print.
             println!(
                 "cli: note-funded-build id={} txid={} fee={} gift={} fund_in={} -> {}",
-                hex::encode(note_id),
+                built.txid,
                 built.txid,
                 built.fee,
                 built.sent_to_recipient,
@@ -872,8 +870,6 @@ fn main() {
             }
 
             let recipient = to.as_deref().map(|a| Recipient::parse(net, a).expect("recipient"));
-            let r = app_core::notes_core::keys::generate_aux_rand().expect("rng");
-            let note_id = [r[0], r[1], r[2], r[3]];
             let ix_path = spending_index_path(&args[2], net, &material);
             let mut ix = NotebookIndex::load(&ix_path).unwrap_or_default();
             let mut section = ix.spending_for(account);
@@ -890,7 +886,6 @@ fn main() {
                 text: &text,
                 private,
                 recipient: recipient.as_ref(),
-                note_id,
                 max_op_return_bytes: store.chunk_size,
                 network: net,
             };
@@ -917,9 +912,10 @@ fn main() {
                 ix.set_spending(account, section);
                 ix.save(&ix_path).expect("save notebooks index");
             }
+            // PLAN-pnte-redesign.md: the note id IS the txid.
             println!(
                 "cli: compose id={} txid={} fee={} vsize={} to={} private={} broadcast=ok",
-                hex::encode(note_id),
+                txid,
                 txid,
                 built.fee,
                 vsize,
@@ -970,8 +966,6 @@ fn main() {
                 panic!("spending wallet has no spendable coins");
             }
 
-            let r = app_core::notes_core::keys::generate_aux_rand().expect("rng");
-            let note_id = [r[0], r[1], r[2], r[3]];
             let ix_path = spending_index_path(&args[2], net, &material);
             let mut ix = NotebookIndex::load(&ix_path).unwrap_or_default();
             let mut section = ix.spending_for(account);
@@ -988,7 +982,6 @@ fn main() {
                 text: &text,
                 private,
                 recipient: None, // ignored by the multi entry point — `recipients` replaces it
-                note_id,
                 max_op_return_bytes: store.chunk_size,
                 network: net,
             };
@@ -1017,9 +1010,10 @@ fn main() {
                 ix.set_spending(account, section);
                 ix.save(&ix_path).expect("save notebooks index");
             }
+            // PLAN-pnte-redesign.md: the note id IS the txid.
             println!(
                 "cli: compose id={} txid={} fee={} vsize={} recipients={} sent_to_recipient={} private={} broadcast=ok",
-                hex::encode(note_id),
+                txid,
                 txid,
                 built.fee,
                 vsize,
@@ -1071,8 +1065,6 @@ fn main() {
                 panic!("no spendable coins at the funding descriptor");
             }
             let recipient = to.as_deref().map(|a| Recipient::parse(net, a).expect("recipient"));
-            let r = app_core::notes_core::keys::generate_aux_rand().expect("rng");
-            let note_id = [r[0], r[1], r[2], r[3]];
             let plan = FundingPlan {
                 source: &src,
                 coins: &scan.utxos,
@@ -1085,7 +1077,6 @@ fn main() {
                 text: &text,
                 private,
                 recipient: recipient.as_ref(),
-                note_id,
                 max_op_return_bytes: 100_000,
                 network: net,
             };
@@ -1128,8 +1119,6 @@ fn main() {
                 confirmed: true,
             }];
             let recipient = to.as_deref().map(|a| Recipient::parse(net, a).expect("recipient"));
-            let r = app_core::notes_core::keys::generate_aux_rand().expect("rng");
-            let note_id = [r[0], r[1], r[2], r[3]];
             let plan = FundingPlan {
                 source: &src,
                 coins: &coins,
@@ -1142,7 +1131,6 @@ fn main() {
                 text: &text,
                 private,
                 recipient: recipient.as_ref(),
-                note_id,
                 max_op_return_bytes: 100_000,
                 network: net,
             };
