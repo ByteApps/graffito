@@ -30,7 +30,6 @@ fn compose_note_standalone() {
             &utxos,
             "hello from chain-notes-app (M0 smoke)",
             private,
-            [0xAB, 0xCD, 0xEF, 0x01],
             80, // chunked path
             1.0,
             0,

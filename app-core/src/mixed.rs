@@ -823,7 +823,7 @@ mod tests {
         assert!(spans_multiple_wallets(&coins), "notebook + spending = two distinct sources");
 
         let payloads =
-            notes_core::envelope::encode_chunks([1, 2, 3, 4], notes_core::envelope::FLAG_DIRECTED, b"mixed source note", 80)
+            notes_core::envelope::encode_outputs(notes_core::envelope::FLAG_DIRECTED, None, b"mixed source note", 80)
                 .unwrap();
         let wallets = HashMap::new();
         let built = assemble_mixed_note_psbt(
@@ -886,9 +886,9 @@ mod tests {
             MixedCoin { source: CoinSource::Notebook, txid: "a".repeat(64), vout: 0, value: 60_000, chain: 0, index: 0 },
             MixedCoin { source: CoinSource::Spending, txid: "b".repeat(64), vout: 1, value: 40_000, chain: 0, index: 0 },
         ];
-        let payloads = notes_core::envelope::encode_chunks(
-            [1, 2, 3, 4],
+        let payloads = notes_core::envelope::encode_outputs(
             notes_core::envelope::FLAG_DIRECTED,
+            None,
             b"mixed source note",
             80,
         )
@@ -947,7 +947,7 @@ mod tests {
             MixedCoin { source: CoinSource::Spending, txid: "b".repeat(64), vout: 1, value: 40_000, chain: 0, index: 0 },
             MixedCoin { source: CoinSource::Wallet("ext1".to_string()), txid: "c".repeat(64), vout: 0, value: 40_000, chain: 0, index: 0 },
         ];
-        let payloads = notes_core::envelope::encode_chunks([1, 2, 3, 4], 0, b"unanchored mixed note", 80).unwrap();
+        let payloads = notes_core::envelope::encode_outputs(0, None, b"unanchored mixed note", 80).unwrap();
         let built = assemble_mixed_note_psbt(
             &coins,
             notebook_spk,
@@ -980,8 +980,10 @@ mod tests {
     /// selection that folds must predict the SAME (nominal, folded) split
     /// notes-core's own `compose_note_exact` actually pays. Uses Sal's
     /// concrete example (330-sat coin, 1 sat/vB, a note whose single
-    /// OP_RETURN chunk sizes to a 103-vB no-change tx) so the numbers in
-    /// the UI copy are provably real, not illustrative.
+    /// OP_RETURN chunk sizes to a 99-vB no-change tx — was 103 vB before
+    /// PLAN-pnte-redesign.md shrank the envelope header by 4 bytes, no
+    /// more binary `note_id`) so the numbers in the UI copy are provably
+    /// real, not illustrative.
     #[test]
     fn predict_notebook_fold_matches_real_build() {
         let identity = Identity::from_app_seed(&[3u8; 32]).unwrap();
@@ -994,7 +996,6 @@ mod tests {
             std::slice::from_ref(&utxo),
             &text,
             false,
-            [9, 9, 9, 9],
             None,
             chunk,
             rate,
@@ -1008,7 +1009,7 @@ mod tests {
         // vsize computed directly (change=true/false) rather than through
         // the predictor's Δ-shortcut, so this also proves the shortcut
         // matches calling `estimate_vsize(.., false)` outright.
-        let payloads = notes_core::envelope::encode_chunks([9, 9, 9, 9], 0, text.as_bytes(), chunk).unwrap();
+        let payloads = notes_core::envelope::encode_outputs(0, None, text.as_bytes(), chunk).unwrap();
         let payload_lens: Vec<usize> = payloads.iter().map(Vec::len).collect();
         let vsize_wc = notes_core::tx::estimate_vsize(1, &payload_lens, None, true);
         let vsize_nc_direct = notes_core::tx::estimate_vsize(1, &payload_lens, None, false);
@@ -1017,8 +1018,8 @@ mod tests {
         let (nominal, folded) =
             predict_notebook_fold(330, 0, vsize_wc, 34, rate).expect("fold predicted");
         assert_eq!(nominal, fee_nc_direct, "Δ-shortcut must match direct no-change vsize math");
-        assert_eq!(nominal, 103, "matches Sal's concrete example exactly");
-        assert_eq!(folded, 227);
+        assert_eq!(nominal, 99, "matches Sal's concrete example exactly (PLAN-pnte-redesign.md: was 103 before the 4-byte-shorter envelope header)");
+        assert_eq!(folded, 231);
         assert_eq!(nominal + folded, built.fee, "predicted split must equal the real built tx's fee");
     }
 
@@ -1049,7 +1050,7 @@ mod tests {
             chain: 0,
             index: 0,
         }];
-        let payloads = notes_core::envelope::encode_chunks([1, 2, 3, 4], 0, b"fold pin test", 80).unwrap();
+        let payloads = notes_core::envelope::encode_outputs(0, None, b"fold pin test", 80).unwrap();
         let built = assemble_mixed_note_psbt(
             &coins,
             notebook_spk,
@@ -1099,7 +1100,7 @@ mod tests {
             MixedCoin { source: CoinSource::Notebook, txid: "d".repeat(64), vout: 0, value: notebook_value, chain: 0, index: 0 },
             MixedCoin { source: CoinSource::Spending, txid: "e".repeat(64), vout: 0, value: spending_value, chain: 0, index: 0 },
         ];
-        let payloads = notes_core::envelope::encode_chunks([1, 2, 3, 4], 0, b"anchored fold pin test", 80).unwrap();
+        let payloads = notes_core::envelope::encode_outputs(0, None, b"anchored fold pin test", 80).unwrap();
         let built = assemble_mixed_note_psbt(
             &coins,
             notebook_spk.clone(),
@@ -1460,8 +1461,8 @@ mod tests {
         let coins = vec![MixedCoin {
             source: CoinSource::Spending, txid: "b".repeat(64), vout: 1, value: 100_000, chain: 0, index: 0,
         }];
-        let payloads = notes_core::envelope::encode_chunks(
-            [1, 2, 3, 4], notes_core::envelope::FLAG_DIRECTED, b"single via multi", 80,
+        let payloads = notes_core::envelope::encode_outputs(
+            notes_core::envelope::FLAG_DIRECTED, None, b"single via multi", 80,
         )
         .unwrap();
         let old = assemble_mixed_note_psbt(
@@ -1505,9 +1506,9 @@ mod tests {
             MixedCoin { source: CoinSource::Notebook, txid: "a".repeat(64), vout: 0, value: 60_000, chain: 0, index: 0 },
             MixedCoin { source: CoinSource::Spending, txid: "b".repeat(64), vout: 1, value: 40_000, chain: 0, index: 0 },
         ];
-        let payloads = notes_core::envelope::encode_chunks(
-            [2, 0, 1, 6],
+        let payloads = notes_core::envelope::encode_outputs(
             notes_core::envelope::FLAG_DIRECTED | notes_core::envelope::FLAG_MULTI,
+            Some(3),
             b"group note",
             80,
         )
@@ -1567,9 +1568,9 @@ mod tests {
         let coins = vec![MixedCoin {
             source: CoinSource::Spending, txid: "b".repeat(64), vout: 1, value: 100_000, chain: 0, index: 0,
         }];
-        let payloads = notes_core::envelope::encode_chunks(
-            [3, 0, 1, 7],
+        let payloads = notes_core::envelope::encode_outputs(
             notes_core::envelope::FLAG_DIRECTED | notes_core::envelope::FLAG_MULTI,
+            Some(2),
             b"two recipients, spending only",
             80,
         )
@@ -1626,8 +1627,8 @@ mod tests {
         let mut change_spks = HashMap::new();
         change_spks.insert(0u32, change_spk.clone());
 
-        let payloads = notes_core::envelope::encode_chunks(
-            [1, 2, 3, 4], notes_core::envelope::FLAG_DIRECTED, b"change only note", 80,
+        let payloads = notes_core::envelope::encode_outputs(
+            notes_core::envelope::FLAG_DIRECTED, None, b"change only note", 80,
         )
         .unwrap();
         let built = assemble_mixed_note_psbt_multi_ext(
@@ -1702,7 +1703,7 @@ mod tests {
         change_spks.insert(0u32, change_spk.clone());
 
         let payloads =
-            notes_core::envelope::encode_chunks([2, 0, 0, 1], 0, b"notebook plus change, self note", 80).unwrap();
+            notes_core::envelope::encode_outputs(0, None, b"notebook plus change, self note", 80).unwrap();
         let built = assemble_mixed_note_psbt_multi_ext(
             &coins, notebook_spk.clone(), None, &HashMap::new(), &change_spks, &payloads,
             &[], &ChangeDefault::Notebook, None, 0, 2.0, 0)
@@ -1783,8 +1784,8 @@ mod tests {
         let mut change_spks = HashMap::new();
         change_spks.insert(0u32, change_spk.clone());
 
-        let payloads = notes_core::envelope::encode_chunks(
-            [3, 0, 0, 2], notes_core::envelope::FLAG_DIRECTED, b"change plus spending", 80,
+        let payloads = notes_core::envelope::encode_outputs(
+            notes_core::envelope::FLAG_DIRECTED, None, b"change plus spending", 80,
         )
         .unwrap();
         let built = assemble_mixed_note_psbt_multi_ext(

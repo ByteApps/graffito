@@ -3056,6 +3056,17 @@ fn classify_tx_inner(tx: &EsploraTx, address: &str, network: Option<Network>) ->
         .any(|i| i.prevout.as_ref().and_then(|p| p.scriptpubkey_address.as_deref()) == Some(address));
     let pays_self = tx.vout.iter().any(|o| o.scriptpubkey_address.as_deref() == Some(address));
 
+    // PLAN-pnte-redesign.md: the tx's FIRST input's prevout — display-order
+    // `"<txid>:<vout>"`, matching notes-core's `bundle::format_outpoint`
+    // convention. This is the outpoint every private body's AAD binds
+    // (self-note or directed), so decrypting one requires it. Esplora and
+    // server.py both carry `vin[i].txid`/`.vout` on every input regardless
+    // of whether the prevout itself resolved, so this needs no `prevout`
+    // lookup and degrades to `None` only when the tx somehow has zero
+    // inputs (never true for a real signed tx).
+    let first_input_outpoint =
+        tx.vin.first().and_then(|i| Some(format!("{}:{}", i.txid.as_deref()?, i.vout?)));
+
     // FROZEN: prefer the first TAPROOT input prevout address — this is the
     // sender rule notes-core/contacts/reply-target logic keys off, since a
     // taproot address is the one that can double as a chain-notes identity.
@@ -3165,6 +3176,7 @@ fn classify_tx_inner(tx: &EsploraTx, address: &str, network: Option<Network>) ->
         recipient,
         input_prevout_spks,
         output_addrs,
+        first_input_outpoint,
     })
 }
 

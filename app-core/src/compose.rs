@@ -1,7 +1,9 @@
-//! Compose orchestration: unique note_id → notes-core compose (the ONLY
-//! producer of on-chain bytes) → record pending in the store. Broadcast
-//! is the caller's step (chain.rs), so a failed POST leaves a retryable
-//! Pending note with the tx hex still in hand.
+//! Compose orchestration: build via notes-core compose (the ONLY producer
+//! of on-chain bytes) → record pending in the store, keyed by the just-
+//! built tx's txid (PLAN-pnte-redesign.md: the note id IS the txid — there
+//! is no synthetic id to generate up front any more). Broadcast is the
+//! caller's step (chain.rs), so a failed POST leaves a retryable Pending
+//! note with the tx hex still in hand.
 
 use notes_core::address::Recipient;
 use notes_core::address::address_to_script_pubkey;
@@ -9,7 +11,7 @@ use notes_core::bundle::{
     compose_directed_note_multi_exact, compose_directed_note_multi_with_change,
     compose_directed_note_with_change_amount, compose_note_exact, compose_note_with_change, Identity,
 };
-use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
+use notes_core::keys::generate_aux_rand;
 use notes_core::tx::NoteTx;
 use notes_core::Network;
 use zeroize::Zeroize;
@@ -19,7 +21,7 @@ use crate::Error;
 
 /// Fresh 32-byte OS-TRNG content key for a multi-recipient private compose
 /// (notes-core's `multi_body` hybrid seal, dm.rs) — same one-shot,
-/// never-persisted handling as `note_id`/aux-rand: generated fresh per
+/// never-persisted handling as aux-rand: generated fresh per
 /// compose attempt, never stored, never logged, and zeroized by the caller
 /// immediately after the notes-core call returns. `pub` (not just used
 /// internally by [`compose_note`]) — every externally-assembled
@@ -100,7 +102,11 @@ pub struct ComposeRequest<'a> {
 
 #[derive(Debug, Clone)]
 pub struct ComposedNote {
-    pub note_id: String, // hex8
+    /// PLAN-pnte-redesign.md: the note id IS the txid of the tx this
+    /// compose just built — always equal to `tx.txid_hex`. No longer a
+    /// synthetic 4-byte id chosen before signing (there is nothing left to
+    /// generate — the id only exists once the tx does).
+    pub note_id: String,
     pub tx: NoteTx,
     /// The directed-note recipient's address, if any (the FIRST recipient
     /// for a multi-recipient note) — carried alongside the built tx so a
@@ -132,9 +138,6 @@ pub fn compose_note(
     network: Network,
     req: &ComposeRequest,
 ) -> Result<ComposedNote, Error> {
-    let note_id =
-        pick_unique_note_id(generate_note_id, |id| store.note_id_taken(id))?;
-
     let utxos = store.available_utxos();
     // Every recipient (primary `req.recipient` + `req.extra_recipients`,
     // parsed in that order), each paired with the SAME gift amount —
@@ -191,11 +194,11 @@ pub fn compose_note(
     let tx = if recipients.is_empty() {
         match &selected {
             Some(ins) => compose_note_exact(
-                identity, ins, req.text, req.private, note_id, change_spk,
+                identity, ins, req.text, req.private, change_spk,
                 store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
             ),
             None => compose_note_with_change(
-                identity, &utxos, req.text, req.private, note_id, change_spk,
+                identity, &utxos, req.text, req.private, change_spk,
                 store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
             ),
         }
@@ -209,11 +212,11 @@ pub fn compose_note(
         let mut content_key = fresh_content_key()?;
         let result = match &selected {
             Some(ins) => compose_directed_note_multi_exact(
-                identity, ins, req.text, req.private, note_id, &recipients, content_key,
+                identity, ins, req.text, req.private, &recipients, content_key,
                 change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
             ),
             None => compose_directed_note_multi_with_change(
-                identity, &utxos, req.text, req.private, note_id, &recipients, content_key,
+                identity, &utxos, req.text, req.private, &recipients, content_key,
                 change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
             ),
         };
@@ -222,7 +225,7 @@ pub fn compose_note(
     }?;
 
     Ok(ComposedNote {
-        note_id: hex::encode(note_id),
+        note_id: tx.txid_hex.clone(),
         recipient_address,
         recipients: recipient_addresses,
         change_is_self: change_spk.is_none(),
@@ -321,9 +324,11 @@ pub fn compose_and_record(
 /// Build + sign an RBF fee-bump replacement for a Pending note — PURE, no
 /// store mutation (the universal confirm screen's stage-A seam, same
 /// pattern as [`compose_note`] / [`record_composed_note`]): re-sign the
-/// SAME note_id spending the SAME inputs at a higher rate. The envelope's
-/// note_id is unchanged, so the next scan re-matches whichever tx
-/// confirms. Callers that want the original build-then-record behavior in
+/// SAME inputs at a higher rate. PLAN-pnte-redesign.md: the note id IS
+/// the txid, so a replacement (different fee, different outputs) has a
+/// DIFFERENT id from the note it replaces — [`record_bumped_note`] is
+/// what actually renames the stored record so the next scan re-matches
+/// whichever tx confirms. Callers that want the original build-then-record behavior in
 /// one step call [`bump_fee`]; the universal confirm screen calls this
 /// alone at Sign time and defers [`record_bumped_note`] to the user's
 /// Broadcast tap — a Cancel then leaves the store byte-identical.
@@ -362,9 +367,6 @@ pub fn bump_fee_build(
     let change_to = rec.change_to.clone();
     let spent = rec.spent.clone();
 
-    let mut note_id = [0u8; 4];
-    hex::decode_to_slice(note_id_hex, &mut note_id).map_err(|_| Error::Store("bad id".into()))?;
-
     // Rebuild the exact input set (values from the ledger, which retains
     // pending-locked entries).
     let utxos: Vec<notes_core::tx::Utxo> = spent
@@ -394,17 +396,22 @@ pub fn bump_fee_build(
     let lock_time = lock_time.unwrap_or_else(|| store.lock_time());
     let tx = match &recipient {
         Some(r) => compose_directed_note_with_change_amount(
-            identity, &utxos, &text, private, note_id, r, gift, change_spk,
+            identity, &utxos, &text, private, r, gift, change_spk,
             store.chunk_size, new_rate, lock_time, generate_aux_rand,
         ),
         None => compose_note_with_change(
-            identity, &utxos, &text, private, note_id, change_spk,
+            identity, &utxos, &text, private, change_spk,
             store.chunk_size, new_rate, lock_time, generate_aux_rand,
         ),
     }?;
 
+    // PLAN-pnte-redesign.md: the replacement is a DIFFERENT tx (same
+    // inputs, different fee/outputs), so it has a DIFFERENT txid — the
+    // note's new canonical id. `record_bumped_note` is what actually
+    // renames the stored record; this just reports it, same as
+    // `compose_note` reporting the freshly-built tx's id.
     Ok(ComposedNote {
-        note_id: note_id_hex.to_string(),
+        note_id: tx.txid_hex.clone(),
         recipient_address: recipient_addr,
         recipients: Vec::new(),
         change_is_self: change_spk.is_none(),
@@ -414,15 +421,25 @@ pub fn bump_fee_build(
 
 /// Apply EXACTLY the store mutation the one-shot [`bump_fee`] makes after
 /// building: swap the ledger change (drop the replaced tx's outputs,
-/// re-add only if change returns to self), then append the replacement
-/// txid + update raw_hex/fee/vsize on the note record — nothing more or
-/// less. A vanished record (e.g. it confirmed between build and record)
-/// is a quiet no-op rather than a panic; the one-shot path can never hit
-/// that, so its behavior is unchanged.
-pub fn record_bumped_note(store: &mut Store, composed: &ComposedNote) {
-    let Some(rec) = store.notes.iter().find(|n| n.note_id == composed.note_id) else {
-        return;
-    };
+/// re-add only if change returns to self), append the replacement txid +
+/// update raw_hex/fee/vsize on the note record, and — PLAN-pnte-
+/// redesign.md — RENAME the record's `note_id` to the replacement's txid
+/// (the note id IS the txid now, and a fee-bump is a different tx with a
+/// different txid; a Confirmed record's id never changes again, but a
+/// Pending one's does on every bump). `old_note_id` is the id
+/// [`bump_fee_build`] was called with — the record's CURRENT (about to be
+/// superseded) id, needed to find it since building was pure and never
+/// touched the store. Returns the record's new id (== `composed.note_id`)
+/// on success, so a caller tracking "which row is busy" by id can follow
+/// the rename — `None` when the record vanished (e.g. it confirmed
+/// between build and record), a quiet no-op the one-shot path can never
+/// hit.
+pub fn record_bumped_note(
+    store: &mut Store,
+    old_note_id: &str,
+    composed: &ComposedNote,
+) -> Option<String> {
+    let rec = store.notes.iter().find(|n| n.note_id == old_note_id)?;
     let old_txids = rec.txids.clone();
     store.utxos.retain(|u| !old_txids.contains(&u.txid));
     if composed.tx.change > 0 && composed.change_is_self {
@@ -437,12 +454,14 @@ pub fn record_bumped_note(store: &mut Store, composed: &ComposedNote) {
     let rec = store
         .notes
         .iter_mut()
-        .find(|n| n.note_id == composed.note_id)
+        .find(|n| n.note_id == old_note_id)
         .expect("checked above");
+    rec.note_id = composed.tx.txid_hex.clone();
     rec.txids.push(composed.tx.txid_hex.clone());
     rec.raw_hex = Some(composed.tx.raw_hex.clone());
     rec.fee = Some(composed.tx.fee);
     rec.vsize = Some(composed.tx.vsize as u64);
+    Some(rec.note_id.clone())
 }
 
 /// RBF fee-bump a Pending note: [`bump_fee_build`] then
@@ -457,7 +476,7 @@ pub fn bump_fee(
     new_rate: f64,
 ) -> Result<ComposedNote, Error> {
     let composed = bump_fee_build(store, identity, network, note_id_hex, new_rate, None)?;
-    record_bumped_note(store, &composed);
+    record_bumped_note(store, note_id_hex, &composed);
     Ok(composed)
 }
 
@@ -832,9 +851,12 @@ mod bump_tests {
         );
 
         let one = bump_fee(&mut one_shot, &id, Network::Regtest, &note_id, 5.0).unwrap();
-        record_bumped_note(&mut split, &built);
+        record_bumped_note(&mut split, &note_id, &built);
         let (na, nb) = (&one_shot.notes[0], &split.notes[0]);
         assert_eq!(na.txids, nb.txids, "same replacement txid appended");
+        assert_eq!(na.note_id, nb.note_id, "both rename to the same replacement txid");
+        assert_eq!(na.note_id, na.txids.last().cloned().unwrap(), "renamed id IS the current txid");
+        assert_ne!(na.note_id, note_id, "the bumped note's id changed from the original txid");
         assert_eq!(na.fee, nb.fee);
         assert_eq!(na.vsize, nb.vsize);
         assert_eq!(na.raw_hex.as_deref(), Some(one.tx.raw_hex.as_str()));
@@ -905,22 +927,16 @@ mod multi_recipient_tests {
         assert!(composed.recipients.is_empty(), "single recipient: plural list stays empty");
 
         // Rebuild directly through notes-core's single-recipient entry
-        // point with the SAME note_id/aux (both zero, deterministic aux
-        // for this cross-check) and compare txids (non-witness bytes —
-        // schnorr aux-rand makes the witness itself non-deterministic
-        // across two independent runs).
+        // point over the SAME inputs (there is no more note_id to line up —
+        // PLAN-pnte-redesign.md dropped it entirely) and compare txids
+        // (non-witness bytes — schnorr aux-rand makes the witness itself
+        // non-deterministic across two independent runs).
         let recipient = notes_core::address::Recipient::parse(NET, &bob_addr).unwrap();
-        let note_id = {
-            let mut id = [0u8; 4];
-            hex::decode_to_slice(&composed.note_id, &mut id).unwrap();
-            id
-        };
         let direct = notes_core::bundle::compose_directed_note_with_change_amount(
             &a,
             &store.available_utxos(),
             "hi bob",
             false,
-            note_id,
             &recipient,
             notes_core::DUST_LIMIT,
             None,
