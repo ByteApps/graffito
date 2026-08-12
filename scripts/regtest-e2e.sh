@@ -46,7 +46,7 @@
 #   CORE_RPC_USER / CORE_RPC_PASS   RPC credentials — REQUIRED, no default.
 # In the prime workspace, `ui-automation/node-env.sh <net> <cmd>...` decrypts
 # the Pi's creds and execs a command with all five exported — e.g.:
-#   ui-automation/node-env.sh testnet4 bash chain-notes-app/scripts/regtest-e2e.sh --network testnet4
+#   ui-automation/node-env.sh testnet4 bash graffito/scripts/regtest-e2e.sh --network testnet4
 # Both an already-open SSH tunnel (127.0.0.1) and a direct tailnet address
 # work identically — this script never assumes which.
 #

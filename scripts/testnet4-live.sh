@@ -353,8 +353,10 @@ if [[ "$STEP345_OK" == 1 ]]; then
             # that also matches inside 'txid=' and 'vsize=' has no 'id' but
             # 'txid=' does, so a naive `grep -o 'id=[0-9a-f]*'` double-hits
             # and corrupts NOTE_ID with the txid appended). The line has a
-            # fixed shape: "cli: compose id=<hex8> txid=<hex64> fee=<n>
-            # vsize=<n> to=<addr|self> private=<bool> broadcast=ok".
+            # fixed shape: "cli: compose id=<hex64> txid=<hex64> fee=<n>
+            # vsize=<n> to=<addr|self> private=<bool> broadcast=ok" — under
+            # the PNTE redesign the note id IS the txid, so both fields now
+            # carry the same 64-hex value (field position is unchanged).
             NOTE_ID="$(echo "$COMPOSE_LINE" | awk '{print $3}' | cut -d= -f2)"
             COMPOSE_TXID="$(echo "$COMPOSE_LINE" | awk '{print $4}' | cut -d= -f2)"
             MP="$("$BITCOIN_CLI" "${RPC_ARGS[@]}" getmempoolentry "$COMPOSE_TXID" 2>/dev/null)"
