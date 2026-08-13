@@ -6,7 +6,7 @@ Direct dependencies of this app and its `app-core` library. The complete transit
 
 | Library | Version | License | Used for |
 |---|---|---|---|
-| [notes-core](https://github.com/ObjSal/prime-chain-notes) | pinned git rev | MIT OR Apache-2.0 | The PNTE protocol: envelope, sealing, ECDH, taproot tx build/sign — shared with the Passport Prime app |
+| [notes-core](https://github.com/ObjSal/prime-graffito) | pinned git rev | MIT OR Apache-2.0 | The PNTE protocol: envelope, sealing, ECDH, taproot tx build/sign — shared with the Passport Prime app |
 | [bitcoin](https://crates.io/crates/bitcoin) (rust-bitcoin) | 0.32 | CC0-1.0 | BIP-32/86 derivation, WIF/xprv parsing, PSBT |
 | [miniscript](https://crates.io/crates/miniscript) | 12 | CC0-1.0 | Output-descriptor parsing for watch-only identities |
 | [bip39](https://crates.io/crates/bip39) | 2 | CC0-1.0 | BIP-39 mnemonic handling |

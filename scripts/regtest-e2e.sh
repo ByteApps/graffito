@@ -4,7 +4,7 @@
 # in this one script.
 #
 #   app role   = app-core/examples/cli.rs   (identity from APP_KEY)
-#   prime role = prime-chain-notes' notes_cli (identity from NOTES_APP_SEED)
+#   prime role = prime-graffito' notes_cli (identity from NOTES_APP_SEED)
 #   chain role = the shared PERSISTENT node described below
 #
 # PLAN-one-regtest-node.md (prime workspace root): there is only ONE
@@ -14,7 +14,7 @@
 #
 #   BACKEND  --esplora (default) | --core-rpc
 #            HOW THE APP talks to the chain. Esplora goes through
-#            ../prime-chain-notes/companion/server.py, a mempool.space-
+#            ../prime-graffito/companion/server.py, a mempool.space-
 #            shaped shim pointed at the real node (`AnyTransport::Esplora`
 #            on the app side). --core-rpc has the app speak Bitcoin Core
 #            JSON-RPC directly (`AnyTransport::Core`, a
@@ -186,7 +186,7 @@ export CN_NODE_HOST CN_NODE_PORT CORE_RPC_USER CORE_RPC_PASS
 CN_CONFIRM_TIMEOUT="${CN_CONFIRM_TIMEOUT:-1800}"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-PRIME="$(cd "$REPO/../prime-chain-notes" && pwd)" || fail "needs ../prime-chain-notes"
+PRIME="$(cd "$REPO/../prime-graffito" && pwd)" || fail "needs ../prime-graffito"
 WORK="${E2E_WORK:-$(mktemp -d /tmp/chain-notes-app-e2e.XXXXXX)}"
 
 echo "== build both host binaries =="
