@@ -61,7 +61,7 @@ fi
 # server.py reads CN_NETWORK/CN_NODE_HOST/CN_NODE_PORT/CORE_RPC_USER/
 # CORE_RPC_PASS straight from the environment (no --regtest/--datadir —
 # those are gone; see companion/server.py's module docstring).
-python3 "$PRIME_ROOT/prime-chain-notes/companion/server.py" $PORT >/dev/null 2>&1 &
+python3 "$PRIME_ROOT/prime-graffito/companion/server.py" $PORT >/dev/null 2>&1 &
 SRV=$!
 cleanup() { kill $SRV 2>/dev/null || true; }
 trap cleanup EXIT
