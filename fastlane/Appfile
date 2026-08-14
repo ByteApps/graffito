@@ -13,3 +13,13 @@ team_id(ENV["TEAM_ID"].to_s)                                     # Apple Develop
 for_platform :osx do
   app_identifier(ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes") # same id → Universal Purchase
 end
+
+# Google Play (fastlane supply). Independent of the Apple identity above —
+# Android ships under its own package name, not com.objsal.chainnotes.
+package_name(ENV["ANDROID_PACKAGE_NAME"] || "com.objsal.graffito")
+# Play service-account JSON key (created once the Play Developer account and
+# app record exist, via Play Console > Setup > API access > Create new
+# service account). Store it under ../private/chain-notes-app/ alongside the
+# ASC key — NEVER commit it — and point SUPPLY_JSON_KEY at that path:
+#   export SUPPLY_JSON_KEY=../private/chain-notes-app/play/play-supply-key.json
+json_key_file(ENV["SUPPLY_JSON_KEY"].to_s)

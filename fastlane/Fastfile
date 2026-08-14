@@ -154,3 +154,59 @@ platform :mac do
     )
   end
 end
+
+# Refuse to push the Android listing while support_url.txt/privacy_url.txt
+# under the ANDROID metadata tree still hold REPLACE_ME. Play Console itself
+# takes these two as app-content settings rather than per-locale metadata
+# files, so supply never reads fastlane/metadata/android/en-US/{support,
+# privacy}_url.txt directly — they exist here purely as the source of truth
+# this guard checks and as a paste-in reference for the Play Console fields.
+def guard_android_placeholders!
+  files = %w[
+    fastlane/metadata/android/en-US/support_url.txt
+    fastlane/metadata/android/en-US/privacy_url.txt
+  ]
+  bad = files.select { |f| File.exist?(File.join("..", f)) && File.read(File.join("..", f)).include?("REPLACE_ME") }
+  unless bad.empty?
+    UI.user_error!("Fill these before pushing (still contain REPLACE_ME):\n  - #{bad.join("\n  - ")}")
+  end
+end
+
+platform :android do
+  desc "Upload a release .aab + full listing to Google Play (defaults to the closed-testing Alpha track)"
+  lane :beta do
+    # Play's default closed-testing track is called "Closed testing – Alpha"
+    # in the console; pass SUPPLY_TRACK=internal for instant, no-review
+    # internal testing instead. Either way, the FIRST upload to a package
+    # name also requires the app record to be created once in the Play
+    # Console UI by a human — supply/upload_to_play_store cannot create it.
+    guard_android_placeholders!
+    upload_to_play_store(
+      package_name: ENV["ANDROID_PACKAGE_NAME"] || "com.objsal.graffito",
+      json_key: ENV["SUPPLY_JSON_KEY"].to_s,
+      track: ENV["SUPPLY_TRACK"] || "alpha",
+      # Built by scripts/build-play-bundle.sh (Gradle bundleRelease) — see
+      # that script for the exact Gradle invocation and signing config.
+      aab: "../android/play/app/build/outputs/bundle/release/app-release.aab",
+      skip_upload_apk: true,
+      skip_upload_metadata: false,
+      skip_upload_images: false,
+      skip_upload_screenshots: false
+    )
+  end
+
+  desc "Push Play Store listing text + images only (no .aab) — for listing-only updates"
+  lane :metadata do
+    guard_android_placeholders!
+    upload_to_play_store(
+      package_name: ENV["ANDROID_PACKAGE_NAME"] || "com.objsal.graffito",
+      json_key: ENV["SUPPLY_JSON_KEY"].to_s,
+      track: ENV["SUPPLY_TRACK"] || "alpha",
+      skip_upload_aab: true,
+      skip_upload_apk: true,
+      skip_upload_metadata: false,
+      skip_upload_images: false,
+      skip_upload_screenshots: false
+    )
+  end
+end
