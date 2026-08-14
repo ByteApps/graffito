@@ -1,0 +1,1 @@
+First release. Compose, encrypt, and sign personal notes anchored on the Bitcoin blockchain — private or directed to other taproot addresses. Notebooks, contacts, coin control, and watch-only import included.

@@ -1,0 +1,139 @@
+<!doctype html>
+<!--
+  Google Play feature graphic (1024x500). Rasterize with headless Chrome:
+
+    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+      --headless=new --disable-gpu --screenshot=feature.png \
+      --window-size=1024,500 --hide-scrollbars \
+      "file://$(pwd)/feature-graphic.html"
+
+  Palette pulled straight from ui/app.slint's Pal singleton (bg/text/muted/
+  accent) — do not invent new colors here. The mark is the master
+  assets/icon/icon.svg, inlined verbatim (same squircle/gradient/scratch
+  group as every other rasterized app icon in this repo).
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {
+    margin: 0;
+    width: 1024px;
+    height: 500px;
+    background: #0B0F14;
+    overflow: hidden;
+  }
+  .stage {
+    width: 1024px;
+    height: 500px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    position: relative;
+    background:
+      radial-gradient(ellipse 900px 700px at 30% 40%, #131a22 0%, #0B0F14 60%);
+    box-sizing: border-box;
+  }
+  .icon-wrap {
+    flex: 0 0 auto;
+    margin-left: 88px;
+    margin-right: 64px;
+    width: 320px;
+    height: 320px;
+    border-radius: 72px;
+    overflow: hidden;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+  }
+  .icon-wrap svg {
+    display: block;
+    width: 320px;
+    height: 320px;
+  }
+  .copy {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  .wordmark {
+    font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+    font-weight: 700;
+    font-size: 96px;
+    letter-spacing: -0.01em;
+    color: #E6EDF3;
+    line-height: 1;
+    margin: 0 0 22px 0;
+  }
+  .wordmark .dot {
+    color: #F7931A;
+  }
+  .tagline {
+    font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+    font-weight: 400;
+    font-size: 38px;
+    color: #8B98A5;
+    margin: 0;
+  }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="icon-wrap">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+      <defs>
+        <radialGradient id="wall" cx="38%" cy="30%" r="90%">
+          <stop offset="0%" stop-color="#2b2723"/>
+          <stop offset="60%" stop-color="#211e1a"/>
+          <stop offset="100%" stop-color="#171512"/>
+        </radialGradient>
+        <clipPath id="squircle"><rect x="0" y="0" width="1024" height="1024" rx="230"/></clipPath>
+      </defs>
+      <g clip-path="url(#squircle)">
+        <rect width="1024" height="1024" fill="url(#wall)"/>
+        <g fill="#efe8da" opacity="0.05">
+          <circle cx="142" cy="210" r="4"/><circle cx="300" cy="120" r="3"/><circle cx="520" cy="88" r="5"/>
+          <circle cx="760" cy="150" r="3"/><circle cx="890" cy="300" r="4"/><circle cx="930" cy="540" r="3"/>
+          <circle cx="850" cy="820" r="5"/><circle cx="640" cy="930" r="3"/><circle cx="380" cy="900" r="4"/>
+          <circle cx="150" cy="780" r="3"/><circle cx="95" cy="520" r="4"/><circle cx="230" cy="640" r="2.5"/>
+          <circle cx="700" cy="420" r="2.5"/><circle cx="820" cy="640" r="3"/><circle cx="440" cy="180" r="2.5"/>
+        </g>
+        <g stroke="#0c0b09" stroke-width="3" fill="none" opacity="0.5">
+          <path d="M 940 120 L 880 210 L 895 300 L 845 370"/>
+          <path d="M 90 860 L 175 800 L 195 720"/>
+        </g>
+        <g stroke="#efe8da" stroke-width="1.5" fill="none" opacity="0.12">
+          <path d="M 942 123 L 882 213 L 897 303 L 847 373"/>
+          <path d="M 92 863 L 177 803 L 197 723"/>
+        </g>
+        <g transform="rotate(-4 512 512)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <g stroke="#000000" opacity="0.45" stroke-width="34" transform="translate(4,6)">
+            <path d="M 618 348 C 560 292, 415 296, 350 372 C 290 445, 302 560, 385 602 C 458 638, 570 610, 606 532"/>
+            <path d="M 622 318 L 630 380 L 636 560 C 642 668, 606 752, 492 758 C 418 760, 368 716, 380 668"/>
+          </g>
+          <g stroke="#ece5d6" stroke-width="21">
+            <path d="M 618 348 C 560 292, 415 296, 350 372 C 290 445, 302 560, 385 602 C 458 638, 570 610, 606 532"/>
+            <path d="M 622 318 L 630 380 L 636 560 C 642 668, 606 752, 492 758 C 418 760, 368 716, 380 668"/>
+          </g>
+          <g stroke="#fffdf4" stroke-width="7" opacity="0.9" stroke-dasharray="64 16 110 12 88 20 140 14">
+            <path d="M 618 348 C 560 292, 415 296, 350 372 C 290 445, 302 560, 385 602 C 458 638, 570 610, 606 532"/>
+            <path d="M 622 318 L 630 380 L 636 560 C 642 668, 606 752, 492 758 C 418 760, 368 716, 380 668"/>
+          </g>
+          <g stroke="#ece5d6" stroke-width="4.5" opacity="0.35" transform="translate(9,-8)">
+            <path d="M 618 348 C 560 292, 415 296, 350 372"/>
+            <path d="M 636 560 C 642 668, 606 752, 492 758"/>
+          </g>
+        </g>
+        <g fill="none" stroke="#f7931a" stroke-linecap="round">
+          <path d="M 712 716 l 34 30 M 744 712 l -30 36" stroke-width="16"/>
+          <path d="M 714 718 l 32 28" stroke-width="6" opacity="0.6" transform="translate(6,-5)"/>
+        </g>
+      </g>
+    </svg>
+  </div>
+  <div class="copy">
+    <p class="wordmark">Graffito<span class="dot">.</span></p>
+    <p class="tagline">Private notes, on Bitcoin</p>
+  </div>
+</div>
+</body>
+</html>
