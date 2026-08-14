@@ -39,6 +39,8 @@ cargo run
 
 See **[DEVELOPMENT.md](DEVELOPMENT.md)** for toolchain setup, mobile builds, and the test suites.
 
+On Android, a **Google Play closed beta** is on its way — the same app, packaged for Play (`scripts/build-play-bundle.sh` builds the store bundle if you'd rather sideload your own).
+
 ## Learn more
 
 - [DEVELOPMENT.md](DEVELOPMENT.md) — building (desktop + mobile), testing, architecture pointers
