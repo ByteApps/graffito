@@ -39,3 +39,15 @@
 
 # xcodebuild -derivedDataPath for iOS Simulator builds
 /build-sim
+
+# Google Play AAB build wrapper (android/play/) — Gradle project outputs and
+# machine-local config, not build inputs. The .so staged into jniLibs is a
+# build product copied out of the cargo-apk APK by
+# scripts/build-play-bundle.sh, not source; bundletool.jar is downloaded by
+# the same script from the official Google GitHub releases.
+/android/play/local.properties
+/android/play/.gradle
+/android/play/build
+/android/play/app/build
+/android/play/app/src/main/jniLibs
+/android/play/tools

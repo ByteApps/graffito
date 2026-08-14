@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Hand-mirrored from the cargo-apk-generated manifest of the known-good
+  sideload release APK at
+  /Users/sal/Projects/prime/graffito/target-mobile/release/apk/chain-notes-app.apk
+  (read-only reference checkout, sibling of this worktree — dumped with
+  aapt2's "dump xmltree" subcommand).
+
+  Structural NativeActivity attributes (activity name, exported,
+  configChanges, the android.app.lib_name meta-data, the MAIN/LAUNCHER
+  intent-filter, application hasCode=false) are copied VERBATIM from that
+  dump — those are what cargo-apk's manifest template always sets for a
+  NativeActivity app and are not app-specific.
+
+  App-identity values (label, icon, theme, permissions, uses-feature) instead
+  follow ../../../../Cargo.toml's CURRENT [package.metadata.android] —
+  the reference APK predates both the Graffito rebrand (it still says
+  "Chain Notes") and the USE_BIOMETRIC permission, so those two fields were
+  NOT mirrored from it; everything else was.
+
+  package/versionCode/versionName/compileSdk/minSdk/targetSdk are NOT set
+  here — AGP injects them from app/build.gradle.kts (applicationId,
+  versionCode, versionName, compileSdk, minSdk, targetSdk) at merge time.
+  windowSoftInputMode and launchMode are absent from the reference dump too
+  (cargo-apk's default: standard launchMode, unset softInputMode), so this
+  manifest leaves them at platform defaults, matching it exactly.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- No explicit <uses-sdk> here: AGP injects min/targetSdkVersion from
+         app/build.gradle.kts's defaultConfig at manifest-merge time. -->
+
+    <!-- Chain sync + broadcast (esplora/mempool.space over HTTPS). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- QR scan (camera) — install-time half; the runtime half is NDK
+         Camera2, requested at capture time. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- Reveal gate for the BiometricPrompt bridge (see
+         src/keychain/android.rs). Without it BiometricPrompt.authenticate
+         throws a SecurityException, caught by the bridge and reported as a
+         denial — so the symptom is "reveal always refused, no dialog ever
+         appears", not a crash. -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+    <uses-feature
+        android:name="android.hardware.camera.any"
+        android:required="false" />
+
+    <application
+        android:label="Graffito"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+        android:hasCode="false">
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:configChanges="orientation|keyboardHidden|screenSize">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="chain_notes_app" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+</manifest>
