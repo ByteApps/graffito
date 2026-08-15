@@ -61,7 +61,7 @@ const DUST_SATS: u64 = app_core::notes_core::DUST_LIMIT;
 const DISCLAIMER: &str = "Graffito is free software provided \"as is\", without warranty of any kind. You alone control your keys and funds. The authors accept no liability for any loss of funds or data — from lost or leaked keys, fees, failed or malformed transactions, or bugs. Bitcoin transactions are irreversible and on-chain data is public and permanent. This is a hot wallet: keep only small, note-fee amounts here and use it at your own risk.";
 
 const ABOUT_INTRO: &str = "Graffito writes short personal notes onto the Bitcoin blockchain, signed by keys that never leave your device. Notes can be public, or private — encrypted so only you (or a chosen recipient) can read them. Read them back on any device from your key alone.";
-const ABOUT_FOOTER: &str = "Companion & viewer:\nbyteapps.github.io/graffito/companion";
+const ABOUT_FOOTER: &str = "Companion & viewer:\nbyteapps.com/graffito/companion";
 
 /// About-screen body, built at runtime so the version line can carry the
 /// bundle's build number (`platform::build_number`) — "Version 0.1.0 (30)"
@@ -2254,7 +2254,7 @@ fn note_web_url(network: Network, address: &str, note_id: &str) -> String {
     match network {
         Network::Regtest => String::new(),
         net => format!(
-            "https://byteapps.github.io/graffito/companion/note.html?address={address}&network={}&note={note_id}",
+            "https://byteapps.com/graffito/companion/note.html?address={address}&network={}&note={note_id}",
             net.as_str()
         ),
     }
@@ -13140,7 +13140,7 @@ pub fn run() {
                 net => {
                     let addr = s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
                     format!(
-                        "https://byteapps.github.io/graffito/companion/note.html?address={addr}&network={}&note={}",
+                        "https://byteapps.com/graffito/companion/note.html?address={addr}&network={}&note={}",
                         net.as_str(),
                         n.note_id
                     )
