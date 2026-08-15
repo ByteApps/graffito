@@ -2,7 +2,7 @@
 
 **Bitcoin · Notes · Mac / iOS / Android** — your notebooks on the bitcoin blockchain, in a native app that goes where you go.
 
-Graffito writes personal notes into real bitcoin transactions — public ones anyone can read, private ones only your key can open, and directed notes delivered to any taproot address like unstoppable mail. This is the online, full-featured peer of the [Passport Prime app](https://github.com/ObjSal/prime-graffito): the same protocol, byte-identical transactions, but with its own keys, direct broadcasting, and a native interface on Mac, iPhone, and Android. Keep as many **notebooks** as you like — each its own address from the same seed, with its own notes, balance, and name. Lose the device, keep the key — every notebook rebuilds itself from the chain.
+Graffito writes personal notes into real bitcoin transactions — public ones anyone can read, private ones only your key can open, and directed notes delivered to any taproot address like unstoppable mail. This is the online, full-featured peer of the [Passport Prime app](https://github.com/ByteApps/prime-graffito): the same protocol, byte-identical transactions, but with its own keys, direct broadcasting, and a native interface on Mac, iPhone, and Android. Keep as many **notebooks** as you like — each its own address from the same seed, with its own notes, balance, and name. Lose the device, keep the key — every notebook rebuilds itself from the chain.
 
 <p align="center">
   <img src="screenshots/home.png" alt="Notebooks — your list of them, each an address with its own notes and balance" width="290">
@@ -46,20 +46,6 @@ On Android, a **Google Play closed beta** is on its way — the same app, packag
 - [DEVELOPMENT.md](DEVELOPMENT.md) — building (desktop + mobile), testing, architecture pointers
 - [THIRD-PARTY.md](THIRD-PARTY.md) — libraries this app is built on
 - `PLAN-chain-notes-app.md` (workspace repo) — design document and milestones
-
-## Support
-
-If this app is useful to you, a small bitcoin donation is always appreciated — entirely optional.
-
-<div align="center">
-
-<img src="donate-qr.png" alt="Donate bitcoin" width="200">
-
-**`bc1qrfagrsfrm8erdsmrku3fgq5yc573zyp2q3uje8`**
-
-</div>
-
-Donations help cover development costs and keep more open-source bitcoin tools coming. No VC funding, no ads, no tracking.
 
 ## License & disclaimer
 
