@@ -187,7 +187,12 @@ platform :android do
       track: ENV["SUPPLY_TRACK"] || "alpha",
       # Built by scripts/build-play-bundle.sh (Gradle bundleRelease) — see
       # that script for the exact Gradle invocation and signing config.
-      aab: "../android/play/app/build/outputs/bundle/release/app-release.aab",
+      # Anchored to THIS file's directory, not the CWD: supply resolves a
+      # relative `aab:` against the working directory, and fastlane runs from
+      # the repo root (graffito/), not from fastlane/. A bare
+      # "../android/play/..." therefore resolved to prime/android/play/... and
+      # failed with "Could not find aab file at path".
+      aab: File.expand_path("../android/play/app/build/outputs/bundle/release/app-release.aab", __dir__),
       skip_upload_apk: true,
       skip_upload_metadata: false,
       skip_upload_images: false,
@@ -202,6 +207,14 @@ platform :android do
       package_name: ENV["ANDROID_PACKAGE_NAME"] || "com.byteapps.graffito",
       json_key: ENV["SUPPLY_JSON_KEY"].to_s,
       track: ENV["SUPPLY_TRACK"] || "alpha",
+      # Listing-only runs upload no binary, so supply has no version code to
+      # hang the changelog on and dies with "Cannot find changelog because no
+      # version code given" AFTER uploading the images — which discards the
+      # whole edit, listing and images with it. Point SUPPLY_VERSION_CODE at
+      # the release already live on SUPPLY_TRACK to keep the changelog, or
+      # leave it unset to push listing text + images only.
+      version_code: ENV["SUPPLY_VERSION_CODE"],
+      skip_upload_changelogs: ENV["SUPPLY_VERSION_CODE"].to_s.empty?,
       skip_upload_aab: true,
       skip_upload_apk: true,
       skip_upload_metadata: false,
