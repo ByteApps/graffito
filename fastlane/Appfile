@@ -16,7 +16,7 @@ end
 
 # Google Play (fastlane supply). Independent of the Apple identity above —
 # Android ships under its own package name, not com.objsal.chainnotes.
-package_name(ENV["ANDROID_PACKAGE_NAME"] || "com.objsal.graffito")
+package_name(ENV["ANDROID_PACKAGE_NAME"] || "com.byteapps.graffito")
 # Play service-account JSON key (created once the Play Developer account and
 # app record exist, via Play Console > Setup > API access > Create new
 # service account). Store it under ../private/chain-notes-app/ alongside the

@@ -182,7 +182,7 @@ platform :android do
     # Console UI by a human — supply/upload_to_play_store cannot create it.
     guard_android_placeholders!
     upload_to_play_store(
-      package_name: ENV["ANDROID_PACKAGE_NAME"] || "com.objsal.graffito",
+      package_name: ENV["ANDROID_PACKAGE_NAME"] || "com.byteapps.graffito",
       json_key: ENV["SUPPLY_JSON_KEY"].to_s,
       track: ENV["SUPPLY_TRACK"] || "alpha",
       # Built by scripts/build-play-bundle.sh (Gradle bundleRelease) — see
@@ -199,7 +199,7 @@ platform :android do
   lane :metadata do
     guard_android_placeholders!
     upload_to_play_store(
-      package_name: ENV["ANDROID_PACKAGE_NAME"] || "com.objsal.graffito",
+      package_name: ENV["ANDROID_PACKAGE_NAME"] || "com.byteapps.graffito",
       json_key: ENV["SUPPLY_JSON_KEY"].to_s,
       track: ENV["SUPPLY_TRACK"] || "alpha",
       skip_upload_aab: true,
