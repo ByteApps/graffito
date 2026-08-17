@@ -1,16 +1,23 @@
 // ---------------------------------------------------------------------------
 // applicationId — DEFINED ONCE, HERE.
 //
-// com.objsal.graffito is PERMANENT the moment it is first uploaded to Google
+// com.byteapps.graffito is PERMANENT the moment it is first uploaded to Google
 // Play (Play ties the app listing to this id for life; it cannot be changed
-// or reused later). This is deliberately a DIFFERENT id from the iOS/macOS
-// bundle id family (xyz.foundation.chainnotes.app, set at the Rust-package
-// level in ../../../Cargo.toml's [package.metadata.android] — that id is
-// cargo-apk's sideload/dev path, NOT what ships to Play) — CONFIRM this is
-// the intended id with Sal before running `./gradlew bundleRelease` against
-// a real upload, and definitely before any `bundletool`/Play Console step
-// that actually publishes.
-val playApplicationId = "com.objsal.graffito"
+// or reused later). `com.byteapps.*` is ByteApps LLC's namespace — reverse-DNS
+// of byteapps.com, the domain the LLC actually owns — and every future LLC app
+// takes an id under it (Sal, 2026-08-16, superseding the earlier
+// com.objsal.graffito: that carried Sal's PERSONAL handle on an app the LLC
+// publishes). NOT com.byteappsllc.* — that would assert a domain nobody owns.
+// Package ids are a separate namespace from Play DEVELOPER NAMES: another
+// developer holding the display name "ByteApps" does not reserve any id
+// prefix, only the exact string it published.
+// This is deliberately a DIFFERENT id from the iOS/macOS bundle id family
+// (xyz.foundation.chainnotes.app, set at the Rust-package level in
+// ../../../Cargo.toml's [package.metadata.android] — that id is cargo-apk's
+// sideload/dev path, NOT what ships to Play) — CONFIRM this is the intended id
+// with Sal before running `./gradlew bundleRelease` against a real upload, and
+// definitely before any `bundletool`/Play Console step that actually publishes.
+val playApplicationId = "com.byteapps.graffito"
 // ---------------------------------------------------------------------------
 
 plugins {
@@ -18,7 +25,7 @@ plugins {
 }
 
 android {
-    namespace = "com.objsal.graffito"
+    namespace = "com.byteapps.graffito"
     // Google Play requires new-app uploads to target API 36 starting
     // 2026-08-31 (policy fact confirmed by the orchestrator after this
     // module was drafted) — compileSdk must be >= targetSdk.
