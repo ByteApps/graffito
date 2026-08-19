@@ -17,7 +17,11 @@ use zeroize::Zeroizing;
 
 use crate::Error;
 
-pub const ENC_SALT: &[u8] = b"chain-notes-app/enc/v1";
+// GRAFFITO EPOCH (2026-08-18): rebound from b"chain-notes-app/enc/v1" in
+// lockstep with notes-core's ENC_APP_SALT (rev 28b7daf) — a deliberate
+// crypto epoch break. Notes sealed under the old salt are permanently
+// undecryptable. Must stay byte-identical to notes-core's ENC_APP_SALT.
+pub const ENC_SALT: &[u8] = b"graffito/enc/v1";
 pub const ENC_INFO: &[u8] = b"note-enc/v1";
 
 /// BIP-44 coin type for the BIP-86 path: 0' on mainnet, 1' on every test

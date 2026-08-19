@@ -41,7 +41,7 @@ pub const DEFAULT_CHUNK: usize = 100_000;
 /// drops every note this store holds when crossing this threshold —
 /// nothing was in production, so old-format rows simply vanish and a
 /// full rescan repopulates the store in the new format.
-pub const CLASSIFY_VERSION: u32 = 2;
+pub const CLASSIFY_VERSION: u32 = 3; // 3: graffito crypto epoch — old-salt notes no longer decrypt; force one full rescan
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutPointRef {
