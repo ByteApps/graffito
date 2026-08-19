@@ -38,8 +38,11 @@ android {
         // Play rejects a re-upload of an existing versionCode. 1 = the
         // 2026-08-16 internal release (shipped WITHOUT native debug symbols —
         // stripped at link, unrecoverable). 2 adds native-debug-symbols.zip.
-        versionCode = 2
-        versionName = "0.1.0"
+        // 3 = the 2026-08-18 graffito crypto epoch (graffito/enc/v1 salts,
+        // notes-core 28b7daf, CLASSIFY_VERSION 3) — earlier builds' private
+        // notes are permanently undecryptable, by decision.
+        versionCode = 3
+        versionName = "0.1.1"
     }
 
     // No java/kotlin sources: the BiometricPrompt bridge ships as a dex
