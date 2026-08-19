@@ -18,6 +18,7 @@
 /EXTERNAL-FUNDING-STATUS.md
 /SIGNING-NOTARIZATION.md
 /UPSTREAM-ISSUES.md
+/SECURITY-AUDIT-2026-07-25.md
 
 # Local signing config symlinked from the private companion (real Team ID) — never publish
 /signing.env
@@ -51,3 +52,17 @@
 /android/play/app/build
 /android/play/app/src/main/jniLibs
 /android/play/tools
+
+# Google Play upload signing (keystore + passwords) symlinked from the
+# private companion (prime/private/graffito) — never publish. The .gpg
+# copies are the encrypted-at-rest originals.
+/android-signing.env
+/android-signing.env.gpg
+/upload-keystore.jks
+/upload-keystore.jks.gpg
+
+# Play Console runbook + service-account/listing config, symlinked from
+# the private companion (prime/private/graffito/play, .../playstore).
+# Never publish.
+/play
+/playstore
