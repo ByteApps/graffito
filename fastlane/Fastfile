@@ -172,6 +172,37 @@ def guard_android_placeholders!
   end
 end
 
+# The .aab and native-debug-symbols.zip MUST ship in the SAME Play edit:
+# the API refuses to attach symbols to a committed bundle (400
+# FAILED_PRECONDITION — versionCode 3 shipped symbol-less on 2026-08-19
+# because supply committed before symbols were even considered). supply
+# does the same-edit upload for us via `mapping:` (a .zip is uploaded as
+# deobfuscationFileType nativeCode right after the bundle, pre-commit).
+ANDROID_OUT = File.expand_path("../android/play/app/build/outputs", __dir__)
+ANDROID_AAB = File.join(ANDROID_OUT, "bundle/release/app-release.aab")
+ANDROID_SYMBOLS = File.join(ANDROID_OUT, "native-debug-symbols.zip")
+
+# Refuse to upload unless the aab + symbols pair matches the stamp
+# scripts/build-play-bundle.sh wrote at the end of ONE build run — a stale
+# zip next to a fresh aab would symbolicate nothing (mtime ordering can't
+# prove pairing: gradle finishes after the symbols zip is written).
+def guard_android_symbols!
+  require "digest"
+  stamp = File.join(ANDROID_OUT, "play-release-stamp")
+  missing = [ANDROID_AAB, ANDROID_SYMBOLS, stamp].reject { |f| File.exist?(f) }
+  unless missing.empty?
+    UI.user_error!("Missing #{missing.join(', ')} — run scripts/build-play-bundle.sh first")
+  end
+  want = File.readlines(stamp).map { |l| l.strip.split("=", 2) }.to_h
+  got = {
+    "aab_sha256" => Digest::SHA256.file(ANDROID_AAB).hexdigest,
+    "symbols_sha256" => Digest::SHA256.file(ANDROID_SYMBOLS).hexdigest,
+  }
+  if want != got
+    UI.user_error!("aab/symbols pair does not match the build stamp — stale "                    "outputs; re-run scripts/build-play-bundle.sh")
+  end
+end
+
 platform :android do
   desc "Upload a release .aab + full listing to Google Play (defaults to the closed-testing Alpha track)"
   lane :beta do
@@ -181,6 +212,7 @@ platform :android do
     # name also requires the app record to be created once in the Play
     # Console UI by a human — supply/upload_to_play_store cannot create it.
     guard_android_placeholders!
+    guard_android_symbols!
     upload_to_play_store(
       package_name: ENV["ANDROID_PACKAGE_NAME"] || "com.byteapps.graffito",
       json_key: ENV["SUPPLY_JSON_KEY"].to_s,
@@ -192,11 +224,38 @@ platform :android do
       # the repo root (graffito/), not from fastlane/. A bare
       # "../android/play/..." therefore resolved to prime/android/play/... and
       # failed with "Could not find aab file at path".
-      aab: File.expand_path("../android/play/app/build/outputs/bundle/release/app-release.aab", __dir__),
+      aab: ANDROID_AAB,
+      # Same-edit native-symbols upload (see guard_android_symbols! above).
+      mapping: ANDROID_SYMBOLS,
       skip_upload_apk: true,
       skip_upload_metadata: false,
       skip_upload_images: false,
-      skip_upload_screenshots: false
+      skip_upload_screenshots: false,
+      # SUPPLY_VALIDATE_ONLY=1: run the whole edit — aab, symbols, track,
+      # listing — through Google's validation and DISCARD it (nothing ships,
+      # the version code is not consumed). scripts/play-release.sh --validate
+      # pairs this with a probe version code.
+      validate_only: ENV["SUPPLY_VALIDATE_ONLY"] == "1"
+    )
+  end
+
+  desc "Promote the completed internal-track release to alpha (no re-upload)"
+  lane :promote do
+    # Symbols and .aab are already attached to the release being promoted —
+    # promotion moves the whole release object, notes included. supply only
+    # promotes when NO new binaries are uploaded, hence all the skips.
+    upload_to_play_store(
+      package_name: ENV["ANDROID_PACKAGE_NAME"] || "com.byteapps.graffito",
+      json_key: ENV["SUPPLY_JSON_KEY"].to_s,
+      track: ENV["SUPPLY_TRACK"] || "internal",
+      track_promote_to: ENV["SUPPLY_PROMOTE_TO"] || "alpha",
+      version_code: ENV["SUPPLY_VERSION_CODE"], # optional filter; nil = the completed release
+      skip_upload_aab: true,
+      skip_upload_apk: true,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+      validate_only: ENV["SUPPLY_VALIDATE_ONLY"] == "1"
     )
   end
 
