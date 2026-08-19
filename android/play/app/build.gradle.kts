@@ -40,13 +40,16 @@ android {
         // stripped at link, unrecoverable). 2 adds native-debug-symbols.zip.
         // 3 = the 2026-08-18 graffito crypto epoch (graffito/enc/v1 salts,
         // notes-core 28b7daf, CLASSIFY_VERSION 3) — earlier builds' private
-        // notes are permanently undecryptable, by decision.
+        // notes are permanently undecryptable, by decision. 3 shipped
+        // symbol-less (see scripts/play-release.sh). 4 = same app code,
+        // first release through the one-command pipeline with native
+        // symbols attached in the same Play edit.
         // scripts/play-release.sh --validate builds a PROBE bundle with an
         // unused code (-PplayVersionCode=N) so supply's validate_only pass can
         // exercise the full upload — aab + native symbols in one edit —
         // without committing anything. The hardcoded default stays the source
         // of truth for real releases.
-        versionCode = (project.findProperty("playVersionCode") as String?)?.toInt() ?: 3
+        versionCode = (project.findProperty("playVersionCode") as String?)?.toInt() ?: 4
         versionName = "0.1.1"
     }
 

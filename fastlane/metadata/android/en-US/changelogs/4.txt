@@ -1,0 +1,1 @@
+Packaging update: native crash symbols now ship with every release, so crash reports from this build can be fully symbolicated. No app changes since 0.1.1's encryption update (notes written by pre-epoch builds remain unreadable, by design; funds and seeds are unaffected).

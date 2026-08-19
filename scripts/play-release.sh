@@ -87,7 +87,34 @@ CHANGELOG="$REPO/fastlane/metadata/android/en-US/changelogs/$CURRENT_CODE.txt"
 
 echo "== RELEASE mode: versionCode $CURRENT_CODE"
 scripts/build-play-bundle.sh
-SUPPLY_TRACK=internal fastlane android beta
+
+# The Play API sometimes kills a fresh edit mid-upload ("This edit has
+# expired, please create a new Edit" — hit live on v4's first attempt,
+# seconds after the edit was created). A failed run is clean (supply commits
+# only at the end), so retry once. And if the version code is already on
+# Play, a previous run's commit went through — since supply uploads the
+# symbols BEFORE committing, that committed edit always carries them, so
+# skipping straight to promote is sound.
+BETA_LOG="$(mktemp)"
+beta_ok=0
+for attempt in 1 2; do
+    if SUPPLY_TRACK=internal fastlane android beta 2>&1 | tee "$BETA_LOG"; then
+        beta_ok=1
+        break
+    fi
+    if grep -q "has already been used" "$BETA_LOG"; then
+        echo "== versionCode $CURRENT_CODE already committed on Play — continuing to promote"
+        beta_ok=1
+        break
+    fi
+    if grep -q "edit has expired" "$BETA_LOG" && [ "$attempt" = 1 ]; then
+        echo "== transient 'edit has expired' from the Play API — retrying the upload once"
+        continue
+    fi
+    break
+done
+[ "$beta_ok" = 1 ] || { echo "!! upload failed — see the log above" >&2; exit 1; }
+
 SUPPLY_VERSION_CODE="$CURRENT_CODE" fastlane android promote
 echo
 echo "== SHIPPED — versionCode $CURRENT_CODE on internal + alpha, symbols attached."
