@@ -1,0 +1,1 @@
+Encryption update: note keys are now derived under Graffito-native identifiers. Private and directed notes written by earlier beta builds can no longer be decrypted — there is deliberately no compatibility with them. Public notes are unaffected, and your wallet funds and seed are untouched. The app performs a full rescan after updating.
