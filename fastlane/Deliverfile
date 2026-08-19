@@ -3,7 +3,7 @@
 # (xcodebuild archive/export via the ASC API key), so deliver never touches it.
 # Text lives in fastlane/metadata/**; screenshots in fastlane/screenshots/en-US/.
 
-app_identifier(ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes")
+app_identifier(ENV["APP_BUNDLE_ID"] || "com.byteapps.graffito")
 
 skip_binary_upload(true)      # binary handled by ios-archive-upload.sh
 overwrite_screenshots(true)   # replace the set on every run

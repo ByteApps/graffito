@@ -13,7 +13,7 @@ targets:
     deploymentTarget: "16.0"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.objsal.chainnotes
+        PRODUCT_BUNDLE_IDENTIFIER: com.byteapps.graffito
         PRODUCT_NAME: chain-notes-app
         EXECUTABLE_NAME: chain-notes-app
         CODE_SIGN_STYLE: Automatic
@@ -85,7 +85,7 @@ targets:
     deploymentTarget: "12.0"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.objsal.chainnotes
+        PRODUCT_BUNDLE_IDENTIFIER: com.byteapps.graffito
         # Bundle is "Graffito.app" (user-visible in Finder/switcher). The
         # Unix executable stays chain-notes-app so build_mac.bash keeps copying
         # the Rust binary to Contents/MacOS/chain-notes-app.
