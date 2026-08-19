@@ -7354,7 +7354,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -7693,7 +7693,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "git+https://github.com/ObjSal/winit?rev=cea753eacbc334b1b61056efb6690075b5235cf1#cea753eacbc334b1b61056efb6690075b5235cf1"
+source = "git+https://github.com/ByteApps/winit?rev=cea753eacbc334b1b61056efb6690075b5235cf1#cea753eacbc334b1b61056efb6690075b5235cf1"
 dependencies = [
  "ahash",
  "android-activity 0.6.1",
