@@ -108,7 +108,7 @@ fn handle_conn(
     };
     let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let mut lines = header_text.lines();
-    // Request line: "POST /wallet/chain-notes-watch HTTP/1.1" — the path is
+    // Request line: "POST /wallet/graffito-watch HTTP/1.1" — the path is
     // what tells the real node which wallet (or the node-level endpoint)
     // this call targets; must be preserved verbatim on forward.
     let path = lines

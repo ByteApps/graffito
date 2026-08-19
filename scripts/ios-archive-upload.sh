@@ -29,10 +29,10 @@ for v in TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_PATH; do
 done
 [ -s "$ASC_KEY_PATH" ] || { echo "!! ASC key missing at $ASC_KEY_PATH — run appstore/install.sh" >&2; exit 1; }
 
-SCHEME=chain-notes-app
-PROJECT="$REPO/chain-notes-app.xcodeproj"
+SCHEME=graffito
+PROJECT="$REPO/graffito.xcodeproj"
 BUILD_DIR="$REPO/build/ios-release"
-ARCHIVE="$BUILD_DIR/chain-notes-app.xcarchive"
+ARCHIVE="$BUILD_DIR/graffito.xcarchive"
 EXPORT_DIR="$BUILD_DIR/export"
 EXPORT_OPTS="$BUILD_DIR/ExportOptions.plist"
 LOG="$BUILD_DIR/archive.log"
@@ -92,7 +92,7 @@ fi
 # 2026-07-19.)
 BUILD_NUM="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleVersion' "$ARCHIVE/Info.plist" 2>/dev/null || echo unknown)"
 ORG_DIR="$HOME/Library/Developer/Xcode/Archives/$(date +%Y-%m-%d)"
-ORG_ARCHIVE="$ORG_DIR/chain-notes-app iOS build $BUILD_NUM.xcarchive"
+ORG_ARCHIVE="$ORG_DIR/graffito iOS build $BUILD_NUM.xcarchive"
 mkdir -p "$ORG_DIR"
 rm -rf "$ORG_ARCHIVE"
 cp -R "$ARCHIVE" "$ORG_ARCHIVE"

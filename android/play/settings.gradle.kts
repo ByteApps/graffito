@@ -1,7 +1,7 @@
 // Google Play AAB build wrapper for the Graffito Android app.
 //
 // This is a THIN Gradle shim around the real build: the app itself is a
-// Rust cdylib (crate chain-notes-app, built by cargo-apk for the sideload
+// Rust cdylib (crate graffito, built by cargo-apk for the sideload
 // APK path — see ../../src and ../../Cargo.toml's [package.metadata.android]).
 // cargo-apk only produces APKs; Google Play requires an Android App Bundle
 // (.aab) for new app uploads, and AGP's bundleRelease task is the only

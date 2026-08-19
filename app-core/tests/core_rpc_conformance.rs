@@ -250,7 +250,7 @@ fn node_env() -> NodeEnv {
     // A per-run watch wallet is REQUIRED against the shared node, and its
     // absence is a hard failure for the same reason missing credentials are:
     // the alternative is quietly doing the wrong thing. Without it the code
-    // under test creates and imports into the PRODUCTION `chain-notes-watch`
+    // under test creates and imports into the PRODUCTION `graffito-watch`
     // wallet, which every run then grows — it reached 642 txs / 404
     // descriptors that way, and since a rescan is O(blocks x descriptors)
     // under the wallet lock, a `timestamp: 0` import cost ~130s against ~0.5s
@@ -262,7 +262,7 @@ fn node_env() -> NodeEnv {
     if std::env::var("CN_WATCH_WALLET").map(|v| v.trim().is_empty()).unwrap_or(true) {
         panic!(
             "CN_WATCH_WALLET is not set. This suite drives the PRODUCTION Core transport, so without \
-             a per-run wallet name it creates and bloats the shared `chain-notes-watch` wallet on the \
+             a per-run wallet name it creates and bloats the shared `graffito-watch` wallet on the \
              {network} node (PLAN-one-regtest-node.md, \"Two things now grow\"). Fix: export a unique \
              name first, e.g. `export CN_WATCH_WALLET=\"cn-conf-$$-$(date +%s)\"`, alongside the \
              CN_NETWORK/CN_NODE_* and CORE_RPC_* variables."
@@ -273,13 +273,13 @@ fn node_env() -> NodeEnv {
 
 /// The watch wallet this run's assertions must target — the same name the code
 /// under test resolves (`CoreRpcTransport::WATCH_WALLET_ENV`). Asserting
-/// against a hardcoded "chain-notes-watch" while the transport wrote somewhere
+/// against a hardcoded "graffito-watch" while the transport wrote somewhere
 /// else would check an empty wallet and pass for the wrong reason.
 fn watch_wallet() -> String {
     std::env::var("CN_WATCH_WALLET")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "chain-notes-watch".to_string())
+        .unwrap_or_else(|| "graffito-watch".to_string())
 }
 
 fn network_of(env: &NodeEnv) -> Network {
@@ -328,7 +328,7 @@ impl Node {
     /// routes its transport-under-test through the counting proxy instead,
     /// which is why nothing here calls this. **Never print or embed this
     /// string in a panic/assert message** — it carries the real shared
-    /// node's credentials (`chain-notes-app` is a PUBLIC repo).
+    /// node's credentials (`graffito` is a PUBLIC repo).
     #[allow(dead_code)]
     fn core_rpc_url(&self) -> String {
         format!("bitcoind+http://{}:{}@{}:{}", self.env.user, self.env.pass, self.env.host, self.env.port)
@@ -438,7 +438,7 @@ impl Node {
     }
 
     /// Best-effort cleanup for a throwaway signing wallet THIS RUN created
-    /// (never `testwallet`, never `chain-notes-watch` — production state
+    /// (never `testwallet`, never `graffito-watch` — production state
     /// this suite doesn't own). Doesn't delete wallet files on the node,
     /// just unloads it so repeated runs don't leave an ever-growing pile of
     /// loaded wallets on a shared, persistent node.
@@ -458,7 +458,7 @@ fn connect_node() -> Node {
     node
 }
 
-/// Waits (bounded) for the shared node's `chain-notes-watch` wallet to
+/// Waits (bounded) for the shared node's `graffito-watch` wallet to
 /// finish any IN-PROGRESS rescan before this test starts touching it.
 /// Purely test-harness courtesy for a genuinely observed hazard on the
 /// shared, multi-consumer node (`PLAN-one-regtest-node.md`): bitcoind
@@ -466,7 +466,7 @@ fn connect_node() -> Node {
 /// "Wallet is currently rescanning. Abort existing rescan or wait.")  — and
 /// on a node other agents/suites/the real app may be touching at the same
 /// moment, SOMEONE ELSE'S rescan can already be running the instant this
-/// test makes its very first touch of `chain-notes-watch`. Observed live
+/// test makes its very first touch of `graffito-watch`. Observed live
 /// (2026-08-02): four tests in one run each hit -4 on their FIRST touch of
 /// the wallet, and a direct `getwalletinfo` moments after that run ended
 /// showed `scanning: false` — i.e. genuinely external, transient
@@ -498,10 +498,10 @@ fn wait_for_watch_wallet_idle(node: &Node) {
             return;
         }
         if Instant::now() >= deadline {
-            eprintln!("cb: test-harness gave up waiting for chain-notes-watch to finish rescanning after 300s");
+            eprintln!("cb: test-harness gave up waiting for graffito-watch to finish rescanning after 300s");
             return;
         }
-        eprintln!("cb: test-harness waiting for a concurrent chain-notes-watch rescan to clear (shared node)");
+        eprintln!("cb: test-harness waiting for a concurrent graffito-watch rescan to clear (shared node)");
         std::thread::sleep(Duration::from_secs(3));
     }
 }
@@ -590,7 +590,7 @@ fn sweep_wallet_to_testwallet(node: &Node, wallet: &str) {
 }
 
 /// RAII guard for a throwaway SIGNING wallet (a `sender`-role wallet this
-/// suite created — NEVER `testwallet`/`chain-notes-watch`, production
+/// suite created — NEVER `testwallet`/`graffito-watch`, production
 /// state this suite doesn't own): on `Drop`, sweeps its balance back to
 /// `testwallet` and unloads it — success OR failure. Rust's default test
 /// profile is `panic = "unwind"` (verified: neither this repo's
@@ -743,7 +743,7 @@ fn random_account() -> u32 {
 /// throwaway `bitcoind` process and this lock only existed to avoid
 /// resource contention between them), this now guards CORRECTNESS: every
 /// test shares the SAME shared node and, more specifically, the SAME
-/// production `chain-notes-watch` wallet the code under test creates
+/// production `graffito-watch` wallet the code under test creates
 /// lazily — two tests racing on it concurrently (cargo's default
 /// `#[test]` parallelism) could see each other's descriptor imports
 /// mid-assertion. Recovers from a poisoned lock (an earlier test panicking)
@@ -823,7 +823,7 @@ fn build_scenario_tx(node: &Node, txid: &str, tip: u64) -> ScenarioTx {
 /// assertion on RESULTS alone cannot tell the two implementations apart.
 /// This CAN: a ranged family's `desc` is `tr(...)`/`wpkh(...)` with a
 /// wildcard; the per-address fallback's is literally `addr(<address>)`.
-/// Must be called against `"chain-notes-watch"`, matching
+/// Must be called against `"graffito-watch"`, matching
 /// `CoreRpcTransport::WATCH_WALLET` (private to app-core, so this test
 /// hardcodes the string it must match).
 fn watch_wallet_descriptors(node: &Node) -> Vec<(String, u32)> {
@@ -903,7 +903,7 @@ fn build_conformance_fixture() -> ConformanceFixture {
 
     // The throwaway signing wallet holds every test address's private key
     // (so it can sign the spend-with-change / OP_RETURN-note / broadcast-
-    // probe legs). The watch-only "chain-notes-watch" wallet is created
+    // probe legs). The watch-only "graffito-watch" wallet is created
     // LAZILY by the CoreRpcTransport under test, never here. Guarded from
     // this point on — a panic anywhere below (fixture building OR the
     // caller's own `assert_chain_contract` run) still sweeps it back to
@@ -1510,7 +1510,7 @@ fn core_rpc_cli_scan_wires_ranged_watch_descriptors() {
     assert!(cli_bin.exists(), "expected the built cli binary at {cli_bin:?}");
 
     let store_path =
-        std::env::temp_dir().join(format!("chain-notes-cli-scan-wiring-{}.json", std::process::id()));
+        std::env::temp_dir().join(format!("graffito-cli-scan-wiring-{}.json", std::process::id()));
     let _ = std::fs::remove_file(&store_path);
 
     let run_cli = |args: &[&str], app_index: u32| -> std::process::Output {
@@ -1692,7 +1692,7 @@ fn core_rpc_preflight_reports_missing_txindex() {
 #[test]
 fn core_rpc_ranged_import_sends_the_caller_birthday_not_zero() {
     let mock = common::mock_rpc::MockRpcServer::start();
-    mock.set("createwallet", common::mock_rpc::MockResponse::Ok(serde_json::json!({"name": "chain-notes-watch"})));
+    mock.set("createwallet", common::mock_rpc::MockResponse::Ok(serde_json::json!({"name": "graffito-watch"})));
     // No descriptors configured yet on this fresh synthetic wallet —
     // `ranged_family_imported_end` must see nothing and fall through to a
     // real `import_ranged` call.
@@ -1903,7 +1903,7 @@ fn core_rpc_confirmed_tx_json_is_cached_but_a_pending_one_is_never_served_stale(
     let txid = "ab".repeat(32);
     let addr = "bcrt1pmockaddressfortxcachetest0000000000000000000000000000";
 
-    mock.set("createwallet", common::mock_rpc::MockResponse::Ok(serde_json::json!({"name": "chain-notes-watch"})));
+    mock.set("createwallet", common::mock_rpc::MockResponse::Ok(serde_json::json!({"name": "graffito-watch"})));
     mock.set("getaddressinfo", common::mock_rpc::MockResponse::Ok(serde_json::json!({"ismine": true})));
     mock.set("getblockcount", common::mock_rpc::MockResponse::Ok(serde_json::json!(800)));
 
@@ -1992,7 +1992,7 @@ fn core_rpc_tx_json_cache_is_bounded() {
     let mock = common::mock_rpc::MockRpcServer::start();
     let addr = "bcrt1pmockaddressforcachecaptest0000000000000000000000000000000";
 
-    mock.set("createwallet", common::mock_rpc::MockResponse::Ok(serde_json::json!({"name": "chain-notes-watch"})));
+    mock.set("createwallet", common::mock_rpc::MockResponse::Ok(serde_json::json!({"name": "graffito-watch"})));
     mock.set("getaddressinfo", common::mock_rpc::MockResponse::Ok(serde_json::json!({"ismine": true})));
     mock.set("getblockcount", common::mock_rpc::MockResponse::Ok(serde_json::json!(800)));
     // Every txid resolves to the SAME confirmed, empty-vin/vout body — the
@@ -2406,7 +2406,7 @@ fn core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero() {
     // though it is always exactly one RPC call. Not a call-count defect,
     // but the same "grows without bound" family the coordinator flagged;
     // logging the count here is a cheap trend signal for future runs.
-    eprintln!("cb: chain-notes-watch now carries {} total descriptor entries", timestamps.len());
+    eprintln!("cb: graffito-watch now carries {} total descriptor entries", timestamps.len());
     assert!(
         timestamps.values().any(|&ts| ts == birthday),
         "expected a descriptor carrying the exact caller-supplied birthday {birthday}, \
@@ -2415,7 +2415,7 @@ fn core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero() {
     );
     // NOTE: unlike the old locally-spawned-node version of this test, this
     // can no longer also assert "no descriptor anywhere carries the
-    // genesis-clamp value `1`" — the shared `chain-notes-watch` wallet may
+    // genesis-clamp value `1`" — the shared `graffito-watch` wallet may
     // already carry OTHER descriptors (from earlier runs of this suite, or
     // other consumers of the shared node) imported at genesis. The
     // targeted assertion above (the caller-supplied birthday shows up

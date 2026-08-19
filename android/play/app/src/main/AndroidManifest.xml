@@ -2,7 +2,7 @@
 <!--
   Hand-mirrored from the cargo-apk-generated manifest of the known-good
   sideload release APK at
-  /Users/sal/Projects/prime/graffito/target-mobile/release/apk/chain-notes-app.apk
+  /Users/sal/Projects/prime/graffito/target-mobile/release/apk/graffito.apk
   (read-only reference checkout, sibling of this worktree — dumped with
   aapt2's "dump xmltree" subcommand).
 
@@ -60,7 +60,7 @@
             android:configChanges="orientation|keyboardHidden|screenSize">
             <meta-data
                 android:name="android.app.lib_name"
-                android:value="chain_notes_app" />
+                android:value="graffito" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

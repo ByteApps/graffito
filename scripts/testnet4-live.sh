@@ -49,7 +49,7 @@ bug()  { echo "${YEL}BUG ${NC} $*"; }
 export CORE_RPC_USER CORE_RPC_PASS
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-WORK="${E2E_WORK:-$(mktemp -d /tmp/chain-notes-app-t4-live.XXXXXX)}"
+WORK="${E2E_WORK:-$(mktemp -d /tmp/graffito-t4-live.XXXXXX)}"
 T4_HOST="${E2E_T4_HOST:-127.0.0.1}"
 T4_PORT="${E2E_T4_PORT:-48332}"
 BASE="bitcoind+http://$T4_HOST:$T4_PORT"
@@ -327,7 +327,7 @@ FUND_WIF=""  # belt and braces
 STORE="$WORK/sim-store.json"
 COMPOSE_TXID=""
 NOTE_ID=""
-NOTE_TEXT="chain-notes-app testnet4-live-pass: real note through the Core RPC backend ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+NOTE_TEXT="graffito testnet4-live-pass: real note through the Core RPC backend ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
 if [[ "$STEP345_OK" == 1 ]]; then
     echo
     echo "== step 4: compose + broadcast ONE note through the Core RPC backend =="

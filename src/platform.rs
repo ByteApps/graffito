@@ -200,7 +200,7 @@ pub fn spike_clipboard() -> Result<(), String> {
 /// a real iOS device.
 #[cfg(target_vendor = "apple")]
 pub fn spike_file_protection() -> Result<(), String> {
-    let dir = std::env::temp_dir().join("chain-notes-spike-fileprot");
+    let dir = std::env::temp_dir().join("graffito-spike-fileprot");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     protect_data_dir(&dir);
@@ -555,7 +555,7 @@ mod android_jni {
     }
 
     /// context.getSystemService("clipboard").setPrimaryClip(
-    ///     ClipData.newPlainText("chain-notes", text))
+    ///     ClipData.newPlainText("graffito", text))
     ///
     /// `sensitive` additionally marks the clip with
     /// `ClipDescription.EXTRA_IS_SENSITIVE` (honored from API 33) so the
@@ -583,7 +583,7 @@ mod android_jni {
                     &[JValue::Object(&name)],
                 )?
                 .l()?;
-            let label = env.new_string("chain-notes")?;
+            let label = env.new_string("graffito")?;
             let value = env.new_string(text)?;
             let clip = env
                 .call_static_method(

@@ -1,4 +1,4 @@
-package xyz.foundation.chainnotes;
+package xyz.foundation.graffito;
 
 import android.app.Activity;
 import android.hardware.biometrics.BiometricPrompt;

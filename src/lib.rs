@@ -2249,7 +2249,7 @@ impl DestLen for String {
     }
 }
 
-/// chain-notes companion note.html permalink, or empty on regtest.
+/// Graffito companion note.html permalink, or empty on regtest.
 fn note_web_url(network: Network, address: &str, note_id: &str) -> String {
     match network {
         Network::Regtest => String::new(),
@@ -11923,7 +11923,7 @@ pub fn run() {
 
     let data_dir = std::env::var("APP_DATA_DIR").map(PathBuf::from).unwrap_or_else(|_| {
         PathBuf::from(std::env::var("HOME").expect("HOME"))
-            .join("Library/Application Support/ChainNotes")
+            .join("Library/Application Support/Graffito")
     });
     let _ = std::fs::create_dir_all(&data_dir);
     // Data-at-rest (audit M1). Directory first: every file created inside

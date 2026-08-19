@@ -1,4 +1,4 @@
-//! app-core — UI-free core for chain-notes-app.
+//! app-core — UI-free core for graffito.
 //!
 //! Wraps notes-core (the frozen PNTE protocol, pinned by rev) with what a
 //! native online app adds: identity create/import (BIP-39 / xprv / WIF /

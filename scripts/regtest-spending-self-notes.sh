@@ -33,7 +33,7 @@
 # exit instead of quietly proving less. Each run also derives a fresh
 # APP_ACCOUNT so its notebook/spending addresses are brand new on the
 # shared chain (the Pi's chain is never wiped/reset; this script only ever
-# touches server.py's own chain-notes-watch/chain-notes-miner wallets, not
+# touches server.py's own graffito-watch/graffito-miner wallets, not
 # the Pi's testwallet). Never prints a credential value.
 set -euo pipefail
 GRN=$'\033[32m'; RED=$'\033[31m'; NC=$'\033[0m'

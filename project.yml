@@ -1,4 +1,4 @@
-name: chain-notes-app
+name: graffito
 options:
   bundleIdPrefix: com.objsal
   createIntermediateGroups: true
@@ -7,18 +7,18 @@ settings:
     MARKETING_VERSION: "1.0"
     CURRENT_PROJECT_VERSION: "61"
 targets:
-  chain-notes-app:
+  graffito:
     type: application
     platform: iOS
     deploymentTarget: "16.0"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.byteapps.graffito
-        PRODUCT_NAME: chain-notes-app
-        EXECUTABLE_NAME: chain-notes-app
+        PRODUCT_NAME: graffito
+        EXECUTABLE_NAME: graffito
         CODE_SIGN_STYLE: Automatic
         # Set via env at `xcodegen generate` time (not committed) — see
-        # ../private/chain-notes-app/signing.env for the local value.
+        # ../private/graffito/signing.env for the local value.
         DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
         GENERATE_INFOPLIST_FILE: NO
         # Single-size 1024px icon in Assets.xcassets/AppIcon.appiconset,
@@ -27,9 +27,9 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # iCloud-contacts feature (2026-07-20): NSUbiquitousKeyValueStore
         # needs the ubiquity-kvstore-identifier capability — same identifier
-        # as the macOS target (chain-notes-mac.entitlements) so the two
+        # as the macOS target (graffito-mac.entitlements) so the two
         # platforms share one KV store.
-        CODE_SIGN_ENTITLEMENTS: chain-notes-ios.entitlements
+        CODE_SIGN_ENTITLEMENTS: graffito-ios.entitlements
         # iPhone ONLY (Sal 2026-07-26). Without this xcodegen defaults an iOS
         # app to "1,2" (iPhone + iPad), and App Store submission then demands a
         # full iPad Pro 12.9" screenshot set for a UI that is phone-shaped and
@@ -41,7 +41,7 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: Graffito
-        CFBundleExecutable: chain-notes-app
+        CFBundleExecutable: graffito
         # xcodegen regenerates Info.plist from these properties on every
         # `generate` — without an explicit entry here it defaults
         # CFBundleVersion to "1" every time, silently discarding
@@ -71,15 +71,15 @@ targets:
     postCompileScripts:
       - name: Build Rust binary with cargo
         script: |
-          bash "${SRCROOT}/build_ios.bash" chain-notes-app
+          bash "${SRCROOT}/build_ios.bash" graffito
         outputFiles:
           - $(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)
 
   # macOS Mac App Store build. Same bundle id as iOS → Universal Purchase.
-  # App-Sandboxed (chain-notes-mac.entitlements) and Mac-App-Store-signed.
+  # App-Sandboxed (graffito-mac.entitlements) and Mac-App-Store-signed.
   # The Rust bin is built (universal, per $ARCHS) and code-signed by Xcode
   # via the build_mac.bash post-compile step — mirrors build_ios.bash.
-  chain-notes-app-mac:
+  graffito-mac:
     type: application
     platform: macOS
     deploymentTarget: "12.0"
@@ -87,10 +87,10 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.byteapps.graffito
         # Bundle is "Graffito.app" (user-visible in Finder/switcher). The
-        # Unix executable stays chain-notes-app so build_mac.bash keeps copying
-        # the Rust binary to Contents/MacOS/chain-notes-app.
+        # Unix executable stays graffito so build_mac.bash keeps copying
+        # the Rust binary to Contents/MacOS/graffito.
         PRODUCT_NAME: Graffito
-        EXECUTABLE_NAME: chain-notes-app
+        EXECUTABLE_NAME: graffito
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
         GENERATE_INFOPLIST_FILE: NO
@@ -98,7 +98,7 @@ targets:
         # (single 1024, ios platform) is untouched.
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon-mac
         # App Sandbox + camera/files/network/keychain-access-groups.
-        CODE_SIGN_ENTITLEMENTS: chain-notes-mac.entitlements
+        CODE_SIGN_ENTITLEMENTS: graffito-mac.entitlements
         # Hardened Runtime (audit M5). App Sandbox and Hardened Runtime cover
         # different things: the sandbox limits what this process may reach,
         # Hardened Runtime stops another process running as the same user from
@@ -115,7 +115,7 @@ targets:
       properties:
         CFBundleDisplayName: Graffito
         CFBundleName: Graffito
-        CFBundleExecutable: chain-notes-app
+        CFBundleExecutable: graffito
         CFBundlePackageType: APPL
         NSCameraUsageDescription: "Scan QR codes (keys, addresses, PSBTs, sync bundles)."
         NSHighResolutionCapable: true
@@ -130,6 +130,6 @@ targets:
     postCompileScripts:
       - name: Build Rust binary with cargo
         script: |
-          bash "${SRCROOT}/build_mac.bash" chain-notes-app
+          bash "${SRCROOT}/build_mac.bash" graffito
         outputFiles:
           - $(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)

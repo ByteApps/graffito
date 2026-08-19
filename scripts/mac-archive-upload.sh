@@ -3,8 +3,8 @@
 # TestFlight. Sibling of ios-archive-upload.sh — same App Store Connect API key
 # auth, same "Xcode session signs, key can't cloud-sign" model.
 #
-# The macOS target (chain-notes-app-mac, scheme chain-notes-app-mac) is
-# App-Sandboxed (chain-notes-mac.entitlements) and signed for the Mac App Store
+# The macOS target (graffito-mac, scheme graffito-mac) is
+# App-Sandboxed (graffito-mac.entitlements) and signed for the Mac App Store
 # (Apple Distribution + a Mac App Store provisioning profile, minted on demand by
 # -allowProvisioningUpdates using the Xcode signed-in session).
 #
@@ -31,10 +31,10 @@ for v in TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_PATH; do
 done
 [ -s "$ASC_KEY_PATH" ] || { echo "!! ASC key missing at $ASC_KEY_PATH — run appstore/install.sh" >&2; exit 1; }
 
-SCHEME=chain-notes-app-mac
-PROJECT="$REPO/chain-notes-app.xcodeproj"
+SCHEME=graffito-mac
+PROJECT="$REPO/graffito.xcodeproj"
 BUILD_DIR="$REPO/build/mac-release"
-ARCHIVE="$BUILD_DIR/chain-notes-app-mac.xcarchive"
+ARCHIVE="$BUILD_DIR/graffito-mac.xcarchive"
 EXPORT_DIR="$BUILD_DIR/export"
 EXPORT_OPTS="$BUILD_DIR/ExportOptions.plist"
 LOG="$BUILD_DIR/archive.log"
@@ -78,7 +78,7 @@ grep -q "ARCHIVE SUCCEEDED" "$LOG" || { echo "ARCHIVE FAILED — see $LOG" >&2; 
 # the local archive is the only symbolication source for old builds.
 BUILD_NUM="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleVersion' "$ARCHIVE/Info.plist" 2>/dev/null || echo unknown)"
 ORG_DIR="$HOME/Library/Developer/Xcode/Archives/$(date +%Y-%m-%d)"
-ORG_ARCHIVE="$ORG_DIR/chain-notes-app macOS build $BUILD_NUM.xcarchive"
+ORG_ARCHIVE="$ORG_DIR/graffito macOS build $BUILD_NUM.xcarchive"
 mkdir -p "$ORG_DIR"
 rm -rf "$ORG_ARCHIVE"
 cp -R "$ARCHIVE" "$ORG_ARCHIVE"
