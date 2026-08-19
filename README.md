@@ -47,6 +47,20 @@ On Android, a **Google Play closed beta** is on its way — the same app, packag
 - [THIRD-PARTY.md](THIRD-PARTY.md) — libraries this app is built on
 - `PLAN-chain-notes-app.md` (workspace repo) — design document and milestones
 
+## Support
+
+If this app is useful to you, a small bitcoin donation is always appreciated — entirely optional.
+
+<div align="center">
+
+<img src="donate-qr.png" alt="Donate bitcoin" width="200">
+
+**`bc1qkmg7qek6vuuw6hqp9sm06krzcr7pwd5jhcr43f`**
+
+</div>
+
+Donations help cover development costs and keep more open-source bitcoin tools coming. No VC funding, no ads, no tracking.
+
 ## License & disclaimer
 
 Licensed under the [Apache License 2.0](LICENSE-APACHE). It disclaims all warranty and liability; the notes below restate that in plain language.
