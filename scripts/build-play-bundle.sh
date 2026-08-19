@@ -117,8 +117,13 @@ echo "== cargo-apk output: $APK"
 # --- 2. extract libgraffito.so into the Gradle project's jniLibs ----
 PLAY_DIR="$REPO/android/play"
 JNI_DIR="$PLAY_DIR/app/src/main/jniLibs/arm64-v8a"
+# Sweep the whole dir, not just the current lib name: after the
+# prime-chain-notes -> graffito crate rename, a stale libchain_notes_app.so
+# sat here and rode into the .aab alongside the real lib (caught 2026-08-19
+# by the pre-upload salt check). Any lib the copy below doesn't recreate is
+# by definition stale.
+rm -rf "$JNI_DIR"
 mkdir -p "$JNI_DIR"
-rm -f "$JNI_DIR/libgraffito.so"
 
 UNZIP_TMP="$(mktemp -d)"
 trap 'rm -rf "$UNZIP_TMP"' EXIT
