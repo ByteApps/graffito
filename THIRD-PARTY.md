@@ -39,10 +39,10 @@ also be incompatible with keeping this repo Apache-2.0.
 That license is conditional. Section 2 grants it only if the application
 either displays the `AboutSlint` widget in an About screen reachable from the
 top level, or shows the Slint attribution badge on a public page where the app
-can be found. **Both are in place** — the widget on Settings → About & help →
-About (`ui/app.slint`, gated by `info-show-slint`), and the badge on
-[byteapps.com](https://byteapps.com). Removing either one ends the grant, so
-treat them as build requirements rather than decoration.
+can be found. **This app elects the widget branch**: `AboutSlint` renders on
+Settings → About & help → About (`ui/app.slint`, gated by `info-show-slint`).
+That widget is the load-bearing attribution — removing it ends the grant, so
+treat it as a build requirement rather than decoration.
 
 Section 3 of the same license excludes embedded systems, which is why the
 Passport Prime peer app ([prime-graffito](https://github.com/ByteApps/prime-graffito))
