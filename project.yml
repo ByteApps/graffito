@@ -117,6 +117,12 @@ targets:
         CFBundleName: Graffito
         CFBundleExecutable: graffito
         CFBundlePackageType: APPL
+        # Same trap as the iOS target above: without this entry xcodegen
+        # defaults CFBundleVersion to "1" on every generate — which is how
+        # the first org-account macOS upload went out as "build 1" while
+        # CURRENT_PROJECT_VERSION said 61. Track the shared setting so one
+        # bump moves both platforms.
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSCameraUsageDescription: "Scan QR codes (keys, addresses, PSBTs, sync bundles)."
         NSHighResolutionCapable: true
         ITSAppUsesNonExemptEncryption: false
