@@ -10,7 +10,7 @@
 /Info-mac.plist
 
 # Internal docs kept in the private workspace companion
-# (prime/private/chain-notes-app) — not published in this (public-ready)
+# (prime/private/graffito) — not published in this (public-ready)
 # repo. Copies live there; these are the working-tree originals a local
 # checkout may still have on disk from before the move.
 /CLAUDE.md
@@ -23,7 +23,7 @@
 /signing.env
 
 # App Store Connect signing + config, symlinked from the private companion
-# (prime/private/chain-notes-app/appstore) — certs, ASC key, provisioning
+# (prime/private/graffito/appstore) — certs, ASC key, provisioning
 # profiles, team/app ids. Never publish.
 /appstore
 

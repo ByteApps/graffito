@@ -1198,7 +1198,7 @@ mod tests {
     /// but through `build_wallet_sweep_mixed`/`build_sweep_tx_mixed`
     /// (raw signed tx, not a PSBT). Verification recipe mirrors notes-core's
     /// own `sweep_mixed_taproot_and_wpkh_cross_check` test one layer down
-    /// (`prime-chain-notes/notes-core/tests/mixed_tx.rs`): re-derive both
+    /// (`prime-graffito/notes-core/tests/mixed_tx.rs`): re-derive both
     /// sighashes independently via rust-bitcoin and check each witness
     /// verifies under its own BIP against the actual signing key.
     #[test]

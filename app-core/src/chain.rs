@@ -1,7 +1,7 @@
 //! Esplora/mempool.space chain client → in-memory notes-core SyncBundle.
 //!
 //! Mirrors the companion's scan semantics exactly (chain-scan.js /
-//! index.html in prime-chain-notes): full history = `/address/:a/txs`
+//! index.html in prime-graffito): full history = `/address/:a/txs`
 //! then `/address/:a/txs/chain?after_txid=` while pages come back full
 //! (25); a tx enters `notes_onchain` iff it carries ≥1 OP_RETURN payload;
 //! `spends_from_self` = any input prevout is ours (the OWN-note rule),
@@ -307,7 +307,7 @@ static TX_JSON_CACHE: std::sync::LazyLock<Mutex<HashMap<(String, String), serde_
 /// instead, on a platform (a phone) that can least afford it.
 ///
 /// Arithmetic: one cache entry is a confirmed transaction's fully-built
-/// esplora-shaped JSON. A typical chain-notes tx (1-2 inputs, a recipient
+/// esplora-shaped JSON. A typical Graffito tx (1-2 inputs, a recipient
 /// output, an OP_RETURN chunk or two, maybe a taproot change output)
 /// serializes to roughly 0.5-1 KB; an outlier — a wallet sweep/consolidate
 /// pulling in many inputs — runs a few KB. At [`TX_JSON_CACHE_MAX_ENTRIES`]
@@ -546,7 +546,7 @@ pub fn node_backend_label(base: &str) -> &'static str {
 ///    as before. Also the ENTIRE behavior when nothing has been configured
 ///    at all, so every existing test and caller stays green.
 ///
-/// Ported from the reference implementation, `prime-chain-notes/companion/
+/// Ported from the reference implementation, `prime-graffito/companion/
 /// server.py`, which does the identical per-address translation against a
 /// real node and backs the whole regtest e2e + app↔Prime interop matrix.
 ///
@@ -826,7 +826,7 @@ fn btc_to_sats(btc: f64) -> u64 {
 /// Does `tx` (an esplora-shaped JSON value, as built by
 /// [`CoreRpcTransport::esplora_tx_json`]) touch `address` — an input
 /// prevout OR an output? The watch wallet is SHARED across every address
-/// ever queried (one `chain-notes-watch` wallet holds every imported
+/// ever queried (one `graffito-watch` wallet holds every imported
 /// `addr()` descriptor), so `listtransactions` returns other addresses'
 /// txs too; this filter is load-bearing exactly as the plan's §1.3 table
 /// notes — without it a gap-limit scan never finds an unused address and
@@ -852,7 +852,7 @@ impl CoreRpcTransport {
     /// fallback) or ranged families (U4, [`Self::watch_descriptors`]).
     /// Blank + private-keys-disabled, exactly like the reference
     /// `companion/server.py` shim's `cn-watch`.
-    const WATCH_WALLET: &'static str = "chain-notes-watch";
+    const WATCH_WALLET: &'static str = "graffito-watch";
 
     /// Environment override for [`Self::WATCH_WALLET`], for HARNESSES ONLY.
     ///
@@ -3069,7 +3069,7 @@ fn classify_tx_inner(tx: &EsploraTx, address: &str, network: Option<Network>) ->
 
     // FROZEN: prefer the first TAPROOT input prevout address — this is the
     // sender rule notes-core/contacts/reply-target logic keys off, since a
-    // taproot address is the one that can double as a chain-notes identity.
+    // taproot address is the one that can double as a Graffito identity.
     // Do not change the taproot-first preference.
     //
     // DISPLAY-ONLY fallback: when the tx has no taproot input at all (e.g.
@@ -4549,10 +4549,10 @@ mod tests {
         // The default path is what matters, and it is what ships.
         assert_eq!(
             CoreRpcTransport::watch_wallet(),
-            "chain-notes-watch",
+            "graffito-watch",
             "the default watch wallet name is production state — harnesses \
              override it via CN_WATCH_WALLET, they do not change this"
         );
-        assert_eq!(CoreRpcTransport::WATCH_WALLET, "chain-notes-watch");
+        assert_eq!(CoreRpcTransport::WATCH_WALLET, "graffito-watch");
     }
 }

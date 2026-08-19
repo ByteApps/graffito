@@ -4,7 +4,7 @@
 
 #[cfg(not(target_os = "android"))]
 fn main() {
-    chain_notes_app::run();
+    graffito::run();
 }
 
 #[cfg(target_os = "android")]

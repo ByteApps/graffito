@@ -28,7 +28,7 @@ fn compose_note_standalone() {
         compose_note(
             &ident,
             &utxos,
-            "hello from chain-notes-app (M0 smoke)",
+            "hello from graffito (M0 smoke)",
             private,
             80, // chunked path
             1.0,

@@ -39,7 +39,7 @@ const DECRYPT_MODE: i32 = 2;
 const GCM_TAG_BITS: i32 = 128;
 
 fn alias(account: &str) -> String {
-    format!("chain-notes-app.{account}")
+    format!("graffito.{account}")
 }
 
 /// Where the wrapped blob lives — app-private internal storage, seeded by
@@ -357,7 +357,7 @@ fn user_presence_check(reason: &str) -> Result<(), String> {
             "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
             &[JValue::Object(&buf), JValue::Object(&parent)],
         )?;
-        let name = jstr(env, "xyz.foundation.chainnotes.BiometricBridge")?;
+        let name = jstr(env, "xyz.foundation.graffito.BiometricBridge")?;
         let class = env
             .call_method(
                 &loader,

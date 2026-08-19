@@ -9,7 +9,7 @@ cargo build --release
 APP="$REPO/target/Graffito.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/chain-notes-app "$APP/Contents/MacOS/"
+cp target/release/graffito "$APP/Contents/MacOS/"
 cp assets/icon/mac/AppIcon.icns "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -18,7 +18,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <dict>
     <key>CFBundleIdentifier</key><string>com.byteapps.graffito</string>
     <key>CFBundleName</key><string>Graffito</string>
-    <key>CFBundleExecutable</key><string>chain-notes-app</string>
+    <key>CFBundleExecutable</key><string>graffito</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>NSCameraUsageDescription</key>

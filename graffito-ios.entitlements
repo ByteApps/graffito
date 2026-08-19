@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- iOS entitlements for chain-notes-app. Referenced by the iOS target's
+<!-- iOS entitlements for graffito. Referenced by the iOS target's
      CODE_SIGN_ENTITLEMENTS (project.yml). No secrets here —
      $(TeamIdentifierPrefix) is resolved to the team prefix by the signing
      toolchain at build time.
@@ -9,7 +9,7 @@
                                       NSUbiquitousKeyValueStore (src/icloud.rs)
                                       syncs the device-level contacts list
                                       Mac <-> iPhone. SAME identifier as the
-                                      macOS target (chain-notes-mac.entitlements)
+                                      macOS target (graffito-mac.entitlements)
                                       so both platforms read/write the one KV
                                       store — required for iCloud KV sync to
                                       work at all; the iOS target previously

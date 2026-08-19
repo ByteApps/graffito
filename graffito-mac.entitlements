@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- App Sandbox entitlements for the Mac App Store build of chain-notes-app.
+<!-- App Sandbox entitlements for the Mac App Store build of graffito.
      Referenced by the macOS target's CODE_SIGN_ENTITLEMENTS (project.yml).
      No secrets here — $(AppIdentifierPrefix) is resolved to the team prefix
      by the signing toolchain at build time.
@@ -18,7 +18,7 @@
                                       needs this capability to sync the
                                       device-level contacts list iPhone <-> Mac;
                                       SAME identifier as the iOS target
-                                      (chain-notes-ios.entitlements) so both
+                                      (graffito-ios.entitlements) so both
                                       platforms read/write the one KV store. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

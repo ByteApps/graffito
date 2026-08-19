@@ -1,9 +1,9 @@
 [package]
-name = "chain-notes-app"
+name = "graffito"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Native Mac/iOS/Android peer for chain notes (PNTE protocol)"
+description = "Native Mac/iOS/Android peer for Graffito (PNTE protocol)"
 
 [workspace]
 members = ["app-core"]
@@ -14,7 +14,7 @@ members = ["app-core"]
 crate-type = ["lib", "cdylib"]
 
 [[bin]]
-name = "chain-notes-app"
+name = "graffito"
 path = "src/main.rs"
 
 # Cross-platform (macOS desktop + iOS/Android mobile). Platform-specific glue
@@ -84,7 +84,7 @@ ndk-context = "0.1"
 # cargo-apk packaging (NativeActivity via android-activity). Build:
 #   cargo apk build --lib --target aarch64-linux-android
 [package.metadata.android]
-package = "xyz.foundation.chainnotes.app"
+package = "xyz.foundation.graffito.app"
 build_targets = ["aarch64-linux-android"]
 # Launcher icon: adaptive (anydpi-v26 fg/bg layers) + legacy mipmaps,
 # all generated from assets/icon/icon.svg.
@@ -113,7 +113,7 @@ theme = "@android:style/Theme.DeviceDefault.NoActionBar"
 # manifest section, and (for the plain, non-`--release` dev profile)
 # auto-locates/creates the debug keystore on its own with no config at
 # all. Set the two env vars locally — see
-# ../private/chain-notes-app/signing.env — before `cargo apk build
+# ../private/graffito/signing.env — before `cargo apk build
 # --release`; plain `cargo apk build` needs nothing.
 
 # Chain sync + broadcast (esplora/mempool.space over HTTPS). cargo-apk

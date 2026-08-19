@@ -12,7 +12,7 @@
 // developer holding the display name "ByteApps" does not reserve any id
 // prefix, only the exact string it published.
 // This is deliberately a DIFFERENT id from the iOS/macOS bundle id family
-// (xyz.foundation.chainnotes.app, set at the Rust-package level in
+// (xyz.foundation.graffito.app, set at the Rust-package level in
 // ../../../Cargo.toml's [package.metadata.android] — that id is cargo-apk's
 // sideload/dev path, NOT what ships to Play) — CONFIRM this is the intended id
 // with Sal before running `./gradlew bundleRelease` against a real upload, and
@@ -35,7 +35,10 @@ android {
         applicationId = playApplicationId
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
+        // Play rejects a re-upload of an existing versionCode. 1 = the
+        // 2026-08-16 internal release (shipped WITHOUT native debug symbols —
+        // stripped at link, unrecoverable). 2 adds native-debug-symbols.zip.
+        versionCode = 2
         versionName = "0.1.0"
     }
 
@@ -53,7 +56,7 @@ android {
             // drift. AGP is fine merging a res dir outside the module tree.
             res.srcDirs("../../../assets/icon/android/res")
             // Staged by scripts/build-play-bundle.sh from the cargo-apk
-            // output (lib/arm64-v8a/libchain_notes_app.so extracted out of
+            // output (lib/arm64-v8a/libgraffito.so extracted out of
             // the APK cargo-apk builds) — see .gitignore, this directory's
             // contents are a build product, not checked in.
             jniLibs.srcDirs("src/main/jniLibs")
@@ -82,7 +85,7 @@ android {
     signingConfigs {
         create("release") {
             // Values come from the environment (sourced from
-            // ../../../../private/chain-notes-app/android-signing.env by
+            // ../../../../private/graffito/android-signing.env by
             // scripts/build-play-bundle.sh) — never hardcoded, never
             // committed. Fail loudly rather than silently falling back to
             // an unsigned/debug-signed bundle.
@@ -92,7 +95,7 @@ android {
             if (releaseTaskRequested) {
                 require(!ksPath.isNullOrBlank()) {
                     "ANDROID_UPLOAD_KEYSTORE is not set — source " +
-                        "private/chain-notes-app/android-signing.env before " +
+                        "private/graffito/android-signing.env before " +
                         "running ./gradlew bundleRelease (see " +
                         "scripts/build-play-bundle.sh)."
                 }
@@ -122,6 +125,16 @@ android {
             signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
             isShrinkResources = false
+            // NB: `ndk { debugSymbolLevel = "SYMBOL_TABLE" }` does NOT work
+            // here and was removed after being tried (2026-08-16). AGP only
+            // extracts native symbols from libraries IT builds via
+            // externalNativeBuild (CMake/ndk-build); it ignores a prebuilt
+            // .so dropped into jniLibs, which is exactly what this
+            // source-less wrapper packages. Setting it produced an AAB with
+            // no BUNDLE-METADATA/…/debugsymbols entry AND shipped the .so
+            // unstripped — 19.6 MB instead of 14.8 MB. Symbols are therefore
+            // produced by scripts/build-play-bundle.sh as a separate
+            // native-debug-symbols.zip and uploaded to Play by hand.
         }
     }
 

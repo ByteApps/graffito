@@ -125,7 +125,7 @@
 # free on a short chain, fatal on testnet4, and dangerous on ANY shared
 # node since another consumer's import can start one underneath this
 # script at any moment (app-core and server.py both use the SAME
-# `chain-notes-watch` wallet on the node). Three rules, all implemented
+# `graffito-watch` wallet on the node). Three rules, all implemented
 # here: (1) `pre_watch_fresh` registers this run's fresh addresses in that
 # wallet at a RECENT timestamp (not 0) before app-core/server.py's own
 # lazy per-address import would otherwise fall back to genesis — this
@@ -187,7 +187,7 @@ CN_CONFIRM_TIMEOUT="${CN_CONFIRM_TIMEOUT:-1800}"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 PRIME="$(cd "$REPO/../prime-graffito" && pwd)" || fail "needs ../prime-graffito"
-WORK="${E2E_WORK:-$(mktemp -d /tmp/chain-notes-app-e2e.XXXXXX)}"
+WORK="${E2E_WORK:-$(mktemp -d /tmp/graffito-e2e.XXXXXX)}"
 
 echo "== build both host binaries =="
 ( cd "$REPO" && cargo build -q -p app-core --example cli )
@@ -252,7 +252,7 @@ echo "$NETWORK node reachable at $CN_NODE_HOST:$CN_NODE_PORT, tip=$TIP_BEFORE (p
 # The wallet is PER RUN, and that is the whole point. A rescan costs
 # O(blocks x descriptors), so a long-lived shared watch wallet gets
 # monotonically slower as every run imports more addresses into it: measured
-# 2026-08-04 on the shared `chain-notes-watch`, one `timestamp: 0` import
+# 2026-08-04 on the shared `graffito-watch`, one `timestamp: 0` import
 # took **130 seconds** (630 txs, hundreds of descriptors) against **0.5s**
 # for the identical import into a fresh wallet on the same chain. At 130s
 # the app's own 30s HTTP timeout fires first, which is exactly how this
@@ -260,7 +260,7 @@ echo "$NETWORK node reachable at $CN_NODE_HOST:$CN_NODE_PORT, tip=$TIP_BEFORE (p
 # mid-run that nothing could have pre-registered, so it paid full price.
 #
 # Exported so the server.py this script launches uses the same wallet
-# (server.py reads CN_WATCH_WALLET, defaulting to `chain-notes-watch`).
+# (server.py reads CN_WATCH_WALLET, defaulting to `graffito-watch`).
 # NOTE this only covers the Esplora path: in --core-rpc mode the app talks
 # to the node directly and uses app-core's own WATCH_WALLET constant, which
 # is correct for production (a real user has one wallet, holding only their

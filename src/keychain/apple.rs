@@ -727,7 +727,7 @@ pub fn spike_atomic() -> Result<(), String> {
     // so no LAContext gate. That isolates the promotion logic from the
     // biometric path, which `spike_atomic_auth` covers separately.
     set_generic_password(SERVICE, &staging, b"orphaned secret").map_err(|e| e.to_string())?;
-    let recovered = load_secret_protected(account, "chain-notes-app atomic spike")?;
+    let recovered = load_secret_protected(account, "graffito atomic spike")?;
     let promoted = item_exists(account) && !item_exists(&staging);
     cleanup();
     match recovered.as_deref() {
@@ -753,7 +753,7 @@ pub fn spike_atomic_auth() -> Result<(), String> {
     add_item(&staging, "recovered secret", false)?;
     println!("cb: spike-keychain-atomic-auth staged (expect a prompt now)");
 
-    let loaded = load_secret_protected(account, "chain-notes-app recovery spike")?;
+    let loaded = load_secret_protected(account, "graffito recovery spike")?;
     let promoted = item_exists(account) && !item_exists(&staging);
     let _ = purge_account(account);
     let _ = purge_account(&staging);
@@ -773,7 +773,7 @@ pub fn spike_auth() -> Result<(), String> {
     let account = "spike-auth-test";
     store_secret_protected(account, "protected test secret", false)?;
     println!("cb: spike-keychain-auth stored (expect a Touch ID prompt now)");
-    let loaded = load_secret_protected(account, "chain-notes-app keychain spike")?;
+    let loaded = load_secret_protected(account, "graffito keychain spike")?;
     delete_secret(account)?;
     match loaded.as_deref() {
         Some("protected test secret") => {
