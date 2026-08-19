@@ -698,7 +698,7 @@ dependencies = [
 [[package]]
 name = "bip85-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ObjSal/prime-bip85.git?rev=dbc446534e67314d40c06c3261812fccede3ec29#dbc446534e67314d40c06c3261812fccede3ec29"
+source = "git+ssh://git@github.com/ByteApps/prime-bip85.git?rev=dbc446534e67314d40c06c3261812fccede3ec29#dbc446534e67314d40c06c3261812fccede3ec29"
 dependencies = [
  "bs58",
  "hmac",
@@ -1070,41 +1070,6 @@ dependencies = [
  "chacha20 0.9.1",
  "cipher",
  "poly1305",
- "zeroize",
-]
-
-[[package]]
-name = "chain-notes-app"
-version = "0.1.0"
-dependencies = [
- "app-core",
- "bip39",
- "block2 0.6.2",
- "core-foundation 0.10.1",
- "core-foundation-sys 0.8.7",
- "dispatch2",
- "getrandom 0.2.17",
- "hex",
- "jni 0.21.1",
- "ndk-context",
- "nokhwa",
- "objc2 0.6.4",
- "objc2-av-foundation",
- "objc2-core-foundation",
- "objc2-core-media",
- "objc2-core-video",
- "objc2-foundation 0.3.2",
- "objc2-local-authentication",
- "objc2-ui-kit 0.3.2",
- "png 0.17.16",
- "qrcode",
- "rfd",
- "rqrr",
- "security-framework",
- "security-framework-sys",
- "serde_json",
- "slint",
- "slint-build",
  "zeroize",
 ]
 
@@ -2423,6 +2388,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c4ee00b289aba7a9e5306d57c2d05499b2e5dc427f84ac708bd2c090212cf3e"
 dependencies = [
  "gl_generator",
+]
+
+[[package]]
+name = "graffito"
+version = "0.1.0"
+dependencies = [
+ "app-core",
+ "bip39",
+ "block2 0.6.2",
+ "core-foundation 0.10.1",
+ "core-foundation-sys 0.8.7",
+ "dispatch2",
+ "getrandom 0.2.17",
+ "hex",
+ "jni 0.21.1",
+ "ndk-context",
+ "nokhwa",
+ "objc2 0.6.4",
+ "objc2-av-foundation",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation 0.3.2",
+ "objc2-local-authentication",
+ "objc2-ui-kit 0.3.2",
+ "png 0.17.16",
+ "qrcode",
+ "rfd",
+ "rqrr",
+ "security-framework",
+ "security-framework-sys",
+ "serde_json",
+ "slint",
+ "slint-build",
+ "zeroize",
 ]
 
 [[package]]
