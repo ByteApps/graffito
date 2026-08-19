@@ -76,7 +76,7 @@ cannot use it and is GPL-3.0-or-later instead.
 
 | Library | Version | License | Used for |
 |---|---|---|---|
-| [bip85-core](https://github.com/ObjSal/prime-bip85) | pinned git rev | MIT OR Apache-2.0 | Parity-test fixture generator (real BIP-85 outputs feed the importer tests) |
+| [bip85-core](https://github.com/ByteApps/prime-bip85) | pinned git rev | MIT OR Apache-2.0 | Parity-test fixture generator (real BIP-85 outputs feed the importer tests) |
 
 ## Patched dependencies
 
