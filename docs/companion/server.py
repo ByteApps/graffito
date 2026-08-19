@@ -121,7 +121,7 @@ _wallets_ready = set()   # wallets we've confirmed loaded this process
 
 class TxNotFound(RuntimeError):
     """A DEFINITIVELY unknown txid — bitcoind RPC error code -5. Esplora
-    answers this with a plain 404, not a 400; graffito's dropped-tx
+    answers this with a plain 404, not a 400; the graffito desktop app's dropped-tx
     detection (TxLookupStatus::NotFound) depends on the real status code,
     so this must never fire for a transport/other error (those keep
     raising a plain RuntimeError -> 400, unchanged)."""
@@ -270,7 +270,7 @@ def mine(blocks=1):
     # callbacks drain on the scheduler thread AFTER generatetoaddress
     # returns) — without this, a listunspent served right after a mine can
     # answer from the PRE-block view: freshly-spent coins still listed,
-    # fresh outputs missing. The graffito UI suite's mixed-sweep leg
+    # fresh outputs missing. The graffito desktop app's UI suite's mixed-sweep leg
     # raced exactly that (scanned its consolidate's spent inputs as
     # spendable → missing-inputs on broadcast). Best-effort: the drain is
     # a consistency optimization — a hiccup in this hidden RPC must never
@@ -326,7 +326,7 @@ def esplora_tx(txid, tip):
             # live node: a mempool vin has no `prevout` key at all, a confirmed
             # one does. Without this fallback every unconfirmed tx reports
             # `scriptpubkey_address: null` for its inputs, and a consumer that
-            # identifies ownership by input address (graffito's
+            # identifies ownership by input address (the graffito desktop app's
             # spending-wallet-funded self-notes) mis-files its OWN note as
             # `received` until a block arrives.
             #
@@ -482,7 +482,7 @@ def handle_api(handler, method, path, query, body):
         return txs[:50 if not chain_only else PAGE_SIZE]
 
     # /node/api/tx/{txid}[/hex] — single-tx lookup (esplora shape / raw hex),
-    # what the graffito watch-mode bump/rebroadcast path reads.
+    # what the graffito desktop app's watch-mode bump/rebroadcast path reads.
     if method == "GET" and len(parts) >= 5 and parts[3] == "tx" and parts[4]:
         if len(parts) >= 6 and parts[5] == "hex":
             return cli("getrawtransaction", parts[4])
@@ -673,7 +673,7 @@ def main():
 
     print(f"companion on http://localhost:{port}  (node: {_node['network'] if _node else 'off'})")
     # request_queue_size: the default listen backlog (5) is too small for
-    # the graffito's scan workers — each opens its own connection,
+    # the graffito desktop app's scan workers — each opens its own connection,
     # and a burst of queued scans can fill the backlog so a broadcast
     # POST's connect gets REFUSED ("error sending request"). This server
     # is single-threaded on purpose (deterministic ordering for tests);
