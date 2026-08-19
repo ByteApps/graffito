@@ -41,7 +41,12 @@ android {
         // 3 = the 2026-08-18 graffito crypto epoch (graffito/enc/v1 salts,
         // notes-core 28b7daf, CLASSIFY_VERSION 3) — earlier builds' private
         // notes are permanently undecryptable, by decision.
-        versionCode = 3
+        // scripts/play-release.sh --validate builds a PROBE bundle with an
+        // unused code (-PplayVersionCode=N) so supply's validate_only pass can
+        // exercise the full upload — aab + native symbols in one edit —
+        // without committing anything. The hardcoded default stays the source
+        // of truth for real releases.
+        versionCode = (project.findProperty("playVersionCode") as String?)?.toInt() ?: 3
         versionName = "0.1.1"
     }
 

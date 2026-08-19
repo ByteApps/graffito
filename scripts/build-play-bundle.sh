@@ -138,9 +138,12 @@ cp "$SO_SRC" "$JNI_DIR/libgraffito.so"
 # (2026-08-16) shipped stripped and its stacks are unrecoverable for good.
 # So: zip the UNSTRIPPED .so as native-debug-symbols.zip (Play expects the
 # libs laid out under <abi>/), then strip the copy staged for the bundle.
-# The zip is uploaded BY HAND in Play Console → App bundle explorer → the
-# version → Downloads → "Upload native debug symbols"; AGP cannot do it for
-# us (see the note in android/play/app/build.gradle.kts's release block).
+# The zip is uploaded by `fastlane android beta` in the SAME Play edit as
+# the .aab (supply's `mapping:` param, deobfuscationFileType nativeCode) —
+# it MUST ride in that edit, because the API refuses to attach symbols to
+# an already-committed bundle (400 FAILED_PRECONDITION, learned 2026-08-19
+# when versionCode 3 shipped symbol-less). AGP cannot do it for us (see the
+# note in android/play/app/build.gradle.kts's release block).
 [ -s "$JNI_DIR/libgraffito.so" ] || { echo "!! staged .so missing" >&2; exit 1; }
 if ! file "$JNI_DIR/libgraffito.so" | grep -q "not stripped"; then
     echo "!! staged .so is already STRIPPED — no symbols to extract." >&2
@@ -183,14 +186,35 @@ echo "== bundletool: $BUNDLETOOL_JAR"
 
 # --- 4. Gradle: package the .aab --------------------------------------------
 cd "$PLAY_DIR"
-echo "== ./gradlew bundleRelease"
-./gradlew bundleRelease --console=plain
+echo "== ./gradlew bundleRelease${PLAY_VERSION_CODE:+ (-PplayVersionCode=$PLAY_VERSION_CODE)}"
+./gradlew bundleRelease --console=plain ${PLAY_VERSION_CODE:+-PplayVersionCode="$PLAY_VERSION_CODE"}
 
 AAB="$PLAY_DIR/app/build/outputs/bundle/release/app-release.aab"
 [ -s "$AAB" ] || { echo "!! expected AAB not found: $AAB" >&2; exit 1; }
+
+# --- 5. structural checks + build stamp -------------------------------------
+# Exactly ONE native lib, and it is libgraffito.so: a stale differently-named
+# .so left in jniLibs/ once rode into the bundle beside the real one (the
+# pre-rename libchain_notes_app.so with the OLD enc salt, caught 2026-08-19).
+AAB_LIBS="$(unzip -l "$AAB" | awk '{print $NF}' | grep -E '^base/lib/.*\.so$' || true)"
+if [ "$AAB_LIBS" != "base/lib/arm64-v8a/libgraffito.so" ]; then
+    echo "!! unexpected native-lib set inside the .aab:" >&2
+    echo "$AAB_LIBS" >&2
+    exit 1
+fi
+
+# Stamp the aab/symbols pair so the upload lane can prove they came from ONE
+# build run (mtime ordering can't: gradle finishes after the symbols zip).
+STAMP="$PLAY_DIR/app/build/outputs/play-release-stamp"
+{
+    echo "aab_sha256=$(shasum -a 256 "$AAB" | awk '{print $1}')"
+    echo "symbols_sha256=$(shasum -a 256 "$SYMS_ZIP" | awk '{print $1}')"
+} > "$STAMP"
 
 echo
 echo "== DONE"
 echo "AAB:    $AAB"
 echo "Size:   $(wc -c < "$AAB") bytes"
 echo "SHA256: $(shasum -a 256 "$AAB" | awk '{print $1}')"
+echo "Symbols: $SYMS_ZIP"
+echo "Stamp:  $STAMP"
