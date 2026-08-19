@@ -16,7 +16,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-notes-core = { git = "ssh://git@github.com/ByteApps/prime-graffito.git", rev = "c7ab388da9afbf8162c31c1ea4a296210a2edcdc" }
+notes-core = { git = "ssh://git@github.com/ByteApps/prime-graffito.git", rev = "28b7dafffad1c0a01d00af93870e8000c7aece63" }
 # base64 feature = PSBT <-> base64 string (`.psbt` file / clipboard export).
 bitcoin = { version = "0.32", features = ["base64"] }
 # Output-descriptor parsing + address derivation for external funding wallets
