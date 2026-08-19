@@ -9,7 +9,7 @@
 # -allowProvisioningUpdates using the Xcode signed-in session).
 #
 # Prereqs (once): the app RECORD exists in App Store Connect as a Universal
-# Purchase (iOS + macOS under com.objsal.chainnotes — already created), and the
+# Purchase (iOS + macOS under com.byteapps.graffito — already created), and the
 # paid account is added in Xcode > Settings > Accounts (for distribution signing).
 #
 # Usage (from the repo root):

@@ -5,17 +5,18 @@
 #   source appstore/config.local.env    # TEAM_ID / ASC_TEAM_ID / APPLE_ID / APP_BUNDLE_ID
 # (appstore/ is symlinked from prime/private/chain-notes-app/appstore).
 
-app_identifier(ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes")  # public — ships in the app
+app_identifier(ENV["APP_BUNDLE_ID"] || "com.byteapps.graffito")  # public — ships in the app
 apple_id(ENV["APPLE_ID"].to_s)                                   # Apple account (interactive auth only)
 itc_team_id(ENV["ASC_TEAM_ID"].to_s)                             # App Store Connect provider id
 team_id(ENV["TEAM_ID"].to_s)                                     # Apple Developer Program team id
 
 for_platform :osx do
-  app_identifier(ENV["APP_BUNDLE_ID"] || "com.objsal.chainnotes") # same id → Universal Purchase
+  app_identifier(ENV["APP_BUNDLE_ID"] || "com.byteapps.graffito") # same id → Universal Purchase
 end
 
 # Google Play (fastlane supply). Independent of the Apple identity above —
-# Android ships under its own package name, not com.objsal.chainnotes.
+# though since the 2026-08-18 org migration the Android package name and the
+# Apple bundle id are the SAME string (com.byteapps.graffito).
 package_name(ENV["ANDROID_PACKAGE_NAME"] || "com.byteapps.graffito")
 # Play service-account JSON key (created once the Play Developer account and
 # app record exist, via Play Console > Setup > API access > Create new

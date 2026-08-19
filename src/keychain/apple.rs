@@ -47,7 +47,7 @@ extern "C" {
 }
 use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete};
 
-const SERVICE: &str = "com.objsal.chainnotes";
+const SERVICE: &str = "com.byteapps.graffito";
 const ERR_NOT_FOUND: i32 = -25300; // errSecItemNotFound
 const ERR_CANCELED: i32 = -128; // errSecUserCanceled
 /// errSecInteractionNotAllowed — returned when a query matches an item that

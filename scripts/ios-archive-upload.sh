@@ -8,7 +8,7 @@
 #
 # Prereqs (once): the app RECORD must exist in App Store Connect
 #   (fastlane ios create_app), and the Bundle ID must be registered
-#   (fastlane ios ensure_bundle_id — already done for com.objsal.chainnotes).
+#   (fastlane ios ensure_bundle_id — already done for com.byteapps.graffito).
 #
 # Usage (from the repo root):
 #   source signing.env                 # DEVELOPMENT_TEAM
