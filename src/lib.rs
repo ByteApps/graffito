@@ -14378,6 +14378,10 @@ pub fn run() {
         };
         w.set_info_title(title.into());
         w.set_info_body(body.as_str().into());
+        // The Slint attribution rides the About entry only. Section 2 of the
+        // Slint Royalty-free license makes it a condition of the grant, so
+        // this flag is load-bearing, not cosmetic — see THIRD-PARTY.md.
+        w.set_info_show_slint(kind.as_str() == "about");
         w.set_screen(25);
         println!("cb: open-info {kind}");
     });
@@ -17380,6 +17384,12 @@ pub fn run() {
 /// Populate every external-funding screen with representative mock data for
 /// the `CN_PREVIEW` design harness.
 fn preview_mock(w: &AppWindow) {
+    // Screen 25 is content-driven, so without this it previews blank. Staged
+    // as the About entry specifically, since that is the one the Slint
+    // attribution rides on and the preview is how we check it still renders.
+    w.set_info_title("About".into());
+    w.set_info_body(about_body().as_str().into());
+    w.set_info_show_slint(true);
     w.set_directed(true);
     w.set_gift_sats("330".into());
     w.set_backup_words(
