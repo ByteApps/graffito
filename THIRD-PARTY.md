@@ -23,10 +23,30 @@ Direct dependencies of this app and its `app-core` library. The complete transit
 
 | Library | Version | License | Used for |
 |---|---|---|---|
-| [slint](https://slint.dev) (+ slint-build) | 1.17.1 (pinned) | GPL-3.0-only OR Slint Royalty-free OR Slint commercial | The UI toolkit (used here under GPL-compatible terms with this repo's MIT/Apache-2.0 code) |
+| [slint](https://slint.dev) (+ slint-build) | 1.17.1 (pinned) | GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0 | The UI toolkit. **This app elects the Royalty-free license** — see the note below |
 | [qrcode](https://crates.io/crates/qrcode) | 0.14 | MIT OR Apache-2.0 | QR rendering (addresses, signed txs, backups) |
 | [rqrr](https://crates.io/crates/rqrr) | 0.7 | MIT OR Apache-2.0 | QR decoding from camera frames |
 | [png](https://crates.io/crates/png) | 0.17 | MIT OR Apache-2.0 | PNG encode for `--render` snapshots (dev tool) |
+
+### Which Slint license this app uses
+
+Slint is offered under three licenses and a user picks one. This app is
+distributed under the **Slint Royalty-free Desktop, Mobile, and Web
+Applications License 2.0**, *not* the GPL — deliberately, because the GPL
+option would conflict with the App Store's terms of distribution and would
+also be incompatible with keeping this repo Apache-2.0.
+
+That license is conditional. Section 2 grants it only if the application
+either displays the `AboutSlint` widget in an About screen reachable from the
+top level, or shows the Slint attribution badge on a public page where the app
+can be found. **Both are in place** — the widget on Settings → About & help →
+About (`ui/app.slint`, gated by `info-show-slint`), and the badge on
+[byteapps.com](https://byteapps.com). Removing either one ends the grant, so
+treat them as build requirements rather than decoration.
+
+Section 3 of the same license excludes embedded systems, which is why the
+Passport Prime peer app ([prime-graffito](https://github.com/ByteApps/prime-graffito))
+cannot use it and is GPL-3.0-or-later instead.
 
 ## macOS
 

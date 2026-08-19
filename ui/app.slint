@@ -2,7 +2,13 @@
 // layout. Property/callback names are the contract with main.rs — do
 // not rename. Router: `screen` property; every action emits a cb: line
 // on the Rust side.
-import { ListView, Switch } from "std-widgets.slint";
+// AboutSlint carries the "Made with Slint" mark. It is REQUIRED, not
+// decoration: this app ships under the Slint Royalty-free Desktop, Mobile
+// and Web Applications License 2.0, whose section 2 grants the license
+// only if the app either shows this widget in an About screen reachable
+// from the top level, or carries the attribution badge on its download
+// page. We do both -- see THIRD-PARTY.md.
+import { ListView, Switch, AboutSlint } from "std-widgets.slint";
 
 export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string, private: bool }
 // One notebook row: `unread` is a preformatted badge label ("3 new"), empty =
@@ -1532,6 +1538,9 @@ export component AppWindow inherits Window {
     // and, from Settings, a read-only re-view (terms-accept-mode = false).
     in property <string> info-title;
     in property <string> info-body;
+    // True only for the About entry, which is the screen the Slint license
+    // requires the attribution on -- not Privacy/Help/Q&A/Terms.
+    in property <bool> info-show-slint;
     in property <string> disclaimer-body;
     in property <bool> terms-accept-mode;
     // Settings scroll position, preserved across sub-screen visits (Rust resets
@@ -5596,6 +5605,9 @@ export component AppWindow inherits Window {
                 text: root.info-body;
                 font-size: 17px;
             }
+        }
+        if root.info-show-slint: AboutSlint {
+            height: 110px;
         }
     }
 
