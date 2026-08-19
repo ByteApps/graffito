@@ -158,7 +158,7 @@ slint-build = "=1.17.1"
 # a no-op. Nothing else differs. Verify after any slint/winit bump with
 # `scripts/check-private-apis.sh` (also run from build_mac.bash / build_ios.bash).
 [patch.crates-io]
-winit = { git = "https://github.com/ObjSal/winit", rev = "cea753eacbc334b1b61056efb6690075b5235cf1" }
+winit = { git = "https://github.com/ByteApps/winit", rev = "cea753eacbc334b1b61056efb6690075b5235cf1" }
 
 # Slint's text shaper (harfrust, via parley) has an integer add that overflows
 # on very large single text runs. Release wraps it (overflow-checks off by
