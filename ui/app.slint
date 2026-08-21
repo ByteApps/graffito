@@ -10,7 +10,12 @@
 // page. We do both -- see THIRD-PARTY.md.
 import { ListView, Switch, AboutSlint } from "std-widgets.slint";
 
-export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string, private: bool }
+// `locked`: a post-quantum note this device hasn't decrypted yet
+// (NoteRecord.locked.is_some() — text stays None until Store::unlock_note
+// succeeds). Distinct from `private`, which just means "encrypted" —
+// every private note (pq or not) already shows the padlock glyph next to
+// its title; `locked` additionally means "and we can't currently read it".
+export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string, private: bool, locked: bool }
 // One notebook row: `unread` is a preformatted badge label ("3 new"), empty =
 // no badge; `meta` is "addr-short · balance · note count".
 export struct NotebookItem { index: int, name: string, snippet: string, meta: string, unread: string, active: bool }
@@ -1584,6 +1589,22 @@ export component AppWindow inherits Window {
     // first (notes-core's `reply_set`), contact names resolved. Hidden
     // whenever length <= 1 — nothing to add beyond what plain Reply covers.
     in property <[ContactItem]> note-reply-set;
+    // ---- locked-note unlock (post-quantum note view) ----
+    // True while NoteRecord.locked is Some — text stays hidden until
+    // Store::unlock_note succeeds. `note-unlock-needs-password`: a
+    // passphrase field + Unlock button apply (FLAG_PW set, and — for a
+    // received note — the FLAG_MLKEM half either isn't set or this device
+    // already holds the key, so a password is genuinely the missing
+    // piece). When false and `note-locked` is true, `note-unlock-caption`
+    // explains why nothing can be typed to fix it (KEM-only and this
+    // device lacks the key, or an own note sealed with ML-KEM — the
+    // sender can never reopen that layer).
+    in property <bool> note-locked;
+    in property <bool> note-unlock-needs-password;
+    in property <string> note-unlock-caption;
+    in-out property <string> note-unlock-passphrase;
+    in property <bool> note-unlock-busy;
+    callback unlock-note();
 
     // The primary recipient's contact name / address, or "Self (my
     // notebook)" — NO "To: " prefix (Sal, 2026-07-19: the compose screen's
@@ -1640,6 +1661,35 @@ export component AppWindow inherits Window {
     // the transaction would be non-final and get rejected. Shown
     // regardless of expanded state (safety content).
     in property <string> compose-locktime-warn;
+    // ---- post-quantum layers (compose screen 6, "Security" collapsible —
+    // visible only for a directed+private single-recipient, non-watch
+    // note). LAST collapsible on the screen (Sal's e2e-drift rule: put new
+    // panels as late as possible so only the Sign/cost area below needs
+    // recalibration).
+    in-out property <bool> pq-expanded;
+    // Header status chip on the (always-visible) section header row.
+    in property <bool> pq-quantum-resistant;
+    in property <string> pq-status-chip: root.pq-quantum-resistant ? "Quantum-resistant" : "Not quantum-resistant";
+    // Passphrase layer: toggle + text (two-way — the Generate button fills
+    // it from Rust) + a Rust-computed strength line + whether the CURRENT
+    // text is a verified (untouched-since-generate) phrase.
+    in-out property <bool> pq-passphrase-enabled;
+    in-out property <string> pq-passphrase-text;
+    in property <bool> pq-passphrase-verified;
+    in property <string> pq-passphrase-strength-line;
+    // ML-KEM layer: toggle, whether the resolved recipient has a usable
+    // key on file, and a caption — "<level> · <fingerprint>" when
+    // available+on, else a hint to add one in Contacts when unavailable.
+    in-out property <bool> pq-mlkem-enabled;
+    in property <bool> pq-mlkem-available;
+    in property <string> pq-mlkem-caption;
+    // Bottom-of-section summary line — `passphrase::security_label`
+    // verbatim, recomputed in Rust on any relevant change; never
+    // reimplemented here.
+    in property <string> pq-security-label;
+    callback pq-generate-passphrase();
+    callback pq-passphrase-changed(string);
+    callback pq-mlkem-toggled(bool);
     // "Note too large to broadcast" dialog (per-tx ~100 kB ceiling).
     in-out property <bool> show-oversize-modal;
     in property <bool> oversize-offer-bump; // true → offer to switch to Standard
@@ -2837,6 +2887,7 @@ export component AppWindow inherits Window {
                                     tint: note.badge == "confirmed" ? Pal.good
                                         : (note.badge == "pending" ? Pal.warn : Pal.bad);
                                 }
+                                if note.locked: Badge { label: "locked"; tint: Pal.warn; }
                                 Caption {
                                     text: note.meta;
                                     vertical-alignment: center;
@@ -3025,6 +3076,61 @@ export component AppWindow inherits Window {
                 width: parent.width - 32px;
                 text: root.note-detail;
                 font-size: 12px;
+            }
+        }
+        // ---- locked-note unlock (post-quantum) ----
+        if root.note-locked && root.note-unlock-needs-password: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: unlock-col.preferred-height;
+            unlock-col := VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+                Image {
+                    source: @image-url("icons/lock.svg");
+                    colorize: Pal.warn;
+                    width: 16px;
+                    height: 16px;
+                    horizontal-alignment: left;
+                }
+                Caption { text: "This note is locked. Enter its passphrase to view it."; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    EditField {
+                        horizontal-stretch: 1;
+                        text <=> root.note-unlock-passphrase;
+                        placeholder-text: "passphrase";
+                        accepted => { root.unlock-note(); }
+                    }
+                    PrimaryButton {
+                        width: 100px;
+                        text: root.note-unlock-busy ? "…" : "Unlock";
+                        clicked => { root.unlock-note(); }
+                    }
+                }
+            }
+        }
+        if root.note-locked && !root.note-unlock-needs-password: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: unlock-hint-col.preferred-height;
+            unlock-hint-col := VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Image {
+                        source: @image-url("icons/lock.svg");
+                        colorize: Pal.muted;
+                        width: 16px;
+                        height: 16px;
+                    }
+                    Caption { text: root.note-unlock-caption; }
+                }
             }
         }
         HorizontalLayout {
@@ -3409,6 +3515,95 @@ export component AppWindow inherits Window {
                 }
                 if root.compose-locktime-expanded: Caption { text: root.compose-locktime-effective; }
                 if root.compose-locktime-warn != "": Caption { text: root.compose-locktime-warn; color: Pal.warn; }
+            }
+        }
+        // ---- post-quantum layers (directed + private + single-recipient,
+        // keyed only) — the LAST collapsible on this screen, deliberately:
+        // it only pushes the Sign/cost area below it, so that's the one
+        // area an e2e recalibration needs to touch. Imitates the Gift/
+        // Locktime panels exactly (same card/caret/caption shape).
+        if root.directed && root.compose-private && root.to-chips.length == 0 && !root.watch-only: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: pq-col.preferred-height;
+            pq-col := VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                Rectangle {
+                    height: 22px;
+                    TouchArea { clicked => { root.pq-expanded = !root.pq-expanded; } }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: "Security";
+                            font-size: 12px;
+                            color: Pal.muted;
+                            vertical-alignment: center;
+                        }
+                        Badge {
+                            label: root.pq-status-chip;
+                            tint: root.pq-quantum-resistant ? Pal.good : Pal.faint;
+                        }
+                        Rectangle { }
+                        Image {
+                            source: root.pq-expanded
+                                ? @image-url("icons/caret-up.svg")
+                                : @image-url("icons/caret-down.svg");
+                            colorize: Pal.muted;
+                            width: 16px;
+                            height: 16px;
+                        }
+                    }
+                }
+                // ---- passphrase layer ----
+                if root.pq-expanded: HorizontalLayout {
+                    Switch {
+                        text: "Passphrase";
+                        checked <=> root.pq-passphrase-enabled;
+                        toggled => { root.pq-passphrase-changed(root.pq-passphrase-text); }
+                    }
+                    Rectangle { }
+                }
+                if root.pq-expanded && root.pq-passphrase-enabled: HorizontalLayout {
+                    spacing: 8px;
+                    // Deliberately PLAIN text, not `input-type: password`:
+                    // the whole point of Generate is a phrase the user can
+                    // read and copy down (the same reasoning screen 19's
+                    // "Private keys" reveal already follows — a secret
+                    // meant to be recorded is shown, not masked).
+                    EditField {
+                        horizontal-stretch: 1;
+                        text <=> root.pq-passphrase-text;
+                        placeholder-text: "type, paste, or generate a passphrase";
+                        edited(t) => { root.pq-passphrase-changed(t); }
+                    }
+                    GhostButton {
+                        text: "Generate";
+                        width: 96px;
+                        clicked => { root.pq-generate-passphrase(); }
+                    }
+                }
+                if root.pq-expanded && root.pq-passphrase-enabled: Caption {
+                    text: root.pq-passphrase-strength-line;
+                    color: root.pq-passphrase-verified ? Pal.good : Pal.warn;
+                }
+                // ---- ML-KEM hybrid layer ----
+                if root.pq-expanded: HorizontalLayout {
+                    Switch {
+                        text: "Quantum encryption (ML-KEM)";
+                        enabled: root.pq-mlkem-available;
+                        checked <=> root.pq-mlkem-enabled;
+                        toggled => { root.pq-mlkem-toggled(self.checked); }
+                    }
+                    Rectangle { }
+                }
+                if root.pq-expanded && root.pq-mlkem-caption != "": Caption {
+                    text: root.pq-mlkem-caption;
+                    color: root.pq-mlkem-available ? Pal.muted : Pal.warn;
+                }
+                if root.pq-expanded: Caption { text: root.pq-security-label; }
             }
         }
         if root.mixed-linkage-hint: Caption {
