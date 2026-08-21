@@ -211,8 +211,12 @@ pub fn generate() -> Result<(String, f64), Error> {
 
 /// The three ML-KEM (FIPS 203) parameter sets offered for the note's PQ
 /// hybrid-encryption layer, ordered by parameter size (not necessarily by
-/// UI display order).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// UI display order). `Serialize`/`Deserialize` (added for `pqkeys::
+/// PqKeySource`, which persists which level a per-notebook derived key —
+/// or an imported one's declared level — uses) round-trip as the plain
+/// variant name (`"MlKem512"`/`"MlKem768"`/`"MlKem1024"`) via serde's
+/// default enum representation — pinned by a test in `pqkeys.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MlKemLevel {
     MlKem512,
     MlKem768,

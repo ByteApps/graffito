@@ -21,6 +21,7 @@ pub mod netq;
 pub mod notebooks;
 pub mod passphrase;
 pub mod pgp_import;
+pub mod pqkeys;
 pub mod psbt_build;
 pub mod psbt_finalize;
 pub mod scan_gate;

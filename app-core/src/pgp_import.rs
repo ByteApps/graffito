@@ -40,18 +40,24 @@
 //!   are `pub` modules (gated on `draft-pqc`, which this crate always
 //!   enables) exposing `SecretKey::try_from_bytes(classical_bytes, seed)`
 //!   and a `From<&SecretKey> for {MlKem768X25519,MlKem1024X448}PublicParams`
-//!   impl. Because the ML-KEM half of that expansion is fully independent
-//!   of the classical half, calling `try_from_bytes` with a throwaway
-//!   all-zero classical key and a REAL ML-KEM seed correctly re-derives
-//!   the same ML-KEM keypair a pure keygen would — which is how
-//!   `derive_ek_from_seed` expands a graffito-native private-only import
-//!   into its encapsulation key using only the `pgp` crate (already a
-//!   regular dependency), with no separate `ml-kem` dependency.
+//!   impl — the ORIGINAL way `derive_ek_from_seed` expanded a graffito-
+//!   native private-only import's seed into its encapsulation key, before
+//!   notes-core grew its own `pq` module. **Superseded**: `derive_ek_from_seed`
+//!   now delegates to `notes_core::pq::MlKemKeypair::from_seed` for all
+//!   three levels instead (see that function's doc) — this bullet point
+//!   and the two rpgp composite modules it describes are kept alive only
+//!   inside `pqkeys`'s cross-implementation parity test, which proves the
+//!   new path produces byte-identical eks to this original one at 768 and
+//!   1024 (there was never an rpgp-composite path for 512 to compare
+//!   against — see the next bullet).
 //! - There is no OpenPGP (or rpgp) composite for ML-KEM-512 — RFC 9980
-//!   only defines algorithm 35 (768+X25519) and 36 (1024+X448) — so that
-//!   expansion trick has nothing to reuse for level 512.
-//!   `derive_ek_from_seed` reports that gap via `ImportError::WrongAlg`
-//!   rather than silently returning wrong bytes; see that function's docs.
+//!   only defines algorithm 35 (768+X25519) and 36 (1024+X448). That NEVER
+//!   blocked `derive_ek_from_seed` (see above, superseded) — the OpenPGP
+//!   EXTRACTION paths (`extract_ek`/`extract_secret`/`import_from_public`/
+//!   `import_from_secret`) still only handle algorithm 35, unchanged,
+//!   because that is a real RFC 9980 protocol constraint (no v4 OpenPGP
+//!   key can ever carry a level-512 PQC component), not an implementation
+//!   gap in this module.
 //!
 //! # Scope note
 //!
@@ -335,47 +341,35 @@ fn parse_native_body(body: &str, is_secret: bool) -> Result<ImportedMlKem, Impor
     }
 }
 
-/// Expand a bare 64-byte `(d, z)` ML-KEM seed into its encapsulation key,
-/// using only rpgp's own composite modules (see module docs for why this
-/// is correct and why level 512 can't be supported this way).
-///
-/// The raw `EncapsulationKey::as_bytes()` accessor lives behind a trait
-/// defined in the standalone `ml-kem` crate, which this unit deliberately
-/// keeps out of app-core's regular dependencies (see Cargo.toml) — so
-/// instead of naming that crate, this serializes the WHOLE composite
-/// public-params struct through rpgp's own `Serialize` trait (classical
-/// key || ek, exactly the OpenPGP wire layout) and strips the classical
-/// prefix, using only APIs `pgp` itself exposes.
-fn derive_ek_from_seed(level: MlKemLevel, seed: &[u8; 64]) -> Result<Vec<u8>, ImportError> {
+/// `pgp_import::MlKemLevel` -> `notes_core::pq::MlKemAlg` — the two exist
+/// for different audiences (this module's OpenPGP/native-armor level ids
+/// vs. notes-core's crypto-facing enum) but always name the same three
+/// FIPS-203 parameter sets, so the conversion is total.
+fn to_pq_alg(level: MlKemLevel) -> notes_core::pq::MlKemAlg {
     match level {
-        MlKemLevel::MlKem768 => {
-            let sk = pgp::crypto::ml_kem768_x25519::SecretKey::try_from_bytes([0u8; 32], *seed)
-                .map_err(|e| ImportError::ParseFailed(format!("invalid ML-KEM-768 seed: {e}")))?;
-            let params: pgp::types::MlKem768X25519PublicParams = (&sk).into();
-            let wire = params
-                .to_bytes()
-                .map_err(|e| ImportError::ParseFailed(format!("failed to encode ek: {e}")))?;
-            Ok(wire[32..].to_vec()) // strip the 32-byte X25519 public key prefix
-        }
-        MlKemLevel::MlKem1024 => {
-            let sk = pgp::crypto::ml_kem1024_x448::SecretKey::try_from_bytes([0u8; 56], *seed)
-                .map_err(|e| ImportError::ParseFailed(format!("invalid ML-KEM-1024 seed: {e}")))?;
-            let params: pgp::types::MlKem1024X448PublicParams = (&sk).into();
-            let wire = params
-                .to_bytes()
-                .map_err(|e| ImportError::ParseFailed(format!("failed to encode ek: {e}")))?;
-            Ok(wire[56..].to_vec()) // strip the 56-byte X448 public key prefix
-        }
-        MlKemLevel::MlKem512 => Err(ImportError::WrongAlg(
-            "ML-KEM-512 has no RFC 9980 OpenPGP composite algorithm, so this build has \
-             no way to expand a bare ML-KEM-512 seed into its encapsulation key: rpgp \
-             only implements the ML-KEM-768+X25519 and ML-KEM-1024+X448 composites, and \
-             a standalone ML-KEM-512 keygen would need the `ml-kem` crate as a regular \
-             dependency, which this unit deliberately does not add. Import the public \
-             form instead, or use ML-KEM-768."
-                .into(),
-        )),
+        MlKemLevel::MlKem512 => notes_core::pq::MlKemAlg::MlKem512,
+        MlKemLevel::MlKem768 => notes_core::pq::MlKemAlg::MlKem768,
+        MlKemLevel::MlKem1024 => notes_core::pq::MlKemAlg::MlKem1024,
     }
+}
+
+/// Expand a bare 64-byte `(d, z)` ML-KEM seed into its encapsulation key.
+///
+/// Delegates to `notes_core::pq::MlKemKeypair::from_seed` for ALL THREE
+/// levels — notes-core's `pq` module (added for the graffito post-quantum
+/// notes feature) does the same FIPS-203 `generate_deterministic` keygen
+/// this module used to reach only indirectly, via rpgp's OpenPGP composite
+/// modules (`pgp::crypto::ml_kem768_x25519`/`ml_kem1024_x448`), which have
+/// no ML-KEM-512 composite at all (RFC 9980 doesn't define one). Going
+/// straight to notes-core removes that gap — level 512 now expands exactly
+/// like 768/1024 — and drops the rpgp-composite round trip entirely: no
+/// classical placeholder key, no OpenPGP wire-format serialize-then-strip.
+/// Byte-identical to the old rpgp-composite path for 768/1024 is PROVEN,
+/// not assumed — see `pqkeys`'s cross-implementation parity test, which
+/// keeps a copy of the old rpgp-composite code alive specifically to
+/// check this against notes-core's `pq` module.
+fn derive_ek_from_seed(level: MlKemLevel, seed: &[u8; 64]) -> Result<Vec<u8>, ImportError> {
+    Ok(notes_core::pq::MlKemKeypair::from_seed(to_pq_alg(level), seed).ek().to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -606,8 +600,8 @@ mod tests {
     }
 
     #[test]
-    fn native_private_round_trips_768_and_1024() {
-        for level in [MlKemLevel::MlKem768, MlKemLevel::MlKem1024] {
+    fn native_private_round_trips_all_levels() {
+        for level in [MlKemLevel::MlKem512, MlKemLevel::MlKem768, MlKemLevel::MlKem1024] {
             let mut seed = [0u8; 64];
             for (i, b) in seed.iter_mut().enumerate() {
                 *b = (i * 7 + 3) as u8;
@@ -628,11 +622,23 @@ mod tests {
     }
 
     #[test]
-    fn native_private_512_reports_the_real_gap_instead_of_faking_it() {
+    fn native_private_512_now_expands_via_notes_core_pq() {
+        // Superseded test (was `native_private_512_reports_the_real_gap_
+        // instead_of_faking_it`): level 512 used to have no rpgp composite
+        // to expand through, so `parse_mlkem_key` reported that gap loudly
+        // (`ImportError::WrongAlg`) rather than fake bytes. Now that
+        // `derive_ek_from_seed` delegates to notes-core's `pq` module for
+        // every level, 512 imports exactly like 768/1024 — this asserts
+        // the gap is genuinely closed, not just that the old error is
+        // gone, by cross-checking against notes-core directly.
         let seed = [0x42u8; 64];
         let armored = armor_native_private(MlKemLevel::MlKem512, &seed);
-        let err = parse_mlkem_key(&armored).unwrap_err();
-        assert!(matches!(err, ImportError::WrongAlg(_)));
+        let imported = parse_mlkem_key(&armored).unwrap();
+        assert_eq!(imported.alg, MlKemLevel::MlKem512);
+        assert_eq!(imported.ek.len(), MlKemLevel::MlKem512.ek_len());
+        let expected =
+            notes_core::pq::MlKemKeypair::from_seed(notes_core::pq::MlKemAlg::MlKem512, &seed);
+        assert_eq!(imported.ek, expected.ek());
     }
 
     #[test]
@@ -924,5 +930,93 @@ mod tests {
         let armored = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nnotbase64!!!\n-----END PGP PUBLIC KEY BLOCK-----\n";
         let err = parse_mlkem_key(armored).unwrap_err();
         assert!(matches!(err, ImportError::ParseFailed(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Cross-implementation parity (Unit 6, load-bearing): the ORIGINAL
+    // rpgp-composite ek expansion `derive_ek_from_seed` used before it was
+    // switched to delegate to notes-core's `pq` module (Unit 5), kept
+    // alive HERE — test-only, an independent implementation, never called
+    // from production code again — vs. `notes_core::pq::MlKemKeypair::
+    // from_seed` for the SAME 64-byte seed. There is no rpgp composite for
+    // ML-KEM-512 (RFC 9980 doesn't define one), so this only covers 768
+    // and 1024 — the two levels the production switch could have silently
+    // changed. If this ever disagrees: STOP. Do not adjust either side to
+    // force agreement — report it loudly, with the hex dumps the
+    // assertion messages carry, per the task brief.
+    // -----------------------------------------------------------------
+
+    /// `pgp::crypto::ml_kem768_x25519::SecretKey::try_from_bytes` with a
+    /// throwaway all-zero classical (X25519) key and the real ML-KEM seed
+    /// — exactly what `derive_ek_from_seed` did for level 768 before Unit
+    /// 5. Serializes the whole composite public-params struct through
+    /// rpgp's own `Serialize` trait and strips the 32-byte X25519 prefix.
+    fn old_rpgp_composite_ek_768(seed: &[u8; 64]) -> Vec<u8> {
+        let sk = pgp::crypto::ml_kem768_x25519::SecretKey::try_from_bytes([0u8; 32], *seed)
+            .expect("valid seed bytes");
+        let params: pgp::types::MlKem768X25519PublicParams = (&sk).into();
+        let wire = params.to_bytes().expect("serialize composite public params");
+        wire[32..].to_vec()
+    }
+
+    /// Same as [`old_rpgp_composite_ek_768`], level 1024 (X448, 56-byte
+    /// classical prefix).
+    fn old_rpgp_composite_ek_1024(seed: &[u8; 64]) -> Vec<u8> {
+        let sk = pgp::crypto::ml_kem1024_x448::SecretKey::try_from_bytes([0u8; 56], *seed)
+            .expect("valid seed bytes");
+        let params: pgp::types::MlKem1024X448PublicParams = (&sk).into();
+        let wire = params.to_bytes().expect("serialize composite public params");
+        wire[56..].to_vec()
+    }
+
+    #[test]
+    fn old_rpgp_composite_and_notes_core_pq_agree_byte_for_byte() {
+        use notes_core::pq::{MlKemAlg, MlKemKeypair};
+
+        // A handful of distinct, deterministic seeds — not exhaustive (ML-
+        // KEM keygen has no seed-dependent branching to hit edge cases
+        // for), just enough to rule out a fluke on one particular byte
+        // pattern.
+        let seeds: Vec<[u8; 64]> = vec![
+            [0u8; 64],
+            [0xffu8; 64],
+            {
+                let mut s = [0x42u8; 64];
+                s[0] = 0x00;
+                s[63] = 0xff;
+                s
+            },
+            {
+                let mut s = [0u8; 64];
+                for (i, b) in s.iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+                }
+                s
+            },
+        ];
+
+        for (i, seed) in seeds.iter().enumerate() {
+            let old_768 = old_rpgp_composite_ek_768(seed);
+            let new_768 = MlKemKeypair::from_seed(MlKemAlg::MlKem768, seed);
+            assert_eq!(
+                old_768,
+                new_768.ek(),
+                "ML-KEM-768 ek MISMATCH between the old rpgp-composite path and \
+                 notes-core's pq module, seed case {i}\n  old (rpgp)      = {}\n  new (notes-core) = {}",
+                hex::encode(&old_768),
+                hex::encode(new_768.ek()),
+            );
+
+            let old_1024 = old_rpgp_composite_ek_1024(seed);
+            let new_1024 = MlKemKeypair::from_seed(MlKemAlg::MlKem1024, seed);
+            assert_eq!(
+                old_1024,
+                new_1024.ek(),
+                "ML-KEM-1024 ek MISMATCH between the old rpgp-composite path and \
+                 notes-core's pq module, seed case {i}\n  old (rpgp)      = {}\n  new (notes-core) = {}",
+                hex::encode(&old_1024),
+                hex::encode(new_1024.ek()),
+            );
+        }
     }
 }
