@@ -4,14 +4,18 @@
 //! key material (private text decrypts back), cross-identity directed
 //! private notes, and orphan detection.
 
-use app_core::compose::{compose_and_record, ComposeRequest};
+use app_core::compose::{compose_and_record, compose_note, ComposeRequest};
 use app_core::derive::identity_from_leaf;
 use app_core::identity::{parse_key_material, realize};
 use app_core::notes_core::bundle::{BundleUtxo, Identity, OnchainTx, SyncBundle};
+use app_core::notes_core::envelope::{FLAG_MLKEM, FLAG_PW};
+use app_core::notes_core::pq::MlKemAlg;
 use app_core::notes_core::tx::{op_return_payload, NoteTx};
 use app_core::notes_core::Network;
+use app_core::pqkeys;
 use app_core::spending;
 use app_core::store::{LedgerUtxo, NoteRecord, NoteStatus, Store};
+use app_core::Error;
 
 const NET: Network = Network::Regtest;
 
@@ -112,7 +116,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1000 },
+        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1000, pq_password: None, pq_mlkem: None },
     )
     .unwrap();
     assert_eq!(store.notes.len(), 1);
@@ -123,7 +127,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 2000 },
+        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 2000, pq_password: None, pq_mlkem: None },
     )
     .unwrap();
     assert_eq!(
@@ -138,7 +142,7 @@ fn compose_confirm_recover_lifecycle() {
         vec![change_utxo(&n2.tx, Some(102))],
         102,
     );
-    let stats = store.apply_bundle(&b, &a, NET, &[], &[]).unwrap();
+    let stats = store.apply_bundle(&b, &a, NET, &[], &[], &[]).unwrap();
     assert_eq!(stats.orphaned, 0);
     assert!(store.notes.iter().all(|n| n.status == NoteStatus::Confirmed));
     assert_eq!(store.balance(), n2.tx.change);
@@ -146,13 +150,13 @@ fn compose_confirm_recover_lifecycle() {
 
     // Idempotency: re-applying the identical bundle changes nothing.
     let snapshot = serde_json::to_string(&store).unwrap();
-    store.apply_bundle(&b, &a, NET, &[], &[]).unwrap();
+    store.apply_bundle(&b, &a, NET, &[], &[], &[]).unwrap();
     assert_eq!(serde_json::to_string(&store).unwrap(), snapshot);
 
     // Wipe recovery: fresh store + bare key + full bundle = notebook
     // back, INCLUDING the private note's plaintext.
     let mut fresh = Store::new(&a.output_x, NET);
-    fresh.apply_bundle(&b, &a, NET, &[], &[]).unwrap();
+    fresh.apply_bundle(&b, &a, NET, &[], &[], &[]).unwrap();
     assert_eq!(fresh.notes.len(), 2);
     let recovered_private = fresh.notes.iter().find(|n| n.private).unwrap();
     assert_eq!(recovered_private.text.as_deref(), Some("second, private"));
@@ -181,7 +185,7 @@ fn directed_private_note_both_sides() {
             change_to: None,
             coins: None,
             fee_rate: 1.0,
-            gift_amount: None, lock_time: None, now: 3000,
+            gift_amount: None, lock_time: None, now: 3000, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -196,7 +200,7 @@ fn directed_private_note_both_sides() {
         105,
     );
     let mut alice_fresh = Store::new(&a.output_x, NET);
-    alice_fresh.apply_bundle(&alice_bundle, &a, NET, &[], &[]).unwrap();
+    alice_fresh.apply_bundle(&alice_bundle, &a, NET, &[], &[], &[]).unwrap();
     let note = &alice_fresh.notes[0];
     assert!(note.directed && note.private && !note.received);
     assert_eq!(note.recipient.as_deref(), Some(bob_addr.as_str()));
@@ -210,7 +214,7 @@ fn directed_private_note_both_sides() {
         105,
     );
     let mut bob_store = Store::new(&b.output_x, NET);
-    bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &[]).unwrap();
+    bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &[], &[]).unwrap();
     let received = &bob_store.notes[0];
     assert!(received.received && received.private && received.directed);
     assert_eq!(received.sender.as_deref(), Some(alice_addr.as_str()));
@@ -283,7 +287,7 @@ fn multi_recipient_note_recovers_recipients_on_rescan() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 1,
+            now: 1, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -291,7 +295,7 @@ fn multi_recipient_note_recovers_recipients_on_rescan() {
 
     let b = bundle(vec![onchain_own_multi(&composed.tx, 105)], vec![change_utxo(&composed.tx, Some(105))], 105);
     let mut fresh = Store::new(&a.output_x, NET);
-    fresh.apply_bundle(&b, &a, NET, &[], &[]).unwrap();
+    fresh.apply_bundle(&b, &a, NET, &[], &[], &[]).unwrap();
     let note = &fresh.notes[0];
     assert!(note.directed && !note.received);
     assert_eq!(note.recipient.as_deref(), Some(bob_addr.as_str()), "singular field keeps the first recipient");
@@ -309,7 +313,7 @@ fn unconfirmed_scanned_utxo_is_spendable() {
         vec![BundleUtxo { txid: "ab".repeat(32), vout: 0, value: 50_000, height: None, owner_address: None }],
         100,
     );
-    store.apply_bundle(&b, &a, NET, &[], &[]).unwrap();
+    store.apply_bundle(&b, &a, NET, &[], &[], &[]).unwrap();
     // Counts toward balance and is spendable (0-conf), not filtered out.
     assert_eq!(store.balance(), 50_000);
     assert_eq!(store.available_utxos().len(), 1);
@@ -318,7 +322,7 @@ fn unconfirmed_scanned_utxo_is_spendable() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "spend unconfirmed", private: false, recipient: None, extra_recipients: &[],
-            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1,
+            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -345,7 +349,7 @@ fn coin_control_spends_exactly_selected() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "coin control", private: false, recipient: None, extra_recipients: &[],
-            change_to: None, coins: Some(&picks), fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1,
+            change_to: None, coins: Some(&picks), fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -371,7 +375,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "change goes to bob", private: false, recipient: None, extra_recipients: &[],
-            change_to: Some(&bob_addr), coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1,
+            change_to: Some(&bob_addr), coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -388,7 +392,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
         &mut store2, &a, NET,
         &ComposeRequest {
             text: "change to self", private: false, recipient: None, extra_recipients: &[],
-            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1,
+            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -408,7 +412,7 @@ fn bump_fee_renames_note_id_to_replacement_txid_same_inputs_higher_fee() {
     let mut store = funded_store(&a);
     let n1 = compose_and_record(
         &mut store, &a, NET,
-        &ComposeRequest { text: "bump me", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1 },
+        &ComposeRequest { text: "bump me", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None },
     )
     .unwrap();
     assert!(store.notes[0].raw_hex.is_some(), "raw kept for rebroadcast");
@@ -435,7 +439,7 @@ fn bump_fee_renames_note_id_to_replacement_txid_same_inputs_higher_fee() {
         vec![change_utxo(&bumped.tx, Some(120))],
         120,
     );
-    store.apply_bundle(&b, &a, NET, &[], &[]).unwrap();
+    store.apply_bundle(&b, &a, NET, &[], &[], &[]).unwrap();
     assert_eq!(store.notes[0].status, NoteStatus::Confirmed);
     assert_eq!(store.notes[0].note_id, bumped.tx.txid_hex);
     assert!(store.notes[0].raw_hex.is_none());
@@ -449,14 +453,14 @@ fn orphaned_when_inputs_spent_elsewhere() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "never broadcast", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1 },
+        &ComposeRequest { text: "never broadcast", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None },
     )
     .unwrap();
 
     // Full rescan: the funding UTXO is gone (spent by another wallet
     // holding the same key) and our txid never appeared.
     let empty = bundle(vec![], vec![], 110);
-    let stats = store.apply_bundle(&empty, &a, NET, &[], &[]).unwrap();
+    let stats = store.apply_bundle(&empty, &a, NET, &[], &[], &[]).unwrap();
     assert_eq!(stats.orphaned, 1);
     assert_eq!(store.notes[0].status, NoteStatus::Orphaned);
     assert_eq!(store.balance(), 0);
@@ -495,7 +499,7 @@ fn sweep_tx_record_bump_and_confirm() {
     // mempool acceptance); the record settles when the node reports the
     // REPLACEMENT txid in a block.
     let b = bundle(vec![], vec![change_utxo(&bumped, Some(120))], 120);
-    store.apply_bundle(&b, &a, NET, &[], &[]).unwrap();
+    store.apply_bundle(&b, &a, NET, &[], &[], &[]).unwrap();
     assert_eq!(store.txs[0].status, NoteStatus::Pending);
     let winner = bumped.txid_hex.clone();
     store.resolve_spend_statuses(|t| if t == winner { Some(true) } else { None });
@@ -507,7 +511,7 @@ fn sweep_tx_record_bump_and_confirm() {
 fn identity_mismatch_rejected_and_persistence_roundtrip() {
     let a = alice();
     let mut store = funded_store(&a);
-    let err = store.apply_bundle(&bundle(vec![], vec![], 1), &bob(), NET, &[], &[]);
+    let err = store.apply_bundle(&bundle(vec![], vec![], 1), &bob(), NET, &[], &[], &[]);
     assert!(err.is_err(), "bundle for a different identity must be refused");
 
     store.touch_contact("bcrt1qsomeone");
@@ -565,7 +569,7 @@ fn directed_gift_amount_plumbs_through() {
             fee_rate: 1.0,
             gift_amount: Some(gift),
             lock_time: None,
-            now: 1,
+            now: 1, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -593,7 +597,7 @@ fn directed_gift_amount_plumbs_through() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 1,
+            now: 1, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -612,14 +616,14 @@ fn watch_store_recovers_notebook_without_keys() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1000 },
+        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1000, pq_password: None, pq_mlkem: None },
     )
     .unwrap();
     let n2 = compose_and_record(
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 2000 },
+        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 2000, pq_password: None, pq_mlkem: None },
     )
     .unwrap();
     let b = bundle(
@@ -629,7 +633,7 @@ fn watch_store_recovers_notebook_without_keys() {
     );
 
     let mut keyed = Store::new(&a.output_x, NET);
-    keyed.apply_bundle(&b, &a, NET, &[], &[]).unwrap();
+    keyed.apply_bundle(&b, &a, NET, &[], &[], &[]).unwrap();
     let mut watch = Store::new(&a.output_x, NET);
     let stats = watch.apply_bundle_watch(&b, &a.output_x, NET, &[], &[]).unwrap();
     assert_eq!(stats.notes_new, 2);
@@ -676,7 +680,7 @@ fn spend_records_confirm_by_tx_status_not_utxo_disappearance() {
     // Full bundle WITHOUT the spent coin: the old inference would have
     // confirmed here. It must stay Pending now.
     let empty = bundle(vec![], vec![], 200);
-    store.apply_bundle(&empty, &a, NET, &[], &[]).unwrap();
+    store.apply_bundle(&empty, &a, NET, &[], &[], &[]).unwrap();
     assert_eq!(store.txs[0].status, NoteStatus::Pending, "mempool-spent is not finality");
     assert!(store.txs[0].raw_hex.is_some(), "rebroadcast must stay possible");
 
@@ -767,7 +771,7 @@ fn display_owner_dedup_keeps_note_only_in_first_notebook_input_scan() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 4000,
+            now: 4000, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -778,9 +782,9 @@ fn display_owner_dedup_keeps_note_only_in_first_notebook_input_scan() {
     let notebook_spks = vec![spk_a.clone(), spk_b.clone()];
 
     let mut store_a = Store::new(&a.output_x, NET);
-    let stats_a = store_a.apply_bundle(&scan_bundle, &a, NET, &notebook_spks, &[]).unwrap();
+    let stats_a = store_a.apply_bundle(&scan_bundle, &a, NET, &notebook_spks, &[], &[]).unwrap();
     let mut store_b = Store::new(&b.output_x, NET);
-    let stats_b = store_b.apply_bundle(&scan_bundle, &b, NET, &notebook_spks, &[]).unwrap();
+    let stats_b = store_b.apply_bundle(&scan_bundle, &b, NET, &notebook_spks, &[], &[]).unwrap();
 
     assert_eq!(store_a.notes.len(), 1, "notebook A (first notebook input) keeps the note");
     assert_eq!(stats_a.notes_seen, 1);
@@ -817,7 +821,7 @@ fn display_owner_dedup_archived_notebook_input_never_anchors() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 4100,
+            now: 4100, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -829,7 +833,7 @@ fn display_owner_dedup_archived_notebook_input_never_anchors() {
     let notebook_spks = vec![spk_a.clone()]; // B deliberately excluded
 
     let mut store_a = Store::new(&a.output_x, NET);
-    let stats_a = store_a.apply_bundle(&scan_bundle, &a, NET, &notebook_spks, &[]).unwrap();
+    let stats_a = store_a.apply_bundle(&scan_bundle, &a, NET, &notebook_spks, &[], &[]).unwrap();
 
     assert_eq!(
         store_a.notes.len(),
@@ -904,6 +908,8 @@ fn stale_received_twin(note_id: &str, txid: &str, height: u64) -> NoteRecord {
         gift_amount: None,
         funded_by: None,
         dropped: false,
+        pq_flags: 0,
+        locked: None,
     }
 }
 
@@ -932,7 +938,7 @@ fn spending_window_spk_makes_funded_note_own() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 9000,
+            now: 9000, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -953,14 +959,14 @@ fn spending_window_spk_makes_funded_note_own() {
     // Empty window (today's bug reproduced): no notebook input, no
     // taproot input to name a sender — RECEIVED, sender "unknown".
     let mut without_window = Store::new(&a.output_x, NET);
-    without_window.apply_bundle(&b, a, NET, &[], &[]).unwrap();
+    without_window.apply_bundle(&b, a, NET, &[], &[], &[]).unwrap();
     assert_eq!(without_window.notes.len(), 1);
     assert!(without_window.notes[0].received, "no window: classifies received (the bug)");
     assert_eq!(without_window.sender_key(&without_window.notes[0]), "unknown");
 
     // Widened window: the SAME bundle now classifies OWN.
     let mut with_window = Store::new(&a.output_x, NET);
-    with_window.apply_bundle(&b, a, NET, &[], &window).unwrap();
+    with_window.apply_bundle(&b, a, NET, &[], &window, &[]).unwrap();
     assert_eq!(with_window.notes.len(), 1);
     assert!(!with_window.notes[0].received, "widened window: classifies OWN");
     assert_eq!(with_window.sender_key(&with_window.notes[0]), with_window.address);
@@ -990,7 +996,7 @@ fn stale_received_twin_pruned_on_full_scan() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 9100,
+            now: 9100, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -1007,7 +1013,7 @@ fn stale_received_twin_pruned_on_full_scan() {
         vec![change_utxo(&n1.tx, Some(900))],
         900,
     );
-    let stats = fresh.apply_bundle(&b, a, NET, &[], &window).unwrap();
+    let stats = fresh.apply_bundle(&b, a, NET, &[], &window, &[]).unwrap();
 
     assert_eq!(stats.reclassified, 1, "the stale received twin must be pruned");
     assert_eq!(fresh.notes.len(), 1, "exactly one note remains");
@@ -1043,7 +1049,7 @@ fn third_party_received_note_never_pruned() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 9200,
+            now: 9200, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -1066,14 +1072,14 @@ fn third_party_received_note_never_pruned() {
     let decoy_spks: Vec<Vec<u8>> = (0u8..50).map(|i| vec![i; 22]).collect();
 
     let mut bob_store = Store::new(&b.output_x, NET);
-    let stats = bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &decoy_spks).unwrap();
+    let stats = bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &decoy_spks, &[]).unwrap();
     assert_eq!(stats.reclassified, 0);
     assert_eq!(bob_store.notes.len(), 1);
     assert!(bob_store.notes[0].received);
     assert_eq!(bob_store.notes[0].sender.as_deref(), Some(alice_addr.as_str()));
 
     // A second full scan (idempotency) must not prune it either.
-    let stats2 = bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &decoy_spks).unwrap();
+    let stats2 = bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &decoy_spks, &[]).unwrap();
     assert_eq!(stats2.reclassified, 0);
     assert_eq!(bob_store.notes.len(), 1);
     assert!(bob_store.notes[0].received);
@@ -1102,7 +1108,7 @@ fn stale_received_twin_not_pruned_on_incremental_bundle() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 9300,
+            now: 9300, pq_password: None, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -1121,9 +1127,411 @@ fn stale_received_twin_not_pruned_on_incremental_bundle() {
     );
     incremental.full = false;
 
-    let stats = fresh.apply_bundle(&incremental, a, NET, &[], &window).unwrap();
+    let stats = fresh.apply_bundle(&incremental, a, NET, &[], &window, &[]).unwrap();
     assert_eq!(stats.reclassified, 0, "an incremental bundle must never prune");
     assert_eq!(fresh.notes.len(), 2, "the stale twin AND the freshly-own note both exist");
     assert!(fresh.notes.iter().any(|n| n.received), "the stale twin survives the incremental apply");
     assert!(fresh.notes.iter().any(|n| !n.received), "the new own note was still added");
+}
+
+// ---------------------------------------------------------------------------
+// Post-quantum notes (pq.rs hybrid layers): compose e2e through canned
+// bundles for password-only, ML-KEM-only, and both together, plus the
+// store's locked-note lifecycle (scan -> locked, unlock -> cached,
+// re-scan -> cache preserved).
+// ---------------------------------------------------------------------------
+
+// `bob()`'s notes identity leaf (matches `identity_from_leaf(&[0x44u8; 32])`
+// above) — `pqkeys::derive_keypair`/`derive_secrets` need the raw leaf
+// bytes directly (not the derived `Identity`), same "same leaf as the
+// notebook" contract `pqkeys`'s module doc describes.
+const BOB_LEAF: [u8; 32] = [0x44u8; 32];
+
+/// Bob's derived ML-KEM-768 receive keypair — same leaf secret `bob()`
+/// derives its notes identity from, matching `pqkeys`' "same leaf as the
+/// notebook" contract.
+fn bob_pq_keypair() -> app_core::notes_core::pq::MlKemKeypair {
+    pqkeys::derive_keypair(&BOB_LEAF, MlKemAlg::MlKem768)
+}
+
+/// A received-note fixture: Bob's view of `tx` (Alice -> Bob, dust output
+/// at vout 1) — mirrors `directed_private_note_both_sides`'s `bob_bundle`
+/// construction exactly.
+fn bob_receives(tx: &NoteTx, alice_addr: &str, height: u64) -> SyncBundle {
+    bundle(
+        vec![onchain(tx, height, false, Some(alice_addr), None)],
+        vec![BundleUtxo {
+            txid: tx.txid_hex.clone(),
+            vout: 1,
+            value: 330,
+            height: Some(height),
+            owner_address: None,
+        }],
+        height,
+    )
+}
+
+/// Alice's own view of her just-sent `tx` — mirrors
+/// `directed_private_note_both_sides`'s `alice_bundle` construction.
+fn alice_own_view(tx: &NoteTx, bob_addr: &str, height: u64) -> SyncBundle {
+    bundle(
+        vec![onchain(tx, height, true, None, Some(bob_addr))],
+        vec![change_utxo(tx, Some(height))],
+        height,
+    )
+}
+
+/// Structural validation: a pq layer on anything other than a single-
+/// recipient directed PRIVATE note is refused loudly, never silently
+/// dropped. Covers: a public note, a self-note, and a multi-recipient
+/// pick — one representative failure each is enough (the guard is a
+/// single `if` in `compose_note`, not per-shape logic).
+#[test]
+fn pq_layers_require_single_recipient_directed_private() {
+    let a = alice();
+    let b = bob();
+    let bob_addr = b.address(NET);
+    let store = funded_store(&a);
+
+    // Public note (private: false) + a password layer.
+    let err = compose_note(
+        &store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "nope",
+            private: false,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: Some("hunter2hunter2hunter2".into()),
+            pq_mlkem: None,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Store(_)));
+
+    // Self-note (no recipient) + an ML-KEM layer.
+    let err = compose_note(
+        &store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "nope",
+            private: true,
+            recipient: None,
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: None,
+            pq_mlkem: Some((MlKemAlg::MlKem768, bob_pq_keypair().ek().to_vec())),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Store(_)));
+
+    // Multi-recipient (extra_recipients adds a distinct address) + a
+    // password layer.
+    let carol_addr = carol().address(NET);
+    let err = compose_note(
+        &store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "nope",
+            private: true,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[&carol_addr],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: Some("hunter2hunter2hunter2".into()),
+            pq_mlkem: None,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Store(_)));
+}
+
+/// Password-only pq note: recoverable by EITHER party who knows the
+/// password (the module doc's "no asymmetric secret" property) — neither
+/// side auto-unlocks on scan (passwords are never stored/guessed), both
+/// unlock explicitly via `Store::unlock_note`, and Bob's own re-scan after
+/// unlocking must never clobber the cached plaintext back to locked.
+#[test]
+fn pq_password_only_note_round_trips_both_sides_and_survives_rescan() {
+    let a = alice();
+    let b = bob();
+    let bob_addr = b.address(NET);
+    let alice_addr = a.address(NET);
+    let password = "correct horse battery staple extra";
+
+    let mut store = funded_store(&a);
+    let sent = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "pw only, for bob",
+            private: true,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: Some(password.into()),
+            pq_mlkem: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(sent.pq_flags, FLAG_PW);
+    // The sender's OWN store cached the plaintext directly at compose time
+    // (no decryption needed — they just typed it).
+    assert_eq!(store.notes[0].text.as_deref(), Some("pw only, for bob"));
+    assert_eq!(store.notes[0].pq_flags, FLAG_PW);
+    assert!(store.notes[0].locked.is_none(), "the composer's own copy is never locked");
+
+    // Alice, wipe-recovered: her own pq note comes back LOCKED (auto-
+    // unlock never runs for an own note or a password-involving one).
+    let alice_bundle = alice_own_view(&sent.tx, &bob_addr, 105);
+    let mut alice_fresh = Store::new(&a.output_x, NET);
+    alice_fresh.apply_bundle(&alice_bundle, &a, NET, &[], &[], &[]).unwrap();
+    assert_eq!(alice_fresh.notes.len(), 1);
+    assert!(alice_fresh.notes[0].text.is_none(), "no auto-unlock for an own pq note");
+    assert!(alice_fresh.notes[0].locked.is_some());
+    assert_eq!(alice_fresh.notes[0].pq_flags, FLAG_PW);
+    let note_id = alice_fresh.notes[0].note_id.clone();
+    // Wrong password fails cleanly and never mutates the record.
+    assert!(alice_fresh.unlock_note(&note_id, &a, &[], Some("wrong password")).is_err());
+    assert!(alice_fresh.notes[0].locked.is_some(), "a failed unlock must not clear locked");
+    // Right password re-opens via unlock_sent (sender-reopen — password-
+    // only is the ONE pq shape a sender can ever recover this way).
+    let text = alice_fresh.unlock_note(&note_id, &a, &[], Some(password)).unwrap();
+    assert_eq!(text, "pw only, for bob");
+    assert_eq!(alice_fresh.notes[0].text.as_deref(), Some("pw only, for bob"));
+    assert!(alice_fresh.notes[0].locked.is_none(), "unlocking clears locked");
+
+    // Bob's view: received, locked (password-only never auto-unlocks even
+    // though he's the recipient), then explicitly unlocked.
+    let bob_bundle = bob_receives(&sent.tx, &alice_addr, 105);
+    let mut bob_store = Store::new(&b.output_x, NET);
+    bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &[], &[]).unwrap();
+    assert_eq!(bob_store.notes.len(), 1);
+    assert!(bob_store.notes[0].received);
+    assert!(bob_store.notes[0].text.is_none());
+    assert_eq!(bob_store.notes[0].pq_flags, FLAG_PW);
+    let bob_note_id = bob_store.notes[0].note_id.clone();
+    let text = bob_store.unlock_note(&bob_note_id, &b, &[], Some(password)).unwrap();
+    assert_eq!(text, "pw only, for bob");
+    assert!(bob_store.notes[0].locked.is_none());
+
+    // Re-scan (idempotent full-bundle re-apply, no secrets supplied this
+    // time): Bob's already-unlocked cache must survive untouched — the
+    // "fresh success wins, a still-locked re-derivation never clobbers a
+    // good cache" rule from `fresh_decode_corrects_stale_text_cache`,
+    // extended to pq notes.
+    bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &[], &[]).unwrap();
+    assert_eq!(bob_store.notes[0].text.as_deref(), Some("pw only, for bob"));
+    assert!(bob_store.notes[0].locked.is_none(), "a re-scan must not re-lock an unlocked note");
+}
+
+/// ML-KEM-only pq note: Bob AUTO-unlocks on scan when his derived secret
+/// is supplied to `apply_bundle` (the only auto-unlock case — received +
+/// KEM-only); without it he stays locked and must call `unlock_note`
+/// explicitly. Alice, the sender, can NEVER reopen it — no asymmetric
+/// secret was ever hers to begin with (`SenderCannotReopen`).
+#[test]
+fn pq_kem_only_note_auto_unlocks_for_recipient_with_derived_secret() {
+    let a = alice();
+    let b = bob();
+    let bob_addr = b.address(NET);
+    let alice_addr = a.address(NET);
+    let bob_kp = bob_pq_keypair();
+
+    let mut store = funded_store(&a);
+    let sent = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "kem only, for bob",
+            private: true,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: None,
+            pq_mlkem: Some((MlKemAlg::MlKem768, bob_kp.ek().to_vec())),
+        },
+    )
+    .unwrap();
+    assert_eq!(sent.pq_flags, FLAG_MLKEM);
+
+    let bob_bundle = bob_receives(&sent.tx, &alice_addr, 200);
+
+    // Without any secret: stays locked.
+    let mut bob_locked = Store::new(&b.output_x, NET);
+    bob_locked.apply_bundle(&bob_bundle, &b, NET, &[], &[], &[]).unwrap();
+    assert!(bob_locked.notes[0].text.is_none());
+    assert!(bob_locked.notes[0].locked.is_some());
+
+    // With the WRONG level's secret (512, not the 768 this was sealed
+    // to): still locked — cryptographically indistinguishable from
+    // tampering, never a crash.
+    let wrong_level = pqkeys::derive_secrets(&BOB_LEAF)
+        .into_iter()
+        .next() // MlKem512, per derive_secrets' documented [512, 768, 1024] order
+        .unwrap();
+    let mut bob_wrong = Store::new(&b.output_x, NET);
+    bob_wrong.apply_bundle(&bob_bundle, &b, NET, &[], &[], std::slice::from_ref(&wrong_level)).unwrap();
+    assert!(bob_wrong.notes[0].text.is_none(), "wrong-level secret must not authenticate");
+
+    // With Bob's FULL derived secret set (all three levels — the same
+    // union `apply_bundle`'s doc comment describes): auto-unlocks.
+    let secrets = pqkeys::derive_secrets(&BOB_LEAF);
+    let mut bob_auto = Store::new(&b.output_x, NET);
+    bob_auto.apply_bundle(&bob_bundle, &b, NET, &[], &[], &secrets).unwrap();
+    assert_eq!(bob_auto.notes[0].text.as_deref(), Some("kem only, for bob"));
+    assert!(bob_auto.notes[0].locked.is_none());
+
+    // Re-scan with an EMPTY secret set this time: the auto-unlocked cache
+    // must survive (never re-locked by a weaker follow-up scan).
+    bob_auto.apply_bundle(&bob_bundle, &b, NET, &[], &[], &[]).unwrap();
+    assert_eq!(bob_auto.notes[0].text.as_deref(), Some("kem only, for bob"));
+    assert!(bob_auto.notes[0].locked.is_none());
+
+    // Explicit unlock_note path (no auto-unlock) also works, given the
+    // right secret.
+    let bob_note_id = bob_locked.notes[0].note_id.clone();
+    let secret_only = pqkeys::derive_keypair(&BOB_LEAF, MlKemAlg::MlKem768).secret();
+    let text =
+        bob_locked.unlock_note(&bob_note_id, &b, std::slice::from_ref(&secret_only), None).unwrap();
+    assert_eq!(text, "kem only, for bob");
+
+    // Alice, the sender, structurally CANNOT reopen a KEM-layered note —
+    // she never held the ML-KEM secret (it was encapsulated to Bob's key).
+    let alice_bundle = alice_own_view(&sent.tx, &bob_addr, 200);
+    let mut alice_fresh = Store::new(&a.output_x, NET);
+    alice_fresh.apply_bundle(&alice_bundle, &a, NET, &[], &[], &[]).unwrap();
+    let alice_note_id = alice_fresh.notes[0].note_id.clone();
+    let err = alice_fresh.unlock_note(&alice_note_id, &a, &[], None).unwrap_err();
+    assert!(
+        matches!(err, Error::Notes(app_core::notes_core::Error::SenderCannotReopen)),
+        "expected SenderCannotReopen, got {err:?}"
+    );
+}
+
+/// Hybrid (both layers): unlocking needs the ML-KEM secret AND the
+/// password TOGETHER — the sealing key is one HKDF over both shared
+/// secrets combined, so a partial credential (only one of the two)
+/// authenticates nothing (implicit-rejection/AEAD-failure territory,
+/// not a distinct "which one was wrong" error).
+#[test]
+fn pq_hybrid_note_needs_both_layers_together() {
+    let a = alice();
+    let b = bob();
+    let bob_addr = b.address(NET);
+    let alice_addr = a.address(NET);
+    let bob_kp = bob_pq_keypair();
+    let password = "hybrid layer password, quite long";
+
+    let mut store = funded_store(&a);
+    let sent = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "hybrid, for bob",
+            private: true,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: Some(password.into()),
+            pq_mlkem: Some((MlKemAlg::MlKem768, bob_kp.ek().to_vec())),
+        },
+    )
+    .unwrap();
+    assert_eq!(sent.pq_flags, FLAG_PW | FLAG_MLKEM);
+
+    let bob_bundle = bob_receives(&sent.tx, &alice_addr, 300);
+    let secrets = pqkeys::derive_secrets(&BOB_LEAF);
+
+    // Auto-unlock never runs for a hybrid note (pq_flags != FLAG_MLKEM
+    // exactly) — locked regardless of secrets supplied to apply_bundle.
+    let mut bob_store = Store::new(&b.output_x, NET);
+    bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &[], &secrets).unwrap();
+    assert!(bob_store.notes[0].text.is_none());
+    let note_id = bob_store.notes[0].note_id.clone();
+
+    // Secret alone, no password: fails.
+    assert!(bob_store.unlock_note(&note_id, &b, &secrets, None).is_err());
+    assert!(bob_store.notes[0].locked.is_some());
+    // Password alone, no secret: fails.
+    assert!(bob_store.unlock_note(&note_id, &b, &[], Some(password)).is_err());
+    assert!(bob_store.notes[0].locked.is_some());
+    // Both together: succeeds.
+    let text = bob_store.unlock_note(&note_id, &b, &secrets, Some(password)).unwrap();
+    assert_eq!(text, "hybrid, for bob");
+    assert!(bob_store.notes[0].locked.is_none());
+}
+
+/// A fee-bump attempt on a pq note is refused loudly (its layers can't be
+/// re-sealed without the original password/ek, which `bump_fee_build`'s
+/// signature doesn't carry) rather than silently rebuilding a plain v1
+/// replacement that drops both layers.
+#[test]
+fn pq_note_refuses_fee_bump() {
+    let a = alice();
+    let b = bob();
+    let bob_addr = b.address(NET);
+
+    let mut store = funded_store(&a);
+    let sent = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "pq, don't bump me",
+            private: true,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: Some("some reasonably long password".into()),
+            pq_mlkem: None,
+        },
+    )
+    .unwrap();
+
+    let err =
+        app_core::compose::bump_fee_build(&store, &a, NET, &sent.note_id, 5.0, None).unwrap_err();
+    assert!(matches!(err, Error::Store(_)));
 }

@@ -10,7 +10,12 @@
 // page. We do both -- see THIRD-PARTY.md.
 import { ListView, Switch, AboutSlint } from "std-widgets.slint";
 
-export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string, private: bool }
+// `locked`: a post-quantum note this device hasn't decrypted yet
+// (NoteRecord.locked.is_some() — text stays None until Store::unlock_note
+// succeeds). Distinct from `private`, which just means "encrypted" —
+// every private note (pq or not) already shows the padlock glyph next to
+// its title; `locked` additionally means "and we can't currently read it".
+export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string, private: bool, locked: bool }
 // One notebook row: `unread` is a preformatted badge label ("3 new"), empty =
 // no badge; `meta` is "addr-short · balance · note count".
 export struct NotebookItem { index: int, name: string, snippet: string, meta: string, unread: string, active: bool }
@@ -22,7 +27,7 @@ export struct SenderItem { key: string, label: string, sub: string, excluded: bo
 // in and the last push reached iCloud (cloud-check), 3 = opted in but
 // iCloud is unavailable / the last push failed (cloud-alert). Only
 // meaningful when `synced` is true — see `refresh_contacts` in lib.rs.
-export struct ContactItem { address: string, name: string, synced: bool, sync-status: int }
+export struct ContactItem { address: string, name: string, synced: bool, sync-status: int, pq: bool }
 // One revealed key-export format (Public keys screen — the ONLY reveal
 // surface that shows several rows at once; Private keys is progressive-
 // disclosure, one format at a time, via scalar reveal-private-* props).
@@ -1584,6 +1589,22 @@ export component AppWindow inherits Window {
     // first (notes-core's `reply_set`), contact names resolved. Hidden
     // whenever length <= 1 — nothing to add beyond what plain Reply covers.
     in property <[ContactItem]> note-reply-set;
+    // ---- locked-note unlock (post-quantum note view) ----
+    // True while NoteRecord.locked is Some — text stays hidden until
+    // Store::unlock_note succeeds. `note-unlock-needs-password`: a
+    // passphrase field + Unlock button apply (FLAG_PW set, and — for a
+    // received note — the FLAG_MLKEM half either isn't set or this device
+    // already holds the key, so a password is genuinely the missing
+    // piece). When false and `note-locked` is true, `note-unlock-caption`
+    // explains why nothing can be typed to fix it (KEM-only and this
+    // device lacks the key, or an own note sealed with ML-KEM — the
+    // sender can never reopen that layer).
+    in property <bool> note-locked;
+    in property <bool> note-unlock-needs-password;
+    in property <string> note-unlock-caption;
+    in-out property <string> note-unlock-passphrase;
+    in property <bool> note-unlock-busy;
+    callback unlock-note();
 
     // The primary recipient's contact name / address, or "Self (my
     // notebook)" — NO "To: " prefix (Sal, 2026-07-19: the compose screen's
@@ -1640,6 +1661,35 @@ export component AppWindow inherits Window {
     // the transaction would be non-final and get rejected. Shown
     // regardless of expanded state (safety content).
     in property <string> compose-locktime-warn;
+    // ---- post-quantum layers (compose screen 6, "Security" collapsible —
+    // visible only for a directed+private single-recipient, non-watch
+    // note). LAST collapsible on the screen (Sal's e2e-drift rule: put new
+    // panels as late as possible so only the Sign/cost area below needs
+    // recalibration).
+    in-out property <bool> pq-expanded;
+    // Header status chip on the (always-visible) section header row.
+    in property <bool> pq-quantum-resistant;
+    in property <string> pq-status-chip: root.pq-quantum-resistant ? "Quantum-resistant" : "Not quantum-resistant";
+    // Passphrase layer: toggle + text (two-way — the Generate button fills
+    // it from Rust) + a Rust-computed strength line + whether the CURRENT
+    // text is a verified (untouched-since-generate) phrase.
+    in-out property <bool> pq-passphrase-enabled;
+    in-out property <string> pq-passphrase-text;
+    in property <bool> pq-passphrase-verified;
+    in property <string> pq-passphrase-strength-line;
+    // ML-KEM layer: toggle, whether the resolved recipient has a usable
+    // key on file, and a caption — "<level> · <fingerprint>" when
+    // available+on, else a hint to add one in Contacts when unavailable.
+    in-out property <bool> pq-mlkem-enabled;
+    in property <bool> pq-mlkem-available;
+    in property <string> pq-mlkem-caption;
+    // Bottom-of-section summary line — `passphrase::security_label`
+    // verbatim, recomputed in Rust on any relevant change; never
+    // reimplemented here.
+    in property <string> pq-security-label;
+    callback pq-generate-passphrase();
+    callback pq-passphrase-changed(string);
+    callback pq-mlkem-toggled(bool);
     // "Note too large to broadcast" dialog (per-tx ~100 kB ceiling).
     in-out property <bool> show-oversize-modal;
     in property <bool> oversize-offer-bump; // true → offer to switch to Standard
@@ -1774,6 +1824,16 @@ export component AppWindow inherits Window {
     // property; on-start-rename seeds it from the contact's current
     // `synced` flag, defaulting unchecked for a never-synced contact.
     in-out property <bool> rename-synced;
+    // Quantum key on this contact (rename dialog "Quantum key" section):
+    // `rename-pq-display` is "" while none is set, else "<level> · <fp>"
+    // (`pqkeys::contact_pq_display`) — seeded by `start-rename`, refreshed
+    // after `contact-pq-set`/`contact-pq-remove`.
+    in-out property <string> rename-pq-input;
+    in property <string> rename-pq-display;
+    in property <string> rename-pq-error;
+    callback contact-pq-set(string);
+    callback contact-pq-remove();
+    callback contact-pq-file();
     in-out property <string> confirm-remove-address;
     in property <string> confirm-remove-name;
 
@@ -1894,6 +1954,38 @@ export component AppWindow inherits Window {
     // notebook. Picking re-derives hex/WIF for THAT notebook, no re-auth.
     in property <[NbPickRow]> reveal-nb-rows;
     in-out property <int> reveal-nb-index;
+    // ---- Quantum keys (Settings "Dangerous area" -> screen 29) ----
+    // Hidden for watch-only identities (gated on `!watch-only` in the
+    // Settings card, same as "Private keys" — no leaf secret there, so no
+    // derived ML-KEM receive key either).
+    callback open-pq-keys();
+    // Level picker: "512" | "768" | "1024" — device-level (config.json
+    // "pq_level"), MlKem768 pre-selected by default.
+    in property <string> pq-key-level: "768";
+    callback pq-set-level(string);
+    in property <string> pq-key-fingerprint;
+    // Static per-level copy — sourced from `passphrase::MlKemLevel::
+    // describe()` (pinned text) once at boot, never changes at runtime.
+    in property <string> pq-desc-512;
+    in property <string> pq-desc-768;
+    in property <string> pq-desc-1024;
+    callback pq-copy-public();
+    callback pq-save-public();
+    in-out property <bool> pq-show-backup-confirm;
+    callback pq-copy-private();
+    callback pq-save-private();
+    // Import a key: paste/file -> parse -> keychain-store. `pq-import-fp`
+    // is the CURRENT imported key's display line ("ML-KEM-768 · fp"),
+    // empty when nothing is imported; `pq-import-source` names where it
+    // came from (only set right after a successful import this session).
+    in-out property <string> pq-import-text;
+    callback pq-import-paste();
+    callback pq-import-file();
+    callback pq-import-submit();
+    callback pq-import-remove();
+    in property <string> pq-import-error;
+    in property <string> pq-import-fp;
+    in property <string> pq-import-source;
     in property <[CoinItem]> coins;
     in property <string> coins-summary;
     // Settings Coins card only: aggregates notebook + spending pools (the
@@ -2308,6 +2400,11 @@ export component AppWindow inherits Window {
         if (root.screen == 21) { root.screen = 6; return true; }
         if (root.screen == 18 || root.screen == 19) {
             root.reveal-hide();
+            root.screen = 8;
+            return true;
+        }
+        if (root.screen == 29) {
+            root.pq-show-backup-confirm = false;
             root.screen = 8;
             return true;
         }
@@ -2837,6 +2934,7 @@ export component AppWindow inherits Window {
                                     tint: note.badge == "confirmed" ? Pal.good
                                         : (note.badge == "pending" ? Pal.warn : Pal.bad);
                                 }
+                                if note.locked: Badge { label: "locked"; tint: Pal.warn; }
                                 Caption {
                                     text: note.meta;
                                     vertical-alignment: center;
@@ -3025,6 +3123,61 @@ export component AppWindow inherits Window {
                 width: parent.width - 32px;
                 text: root.note-detail;
                 font-size: 12px;
+            }
+        }
+        // ---- locked-note unlock (post-quantum) ----
+        if root.note-locked && root.note-unlock-needs-password: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: unlock-col.preferred-height;
+            unlock-col := VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+                Image {
+                    source: @image-url("icons/lock.svg");
+                    colorize: Pal.warn;
+                    width: 16px;
+                    height: 16px;
+                    horizontal-alignment: left;
+                }
+                Caption { text: "This note is locked. Enter its passphrase to view it."; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    EditField {
+                        horizontal-stretch: 1;
+                        text <=> root.note-unlock-passphrase;
+                        placeholder-text: "passphrase";
+                        accepted => { root.unlock-note(); }
+                    }
+                    PrimaryButton {
+                        width: 100px;
+                        text: root.note-unlock-busy ? "…" : "Unlock";
+                        clicked => { root.unlock-note(); }
+                    }
+                }
+            }
+        }
+        if root.note-locked && !root.note-unlock-needs-password: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: unlock-hint-col.preferred-height;
+            unlock-hint-col := VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Image {
+                        source: @image-url("icons/lock.svg");
+                        colorize: Pal.muted;
+                        width: 16px;
+                        height: 16px;
+                    }
+                    Caption { text: root.note-unlock-caption; }
+                }
             }
         }
         HorizontalLayout {
@@ -3411,6 +3564,95 @@ export component AppWindow inherits Window {
                 if root.compose-locktime-warn != "": Caption { text: root.compose-locktime-warn; color: Pal.warn; }
             }
         }
+        // ---- post-quantum layers (directed + private + single-recipient,
+        // keyed only) — the LAST collapsible on this screen, deliberately:
+        // it only pushes the Sign/cost area below it, so that's the one
+        // area an e2e recalibration needs to touch. Imitates the Gift/
+        // Locktime panels exactly (same card/caret/caption shape).
+        if root.directed && root.compose-private && root.to-chips.length == 0 && !root.watch-only: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: pq-col.preferred-height;
+            pq-col := VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                Rectangle {
+                    height: 22px;
+                    TouchArea { clicked => { root.pq-expanded = !root.pq-expanded; } }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: "Security";
+                            font-size: 12px;
+                            color: Pal.muted;
+                            vertical-alignment: center;
+                        }
+                        Badge {
+                            label: root.pq-status-chip;
+                            tint: root.pq-quantum-resistant ? Pal.good : Pal.faint;
+                        }
+                        Rectangle { }
+                        Image {
+                            source: root.pq-expanded
+                                ? @image-url("icons/caret-up.svg")
+                                : @image-url("icons/caret-down.svg");
+                            colorize: Pal.muted;
+                            width: 16px;
+                            height: 16px;
+                        }
+                    }
+                }
+                // ---- passphrase layer ----
+                if root.pq-expanded: HorizontalLayout {
+                    Switch {
+                        text: "Passphrase";
+                        checked <=> root.pq-passphrase-enabled;
+                        toggled => { root.pq-passphrase-changed(root.pq-passphrase-text); }
+                    }
+                    Rectangle { }
+                }
+                if root.pq-expanded && root.pq-passphrase-enabled: HorizontalLayout {
+                    spacing: 8px;
+                    // Deliberately PLAIN text, not `input-type: password`:
+                    // the whole point of Generate is a phrase the user can
+                    // read and copy down (the same reasoning screen 19's
+                    // "Private keys" reveal already follows — a secret
+                    // meant to be recorded is shown, not masked).
+                    EditField {
+                        horizontal-stretch: 1;
+                        text <=> root.pq-passphrase-text;
+                        placeholder-text: "type, paste, or generate a passphrase";
+                        edited(t) => { root.pq-passphrase-changed(t); }
+                    }
+                    GhostButton {
+                        text: "Generate";
+                        width: 96px;
+                        clicked => { root.pq-generate-passphrase(); }
+                    }
+                }
+                if root.pq-expanded && root.pq-passphrase-enabled: Caption {
+                    text: root.pq-passphrase-strength-line;
+                    color: root.pq-passphrase-verified ? Pal.good : Pal.warn;
+                }
+                // ---- ML-KEM hybrid layer ----
+                if root.pq-expanded: HorizontalLayout {
+                    Switch {
+                        text: "Quantum encryption (ML-KEM)";
+                        enabled: root.pq-mlkem-available;
+                        checked <=> root.pq-mlkem-enabled;
+                        toggled => { root.pq-mlkem-toggled(self.checked); }
+                    }
+                    Rectangle { }
+                }
+                if root.pq-expanded && root.pq-mlkem-caption != "": Caption {
+                    text: root.pq-mlkem-caption;
+                    color: root.pq-mlkem-available ? Pal.muted : Pal.warn;
+                }
+                if root.pq-expanded: Caption { text: root.pq-security-label; }
+            }
+        }
         if root.mixed-linkage-hint: Caption {
             text: "This note spends coins from more than one wallet — their addresses become publicly linked on-chain.";
             color: Pal.warn;
@@ -3582,6 +3824,10 @@ export component AppWindow inherits Window {
                                     overflow: elide;
                                 }
                                 if c.name != "": Caption { text: c.address; overflow: elide; }
+                            }
+                            if c.pq: VerticalLayout {
+                                alignment: center;
+                                Badge { label: "PQ"; tint: Pal.accent; }
                             }
                             VerticalLayout {
                                 alignment: center;
@@ -3996,6 +4242,14 @@ export component AppWindow inherits Window {
                 text: "Private keys";
                 clicked => { root.reveal-private(); }
             }
+        }
+        // Hidden for watch-only, same reasoning as "Private keys" above —
+        // no leaf secret on a watch-only identity, so no derived ML-KEM
+        // receive key to manage either.
+        if !root.watch-only: SettingsCard {
+            title: "Quantum keys";
+            subtitle: "A post-quantum receive key for this notebook (ML-KEM), added on top of your normal note encryption so directed notes to you can add hybrid protection against a future quantum computer.";
+            GhostButton { text: "Manage quantum keys…"; clicked => { root.open-pq-keys(); } }
         }
         SettingsCard {
             title: "About & help";
@@ -5554,6 +5808,108 @@ export component AppWindow inherits Window {
         }
     }
 
+    // ---------- 29 · quantum keys (Settings -> ML-KEM receive key + import) ----------
+    if screen == 29: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: "Quantum keys";
+            back => { root.nav-back(); }
+        }
+        Flickable {
+            viewport-width: self.width;
+            viewport-height: pq-keys-col.preferred-height;
+            // Dismiss layer (see the global one under back-scope): this
+            // Flickable holds text fields (paste box), so it needs its own
+            // copy — same pattern screens 6/8/16/21 already use.
+            TouchArea {
+                width: parent.width;
+                height: pq-keys-col.preferred-height;
+                clicked => { back-scope.focus(); }
+            }
+            pq-keys-col := VerticalLayout {
+                width: parent.width;
+                spacing: 14px;
+                alignment: start;
+                Caption {
+                    text: "A post-quantum receive key for this notebook, layered on top of your normal note encryption. Share the public half so others can seal directed notes to you with quantum-resistant protection — it recovers automatically from your seed phrase.";
+                }
+                Text { text: "Parameter level"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                VerticalLayout {
+                    spacing: 8px;
+                    DoorCard {
+                        title: "ML-KEM-512";
+                        subtitle: root.pq-desc-512;
+                        highlight: root.pq-key-level == "512";
+                        clicked => { root.pq-set-level("512"); }
+                    }
+                    DoorCard {
+                        title: "ML-KEM-768";
+                        subtitle: root.pq-desc-768;
+                        highlight: root.pq-key-level == "768";
+                        clicked => { root.pq-set-level("768"); }
+                    }
+                    DoorCard {
+                        title: "ML-KEM-1024";
+                        subtitle: root.pq-desc-1024;
+                        highlight: root.pq-key-level == "1024";
+                        clicked => { root.pq-set-level("1024"); }
+                    }
+                }
+                Rectangle {
+                    border-radius: 10px;
+                    background: Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    height: pq-key-col.preferred-height;
+                    pq-key-col := VerticalLayout {
+                        padding: 12px;
+                        spacing: 6px;
+                        Text { text: "Your notebook's quantum key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                        Mono { text: root.pq-key-fingerprint; color: Pal.muted; }
+                        Caption { text: "Derived from your seed — recovers with your seed phrase; backup is optional."; }
+                    }
+                }
+                VerticalLayout {
+                    spacing: 8px;
+                    Text { text: "Share your public key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        GhostButton { text: "Copy public key"; clicked => { root.pq-copy-public(); } }
+                        if root.desktop-platform: GhostButton { text: "Save public key…"; clicked => { root.pq-save-public(); } }
+                    }
+                }
+                VerticalLayout {
+                    spacing: 8px;
+                    Text { text: "Backup"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                    Caption { text: "Optional — this key already recovers from your seed phrase. Only do this if you want a separate copy outside the app."; }
+                    GhostButton { text: "Backup private key…"; clicked => { root.pq-show-backup-confirm = true; } }
+                }
+                Rectangle { height: 1px; background: Pal.line; }
+                Text { text: "Import a key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                Caption { text: "Import someone else's ML-KEM SECRET key so this device can read notes sealed to it — a Graffito private-key export, or an OpenPGP key with an RFC 9980 ML-KEM-768+X25519 component."; }
+                EditArea {
+                    height: 90px;
+                    text <=> root.pq-import-text;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Paste"; clicked => { root.pq-import-paste(); } }
+                    if root.desktop-platform: GhostButton { text: "From file…"; clicked => { root.pq-import-file(); } }
+                    GhostButton { text: "Import"; clicked => { root.pq-import-submit(); } }
+                }
+                if root.pq-import-error != "": Caption { text: root.pq-import-error; color: Pal.bad; wrap: word-wrap; }
+                if root.pq-import-fp != "": VerticalLayout {
+                    spacing: 4px;
+                    Caption { text: "Imported: " + root.pq-import-fp; color: Pal.good; }
+                    if root.pq-import-source != "": Caption { text: root.pq-import-source; color: Pal.muted; wrap: word-wrap; }
+                    GhostButton { text: "Remove imported key"; clicked => { root.pq-import-remove(); } }
+                }
+            }
+        }
+        Caption { text: root.status; color: Pal.bad; }
+    }
+
     // ---------- 24 · terms & disclaimer (first-run accept gate + re-view) ----------
     if screen == 24: VerticalLayout { padding-top: root.safe-top + 20px; padding-bottom: root.safe-bottom + 10px;
         padding: 24px;
@@ -6016,6 +6372,35 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                Rectangle { height: 1px; background: Pal.line; }
+                Text { text: "Quantum key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                if root.rename-pq-display != "": HorizontalLayout {
+                    spacing: 8px;
+                    Caption { text: root.rename-pq-display; horizontal-stretch: 1; wrap: word-wrap; }
+                    IconButton {
+                        glyph: "×";
+                        glyph-size: 18px;
+                        width: 28px;
+                        height: 28px;
+                        glyph-color: Pal.bad;
+                        clicked => { root.contact-pq-remove(); }
+                    }
+                }
+                if root.rename-pq-display == "": HorizontalLayout {
+                    spacing: 8px;
+                    EditField {
+                        horizontal-stretch: 1;
+                        text <=> root.rename-pq-input;
+                        placeholder-text: "paste their quantum public key";
+                        accepted(t) => { root.contact-pq-set(t); }
+                    }
+                    GhostButton { text: "Set"; width: 64px; clicked => { root.contact-pq-set(root.rename-pq-input); } }
+                }
+                if root.desktop-platform && root.rename-pq-display == "": GhostButton {
+                    text: "From file…";
+                    clicked => { root.contact-pq-file(); }
+                }
+                if root.rename-pq-error != "": Caption { text: root.rename-pq-error; color: Pal.bad; wrap: word-wrap; }
                 HorizontalLayout {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.cancel-rename(); } }
@@ -6165,6 +6550,45 @@ export component AppWindow inherits Window {
                             root.dice-clear();
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // ---------- backup quantum private key confirmation (modal overlay) ----------
+    if root.pq-show-backup-confirm: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.pq-show-backup-confirm = false; } }
+        Rectangle {
+            width: 400px;
+            height: pqbl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { clicked => { back-scope.focus(); } }
+            pqbl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Back up your quantum private key?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Caption {
+                    text: "Anyone who gets this key can read notes sealed to it. It already recovers from your seed phrase — only do this if you want a separate copy.";
+                    color: Pal.warn;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.pq-show-backup-confirm = false; } }
+                    GhostButton { text: "Copy"; clicked => { root.pq-copy-private(); } }
+                    if root.desktop-platform: GhostButton { text: "Save…"; clicked => { root.pq-save-private(); } }
                 }
             }
         }

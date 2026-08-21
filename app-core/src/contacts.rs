@@ -305,6 +305,7 @@ mod tests {
             network: network.to_string(),
             updated_at,
             synced,
+            mlkem_ek: None,
         }
     }
 
@@ -420,6 +421,41 @@ mod tests {
         assert!(blob.contains("\"v\":2"));
         let back = parse_contacts_blob(&blob);
         assert_eq!(back, s);
+    }
+
+    /// A contact's post-quantum `mlkem_ek` (graffito-native public armor)
+    /// rides along through the blob round-trip AND `merge_state` exactly
+    /// like `name`/`synced` — no separate merge rule was needed for it
+    /// (the module doc's "rides along with whichever side's `Contact`
+    /// value wins" claim, specifically for this field).
+    #[test]
+    fn mlkem_ek_round_trips_through_blob_and_merge() {
+        let armor = "-----BEGIN GRAFFITO ML-KEM PUBLIC KEY-----\ntest-payload\n-----END GRAFFITO ML-KEM PUBLIC KEY-----\n";
+        let mut with_key = cnt("addr-a", "Alice", "", 100, true);
+        with_key.mlkem_ek = Some(armor.to_string());
+
+        // Blob round-trip: the field survives serialize -> parse verbatim.
+        let s = state(vec![with_key.clone()], vec![]);
+        let blob = serialize_contacts_blob(&s);
+        assert!(blob.contains("mlkem_ek"));
+        let back = parse_contacts_blob(&blob);
+        assert_eq!(back, s);
+        assert_eq!(back.contacts[0].mlkem_ek.as_deref(), Some(armor));
+
+        // Merge: incoming (with a pq key, newer updated_at) beats a local
+        // copy with none — the whole Contact value wins, key included.
+        let local = state(vec![cnt("addr-a", "Alice (no key)", "", 50, false)], vec![]);
+        let incoming = state(vec![with_key.clone()], vec![]);
+        let merged = merge_state(&local, &incoming, 0);
+        assert_eq!(merged.contacts.len(), 1);
+        assert_eq!(merged.contacts[0].mlkem_ek.as_deref(), Some(armor));
+
+        // Merge the other direction: local already has the pq key and is
+        // newer — an incoming stale/keyless copy must never blank it out.
+        let local_with_key = state(vec![with_key.clone()], vec![]);
+        let incoming_stale = state(vec![cnt("addr-a", "Alice (stale)", "", 10, false)], vec![]);
+        let merged2 = merge_state(&local_with_key, &incoming_stale, 0);
+        assert_eq!(merged2.contacts[0].mlkem_ek.as_deref(), Some(armor));
     }
 
     #[test]
