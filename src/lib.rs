@@ -50,6 +50,11 @@ use zeroize::{Zeroize, Zeroizing};
 slint::include_modules!();
 
 const KEYCHAIN_ACCOUNT: &str = "identity-key";
+/// An externally imported ML-KEM secret key (Settings → Quantum keys →
+/// "Import a key"), Keychain-stored exactly like `KEYCHAIN_ACCOUNT` (crash-
+/// safe two-phase write, local-only — never synced) but under its own
+/// account: one slot, overwriting replaces whatever was there.
+const PQ_IMPORTED_ACCOUNT: &str = "pq-imported";
 
 /// Opened by Settings → About & help → "Source code".
 const SOURCE_URL: &str = "https://github.com/ByteApps/graffito";
@@ -359,6 +364,25 @@ struct State {
     /// whether that contact has a key on file at all; inner `Result` =
     /// whether the stored armor parsed.
     pq_recipient_cache: Option<(String, Option<Result<(app_core::passphrase::MlKemLevel, String), String>>)>,
+    /// Settings → "Quantum keys" (screen 29): device-level default ML-KEM
+    /// parameter level for THIS notebook's derived receive key
+    /// (config.json "pq_level"). Absent config key (every pre-C2 config)
+    /// => `MlKemLevel::DEFAULT` (768) — matches the compose Security
+    /// section's own picker default. Distinct from the compose screen's
+    /// per-note `pq-mlkem-enabled` toggle: this only picks WHICH level the
+    /// Quantum keys screen shows/exports; compose always seals to whatever
+    /// level the RECIPIENT's stored contact key declares.
+    pq_level: app_core::passphrase::MlKemLevel,
+    /// An externally IMPORTED ML-KEM secret key, cached in-session only —
+    /// loaded from the `pq-imported` Keychain account ONLY when the user
+    /// opens the Quantum keys screen or taps Unlock on a locked note
+    /// (`ensure_pq_imported_loaded`; LAUNCH-PATH rule — never at boot or
+    /// from a scan). `mlkem_secrets_for` appends its decapsulation secret
+    /// to a notebook's own derived candidates so a scan/unlock can also
+    /// open notes sealed to this imported key. Zeroized on drop
+    /// (`MlKemKeypair`'s own `Drop`); `None` before the first load/import
+    /// this session, or after "Remove imported key".
+    pq_imported: Option<app_core::notes_core::pq::MlKemKeypair>,
     /// Coin control: selected inputs (display-txid, vout) for the compose
     /// in progress; `coins_overridden` = the user has touched the set (so
     /// stop auto-suggesting).
@@ -1327,6 +1351,7 @@ impl State {
             "terms_accepted": self.terms_accepted,
             "auto_unlock": self.auto_unlock,
             "locktime": self.lock_time_policy,
+            "pq_level": self.pq_level,
         })
     }
 
@@ -1377,6 +1402,8 @@ impl State {
             pq_passphrase_verified: false,
             pq_passphrase_generated: None,
             pq_recipient_cache: None,
+            pq_level: app_core::passphrase::MlKemLevel::DEFAULT,
+            pq_imported: None,
             selected_coins: Vec::new(),
             coins_overridden: false,
             consolidate_coins: false,
@@ -3598,9 +3625,28 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
             name: c.name.clone().into(),
             synced: c.synced,
             sync_status: if c.synced { sync_status } else { 0 },
+            pq: c.mlkem_ek.is_some(),
         })
         .collect();
     w.set_contacts(VecModel::from_slice(&contacts));
+}
+
+/// The rename dialog's "Quantum key" display line for the contact at
+/// `addr` on the active network — `""` when the contact has no key on
+/// file (or isn't found at all), else `pqkeys::contact_pq_display`'s
+/// "<level> · <fingerprint>" (armor that fails to re-parse degrades to
+/// empty too — the dialog's own "Set" flow is what would have rejected a
+/// bad paste in the first place, so this should never actually hit that
+/// branch in practice).
+fn contact_pq_display_for(st: &State, addr: &str) -> String {
+    let net = st.network.as_str();
+    st.contacts
+        .iter()
+        .find(|c| c.address == addr && (c.network == net || c.network.is_empty()))
+        .and_then(|c| c.mlkem_ek.as_deref())
+        .and_then(|armor| app_core::pqkeys::contact_pq_display(armor).ok())
+        .map(|(_, line)| line)
+        .unwrap_or_default()
 }
 
 /// Every contact in the iCloud KV blob is there BECAUSE it's synced —
@@ -3835,7 +3881,7 @@ fn refresh_to_chips(w: &AppWindow, st: &State) {
                 .find(|c| &c.address == a && !c.name.is_empty())
                 .map(|c| c.name.clone())
                 .unwrap_or_default();
-            ContactItem { address: a.clone().into(), name: name.into(), synced: false, sync_status: 0 }
+            ContactItem { address: a.clone().into(), name: name.into(), synced: false, sync_status: 0, pq: false }
         })
         .collect();
     w.set_to_chips(VecModel::from_slice(&rows));
@@ -4067,6 +4113,66 @@ fn clear_reveal(w: &AppWindow, s: &mut State) {
     w.set_reveal_nb_rows(VecModel::from_slice(&Vec::<NbPickRow>::new()));
     w.set_reveal_nb_index(0);
     s.reveal_formats = None;
+}
+
+/// `pq-key-level` (Slint UI string) <-> `passphrase::MlKemLevel` — the
+/// UI only ever needs the short "512"/"768"/"1024" form; config.json and
+/// every app-core call keep using the real enum.
+fn pq_level_str(level: app_core::passphrase::MlKemLevel) -> &'static str {
+    match level {
+        app_core::passphrase::MlKemLevel::MlKem512 => "512",
+        app_core::passphrase::MlKemLevel::MlKem768 => "768",
+        app_core::passphrase::MlKemLevel::MlKem1024 => "1024",
+    }
+}
+
+fn pq_level_from_str(s: &str) -> Option<app_core::passphrase::MlKemLevel> {
+    match s {
+        "512" => Some(app_core::passphrase::MlKemLevel::MlKem512),
+        "768" => Some(app_core::passphrase::MlKemLevel::MlKem768),
+        "1024" => Some(app_core::passphrase::MlKemLevel::MlKem1024),
+        _ => None,
+    }
+}
+
+/// One line naming where an imported ML-KEM key came from, for the
+/// post-import confirmation caption. Purely descriptive — never shown
+/// again after the screen re-derives (a reload from the Keychain has no
+/// OpenPGP framing to re-parse, so this is only set right after a
+/// successful `pq-import-submit` this session).
+fn pq_import_source_label(source: &app_core::pgp_import::ImportSource) -> String {
+    match source {
+        app_core::pgp_import::ImportSource::OpenPgp { fingerprint, primary_uid } => match primary_uid {
+            Some(uid) => format!("OpenPGP key · {uid} · {fingerprint}"),
+            None => format!("OpenPGP key · {fingerprint}"),
+        },
+        app_core::pgp_import::ImportSource::GraffitoNative => "Graffito export".to_string(),
+    }
+}
+
+/// Repaint screen 29 (Settings → "Manage quantum keys…") from `st`: the
+/// level picker's current selection, the active notebook's derived key at
+/// that level (fingerprint only — never re-derives unless the level
+/// actually changed, since ML-KEM keygen isn't free), and the imported-key
+/// display line (from the session cache, NOT a fresh Keychain read — see
+/// `ensure_pq_imported_loaded`). A watch-only identity (no leaf secret)
+/// gets a blank fingerprint; the card itself is hidden in that case
+/// (`!root.watch-only` in app.slint), so this is just defense in depth.
+fn update_pq_keys_screen(w: &AppWindow, st: &State) {
+    w.set_pq_key_level(pq_level_str(st.pq_level).into());
+    let fingerprint = st.ident.as_ref().and_then(|i| i.leaf_secret()).map(|ls| {
+        let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(st.pq_level));
+        app_core::pqkeys::fingerprint(&kp)
+    });
+    w.set_pq_key_fingerprint(fingerprint.unwrap_or_default().into());
+    let import_line = st.pq_imported.as_ref().map(|kp| {
+        format!(
+            "{} · {}",
+            app_core::pqkeys::from_pq_alg(kp.alg()).name(),
+            app_core::pqkeys::fingerprint(kp)
+        )
+    });
+    w.set_pq_import_fp(import_line.unwrap_or_default().into());
 }
 
 /// The active account's notebook picker rows for the Private-keys hex/WIF
@@ -4833,7 +4939,7 @@ fn apply_bundle_to_notebook_file(
             st.network,
             notebook_spks,
             spending_window_spks,
-            &mlkem_secrets_for(&ident),
+            &mlkem_secrets_for(&ident, st.pq_imported.as_ref()),
         ),
         None => store.apply_bundle_watch(
             bundle,
@@ -7920,7 +8026,7 @@ fn apply_active_bundle(
             // here (the wallet-wide caller derives it once itself; see
             // `apply_wallet_stores_refresh_results`).
             let spending_window_spks = spending_window_spks_for(st);
-            let mlkem_secrets = mlkem_secrets_for(st.ident.as_ref().unwrap());
+            let mlkem_secrets = mlkem_secrets_for(st.ident.as_ref().unwrap(), st.pq_imported.as_ref());
             let applied = match &keyed {
                 Some(identity) => st.store.as_mut().unwrap().apply_bundle(
                     &bundle,
@@ -8167,7 +8273,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
             // Spending-self-notes fix (Unit A) — see the matching comment
             // in `apply_active_bundle`.
             let spending_window_spks = spending_window_spks_for(st);
-            let mlkem_secrets = mlkem_secrets_for(st.ident.as_ref().unwrap());
+            let mlkem_secrets = mlkem_secrets_for(st.ident.as_ref().unwrap(), st.pq_imported.as_ref());
             let applied = match &keyed {
                 Some(identity) => st.store.as_mut().unwrap().apply_bundle(
                     &bundle,
@@ -11079,15 +11185,55 @@ fn spending_window_spks_for(st: &State) -> Vec<Vec<u8>> {
 /// Post-quantum: the ML-KEM decapsulation secrets to try against any
 /// received KEM-only-flagged note a scan recovers (`Store::apply_bundle`'s
 /// `mlkem_secrets` param — see its doc comment for the full contract).
-/// Phase 1 (this compose/unlock milestone) covers only the scanned
-/// notebook's OWN derived keys, all three levels
-/// (`pqkeys::derive_secrets`) — an imported/shared secret (another
-/// identity's key kept around to read notes addressed to it) is Phase C2's
-/// job and isn't unioned in yet. Watch-only and any identity with no leaf
-/// secret (`AppIdentity::leaf_secret()` returns `None`) get an empty slice
-/// — a strict no-op for auto-unlock, exactly like `apply_bundle_watch`.
-fn mlkem_secrets_for(ident: &AppIdentity) -> Vec<app_core::notes_core::pq::MlKemSecret> {
-    ident.leaf_secret().map(|ls| app_core::pqkeys::derive_secrets(ls)).unwrap_or_default()
+/// Covers the scanned notebook's OWN derived keys, all three levels
+/// (`pqkeys::derive_secrets`), PLUS `imported` — Phase C2's cached
+/// externally-imported secret (another identity's key kept around to read
+/// notes addressed to it), when the caller already has it loaded
+/// (`ensure_pq_imported_loaded`; never loaded here — this fn never touches
+/// the Keychain). `notes_core::pq::unlock_received` tries a candidate
+/// against whatever algorithm the ciphertext itself declares, so an
+/// imported secret at a different level than the notebook's own derived
+/// keys is still tried and simply fails cleanly (ML-KEM implicit
+/// rejection) when it doesn't match — no per-secret alg tag needed here.
+/// Watch-only and any identity with no leaf secret (`AppIdentity::
+/// leaf_secret()` returns `None`) get just the imported secret (or none at
+/// all) — a strict no-op for the derived half, exactly like
+/// `apply_bundle_watch`.
+fn mlkem_secrets_for(
+    ident: &AppIdentity,
+    imported: Option<&app_core::notes_core::pq::MlKemKeypair>,
+) -> Vec<app_core::notes_core::pq::MlKemSecret> {
+    let mut secrets =
+        ident.leaf_secret().map(|ls| app_core::pqkeys::derive_secrets(ls)).unwrap_or_default();
+    if let Some(kp) = imported {
+        secrets.push(kp.secret());
+    }
+    secrets
+}
+
+/// Post-quantum: lazily load the externally-imported ML-KEM secret
+/// (Settings → Quantum keys → "Import a key") from its Keychain account
+/// into `State.pq_imported` — a no-op once already cached this session
+/// (mirrors `s.material`'s "avoids re-prompting Touch ID" caching). Call
+/// ONLY from a user-initiated point — opening the Quantum keys screen, or
+/// tapping Unlock on a locked note — NEVER from a scan or the boot path
+/// (the LAUNCH-PATH rule: the keychain is off limits until the user asks
+/// for it). A missing item is not an error — nothing has been imported
+/// yet, or it was removed.
+fn ensure_pq_imported_loaded(s: &mut State) {
+    if s.pq_imported.is_some() {
+        return;
+    }
+    match keychain::load_secret_protected(PQ_IMPORTED_ACCOUNT, "unlock your imported quantum key") {
+        Ok(Some(armor)) => match app_core::notes_core::pq::import_private(&armor) {
+            Ok((alg, seed)) => {
+                s.pq_imported = Some(app_core::notes_core::pq::MlKemKeypair::from_seed(alg, &seed));
+            }
+            Err(e) => println!("cb: pq-key-import-load err={e}"),
+        },
+        Ok(None) => {}
+        Err(e) => println!("cb: pq-key-import-load err={e}"),
+    }
 }
 
 /// The confirm screen's one-liner caption for any note-composing tx:
@@ -12269,6 +12415,12 @@ pub fn run() {
         .get("locktime")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+    // Quantum keys (screen 29) level picker — absent config key (every
+    // pre-C2 config) => the same DEFAULT (768) the picker pre-selects.
+    let pq_level: app_core::passphrase::MlKemLevel = config
+        .get("pq_level")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or(app_core::passphrase::MlKemLevel::DEFAULT);
     // Device-level per-network Settings (Bitcoin node / block explorer URLs).
     let str_map = |key: &str| -> HashMap<String, String> {
         config
@@ -12339,6 +12491,8 @@ pub fn run() {
         pq_passphrase_verified: false,
         pq_passphrase_generated: None,
         pq_recipient_cache: None,
+        pq_level,
+        pq_imported: None,
         selected_coins: Vec::new(),
         coins_overridden: false,
         consolidate_coins: false,
@@ -12477,6 +12631,13 @@ pub fn run() {
     // Metrics global in app.slint; Apple platforms keep the -1.25px default).
     #[cfg(target_os = "android")]
     window.global::<Metrics>().set_back_dy(1.5);
+
+    // Quantum keys (screen 29) level-picker captions — pinned copy from
+    // `passphrase::MlKemLevel::describe()`, set once (never changes at
+    // runtime, so no need to re-derive it on every screen open).
+    window.set_pq_desc_512(app_core::passphrase::MlKemLevel::MlKem512.describe().into());
+    window.set_pq_desc_768(app_core::passphrase::MlKemLevel::MlKem768.describe().into());
+    window.set_pq_desc_1024(app_core::passphrase::MlKemLevel::MlKem1024.describe().into());
 
     // EditOps: UTF-8 byte-offset text helpers + platform clipboard for the
     // EditField/EditArea widgets (offsets come from TextInput's cursor API
@@ -13426,7 +13587,7 @@ pub fn run() {
                         .find(|c| &c.address == a && !c.name.is_empty())
                         .map(|c| c.name.clone())
                         .unwrap_or_default();
-                    ContactItem { address: a.clone().into(), name: name.into(), synced: false, sync_status: 0 }
+                    ContactItem { address: a.clone().into(), name: name.into(), synced: false, sync_status: 0, pq: false }
                 })
                 .collect();
             w.set_note_reply_set(VecModel::from_slice(&reply_rows));
@@ -13449,12 +13610,17 @@ pub fn run() {
     // Screen 5's "Unlock" tap. Never logs the typed passphrase — only
     // ok/err, matching the `cb:` log contract's "no secrets in logs" rule.
     cb!(on_unlock_note, |w, s| {
+        // User-initiated tap — the LAUNCH-PATH rule's other sanctioned door
+        // (besides opening the Quantum keys screen) for loading an imported
+        // ML-KEM secret from the Keychain this session. Runs before the
+        // borrows below so it never conflicts with them.
+        ensure_pq_imported_loaded(&mut s);
         let note_id = w.get_note_view_id().to_string();
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()) else {
             w.set_status("no identity".into());
             return;
         };
-        let secrets = mlkem_secrets_for(s.ident.as_ref().unwrap());
+        let secrets = mlkem_secrets_for(s.ident.as_ref().unwrap(), s.pq_imported.as_ref());
         let password = w.get_note_unlock_passphrase().to_string();
         w.set_note_unlock_busy(true);
         let identity = identity.clone_fields();
@@ -14546,9 +14712,12 @@ pub fn run() {
         let _ = &mut s;
         println!("cb: rename-start addr={addr}");
         w.set_status("".into());
-        w.set_rename_address(addr);
+        w.set_rename_address(addr.clone());
         w.set_rename_input(name);
         w.set_rename_synced(synced);
+        w.set_rename_pq_input("".into());
+        w.set_rename_pq_error("".into());
+        w.set_rename_pq_display(contact_pq_display_for(&s, addr.as_str()).into());
     });
 
     cb!(on_save_rename, |w, s, name: SharedString| {
@@ -14561,6 +14730,9 @@ pub fn run() {
         w.set_rename_address("".into());
         w.set_rename_input("".into());
         w.set_rename_synced(false);
+        w.set_rename_pq_input("".into());
+        w.set_rename_pq_display("".into());
+        w.set_rename_pq_error("".into());
         update_home(&w, &s);
     });
 
@@ -14569,6 +14741,72 @@ pub fn run() {
         w.set_rename_address("".into());
         w.set_rename_input("".into());
         w.set_rename_synced(false);
+        w.set_rename_pq_input("".into());
+        w.set_rename_pq_display("".into());
+        w.set_rename_pq_error("".into());
+    });
+
+    // Contact quantum key: paste/file -> `pqkeys::set_contact_pq_key` ->
+    // persist through the normal contacts save path (the field already
+    // rides `Contact` serde + the iCloud blob). Applied immediately (not
+    // deferred to the dialog's own Save), same as the "Save to iCloud"
+    // checkbox — both are contact-record edits independent of the name.
+    cb!(on_contact_pq_set, |w, s, input: SharedString| {
+        let addr = w.get_rename_address().to_string();
+        if addr.is_empty() {
+            return;
+        }
+        let net = s.network.as_str().to_string();
+        let Some(contact) = s
+            .contacts
+            .iter_mut()
+            .find(|c| c.address == addr && (c.network == net || c.network.is_empty()))
+        else {
+            return;
+        };
+        match app_core::pqkeys::set_contact_pq_key(contact, input.trim()) {
+            Ok(fp) => {
+                s.save_contacts();
+                println!("cb: contact-pq-key ok fp={fp}");
+                w.set_rename_pq_error("".into());
+                w.set_rename_pq_input("".into());
+                w.set_rename_pq_display(contact_pq_display_for(&s, &addr).into());
+                refresh_contacts(&w, &s);
+            }
+            Err(e) => {
+                println!("cb: contact-pq-key err={e}");
+                w.set_rename_pq_error(e.to_string().into());
+            }
+        }
+    });
+
+    cb!(on_contact_pq_remove, |w, s| {
+        let addr = w.get_rename_address().to_string();
+        if addr.is_empty() {
+            return;
+        }
+        let net = s.network.as_str().to_string();
+        if let Some(contact) = s
+            .contacts
+            .iter_mut()
+            .find(|c| c.address == addr && (c.network == net || c.network.is_empty()))
+        {
+            contact.mlkem_ek = None;
+            s.save_contacts();
+            println!("cb: contact-pq-key removed");
+            w.set_rename_pq_display("".into());
+            refresh_contacts(&w, &s);
+        }
+    });
+
+    cb!(on_contact_pq_file, |w, s| {
+        let _ = &mut s;
+        if let Some(path) = platform::pick_file(&[("Key", &["asc", "txt", "pgp", "gpg"])]) {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => w.set_rename_pq_input(text.trim().into()),
+                Err(e) => w.set_rename_pq_error(format!("file: {e}").into()),
+            }
+        }
     });
 
     cb!(on_confirm_remove, |w, s, addr: SharedString, name: SharedString| {
@@ -17535,6 +17773,145 @@ pub fn run() {
         let Some(v) = derive_leaf_value(&s, &w, &fmt) else { return };
         w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
         w.set_reveal_private_value(v.into());
+    });
+
+    // ---- Quantum keys (Settings -> screen 29) ----------------------------
+
+    cb!(on_open_pq_keys, |w, s| {
+        // User-initiated — the LAUNCH-PATH rule's other sanctioned door for
+        // loading an imported ML-KEM secret from the Keychain this session
+        // (a no-op once already cached).
+        ensure_pq_imported_loaded(&mut s);
+        w.set_pq_import_text("".into());
+        w.set_pq_import_error("".into());
+        w.set_pq_import_source("".into());
+        w.set_pq_show_backup_confirm(false);
+        update_pq_keys_screen(&w, &s);
+        w.set_screen(29);
+    });
+
+    cb!(on_pq_set_level, |w, s, level: SharedString| {
+        let Some(level) = pq_level_from_str(level.as_str()) else { return };
+        s.pq_level = level;
+        s.save_config();
+        println!("cb: pq-key level={}", pq_level_str(level));
+        update_pq_keys_screen(&w, &s);
+    });
+
+    cb!(on_pq_copy_public, |w, s| {
+        let _ = &mut s;
+        let Some(ls) = s.ident.as_ref().and_then(|i| i.leaf_secret()) else { return };
+        let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(s.pq_level));
+        let armor = app_core::pqkeys::export_public_armor(&kp);
+        let ok = platform::set_clipboard_text(&armor);
+        println!("cb: pq-key-export public len={}", armor.len());
+        show_toast(&w, if ok { "Copied" } else { "Copy failed" });
+    });
+
+    cb!(on_pq_save_public, |w, s| {
+        let _ = &mut s;
+        let Some(ls) = s.ident.as_ref().and_then(|i| i.leaf_secret()) else { return };
+        let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(s.pq_level));
+        let armor = app_core::pqkeys::export_public_armor(&kp);
+        if let Some(path) = platform::save_file("quantum-public-key.asc") {
+            match std::fs::write(&path, armor.as_bytes()) {
+                Ok(()) => {
+                    println!("cb: pq-key-export public len={}", armor.len());
+                    w.set_status("saved public key".into());
+                }
+                Err(e) => w.set_status(format!("save failed: {e}").into()),
+            }
+        }
+    });
+
+    cb!(on_pq_copy_private, |w, s| {
+        let _ = &mut s;
+        let Some(ls) = s.ident.as_ref().and_then(|i| i.leaf_secret()) else { return };
+        let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(s.pq_level));
+        let armor = app_core::pqkeys::export_private_armor(&kp);
+        let ok = platform::set_clipboard_secret(&armor);
+        println!("cb: pq-key-export private len={}", armor.len());
+        w.set_pq_show_backup_confirm(false);
+        show_toast(&w, if ok { "Copied" } else { "Copy failed" });
+    });
+
+    cb!(on_pq_save_private, |w, s| {
+        let _ = &mut s;
+        let Some(ls) = s.ident.as_ref().and_then(|i| i.leaf_secret()) else { return };
+        let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(s.pq_level));
+        let armor = app_core::pqkeys::export_private_armor(&kp);
+        w.set_pq_show_backup_confirm(false);
+        if let Some(path) = platform::save_file("quantum-private-key.asc") {
+            match std::fs::write(&path, armor.as_bytes()) {
+                Ok(()) => {
+                    println!("cb: pq-key-export private len={}", armor.len());
+                    w.set_status("saved private key".into());
+                }
+                Err(e) => w.set_status(format!("save failed: {e}").into()),
+            }
+        }
+    });
+
+    cb!(on_pq_import_paste, |w, s| {
+        let _ = &mut s;
+        match platform::clipboard_text() {
+            Some(text) => w.set_pq_import_text(text.into()),
+            None => w.set_pq_import_error("clipboard empty".into()),
+        }
+    });
+
+    cb!(on_pq_import_file, |w, s| {
+        let _ = &mut s;
+        if let Some(path) = platform::pick_file(&[("Key", &["asc", "txt", "pgp", "gpg"])]) {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => w.set_pq_import_text(text.trim().into()),
+                Err(e) => w.set_pq_import_error(format!("file: {e}").into()),
+            }
+        }
+    });
+
+    cb!(on_pq_import_submit, |w, s| {
+        let text = w.get_pq_import_text().to_string();
+        w.set_pq_import_error("".into());
+        let imported = match app_core::pgp_import::parse_mlkem_key(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("cb: pq-key-import err={e}");
+                w.set_pq_import_error(e.to_string().into());
+                return;
+            }
+        };
+        let (kp, armor) = match app_core::pqkeys::import_to_native_private(&imported) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("cb: pq-key-import err={e}");
+                w.set_pq_import_error(e.into());
+                return;
+            }
+        };
+        match keychain::store_secret_protected(PQ_IMPORTED_ACCOUNT, &armor, false) {
+            Ok(()) => {
+                let fp = app_core::pqkeys::fingerprint(&kp);
+                println!("cb: pq-key-import ok fp={fp}");
+                w.set_pq_import_text("".into());
+                w.set_pq_import_source(pq_import_source_label(&imported.source).into());
+                s.pq_imported = Some(kp);
+                update_pq_keys_screen(&w, &s);
+            }
+            Err(e) => {
+                println!("cb: pq-key-import err={e}");
+                w.set_pq_import_error(format!("couldn't save this key: {e}").into());
+            }
+        }
+    });
+
+    cb!(on_pq_import_remove, |w, s| {
+        let _ = keychain::delete_secret(PQ_IMPORTED_ACCOUNT);
+        s.pq_imported = None;
+        w.set_pq_import_source("".into());
+        w.set_pq_import_error("".into());
+        println!("cb: pq-key-remove");
+        update_pq_keys_screen(&w, &s);
     });
 
     cb!(on_copy_value, |w, s, value: SharedString| {

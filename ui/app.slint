@@ -27,7 +27,7 @@ export struct SenderItem { key: string, label: string, sub: string, excluded: bo
 // in and the last push reached iCloud (cloud-check), 3 = opted in but
 // iCloud is unavailable / the last push failed (cloud-alert). Only
 // meaningful when `synced` is true — see `refresh_contacts` in lib.rs.
-export struct ContactItem { address: string, name: string, synced: bool, sync-status: int }
+export struct ContactItem { address: string, name: string, synced: bool, sync-status: int, pq: bool }
 // One revealed key-export format (Public keys screen — the ONLY reveal
 // surface that shows several rows at once; Private keys is progressive-
 // disclosure, one format at a time, via scalar reveal-private-* props).
@@ -1824,6 +1824,16 @@ export component AppWindow inherits Window {
     // property; on-start-rename seeds it from the contact's current
     // `synced` flag, defaulting unchecked for a never-synced contact.
     in-out property <bool> rename-synced;
+    // Quantum key on this contact (rename dialog "Quantum key" section):
+    // `rename-pq-display` is "" while none is set, else "<level> · <fp>"
+    // (`pqkeys::contact_pq_display`) — seeded by `start-rename`, refreshed
+    // after `contact-pq-set`/`contact-pq-remove`.
+    in-out property <string> rename-pq-input;
+    in property <string> rename-pq-display;
+    in property <string> rename-pq-error;
+    callback contact-pq-set(string);
+    callback contact-pq-remove();
+    callback contact-pq-file();
     in-out property <string> confirm-remove-address;
     in property <string> confirm-remove-name;
 
@@ -1944,6 +1954,38 @@ export component AppWindow inherits Window {
     // notebook. Picking re-derives hex/WIF for THAT notebook, no re-auth.
     in property <[NbPickRow]> reveal-nb-rows;
     in-out property <int> reveal-nb-index;
+    // ---- Quantum keys (Settings "Dangerous area" -> screen 29) ----
+    // Hidden for watch-only identities (gated on `!watch-only` in the
+    // Settings card, same as "Private keys" — no leaf secret there, so no
+    // derived ML-KEM receive key either).
+    callback open-pq-keys();
+    // Level picker: "512" | "768" | "1024" — device-level (config.json
+    // "pq_level"), MlKem768 pre-selected by default.
+    in property <string> pq-key-level: "768";
+    callback pq-set-level(string);
+    in property <string> pq-key-fingerprint;
+    // Static per-level copy — sourced from `passphrase::MlKemLevel::
+    // describe()` (pinned text) once at boot, never changes at runtime.
+    in property <string> pq-desc-512;
+    in property <string> pq-desc-768;
+    in property <string> pq-desc-1024;
+    callback pq-copy-public();
+    callback pq-save-public();
+    in-out property <bool> pq-show-backup-confirm;
+    callback pq-copy-private();
+    callback pq-save-private();
+    // Import a key: paste/file -> parse -> keychain-store. `pq-import-fp`
+    // is the CURRENT imported key's display line ("ML-KEM-768 · fp"),
+    // empty when nothing is imported; `pq-import-source` names where it
+    // came from (only set right after a successful import this session).
+    in-out property <string> pq-import-text;
+    callback pq-import-paste();
+    callback pq-import-file();
+    callback pq-import-submit();
+    callback pq-import-remove();
+    in property <string> pq-import-error;
+    in property <string> pq-import-fp;
+    in property <string> pq-import-source;
     in property <[CoinItem]> coins;
     in property <string> coins-summary;
     // Settings Coins card only: aggregates notebook + spending pools (the
@@ -2358,6 +2400,11 @@ export component AppWindow inherits Window {
         if (root.screen == 21) { root.screen = 6; return true; }
         if (root.screen == 18 || root.screen == 19) {
             root.reveal-hide();
+            root.screen = 8;
+            return true;
+        }
+        if (root.screen == 29) {
+            root.pq-show-backup-confirm = false;
             root.screen = 8;
             return true;
         }
@@ -3778,6 +3825,10 @@ export component AppWindow inherits Window {
                                 }
                                 if c.name != "": Caption { text: c.address; overflow: elide; }
                             }
+                            if c.pq: VerticalLayout {
+                                alignment: center;
+                                Badge { label: "PQ"; tint: Pal.accent; }
+                            }
                             VerticalLayout {
                                 alignment: center;
                                 PencilButton {
@@ -4191,6 +4242,14 @@ export component AppWindow inherits Window {
                 text: "Private keys";
                 clicked => { root.reveal-private(); }
             }
+        }
+        // Hidden for watch-only, same reasoning as "Private keys" above —
+        // no leaf secret on a watch-only identity, so no derived ML-KEM
+        // receive key to manage either.
+        if !root.watch-only: SettingsCard {
+            title: "Quantum keys";
+            subtitle: "A post-quantum receive key for this notebook (ML-KEM), added on top of your normal note encryption so directed notes to you can add hybrid protection against a future quantum computer.";
+            GhostButton { text: "Manage quantum keys…"; clicked => { root.open-pq-keys(); } }
         }
         SettingsCard {
             title: "About & help";
@@ -5749,6 +5808,108 @@ export component AppWindow inherits Window {
         }
     }
 
+    // ---------- 29 · quantum keys (Settings -> ML-KEM receive key + import) ----------
+    if screen == 29: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: "Quantum keys";
+            back => { root.nav-back(); }
+        }
+        Flickable {
+            viewport-width: self.width;
+            viewport-height: pq-keys-col.preferred-height;
+            // Dismiss layer (see the global one under back-scope): this
+            // Flickable holds text fields (paste box), so it needs its own
+            // copy — same pattern screens 6/8/16/21 already use.
+            TouchArea {
+                width: parent.width;
+                height: pq-keys-col.preferred-height;
+                clicked => { back-scope.focus(); }
+            }
+            pq-keys-col := VerticalLayout {
+                width: parent.width;
+                spacing: 14px;
+                alignment: start;
+                Caption {
+                    text: "A post-quantum receive key for this notebook, layered on top of your normal note encryption. Share the public half so others can seal directed notes to you with quantum-resistant protection — it recovers automatically from your seed phrase.";
+                }
+                Text { text: "Parameter level"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                VerticalLayout {
+                    spacing: 8px;
+                    DoorCard {
+                        title: "ML-KEM-512";
+                        subtitle: root.pq-desc-512;
+                        highlight: root.pq-key-level == "512";
+                        clicked => { root.pq-set-level("512"); }
+                    }
+                    DoorCard {
+                        title: "ML-KEM-768";
+                        subtitle: root.pq-desc-768;
+                        highlight: root.pq-key-level == "768";
+                        clicked => { root.pq-set-level("768"); }
+                    }
+                    DoorCard {
+                        title: "ML-KEM-1024";
+                        subtitle: root.pq-desc-1024;
+                        highlight: root.pq-key-level == "1024";
+                        clicked => { root.pq-set-level("1024"); }
+                    }
+                }
+                Rectangle {
+                    border-radius: 10px;
+                    background: Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    height: pq-key-col.preferred-height;
+                    pq-key-col := VerticalLayout {
+                        padding: 12px;
+                        spacing: 6px;
+                        Text { text: "Your notebook's quantum key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                        Mono { text: root.pq-key-fingerprint; color: Pal.muted; }
+                        Caption { text: "Derived from your seed — recovers with your seed phrase; backup is optional."; }
+                    }
+                }
+                VerticalLayout {
+                    spacing: 8px;
+                    Text { text: "Share your public key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        GhostButton { text: "Copy public key"; clicked => { root.pq-copy-public(); } }
+                        if root.desktop-platform: GhostButton { text: "Save public key…"; clicked => { root.pq-save-public(); } }
+                    }
+                }
+                VerticalLayout {
+                    spacing: 8px;
+                    Text { text: "Backup"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                    Caption { text: "Optional — this key already recovers from your seed phrase. Only do this if you want a separate copy outside the app."; }
+                    GhostButton { text: "Backup private key…"; clicked => { root.pq-show-backup-confirm = true; } }
+                }
+                Rectangle { height: 1px; background: Pal.line; }
+                Text { text: "Import a key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                Caption { text: "Import someone else's ML-KEM SECRET key so this device can read notes sealed to it — a Graffito private-key export, or an OpenPGP key with an RFC 9980 ML-KEM-768+X25519 component."; }
+                EditArea {
+                    height: 90px;
+                    text <=> root.pq-import-text;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Paste"; clicked => { root.pq-import-paste(); } }
+                    if root.desktop-platform: GhostButton { text: "From file…"; clicked => { root.pq-import-file(); } }
+                    GhostButton { text: "Import"; clicked => { root.pq-import-submit(); } }
+                }
+                if root.pq-import-error != "": Caption { text: root.pq-import-error; color: Pal.bad; wrap: word-wrap; }
+                if root.pq-import-fp != "": VerticalLayout {
+                    spacing: 4px;
+                    Caption { text: "Imported: " + root.pq-import-fp; color: Pal.good; }
+                    if root.pq-import-source != "": Caption { text: root.pq-import-source; color: Pal.muted; wrap: word-wrap; }
+                    GhostButton { text: "Remove imported key"; clicked => { root.pq-import-remove(); } }
+                }
+            }
+        }
+        Caption { text: root.status; color: Pal.bad; }
+    }
+
     // ---------- 24 · terms & disclaimer (first-run accept gate + re-view) ----------
     if screen == 24: VerticalLayout { padding-top: root.safe-top + 20px; padding-bottom: root.safe-bottom + 10px;
         padding: 24px;
@@ -6211,6 +6372,35 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                Rectangle { height: 1px; background: Pal.line; }
+                Text { text: "Quantum key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                if root.rename-pq-display != "": HorizontalLayout {
+                    spacing: 8px;
+                    Caption { text: root.rename-pq-display; horizontal-stretch: 1; wrap: word-wrap; }
+                    IconButton {
+                        glyph: "×";
+                        glyph-size: 18px;
+                        width: 28px;
+                        height: 28px;
+                        glyph-color: Pal.bad;
+                        clicked => { root.contact-pq-remove(); }
+                    }
+                }
+                if root.rename-pq-display == "": HorizontalLayout {
+                    spacing: 8px;
+                    EditField {
+                        horizontal-stretch: 1;
+                        text <=> root.rename-pq-input;
+                        placeholder-text: "paste their quantum public key";
+                        accepted(t) => { root.contact-pq-set(t); }
+                    }
+                    GhostButton { text: "Set"; width: 64px; clicked => { root.contact-pq-set(root.rename-pq-input); } }
+                }
+                if root.desktop-platform && root.rename-pq-display == "": GhostButton {
+                    text: "From file…";
+                    clicked => { root.contact-pq-file(); }
+                }
+                if root.rename-pq-error != "": Caption { text: root.rename-pq-error; color: Pal.bad; wrap: word-wrap; }
                 HorizontalLayout {
                     spacing: 10px;
                     GhostButton { text: "Cancel"; clicked => { root.cancel-rename(); } }
@@ -6360,6 +6550,45 @@ export component AppWindow inherits Window {
                             root.dice-clear();
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // ---------- backup quantum private key confirmation (modal overlay) ----------
+    if root.pq-show-backup-confirm: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.pq-show-backup-confirm = false; } }
+        Rectangle {
+            width: 400px;
+            height: pqbl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { clicked => { back-scope.focus(); } }
+            pqbl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Back up your quantum private key?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Caption {
+                    text: "Anyone who gets this key can read notes sealed to it. It already recovers from your seed phrase — only do this if you want a separate copy.";
+                    color: Pal.warn;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.pq-show-backup-confirm = false; } }
+                    GhostButton { text: "Copy"; clicked => { root.pq-copy-private(); } }
+                    if root.desktop-platform: GhostButton { text: "Save…"; clicked => { root.pq-save-private(); } }
                 }
             }
         }
