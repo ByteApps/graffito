@@ -135,6 +135,56 @@ pub fn fingerprint(kp: &MlKemKeypair) -> String {
     kp.fingerprint()
 }
 
+/// Bridge a successful [`crate::pgp_import::parse_mlkem_key`] SECRET-key
+/// import into this crate's own native PRIVATE armor — the ONE form the
+/// app layer persists an imported ML-KEM secret in (its `pq-imported`
+/// keychain account), regardless of whether the original was an OpenPGP
+/// key or graffito-native armor. Also hands back the reconstructed
+/// [`MlKemKeypair`] so the caller can show a fingerprint/level immediately
+/// without re-parsing the armor it just wrote.
+///
+/// Errors:
+/// - `imported.secret` is `None` (a public-only key/cert): "public key
+///   only — it can't receive notes; import it on a contact instead" — the
+///   exact UI-facing guidance for this case (use [`set_contact_pq_key`]
+///   instead).
+/// - `imported.secret` is [`crate::pgp_import::MlKemSecretMaterial::Expanded`]:
+///   this crate's native private armor only has a slot for the 64-byte
+///   seed form (see `pgp_import`'s module doc for why every real source —
+///   rpgp 0.20 and graffito-native alike — is Seed-only in practice; this
+///   branch exists only so the match stays exhaustive against the wider
+///   wire format `MlKemSecretMaterial` documents).
+pub fn import_to_native_private(
+    imported: &crate::pgp_import::ImportedMlKem,
+) -> Result<(MlKemKeypair, String), String> {
+    use crate::pgp_import::MlKemSecretMaterial;
+
+    let seed = match &imported.secret {
+        Some(MlKemSecretMaterial::Seed(s)) => *s,
+        Some(MlKemSecretMaterial::Expanded(_)) => {
+            return Err(
+                "this key's secret material is in an expanded form this app can't store — \
+                 re-export it from its original source in seed form"
+                    .into(),
+            );
+        }
+        None => {
+            return Err(
+                "public key only — it can't receive notes; import it on a contact instead".into(),
+            );
+        }
+    };
+    let alg = MlKemAlg::from_id(match imported.alg {
+        crate::pgp_import::MlKemLevel::MlKem512 => 0x01,
+        crate::pgp_import::MlKemLevel::MlKem768 => 0x02,
+        crate::pgp_import::MlKemLevel::MlKem1024 => 0x03,
+    })
+    .expect("pgp_import::MlKemLevel always maps to a valid MlKemAlg id");
+    let kp = MlKemKeypair::from_seed(alg, &seed);
+    let armor = export_private_armor(&kp);
+    Ok((kp, armor))
+}
+
 /// Where a notebook's (or a contact's) ML-KEM key comes from — persisted
 /// by the app layer (Phase C) in its config, never here (app-core stores
 /// no config of its own). The imported SECRET material itself is never
@@ -352,6 +402,65 @@ mod tests {
         let kp = derive_keypair(&leaf(0x66), MlKemAlg::MlKem1024);
         assert_eq!(fingerprint(&kp), kp.fingerprint());
         assert_eq!(fingerprint(&kp), notes_core::pq::fingerprint(MlKemAlg::MlKem1024, kp.ek()));
+    }
+
+    // ---- import_to_native_private ----------------------------------------
+
+    #[test]
+    fn import_to_native_private_accepts_seed_form() {
+        use crate::pgp_import::{ImportSource, ImportedMlKem, MlKemLevel as PgpLevel, MlKemSecretMaterial};
+
+        let seed = [0x42u8; 64];
+        let expected = MlKemKeypair::from_seed(MlKemAlg::MlKem768, &seed);
+        let imported = ImportedMlKem {
+            ek: expected.ek().to_vec(),
+            secret: Some(MlKemSecretMaterial::Seed(seed)),
+            source: ImportSource::GraffitoNative,
+            alg: PgpLevel::MlKem768,
+        };
+
+        let (kp, armor) = import_to_native_private(&imported).unwrap();
+        assert_eq!(kp.alg(), MlKemAlg::MlKem768);
+        assert_eq!(kp.seed(), &seed);
+        assert_eq!(kp.ek(), expected.ek());
+
+        let (alg, round_seed) = notes_core::pq::import_private(&armor).unwrap();
+        assert_eq!(alg, MlKemAlg::MlKem768);
+        assert_eq!(round_seed, seed);
+    }
+
+    #[test]
+    fn import_to_native_private_rejects_public_only() {
+        use crate::pgp_import::{ImportSource, ImportedMlKem, MlKemLevel as PgpLevel};
+
+        let imported = ImportedMlKem {
+            ek: vec![0u8; MlKemAlg::MlKem768.ek_len()],
+            secret: None,
+            source: ImportSource::GraffitoNative,
+            alg: PgpLevel::MlKem768,
+        };
+        let err = match import_to_native_private(&imported) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("public key only"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn import_to_native_private_rejects_expanded_form() {
+        use crate::pgp_import::{ImportSource, ImportedMlKem, MlKemLevel as PgpLevel, MlKemSecretMaterial};
+
+        let imported = ImportedMlKem {
+            ek: vec![0u8; MlKemAlg::MlKem768.ek_len()],
+            secret: Some(MlKemSecretMaterial::Expanded(vec![0u8; 2400])),
+            source: ImportSource::GraffitoNative,
+            alg: PgpLevel::MlKem768,
+        };
+        let err = match import_to_native_private(&imported) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("expanded"), "unexpected error: {err}");
     }
 
     // ---- set_contact_pq_key ---------------------------------------------
