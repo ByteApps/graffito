@@ -1646,6 +1646,8 @@ mod tests {
             recipient: None,
             recipients: vec![],
             text: Some("public note to many".into()),
+            pq_flags: 0,
+            locked: None,
         };
         // Fresh scan decodes correctly -> cache corrected.
         store.upsert_note(&rec);
