@@ -38,6 +38,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # rustls so no system TLS/openssl is needed inside the Nix shell.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+# pgp_import.rs: parses RFC 9980 OpenPGP keys (algorithm 35, ML-KEM-768+
+# X25519 composite) to extract the ML-KEM component for note encryption.
+# No default features (drops bzip2 message decompression — irrelevant
+# here, mirrors pgp-core's own choice). `draft-pqc` is what exposes the
+# algorithm-35 (de)serialization plus the `crypto::ml_kem768_x25519` /
+# `crypto::ml_kem1024_x448` composite modules pgp_import.rs also reuses
+# to expand a bare native-armor ML-KEM seed into its encapsulation key.
+pgp = { version = "=0.20.0", default-features = false, features = ["draft-pqc"] }
+# Graffito-native armor's payload encoding ("standard base64" per spec).
+base64 = "0.22"
 
 [dev-dependencies]
 # Fixture generator for the flagship import path: the parity tests feed
@@ -49,3 +59,14 @@ bip85-core = { git = "ssh://git@github.com/ByteApps/prime-bip85.git", rev = "dbc
 # major already resolved above, so it's the SAME getrandom, not a second
 # copy.
 getrandom = "0.2"
+# tests/pgp_import.rs: generates real algorithm-35 fixtures (mirrors
+# prime-openpgp-keys/pgp-core's keygen) and proves the extracted ek/
+# secret are correct by encapsulating/decapsulating directly against the
+# standalone ml-kem crate rpgp uses internally. Never a REGULAR
+# dependency of app-core — production code only expands a seed through
+# rpgp's own composite modules (see pgp_import.rs module docs).
+ml-kem = "0.2"
+# Same major rpgp's own code uses; needed for `generate_pqc_hybrid`'s
+# `rand::thread_rng()` (matches the `Rng` bound rpgp's `.generate()`
+# takes) and for driving ml-kem's encapsulate/decapsulate in tests.
+rand = "0.8"

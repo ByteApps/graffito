@@ -19,6 +19,7 @@ pub mod keyexport;
 pub mod mixed;
 pub mod netq;
 pub mod notebooks;
+pub mod pgp_import;
 pub mod psbt_build;
 pub mod psbt_finalize;
 pub mod scan_gate;
