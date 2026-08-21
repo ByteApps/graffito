@@ -29,6 +29,10 @@ foundation-ur = "0.4"
 # (BCR-2020-007/010/015) — hardware-wallet account-export QR import.
 ciborium = "0.2"
 bip39 = "2"
+# Passphrase-strength estimation for the optional PQ passphrase layer on
+# directed private notes (see passphrase.rs) — dictionary/pattern-aware
+# guess estimation, not a naive charset-entropy formula.
+zxcvbn = "3"
 hkdf = "0.12"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
