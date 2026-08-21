@@ -275,6 +275,16 @@ pub struct SecurityChoice {
     /// `None` when the passphrase layer isn't in use. Only offered on
     /// directed notes.
     pub passphrase_bits: Option<f64>,
+    /// `true` iff the CURRENT passphrase text came out of [`generate`] this
+    /// session, untouched since. A generated phrase's entropy is a
+    /// closed-form fact ([`GENERATED_BITS`]); anything typed or pasted, or a
+    /// generated phrase the user has since edited, has only an ESTIMATE
+    /// ([`estimate_bits`]) that zxcvbn 3.x cannot even represent past ~64
+    /// bits (see the module doc) — so an unverified passphrase must never
+    /// count toward quantum-resistance no matter how high its estimate
+    /// reads. The compose screen flips this back to `false` the instant the
+    /// generated text changes.
+    pub passphrase_verified: bool,
     /// The ML-KEM level, if the hybrid layer is enabled. `None` when it
     /// isn't in use. Only offered on directed notes.
     pub mlkem: Option<MlKemLevel>,
@@ -289,12 +299,16 @@ pub struct SecurityChoice {
 ///   derived from the seed puts no public-key material on-chain for a
 ///   quantum algorithm (e.g. Shor's) to attack in the first place.
 /// - Private directed note: quantum-resistant iff the ML-KEM hybrid layer
-///   is enabled, OR the passphrase layer is enabled with an estimated
-///   classical entropy at or above [`REQUIRED_BITS`] (a sufficiently
-///   strong passphrase-derived key has no public-key structure for a
-///   quantum algorithm to exploit either — the base ECDH layer stays
-///   quantum-VULNERABLE regardless, but an attacker who breaks it still
-///   hits the passphrase- or ML-KEM-derived layer underneath).
+///   is enabled, OR the passphrase layer is enabled with a VERIFIED
+///   (app-[`generate`]d, unedited) passphrase whose exact entropy is at or
+///   above [`REQUIRED_BITS`] (a sufficiently strong passphrase-derived key
+///   has no public-key structure for a quantum algorithm to exploit either
+///   — the base ECDH layer stays quantum-VULNERABLE regardless, but an
+///   attacker who breaks it still hits the passphrase- or ML-KEM-derived
+///   layer underneath). A typed/pasted passphrase never counts here, no
+///   matter how high its `estimate_bits` reads — see
+///   [`SecurityChoice::passphrase_verified`]'s doc for why an unverified
+///   estimate can't be trusted as a quantum-resistance claim.
 pub fn is_quantum_resistant(c: &SecurityChoice) -> bool {
     if !c.private {
         return false;
@@ -305,7 +319,7 @@ pub fn is_quantum_resistant(c: &SecurityChoice) -> bool {
     if c.mlkem.is_some() {
         return true;
     }
-    matches!(c.passphrase_bits, Some(bits) if bits >= REQUIRED_BITS)
+    c.passphrase_verified && matches!(c.passphrase_bits, Some(bits) if bits >= REQUIRED_BITS)
 }
 
 /// One line of compose-screen copy summarizing the protection
@@ -323,46 +337,47 @@ pub fn security_label(c: &SecurityChoice) -> String {
             .to_string();
     }
 
-    let passphrase_strong = matches!(c.passphrase_bits, Some(bits) if bits >= REQUIRED_BITS);
-    let passphrase_weak = matches!(c.passphrase_bits, Some(bits) if bits < REQUIRED_BITS);
+    // A passphrase counts toward quantum-resistance only when it's BOTH
+    // verified (came from `generate()`, unedited since) AND at/above the
+    // bit bar — see `SecurityChoice::passphrase_verified`'s doc for why an
+    // unverified estimate, however high it reads, can never be trusted for
+    // this claim (zxcvbn 3.x can't even represent 128 bits for typed
+    // input — module doc). `passphrase_present` covers every other case
+    // where the layer is on but doesn't (yet, or ever) count: unverified
+    // typed/pasted input at any estimate, or a verified-but-somehow-short
+    // reading that shouldn't occur in practice but is handled the same way
+    // defensively.
+    let passphrase_counts =
+        c.passphrase_verified && matches!(c.passphrase_bits, Some(bits) if bits >= REQUIRED_BITS);
+    let passphrase_present = c.passphrase_bits.is_some();
 
-    match (c.mlkem, passphrase_strong, passphrase_weak) {
+    match (c.mlkem, passphrase_counts, passphrase_present) {
         (None, false, false) => {
             "Directed note: end-to-end encrypted (~128-bit ECDH), but NOT quantum-resistant."
                 .to_string()
         }
-        (None, true, false) => {
-            let bits = c.passphrase_bits.expect("passphrase_strong implies Some");
-            format!(
-                "Quantum-resistant: protected by a strong passphrase (~{bits:.0} bits)."
-            )
+        (None, true, _) => {
+            let bits = c.passphrase_bits.expect("passphrase_counts implies Some");
+            format!("Quantum-resistant: protected by a strong passphrase (~{bits:.0} bits).")
         }
         (None, false, true) => {
-            let bits = c.passphrase_bits.expect("passphrase_weak implies Some");
-            format!(
-                "Warning: NOT quantum-resistant — passphrase is too weak (~{bits:.0} bits, need {REQUIRED_BITS:.0})."
-            )
+            "Passphrase added — strength unverifiable, not counted as quantum-resistant."
+                .to_string()
         }
         (Some(level), false, false) => format!(
             "Quantum-resistant: protected by {} hybrid encryption.",
             level.name()
         ),
-        (Some(level), true, false) => {
-            let bits = c.passphrase_bits.expect("passphrase_strong implies Some");
+        (Some(level), true, _) => {
+            let bits = c.passphrase_bits.expect("passphrase_counts implies Some");
             format!(
                 "Quantum-resistant: {} hybrid encryption plus a strong passphrase (~{bits:.0} bits).",
                 level.name()
             )
         }
-        (Some(level), false, true) => {
-            let bits = c.passphrase_bits.expect("passphrase_weak implies Some");
-            format!(
-                "Quantum-resistant via {} hybrid encryption — passphrase layer is weak (~{bits:.0} bits) and adds little.",
-                level.name()
-            )
-        }
-        (_, true, true) => unreachable!(
-            "passphrase_bits cannot be simultaneously >= and < REQUIRED_BITS"
+        (Some(level), false, true) => format!(
+            "Quantum-resistant via {} hybrid encryption — passphrase layer added but unverified.",
+            level.name()
         ),
     }
 }
@@ -588,6 +603,7 @@ mod tests {
                     private: false,
                     directed: false,
                     passphrase_bits: None,
+                    passphrase_verified: false,
                     mlkem: None,
                 },
                 quantum_resistant: false,
@@ -600,6 +616,7 @@ mod tests {
                     private: true,
                     directed: false,
                     passphrase_bits: None,
+                    passphrase_verified: false,
                     mlkem: None,
                 },
                 quantum_resistant: true,
@@ -612,35 +629,57 @@ mod tests {
                     private: true,
                     directed: true,
                     passphrase_bits: None,
+                    passphrase_verified: false,
                     mlkem: None,
                 },
                 quantum_resistant: false,
                 must_contain: &["NOT quantum-resistant"],
                 must_not_contain: &[],
             },
+            // Spec change (orchestrator-approved, 2026-08-20): a passphrase
+            // only counts toward quantum-resistance when it is BOTH
+            // verified (app-generated, unedited) AND >= REQUIRED_BITS. This
+            // row is the one that used to read "quantum-resistant" purely
+            // off a >=128-bit estimate; it now must NOT, because nothing
+            // about it says the phrase was app-generated.
             Row {
-                name: "directed + strong passphrase",
+                name: "directed + high-estimate but UNVERIFIED (typed) passphrase",
                 choice: SecurityChoice {
                     private: true,
                     directed: true,
                     passphrase_bits: Some(140.0),
+                    passphrase_verified: false,
+                    mlkem: None,
+                },
+                quantum_resistant: false,
+                must_contain: &["unverifiable", "not counted as quantum-resistant"],
+                must_not_contain: &["NOT quantum-resistant", "Quantum-resistant:"],
+            },
+            Row {
+                name: "directed + verified generated passphrase",
+                choice: SecurityChoice {
+                    private: true,
+                    directed: true,
+                    passphrase_bits: Some(GENERATED_BITS),
+                    passphrase_verified: true,
                     mlkem: None,
                 },
                 quantum_resistant: true,
-                must_contain: &["quantum-resistant", "140"],
-                must_not_contain: &["not quantum-resistant"],
+                must_contain: &["quantum-resistant", "132"],
+                must_not_contain: &["not quantum-resistant", "unverifiable"],
             },
             Row {
-                name: "directed + weak passphrase",
+                name: "directed + weak passphrase (also unverified)",
                 choice: SecurityChoice {
                     private: true,
                     directed: true,
                     passphrase_bits: Some(40.0),
+                    passphrase_verified: false,
                     mlkem: None,
                 },
                 quantum_resistant: false,
-                must_contain: &["NOT quantum-resistant", "40", "Warning"],
-                must_not_contain: &[],
+                must_contain: &["unverifiable", "not counted as quantum-resistant"],
+                must_not_contain: &["NOT quantum-resistant", "Quantum-resistant:"],
             },
             Row {
                 name: "directed + ML-KEM only",
@@ -648,6 +687,7 @@ mod tests {
                     private: true,
                     directed: true,
                     passphrase_bits: None,
+                    passphrase_verified: false,
                     mlkem: Some(MlKemLevel::MlKem768),
                 },
                 quantum_resistant: true,
@@ -655,27 +695,29 @@ mod tests {
                 must_not_contain: &["not quantum-resistant"],
             },
             Row {
-                name: "directed + ML-KEM + strong passphrase",
+                name: "directed + ML-KEM + verified strong passphrase",
                 choice: SecurityChoice {
                     private: true,
                     directed: true,
-                    passphrase_bits: Some(150.0),
+                    passphrase_bits: Some(GENERATED_BITS),
+                    passphrase_verified: true,
                     mlkem: Some(MlKemLevel::MlKem1024),
                 },
                 quantum_resistant: true,
-                must_contain: &["quantum-resistant", "ML-KEM-1024", "150"],
+                must_contain: &["quantum-resistant", "ML-KEM-1024", "132"],
                 must_not_contain: &["not quantum-resistant"],
             },
             Row {
-                name: "directed + ML-KEM + weak passphrase",
+                name: "directed + ML-KEM + unverified passphrase",
                 choice: SecurityChoice {
                     private: true,
                     directed: true,
                     passphrase_bits: Some(30.0),
+                    passphrase_verified: false,
                     mlkem: Some(MlKemLevel::MlKem512),
                 },
                 quantum_resistant: true,
-                must_contain: &["quantum-resistant", "ML-KEM-512", "weak", "30"],
+                must_contain: &["quantum-resistant", "ML-KEM-512", "unverified"],
                 must_not_contain: &["NOT quantum-resistant"],
             },
         ];
