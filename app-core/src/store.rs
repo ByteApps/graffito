@@ -1012,7 +1012,16 @@ impl Store {
                     funded_by: None,
                     dropped: false,
                     pq_flags: note.pq_flags,
-                    locked: note.locked.clone(),
+                    // notes-core's `RecoveredNote::locked` stays populated
+                    // even after a successful `extract_notes_pq` auto-
+                    // unlock (informational, by its own doc contract) —
+                    // so a fresh note whose `text` already decrypted must
+                    // NOT also carry a `locked` body, or it would read as
+                    // simultaneously unlocked and locked. Only copy it
+                    // over while genuinely still locked (mirrors the
+                    // `existing`-record branch's `n.text.is_none()` guard
+                    // just above).
+                    locked: if note.text.is_none() { note.locked.clone() } else { None },
                 });
                 true
             }
