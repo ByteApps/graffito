@@ -382,6 +382,15 @@ pub fn security_label(c: &SecurityChoice) -> String {
     }
 }
 
+/// `(is_quantum_resistant(c), security_label(c))` together — the compose
+/// screen's Security section always wants both for the same
+/// [`SecurityChoice`] (the header status chip and the section's bottom
+/// caption), so this is the ONE call site lib.rs makes rather than
+/// duplicating the branching those two functions already do.
+pub fn describe(c: &SecurityChoice) -> (bool, String) {
+    (is_quantum_resistant(c), security_label(c))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +591,23 @@ mod tests {
     #[test]
     fn mlkem_default_is_768() {
         assert_eq!(MlKemLevel::DEFAULT, MlKemLevel::MlKem768);
+    }
+
+    // ---- describe() ---------------------------------------------------
+
+    #[test]
+    fn describe_matches_the_two_underlying_calls() {
+        let c = SecurityChoice {
+            private: true,
+            directed: true,
+            passphrase_bits: Some(GENERATED_BITS),
+            passphrase_verified: true,
+            mlkem: None,
+        };
+        let (resistant, label) = describe(&c);
+        assert_eq!(resistant, is_quantum_resistant(&c));
+        assert_eq!(label, security_label(&c));
+        assert!(resistant);
     }
 
     // ---- security_label / is_quantum_resistant (table-driven) -----------

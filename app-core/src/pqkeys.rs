@@ -198,6 +198,24 @@ pub fn set_contact_pq_key(
     Ok(fp)
 }
 
+/// The compose screen's Quantum-encryption-row caption for a contact's
+/// stored pq key: `(level, "<level name> · <fingerprint>")` on success. A
+/// `Contact::mlkem_ek` is ALWAYS graffito-native public armor by
+/// construction (`set_contact_pq_key` above never stores OpenPGP framing
+/// on a contact), so this goes straight through `notes_core::pq::
+/// import_public` rather than the fuller `pgp_import::parse_mlkem_key`
+/// auto-detection that import-time parsing needs — pure formatting, no
+/// crypto, safe to call on every recipient change without re-deriving
+/// anything. Callers are expected to cache the result and only recompute
+/// it when the resolved recipient address changes (parsing an armored
+/// blob on every UI repaint would be wasted work, not incorrectness).
+pub fn contact_pq_display(armor: &str) -> Result<(MlKemLevel, String), String> {
+    use notes_core::pq::{fingerprint as pq_fingerprint, import_public};
+    let (alg, ek) = import_public(armor).map_err(|e| e.to_string())?;
+    let level = from_pq_alg(alg);
+    Ok((level, format!("{} · {}", level.name(), pq_fingerprint(alg, &ek))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +421,35 @@ mod tests {
         let (alg, ek) = notes_core::pq::import_public(c.mlkem_ek.as_deref().unwrap()).unwrap();
         assert_eq!(alg, MlKemAlg::MlKem1024);
         assert_eq!(ek, kp2.ek());
+    }
+
+    // ---- contact_pq_display ---------------------------------------------
+
+    #[test]
+    fn contact_pq_display_reports_level_and_fingerprint() {
+        let kp = derive_keypair(&leaf(0x55), MlKemAlg::MlKem1024);
+        let armor = export_public_armor(&kp);
+        let (level, line) = contact_pq_display(&armor).unwrap();
+        assert_eq!(level, MlKemLevel::MlKem1024);
+        assert!(line.starts_with("ML-KEM-1024 · "));
+        assert!(line.contains(&kp.fingerprint()));
+    }
+
+    #[test]
+    fn contact_pq_display_matches_the_actual_stored_form() {
+        // Exactly the round trip the compose screen exercises: set a
+        // contact's key via set_contact_pq_key, then feed the STORED
+        // armor (not the original export) into contact_pq_display.
+        let kp = derive_keypair(&leaf(0x66), MlKemAlg::MlKem512);
+        let mut c = blank_contact();
+        set_contact_pq_key(&mut c, &export_public_armor(&kp)).unwrap();
+        let (level, line) = contact_pq_display(c.mlkem_ek.as_deref().unwrap()).unwrap();
+        assert_eq!(level, MlKemLevel::MlKem512);
+        assert!(line.contains(&kp.fingerprint()));
+    }
+
+    #[test]
+    fn contact_pq_display_rejects_garbage() {
+        assert!(contact_pq_display("not a key").is_err());
     }
 }
