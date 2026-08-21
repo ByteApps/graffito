@@ -1163,6 +1163,10 @@ impl State {
         // must never silently flip a contact's iCloud-sync opt-in either
         // way. A brand-new contact defaults unsynced (serde-default).
         let synced = existing.as_ref().map(|c| c.synced).unwrap_or(false);
+        // Preserve a contact's shared PQ key across a re-touch too — a
+        // recency bump (e.g. picking them again in compose) must not lose
+        // an ML-KEM key set via Contacts, exactly like `synced` above.
+        let mlkem_ek = existing.as_ref().and_then(|c| c.mlkem_ek.clone());
         self.contacts.insert(
             0,
             app_core::store::Contact {
@@ -1171,6 +1175,7 @@ impl State {
                 network: net.clone(),
                 updated_at: now_ms(),
                 synced,
+                mlkem_ek,
             },
         );
         self.contacts.truncate(CONTACTS_CAP);
@@ -1624,6 +1629,11 @@ fn record_watch_note(st: &mut State, wn: &WatchNote, txid: &str, raw: &str, vsiz
             gift_amount: wn.recipient.is_some().then_some(wn.gift),
             funded_by: wn.funded.clone(),
             dropped: false,
+            // Watch-mode compose never carries a pq layer — directed-
+            // private (the only pq-eligible kind) needs the identity key
+            // at compose time, which a watch identity never has.
+            pq_flags: 0,
+            locked: None,
         },
         change,
     );
@@ -4624,7 +4634,14 @@ fn apply_bundle_to_notebook_file(
     let mut store =
         notebook_store(st, index).unwrap_or_else(|| Store::new(&ident.output_x(), st.network));
     let applied = match ident.full() {
-        Some(id) => store.apply_bundle(bundle, id, st.network, notebook_spks, spending_window_spks),
+        Some(id) => store.apply_bundle(
+            bundle,
+            id,
+            st.network,
+            notebook_spks,
+            spending_window_spks,
+            &mlkem_secrets_for(&ident),
+        ),
         None => store.apply_bundle_watch(
             bundle,
             &ident.output_x(),
@@ -7199,6 +7216,13 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
                         gift_amount: r.to.as_ref().map(|_| r.gift),
                         funded_by: Some("spending".into()),
                         dropped: false,
+                        // The spending-wallet compose path builds via
+                        // `psbt_build::build_funding_psbt_amount`, not
+                        // `ComposeRequest` — pq layers aren't wired into
+                        // that builder yet (out of scope for this pass;
+                        // see the compose-send glue notes).
+                        pq_flags: 0,
+                        locked: None,
                     },
                     None,
                 );
@@ -7329,6 +7353,11 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                         gift_amount: r.to.as_ref().map(|_| r.gift),
                         funded_by: Some("mixed".into()),
                         dropped: false,
+                        // Mixed-source compose also bypasses `ComposeRequest`
+                        // (see the spending-wallet path's identical note) —
+                        // no pq layer here yet.
+                        pq_flags: 0,
+                        locked: None,
                     },
                     change_utxo,
                 );
@@ -7690,6 +7719,7 @@ fn apply_active_bundle(
             // here (the wallet-wide caller derives it once itself; see
             // `apply_wallet_stores_refresh_results`).
             let spending_window_spks = spending_window_spks_for(st);
+            let mlkem_secrets = mlkem_secrets_for(st.ident.as_ref().unwrap());
             let applied = match &keyed {
                 Some(identity) => st.store.as_mut().unwrap().apply_bundle(
                     &bundle,
@@ -7697,6 +7727,7 @@ fn apply_active_bundle(
                     network,
                     &notebook_spks,
                     &spending_window_spks,
+                    &mlkem_secrets,
                 ),
                 None => st.store.as_mut().unwrap().apply_bundle_watch(
                     &bundle,
@@ -7935,6 +7966,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
             // Spending-self-notes fix (Unit A) — see the matching comment
             // in `apply_active_bundle`.
             let spending_window_spks = spending_window_spks_for(st);
+            let mlkem_secrets = mlkem_secrets_for(st.ident.as_ref().unwrap());
             let applied = match &keyed {
                 Some(identity) => st.store.as_mut().unwrap().apply_bundle(
                     &bundle,
@@ -7942,6 +7974,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
                     network,
                     &notebook_spks,
                     &spending_window_spks,
+                    &mlkem_secrets,
                 ),
                 None => st.store.as_mut().unwrap().apply_bundle_watch(
                     &bundle,
@@ -10799,6 +10832,20 @@ fn spending_window_spks_for(st: &State) -> Vec<Vec<u8>> {
     let discovered_next_index = section.next_receive.max(section.next_change);
     let upto = SPENDING_WINDOW_MIN.max(discovered_next_index.saturating_add(SPENDING_WINDOW_BUFFER));
     app_core::spending::window_spks(&material, st.network, st.account, upto).unwrap_or_default()
+}
+
+/// Post-quantum: the ML-KEM decapsulation secrets to try against any
+/// received KEM-only-flagged note a scan recovers (`Store::apply_bundle`'s
+/// `mlkem_secrets` param — see its doc comment for the full contract).
+/// Phase 1 (this compose/unlock milestone) covers only the scanned
+/// notebook's OWN derived keys, all three levels
+/// (`pqkeys::derive_secrets`) — an imported/shared secret (another
+/// identity's key kept around to read notes addressed to it) is Phase C2's
+/// job and isn't unioned in yet. Watch-only and any identity with no leaf
+/// secret (`AppIdentity::leaf_secret()` returns `None`) get an empty slice
+/// — a strict no-op for auto-unlock, exactly like `apply_bundle_watch`.
+fn mlkem_secrets_for(ident: &AppIdentity) -> Vec<app_core::notes_core::pq::MlKemSecret> {
+    ident.leaf_secret().map(|ls| app_core::pqkeys::derive_secrets(ls)).unwrap_or_default()
 }
 
 /// The confirm screen's one-liner caption for any note-composing tx:
@@ -15535,6 +15582,8 @@ pub fn run() {
             gift_amount,
             lock_time: s.lock_time_override_value(),
             now: created_at,
+            pq_password: None,
+            pq_mlkem: None,
         };
         let Some(store) = s.store.as_ref() else {
             w.set_status("no store".into());
