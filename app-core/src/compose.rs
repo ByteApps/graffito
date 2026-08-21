@@ -9,9 +9,11 @@ use notes_core::address::Recipient;
 use notes_core::address::address_to_script_pubkey;
 use notes_core::bundle::{
     compose_directed_note_multi_exact, compose_directed_note_multi_with_change,
+    compose_directed_note_pq_exact_amount, compose_directed_note_pq_with_change_amount,
     compose_directed_note_with_change_amount, compose_note_exact, compose_note_with_change, Identity,
 };
 use notes_core::keys::generate_aux_rand;
+use notes_core::pq::SealLayers;
 use notes_core::tx::NoteTx;
 use notes_core::Network;
 use zeroize::Zeroize;
@@ -98,6 +100,22 @@ pub struct ComposeRequest<'a> {
     pub lock_time: Option<u32>,
     /// Local wall-clock seconds for created_at (display only).
     pub now: u64,
+    /// Post-quantum: an Argon2id passphrase layer over a directed-private
+    /// note (`notes_core::pq::SealLayers::password`), composable with
+    /// `pq_mlkem`. Requires a single-recipient DIRECTED PRIVATE note —
+    /// `compose_note` errors otherwise (mirrors notes-core's own
+    /// `SealLayers`/envelope validity rule: no public/self-note/multi-
+    /// recipient pq notes). `None` = no passphrase layer (the ordinary v1
+    /// path, byte-identical to before this field existed).
+    pub pq_password: Option<String>,
+    /// Post-quantum: an ML-KEM hybrid layer sealed to the recipient's
+    /// encapsulation key — `(alg, ek_bytes)`. The caller resolves `ek`
+    /// (from a `Contact::mlkem_ek` or a freshly imported key) before
+    /// calling; this module never looks it up itself. Same single-
+    /// recipient directed-PRIVATE requirement as `pq_password`, and the
+    /// two compose together (hybrid, never exclusive). `None` = no ML-KEM
+    /// layer.
+    pub pq_mlkem: Option<(notes_core::pq::MlKemAlg, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +141,13 @@ pub struct ComposedNote {
     /// `change_spk.is_none()` check `compose_and_record` used to make
     /// inline before it split into `compose_note` + `record_composed_note`.
     pub change_is_self: bool,
+    /// Post-quantum sealing flags this note carries
+    /// (`notes_core::envelope::FLAG_PW`/`FLAG_MLKEM`) — 0 for an ordinary
+    /// v1 note (every non-pq compose path, and `bump_fee_build`, which
+    /// refuses to rebuild a pq note rather than silently drop its layers —
+    /// see its doc comment). See [`ComposeRequest::pq_password`]/
+    /// [`ComposeRequest::pq_mlkem`].
+    pub pq_flags: u8,
 }
 
 /// Build + sign ONLY — no store mutation. The paranoid "cancel leaves zero
@@ -191,6 +216,47 @@ pub fn compose_note(
         None => None,
     };
 
+    // Post-quantum layers (Argon2id password / ML-KEM hybrid, notes-core's
+    // pq.rs): additive over the ordinary compose path, so this branches out
+    // BEFORE the existing self/multi dispatch below rather than threading
+    // pq state through it. Structural requirement mirrors notes-core's own
+    // `SealLayers`/envelope validity rule: a pq note is always directed,
+    // private, and single-recipient — no public/self-note/multi-recipient
+    // pq notes exist. `req.private` false, a self-note (`recipients`
+    // empty), or a multi-recipient pick (`recipients.len() > 1`) with a pq
+    // layer set is refused loudly rather than silently dropping the layer.
+    if req.pq_password.is_some() || req.pq_mlkem.is_some() {
+        if !req.private || recipients.len() != 1 {
+            return Err(Error::Store(
+                "post-quantum layers require a single-recipient directed private note".into(),
+            ));
+        }
+        let layers = SealLayers {
+            mlkem_ek: req.pq_mlkem.as_ref().map(|(alg, ek)| (*alg, ek.as_slice())),
+            password: req.pq_password.as_deref(),
+        };
+        let pq_flags = layers.flags();
+        let (recipient, gift) = &recipients[0];
+        let tx = match &selected {
+            Some(ins) => compose_directed_note_pq_exact_amount(
+                identity, ins, req.text, recipient, *gift, layers,
+                change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
+            ),
+            None => compose_directed_note_pq_with_change_amount(
+                identity, &utxos, req.text, recipient, *gift, layers,
+                change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
+            ),
+        }?;
+        return Ok(ComposedNote {
+            note_id: tx.txid_hex.clone(),
+            recipient_address,
+            recipients: recipient_addresses,
+            change_is_self: change_spk.is_none(),
+            pq_flags,
+            tx,
+        });
+    }
+
     let tx = if recipients.is_empty() {
         match &selected {
             Some(ins) => compose_note_exact(
@@ -229,6 +295,7 @@ pub fn compose_note(
         recipient_address,
         recipients: recipient_addresses,
         change_is_self: change_spk.is_none(),
+        pq_flags: 0,
         tx,
     })
 }
@@ -290,6 +357,12 @@ pub fn record_composed_note(
         gift_amount: composed.recipient_address.as_ref().map(|_| tx.sent),
         funded_by: None,
         dropped: false,
+        pq_flags: composed.pq_flags,
+        // We composed this note ourselves — the plaintext is right there in
+        // `text`, so there is nothing to unlock later. `locked` is only
+        // ever populated for a RECEIVED pq note the scanner couldn't
+        // decrypt yet (see `store::extract_and_apply_pq`/`unlock_note`).
+        locked: None,
     };
     store.record_signed(record, change_utxo);
 
@@ -363,6 +436,13 @@ pub fn bump_fee_build(
     if rec.recipients.len() > 1 {
         return Err(Error::Store("fee-bumping a multi-recipient note isn't supported yet".into()));
     }
+    // Same reasoning: rebuilding a pq-layered note's replacement would need
+    // its original password/ML-KEM ek re-supplied (never persisted, and
+    // not threaded through this signature) — refuse rather than silently
+    // rebuild a plain v1 replacement that drops both layers.
+    if rec.pq_flags != 0 {
+        return Err(Error::Store("fee-bumping a post-quantum note isn't supported yet".into()));
+    }
     let gift = rec.gift_amount.unwrap_or(notes_core::DUST_LIMIT);
     let change_to = rec.change_to.clone();
     let spent = rec.spent.clone();
@@ -415,6 +495,7 @@ pub fn bump_fee_build(
         recipient_address: recipient_addr,
         recipients: Vec::new(),
         change_is_self: change_spk.is_none(),
+        pq_flags: 0,
         tx,
     })
 }
@@ -835,6 +916,8 @@ mod bump_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();
@@ -920,6 +1003,8 @@ mod multi_recipient_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();
@@ -976,6 +1061,8 @@ mod multi_recipient_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();
@@ -1014,6 +1101,8 @@ mod multi_recipient_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 42,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();
@@ -1066,6 +1155,8 @@ mod multi_recipient_tests {
                 gift_amount: Some(5_000),
                 lock_time: None,
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();
@@ -1102,6 +1193,8 @@ mod multi_recipient_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap_err();
@@ -1134,6 +1227,8 @@ mod multi_recipient_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();
@@ -1199,6 +1294,8 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: Some(777_777),
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();
@@ -1229,6 +1326,8 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();
@@ -1259,6 +1358,8 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: Some(123_456),
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();
@@ -1289,6 +1390,8 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: Some(444_444),
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();
@@ -1351,6 +1454,8 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();
@@ -1387,6 +1492,8 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: Some(999_999),
                 now: 1,
+                pq_password: None,
+                pq_mlkem: None,
             },
         )
         .unwrap();

@@ -10,7 +10,7 @@
 
 use notes_core::address::{p2tr_script_pubkey, taproot_address};
 use notes_core::bundle::{
-    extract_notes_multi_deduped, extract_notes_watch_multi_deduped, Identity, RecoveredNote, SyncBundle,
+    extract_notes_pq, extract_notes_watch_multi_deduped, Identity, RecoveredNote, SyncBundle,
 };
 use notes_core::tx::Utxo;
 use notes_core::Network;
@@ -133,6 +133,21 @@ pub struct NoteRecord {
     /// Confirmed/Orphaned record. See [`resolve_dropped`].
     #[serde(default)]
     pub dropped: bool,
+    /// Post-quantum sealing flags (`notes_core::envelope::FLAG_PW`/
+    /// `FLAG_MLKEM`, notes-core's pq.rs) — 0 for an ordinary v1 note.
+    /// Nonzero means this note carries one or both pq layers; see
+    /// `locked`. `#[serde(default)]` = 0 for every pre-pq store file.
+    #[serde(default)]
+    pub pq_flags: u8,
+    /// A RECEIVED pq note we haven't unlocked yet — `text` stays `None`
+    /// until `store::unlock_note` succeeds, at which point `locked` is
+    /// cleared and `text` is filled (mirrors `RecoveredNote::locked`'s
+    /// contract exactly). `None` for every ordinary v1 note, every note we
+    /// composed ourselves (we already hold the plaintext), and once a
+    /// received pq note has been unlocked. `#[serde(default)]` so every
+    /// pre-pq store file loads with `None`.
+    #[serde(default)]
+    pub locked: Option<notes_core::pq::LockedBody>,
 }
 
 impl NoteRecord {
@@ -293,6 +308,22 @@ pub struct Contact {
     /// naming it.
     #[serde(default)]
     pub synced: bool,
+    /// The contact's ML-KEM encapsulation (public) key for post-quantum
+    /// directed notes, stored as graffito-native PUBLIC armor
+    /// (`notes_core::pq::export_public` — self-describing: the armor
+    /// itself declares which of the three levels it is, so this field
+    /// alone is enough to resolve `compose::ComposeRequest::pq_mlkem`).
+    /// `#[serde(default)] = None` for every contact that existed before
+    /// this field shipped, and for any contact whose owner hasn't shared a
+    /// pq key. Set via [`crate::pqkeys::set_contact_pq_key`], which accepts
+    /// either graffito-native armor or an OpenPGP cert/key (routed through
+    /// `pgp_import::parse_mlkem_key` and re-armored to native public form
+    /// for storage — this device never keeps OpenPGP framing around).
+    /// Rides along with the rest of the `Contact` value through
+    /// `contacts::merge_state` like `name`/`synced` — no separate merge
+    /// rule needed (see that module's doc comment).
+    #[serde(default)]
+    pub mlkem_ek: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,6 +605,25 @@ impl Store {
     /// funded from a spending address the recorded snapshot doesn't (yet, or
     /// ever, on a disk-loaded non-active store) know about. An empty slice
     /// is a strict no-op — byte-identical to before this parameter existed.
+    ///
+    /// `mlkem_secrets` (post-quantum notes) is the FULL set of ML-KEM
+    /// decapsulation secrets to try against any received KEM-only-flagged
+    /// note this scan recovers — the union of this notebook's OWN derived
+    /// receive keys (`pqkeys::derive_secrets(leaf_secret)`, all three
+    /// levels) and any imported secrets the caller holds (a password-
+    /// protected import, or another identity's key kept around to read
+    /// notes addressed to it). Building that union is the CALLER's job —
+    /// this function just forwards the slice to notes-core's
+    /// `extract_notes_pq`, which tries each one via `pq::unlock_received`
+    /// and fills `text` on the first that authenticates (never on an OWN
+    /// note or a password-flagged one — see its doc comment). An empty
+    /// slice is a strict no-op for auto-unlock (every pq note still scans
+    /// in as `pq_flags != 0`/`locked: Some(..)`, just never auto-decrypted)
+    /// — byte-identical to before this parameter existed for every non-pq
+    /// bundle, and this function switched from `extract_notes_multi_deduped`
+    /// to `extract_notes_pq` (a strict superset: it delegates to the exact
+    /// same dedup logic before attempting any pq auto-unlock) specifically
+    /// so that switch carries no other behavioral change.
     pub fn apply_bundle(
         &mut self,
         bundle: &SyncBundle,
@@ -581,6 +631,7 @@ impl Store {
         network: Network,
         notebook_spks: &[Vec<u8>],
         extra_spending_spks: &[Vec<u8>],
+        mlkem_secrets: &[notes_core::pq::MlKemSecret],
     ) -> Result<ApplyStats, Error> {
         self.check_identity(&identity.output_x)?;
         let mut self_spks = vec![p2tr_script_pubkey(&identity.output_x)];
@@ -592,7 +643,7 @@ impl Store {
         }
         self.apply_recovered(
             bundle,
-            extract_notes_multi_deduped(bundle, identity, network, &self_spks, notebook_spks),
+            extract_notes_pq(bundle, identity, network, &self_spks, notebook_spks, mlkem_secrets),
         )
     }
 
@@ -894,14 +945,42 @@ impl Store {
                 // raw count-prefixed body as "text") cached its bad decode,
                 // and no later, smarter rescan could ever correct it (Sal's
                 // "␂public note…" artifact, 2026-07-19).
+                //
+                // Post-quantum: a pq note's `note.text` is only ever
+                // `Some` here when THIS scan's auto-unlock
+                // (`extract_notes_pq`) just succeeded — same "fresh success
+                // wins" rule applies, and success also means the note is no
+                // longer locked, so `locked` clears alongside `text`. A
+                // re-scan that comes back still-locked (`note.text: None`)
+                // must NEVER clobber an already-unlocked cache — the
+                // `note.text.is_some()` guard already gives us that for
+                // free, same as the pre-pq stale-cache rule above.
                 if note.text.is_some() && n.text != note.text {
                     n.text = note.text.clone();
+                    n.locked = None;
                 }
                 if n.recipient.is_none() {
                     n.recipient = note.recipient.clone();
                 }
                 if n.recipients.is_empty() {
                     n.recipients = note.recipients.clone();
+                }
+                // `pq_flags` is a structural property of the envelope
+                // (which bits the wire header carried) — fixed for the
+                // life of the tx, so it's safe to just re-stamp it every
+                // scan (matches `height`/`blocktime` treatment above, not
+                // gated on "new" vs "existing").
+                n.pq_flags = note.pq_flags;
+                // `locked` re-derivation: only ever refreshed while STILL
+                // locked (`n.text` still `None` after the fresh-decode
+                // branch above) — an unlocked note's `locked` must stay
+                // cleared even if a caller re-scans without the secret
+                // that unlocked it (e.g. a watch-only rescan, or a keyed
+                // rescan with a narrower `mlkem_secrets` set).
+                if n.text.is_none() {
+                    if let Some(locked) = &note.locked {
+                        n.locked = Some(locked.clone());
+                    }
                 }
                 false
             }
@@ -932,6 +1011,8 @@ impl Store {
                     gift_amount: None,
                     funded_by: None,
                     dropped: false,
+                    pq_flags: note.pq_flags,
+                    locked: note.locked.clone(),
                 });
                 true
             }
@@ -1172,6 +1253,14 @@ impl Store {
                 // touched entry here starts unsynced like every other
                 // fresh contact.
                 synced: false,
+                // Same legacy caveat as `synced`/`updated_at` above: this
+                // method already discards every field but `name` on a
+                // re-touch, so a pq key set through this list (rather than
+                // the device-level one `contacts.rs`/`merge_state` owns)
+                // doesn't survive a recency bump either. Not a regression —
+                // it's the existing "legacy, best-effort" contract this
+                // whole method documents.
+                mlkem_ek: None,
             },
         );
         self.contacts.truncate(20);
@@ -1226,6 +1315,89 @@ impl Store {
     pub fn spending_set_enabled(&mut self, on: bool) {
         self.spending.enabled = on;
     }
+
+    /// Attempt to open a pq-locked note's [`NoteRecord::locked`] body,
+    /// caching the plaintext on success (`text`) and clearing `locked`.
+    /// `identity` supplies the tweaked signing seckey + output x-only key
+    /// the ECDH/AAD derivation needs — the same `notes_core::bundle::
+    /// Identity` every other keyed store operation takes.
+    ///
+    /// - A RECEIVED note (`NoteRecord::received`) goes through
+    ///   `pq::unlock_received`. When the locked body carries `FLAG_MLKEM`,
+    ///   every candidate in `secrets` is tried in order (the caller's job
+    ///   is building that set — see [`Self::apply_bundle`]'s doc comment on
+    ///   `mlkem_secrets`) until one authenticates; `password` is always
+    ///   passed through (harmless when `FLAG_PW` isn't set — notes-core
+    ///   simply never reads it then). `secrets` is unused for a
+    ///   password-only locked body (never consulted).
+    /// - A note WE SENT (`!received`) goes through `pq::unlock_sent`
+    ///   instead — possible ONLY for a password-only locked body
+    ///   (`Error::Notes(notes_core::Error::SenderCannotReopen)` for any
+    ///   `FLAG_MLKEM` note: the KEM layer was encapsulated to the
+    ///   RECIPIENT's key, which the sender never held — see notes-core's
+    ///   pq.rs module doc). `secrets` is ignored on this path.
+    ///
+    /// Returns `Err` (never mutating the store) when: the note doesn't
+    /// exist, it has no locked body (`locked: None` — already unlocked, or
+    /// never pq in the first place), every candidate secret/the supplied
+    /// password fails to authenticate, or the sender-reopen rule above
+    /// applies. A wrong secret/password is cryptographically
+    /// indistinguishable from tampering (ML-KEM implicit rejection +
+    /// AEAD tag failure) — same `Error::Notes(notes_core::Error::
+    /// DecryptFailed)` either way, matching notes-core's own contract.
+    pub fn unlock_note(
+        &mut self,
+        note_id: &str,
+        identity: &Identity,
+        secrets: &[notes_core::pq::MlKemSecret],
+        password: Option<&str>,
+    ) -> Result<String, Error> {
+        use notes_core::envelope::FLAG_MLKEM;
+        use notes_core::pq::{unlock_received, unlock_sent};
+
+        let rec = self
+            .notes
+            .iter()
+            .find(|n| n.note_id == note_id)
+            .ok_or_else(|| Error::Store("no such note".into()))?;
+        let locked = rec
+            .locked
+            .clone()
+            .ok_or_else(|| Error::Store("note has no locked post-quantum body".into()))?;
+        let received = rec.received;
+
+        let plaintext = if !received {
+            unlock_sent(&locked, &identity.tweaked_seckey, &identity.output_x, password)
+                .map_err(Error::Notes)?
+        } else if locked.pq_flags & FLAG_MLKEM != 0 {
+            let mut last_err = Error::Notes(notes_core::Error::NeedsMlKemKey);
+            let mut ok = None;
+            for secret in secrets {
+                match unlock_received(&locked, &identity.tweaked_seckey, Some(secret), password) {
+                    Ok(pt) => {
+                        ok = Some(pt);
+                        break;
+                    }
+                    Err(e) => last_err = Error::Notes(e),
+                }
+            }
+            ok.ok_or(last_err)?
+        } else {
+            unlock_received(&locked, &identity.tweaked_seckey, None, password).map_err(Error::Notes)?
+        };
+
+        let text = String::from_utf8(plaintext)
+            .map_err(|_| Error::Store("decrypted note body is not valid utf-8".into()))?;
+
+        let rec = self
+            .notes
+            .iter_mut()
+            .find(|n| n.note_id == note_id)
+            .expect("checked present above");
+        rec.text = Some(text.clone());
+        rec.locked = None;
+        Ok(text)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1269,6 +1441,8 @@ mod tests {
             gift_amount: None,
             funded_by: None,
             dropped: false,
+            pq_flags: 0,
+            locked: None,
         }
     }
 

@@ -305,6 +305,7 @@ mod tests {
             network: network.to_string(),
             updated_at,
             synced,
+            mlkem_ek: None,
         }
     }
 

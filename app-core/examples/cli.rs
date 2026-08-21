@@ -232,7 +232,7 @@ fn main() {
             let bundle = client.build_bundle(&store.address, None).expect("build bundle");
             let stats = match ident.full() {
                 Some(id) => store
-                    .apply_bundle(&bundle, id, net, &notebook_spks, &spending_window)
+                    .apply_bundle(&bundle, id, net, &notebook_spks, &spending_window, &[])
                     .expect("apply"),
                 None => store
                     .apply_bundle_watch(&bundle, &ident.output_x(), net, &notebook_spks, &spending_window)
@@ -613,6 +613,7 @@ fn main() {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
+                    pq_password: None, pq_mlkem: None,
                 },
             )
             .expect("compose");
