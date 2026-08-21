@@ -173,8 +173,3 @@ overflow-checks = false
 # (skia + full debug info) and blows past the emulator's internal storage.
 [profile.release]
 strip = true
-
-# TEMPORARY (pq-notes development only — swapped for a rev pin before merge):
-# app-core needs the pq module from prime-graffito's local pq-notes branch.
-[patch."ssh://git@github.com/ByteApps/prime-graffito.git"]
-notes-core = { path = "/Users/sal/Projects/prime/prime-graffito/notes-core" }

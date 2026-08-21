@@ -10,6 +10,9 @@ Direct dependencies of this app and its `app-core` library. The complete transit
 | [bitcoin](https://crates.io/crates/bitcoin) (rust-bitcoin) | 0.32 | CC0-1.0 | BIP-32/86 derivation, WIF/xprv parsing, PSBT |
 | [miniscript](https://crates.io/crates/miniscript) | 12 | CC0-1.0 | Output-descriptor parsing for watch-only identities |
 | [bip39](https://crates.io/crates/bip39) | 2 | CC0-1.0 | BIP-39 mnemonic handling |
+| [pgp](https://crates.io/crates/pgp) (rpgp) | 0.20 | MIT OR Apache-2.0 | Importing ML-KEM keys from RFC 9980 OpenPGP certificates (quantum-key import) |
+| [zxcvbn](https://crates.io/crates/zxcvbn) | 3 | MIT | Passphrase-strength estimation for the post-quantum note passphrase (display only — certification requires a generated phrase) |
+| [base64](https://crates.io/crates/base64) | 0.21 | MIT OR Apache-2.0 | Armored ML-KEM key parsing |
 | [foundation-ur](https://crates.io/crates/foundation-ur) | 0.4 | MIT | Animated UR (BC-UR) QR framing — the exact codec the KeyOS scanner runs |
 | [ciborium](https://crates.io/crates/ciborium) | 0.2 | Apache-2.0 | CBOR decode for hardware-wallet account-export QRs (crypto-account / crypto-hdkey) |
 | [hkdf](https://crates.io/crates/hkdf) / [sha2](https://crates.io/crates/sha2) | 0.12 / 0.10 | MIT OR Apache-2.0 | Key derivation |
