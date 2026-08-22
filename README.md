@@ -7,7 +7,7 @@ Graffito writes personal notes into real bitcoin transactions — public ones an
 <p align="center">
   <img src="screenshots/home.png" alt="Notebooks — your list of them, each an address with its own notes and balance" width="290">
   &nbsp;
-  <img src="screenshots/compose.png" alt="Compose — live cost preview, fee tiers, coin control" width="290">
+  <img src="screenshots/compose.png" alt="Compose — quantum-resistant security layers, live cost preview, fee tiers, gift and coin control" width="290">
   &nbsp;
   <img src="screenshots/activity.png" alt="Activity — every notebook's transactions in one wallet-wide feed" width="290">
 </p>
