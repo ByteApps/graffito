@@ -160,6 +160,14 @@ slint-build = "=1.17.1"
 [patch.crates-io]
 winit = { git = "https://github.com/ByteApps/winit", rev = "cea753eacbc334b1b61056efb6690075b5235cf1" }
 
+# TEMPORARY (pq-derive-canon dev) — swapped for a rev pin before merge.
+# Points app-core's notes-core dep at the local prime-graffito checkout
+# (branch pq-device) so it picks up pq::mlkem_seed_from_leaf/
+# mlkem_keypair_from_leaf ahead of a real commit landing on prime-graffito
+# main.
+[patch."ssh://git@github.com/ByteApps/prime-graffito.git"]
+notes-core = { path = "/Users/sal/Projects/prime/prime-graffito/notes-core" }
+
 # Slint's text shaper (harfrust, via parley) has an integer add that overflows
 # on very large single text runs. Release wraps it (overflow-checks off by
 # default), but debug builds panic-abort — crashing the app on a huge paste
