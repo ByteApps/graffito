@@ -41,7 +41,12 @@ pub const DEFAULT_CHUNK: usize = 100_000;
 /// drops every note this store holds when crossing this threshold —
 /// nothing was in production, so old-format rows simply vanish and a
 /// full rescan repopulates the store in the new format.
-pub const CLASSIFY_VERSION: u32 = 3; // 3: graffito crypto epoch — old-salt notes no longer decrypt; force one full rescan
+pub const CLASSIFY_VERSION: u32 = 4; // 3: graffito crypto epoch — old-salt notes no longer decrypt; force one full rescan
+// 4 (2026-08-21): upsert_note regained the `received` match leg — a store
+// whose stale received twin swallowed (and prune then DELETED) an own note
+// recovers it on the next FULL rescan; the forced rescan is what brings the
+// lost note back on otherwise-quiet wallets (the addr_stats short-circuit
+// would skip them forever).
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutPointRef {
@@ -912,16 +917,25 @@ impl Store {
     fn upsert_note(&mut self, note: &RecoveredNote) -> bool {
         // PLAN-pnte-redesign.md: one note = one tx, and a txid can never
         // collide across two genuinely different transactions — so a
-        // scanned note matches an existing record purely by id (its
-        // CURRENT canonical txid) or by appearing anywhere in that
-        // record's RBF history (`txids`), never by the old
-        // (note_id, received, sender) triple, which existed only to guard
-        // against a collision in the old synthetic 4-byte id space.
+        // scanned note matches an existing record by id (its CURRENT
+        // canonical txid) or by appearing anywhere in that record's RBF
+        // history (`txids`). The old (note_id, received, sender) triple's
+        // SENDER leg stays gone (it only guarded the synthetic 4-byte id
+        // space), but the RECEIVED leg is load-bearing and is back
+        // (2026-08-21): a note recovered as OWN while a stale `received`
+        // twin of the same txid sits in the store (the pre-build-40 scan
+        // shape) must be ADDED alongside the twin, never merged into it —
+        // reclassification is exclusively `prune_stale_received_twins`'s
+        // one-directional, full-scan-only job. Matching on id alone merged
+        // the own recovery into the received twin (without flipping its
+        // side), and the pruner then deleted that lone merged record as
+        // "the twin", losing the note outright.
         let id = &note.id;
         let existing = self
             .notes
             .iter_mut()
-            .find(|n| &n.note_id == id || n.txids.iter().any(|t| t == id));
+            .find(|n| (&n.note_id == id || n.txids.iter().any(|t| t == id))
+                && n.received == note.received);
         match existing {
             Some(n) => {
                 if !n.txids.contains(id) {
