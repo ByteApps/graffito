@@ -4583,6 +4583,7 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 [[package]]
 name = "notes-core"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ByteApps/prime-graffito.git?rev=4ac28d3ec4bb362a3c80e1167255f528815a4d66#4ac28d3ec4bb362a3c80e1167255f528815a4d66"
 dependencies = [
  "argon2",
  "base64 0.22.1",
