@@ -1,0 +1,1 @@
+Post-quantum update: directed private notes can now carry a quantum-resistant encryption layer (ML-KEM-768 hybrid) and an optional passphrase layer, interoperable with the Passport Prime app. Also fixes a rescan bug that could drop a previously received note; the app performs a full rescan after updating. Funds and seeds are unaffected.

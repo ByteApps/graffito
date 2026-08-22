@@ -49,8 +49,8 @@ android {
         // exercise the full upload — aab + native symbols in one edit —
         // without committing anything. The hardcoded default stays the source
         // of truth for real releases.
-        versionCode = (project.findProperty("playVersionCode") as String?)?.toInt() ?: 4
-        versionName = "0.1.1"
+        versionCode = (project.findProperty("playVersionCode") as String?)?.toInt() ?: 5
+        versionName = "0.1.2"
     }
 
     // No java/kotlin sources: the BiometricPrompt bridge ships as a dex
