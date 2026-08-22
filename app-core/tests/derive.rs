@@ -41,13 +41,20 @@ fn address_cross_checks_with_rust_bitcoin() {
 }
 
 /// FROZEN enc-key rule vector — if this ever changes, shipped private
-/// notes become unreadable. Never update this expectation.
+/// notes become unreadable. Never update this expectation — with ONE
+/// recorded exception: the 2026-08-18 graffito crypto epoch deliberately
+/// rebound the salt (`chain-notes-app/enc/v1` -> `graffito/enc/v1`,
+/// old-salt notes unreadable forever by explicit decision), and this
+/// literal is the POST-epoch value (updated 2026-08-21 — the epoch merge
+/// missed this integration-test copy because only `--lib` suites were run;
+/// verified against an independent HKDF-SHA256 computation, not against
+/// the code under test).
 #[test]
 fn enc_key_frozen_vector() {
     let key = enc_key_from_leaf(&[0x11u8; 32]);
     assert_eq!(
         hex::encode(key),
-        "205d621601e88ed1f4503cdf776a6dfa3cd812a5311d96b417e674785a482a40",
+        "5c721ed6e799803079b6ddec26360f51d7b60fcd80a06b41d8e88bfa4b6ae604",
     );
 }
 
@@ -214,7 +221,10 @@ fn prime_recovery_seed_words_import_identically() {
     )
     .map(|i| (i.address.clone(), i.expect_full().enc_key))
     .map(|(addr, enc)| {
-        assert_eq!(addr, "bc1pjezt70dslyv2pfglhncglc3granc7wmgkz5j4u5eyyx92su5ghsqaqxt88");
+        // Post-epoch literal (2026-08-21): the 2026-08-18 crypto epoch
+        // rebound the seeds pipeline's salts, so the seed-0 words — and
+        // therefore this address — changed once, deliberately.
+        assert_eq!(addr, "bc1p0plxgrp03zh56hnydnuagyjyn6rue3e525cccm75rpfzake985lss7kc7a");
         assert_eq!(enc, ident.enc_key);
     });
     ident.unwrap();
