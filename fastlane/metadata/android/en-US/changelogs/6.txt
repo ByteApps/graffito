@@ -1,0 +1,1 @@
+Security hardening for passphrase-protected notes: malformed on-chain notes can no longer demand excessive memory at unlock, an out-of-memory unlock now shows a clean error instead of closing the app, and new passphrase-protected notes use parameters every device (including Passport Prime) can unlock. Existing notes remain readable; funds and seeds are unaffected.
