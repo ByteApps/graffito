@@ -14,6 +14,16 @@
 //! MlKemKeypair::from_seed(alg, &seed64)
 //! ```
 //!
+//! The derivation itself LIVES in notes-core now
+//! (`notes_core::pq::mlkem_seed_from_leaf`/`mlkem_keypair_from_leaf`,
+//! relocated for the Passport Prime device app — same precedent as
+//! `derive::enc_key_from_leaf`'s relocation) so the device and this app
+//! derive byte-identical keys from the same notebook leaf secret;
+//! [`derive_seed64`]/[`derive_keypair`] below are thin delegations, pinned
+//! byte-identical to the pre-relocation implementation by
+//! `pinned_derivation_vectors_per_level` and
+//! `derive_seed64_matches_independent_hkdf` in this module's tests.
+//!
 //! `leaf_secret` is the SAME per-notebook secret the notebook's notes-
 //! encryption/ECDH key derives from (`AppIdentity::leaf_secret()` —
 //! `None` for a watch-only identity, which therefore has no derived
@@ -37,17 +47,11 @@
 //! leaf_secret()`/`identity::realize`'s leaf) — no new derivation path
 //! into the seed tree.
 
-use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use zeroize::Zeroizing;
 
 use notes_core::pq::{MlKemAlg, MlKemKeypair, MlKemSecret};
 
 use crate::passphrase::MlKemLevel;
-
-const MLKEM_SALT: &[u8] = b"graffito/mlkem/v1";
-const MLKEM_INFO_PREFIX: &[u8] = b"seed/v1";
 
 /// [`MlKemLevel`] (this crate's UI-facing enum, also used by
 /// `passphrase::SecurityChoice`) <-> [`MlKemAlg`] (notes-core's crypto-
@@ -76,16 +80,11 @@ pub fn from_pq_alg(alg: MlKemAlg) -> MlKemLevel {
 /// The module doc's HKDF step alone (seed derivation, no ML-KEM keygen) —
 /// broken out so [`derive_keypair`] and any future caller that only needs
 /// the seed (never the expensive keygen) share one implementation.
-/// Zeroizing: the 64-byte seed is exactly as sensitive as the
-/// decapsulation key it deterministically reconstructs.
-fn derive_seed64(leaf_secret: &[u8; 32], alg: MlKemAlg) -> Zeroizing<[u8; 64]> {
-    let hk = Hkdf::<Sha256>::new(Some(MLKEM_SALT), leaf_secret);
-    let mut info = Vec::with_capacity(MLKEM_INFO_PREFIX.len() + 1);
-    info.extend_from_slice(MLKEM_INFO_PREFIX);
-    info.push(alg.id());
-    let mut okm = Zeroizing::new([0u8; 64]);
-    hk.expand(&info, &mut *okm).expect("64 bytes is a valid HKDF length");
-    okm
+/// Delegates to `notes_core::pq::mlkem_seed_from_leaf` — see the module
+/// doc's "Derivation" section. Zeroizing: the 64-byte seed is exactly as
+/// sensitive as the decapsulation key it deterministically reconstructs.
+fn derive_seed64(leaf_secret: &[u8; 32], alg: MlKemAlg) -> zeroize::Zeroizing<[u8; 64]> {
+    notes_core::pq::mlkem_seed_from_leaf(leaf_secret, alg)
 }
 
 /// Deterministically derive this notebook's ML-KEM receive keypair at
@@ -377,6 +376,37 @@ mod tests {
                 prefix_hex, expected_ek_prefix_hex,
                 "derivation for {alg:?} changed — this is a FROZEN-once-shipped vector"
             );
+        }
+    }
+
+    /// [`derive_seed64`] now delegates to `notes_core::pq::
+    /// mlkem_seed_from_leaf` — this reconstructs the HKDF independently
+    /// (the pre-relocation constants/algorithm this module used to
+    /// implement inline) and checks the delegation still lands on the
+    /// exact same bytes. A mismatch means the relocation changed the
+    /// derivation, not that this test's constants are stale — the pinned
+    /// vectors above are the ultimate authority; this test only pins the
+    /// salt/info shape independently of notes-core's own implementation.
+    #[test]
+    fn derive_seed64_matches_independent_hkdf() {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+
+        const MLKEM_SALT: &[u8] = b"graffito/mlkem/v1";
+        const MLKEM_INFO_PREFIX: &[u8] = b"seed/v1";
+
+        for alg in [MlKemAlg::MlKem512, MlKemAlg::MlKem768, MlKemAlg::MlKem1024] {
+            let l = leaf(0x77);
+            let got = derive_seed64(&l, alg);
+
+            let hk = Hkdf::<Sha256>::new(Some(MLKEM_SALT), &l);
+            let mut info = Vec::with_capacity(MLKEM_INFO_PREFIX.len() + 1);
+            info.extend_from_slice(MLKEM_INFO_PREFIX);
+            info.push(alg.id());
+            let mut want = [0u8; 64];
+            hk.expand(&info, &mut want).expect("64 bytes is a valid HKDF length");
+
+            assert_eq!(*got, want, "derive_seed64 delegation drifted for {alg:?}");
         }
     }
 
