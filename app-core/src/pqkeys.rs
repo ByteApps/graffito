@@ -184,6 +184,32 @@ pub fn import_to_native_private(
     Ok((kp, armor))
 }
 
+/// Generate a fresh, NON-seed-derived ML-KEM keypair for the app's "My
+/// quantum key" slot (`PLAN-graffito-quantum-key.md`) — the counterpart to
+/// [`import_to_native_private`], writing the SAME native private armor
+/// format so the caller stores it in the identical keychain account
+/// (`pq-imported`) either way. `extra` is optional caller-supplied entropy
+/// (a typed passphrase, dice rolls — any bytes); it is only ever MIXED
+/// alongside a full fresh TRNG draw, never a substitute for it — see
+/// `notes_core::pq::generate_mlkem_seed`'s doc for the exact rule. Pass an
+/// empty slice for no extra entropy, which is byte-equivalent to
+/// [`MlKemKeypair::generate`]'s own draw.
+///
+/// This deliberately never touches the notebook's seed-derived receive key
+/// ([`derive_keypair`]) — a self-KEM layer is only meaningful when
+/// encapsulated to a keypair with NO seed ancestry (see notes-core
+/// `pq.rs`'s self-note-layers section doc), and this is that keypair's
+/// only generator.
+pub fn generate_native_private(
+    level: MlKemLevel,
+    extra: &[u8],
+) -> Result<(MlKemKeypair, String), crate::Error> {
+    let kp = MlKemKeypair::generate_with_extra(pq_alg(level), extra)
+        .map_err(|e| crate::Error::Store(e.to_string()))?;
+    let armor = export_private_armor(&kp);
+    Ok((kp, armor))
+}
+
 /// Where a notebook's (or a contact's) ML-KEM key comes from — persisted
 /// by the app layer (Phase C) in its config, never here (app-core stores
 /// no config of its own). The imported SECRET material itself is never
@@ -590,5 +616,54 @@ mod tests {
     #[test]
     fn contact_pq_display_rejects_garbage() {
         assert!(contact_pq_display("not a key").is_err());
+    }
+
+    // ---- generate_native_private ("My quantum key" generation) ----------
+
+    #[test]
+    fn generate_native_private_round_trips_with_matching_level_and_fingerprint() {
+        for level in [MlKemLevel::MlKem512, MlKemLevel::MlKem768, MlKemLevel::MlKem1024] {
+            let (kp, armor) = generate_native_private(level, b"").unwrap();
+            assert_eq!(kp.alg(), pq_alg(level));
+
+            let (alg, seed) = notes_core::pq::import_private(&armor).unwrap();
+            assert_eq!(alg, pq_alg(level));
+            assert_eq!(&seed, kp.seed());
+
+            // The armor reconstructs the exact same keypair, so its
+            // fingerprint (and therefore ek) matches too.
+            let reconstructed = MlKemKeypair::from_seed(alg, &seed);
+            assert_eq!(reconstructed.fingerprint(), kp.fingerprint());
+            assert_eq!(reconstructed.ek(), kp.ek());
+        }
+    }
+
+    #[test]
+    fn generate_native_private_empty_and_nonempty_extra_both_produce_valid_keypairs() {
+        let (empty_kp, _) = generate_native_private(MlKemLevel::MlKem768, b"").unwrap();
+        assert_eq!(empty_kp.ek().len(), MlKemAlg::MlKem768.ek_len());
+
+        let (salted_kp, _) =
+            generate_native_private(MlKemLevel::MlKem768, b"correct horse battery staple").unwrap();
+        assert_eq!(salted_kp.ek().len(), MlKemAlg::MlKem768.ek_len());
+
+        let (dice_kp, _) = generate_native_private(MlKemLevel::MlKem768, b"3 1 4 1 5 9 2 6").unwrap();
+        assert_eq!(dice_kp.ek().len(), MlKemAlg::MlKem768.ek_len());
+    }
+
+    #[test]
+    fn generate_native_private_two_generations_differ() {
+        // Same level, same extra-entropy text, twice — the TRNG draw
+        // dominates the mix (`generate_mlkem_seed`'s belt-and-suspenders
+        // rule), so two calls must never collide.
+        let (a, _) = generate_native_private(MlKemLevel::MlKem768, b"same salt").unwrap();
+        let (b, _) = generate_native_private(MlKemLevel::MlKem768, b"same salt").unwrap();
+        assert_ne!(a.seed(), b.seed());
+        assert_ne!(a.ek(), b.ek());
+
+        // And the empty-extra path is likewise never deterministic.
+        let (c, _) = generate_native_private(MlKemLevel::MlKem512, b"").unwrap();
+        let (d, _) = generate_native_private(MlKemLevel::MlKem512, b"").unwrap();
+        assert_ne!(c.seed(), d.seed());
     }
 }
