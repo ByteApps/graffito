@@ -1182,12 +1182,15 @@ fn alice_own_view(tx: &NoteTx, bob_addr: &str, height: u64) -> SyncBundle {
 }
 
 /// Structural validation: a pq layer on anything other than a single-
-/// recipient directed PRIVATE note is refused loudly, never silently
-/// dropped. Covers: a public note, a self-note, and a multi-recipient
-/// pick — one representative failure each is enough (the guard is a
-/// single `if` in `compose_note`, not per-shape logic).
+/// recipient directed PRIVATE note, or a private SELF-note, is refused
+/// loudly, never silently dropped. Covers: a public note and a multi-
+/// recipient pick — one representative failure each is enough (the guard
+/// is a single `if` in `compose_note`, not per-shape logic). A self-note
+/// pq layer is NOT in this list since PLAN-graffito-self-pw.md (2026-08-22)
+/// — see `pq_self_note_with_password_is_stored_locked_and_never_cached`
+/// and the ML-KEM case in `pq_self_note_with_mlkem_layer_composes`.
 #[test]
-fn pq_layers_require_single_recipient_directed_private() {
+fn pq_layers_require_single_recipient_directed_private_or_self() {
     let a = alice();
     let b = bob();
     let bob_addr = b.address(NET);
@@ -1216,14 +1219,15 @@ fn pq_layers_require_single_recipient_directed_private() {
     .unwrap_err();
     assert!(matches!(err, Error::Store(_)));
 
-    // Self-note (no recipient) + an ML-KEM layer.
+    // A public SELF-note (private: false, no recipient) + a password layer
+    // — private is required regardless of recipient shape.
     let err = compose_note(
         &store,
         &a,
         NET,
         &ComposeRequest {
             text: "nope",
-            private: true,
+            private: false,
             recipient: None,
             extra_recipients: &[],
             change_to: None,
@@ -1232,8 +1236,8 @@ fn pq_layers_require_single_recipient_directed_private() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: None,
-            pq_mlkem: Some((MlKemAlg::MlKem768, bob_pq_keypair().ek().to_vec())),
+            pq_password: Some("hunter2hunter2hunter2".into()),
+            pq_mlkem: None,
         },
     )
     .unwrap_err();
@@ -1263,6 +1267,42 @@ fn pq_layers_require_single_recipient_directed_private() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::Store(_)));
+}
+
+/// Self-note pq compose routing (PLAN-graffito-self-pw.md): a private
+/// SELF-note (no recipient) with an ML-KEM layer alone is accepted and
+/// carries JUST `FLAG_MLKEM` — a self-note pq layer is no longer refused
+/// the way it was before this feature (see the previous test's doc
+/// comment). The recipient/multi-recipient bookkeeping stays empty, same
+/// as any other self-note.
+#[test]
+fn pq_self_note_with_mlkem_layer_composes() {
+    let a = alice();
+    let store = funded_store(&a);
+    let kp = bob_pq_keypair(); // stand-in for an imported (non-seed-derived) key
+    let composed = compose_note(
+        &store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "self note, quantum-sealed",
+            private: true,
+            recipient: None,
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: None,
+            pq_mlkem: Some((MlKemAlg::MlKem768, kp.ek().to_vec())),
+        },
+    )
+    .unwrap();
+    assert_eq!(composed.pq_flags, FLAG_MLKEM);
+    assert!(composed.recipient_address.is_none());
+    assert!(composed.recipients.is_empty());
 }
 
 /// Password-only pq note: recoverable by EITHER party who knows the
@@ -1534,4 +1574,165 @@ fn pq_note_refuses_fee_bump() {
     let err =
         app_core::compose::bump_fee_build(&store, &a, NET, &sent.note_id, 5.0, None).unwrap_err();
     assert!(matches!(err, Error::Store(_)));
+}
+
+// ---------------------------------------------------------------------------
+// Self-note pq layers (PLAN-graffito-self-pw.md, 2026-08-22): password and/or
+// ML-KEM on a private SELF-note. Unlike a directed pq note (which the
+// composer caches plaintext for immediately — see the tests above), a
+// self-pq note is stored LOCKED from the moment it's signed and only ever
+// unlocked VIEW-ONLY: `Store::unlock_note_view` never writes into `text`
+// and never clears `locked`.
+// ---------------------------------------------------------------------------
+
+/// Compose routing: a self-note (no recipient) with a password layer
+/// produces a tx whose FIRST OP_RETURN header carries
+/// `FLAG_PRIVATE | FLAG_PW` (decoded independently via
+/// `envelope::decode_note`, not trusted from `composed.pq_flags` alone),
+/// and the recorded store entry has NO cached plaintext and
+/// `locked.is_self()` — the store never gets a chance to hold the
+/// plaintext next to the password-protected note, unlike a directed pq
+/// note (whose composer already had the text in hand with nothing to
+/// decrypt).
+#[test]
+fn pq_self_note_with_password_is_stored_locked_and_never_cached() {
+    use app_core::notes_core::envelope::FLAG_PRIVATE;
+
+    let a = alice();
+    let password = "a genuinely long self-note passphrase";
+    let mut store = funded_store(&a);
+    let composed = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "my private diary entry",
+            private: true,
+            recipient: None,
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: Some(password.into()),
+            pq_mlkem: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(composed.pq_flags, FLAG_PW);
+    assert!(composed.recipient_address.is_none());
+
+    // Byte-truth check on the wire header itself, independent of anything
+    // the compose path claims about itself.
+    let payloads: Vec<Vec<u8>> = composed
+        .tx
+        .tx
+        .outputs
+        .iter()
+        .filter(|o| o.script_pubkey.first() == Some(&0x6a))
+        .filter_map(|o| op_return_payload(&o.script_pubkey).map(<[u8]>::to_vec))
+        .collect();
+    let decoded = app_core::notes_core::envelope::decode_note(&payloads).unwrap();
+    assert_eq!(decoded.flags, FLAG_PRIVATE | FLAG_PW, "no FLAG_DIRECTED on a self-note");
+
+    // The store record: empty text, a self-scoped locked body.
+    assert_eq!(store.notes.len(), 1);
+    let rec = &store.notes[0];
+    assert!(rec.text.is_none(), "a self-pq note must never cache plaintext, even for the composer");
+    assert_eq!(rec.pq_flags, FLAG_PW);
+    let locked = rec.locked.as_ref().expect("self-pq note must be recorded locked");
+    assert!(locked.is_self(), "not a directed locked body");
+    assert!(!rec.directed);
+    assert!(!rec.received);
+}
+
+/// View-only unlock (PLAN-graffito-self-pw.md): `Store::unlock_note_view`
+/// returns the plaintext for display, but — unlike `Store::unlock_note` —
+/// never persists it: the record's `text` stays `None`, `locked` survives
+/// untouched, and a round-trip through `Store::save`/`Store::load` (a real
+/// file on disk) proves the plaintext was never written anywhere, not even
+/// transiently. Every future open must ask again.
+#[test]
+fn pq_self_note_unlock_is_view_only_and_never_persists() {
+    let a = alice();
+    let password = "another self-note passphrase, plenty long";
+    let plaintext = "only readable with the password";
+    let mut store = funded_store(&a);
+    let composed = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: plaintext,
+            private: true,
+            recipient: None,
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: Some(password.into()),
+            pq_mlkem: None,
+        },
+    )
+    .unwrap();
+    let note_id = composed.note_id.clone();
+
+    // Wrong password fails cleanly and never mutates the record.
+    let err = store.unlock_note_view(&note_id, &a, None, Some("wrong password")).unwrap_err();
+    assert!(matches!(err, Error::Notes(_)));
+    assert!(store.notes[0].locked.is_some(), "a failed unlock must not clear locked");
+    assert!(store.notes[0].text.is_none());
+
+    // `unlock_note` (the directed-note fn) must refuse a self locked body —
+    // the two paths never cross.
+    let cross_err = store.unlock_note(&note_id, &a, &[], Some(password)).unwrap_err();
+    assert!(matches!(cross_err, Error::Notes(_)), "got: {cross_err:?}");
+    assert!(store.notes[0].locked.is_some(), "the wrong-path attempt must not mutate either");
+
+    // Right password: returns the plaintext, but the STORE stays untouched.
+    let text = store.unlock_note_view(&note_id, &a, None, Some(password)).unwrap();
+    assert_eq!(text, plaintext);
+    assert!(store.notes[0].text.is_none(), "view-only must never cache the plaintext");
+    assert!(store.notes[0].locked.is_some(), "view-only must never clear locked");
+
+    // Persist to a real file and reload — the disk copy must carry neither
+    // the plaintext nor any trace of it, and `locked` must survive the
+    // round-trip byte-identically.
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let path = dir.join("self-pq-view-only-store.json");
+    store.save(&path).unwrap();
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !on_disk.contains(plaintext),
+        "the plaintext must never reach disk, not even transiently"
+    );
+    let loaded = Store::load(&path).unwrap();
+    let loaded_rec = loaded.notes.iter().find(|n| n.note_id == note_id).unwrap();
+    assert!(loaded_rec.text.is_none());
+    assert!(loaded_rec.locked.is_some());
+    assert_eq!(loaded_rec.locked, store.notes[0].locked, "locked body survives the round-trip");
+
+    // Unlocking the RELOADED store still works — the locked body alone is
+    // enough to recover the note (no session-only state was needed).
+    let text_again = loaded.unlock_note_view(&note_id, &a, None, Some(password)).unwrap();
+    assert_eq!(text_again, plaintext);
+}
+
+/// `CLASSIFY_VERSION` bump pin (PLAN-graffito-self-pw.md): a `PW|PRIVATE`
+/// (no `FLAG_DIRECTED`) header was UNDECODABLE before this feature — an
+/// older build's scan recorded no note at all for such a tx, own or
+/// otherwise. Bumping this constant is what forces one full rescan per
+/// store so those notes stop being invisible on an already-quiet wallet
+/// (the `addr_stats` short-circuit otherwise never triggers one on its
+/// own). This test pins the exact value so a future bump (for an unrelated
+/// reason) doesn't accidentally undo this one, and a missing bump doesn't
+/// silently ship.
+#[test]
+fn classify_version_bumped_for_self_pw_notes() {
+    assert_eq!(app_core::store::CLASSIFY_VERSION, 5);
 }
