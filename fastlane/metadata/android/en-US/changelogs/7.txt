@@ -1,0 +1,1 @@
+Personal notes can now be password-protected (and optionally locked to your imported quantum key): even your recovery seed alone can't read them back without the password. Protected notes are never cached in plain text and ask for the password on every open. Existing notes, funds and seeds are unaffected.
