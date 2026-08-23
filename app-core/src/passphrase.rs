@@ -272,8 +272,10 @@ pub struct SecurityChoice {
     pub directed: bool,
     /// Estimated/exact entropy of the chosen passphrase-layer passphrase,
     /// if the passphrase layer is enabled — from [`check`]/[`check_generated`].
-    /// `None` when the passphrase layer isn't in use. Only offered on
-    /// directed notes.
+    /// `None` when the passphrase layer isn't in use. Offered on directed
+    /// notes and — since PLAN-graffito-self-pw.md (2026-08-22) — self-notes
+    /// too, though it never changes [`is_quantum_resistant`]'s answer for a
+    /// self-note (already `true` regardless — see that fn's doc).
     pub passphrase_bits: Option<f64>,
     /// `true` iff the CURRENT passphrase text came out of [`generate`] this
     /// session, untouched since. A generated phrase's entropy is a
@@ -286,7 +288,11 @@ pub struct SecurityChoice {
     /// generated text changes.
     pub passphrase_verified: bool,
     /// The ML-KEM level, if the hybrid layer is enabled. `None` when it
-    /// isn't in use. Only offered on directed notes.
+    /// isn't in use. Offered on directed notes and — since
+    /// PLAN-graffito-self-pw.md — self-notes too (there, ONLY when sealed
+    /// to a non-seed-derived imported key — a compose-side obligation this
+    /// struct can't see); same quantum-resistance caveat as
+    /// `passphrase_bits` above.
     pub mlkem: Option<MlKemLevel>,
 }
 

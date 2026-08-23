@@ -41,12 +41,19 @@ pub const DEFAULT_CHUNK: usize = 100_000;
 /// drops every note this store holds when crossing this threshold —
 /// nothing was in production, so old-format rows simply vanish and a
 /// full rescan repopulates the store in the new format.
-pub const CLASSIFY_VERSION: u32 = 4; // 3: graffito crypto epoch — old-salt notes no longer decrypt; force one full rescan
+pub const CLASSIFY_VERSION: u32 = 5; // 3: graffito crypto epoch — old-salt notes no longer decrypt; force one full rescan
 // 4 (2026-08-21): upsert_note regained the `received` match leg — a store
 // whose stale received twin swallowed (and prune then DELETED) an own note
 // recovers it on the next FULL rescan; the forced rescan is what brings the
 // lost note back on otherwise-quiet wallets (the addr_stats short-circuit
 // would skip them forever).
+// 5 (2026-08-22, PLAN-graffito-self-pw.md): a PW|PRIVATE (no DIRECTED)
+// envelope header — a self-note pq layer — was UNDECODABLE before this
+// feature (envelope.rs's old validity rule rejected FLAG_PW without
+// FLAG_DIRECTED), so a tx an older build scanned recorded no note at all,
+// own or otherwise. Without this bump such notes stay invisible forever on
+// an already-quiet wallet, since the `addr_stats` short-circuit never
+// triggers a rescan on its own.
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutPointRef {
@@ -1420,6 +1427,57 @@ impl Store {
         rec.text = Some(text.clone());
         rec.locked = None;
         Ok(text)
+    }
+
+    /// View-only unlock of a SELF-note's locked pq body
+    /// (PLAN-graffito-self-pw.md) — DISPLAYS the plaintext but, unlike
+    /// [`Self::unlock_note`], never writes it into `text` and never clears
+    /// `locked`: every future open asks for the password/quantum key again.
+    /// A cached copy would hollow out the whole feature (a self-note's pq
+    /// layer is a second factor against SEED compromise; caching the
+    /// plaintext next to the seed-encrypted store defeats that). Takes
+    /// `&self` (never `&mut self`) precisely because it must not mutate the
+    /// store.
+    ///
+    /// `identity.enc_key` supplies the notebook's ordinary self-encryption
+    /// key `notes_core::pq::unlock_self` mixes in; `mlkem_secret` is the
+    /// caller's already-loaded IMPORTED quantum key (never a seed-derived
+    /// one — see the module-level warning in notes-core's `pq.rs`), needed
+    /// only when the locked body's `pq_flags` carries `FLAG_MLKEM`.
+    ///
+    /// Refuses (never touching the store) when: the note doesn't exist, it
+    /// has no locked body, the locked body is a DIRECTED one (not
+    /// `LockedBody::is_self()` — that goes through [`Self::unlock_note`]
+    /// instead, which owns that path's existing fill-and-clear semantics),
+    /// or the supplied secret(s)/password fail to authenticate (crypto-
+    /// graphically indistinguishable from tampering, same as
+    /// `unlock_note`'s contract).
+    pub fn unlock_note_view(
+        &self,
+        note_id: &str,
+        identity: &Identity,
+        mlkem_secret: Option<&notes_core::pq::MlKemSecret>,
+        password: Option<&str>,
+    ) -> Result<String, Error> {
+        let rec = self
+            .notes
+            .iter()
+            .find(|n| n.note_id == note_id)
+            .ok_or_else(|| Error::Store("no such note".into()))?;
+        let locked = rec
+            .locked
+            .as_ref()
+            .ok_or_else(|| Error::Store("note has no locked post-quantum body".into()))?;
+        if !locked.is_self() {
+            return Err(Error::Store(
+                "directed locked body — use unlock_note, not unlock_note_view".into(),
+            ));
+        }
+        let plaintext =
+            notes_core::pq::unlock_self(locked, &identity.enc_key, mlkem_secret, password)
+                .map_err(Error::Notes)?;
+        String::from_utf8(plaintext)
+            .map_err(|_| Error::Store("decrypted note body is not valid utf-8".into()))
     }
 }
 
