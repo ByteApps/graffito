@@ -1591,16 +1591,23 @@ export component AppWindow inherits Window {
     in property <[ContactItem]> note-reply-set;
     // ---- locked-note unlock (post-quantum note view) ----
     // True while NoteRecord.locked is Some — text stays hidden until
-    // Store::unlock_note succeeds. `note-unlock-needs-password`: a
-    // passphrase field + Unlock button apply (FLAG_PW set, and — for a
-    // received note — the FLAG_MLKEM half either isn't set or this device
-    // already holds the key, so a password is genuinely the missing
-    // piece). When false and `note-locked` is true, `note-unlock-caption`
-    // explains why nothing can be typed to fix it (KEM-only and this
-    // device lacks the key, or an own note sealed with ML-KEM — the
-    // sender can never reopen that layer).
+    // Store::unlock_note/unlock_note_view succeeds. `note-unlock-needs-
+    // password`: a passphrase field + Unlock button apply (FLAG_PW set,
+    // and — for a received note — the FLAG_MLKEM half either isn't set or
+    // this device already holds the key, so a password is genuinely the
+    // missing piece). When false and `note-locked` is true,
+    // `note-unlock-caption` explains why nothing can be typed to fix it
+    // (KEM-only and this device lacks the key, or an own DIRECTED note
+    // sealed with ML-KEM — the sender can never reopen that layer). A
+    // SELF-note (PLAN-graffito-self-pw.md) is different: its author always
+    // holds the enc key, so an Unlock tap can still succeed against an
+    // already-imported quantum key even with no password to type —
+    // `note-unlock-show-button` (true only for that case) adds the button
+    // to the caption-only block too, which the unrecoverable DIRECTED
+    // cases above never get.
     in property <bool> note-locked;
     in property <bool> note-unlock-needs-password;
+    in property <bool> note-unlock-show-button;
     in property <string> note-unlock-caption;
     in-out property <string> note-unlock-passphrase;
     in property <bool> note-unlock-busy;
@@ -1662,10 +1669,11 @@ export component AppWindow inherits Window {
     // regardless of expanded state (safety content).
     in property <string> compose-locktime-warn;
     // ---- post-quantum layers (compose screen 6, "Security" collapsible —
-    // visible only for a directed+private single-recipient, non-watch
-    // note). LAST collapsible on the screen (Sal's e2e-drift rule: put new
-    // panels as late as possible so only the Sign/cost area below needs
-    // recalibration).
+    // visible for a private, single-recipient-or-self, notebook-funded,
+    // non-watch note — PLAN-graffito-self-pw.md extended this to self-notes
+    // too, 2026-08-22). LAST collapsible on the screen (Sal's e2e-drift
+    // rule: put new panels as late as possible so only the Sign/cost area
+    // below needs recalibration).
     in-out property <bool> pq-expanded;
     // Header status chip on the (always-visible) section header row.
     in property <bool> pq-quantum-resistant;
@@ -1690,6 +1698,12 @@ export component AppWindow inherits Window {
     callback pq-generate-passphrase();
     callback pq-passphrase-changed(string);
     callback pq-mlkem-toggled(bool);
+    // Fired whenever the Security panel's header is tapped, with the NEW
+    // expanded state — the sanctioned user-initiated door (LAUNCH-PATH
+    // rule) for lazily loading a self-note's imported quantum key from the
+    // Keychain: the ML-KEM switch itself starts disabled until that key is
+    // loaded, so opening the panel is the earliest tap Rust can hook.
+    callback pq-panel-toggled(bool);
     // "Note too large to broadcast" dialog (per-tx ~100 kB ceiling).
     in-out property <bool> show-oversize-modal;
     in property <bool> oversize-offer-bump; // true → offer to switch to Standard
@@ -3142,7 +3156,11 @@ export component AppWindow inherits Window {
                     height: 16px;
                     horizontal-alignment: left;
                 }
-                Caption { text: "This note is locked. Enter its passphrase to view it."; }
+                Caption {
+                    text: root.note-unlock-caption != ""
+                        ? root.note-unlock-caption
+                        : "This note is locked. Enter its passphrase to view it.";
+                }
                 HorizontalLayout {
                     spacing: 8px;
                     EditField {
@@ -3177,6 +3195,15 @@ export component AppWindow inherits Window {
                         height: 16px;
                     }
                     Caption { text: root.note-unlock-caption; }
+                }
+                // SELF-note ML-KEM-only (PLAN-graffito-self-pw.md): unlike
+                // the unrecoverable directed cases this block otherwise
+                // renders, the author can still retry against an
+                // already-imported quantum key with no password to type.
+                if root.note-unlock-show-button: PrimaryButton {
+                    width: 100px;
+                    text: root.note-unlock-busy ? "…" : "Unlock";
+                    clicked => { root.unlock-note(); }
                 }
             }
         }
@@ -3564,12 +3591,13 @@ export component AppWindow inherits Window {
                 if root.compose-locktime-warn != "": Caption { text: root.compose-locktime-warn; color: Pal.warn; }
             }
         }
-        // ---- post-quantum layers (directed + private + single-recipient,
-        // keyed only) — the LAST collapsible on this screen, deliberately:
-        // it only pushes the Sign/cost area below it, so that's the one
-        // area an e2e recalibration needs to touch. Imitates the Gift/
-        // Locktime panels exactly (same card/caret/caption shape).
-        if root.directed && root.compose-private && root.to-chips.length == 0 && !root.watch-only: Rectangle {
+        // ---- post-quantum layers (private + single-recipient-or-self,
+        // notebook-funded, keyed only — mirrors `pq_compose_eligible` in
+        // src/lib.rs exactly) — the LAST collapsible on this screen,
+        // deliberately: it only pushes the Sign/cost area below it, so
+        // that's the one area an e2e recalibration needs to touch. Imitates
+        // the Gift/Locktime panels exactly (same card/caret/caption shape).
+        if root.compose-private && root.to-chips.length == 0 && !root.watch-only && root.pay-from == "notebook": Rectangle {
             border-radius: 10px;
             background: Pal.card;
             border-width: 1px;
@@ -3580,7 +3608,12 @@ export component AppWindow inherits Window {
                 spacing: 8px;
                 Rectangle {
                     height: 22px;
-                    TouchArea { clicked => { root.pq-expanded = !root.pq-expanded; } }
+                    TouchArea {
+                        clicked => {
+                            root.pq-expanded = !root.pq-expanded;
+                            root.pq-panel-toggled(root.pq-expanded);
+                        }
+                    }
                     HorizontalLayout {
                         spacing: 6px;
                         Text {

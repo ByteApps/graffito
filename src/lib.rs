@@ -2323,10 +2323,18 @@ fn note_web_url(network: Network, address: &str, note_id: &str) -> String {
 }
 
 /// Repaint screen 5's locked-note unlock block for the note `on_open_note`
-/// just resolved. Three states:
+/// just resolved.
 ///
 /// - Not locked (`n.locked` is `None`, whether it's a plaintext note or an
 ///   already-unlocked one): everything hidden.
+/// - A SELF-note (`locked.is_self()`, PLAN-graffito-self-pw.md): checked
+///   FIRST — unlike a directed note, the author always holds the enc key
+///   `unlock_self` needs, so there is no `SenderCannotReopen` case here at
+///   all. `FLAG_PW` shows the password field (+ Unlock button, unchanged
+///   shape); `FLAG_MLKEM` alone (no password) still needs an Unlock button
+///   to try the already-loaded imported key, which the DIRECTED-note
+///   "nothing can help" caption-only block never offered — see
+///   `note-unlock-show-button`.
 /// - `FLAG_PW` set, and NOT a sender-side ML-KEM note (see below): a
 ///   passphrase can genuinely unlock it — show the field + Unlock button.
 /// - Otherwise (locked, no password layer to type, OR an own note carrying
@@ -2335,17 +2343,43 @@ fn note_web_url(network: Network, address: &str, note_id: &str) -> String {
 ///   (with or without `FLAG_PW` alongside it) is `unlock_sent`'s
 ///   `SenderCannotReopen` case UNCONDITIONALLY — the sender never held the
 ///   recipient's decapsulation key, so no password will ever complete it,
-///   which is why this case is checked FIRST and short-circuits past the
-///   password branch even when `FLAG_PW` is also set.
+///   which is why this case is checked FIRST (among directed notes) and
+///   short-circuits past the password branch even when `FLAG_PW` is also
+///   set.
 fn refresh_note_unlock_ui(w: &AppWindow, n: &app_core::store::NoteRecord) {
     use app_core::notes_core::envelope::{FLAG_MLKEM, FLAG_PW};
 
     let locked = n.locked.is_some();
     w.set_note_locked(locked);
     w.set_note_unlock_busy(false);
+    w.set_note_unlock_show_button(false);
     if !locked {
         w.set_note_unlock_needs_password(false);
         w.set_note_unlock_caption("".into());
+        w.set_note_unlock_passphrase("".into());
+        return;
+    }
+    let is_self =
+        n.locked.as_ref().map(app_core::notes_core::pq::LockedBody::is_self).unwrap_or(false);
+    if is_self {
+        let needs_password = n.pq_flags & FLAG_PW != 0;
+        let needs_mlkem = n.pq_flags & FLAG_MLKEM != 0;
+        w.set_note_unlock_needs_password(needs_password);
+        w.set_note_unlock_caption(
+            if needs_mlkem && needs_password {
+                "Also needs your imported quantum key to reopen — you'll be asked if it isn't \
+                 loaded. Losing either the password or the key loses this note forever."
+                    .to_string()
+            } else if needs_mlkem {
+                "Needs your imported quantum key to reopen (Settings → Quantum keys). Losing it \
+                 loses this note forever, even with your seed."
+                    .to_string()
+            } else {
+                String::new()
+            }
+            .into(),
+        );
+        w.set_note_unlock_show_button(true);
         w.set_note_unlock_passphrase("".into());
         return;
     }
@@ -2363,6 +2397,43 @@ fn refresh_note_unlock_ui(w: &AppWindow, n: &app_core::store::NoteRecord) {
         );
     }
     w.set_note_unlock_passphrase("".into());
+}
+
+/// Build screen 5's detail text block for note `n` — shared by
+/// `on_open_note` (the normal, store-backed render, `text_override: None`)
+/// and `on_unlock_note`'s SELF-note view-only path (PLAN-graffito-self-pw.md),
+/// which passes the just-decrypted plaintext as `text_override` WITHOUT
+/// writing it into `n.text`/the store: a self-pq note's second factor stays
+/// load-bearing on every future open, so nothing about this render may
+/// persist. `text_override` always wins over `n.text` when present (it is
+/// only ever passed when `n.text` is `None`, but preferring it here keeps
+/// the precedence explicit rather than accidental).
+fn format_note_detail(n: &app_core::store::NoteRecord, watch: bool, text_override: Option<&str>) -> String {
+    let short_id = &n.note_id[..8.min(n.note_id.len())];
+    format!(
+        "{}\n\nid: {}…\nkind: {}{}{}\ntxids: {}\nheight: {}\n{}{}",
+        text_override.or(n.text.as_deref()).unwrap_or(if n.locked.is_some() {
+            "(locked — see below to unlock)"
+        } else if watch && n.private {
+            "(private — the key that reads this note isn't on this device)"
+        } else {
+            "(not decryptable)"
+        }),
+        short_id,
+        if n.received { "received" } else { "own" },
+        if n.directed { " · directed" } else { "" },
+        if n.private { " · private" } else { " · public" },
+        n.txids.join(", "),
+        n.height.map(|h| h.to_string()).unwrap_or_else(|| "unconfirmed".into()),
+        n.sender.as_deref().map(|a| format!("from: {a}\n")).unwrap_or_default(),
+        // Multi-recipient note: list EVERY recipient (one per line,
+        // output order); the singular field only names the first.
+        if n.recipients.is_empty() {
+            n.recipient.as_deref().map(|a| format!("to: {a}\n")).unwrap_or_default()
+        } else {
+            format!("to ({}): {}\n", n.recipients.len(), n.recipients.join("\n    "))
+        },
+    )
 }
 
 /// Populate the Settings node + explorer dropdown models, selected indices,
@@ -4547,16 +4618,21 @@ fn refresh_compose_locktime_panel(w: &AppWindow, st: &State) {
 }
 
 /// Whether the compose screen's post-quantum "Security" section applies at
-/// all — directed + private + single-recipient (no removable To-chips) +
-/// a KEYED identity (watch-only can't seal anything). Shared by the panel
+/// all — private + single-recipient (no removable To-chips, no multi-
+/// recipient) + a KEYED identity (watch-only can't seal anything) +
+/// NOTEBOOK-funded (mixed/spending-funded compose calls a different
+/// builder that never carries pq layers — see `ComposeRequest::
+/// pq_password`'s doc). Covers BOTH a directed note (`st.to_address` set)
+/// and a self-note (`st.to_address` empty) since PLAN-graffito-self-pw.md —
+/// before that, self-notes were excluded entirely. Shared by the panel
 /// visibility condition (app.slint mirrors this exact logic) and every
 /// Rust caller that needs to know whether pq layers are even reachable
 /// right now.
 fn pq_compose_eligible(w: &AppWindow, st: &State) -> bool {
-    st.to_address.is_some()
-        && w.get_compose_private()
+    w.get_compose_private()
         && st.to_addresses_extra.is_empty()
         && st.ident.as_ref().map(|i| !i.is_watch()).unwrap_or(false)
+        && st.payfrom_active_source == "notebook"
 }
 
 /// Repaint the compose screen's "Security" section from current UI toggle
@@ -4586,26 +4662,52 @@ fn refresh_compose_pq(
     }
 
     let private = true; // pq_compose_eligible already required this
-    let directed = true;
+    let directed = st.to_address.is_some();
 
-    // ---- ML-KEM availability: cached per resolved recipient address ----
-    let addr = st.to_address.clone().unwrap_or_default();
-    let recompute = st.pq_recipient_cache.as_ref().map(|(a, _)| a.as_str()) != Some(addr.as_str());
-    if recompute {
-        let net = st.network.as_str();
-        let display = st
-            .contacts
-            .iter()
-            .find(|c| c.address == addr && (c.network == net || c.network.is_empty()))
-            .and_then(|c| c.mlkem_ek.as_deref())
-            .map(app_core::pqkeys::contact_pq_display);
-        st.pq_recipient_cache = Some((addr.clone(), display));
-    }
-    let resolved = st.pq_recipient_cache.as_ref().and_then(|(_, d)| d.as_ref());
-    let (mlkem_available, mlkem_level, mlkem_caption) = match resolved {
-        Some(Ok((level, line))) => (true, Some(*level), line.clone()),
-        Some(Err(e)) => (false, None, format!("couldn't read this contact's quantum key: {e}")),
-        None => (false, None, "recipient has no quantum key — add one in Contacts".to_string()),
+    // ---- ML-KEM availability ----
+    let (mlkem_available, mlkem_level, mlkem_caption) = if directed {
+        // Directed note: cached per resolved recipient address (unchanged).
+        let addr = st.to_address.clone().unwrap_or_default();
+        let recompute = st.pq_recipient_cache.as_ref().map(|(a, _)| a.as_str()) != Some(addr.as_str());
+        if recompute {
+            let net = st.network.as_str();
+            let display = st
+                .contacts
+                .iter()
+                .find(|c| c.address == addr && (c.network == net || c.network.is_empty()))
+                .and_then(|c| c.mlkem_ek.as_deref())
+                .map(app_core::pqkeys::contact_pq_display);
+            st.pq_recipient_cache = Some((addr.clone(), display));
+        }
+        let resolved = st.pq_recipient_cache.as_ref().and_then(|(_, d)| d.as_ref());
+        match resolved {
+            Some(Ok((level, line))) => (true, Some(*level), line.clone()),
+            Some(Err(e)) => (false, None, format!("couldn't read this contact's quantum key: {e}")),
+            None => (false, None, "recipient has no quantum key — add one in Contacts".to_string()),
+        }
+    } else {
+        // Self-note (PLAN-graffito-self-pw.md): the ONLY eligible key is an
+        // imported/randomly-generated quantum key living outside the seed
+        // tree (`State.pq_imported`) — NEVER the notebook's seed-derived
+        // receive key, which shares the same leaf secret as the enc key it
+        // would be layered over and so buys nothing (notes-core's `pq.rs`
+        // "Self-note pq layers" doc calls this out explicitly). No
+        // recipient-keyed cache applies here.
+        st.pq_recipient_cache = None;
+        match st.pq_imported.as_ref() {
+            Some(kp) => (
+                true,
+                Some(app_core::pqkeys::from_pq_alg(kp.alg())),
+                "readable only where this imported quantum key is present — losing the key loses \
+                 this note forever, even with your seed."
+                    .to_string(),
+            ),
+            None => (
+                false,
+                None,
+                "import a quantum key first (Settings → Quantum keys) to add this layer".to_string(),
+            ),
+        }
     };
     w.set_pq_mlkem_available(mlkem_available);
     w.set_pq_mlkem_caption(mlkem_caption.into());
@@ -4650,6 +4752,29 @@ fn refresh_compose_pq(
         mlkem: if mlkem_on { mlkem_level } else { None },
     };
     let (quantum_resistant, label) = passphrase::describe(&choice);
+    // A self-note is already quantum-resistant on its own (symmetric,
+    // seed-derived key — no public-key material ever touches the chain),
+    // which is exactly what `describe` reports regardless of these extra
+    // layers; the layers protect against a DIFFERENT threat (seed
+    // compromise, an exported xpub + quantum recovery of the leaf secret —
+    // PLAN-graffito-self-pw.md's "Why"), so surface that here instead of
+    // the generic self-note sentence whenever a layer is actually on.
+    let label = if !directed && (passphrase_on || mlkem_on) {
+        match (passphrase_on, mlkem_on) {
+            (true, true) => "Password + quantum-key layer added — forgetting either the password \
+                             or the quantum key loses this note forever, even with your seed."
+                .to_string(),
+            (true, false) => "Password layer added — forgetting it loses this note forever, even \
+                              with your seed."
+                .to_string(),
+            (false, true) => "Quantum-key layer added — losing the imported key loses this note \
+                              forever, even with your seed."
+                .to_string(),
+            (false, false) => label,
+        }
+    } else {
+        label
+    };
     w.set_pq_quantum_resistant(quantum_resistant);
     w.set_pq_security_label(label.into());
 
@@ -13530,31 +13655,7 @@ pub fn run() {
             // before; the full id is still available verbatim via the
             // "Copy text" button (copies this whole block) and the
             // dedicated "Copy txid" button (`note-txid`, set below).
-            let short_id = &n.note_id[..8.min(n.note_id.len())];
-            let detail = format!(
-                "{}\n\nid: {}…\nkind: {}{}{}\ntxids: {}\nheight: {}\n{}{}",
-                n.text.as_deref().unwrap_or(if n.locked.is_some() {
-                    "(locked — see below to unlock)"
-                } else if watch && n.private {
-                    "(private — the key that reads this note isn't on this device)"
-                } else {
-                    "(not decryptable)"
-                }),
-                short_id,
-                if n.received { "received" } else { "own" },
-                if n.directed { " · directed" } else { "" },
-                if n.private { " · private" } else { " · public" },
-                n.txids.join(", "),
-                n.height.map(|h| h.to_string()).unwrap_or_else(|| "unconfirmed".into()),
-                n.sender.as_deref().map(|a| format!("from: {a}\n")).unwrap_or_default(),
-                // Multi-recipient note: list EVERY recipient (one per line,
-                // output order); the singular field only names the first.
-                if n.recipients.is_empty() {
-                    n.recipient.as_deref().map(|a| format!("to: {a}\n")).unwrap_or_default()
-                } else {
-                    format!("to ({}): {}\n", n.recipients.len(), n.recipients.join("\n    "))
-                },
-            );
+            let detail = format_note_detail(n, watch, None);
             w.set_note_detail(detail.into());
             w.set_note_view_id(n.note_id.clone().into());
             w.set_note_pending(n.status == NoteStatus::Pending && n.raw_hex.is_some());
@@ -13611,19 +13712,75 @@ pub fn run() {
     // ok/err, matching the `cb:` log contract's "no secrets in logs" rule.
     cb!(on_unlock_note, |w, s| {
         // User-initiated tap — the LAUNCH-PATH rule's other sanctioned door
-        // (besides opening the Quantum keys screen) for loading an imported
-        // ML-KEM secret from the Keychain this session. Runs before the
-        // borrows below so it never conflicts with them.
+        // (besides opening the Quantum keys screen, and — since
+        // PLAN-graffito-self-pw.md — the Security panel's own header tap)
+        // for loading an imported ML-KEM secret from the Keychain this
+        // session. Runs before the borrows below so it never conflicts
+        // with them.
         ensure_pq_imported_loaded(&mut s);
         let note_id = w.get_note_view_id().to_string();
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()) else {
             w.set_status("no identity".into());
             return;
         };
-        let secrets = mlkem_secrets_for(s.ident.as_ref().unwrap(), s.pq_imported.as_ref());
+        let identity = identity.clone_fields();
         let password = w.get_note_unlock_passphrase().to_string();
         w.set_note_unlock_busy(true);
-        let identity = identity.clone_fields();
+
+        // A SELF-note's locked body goes through the VIEW-ONLY path
+        // (PLAN-graffito-self-pw.md): `unlock_note`/`unlock_sent` refuse it
+        // outright (`is_self()` discriminates in notes-core), so this check
+        // must happen before picking which store fn to call at all.
+        let is_self = s
+            .store
+            .as_ref()
+            .and_then(|store| store.notes.iter().find(|n| n.note_id == note_id))
+            .and_then(|n| n.locked.as_ref())
+            .map(app_core::notes_core::pq::LockedBody::is_self)
+            .unwrap_or(false);
+
+        if is_self {
+            // View-only: NEVER persisted, and `locked` never clears — every
+            // future open asks again (the whole point of the second
+            // factor). `unlock_note_view` takes `&self`, so nothing here
+            // mutates the store — no `save_store()`, unlike the directed
+            // path below.
+            let mlkem_secret = s.pq_imported.as_ref().map(|kp| kp.secret());
+            let result = match s.store.as_ref() {
+                Some(store) => store.unlock_note_view(
+                    &note_id,
+                    &identity,
+                    mlkem_secret.as_ref(),
+                    Some(password.as_str()),
+                ),
+                None => Err(app_core::Error::Store("no store".into())),
+            };
+            w.set_note_unlock_busy(false);
+            match result {
+                Ok(text) => {
+                    println!("cb: unlock-note ok view-only");
+                    let watch = s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
+                    if let Some(n) =
+                        s.store.as_ref().and_then(|store| store.notes.iter().find(|n| n.note_id == note_id))
+                    {
+                        let detail = format_note_detail(n, watch, Some(text.as_str()));
+                        w.set_note_detail(detail.into());
+                    }
+                    w.set_note_locked(false);
+                    w.set_note_unlock_needs_password(false);
+                    w.set_note_unlock_show_button(false);
+                    w.set_note_unlock_caption("".into());
+                    w.set_note_unlock_passphrase("".into());
+                }
+                Err(e) => {
+                    println!("cb: unlock-note err={e}");
+                    w.set_status(format!("couldn't unlock: {e}").into());
+                }
+            }
+            return;
+        }
+
+        let secrets = mlkem_secrets_for(s.ident.as_ref().unwrap(), s.pq_imported.as_ref());
         let result = match s.store.as_mut() {
             Some(store) => store.unlock_note(&note_id, &identity, &secrets, Some(password.as_str())),
             None => Err(app_core::Error::Store("no store".into())),
@@ -14869,6 +15026,22 @@ pub fn run() {
 
     cb!(on_pq_mlkem_toggled, |w, s, _on: bool| {
         refresh_compose(&w, &mut s);
+    });
+
+    // Security panel opened (Sal 2026-08-22, PLAN-graffito-self-pw.md): the
+    // sanctioned user-initiated door for lazily loading a SELF-note's
+    // imported quantum key this session — the ML-KEM switch itself starts
+    // disabled (`pq-mlkem-available` false) until `State.pq_imported` is
+    // populated, so it can't be the trigger; opening the panel is the
+    // earliest tap available. A no-op on every OTHER repaint path (already
+    // cached, or a directed note that never needs this key at all) —
+    // `ensure_pq_imported_loaded` itself short-circuits once loaded. Never
+    // called on close (LAUNCH-PATH rule: only ever from a deliberate tap).
+    cb!(on_pq_panel_toggled, |w, s, opened: bool| {
+        if opened {
+            ensure_pq_imported_loaded(&mut s);
+            refresh_compose(&w, &mut s);
+        }
     });
 
     // Independent-expand rework (2026-07-18): `source` is now passed
@@ -16140,21 +16313,40 @@ pub fn run() {
             None
         };
         let pq_mlkem = if pq_eligible && w.get_pq_mlkem_enabled() {
-            let net_str = s.network.as_str();
-            let armor = to.as_deref().and_then(|addr| {
-                s.contacts
-                    .iter()
-                    .find(|c| c.address == addr && (c.network == net_str || c.network.is_empty()))
-                    .and_then(|c| c.mlkem_ek.clone())
-            });
-            match armor.as_deref().map(app_core::notes_core::pq::import_public) {
-                Some(Ok(pair)) => Some(pair),
-                _ => {
-                    w.set_status(
-                        "couldn't read this contact's quantum key — try again, or turn off quantum encryption".into(),
-                    );
-                    return;
+            match to.as_deref() {
+                Some(addr) => {
+                    let net_str = s.network.as_str();
+                    let armor = s
+                        .contacts
+                        .iter()
+                        .find(|c| c.address == addr && (c.network == net_str || c.network.is_empty()))
+                        .and_then(|c| c.mlkem_ek.clone());
+                    match armor.as_deref().map(app_core::notes_core::pq::import_public) {
+                        Some(Ok(pair)) => Some(pair),
+                        _ => {
+                            w.set_status(
+                                "couldn't read this contact's quantum key — try again, or turn off quantum encryption".into(),
+                            );
+                            return;
+                        }
+                    }
                 }
+                // Self-note (PLAN-graffito-self-pw.md): the imported quantum
+                // key ONLY — never the notebook's seed-derived receive key
+                // (see `pq_compose_eligible`'s doc). `ensure_pq_imported_
+                // loaded` already ran when the Security panel was opened
+                // (`on_pq_panel_toggled`); Sign is a separate tap that could
+                // race the key being removed since, so re-check here rather
+                // than trusting the toggle blindly.
+                None => match s.pq_imported.as_ref() {
+                    Some(kp) => Some((kp.alg(), kp.ek().to_vec())),
+                    None => {
+                        w.set_status(
+                            "no imported quantum key — import one in Settings, or turn off quantum encryption".into(),
+                        );
+                        return;
+                    }
+                },
             }
         } else {
             None
