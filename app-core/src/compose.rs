@@ -10,11 +10,12 @@ use notes_core::address::address_to_script_pubkey;
 use notes_core::bundle::{
     compose_directed_note_multi_exact, compose_directed_note_multi_with_change,
     compose_directed_note_pq_exact_amount, compose_directed_note_pq_with_change_amount,
-    compose_directed_note_with_change_amount, compose_note_exact, compose_note_with_change, Identity,
+    compose_directed_note_with_change_amount, compose_note_exact, compose_note_pq_exact,
+    compose_note_pq_with_change, compose_note_with_change, Identity,
 };
 use notes_core::keys::generate_aux_rand;
-use notes_core::pq::SealLayers;
-use notes_core::tx::NoteTx;
+use notes_core::pq::{LockedBody, SealLayers};
+use notes_core::tx::{op_return_payload, outpoint_bytes, NoteTx};
 use notes_core::Network;
 use zeroize::Zeroize;
 
@@ -102,19 +103,30 @@ pub struct ComposeRequest<'a> {
     pub now: u64,
     /// Post-quantum: an Argon2id passphrase layer over a directed-private
     /// note (`notes_core::pq::SealLayers::password`), composable with
-    /// `pq_mlkem`. Requires a single-recipient DIRECTED PRIVATE note —
-    /// `compose_note` errors otherwise (mirrors notes-core's own
-    /// `SealLayers`/envelope validity rule: no public/self-note/multi-
-    /// recipient pq notes). `None` = no passphrase layer (the ordinary v1
-    /// path, byte-identical to before this field existed).
+    /// `pq_mlkem`. Requires a PRIVATE note that is either single-recipient
+    /// DIRECTED or a SELF-note (no recipient) — `compose_note` errors
+    /// otherwise (mirrors notes-core's own `SealLayers`/envelope validity
+    /// rule: no public/multi-recipient pq notes). A self-note carrying a
+    /// layer is stored LOCKED from the moment it's signed
+    /// (`record_composed_note` never caches its plaintext) —
+    /// PLAN-graffito-self-pw.md: the password is a genuine second factor
+    /// against seed compromise, so a cached copy would hollow it out.
+    /// `None` = no passphrase layer (the ordinary v1 path, byte-identical
+    /// to before this field existed).
     pub pq_password: Option<String>,
-    /// Post-quantum: an ML-KEM hybrid layer sealed to the recipient's
-    /// encapsulation key — `(alg, ek_bytes)`. The caller resolves `ek`
-    /// (from a `Contact::mlkem_ek` or a freshly imported key) before
-    /// calling; this module never looks it up itself. Same single-
-    /// recipient directed-PRIVATE requirement as `pq_password`, and the
-    /// two compose together (hybrid, never exclusive). `None` = no ML-KEM
-    /// layer.
+    /// Post-quantum: an ML-KEM hybrid layer. For a DIRECTED note, sealed to
+    /// the recipient's encapsulation key — `(alg, ek_bytes)`; the caller
+    /// resolves `ek` (from a `Contact::mlkem_ek` or a freshly imported key)
+    /// before calling. For a SELF-note, the caller MUST pass an imported/
+    /// randomly-generated quantum key living outside the seed tree — NEVER
+    /// the notebook's own seed-derived receive key
+    /// (`pqkeys::derive_keypair`/`mlkem_keypair_from_leaf`), which shares
+    /// the same leaf secret as the enc key it would be layered over and so
+    /// buys nothing (notes-core's `pq.rs` "Self-note pq layers" doc calls
+    /// this out explicitly — this module cannot enforce it, since it never
+    /// sees which key the caller resolved). Same single-recipient-directed-
+    /// or-self requirement as `pq_password`, and the two compose together
+    /// (hybrid, never exclusive). `None` = no ML-KEM layer.
     pub pq_mlkem: Option<(notes_core::pq::MlKemAlg, Vec<u8>)>,
 }
 
@@ -220,15 +232,15 @@ pub fn compose_note(
     // pq.rs): additive over the ordinary compose path, so this branches out
     // BEFORE the existing self/multi dispatch below rather than threading
     // pq state through it. Structural requirement mirrors notes-core's own
-    // `SealLayers`/envelope validity rule: a pq note is always directed,
-    // private, and single-recipient — no public/self-note/multi-recipient
-    // pq notes exist. `req.private` false, a self-note (`recipients`
-    // empty), or a multi-recipient pick (`recipients.len() > 1`) with a pq
-    // layer set is refused loudly rather than silently dropping the layer.
+    // `SealLayers`/envelope validity rule: a pq note is always private, and
+    // either single-recipient directed OR a self-note (no recipient) — no
+    // public/multi-recipient pq notes exist. `req.private` false, or a
+    // multi-recipient pick (`recipients.len() > 1`) with a pq layer set is
+    // refused loudly rather than silently dropping the layer.
     if req.pq_password.is_some() || req.pq_mlkem.is_some() {
-        if !req.private || recipients.len() != 1 {
+        if !req.private || recipients.len() > 1 {
             return Err(Error::Store(
-                "post-quantum layers require a single-recipient directed private note".into(),
+                "post-quantum layers require a single-recipient directed or self private note".into(),
             ));
         }
         let layers = SealLayers {
@@ -236,21 +248,45 @@ pub fn compose_note(
             password: req.pq_password.as_deref(),
         };
         let pq_flags = layers.flags();
-        let (recipient, gift) = &recipients[0];
+        if let Some((recipient, gift)) = recipients.first() {
+            let tx = match &selected {
+                Some(ins) => compose_directed_note_pq_exact_amount(
+                    identity, ins, req.text, recipient, *gift, layers,
+                    change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
+                ),
+                None => compose_directed_note_pq_with_change_amount(
+                    identity, &utxos, req.text, recipient, *gift, layers,
+                    change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
+                ),
+            }?;
+            return Ok(ComposedNote {
+                note_id: tx.txid_hex.clone(),
+                recipient_address,
+                recipients: recipient_addresses,
+                change_is_self: change_spk.is_none(),
+                pq_flags,
+                tx,
+            });
+        }
+        // Self-note pq compose (PLAN-graffito-self-pw.md): notebook-funded
+        // only (auto-select or coin control, same two shapes as an ordinary
+        // self-note) — mixed/spending-funded and watch-only compose never
+        // reach this function with pq layers set (see `ComposeRequest::
+        // pq_password`'s doc), so no further gating is needed here.
         let tx = match &selected {
-            Some(ins) => compose_directed_note_pq_exact_amount(
-                identity, ins, req.text, recipient, *gift, layers,
-                change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
+            Some(ins) => compose_note_pq_exact(
+                identity, ins, req.text, layers, change_spk,
+                store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
             ),
-            None => compose_directed_note_pq_with_change_amount(
-                identity, &utxos, req.text, recipient, *gift, layers,
-                change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
+            None => compose_note_pq_with_change(
+                identity, &utxos, req.text, layers, change_spk,
+                store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
             ),
         }?;
         return Ok(ComposedNote {
             note_id: tx.txid_hex.clone(),
-            recipient_address,
-            recipients: recipient_addresses,
+            recipient_address: None,
+            recipients: Vec::new(),
             change_is_self: change_spk.is_none(),
             pq_flags,
             tx,
@@ -335,10 +371,42 @@ pub fn record_composed_note(
         pending_spend: false,
     });
 
+    // Self-note pq layers (PLAN-graffito-self-pw.md): stored LOCKED from
+    // the moment it's signed, even though WE composed it and hold the
+    // plaintext right here — a cached copy would hollow out the password/
+    // quantum-key second factor the whole feature exists for. Reconstruct
+    // exactly what a scanner would recover: the pq body bytes (decoded from
+    // the built tx's own OP_RETURN payloads) and the AAD outpoint (the tx's
+    // first input) — never the plaintext. Directed pq notes are UNCHANGED:
+    // the sender already holds the plaintext with no decryption needed, so
+    // they keep caching `text` and `locked: None`, exactly like before this
+    // feature.
+    let is_self_pq = composed.pq_flags != 0 && composed.recipient_address.is_none();
+    let (stored_text, locked) = if is_self_pq {
+        let payloads: Vec<Vec<u8>> = tx
+            .tx
+            .outputs
+            .iter()
+            .filter(|o| o.script_pubkey.first() == Some(&0x6a)) // OP_RETURN
+            .filter_map(|o| op_return_payload(&o.script_pubkey).map(<[u8]>::to_vec))
+            .collect();
+        let decoded = notes_core::envelope::decode_note(&payloads)
+            .expect("we just built this tx's own PNTE header ourselves");
+        let outpoint = tx
+            .tx
+            .inputs
+            .first()
+            .map(outpoint_bytes)
+            .expect("a signed note tx always has at least one input");
+        (None, Some(LockedBody::new_self(composed.pq_flags, decoded.body, outpoint)))
+    } else {
+        (Some(text.to_string()), None)
+    };
+
     let record = NoteRecord {
         note_id: composed.note_id.clone(),
         status: NoteStatus::Pending,
-        text: Some(text.to_string()),
+        text: stored_text,
         private,
         directed: composed.recipient_address.is_some(),
         received: false,
@@ -358,11 +426,12 @@ pub fn record_composed_note(
         funded_by: None,
         dropped: false,
         pq_flags: composed.pq_flags,
-        // We composed this note ourselves — the plaintext is right there in
-        // `text`, so there is nothing to unlock later. `locked` is only
-        // ever populated for a RECEIVED pq note the scanner couldn't
-        // decrypt yet (see `store::extract_and_apply_pq`/`unlock_note`).
-        locked: None,
+        // A directed pq note we composed ourselves has nothing to unlock
+        // later (see above); a self-pq note is locked from the start.
+        // `locked` is otherwise only ever populated for a RECEIVED pq note
+        // the scanner couldn't decrypt yet (see `Store::apply_bundle`/
+        // `unlock_note`).
+        locked,
     };
     store.record_signed(record, change_utxo);
 
