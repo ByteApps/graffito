@@ -383,6 +383,15 @@ struct State {
     /// (`MlKemKeypair`'s own `Drop`); `None` before the first load/import
     /// this session, or after "Remove imported key".
     pq_imported: Option<app_core::notes_core::pq::MlKemKeypair>,
+    /// "My quantum key" replace guard (PLAN-graffito-quantum-key.md):
+    /// Generate/Import over an EXISTING `pq_imported` key routes through a
+    /// confirm modal instead of acting immediately — this remembers WHICH
+    /// action to actually run once the user confirms
+    /// (`on_pq_replace_confirm`), and is cleared on confirm or cancel. The
+    /// pending action's own input (the generate level/extra fields, or the
+    /// import text) stays live in the Slint UI properties across the round
+    /// trip — nothing sensitive is stashed here.
+    pq_pending_replace: Option<PqReplaceKind>,
     /// Coin control: selected inputs (display-txid, vout) for the compose
     /// in progress; `coins_overridden` = the user has touched the set (so
     /// stop auto-suggesting).
@@ -1404,6 +1413,7 @@ impl State {
             pq_recipient_cache: None,
             pq_level: app_core::passphrase::MlKemLevel::DEFAULT,
             pq_imported: None,
+            pq_pending_replace: None,
             selected_coins: Vec::new(),
             coins_overridden: false,
             consolidate_coins: false,
@@ -4186,6 +4196,14 @@ fn clear_reveal(w: &AppWindow, s: &mut State) {
     s.reveal_formats = None;
 }
 
+/// Which action is behind the "My quantum key" replace-guard confirm
+/// (`State.pq_pending_replace`) — see that field's doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PqReplaceKind {
+    Generate,
+    Import,
+}
+
 /// `pq-key-level` (Slint UI string) <-> `passphrase::MlKemLevel` — the
 /// UI only ever needs the short "512"/"768"/"1024" form; config.json and
 /// every app-core call keep using the real enum.
@@ -4244,6 +4262,91 @@ fn update_pq_keys_screen(w: &AppWindow, st: &State) {
         )
     });
     w.set_pq_import_fp(import_line.unwrap_or_default().into());
+    // "My quantum key"'s public armor never needs a warning — show its QR
+    // whenever a key is present so it's ready to share/scan immediately,
+    // no separate reveal step (unlike the private half below screen 29's
+    // export-warning modal).
+    let public_qr = st
+        .pq_imported
+        .as_ref()
+        .and_then(|kp| qr::qr_image(&app_core::notes_core::pq::export_public(kp.alg(), kp.ek())));
+    w.set_pq_imported_public_qr(public_qr.unwrap_or_default());
+}
+
+/// Generate a fresh "My quantum key" — deliberately NOT seed-derived
+/// (`app_core::pqkeys::generate_native_private`, PLAN-graffito-quantum-key.md)
+/// — from the level/extra-entropy fields on screen 29, store it into the
+/// SAME `pq-imported` Keychain slot the import flow writes, and update
+/// in-memory state. Called directly when no key exists yet, or from
+/// `on_pq_replace_confirm` once the replace guard is confirmed — never
+/// called while a key exists without that confirm having fired first.
+fn do_pq_generate(w: &AppWindow, s: &mut State) {
+    let level = pq_level_from_str(w.get_pq_gen_level().as_str())
+        .unwrap_or(app_core::passphrase::MlKemLevel::DEFAULT);
+    let extra = w.get_pq_gen_extra().to_string();
+    w.set_pq_import_error("".into());
+    let (kp, armor) = match app_core::pqkeys::generate_native_private(level, extra.as_bytes()) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("cb: pq-key-generate err={e}");
+            w.set_pq_import_error(e.to_string().into());
+            return;
+        }
+    };
+    match keychain::store_secret_protected(PQ_IMPORTED_ACCOUNT, &armor, false) {
+        Ok(()) => {
+            let fp = app_core::pqkeys::fingerprint(&kp);
+            println!("cb: pq-key-generate ok level={} fp={fp}", pq_level_str(level));
+            w.set_pq_gen_extra("".into());
+            w.set_pq_import_source("Generated on this device".into());
+            s.pq_imported = Some(kp);
+            update_pq_keys_screen(w, s);
+        }
+        Err(e) => {
+            println!("cb: pq-key-generate err={e}");
+            w.set_pq_import_error(format!("couldn't save this key: {e}").into());
+        }
+    }
+}
+
+/// Import an external "My quantum key" secret (OpenPGP or Graffito-native
+/// armor) from screen 29's paste/file text field into the SAME
+/// `pq-imported` Keychain slot [`do_pq_generate`] writes. Same calling
+/// convention: direct when no key exists yet, or from
+/// `on_pq_replace_confirm` after the replace guard fires.
+fn do_pq_import(w: &AppWindow, s: &mut State) {
+    let text = w.get_pq_import_text().to_string();
+    w.set_pq_import_error("".into());
+    let imported = match app_core::pgp_import::parse_mlkem_key(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("cb: pq-key-import err={e}");
+            w.set_pq_import_error(e.to_string().into());
+            return;
+        }
+    };
+    let (kp, armor) = match app_core::pqkeys::import_to_native_private(&imported) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("cb: pq-key-import err={e}");
+            w.set_pq_import_error(e.into());
+            return;
+        }
+    };
+    match keychain::store_secret_protected(PQ_IMPORTED_ACCOUNT, &armor, false) {
+        Ok(()) => {
+            let fp = app_core::pqkeys::fingerprint(&kp);
+            println!("cb: pq-key-import ok fp={fp}");
+            w.set_pq_import_text("".into());
+            w.set_pq_import_source(pq_import_source_label(&imported.source).into());
+            s.pq_imported = Some(kp);
+            update_pq_keys_screen(w, s);
+        }
+        Err(e) => {
+            println!("cb: pq-key-import err={e}");
+            w.set_pq_import_error(format!("couldn't save this key: {e}").into());
+        }
+    }
 }
 
 /// The active account's notebook picker rows for the Private-keys hex/WIF
@@ -12618,6 +12721,7 @@ pub fn run() {
         pq_recipient_cache: None,
         pq_level,
         pq_imported: None,
+        pq_pending_replace: None,
         selected_coins: Vec::new(),
         coins_overridden: false,
         consolidate_coins: false,
@@ -17978,6 +18082,13 @@ pub fn run() {
         w.set_pq_import_error("".into());
         w.set_pq_import_source("".into());
         w.set_pq_show_backup_confirm(false);
+        w.set_pq_gen_level("768".into());
+        w.set_pq_gen_extra("".into());
+        w.set_pq_show_replace_confirm(false);
+        w.set_pq_show_export_private_confirm(false);
+        w.set_pq_imported_private_value("".into());
+        w.set_pq_imported_private_qr(slint::Image::default());
+        s.pq_pending_replace = None;
         update_pq_keys_screen(&w, &s);
         w.set_screen(29);
     });
@@ -18062,39 +18173,42 @@ pub fn run() {
         }
     });
 
-    cb!(on_pq_import_submit, |w, s| {
-        let text = w.get_pq_import_text().to_string();
-        w.set_pq_import_error("".into());
-        let imported = match app_core::pgp_import::parse_mlkem_key(&text) {
-            Ok(v) => v,
-            Err(e) => {
-                println!("cb: pq-key-import err={e}");
-                w.set_pq_import_error(e.to_string().into());
-                return;
-            }
-        };
-        let (kp, armor) = match app_core::pqkeys::import_to_native_private(&imported) {
-            Ok(v) => v,
-            Err(e) => {
-                println!("cb: pq-key-import err={e}");
-                w.set_pq_import_error(e.into());
-                return;
-            }
-        };
-        match keychain::store_secret_protected(PQ_IMPORTED_ACCOUNT, &armor, false) {
-            Ok(()) => {
-                let fp = app_core::pqkeys::fingerprint(&kp);
-                println!("cb: pq-key-import ok fp={fp}");
-                w.set_pq_import_text("".into());
-                w.set_pq_import_source(pq_import_source_label(&imported.source).into());
-                s.pq_imported = Some(kp);
-                update_pq_keys_screen(&w, &s);
-            }
-            Err(e) => {
-                println!("cb: pq-key-import err={e}");
-                w.set_pq_import_error(format!("couldn't save this key: {e}").into());
-            }
+    // Generate/Import both route through the REPLACE GUARD when a "My
+    // quantum key" is already present (PLAN-graffito-quantum-key.md — never
+    // silently overwrite): the confirm modal opens instead of acting, and
+    // `on_pq_replace_confirm` runs whichever action was pending. The
+    // pending action's own input (gen level/extra, or import text) is left
+    // untouched in the Slint properties across the round trip.
+    cb!(on_pq_generate, |w, s| {
+        if s.pq_imported.is_some() {
+            s.pq_pending_replace = Some(PqReplaceKind::Generate);
+            w.set_pq_show_replace_confirm(true);
+            return;
         }
+        do_pq_generate(&w, &mut s);
+    });
+
+    cb!(on_pq_import_submit, |w, s| {
+        if s.pq_imported.is_some() {
+            s.pq_pending_replace = Some(PqReplaceKind::Import);
+            w.set_pq_show_replace_confirm(true);
+            return;
+        }
+        do_pq_import(&w, &mut s);
+    });
+
+    cb!(on_pq_replace_confirm, |w, s| {
+        w.set_pq_show_replace_confirm(false);
+        match s.pq_pending_replace.take() {
+            Some(PqReplaceKind::Generate) => do_pq_generate(&w, &mut s),
+            Some(PqReplaceKind::Import) => do_pq_import(&w, &mut s),
+            None => {}
+        }
+    });
+
+    cb!(on_pq_replace_cancel, |w, s| {
+        s.pq_pending_replace = None;
+        w.set_pq_show_replace_confirm(false);
     });
 
     cb!(on_pq_import_remove, |w, s| {
@@ -18104,6 +18218,45 @@ pub fn run() {
         w.set_pq_import_error("".into());
         println!("cb: pq-key-remove");
         update_pq_keys_screen(&w, &s);
+    });
+
+    // ---- "My quantum key" export (item 3: public is a plain share, the
+    // private armor sits behind an explicit reveal warning and copies via
+    // the concealed/expiring clipboard, never the plain one) ----
+
+    cb!(on_pq_imported_copy_public, |w, s| {
+        let _ = &mut s;
+        let Some(kp) = s.pq_imported.as_ref() else { return };
+        let armor = app_core::notes_core::pq::export_public(kp.alg(), kp.ek());
+        let ok = platform::set_clipboard_text(&armor);
+        println!("cb: pq-key-export public len={}", armor.len());
+        show_toast(&w, if ok { "Copied" } else { "Copy failed" });
+    });
+
+    cb!(on_pq_imported_reveal_private, |w, s| {
+        let _ = &mut s;
+        let Some(kp) = s.pq_imported.as_ref() else { return };
+        let armor = app_core::pqkeys::export_private_armor(kp);
+        w.set_pq_imported_private_qr(qr::qr_image(&armor).unwrap_or_default());
+        w.set_pq_imported_private_value(armor.into());
+        println!("cb: pq-key-export private-reveal");
+    });
+
+    cb!(on_pq_imported_copy_private, |w, s| {
+        let _ = &mut s;
+        let armor = w.get_pq_imported_private_value().to_string();
+        if armor.is_empty() {
+            return;
+        }
+        let ok = platform::set_clipboard_secret(&armor);
+        println!("cb: pq-key-export private len={}", armor.len());
+        show_toast(&w, if ok { "Copied" } else { "Copy failed" });
+    });
+
+    cb!(on_pq_imported_hide_private, |w, s| {
+        let _ = &mut s;
+        w.set_pq_imported_private_value("".into());
+        w.set_pq_imported_private_qr(slint::Image::default());
     });
 
     cb!(on_copy_value, |w, s, value: SharedString| {

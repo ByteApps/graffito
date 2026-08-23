@@ -1988,10 +1988,13 @@ export component AppWindow inherits Window {
     in-out property <bool> pq-show-backup-confirm;
     callback pq-copy-private();
     callback pq-save-private();
-    // Import a key: paste/file -> parse -> keychain-store. `pq-import-fp`
-    // is the CURRENT imported key's display line ("ML-KEM-768 · fp"),
-    // empty when nothing is imported; `pq-import-source` names where it
-    // came from (only set right after a successful import this session).
+    // "My quantum key" — a separate, NON-seed-derived ML-KEM keypair held
+    // in the keychain (`pq-imported` account) — generate OR import,
+    // shared lifecycle (PLAN-graffito-quantum-key.md). `pq-import-fp` is
+    // the CURRENT key's display line ("ML-KEM-768 · fp"), empty when none
+    // is present; `pq-import-source` names where it came from ("Generated
+    // on this device" or an import source, only set right after a
+    // successful generate/import this session).
     in-out property <string> pq-import-text;
     callback pq-import-paste();
     callback pq-import-file();
@@ -2000,6 +2003,29 @@ export component AppWindow inherits Window {
     in property <string> pq-import-error;
     in property <string> pq-import-fp;
     in property <string> pq-import-source;
+    // Generate a fresh key: its own level picker (independent of the
+    // notebook receive-key picker above) + optional extra entropy, mixed
+    // WITH the device CSPRNG, never in place of it.
+    in-out property <string> pq-gen-level: "768";
+    in-out property <string> pq-gen-extra;
+    callback pq-generate();
+    // Replace guard: Generate/Import over an EXISTING "My quantum key"
+    // routes through this confirm instead of acting immediately — Rust
+    // tracks which action is pending and `pq-replace-confirm` performs it.
+    in-out property <bool> pq-show-replace-confirm;
+    callback pq-replace-confirm();
+    callback pq-replace-cancel();
+    // Export: public half is a plain QR/copy (share freely); the private
+    // seed armor sits behind its own reveal warning, QR'd, and copies via
+    // the CONCEALED/expiring clipboard (never the plain one).
+    in property <image> pq-imported-public-qr;
+    callback pq-imported-copy-public();
+    in-out property <bool> pq-show-export-private-confirm;
+    in property <string> pq-imported-private-value;
+    in property <image> pq-imported-private-qr;
+    callback pq-imported-reveal-private();
+    callback pq-imported-copy-private();
+    callback pq-imported-hide-private();
     in property <[CoinItem]> coins;
     in property <string> coins-summary;
     // Settings Coins card only: aggregates notebook + spending pools (the
@@ -2419,6 +2445,11 @@ export component AppWindow inherits Window {
         }
         if (root.screen == 29) {
             root.pq-show-backup-confirm = false;
+            root.pq-show-replace-confirm = false;
+            if (root.pq-show-export-private-confirm) {
+                root.pq-imported-hide-private();
+            }
+            root.pq-show-export-private-confirm = false;
             root.screen = 8;
             return true;
         }
@@ -5919,8 +5950,78 @@ export component AppWindow inherits Window {
                     GhostButton { text: "Backup private key…"; clicked => { root.pq-show-backup-confirm = true; } }
                 }
                 Rectangle { height: 1px; background: Pal.line; }
+                Text { text: "My quantum key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                Caption { text: "A personal ML-KEM key that does NOT come from your seed phrase — generate one here, or import one (a Graffito private-key export, or an OpenPGP key with an RFC 9980 ML-KEM-768+X25519 component). Self-notes sealed with quantum protection use THIS key, never the seed-derived one above."; }
+
+                // ---- Current key: fingerprint + share/export/remove ----
+                if root.pq-import-fp != "": VerticalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        border-radius: 10px;
+                        background: Pal.card;
+                        border-width: 1px;
+                        border-color: Pal.line;
+                        height: myk-col.preferred-height;
+                        myk-col := VerticalLayout {
+                            padding: 12px;
+                            spacing: 4px;
+                            Caption { text: root.pq-import-fp; color: Pal.good; }
+                            if root.pq-import-source != "": Caption { text: root.pq-import-source; color: Pal.muted; wrap: word-wrap; }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        GhostButton { text: "Share public key"; clicked => { root.pq-imported-copy-public(); } }
+                        GhostButton {
+                            text: "Export private key…";
+                            clicked => { root.pq-show-export-private-confirm = true; }
+                        }
+                    }
+                    if root.pq-imported-public-qr.width > 0: HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 160px;
+                            height: 160px;
+                            QrArea {
+                                img: root.pq-imported-public-qr;
+                                qr-size: 160px;
+                            }
+                            TouchArea {
+                                clicked => {
+                                    root.qr-zoom-image = root.pq-imported-public-qr;
+                                    root.qr-zoom-open = true;
+                                }
+                            }
+                        }
+                    }
+                    Rectangle { height: 1px; background: Pal.line; }
+                    Caption { text: "Removing this key permanently loses access to any notes sealed to it, unless you exported it first."; color: Pal.warn; wrap: word-wrap; }
+                    GhostButton { text: "Remove my quantum key"; clicked => { root.pq-import-remove(); } }
+                    Rectangle { height: 1px; background: Pal.line; }
+                }
+
+                // ---- Generate a fresh key ----
+                Text { text: "Generate a new key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    SelectPill { text: "ML-KEM-512"; active: root.pq-gen-level == "512"; clicked => { root.pq-gen-level = "512"; } }
+                    SelectPill { text: "ML-KEM-768"; active: root.pq-gen-level == "768"; clicked => { root.pq-gen-level = "768"; } }
+                    SelectPill { text: "ML-KEM-1024"; active: root.pq-gen-level == "1024"; clicked => { root.pq-gen-level = "1024"; } }
+                }
+                Caption { text: "768 is the standard recommendation for general use."; }
+                Text { text: "Extra entropy (optional)"; font-size: 12px; font-weight: 600; color: Pal.text; }
+                Caption { text: "Type anything — a passphrase, dice rolls. Mixed WITH the system's randomness, it can only add strength, never replace it."; }
+                EditField {
+                    placeholder-text: "e.g. a passphrase or dice rolls";
+                    text <=> root.pq-gen-extra;
+                }
+                GhostButton { text: "Generate"; clicked => { root.pq-generate(); } }
+
+                Rectangle { height: 1px; background: Pal.line; }
+
+                // ---- Import an existing key ----
                 Text { text: "Import a key"; font-size: 13px; font-weight: 700; color: Pal.text; }
-                Caption { text: "Import someone else's ML-KEM SECRET key so this device can read notes sealed to it — a Graffito private-key export, or an OpenPGP key with an RFC 9980 ML-KEM-768+X25519 component."; }
+                Caption { text: "Import someone else's — or your own already-exported — ML-KEM SECRET key so this device can use it: a Graffito private-key export, or an OpenPGP key with an RFC 9980 ML-KEM-768+X25519 component."; }
                 EditArea {
                     height: 90px;
                     text <=> root.pq-import-text;
@@ -5932,12 +6033,6 @@ export component AppWindow inherits Window {
                     GhostButton { text: "Import"; clicked => { root.pq-import-submit(); } }
                 }
                 if root.pq-import-error != "": Caption { text: root.pq-import-error; color: Pal.bad; wrap: word-wrap; }
-                if root.pq-import-fp != "": VerticalLayout {
-                    spacing: 4px;
-                    Caption { text: "Imported: " + root.pq-import-fp; color: Pal.good; }
-                    if root.pq-import-source != "": Caption { text: root.pq-import-source; color: Pal.muted; wrap: word-wrap; }
-                    GhostButton { text: "Remove imported key"; clicked => { root.pq-import-remove(); } }
-                }
             }
         }
         Caption { text: root.status; color: Pal.bad; }
@@ -6622,6 +6717,131 @@ export component AppWindow inherits Window {
                     GhostButton { text: "Cancel"; clicked => { root.pq-show-backup-confirm = false; } }
                     GhostButton { text: "Copy"; clicked => { root.pq-copy-private(); } }
                     if root.desktop-platform: GhostButton { text: "Save…"; clicked => { root.pq-save-private(); } }
+                }
+            }
+        }
+    }
+
+    // ---- Replace guard: Generate/Import over an existing "My quantum
+    // key" (screen 29) ----
+    if root.pq-show-replace-confirm: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { root.pq-replace-cancel(); } }
+        Rectangle {
+            width: 400px;
+            height: pqrepl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { clicked => { back-scope.focus(); } }
+            pqrepl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Replace your quantum key?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Caption {
+                    text: "Notes sealed to your CURRENT key become permanently unreadable unless you exported it first. This cannot be undone.";
+                    color: Pal.warn;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { root.pq-replace-cancel(); } }
+                    GhostButton { text: "Replace"; clicked => { root.pq-replace-confirm(); } }
+                }
+            }
+        }
+    }
+
+    // ---- Export "My quantum key" private armor (screen 29): a warning
+    // step, then the QR/copy reveal — never shown without the warning
+    // first. Copy uses the CONCEALED/expiring clipboard (never the plain
+    // one) — same path spending material uses elsewhere.
+    if root.pq-show-export-private-confirm: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea {
+            clicked => {
+                root.pq-imported-hide-private();
+                root.pq-show-export-private-confirm = false;
+            }
+        }
+        Rectangle {
+            width: 400px;
+            height: pqexp.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 180px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { clicked => { back-scope.focus(); } }
+            pqexp := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                if root.pq-imported-private-value == "": VerticalLayout {
+                    spacing: 12px;
+                    Text {
+                        text: "Export your quantum private key?";
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: Pal.text;
+                    }
+                    Caption {
+                        text: "Anyone who gets this can read every quantum-sealed note you have. Use this to back it up, or to mirror the key onto another device — the Prime app imports this same armor.";
+                        color: Pal.warn;
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        GhostButton { text: "Cancel"; clicked => { root.pq-show-export-private-confirm = false; } }
+                        GhostButton { text: "Reveal"; clicked => { root.pq-imported-reveal-private(); } }
+                    }
+                }
+                if root.pq-imported-private-value != "": VerticalLayout {
+                    spacing: 12px;
+                    Text {
+                        text: "Your quantum private key";
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: Pal.text;
+                    }
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 176px;
+                            height: 176px;
+                            QrArea {
+                                img: root.pq-imported-private-qr;
+                                qr-size: 176px;
+                            }
+                            TouchArea {
+                                clicked => {
+                                    root.qr-zoom-image = root.pq-imported-private-qr;
+                                    root.qr-zoom-open = true;
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        GhostButton { text: "Copy"; clicked => { root.pq-imported-copy-private(); } }
+                        GhostButton {
+                            text: "Done";
+                            clicked => {
+                                root.pq-imported-hide-private();
+                                root.pq-show-export-private-confirm = false;
+                            }
+                        }
+                    }
                 }
             }
         }
