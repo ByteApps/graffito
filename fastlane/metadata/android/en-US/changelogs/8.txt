@@ -1,0 +1,1 @@
+New: My quantum key — generate or import a personal post-quantum key (with optional extra entropy you type or roll yourself) to lock personal notes to this key in addition to a password. Includes export QRs for backup and safety guards against accidentally replacing a key in use. Funds and seeds are unaffected.
