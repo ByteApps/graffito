@@ -709,6 +709,9 @@ component PrimaryButton inherits Rectangle {
     height: 46px;
     border-radius: 10px;
     background: ta.has-hover ? root.tint-hover : root.tint;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
     ta := TouchArea { clicked => { root.clicked(); } }
     Text {
         width: parent.width;
@@ -1043,6 +1046,11 @@ component SelectPill inherits Rectangle {
     border-color: root.active ? Pal.accent : Pal.line;
     background: root.active ? Pal.accent : (ta.has-hover ? Pal.card-hover : transparent);
     width: t.preferred-width + 24px;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.active;
+    accessible-action-default => { root.clicked(); }
     ta := TouchArea { clicked => { root.clicked(); } }
     t := Text {
         width: parent.width;
