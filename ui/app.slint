@@ -730,6 +730,12 @@ component GhostButton inherits Rectangle {
     border-width: 1px;
     border-color: Pal.line;
     background: ta.has-hover ? Pal.card-hover : transparent;
+    // Accessibility (VoiceOver/TalkBack) AND in-process UI-test findability
+    // (i-slint-backend-testing ElementHandle::find_by_accessible_label) —
+    // one edit here covers every GhostButton instance.
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
     ta := TouchArea { clicked => { root.clicked(); } }
     Text {
         width: parent.width;
