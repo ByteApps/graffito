@@ -18077,11 +18077,6 @@ pub fn run() {
         // User-initiated — the LAUNCH-PATH rule's other sanctioned door for
         // loading an imported ML-KEM secret from the Keychain this session
         // (a no-op once already cached).
-        // Log-contract line (graffito-app-selfpq.sh): the suite's
-        // Settings→here navigation retries keyed on this landing signal —
-        // a scroll+tap on the scrolled Settings screen intermittently
-        // doesn't register, and this screen otherwise logs nothing on open.
-        println!("cb: pq-keys open");
         ensure_pq_imported_loaded(&mut s);
         w.set_pq_import_text("".into());
         w.set_pq_import_error("".into());
@@ -18096,6 +18091,11 @@ pub fn run() {
         s.pq_pending_replace = None;
         update_pq_keys_screen(&w, &s);
         w.set_screen(29);
+        // Log-contract landing signal (graffito-app-selfpq.sh) — emitted
+        // LAST, after ensure_pq_imported_loaded (which blocks on a
+        // SecurityAgent keychain prompt on a freshly-resigned debug build)
+        // and set_screen, so it fires only once the screen is truly shown.
+        println!("cb: pq-keys open");
     });
 
     cb!(on_pq_set_level, |w, s, level: SharedString| {
