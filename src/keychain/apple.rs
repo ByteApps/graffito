@@ -20,6 +20,23 @@ use security_framework::passwords::{
 use security_framework_sys::access_control::{
     kSecAccessControlUserPresence, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
 };
+// In-memory keychain override for tests / automation (runtime-gated on
+// GRAFFITO_KEYCHAIN_MEMORY=1). The resigned-debug binary's shifting code
+// identity makes real login-keychain access raise a SecurityAgent password
+// prompt (see the graffito-mac-ui-key-window memory), and a `cargo test`
+// process can't touch the production keychain safely anyway. This gives the
+// in-process UI harness and any keychain-touching test a hermetic store.
+// NEVER enabled in production — the env var is set only by test harnesses.
+use std::collections::HashMap as StdHashMap;
+use std::sync::{LazyLock, Mutex};
+
+static MEM_KEYCHAIN: LazyLock<Mutex<StdHashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(StdHashMap::new()));
+
+fn mem_keychain_enabled() -> bool {
+    std::env::var("GRAFFITO_KEYCHAIN_MEMORY").as_deref() == Ok("1")
+}
+
 use security_framework_sys::item::{
     kSecAttrAccessControl, kSecAttrAccount, kSecAttrService, kSecClass,
     kSecClassGenericPassword, kSecReturnAttributes, kSecReturnData,
@@ -333,6 +350,9 @@ fn probe_item(account: &str, data_protection: bool) -> i32 {
 /// Also true when only a staging copy survives an interrupted write — that
 /// key is restorable too, and `load_secret_protected` adopts it.
 pub fn identity_exists(account: &str) -> bool {
+    if mem_keychain_enabled() {
+        return MEM_KEYCHAIN.lock().unwrap().contains_key(account);
+    }
     item_exists(account) || item_exists(&staging_account(account))
 }
 
@@ -363,6 +383,10 @@ pub fn identity_exists(account: &str) -> bool {
 /// and another device adopting the staging copy is harmless — it is the
 /// same secret under a different name.
 pub fn store_secret_protected(account: &str, secret: &str, synced: bool) -> Result<(), String> {
+    if mem_keychain_enabled() {
+        MEM_KEYCHAIN.lock().unwrap().insert(account.to_string(), secret.to_string());
+        return Ok(());
+    }
     let staging = staging_account(account);
     // Debris from an earlier interrupted write whose primary was since
     // restored — the live item wins, so clear the way.
@@ -551,6 +575,9 @@ fn read_account(account: &str, prompt: &str) -> Result<Option<String>, String> {
 }
 
 pub fn load_secret_protected(account: &str, prompt: &str) -> Result<Option<String>, String> {
+    if mem_keychain_enabled() {
+        return Ok(MEM_KEYCHAIN.lock().unwrap().get(account).cloned());
+    }
     if let Some(secret) = read_account(account, prompt)? {
         return Ok(Some(secret));
     }
@@ -649,6 +676,10 @@ fn purge_account(account: &str) -> Result<(), String> {
 /// sweep: without it, "Switch identity" would leave the previous seed
 /// sitting in the keychain for the next load to helpfully recover.
 pub fn delete_secret(account: &str) -> Result<(), String> {
+    if mem_keychain_enabled() {
+        MEM_KEYCHAIN.lock().unwrap().remove(account);
+        return Ok(());
+    }
     let live = purge_account(account);
     let staged = purge_account(&staging_account(account));
     // No key left, so "your key isn't protected" would be a lie. The next
