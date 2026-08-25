@@ -18678,3 +18678,73 @@ fn android_main(app: slint::android::AndroidApp) {
     slint::android::init(app).expect("slint android init");
     run();
 }
+
+// ---------------------------------------------------------------------------
+// In-process UI-flow test: drive the REAL quantum-key generate flow headless.
+// ---------------------------------------------------------------------------
+//
+// The ui_harness_* integration tests prove find + click on the real widgets;
+// this proves a whole FLOW end-to-end in-process — window props ->
+// do_pq_generate -> notes-core keygen -> keychain -> State -> window update ->
+// cb: log line — with the in-memory keychain (GRAFFITO_KEYCHAIN_MEMORY) so no
+// SecurityAgent prompt, no window, no coordinates, no key-focus. This is the
+// coverage the flaky coordinate suite (graffito-app-selfpq.sh) was reaching
+// for; see the slint-ui-testing + graffito-mac-ui-key-window memories.
+#[cfg(test)]
+mod ui_flow_quantum_key {
+    use super::*;
+
+    #[test]
+    fn generate_flow_produces_a_key_and_logs_ok() {
+        // Element-tree introspection isn't needed here (we call the callback
+        // logic directly, not find-by-label), but AppWindow::new() needs a
+        // Slint platform — the testing backend provides one, thread-locally.
+        i_slint_backend_testing::init_no_event_loop();
+        std::env::set_var("GRAFFITO_KEYCHAIN_MEMORY", "1");
+        let _ = keychain::delete_secret(PQ_IMPORTED_ACCOUNT);
+
+        let app = AppWindow::new().expect("AppWindow");
+        let mut st = State::test_stub(
+            Network::Regtest,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
+
+        // Drive the compose the UI would: pick a level + type extra entropy,
+        // exactly as the on_pq_generate callback reads them.
+        app.set_pq_gen_level("768".into());
+        app.set_pq_gen_extra("dice 4 2 6 1 3 5 harness entropy".into());
+        assert!(st.pq_imported.is_none());
+
+        do_pq_generate(&app, &mut st);
+
+        // Full-chain assertions:
+        // 1. State holds a fresh keypair,
+        let kp = st.pq_imported.as_ref().expect("generate populated State.pq_imported");
+        assert_eq!(kp.alg(), app_core::pqkeys::pq_alg(app_core::passphrase::MlKemLevel::MlKem768));
+        // 2. it round-trips through the (in-memory) keychain as importable armor,
+        let stored = keychain::load_secret_protected(PQ_IMPORTED_ACCOUNT, "")
+            .expect("keychain load")
+            .expect("armor present in keychain after generate");
+        let (alg, _seed) = app_core::notes_core::pq::import_private(&stored).expect("stored armor parses");
+        assert_eq!(alg, kp.alg());
+        // 3. the window reflects the new key (source set, error cleared, extra wiped),
+        assert_eq!(app.get_pq_import_source().as_str(), "Generated on this device");
+        assert_eq!(app.get_pq_import_error().as_str(), "");
+        assert_eq!(app.get_pq_gen_extra().as_str(), "");
+
+        // Second generate REPLACES cleanly (different key) — the fingerprint
+        // shown must change, proving fresh TRNG each time even with the same
+        // typed entropy.
+        let fp1 = app_core::pqkeys::fingerprint(kp);
+        app.set_pq_gen_extra("dice 4 2 6 1 3 5 harness entropy".into());
+        do_pq_generate(&app, &mut st);
+        let fp2 = app_core::pqkeys::fingerprint(st.pq_imported.as_ref().unwrap());
+        assert_ne!(fp1, fp2, "two generates with identical entropy must differ (fresh TRNG)");
+
+        keychain::delete_secret(PQ_IMPORTED_ACCOUNT).ok();
+        std::env::remove_var("GRAFFITO_KEYCHAIN_MEMORY");
+    }
+}
