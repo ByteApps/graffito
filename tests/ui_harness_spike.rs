@@ -65,3 +65,35 @@ fn findability_real_buttons_by_label_headless() {
         );
     }
 }
+
+#[test]
+fn findability_compose_security_panel() {
+    if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() != Ok("1") {
+        eprintln!("SKIP: set SLINT_EMIT_DEBUG_INFO=1 to run the in-process UI harness tests");
+        return;
+    }
+    i_slint_backend_testing::init_no_event_loop();
+
+    let app = AppWindow::new().expect("AppWindow");
+    // Tall window so the whole (scrollable) compose screen lays out — a
+    // Flickable clips content beyond its viewport, and the backend excludes
+    // zero-geometry/clipped elements from the a11y tree.
+    app.window().set_size(slint::LogicalSize::new(430.0, 2400.0));
+    // Reproduce the state that reveals the self-pw compose Security panel:
+    // a private, notebook-funded self-note with the panel expanded.
+    app.set_screen(6);
+    app.set_compose_private(true);
+    app.set_watch_only(false);
+    app.set_pay_from("notebook".into());
+    app.set_pq_expanded(true);
+
+    // The passphrase + quantum-encryption controls the self-pw feature adds
+    // must be findable by their visible text — the exact controls the flaky
+    // coordinate Mac suite had to reach by pixel.
+    for label in ["Security", "Passphrase", "Quantum encryption (ML-KEM)"] {
+        assert!(
+            ElementHandle::find_by_accessible_label(&app, label).count() >= 1,
+            "compose Security control '{label}' not findable by accessible-label",
+        );
+    }
+}
