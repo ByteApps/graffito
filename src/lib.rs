@@ -4831,8 +4831,23 @@ fn refresh_compose_pq(
         } else {
             passphrase::check(&passphrase_text)
         };
+        // A typed phrase under ~45 estimated bits is called out as WEAK
+        // outright (red, not amber): zxcvbn's ceiling for typed input is
+        // ~64 bits, so 45 separates "thin but deliberate" multi-word
+        // phrases from single words + trivial suffixes that any cracker
+        // enumerates. The device app applies the same idea through its
+        // simpler passphrase::typed_is_weak gate.
+        let weak = !st.pq_passphrase_verified
+            && !passphrase_text.is_empty()
+            && strength.bits < 45.0;
+        w.set_pq_passphrase_weak(weak);
         let line = if st.pq_passphrase_verified {
             format!("{:.0}-bit generated phrase", strength.bits)
+        } else if weak {
+            format!(
+                "weak (~{:.0} bits) — easily brute-forced; use Generate or add more words",
+                strength.bits
+            )
         } else {
             format!(
                 "~{:.0} bits — strength can't be verified; use Generate for a certified phrase",

@@ -1699,6 +1699,9 @@ export component AppWindow inherits Window {
     in-out property <string> pq-passphrase-text;
     in property <bool> pq-passphrase-verified;
     in property <string> pq-passphrase-strength-line;
+    // true while the typed phrase sits under the weak threshold (lib.rs
+    // sets it alongside the strength line) — turns the caption red.
+    in property <bool> pq-passphrase-weak;
     // ML-KEM layer: toggle, whether the resolved recipient has a usable
     // key on file, and a caption — "<level> · <fingerprint>" when
     // available+on, else a hint to add one in Contacts when unavailable.
@@ -3712,7 +3715,8 @@ export component AppWindow inherits Window {
                 }
                 if root.pq-expanded && root.pq-passphrase-enabled: Caption {
                     text: root.pq-passphrase-strength-line;
-                    color: root.pq-passphrase-verified ? Pal.good : Pal.warn;
+                    color: root.pq-passphrase-verified ? Pal.good
+                        : (root.pq-passphrase-weak ? Pal.bad : Pal.warn);
                 }
                 // ---- ML-KEM hybrid layer ----
                 if root.pq-expanded: HorizontalLayout {
