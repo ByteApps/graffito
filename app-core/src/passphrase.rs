@@ -338,9 +338,33 @@ pub fn security_label(c: &SecurityChoice) -> String {
     }
 
     if !c.directed {
-        return "Private note: sealed with a key derived from your seed. Already \
+        // A self-note is already quantum-resistant on its own (symmetric,
+        // seed-derived key — no public-key material ever touches the
+        // chain), so `is_quantum_resistant` stays `true` whatever the
+        // layers say. The layers protect against a DIFFERENT threat (seed
+        // compromise, an exported xpub + quantum recovery of the leaf
+        // secret — PLAN-graffito-self-pw.md's "Why"), so whenever one is
+        // actually on, the label surfaces the loss warning instead of the
+        // generic self-note sentence. This branch used to return early
+        // with only the generic sentence and src/lib.rs patched the
+        // layered cases over it after the fact — the override went stale
+        // ("the imported key" survived quantum-key GENERATION shipping).
+        // The function is total now; the shell has nothing to override.
+        // The full table is pinned in tests/security_label_contract.rs.
+        return match (c.passphrase_bits.is_some(), c.mlkem.is_some()) {
+            (false, false) => "Private note: sealed with a key derived from your seed. Already \
                  quantum-resistant — no public-key material ever touches the chain."
-            .to_string();
+                .to_string(),
+            (true, true) => "Password + quantum-key layer added — forgetting either the password \
+                 or the quantum key loses this note forever, even with your seed."
+                .to_string(),
+            (true, false) => "Password layer added — forgetting it loses this note forever, even \
+                 with your seed."
+                .to_string(),
+            (false, true) => "Quantum-key layer added — losing your quantum key loses this note \
+                 forever, even with your seed."
+                .to_string(),
+        };
     }
 
     // A passphrase counts toward quantum-resistance only when it's BOTH

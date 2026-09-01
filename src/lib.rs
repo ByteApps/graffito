@@ -2377,11 +2377,11 @@ fn refresh_note_unlock_ui(w: &AppWindow, n: &app_core::store::NoteRecord) {
         w.set_note_unlock_needs_password(needs_password);
         w.set_note_unlock_caption(
             if needs_mlkem && needs_password {
-                "Also needs your imported quantum key to reopen — you'll be asked if it isn't \
+                "Also needs your quantum key to reopen — you'll be asked if it isn't \
                  loaded. Losing either the password or the key loses this note forever."
                     .to_string()
             } else if needs_mlkem {
-                "Needs your imported quantum key to reopen (Settings → Quantum keys). Losing it \
+                "Needs your quantum key to reopen (Settings → Quantum keys). Losing it \
                  loses this note forever, even with your seed."
                     .to_string()
             } else {
@@ -4801,14 +4801,16 @@ fn refresh_compose_pq(
             Some(kp) => (
                 true,
                 Some(app_core::pqkeys::from_pq_alg(kp.alg())),
-                "readable only where this imported quantum key is present — losing the key loses \
+                // "your quantum key", not "this imported key": the slot has
+                // held generated keys too since PLAN-graffito-quantum-key.md.
+                "readable only where your quantum key is present — losing the key loses \
                  this note forever, even with your seed."
                     .to_string(),
             ),
             None => (
                 false,
                 None,
-                "import a quantum key first (Settings → Quantum keys) to add this layer".to_string(),
+                "add a quantum key first (Settings → Quantum keys) to add this layer".to_string(),
             ),
         }
     };
@@ -4869,30 +4871,11 @@ fn refresh_compose_pq(
         passphrase_verified: st.pq_passphrase_verified,
         mlkem: if mlkem_on { mlkem_level } else { None },
     };
+    // `security_label` is total over `SecurityChoice` — the self-note
+    // layered cases included (they used to be patched over the label right
+    // here, and the patch went stale; the whole table is pinned in
+    // app-core/tests/security_label_contract.rs). Nothing to override.
     let (quantum_resistant, label) = passphrase::describe(&choice);
-    // A self-note is already quantum-resistant on its own (symmetric,
-    // seed-derived key — no public-key material ever touches the chain),
-    // which is exactly what `describe` reports regardless of these extra
-    // layers; the layers protect against a DIFFERENT threat (seed
-    // compromise, an exported xpub + quantum recovery of the leaf secret —
-    // PLAN-graffito-self-pw.md's "Why"), so surface that here instead of
-    // the generic self-note sentence whenever a layer is actually on.
-    let label = if !directed && (passphrase_on || mlkem_on) {
-        match (passphrase_on, mlkem_on) {
-            (true, true) => "Password + quantum-key layer added — forgetting either the password \
-                             or the quantum key loses this note forever, even with your seed."
-                .to_string(),
-            (true, false) => "Password layer added — forgetting it loses this note forever, even \
-                              with your seed."
-                .to_string(),
-            (false, true) => "Quantum-key layer added — losing the imported key loses this note \
-                              forever, even with your seed."
-                .to_string(),
-            (false, false) => label,
-        }
-    } else {
-        label
-    };
     w.set_pq_quantum_resistant(quantum_resistant);
     w.set_pq_security_label(label.into());
 
@@ -11467,7 +11450,7 @@ fn ensure_pq_imported_loaded(s: &mut State) {
     if s.pq_imported.is_some() {
         return;
     }
-    match keychain::load_secret_protected(PQ_IMPORTED_ACCOUNT, "unlock your imported quantum key") {
+    match keychain::load_secret_protected(PQ_IMPORTED_ACCOUNT, "unlock your quantum key") {
         Ok(Some(armor)) => match app_core::notes_core::pq::import_private(&armor) {
             Ok((alg, seed)) => {
                 s.pq_imported = Some(app_core::notes_core::pq::MlKemKeypair::from_seed(alg, &seed));
@@ -16461,7 +16444,7 @@ pub fn run() {
                     Some(kp) => Some((kp.alg(), kp.ek().to_vec())),
                     None => {
                         w.set_status(
-                            "no imported quantum key — import one in Settings, or turn off quantum encryption".into(),
+                            "no quantum key — add one in Settings, or turn off quantum encryption".into(),
                         );
                         return;
                     }
