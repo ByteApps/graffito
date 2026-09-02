@@ -20,11 +20,11 @@ license = "Apache-2.0"
 # would give cargo two notes-core sources and `pq::MlKemAlg` type clashes.
 # notes-core is byte-identical between e0c7bd1 (the previous pin) and this
 # rev, so tx construction is unchanged (PLAN-graffito-arch.md, phase 2).
-notes-core = { git = "ssh://git@github.com/ByteApps/prime-graffito.git", rev = "9d5f095d276f3f237526226d475b26f68a92f37a" }
+notes-core = { git = "ssh://git@github.com/ByteApps/prime-graffito.git", rev = "1abf76746a2e46bd13a456b54e7e78472d5bbfa1" }
 # Shared UI-free POLICY (compose Security copy — `graffito_core::seclabel`,
 # re-exported through `passphrase`), rendered identically by this app and
 # the Prime app. notes-core + serde only; nothing new enters the graph.
-graffito-core = { git = "ssh://git@github.com/ByteApps/prime-graffito.git", rev = "9d5f095d276f3f237526226d475b26f68a92f37a" }
+graffito-core = { git = "ssh://git@github.com/ByteApps/prime-graffito.git", rev = "1abf76746a2e46bd13a456b54e7e78472d5bbfa1" }
 # base64 feature = PSBT <-> base64 string (`.psbt` file / clipboard export).
 bitcoin = { version = "0.32", features = ["base64"] }
 # Output-descriptor parsing + address derivation for external funding wallets
