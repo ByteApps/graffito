@@ -321,6 +321,7 @@ dependencies = [
  "ciborium",
  "foundation-ur",
  "getrandom 0.2.17",
+ "graffito-core",
  "hex",
  "hkdf",
  "miniscript",
@@ -2849,6 +2850,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "graffito-core"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ByteApps/prime-graffito.git?rev=9d5f095d276f3f237526226d475b26f68a92f37a#9d5f095d276f3f237526226d475b26f68a92f37a"
+dependencies = [
+ "notes-core",
+ "serde",
+]
+
+[[package]]
 name = "grid"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4584,7 +4594,7 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 [[package]]
 name = "notes-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ByteApps/prime-graffito.git?rev=e0c7bd11b30826b3f145940c7c9f19f7cb792c61#e0c7bd11b30826b3f145940c7c9f19f7cb792c61"
+source = "git+ssh://git@github.com/ByteApps/prime-graffito.git?rev=9d5f095d276f3f237526226d475b26f68a92f37a#9d5f095d276f3f237526226d475b26f68a92f37a"
 dependencies = [
  "argon2",
  "base64 0.22.1",
