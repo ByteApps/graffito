@@ -2852,7 +2852,7 @@ dependencies = [
 [[package]]
 name = "graffito-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ByteApps/prime-graffito.git?rev=9d5f095d276f3f237526226d475b26f68a92f37a#9d5f095d276f3f237526226d475b26f68a92f37a"
+source = "git+ssh://git@github.com/ByteApps/prime-graffito.git?rev=1abf76746a2e46bd13a456b54e7e78472d5bbfa1#1abf76746a2e46bd13a456b54e7e78472d5bbfa1"
 dependencies = [
  "notes-core",
  "serde",
@@ -4594,7 +4594,7 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 [[package]]
 name = "notes-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ByteApps/prime-graffito.git?rev=9d5f095d276f3f237526226d475b26f68a92f37a#9d5f095d276f3f237526226d475b26f68a92f37a"
+source = "git+ssh://git@github.com/ByteApps/prime-graffito.git?rev=1abf76746a2e46bd13a456b54e7e78472d5bbfa1#1abf76746a2e46bd13a456b54e7e78472d5bbfa1"
 dependencies = [
  "argon2",
  "base64 0.22.1",
