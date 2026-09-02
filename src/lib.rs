@@ -18692,11 +18692,29 @@ fn android_main(app: slint::android::AndroidApp) {
 mod ui_flow_quantum_key {
     use super::*;
 
+    /// These three tests share process-global state: the
+    /// `GRAFFITO_KEYCHAIN_MEMORY` env var (set at entry, REMOVED at exit)
+    /// and the single in-memory `pq-imported` keychain slot. Under the
+    /// default parallel runner, one test's `remove_var` landed mid-flight in
+    /// another, whose next keychain read then went to the REAL login
+    /// keychain (`keychain load: "UNIX[Operation not permitted]"` in a
+    /// sandbox, or a stale key -> "two generates ... must differ" on a
+    /// plain run) — flaky in roughly 3 of 5 runs, 2026-09-01. Each test
+    /// holds this lock for its whole body; a panicking test poisons it,
+    /// and the next one just takes the poisoned guard (the state it
+    /// re-initializes anyway) rather than failing on the poison.
+    static KEYCHAIN_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn keychain_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        KEYCHAIN_ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn generate_flow_produces_a_key_and_logs_ok() {
         // Element-tree introspection isn't needed here (we call the callback
         // logic directly, not find-by-label), but AppWindow::new() needs a
         // Slint platform — the testing backend provides one, thread-locally.
+        let _serial = keychain_env_lock();
         i_slint_backend_testing::init_no_event_loop();
         std::env::set_var("GRAFFITO_KEYCHAIN_MEMORY", "1");
         let _ = keychain::delete_secret(PQ_IMPORTED_ACCOUNT);
@@ -18748,6 +18766,7 @@ mod ui_flow_quantum_key {
 
     #[test]
     fn import_flow_stores_a_pasted_native_key() {
+        let _serial = keychain_env_lock();
         i_slint_backend_testing::init_no_event_loop();
         std::env::set_var("GRAFFITO_KEYCHAIN_MEMORY", "1");
         let _ = keychain::delete_secret(PQ_IMPORTED_ACCOUNT);
@@ -18797,6 +18816,7 @@ mod ui_flow_quantum_key {
         // key already exists, the action must NOT run directly — it stages a
         // replace confirm instead. Tested as the pure decision the callbacks
         // make, since the cb! wiring itself isn't reachable in isolation.
+        let _serial = keychain_env_lock();
         i_slint_backend_testing::init_no_event_loop();
         std::env::set_var("GRAFFITO_KEYCHAIN_MEMORY", "1");
         let _ = keychain::delete_secret(PQ_IMPORTED_ACCOUNT);
