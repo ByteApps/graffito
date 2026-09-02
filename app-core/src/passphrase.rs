@@ -58,19 +58,17 @@ use bip39::Language;
 
 use crate::Error;
 
-/// Minimum estimated classical entropy, in bits, before a typed passphrase
-/// is considered strong enough for the passphrase layer to carry
-/// quantum-resistance on its own (see the module doc for why 128, and
-/// [`security_label`]/[`is_quantum_resistant`] for how this gates the
-/// label the compose screen shows).
-pub const REQUIRED_BITS: f64 = 128.0;
-
-/// A generated passphrase's EXACT entropy: 12 words drawn independently
-/// and uniformly from the 2048-word BIP-39 English list, 11 bits/word
-/// (`log2(2048) = 11`), `12 * 11 = 132`. This is a closed-form fact about
-/// the draw, not an estimate — unlike [`estimate_bits`], which has to
-/// guess at what a human typed.
-pub const GENERATED_BITS: f64 = 132.0;
+// The security-copy POLICY — `REQUIRED_BITS`, `GENERATED_BITS`,
+// `MlKemLevel`, `SecurityChoice`, `is_quantum_resistant` — lives in the
+// shared crate since PLAN-graffito-arch.md phase 2 and is re-exported here
+// so no call site changed. (`security_label`/`describe` below are this
+// app's Flat-flavor wrappers over the shared functions.) Strength
+// ESTIMATION (`estimate_bits`/`check`/`check_generated`/`generate`) stays
+// here: it needs zxcvbn and the RNG, neither of which belongs in the
+// device-reachable crate.
+pub use graffito_core::seclabel::{
+    is_quantum_resistant, MlKemLevel, SecurityChoice, GENERATED_BITS, REQUIRED_BITS,
+};
 
 /// Number of words in a generated passphrase. Deliberately NOT 12 or 24 —
 /// those word counts read as "this is a BIP-39 seed phrase", and a
@@ -209,216 +207,21 @@ pub fn generate() -> Result<(String, f64), Error> {
     Ok((picked.join(" "), GENERATED_BITS))
 }
 
-/// The three ML-KEM (FIPS 203) parameter sets offered for the note's PQ
-/// hybrid-encryption layer, ordered by parameter size (not necessarily by
-/// UI display order). `Serialize`/`Deserialize` (added for `pqkeys::
-/// PqKeySource`, which persists which level a per-notebook derived key —
-/// or an imported one's declared level — uses) round-trip as the plain
-/// variant name (`"MlKem512"`/`"MlKem768"`/`"MlKem1024"`) via serde's
-/// default enum representation — pinned by a test in `pqkeys.rs`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum MlKemLevel {
-    MlKem512,
-    MlKem768,
-    MlKem1024,
-}
-
-impl MlKemLevel {
-    /// The level pre-selected in the picker UI — NIST's and most
-    /// deployments' standard recommendation for general use, balancing
-    /// ciphertext/key size against security margin.
-    pub const DEFAULT: MlKemLevel = MlKemLevel::MlKem768;
-
-    /// Short display name, e.g. for composing "ML-KEM-768 hybrid" in
-    /// [`security_label`]. Distinct from [`describe`](Self::describe),
-    /// which returns the longer explanatory sentence.
-    pub fn name(self) -> &'static str {
-        match self {
-            MlKemLevel::MlKem512 => "ML-KEM-512",
-            MlKemLevel::MlKem768 => "ML-KEM-768",
-            MlKemLevel::MlKem1024 => "ML-KEM-1024",
-        }
-    }
-
-    /// One-sentence explanation for the level-picker UI. Wording/AES
-    /// comparisons are the exact strings reviewed and approved for that
-    /// picker — treat them as pinned copy, not paraphrasable.
-    pub fn describe(self) -> &'static str {
-        match self {
-            MlKemLevel::MlKem512 => {
-                "Lowest parameter size; offers security roughly comparable to AES-128."
-            }
-            MlKemLevel::MlKem768 => {
-                "Standard recommendation for most general applications; provides security comparable to AES-192."
-            }
-            MlKemLevel::MlKem1024 => {
-                "Highest parameter size; offers security comparable to AES-256 for maximum long-term protection."
-            }
-        }
-    }
-}
-
-/// The compose screen's selected protection for one note — enough to
-/// derive both [`security_label`] and [`is_quantum_resistant`] without
-/// reaching into the actual encryption code.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SecurityChoice {
-    /// `false` for a public note (plaintext OP_RETURN content, readable by
-    /// anyone). `true` for an encrypted note (self or directed).
-    pub private: bool,
-    /// `true` for a directed note (ECDH-sealed to a recipient); `false`
-    /// for a self-note (symmetric key from the sender's own seed). Only
-    /// meaningful when `private` is `true`.
-    pub directed: bool,
-    /// Estimated/exact entropy of the chosen passphrase-layer passphrase,
-    /// if the passphrase layer is enabled — from [`check`]/[`check_generated`].
-    /// `None` when the passphrase layer isn't in use. Offered on directed
-    /// notes and — since PLAN-graffito-self-pw.md (2026-08-22) — self-notes
-    /// too, though it never changes [`is_quantum_resistant`]'s answer for a
-    /// self-note (already `true` regardless — see that fn's doc).
-    pub passphrase_bits: Option<f64>,
-    /// `true` iff the CURRENT passphrase text came out of [`generate`] this
-    /// session, untouched since. A generated phrase's entropy is a
-    /// closed-form fact ([`GENERATED_BITS`]); anything typed or pasted, or a
-    /// generated phrase the user has since edited, has only an ESTIMATE
-    /// ([`estimate_bits`]) that zxcvbn 3.x cannot even represent past ~64
-    /// bits (see the module doc) — so an unverified passphrase must never
-    /// count toward quantum-resistance no matter how high its estimate
-    /// reads. The compose screen flips this back to `false` the instant the
-    /// generated text changes.
-    pub passphrase_verified: bool,
-    /// The ML-KEM level, if the hybrid layer is enabled. `None` when it
-    /// isn't in use. Offered on directed notes and — since
-    /// PLAN-graffito-self-pw.md — self-notes too (there, ONLY when sealed
-    /// to a non-seed-derived imported key — a compose-side obligation this
-    /// struct can't see); same quantum-resistance caveat as
-    /// `passphrase_bits` above.
-    pub mlkem: Option<MlKemLevel>,
-}
-
-/// Whether the SELECTED protection resists a quantum adversary — the same
-/// logic [`security_label`] describes in prose, exposed separately so the
-/// UI can key a badge/icon off it without parsing the label string.
-///
-/// - Public note: never quantum-resistant (there's no encryption at all).
-/// - Private self-note: always quantum-resistant — a symmetric key
-///   derived from the seed puts no public-key material on-chain for a
-///   quantum algorithm (e.g. Shor's) to attack in the first place.
-/// - Private directed note: quantum-resistant iff the ML-KEM hybrid layer
-///   is enabled, OR the passphrase layer is enabled with a VERIFIED
-///   (app-[`generate`]d, unedited) passphrase whose exact entropy is at or
-///   above [`REQUIRED_BITS`] (a sufficiently strong passphrase-derived key
-///   has no public-key structure for a quantum algorithm to exploit either
-///   — the base ECDH layer stays quantum-VULNERABLE regardless, but an
-///   attacker who breaks it still hits the passphrase- or ML-KEM-derived
-///   layer underneath). A typed/pasted passphrase never counts here, no
-///   matter how high its `estimate_bits` reads — see
-///   [`SecurityChoice::passphrase_verified`]'s doc for why an unverified
-///   estimate can't be trusted as a quantum-resistance claim.
-pub fn is_quantum_resistant(c: &SecurityChoice) -> bool {
-    if !c.private {
-        return false;
-    }
-    if !c.directed {
-        return true;
-    }
-    if c.mlkem.is_some() {
-        return true;
-    }
-    c.passphrase_verified && matches!(c.passphrase_bits, Some(bits) if bits >= REQUIRED_BITS)
-}
-
 /// One line of compose-screen copy summarizing the protection
-/// [`SecurityChoice`] describes. See the module doc and
-/// [`is_quantum_resistant`] for the underlying reasoning; this function
-/// only turns that reasoning into a sentence.
+/// [`SecurityChoice`] describes — the shared table in this app's
+/// `SelfNoteCopy::Flat` flavor (the loss warnings pinned by
+/// `tests/security_label_contract.rs`; the Prime app renders `Detailed`).
+/// Total over `SecurityChoice`; the shell has nothing to override.
 pub fn security_label(c: &SecurityChoice) -> String {
-    if !c.private {
-        return "Public note: anyone can read it on the blockchain, forever.".to_string();
-    }
-
-    if !c.directed {
-        // A self-note is already quantum-resistant on its own (symmetric,
-        // seed-derived key — no public-key material ever touches the
-        // chain), so `is_quantum_resistant` stays `true` whatever the
-        // layers say. The layers protect against a DIFFERENT threat (seed
-        // compromise, an exported xpub + quantum recovery of the leaf
-        // secret — PLAN-graffito-self-pw.md's "Why"), so whenever one is
-        // actually on, the label surfaces the loss warning instead of the
-        // generic self-note sentence. This branch used to return early
-        // with only the generic sentence and src/lib.rs patched the
-        // layered cases over it after the fact — the override went stale
-        // ("the imported key" survived quantum-key GENERATION shipping).
-        // The function is total now; the shell has nothing to override.
-        // The full table is pinned in tests/security_label_contract.rs.
-        return match (c.passphrase_bits.is_some(), c.mlkem.is_some()) {
-            (false, false) => "Private note: sealed with a key derived from your seed. Already \
-                 quantum-resistant — no public-key material ever touches the chain."
-                .to_string(),
-            (true, true) => "Password + quantum-key layer added — forgetting either the password \
-                 or the quantum key loses this note forever, even with your seed."
-                .to_string(),
-            (true, false) => "Password layer added — forgetting it loses this note forever, even \
-                 with your seed."
-                .to_string(),
-            (false, true) => "Quantum-key layer added — losing your quantum key loses this note \
-                 forever, even with your seed."
-                .to_string(),
-        };
-    }
-
-    // A passphrase counts toward quantum-resistance only when it's BOTH
-    // verified (came from `generate()`, unedited since) AND at/above the
-    // bit bar — see `SecurityChoice::passphrase_verified`'s doc for why an
-    // unverified estimate, however high it reads, can never be trusted for
-    // this claim (zxcvbn 3.x can't even represent 128 bits for typed
-    // input — module doc). `passphrase_present` covers every other case
-    // where the layer is on but doesn't (yet, or ever) count: unverified
-    // typed/pasted input at any estimate, or a verified-but-somehow-short
-    // reading that shouldn't occur in practice but is handled the same way
-    // defensively.
-    let passphrase_counts =
-        c.passphrase_verified && matches!(c.passphrase_bits, Some(bits) if bits >= REQUIRED_BITS);
-    let passphrase_present = c.passphrase_bits.is_some();
-
-    match (c.mlkem, passphrase_counts, passphrase_present) {
-        (None, false, false) => {
-            "Directed note: end-to-end encrypted (~128-bit ECDH), but NOT quantum-resistant."
-                .to_string()
-        }
-        (None, true, _) => {
-            let bits = c.passphrase_bits.expect("passphrase_counts implies Some");
-            format!("Quantum-resistant: protected by a strong passphrase (~{bits:.0} bits).")
-        }
-        (None, false, true) => {
-            "Passphrase added — strength unverifiable, not counted as quantum-resistant."
-                .to_string()
-        }
-        (Some(level), false, false) => format!(
-            "Quantum-resistant: protected by {} hybrid encryption.",
-            level.name()
-        ),
-        (Some(level), true, _) => {
-            let bits = c.passphrase_bits.expect("passphrase_counts implies Some");
-            format!(
-                "Quantum-resistant: {} hybrid encryption plus a strong passphrase (~{bits:.0} bits).",
-                level.name()
-            )
-        }
-        (Some(level), false, true) => format!(
-            "Quantum-resistant via {} hybrid encryption — passphrase layer added but unverified.",
-            level.name()
-        ),
-    }
+    graffito_core::seclabel::security_label(c, graffito_core::seclabel::SelfNoteCopy::Flat)
 }
 
 /// `(is_quantum_resistant(c), security_label(c))` together — the compose
 /// screen's Security section always wants both for the same
 /// [`SecurityChoice`] (the header status chip and the section's bottom
-/// caption), so this is the ONE call site lib.rs makes rather than
-/// duplicating the branching those two functions already do.
+/// caption), so this is the ONE call site lib.rs makes.
 pub fn describe(c: &SecurityChoice) -> (bool, String) {
-    (is_quantum_resistant(c), security_label(c))
+    graffito_core::seclabel::describe(c, graffito_core::seclabel::SelfNoteCopy::Flat)
 }
 
 #[cfg(test)]
