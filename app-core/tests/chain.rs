@@ -63,8 +63,7 @@ impl Fixture {
                 .unwrap();
         let last_confirmed = txs
             .iter()
-            .filter(|t| t["status"]["confirmed"].as_bool() == Some(true))
-            .last()
+            .rfind(|t| t["status"]["confirmed"].as_bool() == Some(true))
             .and_then(|t| t["txid"].as_str().map(String::from));
         match last_confirmed {
             Some(txid) => fx.body(&format!("/address/{addr}/txs/chain/{txid}"), "[]"),
@@ -181,7 +180,7 @@ fn incremental_bundle_filters_by_height() {
     assert!(some
         .notes_onchain
         .iter()
-        .all(|t| t.height.map_or(true, |h| h > max - 1)));
+        .all(|t| t.height.is_none_or(|h| h > max - 1)));
 }
 
 #[test]

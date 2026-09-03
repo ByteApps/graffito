@@ -34,8 +34,8 @@ fn drain_request(stream: &TcpStream) {
 
 /// Writes a minimal, correct HTTP/1.1 response: status line, `Content-Length`
 /// + `Connection: close` (so the client opens a fresh TCP connection for its
-/// next attempt — keeps the server side of this test a plain one-request-
-/// per-accept loop) + any extra headers, then the body.
+///   next attempt — keeps the server side of this test a plain one-request-
+///   per-accept loop) + any extra headers, then the body.
 fn write_response(mut stream: &TcpStream, status_line: &str, extra_headers: &[(&str, String)], body: &str) {
     let mut resp = format!("{status_line}\r\n");
     resp.push_str(&format!("Content-Length: {}\r\n", body.len()));

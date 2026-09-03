@@ -394,7 +394,7 @@ mod tests {
         })
         .expect("infallible fill");
         assert_eq!(calls, 2, "the out-of-range draw must be discarded and a second draw taken");
-        assert_eq!(idx, 2 % 3);
+        assert_eq!(idx, 2); // the second draw (0x0002) mod bound 3 is 2
     }
 
     #[test]

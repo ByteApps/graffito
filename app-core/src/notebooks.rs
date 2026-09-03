@@ -469,8 +469,7 @@ mod tests {
 
         let path = dir.join("notebooks-regtest-aabbccdd.json");
         let mut ix = NotebookIndex::new();
-        let mut s = SpendingSection::default();
-        s.enabled = true;
+        let mut s = SpendingSection { enabled: true, ..Default::default() };
         s.mark_used(SpendingAddr {
             chain: 0,
             index: 0,

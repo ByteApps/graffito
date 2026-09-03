@@ -1476,8 +1476,8 @@ fn display_owner_dedup_first_notebook_input_wins() {
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
 
-    let as_a = extract_notes_multi_deduped(&bundle, &a, NET, &[spk_a.clone()], &notebook_spks);
-    let as_b = extract_notes_multi_deduped(&bundle, &b, NET, &[spk_b.clone()], &notebook_spks);
+    let as_a = extract_notes_multi_deduped(&bundle, &a, NET, std::slice::from_ref(&spk_a), &notebook_spks);
+    let as_b = extract_notes_multi_deduped(&bundle, &b, NET, std::slice::from_ref(&spk_b), &notebook_spks);
 
     assert_eq!(as_a.len(), 1, "first-notebook-input (A) keeps the note");
     assert_eq!(as_b.len(), 0, "second notebook (B) must not also display it");
@@ -1528,8 +1528,8 @@ fn display_owner_dedup_flips_with_input_order() {
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
 
-    let as_a = extract_notes_multi_deduped(&bundle, &a, NET, &[spk_a.clone()], &notebook_spks);
-    let as_b = extract_notes_multi_deduped(&bundle, &b, NET, &[spk_b.clone()], &notebook_spks);
+    let as_a = extract_notes_multi_deduped(&bundle, &a, NET, std::slice::from_ref(&spk_a), &notebook_spks);
+    let as_b = extract_notes_multi_deduped(&bundle, &b, NET, std::slice::from_ref(&spk_b), &notebook_spks);
 
     assert_eq!(as_a.len(), 0, "A is no longer the first notebook input");
     assert_eq!(as_b.len(), 1, "owner flips to B, the new first-notebook-input");
@@ -1667,8 +1667,8 @@ fn display_owner_dedup_empty_notebook_spks_matches_undeduped() {
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
 
-    let old = extract_notes_multi(&bundle, &a, NET, &[spk_a.clone()]);
-    let deduped_noop = extract_notes_multi_deduped(&bundle, &a, NET, &[spk_a.clone()], &[]);
+    let old = extract_notes_multi(&bundle, &a, NET, std::slice::from_ref(&spk_a));
+    let deduped_noop = extract_notes_multi_deduped(&bundle, &a, NET, std::slice::from_ref(&spk_a), &[]);
     assert_eq!(old, deduped_noop, "empty notebook_spks must be byte-identical to the old fn");
     assert_eq!(old.len(), 1, "sanity: the fixture is scanned OWN and kept by both");
 }

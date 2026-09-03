@@ -740,8 +740,8 @@ fn argon2_production_params_direct() {
     // Production params must always sit within the decode caps — a prod
     // bump past the caps would emit notes every peer rejects (the
     // raise-the-cap-first rule on PW_MAX_M_LOG2/PW_MAX_T).
-    assert!(pq::PW_PROD_M_LOG2 <= pq::PW_MAX_M_LOG2);
-    assert!(pq::PW_PROD_T <= pq::PW_MAX_T);
+    const { assert!(pq::PW_PROD_M_LOG2 <= pq::PW_MAX_M_LOG2) };
+    const { assert!(pq::PW_PROD_T <= pq::PW_MAX_T) };
 }
 
 /// Guards the 2026-08-22 fallible-allocation refactor (audit F2) and any
