@@ -50,8 +50,8 @@ fn generate_flow_produces_a_key_and_logs_ok() {
 
     // Drive the compose the UI would: pick a level + type extra entropy,
     // exactly as the on_pq_generate callback reads them.
-    app.set_pq_gen_level("768".into());
-    app.set_pq_gen_extra("dice 4 2 6 1 3 5 harness entropy".into());
+    app.global::<QuantumKeys>().set_pq_gen_level("768".into());
+    app.global::<QuantumKeys>().set_pq_gen_extra("dice 4 2 6 1 3 5 harness entropy".into());
     assert!(st.pq_imported.is_none());
 
     do_pq_generate(&app, &mut st);
@@ -67,15 +67,15 @@ fn generate_flow_produces_a_key_and_logs_ok() {
     let (alg, _seed) = app_core::notes_core::pq::import_private(&stored).expect("stored armor parses");
     assert_eq!(alg, kp.alg());
     // 3. the window reflects the new key (source set, error cleared, extra wiped),
-    assert_eq!(app.get_pq_import_source().as_str(), "Generated on this device");
-    assert_eq!(app.get_pq_import_error().as_str(), "");
-    assert_eq!(app.get_pq_gen_extra().as_str(), "");
+    assert_eq!(app.global::<Ui>().get_pq_import_source().as_str(), "Generated on this device");
+    assert_eq!(app.global::<QuantumKeys>().get_pq_import_error().as_str(), "");
+    assert_eq!(app.global::<QuantumKeys>().get_pq_gen_extra().as_str(), "");
 
     // Second generate REPLACES cleanly (different key) — the fingerprint
     // shown must change, proving fresh TRNG each time even with the same
     // typed entropy.
     let fp1 = app_core::pqkeys::fingerprint(kp);
-    app.set_pq_gen_extra("dice 4 2 6 1 3 5 harness entropy".into());
+    app.global::<QuantumKeys>().set_pq_gen_extra("dice 4 2 6 1 3 5 harness entropy".into());
     do_pq_generate(&app, &mut st);
     let fp2 = app_core::pqkeys::fingerprint(st.pq_imported.as_ref().unwrap());
     assert_ne!(fp1, fp2, "two generates with identical entropy must differ (fresh TRNG)");
@@ -107,23 +107,23 @@ fn import_flow_stores_a_pasted_native_key() {
         b"",
     )
     .unwrap();
-    app.set_pq_import_text(armor.clone().into());
+    app.global::<QuantumKeys>().set_pq_import_text(armor.clone().into());
 
     do_pq_import(&app, &mut st);
 
-    assert!(app.get_pq_import_error().as_str().is_empty(), "import should not error");
+    assert!(app.global::<QuantumKeys>().get_pq_import_error().as_str().is_empty(), "import should not error");
     let kp = st.pq_imported.as_ref().expect("import populated State.pq_imported");
     assert_eq!(
         app_core::pqkeys::fingerprint(kp),
         app_core::pqkeys::fingerprint(&src_kp),
         "imported key must equal the pasted one",
     );
-    assert_eq!(app.get_pq_import_text().as_str(), "", "import field cleared on success");
+    assert_eq!(app.global::<QuantumKeys>().get_pq_import_text().as_str(), "", "import field cleared on success");
 
     // Garbage paste surfaces an error and leaves the key intact.
-    app.set_pq_import_text("not a quantum key".into());
+    app.global::<QuantumKeys>().set_pq_import_text("not a quantum key".into());
     do_pq_import(&app, &mut st);
-    assert!(!app.get_pq_import_error().as_str().is_empty(), "garbage import must error");
+    assert!(!app.global::<QuantumKeys>().get_pq_import_error().as_str().is_empty(), "garbage import must error");
     assert!(st.pq_imported.is_some(), "a failed import must not drop the existing key");
 
     keychain::delete_secret(PQ_IMPORTED_ACCOUNT).ok();
@@ -152,7 +152,7 @@ fn replace_guard_decision_gates_an_existing_key() {
 
     // No key yet -> the guard would run the action directly.
     assert!(st.pq_imported.is_none());
-    app.set_pq_gen_level("768".into());
+    app.global::<QuantumKeys>().set_pq_gen_level("768".into());
     do_pq_generate(&app, &mut st);
     assert!(st.pq_imported.is_some());
 
