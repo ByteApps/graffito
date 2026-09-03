@@ -130,10 +130,9 @@ pub(crate) fn contact_pq_display_for(&self, addr: &str) -> String {
 }
 
 /// Apply an iCloud KV change that synced in from the user's OTHER device
-/// (`icloud::start_observer`'s callback, via the `apply-pending-icloud-
-/// contacts` trampoline — this runs on the UI thread with full `State`
-/// access, same shape as every other `apply_*` trampoline target). Reads
-/// whatever's in the KV store RIGHT NOW (not what triggered the
+/// (`icloud::start_observer`'s callback, via [`post`] — this runs on the
+/// UI thread with full `State` access, same shape as every other posted
+/// job). Reads whatever's in the KV store RIGHT NOW (not what triggered the
 /// notification — there's no payload, just "something changed"), merges
 /// it into the live state (tombstone-aware — see `app_core::contacts`),
 /// persists + re-syncs only if that actually changed anything, and

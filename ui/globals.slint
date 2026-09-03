@@ -252,12 +252,6 @@ export global Ui {
     callback funding-clear();      // forget the funding wallet
     callback set-pay-from(string);         // compose picker: "notebook" | "spending"
     callback set-coins-segment(string);    // Coins screen: "notebook" | "spending"
-    // Internal: a background spending-wallet scan finished — same
-    // trampoline pattern as apply-pending-refresh.
-    callback apply-pending-spending-refresh();
-    // Internal: a background wallet-wide rescan finished (Coins screen /
-    // notebook-list ↻, watchdog fix 2026-07-20) — same trampoline pattern.
-    callback apply-pending-wallet-stores-refresh();
     callback psbt-copy();          // copy PSBT base64
     callback psbt-loaded(string);  // internal: a scanned PSBT string → validate + confirm
     callback psbt-broadcast();     // finalize + broadcast the signed PSBT
@@ -266,41 +260,15 @@ export global Ui {
     callback reveal-hide();            // back/Done from 18 or 19: wipes every revealed value
     callback copy-value(string);       // copy a revealed format to the clipboard
     callback go-home();
-    // Internal: a background scan finished — Rust invokes this from the
-    // event loop to apply the result (never called from UI elements).
-    callback apply-pending-refresh();
-    // Internal: a notebook gap-discovery walk finished (seed re-import) —
-    // same trampoline pattern as apply-pending-refresh.
-    callback apply-pending-discovery();
-    // Deferred auto-unlock finished on its worker thread — apply on the UI
-    // thread (see UNLOCK_RESULT in lib.rs).
-    callback apply-pending-unlock();
-    // Create-notebook picker: used/new address probes finished on a worker
-    // thread; fill in the pills without blocking the tap that opened it.
-    callback apply-pending-picker-probe();
-    // A Bitcoin Core preflight check (`refresh_node_health` in lib.rs)
-    // finished on a worker thread — fills in the node-health caption.
-    callback apply-pending-node-health();
-    // Async sign+broadcast (2026-07-16): a compose send's build+broadcast
-    // finished on a worker thread — same trampoline pattern.
-    callback apply-pending-compose();
-    // A Rebroadcast (act-retry) finished on a worker thread.
-    callback apply-pending-act-retry();
-    // A Rebroadcast's own raw-hex fetch (sub-case (b): chain-recovered/
-    // watch record, no locally cached hex) finished on a worker thread —
-    // enters the universal confirm screen on success.
-    callback apply-pending-rebroadcast-fetch();
-    // A Speed-up (RBF bump) broadcast finished on a worker thread.
-    callback apply-pending-act-bump();
-    // CHANGE 4: a consolidate/sweep/wallet-consolidate/psbt broadcast
-    // finished on a worker thread — same trampoline pattern, one callback
-    // draining all four result queues (mirrors apply-pending-compose).
-    callback apply-pending-wallet-tx();
-    // iCloud-contacts feature (2026-07-20): the OTHER device just synced a
-    // contacts change in — same trampoline pattern as apply-pending-refresh,
-    // but the source event is an NSUbiquitousKeyValueStore notification
-    // (any thread) rather than a worker-thread scan.
-    callback apply-pending-icloud-contacts();
+    // The ONE async trampoline (U5, PLAN-graffito-app-arch.md): every
+    // worker thread that finishes a background job (a scan, a broadcast, a
+    // probe, an iCloud-contacts merge, …) posts a boxed `FnOnce(&AppWindow,
+    // &mut State)` onto one shared FIFO queue (`pending::post`) and invokes
+    // this SAME callback from the event loop; the UI thread runs every
+    // queued job in arrival order with full State access
+    // (`State::apply_pending`). Replaces the 13 separate per-kind
+    // callbacks this used to be.
+    callback apply-pending();
     // Where settings/activity return on back: the screen they were opened
     // from (the notebook list or a notebook's home). Set by their open
     // callbacks in Rust.

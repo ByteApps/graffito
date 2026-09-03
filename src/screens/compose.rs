@@ -470,7 +470,7 @@ pub(crate) fn add_recipient_chip(&mut self, w: &AppWindow, addr: &str) {
 /// reads as 0 and falls through to Notebook too (never guess a positive
 /// balance we haven't confirmed). A watch identity has no spending wallet
 /// at all. Shared by `pick_contact_core` (fresh compose session) and
-/// `apply_spending_refresh_results` (CHANGE 5: a landed scan re-resolves
+/// `apply_spending_refresh_result` (CHANGE 5: a landed scan re-resolves
 /// the default for a user already sitting on compose, as long as they
 /// haven't made an explicit pick yet this session — `payfrom_manual`).
 pub(crate) fn resolve_payfrom_default(&mut self, w: &AppWindow) {

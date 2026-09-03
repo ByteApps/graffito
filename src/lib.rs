@@ -570,7 +570,7 @@ struct State {
     /// `refresh_async`). True while a wallet-wide rescan is in flight on a
     /// worker thread; a second tap is ignored rather than queued (simpler
     /// than overlapping store-file writes) — see
-    /// `apply_wallet_stores_refresh_results`'s own (fp8, network, account)
+    /// `apply_wallet_stores_refresh_result`'s own (fp8, network, account)
     /// staleness guard for the identity-switch-mid-scan case.
     /// Scan-freshness gate (2026-07-21, the stale-sign-window follow-up to
     /// the 429-politeness work): tracks in-flight notebook refreshes
@@ -1760,11 +1760,9 @@ impl WalletStoresPurpose {
 
 
 
-/// Result of the deferred auto-unlock, handed from its worker thread to the
-/// UI thread via the `apply-pending-unlock` trampoline (same shape as
-/// REFRESH_RESULTS / DISCOVERY_RESULTS).
-static UNLOCK_RESULT: std::sync::Mutex<Option<Result<Option<String>, String>>> =
-    std::sync::Mutex::new(None);
+// Result of the deferred auto-unlock is posted straight to `post` (U5) —
+// no intermediate static needed now that a job only ever exists once there
+// IS a result.
 
 
 
@@ -1788,10 +1786,10 @@ static UNLOCK_RESULT: std::sync::Mutex<Option<Result<Option<String>, String>>> =
 // `client.broadcast()` POST moves to a worker thread — the part that used
 // to visibly freeze the confirm button on a slow connection. Each flow's
 // `apply_*_result` replays its EXACT pre-existing Ok/Err bookkeeping, once,
-// from the worker's result, via the shared `apply-pending-wallet-tx`
-// trampoline (`apply_pending_wallet_tx_results` drains every queue) — same
-// shape as `apply_compose_results`. `State.wallet_tx_busy` is the shared
-// re-entrancy guard; every entry point returns early when it's set.
+// from the worker's result via `post` (U5), which also clears the shared
+// busy flag (`State::clear_wallet_tx_busy`) — same shape every compose
+// path uses (`State::clear_compose_busy`). `State.wallet_tx_busy` is the
+// shared re-entrancy guard; every entry point returns early when it's set.
 
 
 
@@ -1834,9 +1832,10 @@ static UNLOCK_RESULT: std::sync::Mutex<Option<Result<Option<String>, String>>> =
 // used to visibly freeze the Sign button on a slow connection. The UI-
 // thread `apply_*_compose_result` functions replay each path's EXACT
 // pre-existing Ok/Err bookkeeping, now run once from the worker's result via
-// the shared `apply-pending-compose` trampoline (`apply_compose_results`
-// drains all three). The external/watch/fund-external route is untouched —
-// it already hands off to the sign screen instead of broadcasting itself.
+// `post` (U5), which also clears the shared busy/progress state
+// (`State::clear_compose_busy`). The external/watch/fund-external route is
+// untouched — it already hands off to the sign screen instead of
+// broadcasting itself.
 
 
 
@@ -2248,8 +2247,8 @@ pub fn run() {
             // thread nothing the user does can block the main thread, so the
             // watchdog cannot fire no matter how long they take. (The system
             // presents the prompt itself; it needs nothing from us.) The
-            // result comes back through UNLOCK_RESULT + `apply-pending-unlock`,
-            // the same trampoline shape the async scans use.
+            // result comes back via `post` (U5) — the same trampoline shape
+            // the async scans use.
             let w = window.as_weak();
             slint::Timer::single_shot(std::time::Duration::from_millis(700), move || {
                 let weak = w.clone();
@@ -2258,8 +2257,7 @@ pub fn run() {
                         KEYCHAIN_ACCOUNT,
                         "unlock your Graffito identity",
                     );
-                    *UNLOCK_RESULT.lock().expect("unlock result mutex") = Some(r);
-                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_unlock());
+                    post(&weak, move |w, st| st.apply_unlock_result(w, r));
                 });
             });
         } else {
@@ -2462,66 +2460,16 @@ pub fn run() {
 
     cb!(Ui, on_refresh, |w, s| { s.on_refresh(&w) });
 
-    // Trampoline: a finished background scan invokes this from the event
-    // loop; the UI thread applies it with full State access.
-    cb!(Ui, on_apply_pending_refresh, |w, s| { s.on_apply_pending_refresh(&w) });
-
-    // Trampoline: an async compose send (notebook/spending/mixed) finished
-    // building+broadcasting on a worker thread.
-    cb!(Ui, on_apply_pending_compose, |w, s| { s.on_apply_pending_compose(&w) });
-
-    // Trampoline: an Activity Rebroadcast finished on a worker thread.
-    cb!(Ui, on_apply_pending_act_retry, |w, s| { s.on_apply_pending_act_retry(&w) });
-
-    // Trampoline: `on_act_retry`'s sub-case (b) raw-hex fetch (chain-
-    // recovered/watch record, no local hex) landed on a worker thread.
-    cb!(Ui, on_apply_pending_rebroadcast_fetch, |w, s| { s.on_apply_pending_rebroadcast_fetch(&w) });
-
-    // Trampoline: an Activity Speed-up (RBF) broadcast finished on a worker
-    // thread (the re-sign itself stays synchronous — fast, no network; only
-    // the broadcast POST is async).
-    cb!(Ui, on_apply_pending_act_bump, |w, s| { s.on_apply_pending_act_bump(&w) });
-
-    // Trampoline: an async consolidate/sweep/wallet-consolidate/psbt
-    // broadcast (CHANGE 4) finished on a worker thread.
-    cb!(Ui, on_apply_pending_wallet_tx, |w, s| { s.on_apply_pending_wallet_tx(&w) });
-
-    // Trampoline: a finished spending-wallet scan (funding-unification M3)
-    // landed — same pattern as apply-pending-refresh.
-    cb!(Ui, on_apply_pending_spending_refresh, |w, s| { s.on_apply_pending_spending_refresh(&w) });
-
-    // Trampoline: a finished wallet-wide rescan (Coins screen / notebook-
-    // list ↻, watchdog fix 2026-07-20) landed — same pattern as
-    // apply-pending-refresh.
-    cb!(Ui, on_apply_pending_wallet_stores_refresh, |w, s| { s.on_apply_pending_wallet_stores_refresh(&w) });
-
-    // Trampoline: an iCloud KV notification (a contacts change synced in
-    // from the user's OTHER device) landed — re-merge the freshly-synced
-    // blob into the live device-level contacts list and refresh the
-    // picker so the change appears without restarting the app.
-    cb!(Ui, on_apply_pending_icloud_contacts, |w, s| { s.on_apply_pending_icloud_contacts(&w) });
-
-    // Trampoline: worker-thread used/new probes for the create-notebook
-    // picker landed — fill in the pills/balances without having blocked the
-    // tap. Guarded by account/page/screen so a stale probe (user paged or
-    // left) is dropped.
-    cb!(Ui, on_apply_pending_picker_probe, |w, s| { s.on_apply_pending_picker_probe(&w) });
-
-    // Trampoline: a finished Bitcoin Core preflight check (`refresh_node_health`).
-    // Dropped when stale — the network or the configured node changed since
-    // the check started (e.g. the user switched networks, or edited the
-    // node URL again before the first check returned).
-    cb!(Ui, on_apply_pending_node_health, |w, s| { s.on_apply_pending_node_health(&w) });
-
-    // Trampoline: a finished notebook gap-discovery walk (seed re-import).
-    // Discovery is the sanctioned exception to deliberate notebook
-    // creation — every found index has on-chain history, so recovering it
-    // is what the user meant by importing the seed.
-    // Deferred auto-unlock landed. Mirrors read_saved_material's error
-    // handling, but on the UI thread with the result already in hand.
-    cb!(Ui, on_apply_pending_unlock, |w, s| { s.on_apply_pending_unlock(&w) });
-
-    cb!(Ui, on_apply_pending_discovery, |w, s| { s.on_apply_pending_discovery(&w) });
+    // The ONE async trampoline (U5, PLAN-graffito-app-arch.md): every
+    // worker thread that finishes a background job — a scan, a broadcast,
+    // a probe, the deferred auto-unlock, an iCloud-contacts merge — posts a
+    // boxed closure onto the shared queue (`pending::post`) and invokes
+    // this SAME callback from the event loop; `State::apply_pending` runs
+    // every queued job in arrival order with full State access. Replaces
+    // the 13 separate per-kind trampolines this used to be (one Slint
+    // callback + one `on_apply_pending_<kind>` forwarder + one
+    // `apply_<kind>_result(s)` drain each).
+    cb!(Ui, on_apply_pending, |w, s| { s.apply_pending(&w) });
 
     cb!(Home, on_open_note, |w, s, id: SharedString| { s.on_open_note(&w, id) });
 
@@ -2860,7 +2808,7 @@ pub fn run() {
     // notebook synchronously on the UI thread — see
     // `wallet_stores_refresh_async`'s doc comment. The spending-wallet
     // kickoff + notebook-list rebuild now happen in
-    // `apply_wallet_stores_refresh_results` once the scan actually lands.
+    // `apply_wallet_stores_refresh_result` once the scan actually lands.
     cb!(Ui, on_refresh_coins, |w, s| { s.on_refresh_coins(&w) });
 
     // Notebook-list (main screen) header ↻: rescan every active notebook and
@@ -2916,7 +2864,7 @@ pub fn run() {
     // wallet on worker threads, same async/trampoline pattern as
     // refresh_async/spending_refresh_async — never blocks the UI thread.
     // Each landing logs its own `cb: funding-refresh …` (see
-    // apply_refresh_results / apply_spending_refresh_results).
+    // apply_refresh_result / apply_spending_refresh_result).
     cb!(PayFrom, on_funding_refresh, |w, s| { s.on_funding_refresh(&w) });
 
     cb!(FundingWallets, on_add_funding_wallet, |w, s| { s.on_add_funding_wallet(&w) });
@@ -3261,12 +3209,13 @@ pub fn run() {
     // existed). A no-op registration off Apple platforms, or when the OS
     // has no entitlement/iCloud account (see icloud.rs) — the callback can
     // fire on any thread, so it only ever schedules the real work back onto
-    // the UI thread via the same upgrade_in_event_loop trampoline every
-    // other async result uses.
+    // the UI thread via the same `post` (U5) trampoline every other async
+    // result uses — this one just has no payload (re-reads the KV store
+    // itself once it runs).
     {
         let weak = window.as_weak();
         icloud::start_observer(move || {
-            let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_icloud_contacts());
+            post(&weak, |w, st| st.apply_icloud_contacts_merge(w));
         });
     }
 
