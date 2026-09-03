@@ -19,6 +19,7 @@ import { H1, Body, Caption, Mono, Card, PrimaryButton, GhostButton, IconButton, 
 import { OnboardingScreen } from "screens/onboarding.slint";
 import { ImportKeyScreen } from "screens/import-key.slint";
 import { BackupWordsScreen } from "screens/backup-words.slint";
+import { QuizScreen } from "screens/quiz.slint";
 // Rust (src/lib.rs, via slint::include_modules!()) needs these re-exported
 // from the entry-point file.
 export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem, Ui, Modals, Info, Terms, Settings, BackupWords, ImportKey, Quiz, Home, Note, Compose, Change, PayFrom, Sweep, FundingWalletScreen, ExportPsbt, Confirm, Coins, AccountPicker, PublicKeys, PrivateKeys, QuantumKeys, Activity, Onboarding, Dice, EntropySource, Contacts, FundingWallets, ImportSignedPsbt, Notebooks }
@@ -228,21 +229,7 @@ export component AppWindow inherits Window {
 
     if Ui.screen == Screen.backup-words: BackupWordsScreen { }
 
-    // ---------- 3 · quiz ----------
-    if Ui.screen == Screen.quiz: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
-        padding: 20px;
-        spacing: 12px;
-        alignment: start;
-        Header {
-            title: "Spot check";
-            show-back: true;
-            back => { root.nav-back(); }
-        }
-        Body { text: Quiz.quiz-prompt; }
-        EditField { text <=> Quiz.quiz-answer; placeholder-text: "word  word  word"; }
-        PrimaryButton { text: "Verify"; clicked => { Quiz.quiz-submit(Quiz.quiz-answer); } }
-        Caption { text: Ui.status; color: Pal.bad; }
-    }
+    if Ui.screen == Screen.quiz: QuizScreen { }
 
     // ---------- 4 · home ----------
     if Ui.screen == Screen.home: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
