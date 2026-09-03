@@ -172,10 +172,17 @@ export component AppWindow inherits Window {
         property <string> mirror-rename-address <=> Ui.rename-address;
         property <string> mirror-fund-rename-id <=> Ui.fund-rename-id;
         property <int> mirror-nb-rename-index <=> Ui.nb-rename-index;
+        // U3b: same mirror trick for the two nonces extracted screens/modals
+        // bump instead of calling `back-scope.focus()` / `root.nav-back()`
+        // directly (see Ui.focus-back-scope-nonce / Ui.nav-back-nonce).
+        property <int> mirror-focus-nonce <=> Ui.focus-back-scope-nonce;
+        property <int> mirror-nav-back-nonce <=> Ui.nav-back-nonce;
         changed mirror-screen => { self.focus(); }
         changed mirror-rename-address => { if (mirror-rename-address == "") { self.focus(); } }
         changed mirror-fund-rename-id => { if (mirror-fund-rename-id == "") { self.focus(); } }
         changed mirror-nb-rename-index => { if (mirror-nb-rename-index < 0) { self.focus(); } }
+        changed mirror-focus-nonce => { self.focus(); }
+        changed mirror-nav-back-nonce => { root.nav-back(); }
         key-pressed(event) => {
             if (event.text != Key.Back) { return reject; }
             if (!event.repeat) {
