@@ -1,0 +1,160 @@
+// Screen.contacts -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 7 · contacts ----------
+
+import { Ui, Sweep, Contacts } from "../globals.slint";
+import { Caption, GhostButton, IconButton, Header, Badge, PencilButton, ScanButton, DoorCard } from "../components.slint";
+import { EditField } from "../edit.slint";
+import { Pal } from "../theme.slint";
+import { ListView } from "std-widgets.slint";
+
+export component ContactsScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: Ui.picking-extra ? "Add recipient" : (Ui.pick-mode == "sweep" ? "Sweep to" : "Send to");
+            back => { Ui.nav-back-nonce += 1; }
+            // Sync-status UI (2026-07-20): iCloud contact sync is Apple-only
+            // (icloud.rs has no Android backend yet) — force a re-merge +
+            // push right now so a row's cloud icon updates without waiting
+            // for the next edit or a restart.
+            if Ui.apple-platform: Rectangle {
+                height: 32px;
+                width: sync-now-row.preferred-width + 16px;
+                border-radius: 8px;
+                background: sync-now-ta.has-hover ? Pal.card-hover : transparent;
+                sync-now-ta := TouchArea { clicked => { Contacts.sync-contacts-now(); } }
+                sync-now-row := HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 5px;
+                    alignment: center;
+                    Image {
+                        source: @image-url("../icons/refresh.svg");
+                        colorize: Pal.muted;
+                        width: 14px;
+                        height: 14px;
+                        y: (parent.height - 14px) / 2;
+                    }
+                    Text {
+                        text: "Sync now";
+                        font-size: 12px;
+                        color: Pal.muted;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+        // Self can't be an EXTRA recipient on a multi-recipient note (it's
+        // already the notebook composing the tx) — hidden while adding.
+        if Ui.pick-mode != "sweep" && !Ui.picking-extra: DoorCard {
+            highlight: true;
+            title: "Self — my notebook";
+            subtitle: "A note in your own notebook.";
+            clicked => { Contacts.pick-contact("self"); }
+        }
+        // Divider between the Self card and the address-entry section.
+        if Ui.pick-mode != "sweep" && !Ui.picking-extra: Rectangle { height: 1px; background: Pal.line; }
+        HorizontalLayout {
+            spacing: 10px;
+            EditField {
+                text <=> Ui.contact-input;
+                placeholder-text: "taproot / segwit address";
+                accepted(t) => { Contacts.pick-contact(t); }
+            }
+            ScanButton { clicked => { Contacts.contact-scan(); } }
+            GhostButton { width: 64px; text: "Use"; clicked => { Contacts.pick-contact(Ui.contact-input); } }
+        }
+        if Ui.status != "": Caption { text: Ui.status; color: Pal.bad; }
+        // Sweep = leaving the wallet: destinations are EXTERNAL addresses
+        // (moving coins between notebooks is Consolidate's job).
+        if Ui.pick-mode == "sweep": Caption {
+            text: "The whole wallet — every notebook's coins — goes to this address in one transaction.";
+        }
+        if Ui.contacts.length > 0: Caption { text: "Recently used"; }
+        // Recents list. A ListView / stretched Flickable vertically CENTRES a
+        // short list, leaving a big gap under the "Recently used" separator.
+        // Instead: a content-sized column that sits directly under the
+        // separator, and a trailing stretch spacer that soaks up the leftover
+        // space — so the rows always start at the top and grow downward.
+        recents-col := VerticalLayout {
+            spacing: 6px;
+            for c in Ui.contacts: Rectangle {
+                height: 52px;
+                    ct := TouchArea { clicked => { Contacts.pick-contact(c.address); } }
+                    Rectangle {
+                        y: 2px;
+                        height: parent.height - 6px;
+                        border-radius: 10px;
+                        background: ct.has-hover ? Pal.card-hover : Pal.card;
+                        border-width: 1px;
+                        border-color: Pal.line;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 6px;
+                            spacing: 2px;
+                            // Sync-status UI (2026-07-20): 1 = outcome not
+                            // yet known (plain cloud), 2 = last push
+                            // reached iCloud (check), 3 = iCloud
+                            // unavailable / push failed (alert); 0 (not
+                            // opted in) renders nothing.
+                            if c.sync-status == 1: Image {
+                                source: @image-url("../icons/cloud.svg");
+                                colorize: Pal.muted;
+                                width: 15px;
+                                height: 15px;
+                                y: (parent.height - 15px) / 2;
+                            }
+                            if c.sync-status == 2: Image {
+                                source: @image-url("../icons/cloud-check.svg");
+                                colorize: Pal.good;
+                                width: 15px;
+                                height: 15px;
+                                y: (parent.height - 15px) / 2;
+                            }
+                            if c.sync-status == 3: Image {
+                                source: @image-url("../icons/cloud-alert.svg");
+                                colorize: Pal.warn;
+                                width: 15px;
+                                height: 15px;
+                                y: (parent.height - 15px) / 2;
+                            }
+                            VerticalLayout {
+                                spacing: 3px;
+                                alignment: center;
+                                Text {
+                                    text: c.name == "" ? c.address : c.name;
+                                    font-size: 12px;
+                                    color: Pal.text;
+                                    overflow: elide;
+                                }
+                                if c.name != "": Caption { text: c.address; overflow: elide; }
+                            }
+                            if c.pq: VerticalLayout {
+                                alignment: center;
+                                Badge { label: "PQ"; tint: Pal.accent; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                PencilButton {
+                                    clicked => { Ui.start-rename(c.address, c.name, c.synced); }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                IconButton {
+                                    glyph: "×";
+                                    glyph-size: 20px;
+                                    width: 32px;
+                                    height: 32px;
+                                    glyph-color: Pal.bad;
+                                    clicked => { Contacts.confirm-remove(c.address, c.name); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+    }
