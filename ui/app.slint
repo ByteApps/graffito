@@ -38,6 +38,7 @@ import { PublicKeysScreen } from "screens/public-keys.slint";
 import { PrivateKeysScreen } from "screens/private-keys.slint";
 import { PayFromScreen } from "screens/pay-from.slint";
 import { ChangeScreen } from "screens/change.slint";
+import { TermsScreen } from "screens/terms.slint";
 // Rust (src/lib.rs, via slint::include_modules!()) needs these re-exported
 // from the entry-point file.
 export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem, Ui, Modals, Info, Terms, Settings, BackupWords, ImportKey, Quiz, Home, Note, Compose, Change, PayFrom, Sweep, FundingWalletScreen, ExportPsbt, Confirm, Coins, AccountPicker, PublicKeys, PrivateKeys, QuantumKeys, Activity, Onboarding, Dice, EntropySource, Contacts, FundingWallets, ImportSignedPsbt, Notebooks }
@@ -451,40 +452,7 @@ export component AppWindow inherits Window {
         Caption { text: Ui.status; color: Pal.bad; }
     }
 
-    // ---------- 24 · terms & disclaimer (first-run accept gate + re-view) ----------
-    if Ui.screen == Screen.terms: VerticalLayout { padding-top: Ui.safe-top + 20px; padding-bottom: Ui.safe-bottom + 10px;
-        padding: 24px;
-        spacing: 16px;
-        // View mode (opened from Settings) gets a normal header + back chevron.
-        // Accept mode has NO back chevron — it must be accepted to proceed.
-        if !Ui.terms-accept-mode: Header {
-            title: "Terms & disclaimer";
-            back => { root.nav-back(); }
-        }
-        Rectangle { }  // stretch — vertically centers the block on tall screens
-        if Ui.terms-accept-mode: HorizontalLayout {
-            alignment: center;
-            Image {
-                source: @image-url("icons/bitcoin.svg");
-                colorize: Pal.accent;
-                width: 42px;
-                height: 42px;
-            }
-        }
-        if Ui.terms-accept-mode: H1 {
-            text: "Before you begin";
-            horizontal-alignment: center;
-        }
-        Body {
-            text: Terms.disclaimer-body;
-            font-size: 17px;
-        }
-        Rectangle { }  // stretch
-        if Ui.terms-accept-mode: PrimaryButton {
-            text: "I understand and accept";
-            clicked => { Terms.accept-terms(); }
-        }
-    }
+    if Ui.screen == Screen.terms: TermsScreen { }
 
     // ---------- 25 · info (About / Privacy / Help / Q&A) ----------
     if Ui.screen == Screen.info: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;

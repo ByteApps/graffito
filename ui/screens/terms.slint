@@ -1,0 +1,42 @@
+// Screen.terms -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 24 · terms & disclaimer (first-run accept gate + re-view) ----------
+
+import { Ui, Terms, Settings } from "../globals.slint";
+import { H1, Body, PrimaryButton, Header } from "../components.slint";
+import { Pal } from "../theme.slint";
+
+export component TermsScreen inherits VerticalLayout { padding-top: Ui.safe-top + 20px; padding-bottom: Ui.safe-bottom + 10px;
+        padding: 24px;
+        spacing: 16px;
+        // View mode (opened from Settings) gets a normal header + back chevron.
+        // Accept mode has NO back chevron — it must be accepted to proceed.
+        if !Ui.terms-accept-mode: Header {
+            title: "Terms & disclaimer";
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Rectangle { }  // stretch — vertically centers the block on tall screens
+        if Ui.terms-accept-mode: HorizontalLayout {
+            alignment: center;
+            Image {
+                source: @image-url("../icons/bitcoin.svg");
+                colorize: Pal.accent;
+                width: 42px;
+                height: 42px;
+            }
+        }
+        if Ui.terms-accept-mode: H1 {
+            text: "Before you begin";
+            horizontal-alignment: center;
+        }
+        Body {
+            text: Terms.disclaimer-body;
+            font-size: 17px;
+        }
+        Rectangle { }  // stretch
+        if Ui.terms-accept-mode: PrimaryButton {
+            text: "I understand and accept";
+            clicked => { Terms.accept-terms(); }
+        }
+    }
