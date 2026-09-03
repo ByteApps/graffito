@@ -17,7 +17,7 @@
 // tests/ui_harness_click.rs — the two backend init fns can each run once per
 // process, so they need separate test binaries.
 
-use graffito::AppWindow;
+use graffito::{AppWindow, Screen};
 use i_slint_backend_testing::{ElementHandle, ElementRoot};
 use slint::ComponentHandle;
 
@@ -34,7 +34,7 @@ fn findability_real_buttons_by_label_headless() {
     i_slint_backend_testing::init_no_event_loop();
 
     let app = AppWindow::new().expect("AppWindow");
-    app.set_screen(29); // Settings -> Quantum keys
+    app.set_screen(Screen::QuantumKeys); // Settings -> Quantum keys
 
     let labels: Vec<String> = app
         .root_element()
@@ -81,7 +81,7 @@ fn findability_compose_security_panel() {
     app.window().set_size(slint::LogicalSize::new(430.0, 2400.0));
     // Reproduce the state that reveals the self-pw compose Security panel:
     // a private, notebook-funded self-note with the panel expanded.
-    app.set_screen(6);
+    app.set_screen(Screen::Compose);
     app.set_compose_private(true);
     app.set_watch_only(false);
     app.set_pay_from("notebook".into());

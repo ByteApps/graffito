@@ -10,7 +10,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use graffito::AppWindow;
+use graffito::{AppWindow, Screen};
 use i_slint_backend_testing::ElementHandle;
 use slint::platform::PointerEventButton;
 
@@ -28,7 +28,7 @@ fn single_click_reaches_the_handler_headless() {
 
     slint::spawn_local(async move {
         let app = AppWindow::new().expect("AppWindow");
-        app.set_screen(29);
+        app.set_screen(Screen::QuantumKeys);
 
         let fired = Rc::new(Cell::new(false));
         {
