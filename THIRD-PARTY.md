@@ -102,6 +102,16 @@ cannot use it and is GPL-3.0-or-later instead.
 | [jni](https://crates.io/crates/jni) | 0.21 | MIT OR Apache-2.0 | Keystore, clipboard, intents via JNI |
 | [ndk-context](https://crates.io/crates/ndk-context) | 0.1 | MIT OR Apache-2.0 | JavaVM/Activity handles from the NativeActivity |
 
+## Companion web pages (JavaScript, vendored in `companion/`)
+
+The companion (`companion/`, published to `docs/companion/` → [byteapps.com/graffito/companion](https://byteapps.com/graffito/companion/)) moved here from the Passport Prime app repo on 2026-09-02.
+
+| Library | License | Used for |
+|---|---|---|
+| [jsQR](https://github.com/cozmo/jsQR) (`jsqr.js`) | Apache-2.0 | Camera QR decoding in the browser |
+| [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) (`qrcode-gen.js`) | MIT | QR rendering of sync bundles |
+| `ur.js` | project code | Hand-rolled BC-UR encoder, byte-identical to foundation-ur |
+
 ## Dev dependencies
 
 | Library | Version | License | Used for |
