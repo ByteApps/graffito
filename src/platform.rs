@@ -513,7 +513,7 @@ pub fn build_number() -> Option<String> {
     use objc2_foundation::{NSBundle, NSString};
     let bundle = NSBundle::mainBundle();
     let key = NSString::from_str("CFBundleVersion");
-    let val = unsafe { bundle.objectForInfoDictionaryKey(&key) }?;
+    let val = bundle.objectForInfoDictionaryKey(&key)?;
     let s = val.downcast::<NSString>().ok()?.to_string();
     (!s.is_empty()).then_some(s)
 }
