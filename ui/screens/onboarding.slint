@@ -1,0 +1,72 @@
+// Screen.onboarding -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 0 · onboarding ----------
+
+import { Ui, Onboarding } from "../globals.slint";
+import { H1, Caption, DoorCard } from "../components.slint";
+import { Pal } from "../theme.slint";
+
+export component OnboardingScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 24px;
+        spacing: 14px;
+        alignment: start;
+        Rectangle { height: 26px; }
+        // SVG, not a typed "₿": Android's Roboto has no U+20BF glyph and
+        // skia/femtovg have no font fallback (the icon rule).
+        HorizontalLayout {
+            alignment: center;
+            Image {
+                source: @image-url("../icons/bitcoin.svg");
+                colorize: Pal.accent;
+                width: 34px;
+                height: 34px;
+            }
+        }
+        H1 { text: "Graffito"; horizontal-alignment: center; }
+        Caption {
+            text: "Personal notes on the bitcoin blockchain — permanent, and yours.";
+            horizontal-alignment: center;
+        }
+        Rectangle { height: 12px; }
+        // A key saved on THIS device (iOS keychain entries outlive the app, so
+        // this shows up even after a delete-and-reinstall). It is just another
+        // door, deliberately — ignore it and import or create instead, and
+        // saving that new key overwrites this entry. Face ID fires only on the
+        // tap; launch itself never unlocks.
+        if Onboarding.saved-key-present: DoorCard {
+            highlight: true;
+            title: "Restore saved key";
+            subtitle: "A key saved on this device was found. Unlock it to pick up your notebooks where you left off — or ignore this and set up a different key below.";
+            clicked => { Onboarding.restore-saved-key(); }
+        }
+        DoorCard {
+            highlight: !Onboarding.saved-key-present;
+            title: "Import a key";
+            subtitle: "Any mnemonic, xprv, WIF, or 32-byte hex key — e.g. a BIP-85 child from your hardware wallet. An account xpub imports as watch-only. Type, scan, or open a file.";
+            clicked => { Onboarding.door-import(); }
+        }
+        DoorCard {
+            title: "Create a new 12-word seed";
+            subtitle: "Fresh identity, backed up on paper. For everyone without a hardware wallet.";
+            clicked => { Onboarding.door-create(12); }
+        }
+        DoorCard {
+            title: "Create a new 18-word seed";
+            subtitle: "Same, with a longer phrase.";
+            clicked => { Onboarding.door-create(18); }
+        }
+        DoorCard {
+            title: "Create a new 24-word seed";
+            subtitle: "Same, with the longest phrase.";
+            clicked => { Onboarding.door-create(24); }
+        }
+        // NO separate "Restore from iCloud" door (removed 2026-07-26): an
+        // iCloud-synced key IS a saved key on this device — `identity_exists`
+        // matches it (SynchronizableAny) and `load_secret_protected` reads it
+        // through the same call the iCloud door used. Both doors therefore lit
+        // up for ONE key after a fresh install, and each left different state
+        // behind (auto-unlock vs icloud-backup). "Restore saved key" above
+        // covers both shapes.
+        Caption { text: Ui.status; color: Pal.bad; }
+    }
