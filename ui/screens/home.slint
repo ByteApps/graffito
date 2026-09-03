@@ -1,0 +1,239 @@
+// Screen.home -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 4 · home ----------
+
+import { Ui, Settings, Home, Compose } from "../globals.slint";
+import { Caption, Mono, Card, PrimaryButton, SvgIconButton, SyncButton, BackButton, Badge, CopyButton, QrArea, WebViewButton } from "../components.slint";
+import { Pal } from "../theme.slint";
+import { ListView } from "std-widgets.slint";
+
+export component HomeScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        HorizontalLayout {
+            spacing: 8px;
+            height: 40px;
+            BackButton { clicked => { Ui.open-notebooks(); } }
+            Text {
+                text: Home.notebook-title;
+                font-size: 19px;
+                font-weight: 700;
+                color: Pal.text;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Rectangle { }
+            SyncButton {
+                net-busy: Ui.net-busy;
+                sync => { Ui.refresh(); }
+                busy-tapped => { Ui.sync-busy-toast(); }
+            }
+            SvgIconButton { icon: "activity"; clicked => { Ui.open-activity(); } }
+            // No settings gear here (Sal 2026-07-11): settings is
+            // wallet-level, reachable from the notebook list only.
+        }
+        Card {
+            height: 132px;
+            HorizontalLayout {
+                padding: 12px;
+                spacing: 14px;
+                Rectangle {
+                    width: 100px;
+                    height: 100px;
+                    background: white;
+                    border-radius: 8px;
+                    QrArea {
+                        img: Home.address-qr;
+                        qr-size: 92px;
+                        x: 4px;
+                        y: 4px;
+                    }
+                    // Tap the QR to enlarge it for scanning by another device.
+                    TouchArea {
+                        clicked => {
+                            Ui.qr-zoom-image = Home.address-qr;
+                            Ui.qr-zoom-open = true;
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 4px;
+                    Text {
+                        text: Home.balance-line;
+                        font-size: 17px;
+                        font-weight: 700;
+                        color: Pal.text;
+                    }
+                    HorizontalLayout {
+                        spacing: 4px;
+                        Mono {
+                            text: Ui.address;
+                            font-size: 10px;
+                            color: Pal.muted;
+                            vertical-alignment: center;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            CopyButton { clicked => { Ui.copy-text("address", Ui.address); } }
+                        }
+                    }
+                    if Ui.watch-only: HorizontalLayout {
+                        alignment: start;
+                        Badge { label: "watch-only"; tint: Pal.warn; }
+                    }
+                    Caption { text: Ui.status; }
+                }
+            }
+        }
+        PrimaryButton { text: "+  Compose note"; clicked => { Home.compose-open(); } }
+        if Ui.watch-only: Caption { text: "Watch-only — public notes only, signed on your external wallet. Private notes need the key."; }
+        // Sender filter header: tap to expand the per-sender checklist; the
+        // warn pill flags a persisted exclusion so hidden notes are never a
+        // silent mystery.
+        Rectangle {
+            height: 24px;
+            if Ui.senders.length > 1: TouchArea { clicked => { Home.filter-expanded = !Home.filter-expanded; } }
+            HorizontalLayout {
+                spacing: 8px;
+                Caption {
+                    text: Ui.notes.length == 0
+                        ? (Ui.watch-only ? "No notes on this address yet." : "No notes yet — fund the address above, then compose.")
+                        : "Notes";
+                    vertical-alignment: center;
+                }
+                if Home.hidden-senders-label != "": Badge { label: Home.hidden-senders-label; tint: Pal.warn; }
+                Rectangle { }
+                if Ui.senders.length > 1: HorizontalLayout {
+                    spacing: 6px;
+                    Caption { text: "Senders"; vertical-alignment: center; }
+                    VerticalLayout {
+                        alignment: center;
+                        Image {
+                            source: Home.filter-expanded
+                                ? @image-url("../icons/caret-up.svg")
+                                : @image-url("../icons/caret-down.svg");
+                            colorize: Pal.muted;
+                            width: 12px;
+                            height: 12px;
+                        }
+                    }
+                }
+            }
+        }
+        if Home.filter-expanded: VerticalLayout {
+            spacing: 4px;
+            for s in Ui.senders: Rectangle {
+                height: 36px;
+                border-radius: 8px;
+                background: s-ta.has-hover ? Pal.card-hover : Pal.card;
+                border-width: 1px;
+                border-color: Pal.line;
+                s-ta := TouchArea { clicked => { Home.toggle-sender(s.key, !s.excluded); } }
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 12px;
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 16px;
+                            height: 16px;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: s.excluded ? Pal.line : Pal.accent;
+                            background: s.excluded ? transparent : Pal.accent.with-alpha(0.18);
+                            if !s.excluded: Image {
+                                source: @image-url("../icons/check.svg");
+                                colorize: Pal.accent;
+                                width: 11px;
+                                height: 11px;
+                                x: 2.5px;
+                                y: 2.5px;
+                            }
+                        }
+                    }
+                    Text {
+                        text: s.label;
+                        font-size: 12px;
+                        color: s.excluded ? Pal.muted : Pal.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Rectangle { }
+                    Caption { text: s.sub; vertical-alignment: center; }
+                }
+            }
+        }
+        // Notebook list — top-aligned + scrollable (a plain ListView vertically
+        // centres a short list). Matches the Settings-screen Flickable pattern.
+        Flickable {
+            viewport-height: notes-col.preferred-height;
+            notes-col := VerticalLayout {
+                alignment: start;
+                spacing: 6px;
+                for note in Ui.notes: Rectangle {
+                height: 62px;
+                nt := TouchArea { clicked => { Home.open-note(note.id); } }
+                Rectangle {
+                    y: 2px;
+                    height: parent.height - 6px;
+                    border-radius: 10px;
+                    background: nt.has-hover ? Pal.card-hover : Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    HorizontalLayout {
+                        x: 14px;
+                        width: note.web-url != "" ? parent.width - 60px : parent.width - 26px;
+                        height: parent.height;
+                        spacing: 8px;
+                        Rectangle {
+                            width: 16px;
+                            if note.private: Image {
+                                source: @image-url("../icons/lock.svg");
+                                colorize: Pal.muted;
+                                width: 13px;
+                                height: 13px;
+                                x: 0;
+                                y: (parent.height - 13px) / 2;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 6px;
+                            Text {
+                                text: note.title;
+                                horizontal-alignment: left;
+                                font-size: 13px;
+                                color: Pal.text;
+                                overflow: elide;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                height: 20px;
+                                Badge {
+                                    label: note.badge;
+                                    tint: note.badge == "confirmed" ? Pal.good
+                                        : (note.badge == "pending" ? Pal.warn : Pal.bad);
+                                }
+                                if note.locked: Badge { label: "locked"; tint: Pal.warn; }
+                                Caption {
+                                    text: note.meta;
+                                    vertical-alignment: center;
+                                    height: 20px;
+                                }
+                            }
+                        }
+                    }
+                    if note.web-url != "": WebViewButton {
+                        x: parent.width - 44px;
+                        y: (parent.height - self.height) / 2;
+                        clicked => { Home.open-note-web-url(note.web-url); }
+                    }
+                }
+            }
+            }
+        }
+    }
