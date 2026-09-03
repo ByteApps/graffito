@@ -91,6 +91,10 @@ pub struct ChainClient<T: Transport> {
     pub network: Network,
 }
 
+/// [`ChainClient::fetch_tx_io`]'s return: spendable input coins, output
+/// (scriptPubKey, value) pairs, and whether the tx is confirmed.
+type TxIoResult = (Vec<crate::psbt_build::WatchCoin>, Vec<(Vec<u8>, u64)>, bool);
+
 impl<T: Transport> ChainClient<T> {
     pub fn new(transport: T, network: Network) -> Self {
         ChainClient { transport, network }
@@ -143,7 +147,7 @@ impl<T: Transport> ChainClient<T> {
         // handling differs by backend. Guard on it: keep paging while a page
         // brings NEW txids; stop as soon as one adds nothing (empty, or a
         // backend that ignored the cursor and echoed a page we've seen).
-        let mut last = txs.iter().filter(|t| t.status.confirmed).last().map(|t| t.txid.clone());
+        let mut last = txs.iter().rfind(|t| t.status.confirmed).map(|t| t.txid.clone());
         while let Some(after) = last.take() {
             let page: Vec<EsploraTx> = parse_json(&self.transport.get_text(&format!(
                 "/address/{address}/txs/chain/{after}"
@@ -153,7 +157,7 @@ impl<T: Transport> ChainClient<T> {
             if fresh.is_empty() {
                 break;
             }
-            last = fresh.iter().filter(|t| t.status.confirmed).last().map(|t| t.txid.clone());
+            last = fresh.iter().rfind(|t| t.status.confirmed).map(|t| t.txid.clone());
             txs.extend(fresh);
         }
         Ok(txs)
@@ -375,7 +379,7 @@ impl<T: Transport> ChainClient<T> {
         &self,
         txid: &str,
         index_of: impl Fn(&str) -> Option<u32>,
-    ) -> Result<(Vec<crate::psbt_build::WatchCoin>, Vec<(Vec<u8>, u64)>, bool), Error> {
+    ) -> Result<TxIoResult, Error> {
         let t: EsploraTx = parse_json(&self.transport.get_text(&format!("/tx/{txid}"))?)?;
         let mut coins = Vec::with_capacity(t.vin.len());
         for vin in &t.vin {
@@ -691,8 +695,7 @@ pub fn discover_spending<T: Transport>(
         let mut index = 0u32;
         let mut first_unused: Option<u32> = None;
         let mut transport_error = false;
-        loop {
-            let Ok(d) = source.derive(chain, index) else { break };
+        while let Ok(d) = source.derive(chain, index) {
             match client.address_probe(&d.address) {
                 Ok((true, _)) => {
                     used.push(crate::notebooks::SpendingAddr {

@@ -156,6 +156,7 @@ impl FundingSource {
     ///   * a multipath descriptor `tr(<key>/<0;1>/*)` (hardware-wallet export),
     ///   * a single-chain descriptor `tr(<key>/0/*)` (change reuses it), or
     ///   * a bare `xpub…`/`tpub…` (wrapped as taproot BIP-86 `tr(<xpub>/<0;1>/*)`).
+    ///
     /// Key origins `[fingerprint/path]` are preserved when present.
     pub fn parse(input: &str, network: notes_core::Network) -> Result<Self, Error> {
         let s = input.trim();

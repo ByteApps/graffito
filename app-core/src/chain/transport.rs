@@ -257,6 +257,10 @@ impl Transport for HttpTransport {
 /// whichever variant [`AnyTransport::new`] picked, so `ChainClient`, every
 /// free scan function, `netq`, `store`, `compose`, and the whole UI layer
 /// stay untouched — no `dyn`, no generics fallout.
+// Boxing `Core` would shrink the enum but ripples `AnyTransport::Core(_)`
+// through every match site in this crate, its tests/examples, and the
+// graffito shell — out of scope for a hygiene-only pass.
+#[allow(clippy::large_enum_variant)]
 pub enum AnyTransport {
     /// `http(s)://host/api` — mempool.space/Esplora, unchanged behavior.
     Esplora(HttpTransport),

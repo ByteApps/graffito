@@ -4,7 +4,7 @@
 //! Handles (BCR-2020-007/010/015):
 //!   * `crypto-account`            — master fingerprint + an array of descriptors
 //!   * `crypto-output-descriptor`  — one descriptor (old tagged form OR the newer
-//!                                   text-`source` map)
+//!     text-`source` map)
 //!   * `crypto-hdkey`              — a bare account xpub (taken as taproot BIP-86)
 //!
 //! Only the single-sig `tr(...)` (tag 409) and `wpkh(...)` (tag 404) script
@@ -179,9 +179,9 @@ fn as_map(v: &Value) -> Option<&Vec<(Value, Value)>> {
     v.as_map()
 }
 
-fn map_get<'a>(map: &'a [(Value, Value)], key: i128) -> Option<&'a Value> {
+fn map_get(map: &[(Value, Value)], key: i128) -> Option<&Value> {
     map.iter().find_map(|(k, val)| {
-        k.as_integer().and_then(|i| i128::try_from(i).ok()).filter(|&i| i == key).map(|_| val)
+        k.as_integer().map(i128::from).filter(|&i| i == key).map(|_| val)
     })
 }
 
