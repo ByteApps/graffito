@@ -26,6 +26,7 @@ import { ComposeScreen } from "screens/compose.slint";
 import { ContactsScreen } from "screens/contacts.slint";
 import { SettingsScreen } from "screens/settings.slint";
 import { AccountPickerScreen } from "screens/account-picker.slint";
+import { CoinsScreen } from "screens/coins.slint";
 // Rust (src/lib.rs, via slint::include_modules!()) needs these re-exported
 // from the entry-point file.
 export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem, Ui, Modals, Info, Terms, Settings, BackupWords, ImportKey, Quiz, Home, Note, Compose, Change, PayFrom, Sweep, FundingWalletScreen, ExportPsbt, Confirm, Coins, AccountPicker, PublicKeys, PrivateKeys, QuantumKeys, Activity, Onboarding, Dice, EntropySource, Contacts, FundingWallets, ImportSignedPsbt, Notebooks }
@@ -397,140 +398,7 @@ export component AppWindow inherits Window {
 
     if Ui.screen == Screen.account-picker: AccountPickerScreen { }
 
-    // ---------- 10 · coins ----------
-    if Ui.screen == Screen.coins: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
-        padding: 20px;
-        spacing: 12px;
-        Header {
-            title: "Coins";
-            show-sync: true;
-            net-busy: Ui.net-busy;
-            back => { root.nav-back(); }
-            sync => { Ui.refresh-coins(); }
-            busy-tapped => { Ui.sync-busy-toast(); }
-        }
-        Caption {
-            text: Ui.coins-segment == "spending"
-                ? "The spending wallet's coins — fresh bc1q addresses that pay for notes, keeping funds off the public notebook."
-                : (Ui.watch-only
-                    ? "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating signs on your external wallet."
-                    : "Every notebook's unspent outputs — a note tx spends from its own notebook's coins. Consolidating gathers them into ONE coin at an address you pick.");
-        }
-        if Ui.spending-capable && Ui.spending-enabled: HorizontalLayout {
-            spacing: 8px;
-            alignment: start;
-            SelectPill { text: "notebook"; active: Ui.coins-segment == "notebook"; clicked => { Ui.coins-segment = "notebook"; } }
-            SelectPill { text: "spending"; active: Ui.coins-segment == "spending"; clicked => { Ui.set-coins-segment("spending"); } }
-        }
-        // Viewer-first: the list is the point; consolidation is the ONE
-        // action button on top (wallet-level — all notebooks at once).
-        if Ui.coins-segment == "notebook": GhostButton {
-            text: "Consolidate wallet…";
-            clicked => { Coins.consolidate-wallet-open(); }
-        }
-        // CHANGE 3 (2026-07-17): the spending segment gets its own ONE
-        // consolidate button (merges every spending coin into one, at the
-        // NEXT FRESH spending receive address) — disabled below 2 coins.
-        if Ui.coins-segment == "spending": GhostButton {
-            text: "Consolidate spending coins…";
-            opacity: Coins.spending-coins-list.length >= 2 ? 1.0 : 0.4;
-            clicked => { if (Coins.spending-coins-list.length >= 2) { Coins.spending-consolidate-open(); } }
-        }
-        // Deep gap-20 rescan for a seed used in ANOTHER BIP-84 wallet beyond the
-        // shallow gap-3 the automatic scan walks (2026-07-23). Placed here (not
-        // Settings) so it doesn't shift the Settings sweep/consolidate cards.
-        if Ui.coins-segment == "spending": GhostButton {
-            text: "Scan for existing funds…";
-            clicked => { Coins.spending-scan-deep(); }
-        }
-        if Ui.coins-segment == "notebook": Body { text: Ui.coins-summary; font-size: 12px; }
-        if Ui.coins-segment == "spending": Body { text: Ui.spending-balance-line; font-size: 12px; }
-        if Ui.coins-segment == "notebook": Flickable {
-            viewport-height: coins-col.preferred-height;
-            coins-col := VerticalLayout {
-                spacing: 8px;
-                alignment: start;
-                for c in Ui.coins: Rectangle {
-                    height: cil.preferred-height;
-                    border-radius: 10px;
-                    background: Pal.card;
-                    border-width: 1px;
-                    border-color: Pal.line;
-                    cil := VerticalLayout {
-                        padding: 12px;
-                        spacing: 4px;
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Text {
-                                text: c.value + " sats";
-                                font-size: 13px;
-                                font-weight: 700;
-                                color: Pal.text;
-                            }
-                            // "change" (taproot change-chain coins, unit 3) gets the
-                            // accent tint so it reads distinctly from a notebook-name
-                            // badge at a glance, same Badge component either way.
-                            if c.notebook != "": Badge {
-                                label: c.notebook;
-                                tint: c.notebook == "change" ? Pal.accent : Pal.muted;
-                            }
-                            Rectangle { }
-                            Badge {
-                                label: c.status;
-                                tint: c.status == "confirmed" ? Pal.good : Pal.warn;
-                            }
-                        }
-                        Mono {
-                            text: c.outpoint;
-                            font-size: 10px;
-                            color: Pal.muted;
-                            wrap: no-wrap;
-                            overflow: elide;
-                        }
-                    }
-                }
-            }
-        }
-        if Ui.coins-segment == "spending": Flickable {
-            viewport-height: spending-coins-col.preferred-height;
-            spending-coins-col := VerticalLayout {
-                spacing: 8px;
-                alignment: start;
-                for c in Coins.spending-coins-list: Rectangle {
-                    height: scil.preferred-height;
-                    border-radius: 10px;
-                    background: Pal.card;
-                    border-width: 1px;
-                    border-color: Pal.line;
-                    scil := VerticalLayout {
-                        padding: 12px;
-                        spacing: 4px;
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Text {
-                                text: c.value + " sats";
-                                font-size: 13px;
-                                font-weight: 700;
-                                color: Pal.text;
-                            }
-                            Rectangle { }
-                            Badge {
-                                label: c.status;
-                                tint: c.status == "confirmed" ? Pal.good : Pal.warn;
-                            }
-                        }
-                        Mono {
-                            text: c.address;
-                            font-size: 10px;
-                            color: Pal.muted;
-                            wrap: no-wrap;
-                            overflow: elide;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    if Ui.screen == Screen.coins: CoinsScreen { }
 
     // ---------- 11 · activity (transactions) ----------
     if Ui.screen == Screen.activity: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
