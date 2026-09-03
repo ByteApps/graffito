@@ -146,9 +146,12 @@ impl Drop for NetOpGuard {
 /// the account-picker probe (`show_notebook_picker`), iCloud ops — stays
 /// a plain `std::thread::spawn`: money movements and user-facing probes
 /// must never wait behind a queued scan.
-static SCAN_LANE: std::sync::LazyLock<
-    std::sync::Mutex<(app_core::netq::Lane, HashMap<app_core::netq::JobId, Box<dyn FnOnce() + Send>>)>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new((app_core::netq::Lane::new(), HashMap::new())));
+/// [`SCAN_LANE`]'s guarded state: the admission-rule lane plus the queued
+/// jobs it has admitted but not yet run, keyed by their `JobId`.
+type ScanLaneState = (app_core::netq::Lane, HashMap<app_core::netq::JobId, Box<dyn FnOnce() + Send>>);
+
+static SCAN_LANE: std::sync::LazyLock<std::sync::Mutex<ScanLaneState>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new((app_core::netq::Lane::new(), HashMap::new())));
 
 /// Submit a scan-class job to [`SCAN_LANE`] — the impure half of
 /// `app_core::netq::Lane`'s pure admission rules. `key` identifies the
@@ -259,6 +262,11 @@ enum SyncStatus {
     Failed,
 }
 
+/// [`State::pq_recipient_cache`]'s value: whether the cached contact has a
+/// key on file at all (outer `Option`), and if so, whether the stored
+/// armor parsed (inner `Result`).
+type PqRecipientCacheEntry = (String, Option<Result<(app_core::passphrase::MlKemLevel, String), String>>);
+
 struct State {
     data_dir: PathBuf,
     network: Network,
@@ -363,7 +371,7 @@ struct State {
     /// own doc comment asks for this). Outer `Option` on the value =
     /// whether that contact has a key on file at all; inner `Result` =
     /// whether the stored armor parsed.
-    pq_recipient_cache: Option<(String, Option<Result<(app_core::passphrase::MlKemLevel, String), String>>)>,
+    pq_recipient_cache: Option<PqRecipientCacheEntry>,
     /// Settings → "Quantum keys" (screen 29): device-level default ML-KEM
     /// parameter level for THIS notebook's derived receive key
     /// (config.json "pq_level"). Absent config key (every pre-C2 config)
@@ -2003,7 +2011,7 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
             store
                 .txs
                 .iter()
-                .find(|t| t.txids.iter().any(|x| *x == ref_id))
+                .find(|t| t.txids.contains(&ref_id))
                 .and_then(|t| t.txids.last().cloned())
         }
     };
@@ -2020,7 +2028,7 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
         && st
             .store
             .as_ref()
-            .map(|s| s.txs.iter().any(|t| t.txids.iter().any(|x| *x == ref_id) && t.mixed_inputs))
+            .map(|s| s.txs.iter().any(|t| t.txids.contains(&ref_id) && t.mixed_inputs))
             .unwrap_or(false)
     {
         w.set_status(
@@ -2264,10 +2272,9 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
             Some(app_core::funding::FundingKind::Wpkh) => InputWeightPrediction::P2WPKH_MAX,
             _ => InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH,
         };
-        let weights = std::iter::repeat(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH)
-            .take(n)
-            .chain(std::iter::repeat(fund_w).take(st.funding_coins.len()));
-        let vsize = predict_weight(weights, [dest_spk_len, 34usize].into_iter()).to_vbytes_ceil();
+        let weights = std::iter::repeat_n(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH, n)
+            .chain(std::iter::repeat_n(fund_w, st.funding_coins.len()));
+        let vsize = predict_weight(weights, [dest_spk_len, 34usize]).to_vbytes_ceil();
         let fee = (vsize as f64 * rate).ceil() as u64;
         let funding_total: u64 = st.funding_coins.iter().map(|c| c.value).sum();
         if funding_total < fee {
@@ -2290,9 +2297,8 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
         // to build the tx); the all-taproot path is untouched.
         let vsize = if sp_n > 0 {
             use app_core::notes_core::tx::{estimate_vsize_mixed, InputKind};
-            let kinds: Vec<InputKind> = std::iter::repeat(InputKind::Taproot)
-                .take(n)
-                .chain(std::iter::repeat(InputKind::P2wpkh).take(sp_n))
+            let kinds: Vec<InputKind> = std::iter::repeat_n(InputKind::Taproot, n)
+                .chain(std::iter::repeat_n(InputKind::P2wpkh, sp_n))
                 .collect();
             estimate_vsize_mixed(&kinds, &[], &[dest_spk_len]) as u64
         } else {
@@ -2629,7 +2635,7 @@ fn compose_core_url(input: &str, network: Network) -> Result<(String, Option<(St
                 let port = p.parse::<u16>().map_err(|_| format!("invalid port {p:?}"))?;
                 (h.to_string(), Some(port))
             }
-            Some((h, _)) if h.is_empty() => {
+            Some(("", _)) => {
                 return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:8332".to_string())
             }
             _ => (authority.to_string(), None),
@@ -2991,7 +2997,7 @@ fn commas(n: u64) -> String {
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in b.iter().enumerate() {
-        if i > 0 && (b.len() - i) % 3 == 0 {
+        if i > 0 && (b.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*c as char);
@@ -3091,47 +3097,6 @@ fn friendly_net_err(raw: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod net_err_tests {
-    use super::*;
-
-    #[test]
-    fn rate_limit_becomes_a_calm_retry_message() {
-        let raw = "http: 429 Too Many Requests: <html><body>rate limited</body></html>";
-        assert_eq!(friendly_net_err(raw), "server is busy — retrying shortly");
-        // app-core's trim_error_body format (no reason phrase) matches too.
-        assert_eq!(friendly_net_err("http: 429: Too Many Requests"), "server is busy — retrying shortly");
-        assert_eq!(friendly_net_err("429: Too Many Requests"), "server is busy — retrying shortly");
-    }
-
-    #[test]
-    fn a_429_sat_amount_in_a_rejection_is_not_a_rate_limit() {
-        // "429" as a literal fee value must pass through as the real
-        // rejection, not become a misleading "server is busy".
-        let raw = "http: 400: sendrawtransaction min relay fee not met, 429 < 1000";
-        assert_eq!(friendly_net_err(raw), raw);
-    }
-
-    #[test]
-    fn html_bodies_are_stripped_and_whitespace_collapsed() {
-        let raw = "http: 500 Internal Server Error:  \n  <html>\n<body>boom</body></html>";
-        assert_eq!(friendly_net_err(raw), "http: 500 Internal Server Error:");
-    }
-
-    #[test]
-    fn short_plain_errors_pass_through_untouched() {
-        assert_eq!(friendly_net_err("connection reset"), "connection reset");
-    }
-
-    #[test]
-    fn very_long_errors_are_capped() {
-        let raw = "e".repeat(200);
-        let out = friendly_net_err(&raw);
-        assert_eq!(out.chars().count(), 123); // 120 + "..."
-        assert!(out.ends_with("..."));
-    }
-}
-
 /// U5 (`../PLAN-chain-notes-app-core-rpc.md` §2.1/§2.4): Bitcoin Core's
 /// rejection vocabulary — `testmempoolaccept` reject-reason tokens
 /// (`"txn-already-known"`, `"min relay fee not met, ..."`,
@@ -3213,100 +3178,6 @@ fn friendly_broadcast_err(e: &str, base_url: &str) -> String {
             Some(msg) => msg.to_string(),
             None => friendly_net_err(e),
         },
-    }
-}
-
-#[cfg(test)]
-mod broadcast_err_tests {
-    use super::*;
-
-    #[test]
-    fn transport_errors_become_a_friendly_host_message() {
-        let e = "transport: error sending request for url (https://mempool.space/testnet4/api/tx)";
-        assert_eq!(
-            friendly_broadcast_err(e, "https://mempool.space/testnet4/api"),
-            "network error reaching mempool.space — check your connection"
-        );
-    }
-
-    #[test]
-    fn transport_errors_fall_back_when_base_url_is_unknown() {
-        let e = "transport: connection reset";
-        assert_eq!(
-            friendly_broadcast_err(e, ""),
-            "network error reaching your node — check your connection"
-        );
-    }
-
-    #[test]
-    fn server_rejections_pass_through_untouched() {
-        let e = "http: 400 Bad Request: bad-txns-in-belowout";
-        assert_eq!(friendly_broadcast_err(e, "https://mempool.space/testnet4/api"), e);
-    }
-
-    #[test]
-    fn non_broadcast_errors_pass_through_untouched() {
-        let e = "no signed PSBT";
-        assert_eq!(friendly_broadcast_err(e, "https://mempool.space/api"), e);
-    }
-
-    /// U5 (plan §2.1/§2.4): the four common rejection categories must read
-    /// IDENTICALLY whether the raw text came from Core's short
-    /// `testmempoolaccept` reject-reason tokens or from a
-    /// `sendrawtransaction` RPC-error message forwarded verbatim — proving
-    /// the mapping is keyed on the CONDITION, not on which backend's exact
-    /// wording happened to arrive.
-    #[test]
-    fn already_broadcast_reads_identically_regardless_of_wording() {
-        let core_testmempoolaccept = "http: 400: txn-already-known";
-        let core_sendraw_rpc_error = "http: bitcoind [-27]: Transaction already in block chain";
-        let esplora_like = "http: 400 Bad Request: already in mempool";
-        let expected = "already broadcast — this transaction is already on the network";
-        assert_eq!(friendly_broadcast_err(core_testmempoolaccept, "bitcoind+http://127.0.0.1:8332"), expected);
-        assert_eq!(friendly_broadcast_err(core_sendraw_rpc_error, "bitcoind+http://127.0.0.1:8332"), expected);
-        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
-    }
-
-    #[test]
-    fn fee_too_low_reads_identically_regardless_of_wording() {
-        let core = "http: 400: min relay fee not met, 300 < 1000";
-        let esplora_like = "http: 400 Bad Request: insufficient fee, rejecting replacement";
-        let expected = "fee too low — increase the fee and try again";
-        assert_eq!(friendly_broadcast_err(core, "bitcoind+http://127.0.0.1:8332"), expected);
-        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
-    }
-
-    #[test]
-    fn missing_inputs_reads_identically_regardless_of_wording() {
-        let core = "http: 400: bad-txns-inputs-missingorspent";
-        let esplora_like = "http: 400 Bad Request: missing inputs";
-        let expected = "inputs missing or already spent — this transaction can't be sent";
-        assert_eq!(friendly_broadcast_err(core, "bitcoind+http://127.0.0.1:8332"), expected);
-        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
-    }
-
-    #[test]
-    fn non_final_reads_identically_regardless_of_wording() {
-        let core = "http: 400: non-final";
-        let esplora_like = "http: 400 Bad Request: transaction is not final";
-        let expected = "not final yet — try again once its timelock has passed";
-        assert_eq!(friendly_broadcast_err(core, "bitcoind+http://127.0.0.1:8332"), expected);
-        assert_eq!(friendly_broadcast_err(esplora_like, "https://mempool.space/api"), expected);
-    }
-
-    /// The pre-existing 429-in-a-fee-body guard ([`friendly_net_err`]'s own
-    /// `a_429_sat_amount_in_a_rejection_is_not_a_rate_limit` test) must
-    /// stay intact through this new layer too: a literal "429" sat amount
-    /// inside a min-relay-fee rejection must land on the FEE message, never
-    /// the "server is busy" one — `map_broadcast_rejection` runs BEFORE
-    /// `friendly_net_err`'s 429 check ever sees this text.
-    #[test]
-    fn a_429_sat_amount_in_a_fee_rejection_still_maps_to_fee_too_low_not_rate_limit() {
-        let e = "http: 400: sendrawtransaction min relay fee not met, 429 < 1000";
-        assert_eq!(
-            friendly_broadcast_err(e, "bitcoind+http://127.0.0.1:8332"),
-            "fee too low — increase the fee and try again"
-        );
     }
 }
 
@@ -3464,91 +3335,6 @@ fn activate(st: &mut State, material_str: &str, persist: bool) -> Result<(), Str
     st.save_store();
     st.save_config();
     Ok(())
-}
-
-/// Complementary to `core_rpc_wiring_contract` (below `open_client_watched`,
-/// further down this file): that module guards every CALL SITE reaching for
-/// `st.core_rpc_watch`; this one guards where the value itself comes from —
-/// `activate()`'s one-line delegation to `app_core::chain::identity_watch_descriptors`
-/// two screens up. A real `State` (via the existing `State::test_stub`,
-/// which enumerates every field on purpose — see its own doc comment) with
-/// a throwaway temp `data_dir` so `save_store`/`save_config` have somewhere
-/// to write; `persist: false` so this never touches the Keychain.
-#[cfg(test)]
-mod activate_core_rpc_watch_tests {
-    use super::*;
-
-    const MNEMONIC: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-    const WIF: &str = "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn";
-    const WATCH_XPUB: &str = "xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ";
-
-    fn activated_stub(tag: &str, material: &str) -> State {
-        let mut st =
-            State::test_stub(Network::Mainnet, HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
-        let dir = std::env::temp_dir().join(format!("cn-activate-watch-{tag}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        st.data_dir = dir;
-        activate(&mut st, material, false).unwrap_or_else(|e| panic!("activate({tag}) failed: {e}"));
-        st
-    }
-
-    /// A hierarchical (mnemonic) identity gets BOTH families: the account's
-    /// notebook `tr()` descriptor and its `wpkh()` spending descriptor
-    /// (`can_derive_spending` is true for any hierarchical material) — this
-    /// is the len == 2 case every one of the 6 watched call sites relies on
-    /// actually being non-empty, or `open_client_watched` degrades to the
-    /// exact same per-address fallback the plain constructor uses (its own
-    /// doc comment: `if !descriptors.is_empty()`).
-    #[test]
-    fn hierarchical_mnemonic_populates_both_descriptor_families() {
-        let st = activated_stub("mnemonic", MNEMONIC);
-        assert_eq!(
-            st.core_rpc_watch.len(),
-            2,
-            "activate() must populate core_rpc_watch with the notebook + spending \
-             descriptor families for hierarchical material — got {:?}",
-            st.core_rpc_watch
-        );
-        assert!(st.core_rpc_watch[0].descriptor.starts_with("tr("));
-        assert!(st.core_rpc_watch[1].descriptor.starts_with("wpkh("));
-    }
-
-    /// A single-key (WIF) identity has exactly ONE address — nothing to
-    /// range over — so `core_rpc_watch` must stay empty and every lookup
-    /// keeps going through the per-address `addr()` fallback, unchanged.
-    /// An accidental non-empty result here would be silently harmless today
-    /// (the fallback still works) but would mean `identity_watch_descriptors`
-    /// no longer matches its own doc comment's single-key case.
-    #[test]
-    fn single_key_wif_leaves_core_rpc_watch_empty() {
-        let st = activated_stub("wif", WIF);
-        assert!(
-            st.core_rpc_watch.is_empty(),
-            "single-key (WIF) material must not populate core_rpc_watch — got {:?}",
-            st.core_rpc_watch
-        );
-    }
-
-    /// Watch-only (ranged xpub) gets exactly the ONE notebook family — no
-    /// spending descriptor, since `can_derive_spending` requires a private
-    /// hierarchical key this identity doesn't have. The descriptor text
-    /// itself is the bare xpub verbatim (`keyexport::export_formats`'s
-    /// `watch_only_yields_descriptor_no_private` test pins the same
-    /// behavior) — `FundingSource::parse`/`watch_descriptors` wrap a bare
-    /// xpub in `tr(.../<0;1>/*)` themselves, so this is not re-wrapped here.
-    #[test]
-    fn watch_only_xpub_populates_exactly_one_descriptor_family() {
-        let st = activated_stub("xpub", WATCH_XPUB);
-        assert_eq!(
-            st.core_rpc_watch.len(),
-            1,
-            "watch-only xpub material must populate exactly one (notebook) descriptor \
-             family — got {:?}",
-            st.core_rpc_watch
-        );
-        assert_eq!(st.core_rpc_watch[0].descriptor, WATCH_XPUB);
-    }
 }
 
 fn is_hierarchical(material_str: &str, network: Network) -> bool {
@@ -4985,7 +4771,7 @@ fn update_home(w: &AppWindow, st: &State) {
         w.set_address_qr(img);
     }
     w.set_balance_line(
-        format!("{} sats · block {}", commas(store.balance()), commas(store.tip_height as u64))
+        format!("{} sats · block {}", commas(store.balance()), commas(store.tip_height))
             .into(),
     );
     // Sender filter: the checklist model + the "hidden" pill, then the
@@ -5304,242 +5090,6 @@ fn open_client_watched(
     Ok(client)
 }
 
-/// Source-contract test guarding the U7 ranged-descriptor wiring
-/// (`open_client_watched`, above) — the GUI app's counterpart to
-/// `core_rpc_cli_scan_wires_ranged_watch_descriptors`
-/// (`app-core/tests/core_rpc_conformance.rs`), which proves the SAME
-/// mechanism end-to-end but only for `examples/cli.rs`; it never touches
-/// this file's own production call sites, so a regression here (a 7th
-/// address-resolving site added on the plain constructor, or one of the
-/// 6 existing sites reverted to it) stays green forever otherwise — that
-/// gap is what this module closes.
-///
-/// This can't run against a live node (`cargo test --lib` has none, by
-/// design — see the workspace CLAUDE.md), so it inspects the SOURCE TEXT
-/// of this very file instead (`include_str!`, so it always sees the
-/// CURRENT contents, mutation and all). Brittle by nature — same
-/// tradeoff as the `cb:`/`cli:` log-grep contracts already documented in
-/// the workspace CLAUDE.md — but it is what turns red on exactly the two
-/// regressions the U7 gap allows: (1) reverting one of the 6 named sites
-/// below to plain `open_client`, and (2) swapping any of their
-/// descriptor arguments for an empty slice (`&[]`) — which calls
-/// `open_client_watched` but is behaviorally identical to the plain
-/// constructor, since `watch_descriptors` is a no-op on an empty list.
-///
-/// Why not make `open_client` itself always configure watching (the
-/// stronger fix that would remove this choice entirely)? Evaluated and
-/// rejected: `watch_descriptors` is NOT free per call — a fresh
-/// `CoreRpcTransport` is built on every `open_client`, `wallet_ready`
-/// starts false, so `ensure_watch_wallet` (`createwallet`/`loadwallet`)
-/// and `ranged_family_imported_end` (`listdescriptors`, one per
-/// descriptor family) are REAL round trips EVERY call —
-/// `GLOBAL_WATCH_CACHE` only ever short-circuits the per-address `addr()`
-/// fallback, never `watch_descriptors` itself. Forcing that onto the 9
-/// broadcast-only call sites (money-movement critical, and exactly the
-/// kind of avoidable request this app's whole network-politeness effort
-/// — see the workspace CLAUDE.md's "Network efficiency" section — exists
-/// to eliminate) and the 3 third-party-funding-wallet `scan_funding`
-/// sites (a DIFFERENT descriptor family than this identity's own —
-/// configuring ours ahead of one of those helps nothing) would silently
-/// reverse the U7 commit's own deliberate, tested, documented split. A
-/// type-level split (a wrapper type the plain constructor can't expose
-/// address-resolving methods from) is ALSO not viable without touching
-/// the FROZEN `ChainClient` API: `scan_funding` itself is legitimately
-/// called through BOTH constructors today (identity-own, at
-/// `spending_scan_async`, vs. third-party, at the 3 sites above) — which
-/// constructor is correct depends on which descriptor is being scanned,
-/// a runtime fact no static method-based split can see.
-///
-/// **If you add a new call site that resolves one of the identity's OWN
-/// addresses** (a new `.address_probe(`/`.build_bundle(` call — caught
-/// automatically below, no list to update — or a new helper like
-/// `discover_indexes` that takes a `ChainClient` and walks this
-/// identity's own addresses/descriptors, which this test can't detect
-/// generically): wire it through `open_client_watched` with a real
-/// descriptor snapshot (`st.core_rpc_watch.clone()` before a worker-
-/// thread spawn, same as every site here), and add its enclosing
-/// function's name to `NAMED_WATCH_SITES` below.
-#[cfg(test)]
-mod core_rpc_wiring_contract {
-    /// The current text of this very file — re-read at every compile, so
-    /// this test always judges the ACTUAL source, mutation included.
-    const SRC: &str = include_str!("lib.rs");
-
-    /// Top-level functions whose reason for existing includes resolving
-    /// the identity's OWN addresses via something this test can't detect
-    /// by method name alone:
-    /// - `maybe_start_discovery` hands its client to
-    ///   `app_core::chain::discover_indexes`, not a `ChainClient` method
-    ///   call in this file.
-    /// - `spending_scan_async` calls `.scan_funding(`, which is ALSO
-    ///   legitimately called with a THIRD-PARTY descriptor (the funding-
-    ///   wallet sites, correctly on the plain constructor) — the two
-    ///   uses are textually identical calls, distinguishable only by
-    ///   which function they're in.
-    const NAMED_WATCH_SITES: &[&str] = &["maybe_start_discovery", "spending_scan_async"];
-
-    /// The full text of the top-level `fn <name>` in `src` (its
-    /// signature through its matching closing brace), found by scanning
-    /// for the first subsequent line that is EXACTLY `}` at column 0 —
-    /// every top-level item in this rustfmt'd file closes that way, and
-    /// unlike counting every `{`/`}` byte in the body this is immune to
-    /// the (unbalanced, in general) braces that show up inside string
-    /// literals and prose comments. Panics — a hard test failure, never
-    /// a silent skip — when `name` no longer exists as a top-level `fn`:
-    /// a rename must update `NAMED_WATCH_SITES` (or whatever call site
-    /// added it), not go unnoticed.
-    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
-        let marker = format!("\nfn {name}(");
-        let rel = src.find(&marker).unwrap_or_else(|| {
-            panic!(
-                "core-rpc wiring contract: `fn {name}` not found as a top-level function in \
-                 src/lib.rs (renamed or removed?) — update NAMED_WATCH_SITES / this test to match."
-            )
-        });
-        let start = rel + 1; // land exactly on "fn ", past the newline we matched on
-        let mut end = start;
-        for line in src[start..].split_inclusive('\n') {
-            end += line.len();
-            if line.trim_end_matches('\n') == "}" {
-                return &src[start..end];
-            }
-        }
-        panic!("core-rpc wiring contract: no top-level closing `{{`}}` found for fn {name}");
-    }
-
-    /// Every occurrence of `needle` (a call like `"open_client_watched("`)
-    /// inside `body`, each returned as its full call text from the callee
-    /// name through the matching closing paren (depth-tracked, so a
-    /// nested call in an argument wouldn't confuse it, though none of the
-    /// call sites here actually nest one).
-    fn find_calls<'a>(body: &'a str, needle: &str) -> Vec<&'a str> {
-        let bytes = body.as_bytes();
-        let mut calls = Vec::new();
-        let mut from = 0usize;
-        while let Some(rel) = body[from..].find(needle) {
-            let start = from + rel;
-            let paren = start + needle.len() - 1; // index of the call's '('
-            let mut depth = 0i32;
-            let mut i = paren;
-            loop {
-                match bytes[i] {
-                    b'(' => depth += 1,
-                    b')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                i += 1;
-            }
-            calls.push(&body[start..=i]);
-            from = i + 1;
-        }
-        calls
-    }
-
-    /// The nearest enclosing top-level `fn NAME` before byte offset `pos`
-    /// in `src` — the last `"\nfn "` before it, name read up to the next
-    /// `(`/whitespace. Closures (`move || { .. }`) never match `"\nfn "`
-    /// (they're never at column 0 as `fn`), so this always resolves to
-    /// the real enclosing function even when `pos` is inside a
-    /// worker-thread closure's body.
-    fn enclosing_fn_name(src: &str, pos: usize) -> String {
-        let prefix = &src[..pos];
-        let idx = prefix.rfind("\nfn ").unwrap_or_else(|| {
-            panic!("core-rpc wiring contract: no enclosing top-level fn found before byte {pos}")
-        });
-        let after_fn = &prefix[idx + 4..]; // skip "\nfn "
-        let end = after_fn.find(|c: char| c == '(' || c.is_whitespace()).unwrap_or(after_fn.len());
-        after_fn[..end].to_string()
-    }
-
-    /// A descriptor-list ARGUMENT that's a literal empty slice — the
-    /// second regression this contract exists to catch. `open_client_watched`
-    /// treats `descriptors.is_empty()` as "nothing to configure" (its own
-    /// doc comment above), so a call like
-    /// `open_client_watched(&base, network, creds, &[])` calls the right
-    /// FUNCTION but is behaviorally byte-identical to plain `open_client`
-    /// — the exact silent regression a reviewer skimming for
-    /// "does it say `_watched`" would miss.
-    fn passes_empty_descriptor_list(call: &str) -> bool {
-        let trimmed = call.trim_end();
-        let trimmed = trimmed.strip_suffix(')').unwrap_or(trimmed);
-        trimmed.trim_end().ends_with("&[]")
-    }
-
-    /// The 6 sites the U7 commit wired deliberately (per its own commit
-    /// message — "Wired at the 6 call sites that actually look up the
-    /// identity's own addresses"). 4 of them (`.address_probe`/
-    /// `.build_bundle`, unambiguous method names) are caught generically
-    /// by `every_address_probe_and_build_bundle_call_uses_the_watched_client`
-    /// below; the other 2 need `NAMED_WATCH_SITES` because what makes
-    /// them "identity-own" isn't visible in the method name alone (see
-    /// its doc comment).
-    #[test]
-    fn named_watch_sites_use_watched_client_with_a_real_descriptor_list() {
-        for &name in NAMED_WATCH_SITES {
-            let body = fn_body(SRC, name);
-            assert!(
-                body.contains("open_client_watched("),
-                "core-rpc wiring contract: fn {name} no longer calls open_client_watched — it \
-                 resolves one of the identity's OWN addresses (see the U7 commit / \
-                 PLAN-chain-notes-app-core-rpc.md) and must build its ChainClient through the \
-                 watched constructor with a real descriptor list, or every address it touches \
-                 pays for a per-address genesis rescan instead of one ranged import per \
-                 descriptor family.",
-            );
-            assert!(
-                !body.contains("open_client("),
-                "core-rpc wiring contract: fn {name} ALSO calls the plain open_client — this \
-                 function resolves identity-owned addresses and must do so exclusively through \
-                 open_client_watched.",
-            );
-            for call in find_calls(body, "open_client_watched(") {
-                assert!(
-                    !passes_empty_descriptor_list(call),
-                    "core-rpc wiring contract: fn {name}'s open_client_watched call passes an \
-                     EMPTY descriptor list — `{call}` — which is behaviorally identical to the \
-                     plain open_client (watch_descriptors no-ops on an empty list). Pass the \
-                     real `core_rpc_watch`/`st.core_rpc_watch` snapshot instead.",
-                );
-            }
-        }
-    }
-
-    /// Generalizes past `NAMED_WATCH_SITES`: EVERY call to
-    /// `.address_probe(`/`.build_bundle(` anywhere in this file — present
-    /// or future, no list to keep in sync — must live in a function that
-    /// configures ranged watching via `open_client_watched`. Unlike
-    /// `scan_funding`, these two methods are never legitimately called
-    /// against a third-party descriptor anywhere in this app (only ever
-    /// against the active identity's own address), so the method name
-    /// alone is enough signal here.
-    #[test]
-    fn every_address_probe_and_build_bundle_call_uses_the_watched_client() {
-        for needle in [".address_probe(", ".build_bundle("] {
-            let mut from = 0usize;
-            while let Some(rel) = SRC[from..].find(needle) {
-                let pos = from + rel;
-                from = pos + needle.len();
-                let fname = enclosing_fn_name(SRC, pos);
-                let body = fn_body(SRC, &fname);
-                assert!(
-                    body.contains("open_client_watched("),
-                    "core-rpc wiring contract: fn {fname} calls {needle} (an identity-own \
-                     address lookup) but never configures ranged-descriptor watching via \
-                     open_client_watched — build its ChainClient with \
-                     open_client_watched(..., &st.core_rpc_watch) instead of the plain \
-                     open_client, or every address it resolves pays for a per-address genesis \
-                     rescan instead of one ranged import per descriptor family.",
-                );
-            }
-        }
-    }
-}
-
 /// Pure form of `State::core_rpc_should_persist`: default true (an absent
 /// entry — every pre-U10 config, and every network nobody has touched the
 /// switch for) else whatever was explicitly stored. A free function so the
@@ -5782,746 +5332,6 @@ fn flush_core_rpc_migration(s: &mut State) {
                 println!("cb: core-rpc-migrate net={net} persist={persist} ok");
             }
             Err(e) => println!("cb: core-rpc-migrate net={net} persist={persist} err={e}"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod core_rpc_settings_tests {
-    use super::{
-        apply_core_rpc_persist_toggle, compose_core_url, core_rpc_default_port,
-        core_rpc_persist_default_true, display_core_url, fill_node, format_node_status,
-        migrate_inline_node_creds, parse_core_rpc_save_creds, resolve_core_rpc_creds,
-        route_core_rpc_creds, split_url_userinfo, Network, State,
-    };
-    use app_core::chain::node_presets;
-    use app_core::chain::NodeStatus;
-    use std::cell::Cell;
-    use std::collections::HashMap;
-    use zeroize::Zeroizing;
-
-    #[test]
-    fn strips_inline_userinfo_from_core_url() {
-        let (url, creds) = split_url_userinfo("bitcoind+http://alice:s3cr3t@192.168.1.10:8332");
-        assert_eq!(url, "bitcoind+http://192.168.1.10:8332");
-        assert_eq!(creds, Some(("alice".to_string(), "s3cr3t".to_string())));
-    }
-
-    #[test]
-    fn leaves_a_plain_url_untouched() {
-        let (url, creds) = split_url_userinfo("bitcoind+http://192.168.1.10:8332");
-        assert_eq!(url, "bitcoind+http://192.168.1.10:8332");
-        assert_eq!(creds, None);
-    }
-
-    #[test]
-    fn leaves_esplora_urls_untouched() {
-        let (url, creds) = split_url_userinfo("https://mempool.example/api");
-        assert_eq!(url, "https://mempool.example/api");
-        assert_eq!(creds, None);
-    }
-
-    #[test]
-    fn does_not_confuse_a_path_at_sign_for_userinfo() {
-        // No userinfo here — the '@' (if any) would sit after a '/', which
-        // this function must not treat as an authority separator.
-        let (url, creds) = split_url_userinfo("http://127.0.0.1:3002/api@weird");
-        assert_eq!(url, "http://127.0.0.1:3002/api@weird");
-        assert_eq!(creds, None);
-    }
-
-    #[test]
-    fn empty_and_malformed_inputs_pass_through() {
-        assert_eq!(split_url_userinfo(""), (String::new(), None));
-        assert_eq!(split_url_userinfo("not-a-url"), ("not-a-url".to_string(), None));
-    }
-
-    // ---- U10: "Save credentials" switch ----
-
-    #[test]
-    fn persist_default_true_when_absent() {
-        let map: HashMap<String, bool> = HashMap::new();
-        assert!(core_rpc_persist_default_true(&map, "testnet4"));
-    }
-
-    #[test]
-    fn persist_default_respects_explicit_value() {
-        let mut map = HashMap::new();
-        map.insert("testnet4".to_string(), false);
-        map.insert("mainnet".to_string(), true);
-        assert!(!core_rpc_persist_default_true(&map, "testnet4"));
-        assert!(core_rpc_persist_default_true(&map, "mainnet"));
-        // A network never mentioned still defaults true.
-        assert!(core_rpc_persist_default_true(&map, "signet"));
-    }
-
-    #[test]
-    fn resolve_creds_persist_on_uses_keychain_source() {
-        let keychain = Some(("alice".to_string(), "s3cr3t".to_string()));
-        let session = Some(("bob".to_string(), "wrongsource".to_string()));
-        let got = resolve_core_rpc_creds("bitcoind+http://10.0.0.1:8332", true, keychain, session);
-        assert_eq!(got, Some(("alice".to_string(), "s3cr3t".to_string())));
-    }
-
-    #[test]
-    fn resolve_creds_persist_off_uses_session_source() {
-        let keychain = Some(("alice".to_string(), "s3cr3t".to_string()));
-        let session = Some(("bob".to_string(), "sess-pass".to_string()));
-        let got = resolve_core_rpc_creds("bitcoind+http://10.0.0.1:8332", false, keychain, session);
-        assert_eq!(got, Some(("bob".to_string(), "sess-pass".to_string())));
-    }
-
-    #[test]
-    fn resolve_creds_esplora_base_short_circuits_regardless_of_switch() {
-        // Neither source is consulted for a non-`bitcoind+` base — proves
-        // Esplora never touches either the Keychain-shaped input or the
-        // session-shaped input, whichever the switch would otherwise pick.
-        let some_creds = Some(("alice".to_string(), "s3cr3t".to_string()));
-        assert_eq!(
-            resolve_core_rpc_creds(
-                "https://mempool.example/api",
-                true,
-                some_creds.clone(),
-                some_creds.clone()
-            ),
-            None
-        );
-        assert_eq!(
-            resolve_core_rpc_creds("https://mempool.example/api", false, some_creds.clone(), some_creds),
-            None
-        );
-    }
-
-    #[test]
-    fn route_creds_persist_on_calls_keychain_store_not_session() {
-        let mut session: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
-        let stored: Cell<Option<(String, String)>> = Cell::new(None);
-        let deleted = Cell::new(false);
-        let result = route_core_rpc_creds(
-            true,
-            "testnet4",
-            "alice",
-            "s3cr3t",
-            &mut session,
-            |u, p| {
-                stored.set(Some((u.to_string(), p.to_string())));
-                Ok(())
-            },
-            || {
-                deleted.set(true);
-                Ok(())
-            },
-        );
-        assert!(result.is_ok());
-        assert_eq!(stored.into_inner(), Some(("alice".to_string(), "s3cr3t".to_string())));
-        assert!(!deleted.get());
-        assert!(session.is_empty(), "persist-on must never touch the session slot");
-    }
-
-    #[test]
-    fn route_creds_persist_on_clearing_both_fields_deletes() {
-        let mut session: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
-        let stored = Cell::new(false);
-        let deleted = Cell::new(false);
-        let result = route_core_rpc_creds(
-            true,
-            "testnet4",
-            "",
-            "",
-            &mut session,
-            |_, _| {
-                stored.set(true);
-                Ok(())
-            },
-            || {
-                deleted.set(true);
-                Ok(())
-            },
-        );
-        assert!(result.is_ok());
-        assert!(deleted.get());
-        assert!(!stored.get());
-    }
-
-    #[test]
-    fn route_creds_persist_off_never_touches_keychain() {
-        let mut session: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
-        let touched = Cell::new(false);
-        let result = route_core_rpc_creds(
-            false,
-            "testnet4",
-            "alice",
-            "s3cr3t",
-            &mut session,
-            |_, _| {
-                touched.set(true);
-                Ok(())
-            },
-            || {
-                touched.set(true);
-                Ok(())
-            },
-        );
-        assert!(result.is_ok());
-        assert!(!touched.get(), "persist-off must never call a Keychain op");
-        let entry = session.get("testnet4").expect("session slot populated");
-        assert_eq!(entry.0, "alice");
-        assert_eq!(entry.1.as_str(), "s3cr3t");
-    }
-
-    #[test]
-    fn route_creds_persist_off_clearing_both_fields_clears_session_only() {
-        let mut session: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
-        session.insert("testnet4".to_string(), ("alice".to_string(), Zeroizing::new("s3cr3t".to_string())));
-        let touched = Cell::new(false);
-        let result = route_core_rpc_creds(
-            false,
-            "testnet4",
-            "",
-            "",
-            &mut session,
-            |_, _| {
-                touched.set(true);
-                Ok(())
-            },
-            || {
-                touched.set(true);
-                Ok(())
-            },
-        );
-        assert!(result.is_ok());
-        assert!(!touched.get());
-        assert!(session.get("testnet4").is_none());
-    }
-
-    /// The load-bearing invariant: turning the switch OFF must
-    /// unconditionally delete whatever the Keychain holds — this is what a
-    /// mutation test should catch first. Also proves `store` is never
-    /// called on the OFF path.
-    #[test]
-    fn toggle_off_always_deletes_the_stored_keychain_item() {
-        let deleted = Cell::new(false);
-        let stored = Cell::new(false);
-        let result = apply_core_rpc_persist_toggle(
-            false,
-            "alice",
-            "s3cr3t",
-            || {
-                deleted.set(true);
-                Ok(())
-            },
-            |_, _| {
-                stored.set(true);
-                Ok(())
-            },
-        );
-        assert!(deleted.get(), "OFF must delete the stored Keychain item");
-        assert!(!stored.get());
-        match result {
-            Ok(Some((u, p))) => {
-                assert_eq!(u, "alice");
-                assert_eq!(p.as_str(), "s3cr3t");
-            }
-            other => panic!("expected the on-screen fields handed back for the session slot, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn toggle_off_with_blank_fields_still_deletes_and_leaves_session_empty() {
-        // Blank on-screen fields don't imply "nothing to delete" — a
-        // previously saved credential from an earlier session could still
-        // be sitting in the Keychain (this app never pre-populates the
-        // fields from anywhere but Settings-open), so deletion must fire
-        // unconditionally on every ON→OFF transition.
-        let deleted = Cell::new(false);
-        let result = apply_core_rpc_persist_toggle(
-            false,
-            "",
-            "",
-            || {
-                deleted.set(true);
-                Ok(())
-            },
-            |_, _| Ok(()),
-        );
-        assert!(deleted.get());
-        assert_eq!(result.unwrap(), None);
-    }
-
-    #[test]
-    fn toggle_off_propagates_a_keychain_delete_error() {
-        let result = apply_core_rpc_persist_toggle(
-            false,
-            "alice",
-            "s3cr3t",
-            || Err("keychain busy".to_string()),
-            |_, _| Ok(()),
-        );
-        assert_eq!(result, Err("keychain busy".to_string()));
-    }
-
-    #[test]
-    fn toggle_on_persists_the_on_screen_fields_and_clears_session() {
-        let stored: Cell<Option<(String, String)>> = Cell::new(None);
-        let deleted = Cell::new(false);
-        let result = apply_core_rpc_persist_toggle(
-            true,
-            "alice",
-            "s3cr3t",
-            || {
-                deleted.set(true);
-                Ok(())
-            },
-            |u, p| {
-                stored.set(Some((u.to_string(), p.to_string())));
-                Ok(())
-            },
-        );
-        assert!(!deleted.get());
-        assert_eq!(stored.into_inner(), Some(("alice".to_string(), "s3cr3t".to_string())));
-        assert_eq!(result.unwrap(), None);
-    }
-
-    #[test]
-    fn toggle_on_with_nothing_typed_stores_nothing() {
-        let stored = Cell::new(false);
-        let result = apply_core_rpc_persist_toggle(
-            true,
-            "",
-            "",
-            || Ok(()),
-            |_, _| {
-                stored.set(true);
-                Ok(())
-            },
-        );
-        assert!(!stored.get());
-        assert_eq!(result.unwrap(), None);
-    }
-
-    /// `parse_core_rpc_save_creds` round trip in isolation — a hand-built
-    /// `Value`, not the real `State::config_payload()`. This is READ-side
-    /// coverage only (the boot-time parse); the actual WRITE side is
-    /// covered by `config_payload_never_carries_session_credentials`
-    /// below, which drives the production method instead of mirroring its
-    /// shape.
-    #[test]
-    fn save_creds_preference_round_trips_through_config_json_never_carrying_secrets() {
-        let mut before: HashMap<String, bool> = HashMap::new();
-        before.insert("testnet4".to_string(), false);
-        before.insert("mainnet".to_string(), true);
-        let json = serde_json::json!({ "core_rpc_save_creds": before.clone() });
-        let text = json.to_string();
-        assert!(!text.contains("s3cr3t"));
-        assert!(!text.contains("core_rpc_session_creds"));
-        let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid json");
-        let after = parse_core_rpc_save_creds(&parsed);
-        assert_eq!(after, before);
-    }
-
-    #[test]
-    fn save_creds_preference_absent_key_parses_to_empty_map() {
-        let parsed: serde_json::Value = serde_json::json!({ "network": "testnet4" });
-        assert!(parse_core_rpc_save_creds(&parsed).is_empty());
-    }
-
-    /// The load-bearing regression test: drives the REAL
-    /// `State::config_payload()` (what `save_config` actually serializes,
-    /// after this review's extraction) with a distinctive username AND
-    /// password sitting in `core_rpc_session_creds` — the exact plaintext
-    /// a leak would carry — and asserts neither appears anywhere in the
-    /// output, while the boolean preference map and the other expected
-    /// keys still do. A hand-built mirror of the payload shape (as the
-    /// prior version of this test was) cannot catch `save_config` drifting
-    /// to leak a new field; this asserts on bytes the production method
-    /// itself produced.
-    #[test]
-    fn config_payload_never_carries_session_credentials() {
-        let mut save_creds: HashMap<String, bool> = HashMap::new();
-        save_creds.insert("testnet4".to_string(), false);
-        let mut session_creds: HashMap<String, (String, Zeroizing<String>)> = HashMap::new();
-        session_creds.insert(
-            "testnet4".to_string(),
-            (
-                "SENTINEL_USER_do_not_leak".to_string(),
-                Zeroizing::new("SENTINEL_PASS_do_not_leak".to_string()),
-            ),
-        );
-        let state = State::test_stub(
-            Network::Testnet4,
-            HashMap::new(),
-            HashMap::new(),
-            save_creds,
-            session_creds,
-        );
-        let text = state.config_payload().to_string();
-        assert!(!text.contains("SENTINEL_USER_do_not_leak"), "leaked the session username: {text}");
-        assert!(!text.contains("SENTINEL_PASS_do_not_leak"), "leaked the session password: {text}");
-        assert!(!text.contains("core_rpc_session_creds"), "leaked the session-creds field name: {text}");
-        // The boolean preference map DOES round-trip (it's a preference,
-        // not a secret) — and a couple of the other expected keys, so this
-        // test would also fail loudly if `config_payload` lost fields
-        // rather than gained one.
-        assert!(text.contains("core_rpc_save_creds"));
-        assert!(text.contains("testnet4"));
-        assert!(text.contains("\"network\":\"testnet4\""));
-    }
-
-    // ---- U11: node-health caption copy (defect 2) ----
-
-    /// The exact nonsense the review caught: `prune_height` of `Some(0)`
-    /// used to render "pruned below block 0 — notes/history before it
-    /// can't be recovered", which claims something is unrecoverable when
-    /// NOTHING has actually been pruned yet. Zero must read as informational
-    /// (no warn tint), not the strong warning.
-    #[test]
-    fn prune_height_zero_is_not_alarming() {
-        let status = NodeStatus { pruned: true, prune_height: Some(0), txindex: true, ..Default::default() };
-        let (text, warn) = format_node_status(&status);
-        assert!(!warn, "prune height 0 must not set the warn tint: {text}");
-        assert!(!text.contains("can't be recovered"), "prune height 0 must not claim data is lost: {text}");
-        assert!(text.contains("nothing pruned"), "expected an honest not-yet-pruned note: {text}");
-    }
-
-    /// Same honesty rule for the ABSENT case (`prune_height: None` while
-    /// `pruned` is true) — bitcoind only populates `pruneheight` once it has
-    /// pruned at least once, so `None` means the same "nothing pruned yet"
-    /// state as `Some(0)`, never "unknown, assume the worst."
-    #[test]
-    fn prune_height_absent_is_not_alarming() {
-        let status = NodeStatus { pruned: true, prune_height: None, txindex: true, ..Default::default() };
-        let (text, warn) = format_node_status(&status);
-        assert!(!warn, "absent prune height must not set the warn tint: {text}");
-        assert!(!text.contains("can't be recovered"), "absent prune height must not claim data is lost: {text}");
-    }
-
-    /// A REAL nonzero prune height keeps the strong wording and the warn
-    /// tint — the fix must narrow the false-positive case, not silence the
-    /// real one.
-    #[test]
-    fn prune_height_nonzero_still_warns() {
-        let status = NodeStatus { pruned: true, prune_height: Some(500), txindex: true, ..Default::default() };
-        let (text, warn) = format_node_status(&status);
-        assert!(warn, "a real prune height must still warn: {text}");
-        assert!(text.contains("pruned below block 500"), "expected the real height named: {text}");
-        assert!(text.contains("can't be recovered"), "expected the strong wording for a real prune: {text}");
-    }
-
-    /// The exact scenario a locally-running pruned bitcoind hits moments
-    /// after `-prune` is turned on: pruned (height 0, not yet alarming) AND
-    /// no txindex (a real warning) in the SAME status. The overall `warn`
-    /// flag must still be true (txindex alone earns it), the join must not
-    /// leave a dangling `· ` separator, and the non-alarming prune note must
-    /// still be present alongside the real txindex warning.
-    #[test]
-    fn pruned_zero_plus_no_txindex_warns_from_txindex_only() {
-        let status = NodeStatus { pruned: true, prune_height: Some(0), txindex: false, ..Default::default() };
-        let (text, warn) = format_node_status(&status);
-        assert!(warn, "missing txindex alone must still warn: {text}");
-        assert!(text.contains("nothing pruned"));
-        assert!(text.contains("no txindex"));
-        assert!(!text.trim_end().ends_with('·'), "no dangling separator: {text:?}");
-        assert!(!text.contains("  "), "no doubled-up spacing from an empty joined part: {text:?}");
-    }
-
-    /// A fully healthy node — the "previously invisible" one-line case
-    /// (defect 1's UI symptom): no parts pushed at all, so the fallback
-    /// "connected · tip N" line is used, and it must never warn.
-    #[test]
-    fn healthy_node_reports_connected_and_never_warns() {
-        let status = NodeStatus { tip_height: 123_456, txindex: true, ..Default::default() };
-        let (text, warn) = format_node_status(&status);
-        assert!(!warn);
-        assert_eq!(text, "connected · tip 123,456");
-    }
-
-    /// A rescanning wallet must never look like a quiet/empty one — still
-    /// warns.
-    #[test]
-    fn wallet_scanning_warns() {
-        let status = NodeStatus { txindex: true, wallet_scanning: Some(true), ..Default::default() };
-        let (text, warn) = format_node_status(&status);
-        assert!(warn, "{text}");
-        assert!(text.contains("rescanning"));
-    }
-
-    // ---- U11: strip inline creds from a LOADED config.json (defect 3) ----
-
-    #[test]
-    fn migrate_strips_inline_creds_from_a_loaded_node_url() {
-        let mut node_urls = HashMap::new();
-        node_urls.insert(
-            "mainnet".to_string(),
-            "bitcoind+http://alice:s3cr3t@203.0.113.5:8332".to_string(),
-        );
-        let found = migrate_inline_node_creds(&mut node_urls);
-        assert_eq!(found, vec![("mainnet".to_string(), "alice".to_string(), "s3cr3t".to_string())]);
-        assert_eq!(node_urls.get("mainnet").map(String::as_str), Some("bitcoind+http://203.0.113.5:8332"));
-    }
-
-    #[test]
-    fn migrate_leaves_a_clean_loaded_url_untouched() {
-        let mut node_urls = HashMap::new();
-        node_urls.insert("testnet4".to_string(), "bitcoind+http://10.0.0.5:8332".to_string());
-        let found = migrate_inline_node_creds(&mut node_urls);
-        assert!(found.is_empty());
-        assert_eq!(node_urls.get("testnet4").map(String::as_str), Some("bitcoind+http://10.0.0.5:8332"));
-    }
-
-    #[test]
-    fn migrate_handles_multiple_networks_independently() {
-        let mut node_urls = HashMap::new();
-        node_urls.insert(
-            "mainnet".to_string(),
-            "bitcoind+http://alice:s3cr3t@203.0.113.5:8332".to_string(),
-        );
-        node_urls.insert("testnet4".to_string(), "https://mempool.example/api".to_string());
-        node_urls.insert(
-            "signet".to_string(),
-            "bitcoind+http://bob:hunter2@198.51.100.9:8332".to_string(),
-        );
-        let mut found = migrate_inline_node_creds(&mut node_urls);
-        found.sort();
-        assert_eq!(
-            found,
-            vec![
-                ("mainnet".to_string(), "alice".to_string(), "s3cr3t".to_string()),
-                ("signet".to_string(), "bob".to_string(), "hunter2".to_string()),
-            ]
-        );
-        assert_eq!(node_urls.get("mainnet").map(String::as_str), Some("bitcoind+http://203.0.113.5:8332"));
-        assert_eq!(node_urls.get("testnet4").map(String::as_str), Some("https://mempool.example/api"));
-        assert_eq!(node_urls.get("signet").map(String::as_str), Some("bitcoind+http://198.51.100.9:8332"));
-    }
-
-    #[test]
-    fn migrate_on_an_empty_map_is_a_noop() {
-        let mut node_urls: HashMap<String, String> = HashMap::new();
-        assert!(migrate_inline_node_creds(&mut node_urls).is_empty());
-        assert!(node_urls.is_empty());
-    }
-
-    // ---- U12: node picker — "Bitcoin Core" row, prefix-free UI ----
-
-    #[test]
-    fn confirmed_default_rpc_ports_per_network() {
-        // Straight from the installed bitcoind v30.2.0's own
-        // `-help-debug` text (verified 2026-07-29):
-        //   -rpcport=<port> … (default: 8332, testnet3: 18332,
-        //   testnet4: 48332, signet: 38332, regtest: 18443)
-        // This app has no Testnet3 variant, so only the other four apply.
-        assert_eq!(core_rpc_default_port(Network::Mainnet), 8332);
-        assert_eq!(core_rpc_default_port(Network::Testnet4), 48332);
-        assert_eq!(core_rpc_default_port(Network::Signet), 38332);
-        assert_eq!(core_rpc_default_port(Network::Regtest), 18443);
-    }
-
-    #[test]
-    fn compose_core_url_normalization_table() {
-        // (input, network, expected stored URL, expected inline creds)
-        let cases: &[(&str, Network, &str, Option<(&str, &str)>)] = &[
-            // bare host -> default scheme + default port for the network
-            ("192.168.1.10", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
-            ("umbrel.local", Network::Testnet4, "bitcoind+http://umbrel.local:48332", None),
-            ("node.example", Network::Signet, "bitcoind+http://node.example:38332", None),
-            ("127.0.0.1", Network::Regtest, "bitcoind+http://127.0.0.1:18443", None),
-            // host:port -> default scheme, given port honored verbatim
-            ("192.168.1.10:8332", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
-            ("umbrel.local:9998", Network::Testnet4, "bitcoind+http://umbrel.local:9998", None),
-            // explicit http:// / https:// -> scheme honored, port defaults
-            // or is honored the same way
-            ("http://192.168.1.10", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
-            (
-                "https://node.example:8332",
-                Network::Mainnet,
-                "bitcoind+https://node.example:8332",
-                None,
-            ),
-            ("https://umbrel.local", Network::Signet, "bitcoind+https://umbrel.local:38332", None),
-            // whitespace tolerated
-            ("  192.168.1.10:8332  ", Network::Mainnet, "bitcoind+http://192.168.1.10:8332", None),
-            // pasted `bitcoind+…` (backward compat / Sparrow-style paste)
-            // re-normalizes exactly like the bare forms above
-            (
-                "bitcoind+http://192.168.1.10:8332",
-                Network::Mainnet,
-                "bitcoind+http://192.168.1.10:8332",
-                None,
-            ),
-            (
-                "bitcoind+https://node.example",
-                Network::Signet,
-                "bitcoind+https://node.example:38332",
-                None,
-            ),
-            (
-                "bitcoind+http://alice:s3cr3t@192.168.1.10:8332",
-                Network::Mainnet,
-                "bitcoind+http://192.168.1.10:8332",
-                Some(("alice", "s3cr3t")),
-            ),
-            // inline creds on a bare paste (no bitcoind+, no scheme)
-            (
-                "alice:s3cr3t@192.168.1.10:8332",
-                Network::Mainnet,
-                "bitcoind+http://192.168.1.10:8332",
-                Some(("alice", "s3cr3t")),
-            ),
-        ];
-        for (input, net, expect_url, expect_creds) in cases {
-            let (url, creds) = compose_core_url(input, *net)
-                .unwrap_or_else(|e| panic!("expected {input:?} to parse, got err {e:?}"));
-            assert_eq!(url, *expect_url, "input={input:?}");
-            assert_eq!(
-                creds,
-                expect_creds.map(|(u, p)| (u.to_string(), p.to_string())),
-                "input={input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn compose_core_url_rejects_malformed_input() {
-        let bad: &[&str] = &[
-            "",
-            "   ",
-            "bitcoind+",
-            "192.168.1.10:not-a-port",
-            "192.168.1.10:99999999",
-            "ftp://192.168.1.10:8332",
-            "192.168.1.10:8332/wallet/foo", // path not allowed on this field
-            "http://",
-            "http://:8332", // empty host
-        ];
-        for input in bad {
-            assert!(
-                compose_core_url(input, Network::Mainnet).is_err(),
-                "expected {input:?} to be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn compose_core_url_error_messages_are_useful() {
-        let err = compose_core_url("ftp://host:21", Network::Mainnet).unwrap_err();
-        assert!(err.contains("scheme"), "message should mention the bad scheme: {err}");
-        let err = compose_core_url("", Network::Mainnet).unwrap_err();
-        assert!(err.contains("host"), "message should ask for a host: {err}");
-    }
-
-    #[test]
-    fn display_core_url_elides_default_http_scheme_but_keeps_https() {
-        assert_eq!(display_core_url("bitcoind+http://192.168.1.10:8332"), "192.168.1.10:8332");
-        assert_eq!(
-            display_core_url("bitcoind+https://node.example:8332"),
-            "https://node.example:8332"
-        );
-    }
-
-    #[test]
-    fn compose_then_display_round_trips_to_the_same_text() {
-        // What gets shown after a successful commit must, if resubmitted
-        // unchanged, reproduce the exact same stored URL — an elided
-        // scheme must never silently flip http<->https on a second save.
-        for (typed, net) in [
-            ("192.168.1.10:8332", Network::Mainnet),
-            ("umbrel.local", Network::Testnet4),
-            ("https://node.example:8332", Network::Mainnet),
-            ("https://umbrel.local", Network::Signet),
-        ] {
-            let (stored1, _) = compose_core_url(typed, net).unwrap();
-            let shown = display_core_url(&stored1);
-            let (stored2, _) = compose_core_url(&shown, net).unwrap();
-            assert_eq!(stored1, stored2, "typed={typed:?} shown={shown:?}");
-        }
-    }
-
-    #[test]
-    fn fill_node_round_trip_core_base_selects_core_row_no_prefix_no_creds() {
-        let net = Network::Mainnet;
-        let presets = node_presets(net);
-        let (opts, idx, esplora_text, core_text) =
-            fill_node(presets.clone(), Some("bitcoind+http://192.168.1.10:8332"));
-        // Row order: <presets…>, "Bitcoin Core", "Custom…" — Core is
-        // second-to-last regardless of how many presets a network has.
-        assert_eq!(opts[opts.len() - 2], "Bitcoin Core");
-        assert_eq!(opts[opts.len() - 1], "Custom…");
-        assert_eq!(idx as usize, presets.len()); // the "Bitcoin Core" row
-        assert_eq!(esplora_text, "");
-        assert_eq!(core_text, "192.168.1.10:8332"); // no prefix, no creds
-    }
-
-    #[test]
-    fn fill_node_round_trip_preset_esplora_base_selects_that_preset() {
-        let net = Network::Mainnet;
-        let presets = node_presets(net);
-        // Blockstream is a real preset on mainnet with an explicit URL.
-        let (label, url) =
-            presets.iter().find(|(_, u)| u.is_some()).expect("mainnet has an explicit preset");
-        let (opts, idx, esplora_text, core_text) = fill_node(presets.clone(), *url);
-        assert_eq!(opts[idx as usize], *label);
-        assert_eq!(esplora_text, "");
-        assert_eq!(core_text, "");
-    }
-
-    #[test]
-    fn fill_node_round_trip_custom_esplora_base_selects_custom_row() {
-        let net = Network::Mainnet;
-        let presets = node_presets(net);
-        let (opts, idx, esplora_text, core_text) =
-            fill_node(presets.clone(), Some("https://my-own-node.example/api"));
-        assert_eq!(opts[idx as usize], "Custom…");
-        assert_eq!(idx as usize, presets.len() + 1);
-        assert_eq!(esplora_text, "https://my-own-node.example/api");
-        assert_eq!(core_text, "");
-    }
-
-    #[test]
-    fn fill_node_regtest_has_exactly_core_then_custom() {
-        // node_presets(Regtest) is empty — the dropdown must still resolve
-        // to exactly "Bitcoin Core", "Custom…" with correct index math.
-        let net = Network::Regtest;
-        let presets = node_presets(net);
-        assert!(presets.is_empty());
-        let (opts, idx, _, core_text) =
-            fill_node(presets.clone(), Some("bitcoind+http://127.0.0.1:18443"));
-        assert_eq!(opts.len(), 2);
-        assert_eq!(opts[0], "Bitcoin Core");
-        assert_eq!(opts[1], "Custom…");
-        assert_eq!(idx, 0);
-        assert_eq!(core_text, "127.0.0.1:18443");
-
-        // No configured value at all (default network base, None) selects
-        // Custom on regtest — there is no Esplora preset for it to match.
-        let (opts2, idx2, esplora_text2, core_text2) = fill_node(presets, None);
-        assert_eq!(opts2.len(), 2);
-        assert_eq!(idx2, 1); // "Custom…"
-        assert_eq!(esplora_text2, "");
-        assert_eq!(core_text2, "");
-    }
-
-    #[test]
-    fn credentials_typed_into_node_address_field_never_reach_the_stored_url() {
-        // The node-address field's own composer must never let a
-        // credential survive into the value that gets written to
-        // config.json — same invariant `split_url_userinfo` enforces for
-        // the Custom field's paste path, proven here end-to-end through
-        // `compose_core_url` for every accepted input shape that could
-        // carry one.
-        for input in [
-            "alice:s3cr3t@192.168.1.10:8332",
-            "http://alice:s3cr3t@192.168.1.10:8332",
-            "https://alice:s3cr3t@192.168.1.10",
-            "bitcoind+http://alice:s3cr3t@192.168.1.10:8332",
-        ] {
-            let (url, creds) = compose_core_url(input, Network::Mainnet).unwrap();
-            assert!(!url.contains("s3cr3t"), "stored url leaked a credential: {url}");
-            assert!(!url.contains('@'), "stored url carries userinfo syntax: {url}");
-            assert_eq!(creds, Some(("alice".to_string(), "s3cr3t".to_string())));
-            // And the round-trip display of that stored URL is equally
-            // creds-free (belt and suspenders — display never re-derives
-            // creds from anywhere, but prove it never echoes the input).
-            assert!(!display_core_url(&url).contains("s3cr3t"));
         }
     }
 }
@@ -8642,7 +7452,7 @@ static SPENDING_REFRESH_RESULTS: std::sync::Mutex<Vec<SpendingRefreshResult>> =
 /// no-op when the identity can't derive a spending wallet, or none is
 /// configured (no node). Results land through [`SPENDING_REFRESH_RESULTS`]
 /// + the `apply-pending-spending-refresh` trampoline, exactly like
-/// [`refresh_async`].
+///   [`refresh_async`].
 ///
 /// Also goes through the [`SCAN_LANE`] queue (2026-07-21) keyed
 /// `spscan/<fp8>/<network>/<account>` — a SECOND, general layer behind
@@ -9084,9 +7894,9 @@ fn suggested_coins(
         .filter(|u| !u.pending_spend)
         .collect();
     if consolidate {
-        coins.sort_by(|a, b| a.value.cmp(&b.value)); // smallest first
+        coins.sort_by_key(|a| a.value); // smallest first
     } else {
-        coins.sort_by(|a, b| b.value.cmp(&a.value)); // largest first
+        coins.sort_by_key(|b| std::cmp::Reverse(b.value)); // largest first
     }
     let mut chosen = Vec::new();
     let mut total = 0u64;
@@ -9348,7 +8158,7 @@ fn payfrom_panel_coins(st: &State, source: &str) -> (Vec<SpendCoin>, String) {
             if let Some(store) = st.store.as_ref() {
                 let mut spendable: Vec<&app_core::store::LedgerUtxo> =
                     store.utxos.iter().filter(|u| !u.pending_spend).collect();
-                spendable.sort_by(|a, b| a.value.cmp(&b.value));
+                spendable.sort_by_key(|a| a.value);
                 for u in spendable {
                     let selected = sel.contains(&(u.txid.clone(), u.vout));
                     coins.push(row(&u.txid, u.vout, u.value, u.height.is_some(), selected, ""));
@@ -9361,7 +8171,7 @@ fn payfrom_panel_coins(st: &State, source: &str) -> (Vec<SpendCoin>, String) {
             let chg_sel: std::collections::HashSet<(String, u32)> =
                 mixed_coins_for(st, "change").into_iter().collect();
             let mut change_sorted: Vec<&ChangeCoin> = st.change_coins.iter().collect();
-            change_sorted.sort_by(|a, b| a.value.cmp(&b.value));
+            change_sorted.sort_by_key(|a| a.value);
             for c in change_sorted {
                 let selected = chg_sel.contains(&(c.txid.clone(), c.vout));
                 coins.push(row(&c.txid, c.vout, c.value, c.confirmed, selected, "change"));
@@ -9757,9 +8567,11 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         // real (dust-to-self ALWAYS), just never gated on affordability.
         // Same fold treatment as the notebook branch above, via the funded
         // (with-change/no-change) estimator pair.
-        let weights: Vec<_> = std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX)
-            .take(sp_sel.len().max(1))
-            .collect();
+        let weights: Vec<_> = std::iter::repeat_n(
+            bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX,
+            sp_sel.len().max(1),
+        )
+        .collect();
         let change_len = custom_change_spk_len.unwrap_or(22); // BIP84 p2wpkh spk is always 22 bytes
         // Spending-only can never include a notebook coin (groups == 1,
         // nb_total == 0 by this branch's own guard) — dust-to-self always
@@ -9800,11 +8612,11 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         // here via `estimate_funded_fee` (same weights/outputs, no
         // insufficiency gate).
         let mut weights: Vec<bitcoin::transaction::InputWeightPrediction> = Vec::new();
-        weights.extend(std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH).take(nb_sel.len()));
-        weights.extend(std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX).take(sp_sel.len()));
+        weights.extend(std::iter::repeat_n(bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH, nb_sel.len()));
+        weights.extend(std::iter::repeat_n(bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX, sp_sel.len()));
         // Taproot CHANGE-chain coins (unit 5) are P2TR key-path, same
         // weight as a notebook coin.
-        weights.extend(std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH).take(chg_sel.len()));
+        weights.extend(std::iter::repeat_n(bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH, chg_sel.len()));
         for src in &wallet_sources {
             let id = src.strip_prefix("wallet:").unwrap_or("");
             let taproot = st.funding_wallets.iter().find(|fw| fw.id == id).map(|fw| fw.kind == "taproot").unwrap_or(true);
@@ -9813,7 +8625,7 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
             } else {
                 bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX
             };
-            weights.extend(std::iter::repeat(iw).take(mixed_coins_for(st, src).len()));
+            weights.extend(std::iter::repeat_n(iw, mixed_coins_for(st, src).len()));
         }
         let spending_enabled = st.spending_capable && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false);
         // `chg_total == 0` (taproot-change unit 5): a change coin is this
@@ -10302,7 +9114,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     // Spendable coins, sorted by amount low → high.
     let mut spendable: Vec<&app_core::store::LedgerUtxo> =
         store.utxos.iter().filter(|u| !u.pending_spend).collect();
-    spendable.sort_by(|a, b| a.value.cmp(&b.value));
+    spendable.sort_by_key(|a| a.value);
     for u in spendable {
         let selected = sel.contains(&(u.txid.clone(), u.vout));
         if selected {
@@ -10701,9 +9513,11 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
             // sub-dust leftover folded in on top, so the line never reads
             // as an inflated/expensive fee.
             let fold = if built.change == 0 {
-                let weights: Vec<_> = std::iter::repeat(bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX)
-                    .take(selected_coins.len().max(1))
-                    .collect();
+                let weights: Vec<_> = std::iter::repeat_n(
+                    bitcoin::transaction::InputWeightPrediction::P2WPKH_MAX,
+                    selected_coins.len().max(1),
+                )
+                .collect();
                 let payload_and_lens = if n_recipients >= 2 {
                     let mut content_key = [0u8; 32]; // preview only — lengths don't depend on the seal
                     app_core::notes_core::bundle::sealed_note_payloads_multi(
@@ -11430,7 +10244,7 @@ fn mlkem_secrets_for(
     imported: Option<&app_core::notes_core::pq::MlKemKeypair>,
 ) -> Vec<app_core::notes_core::pq::MlKemSecret> {
     let mut secrets =
-        ident.leaf_secret().map(|ls| app_core::pqkeys::derive_secrets(ls)).unwrap_or_default();
+        ident.leaf_secret().map(app_core::pqkeys::derive_secrets).unwrap_or_default();
     if let Some(kp) = imported {
         secrets.push(kp.secret());
     }
@@ -11900,7 +10714,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
     let input_indexes: Vec<u32> = if mixed {
         Vec::new()
     } else {
-        idents.iter().flat_map(|(a, _, coins, _)| std::iter::repeat(*a).take(coins.len())).collect()
+        idents.iter().flat_map(|(a, _, coins, _)| std::iter::repeat_n(*a, coins.len())).collect()
     };
     let spending_spent: Vec<(String, u32)> =
         spending_coins_for_sweep.iter().map(|c| (c.txid.clone(), c.vout)).collect();
@@ -12273,7 +11087,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
         })
         .collect();
     let input_indexes: Vec<u32> =
-        wc.sources.iter().flat_map(|(a, coins, _)| std::iter::repeat(*a).take(coins.len())).collect();
+        wc.sources.iter().flat_map(|(a, coins, _)| std::iter::repeat_n(*a, coins.len())).collect();
     let net = s.network;
     let snap = WConsolSnapshot {
         fp8: s.notebooks_fp8.clone().unwrap_or_default(),
@@ -13113,7 +11927,13 @@ pub fn run() {
             let st = st.clone();
             let weak = window.as_weak();
             window.$name(move |$($arg : $ty),*| {
+                // Not every callback body uses both the window handle and a
+                // mutable state borrow — `#[allow]` here (once, at the
+                // macro definition) rather than at each of the ~170 call
+                // sites, which don't control whether their body needs `mut`.
+                #[allow(unused_variables, unused_mut)]
                 let $w = weak.unwrap();
+                #[allow(unused_variables, unused_mut)]
                 let mut $s = st.borrow_mut();
                 $body
             });
@@ -13394,7 +12214,7 @@ pub fn run() {
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s); // CHANGE 5
             }
-            Err(e) => w.set_status(format!("{e}").into()),
+            Err(e) => w.set_status(e.to_string().into()),
         }
     });
 
@@ -13471,7 +12291,7 @@ pub fn run() {
             Err(e) => {
                 println!("cb: import err={e}");
                 w.set_import_feedback_ok(false);
-                w.set_import_feedback(format!("{e}").into());
+                w.set_import_feedback(e.to_string().into());
             }
         }
     });
@@ -17377,7 +16197,7 @@ pub fn run() {
                     update_notebook_list(&w, &s);
                     w.set_screen(17);
                 }
-                Err(e) => w.set_status(format!("{e}").into()),
+                Err(e) => w.set_status(e.to_string().into()),
             }
             return;
         }
@@ -17413,7 +16233,7 @@ pub fn run() {
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s);
             }
-            Err(e) => w.set_status(format!("{e}").into()),
+            Err(e) => w.set_status(e.to_string().into()),
         }
     });
 
@@ -18309,7 +17129,7 @@ pub fn run() {
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s); // CHANGE 5: was missing — Sal's finding
             }
-            Err(e) => w.set_status(format!("{e}").into()),
+            Err(e) => w.set_status(e.to_string().into()),
         }
     });
 
@@ -18594,6 +17414,8 @@ fn render_previews(w: u32, h: u32, screens: &[i32], out_dir: &str) {
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
     use std::rc::Rc;
 
+    std::fs::create_dir_all(out_dir).expect("create out_dir");
+
     struct HeadlessPlatform {
         win: Rc<MinimalSoftwareWindow>,
     }
@@ -18677,172 +17499,5 @@ fn android_main(app: slint::android::AndroidApp) {
     run();
 }
 
-// ---------------------------------------------------------------------------
-// In-process UI-flow test: drive the REAL quantum-key generate flow headless.
-// ---------------------------------------------------------------------------
-//
-// The ui_harness_* integration tests prove find + click on the real widgets;
-// this proves a whole FLOW end-to-end in-process — window props ->
-// do_pq_generate -> notes-core keygen -> keychain -> State -> window update ->
-// cb: log line — with the in-memory keychain (GRAFFITO_KEYCHAIN_MEMORY) so no
-// SecurityAgent prompt, no window, no coordinates, no key-focus. This is the
-// coverage the flaky coordinate suite (graffito-app-selfpq.sh) was reaching
-// for; see the slint-ui-testing + graffito-mac-ui-key-window memories.
 #[cfg(test)]
-mod ui_flow_quantum_key {
-    use super::*;
-
-    /// These three tests share process-global state: the
-    /// `GRAFFITO_KEYCHAIN_MEMORY` env var (set at entry, REMOVED at exit)
-    /// and the single in-memory `pq-imported` keychain slot. Under the
-    /// default parallel runner, one test's `remove_var` landed mid-flight in
-    /// another, whose next keychain read then went to the REAL login
-    /// keychain (`keychain load: "UNIX[Operation not permitted]"` in a
-    /// sandbox, or a stale key -> "two generates ... must differ" on a
-    /// plain run) — flaky in roughly 3 of 5 runs, 2026-09-01. Each test
-    /// holds this lock for its whole body; a panicking test poisons it,
-    /// and the next one just takes the poisoned guard (the state it
-    /// re-initializes anyway) rather than failing on the poison.
-    static KEYCHAIN_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn keychain_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        KEYCHAIN_ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[test]
-    fn generate_flow_produces_a_key_and_logs_ok() {
-        // Element-tree introspection isn't needed here (we call the callback
-        // logic directly, not find-by-label), but AppWindow::new() needs a
-        // Slint platform — the testing backend provides one, thread-locally.
-        let _serial = keychain_env_lock();
-        i_slint_backend_testing::init_no_event_loop();
-        std::env::set_var("GRAFFITO_KEYCHAIN_MEMORY", "1");
-        let _ = keychain::delete_secret(PQ_IMPORTED_ACCOUNT);
-
-        let app = AppWindow::new().expect("AppWindow");
-        let mut st = State::test_stub(
-            Network::Regtest,
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        );
-
-        // Drive the compose the UI would: pick a level + type extra entropy,
-        // exactly as the on_pq_generate callback reads them.
-        app.set_pq_gen_level("768".into());
-        app.set_pq_gen_extra("dice 4 2 6 1 3 5 harness entropy".into());
-        assert!(st.pq_imported.is_none());
-
-        do_pq_generate(&app, &mut st);
-
-        // Full-chain assertions:
-        // 1. State holds a fresh keypair,
-        let kp = st.pq_imported.as_ref().expect("generate populated State.pq_imported");
-        assert_eq!(kp.alg(), app_core::pqkeys::pq_alg(app_core::passphrase::MlKemLevel::MlKem768));
-        // 2. it round-trips through the (in-memory) keychain as importable armor,
-        let stored = keychain::load_secret_protected(PQ_IMPORTED_ACCOUNT, "")
-            .expect("keychain load")
-            .expect("armor present in keychain after generate");
-        let (alg, _seed) = app_core::notes_core::pq::import_private(&stored).expect("stored armor parses");
-        assert_eq!(alg, kp.alg());
-        // 3. the window reflects the new key (source set, error cleared, extra wiped),
-        assert_eq!(app.get_pq_import_source().as_str(), "Generated on this device");
-        assert_eq!(app.get_pq_import_error().as_str(), "");
-        assert_eq!(app.get_pq_gen_extra().as_str(), "");
-
-        // Second generate REPLACES cleanly (different key) — the fingerprint
-        // shown must change, proving fresh TRNG each time even with the same
-        // typed entropy.
-        let fp1 = app_core::pqkeys::fingerprint(kp);
-        app.set_pq_gen_extra("dice 4 2 6 1 3 5 harness entropy".into());
-        do_pq_generate(&app, &mut st);
-        let fp2 = app_core::pqkeys::fingerprint(st.pq_imported.as_ref().unwrap());
-        assert_ne!(fp1, fp2, "two generates with identical entropy must differ (fresh TRNG)");
-
-        keychain::delete_secret(PQ_IMPORTED_ACCOUNT).ok();
-        std::env::remove_var("GRAFFITO_KEYCHAIN_MEMORY");
-    }
-
-    #[test]
-    fn import_flow_stores_a_pasted_native_key() {
-        let _serial = keychain_env_lock();
-        i_slint_backend_testing::init_no_event_loop();
-        std::env::set_var("GRAFFITO_KEYCHAIN_MEMORY", "1");
-        let _ = keychain::delete_secret(PQ_IMPORTED_ACCOUNT);
-
-        let app = AppWindow::new().expect("AppWindow");
-        let mut st = State::test_stub(
-            Network::Regtest,
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        );
-
-        // Produce a real native-armored private key elsewhere, then paste it
-        // into the import field exactly as a user would (device->Mac mirroring).
-        let (src_kp, armor) = app_core::pqkeys::generate_native_private(
-            app_core::passphrase::MlKemLevel::MlKem768,
-            b"",
-        )
-        .unwrap();
-        app.set_pq_import_text(armor.clone().into());
-
-        do_pq_import(&app, &mut st);
-
-        assert!(app.get_pq_import_error().as_str().is_empty(), "import should not error");
-        let kp = st.pq_imported.as_ref().expect("import populated State.pq_imported");
-        assert_eq!(
-            app_core::pqkeys::fingerprint(kp),
-            app_core::pqkeys::fingerprint(&src_kp),
-            "imported key must equal the pasted one",
-        );
-        assert_eq!(app.get_pq_import_text().as_str(), "", "import field cleared on success");
-
-        // Garbage paste surfaces an error and leaves the key intact.
-        app.set_pq_import_text("not a quantum key".into());
-        do_pq_import(&app, &mut st);
-        assert!(!app.get_pq_import_error().as_str().is_empty(), "garbage import must error");
-        assert!(st.pq_imported.is_some(), "a failed import must not drop the existing key");
-
-        keychain::delete_secret(PQ_IMPORTED_ACCOUNT).ok();
-        std::env::remove_var("GRAFFITO_KEYCHAIN_MEMORY");
-    }
-
-    #[test]
-    fn replace_guard_decision_gates_an_existing_key() {
-        // The guard branch (from on_pq_generate/on_pq_import_submit): when a
-        // key already exists, the action must NOT run directly — it stages a
-        // replace confirm instead. Tested as the pure decision the callbacks
-        // make, since the cb! wiring itself isn't reachable in isolation.
-        let _serial = keychain_env_lock();
-        i_slint_backend_testing::init_no_event_loop();
-        std::env::set_var("GRAFFITO_KEYCHAIN_MEMORY", "1");
-        let _ = keychain::delete_secret(PQ_IMPORTED_ACCOUNT);
-
-        let app = AppWindow::new().expect("AppWindow");
-        let mut st = State::test_stub(
-            Network::Regtest,
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        );
-
-        // No key yet -> the guard would run the action directly.
-        assert!(st.pq_imported.is_none());
-        app.set_pq_gen_level("768".into());
-        do_pq_generate(&app, &mut st);
-        assert!(st.pq_imported.is_some());
-
-        // Now a key exists -> the guard defers (this is the exact condition
-        // on_pq_generate checks before staging pq_pending_replace + the
-        // confirm dialog). Confirming runs do_pq_generate (proven above) and
-        // the fingerprint changes; cancelling leaves the key untouched.
-        assert!(st.pq_imported.is_some(), "guard precondition: a key is present");
-
-        keychain::delete_secret(PQ_IMPORTED_ACCOUNT).ok();
-        std::env::remove_var("GRAFFITO_KEYCHAIN_MEMORY");
-    }
-}
+mod tests;
