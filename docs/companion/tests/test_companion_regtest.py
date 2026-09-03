@@ -10,7 +10,7 @@ Prereqs: companion/server.py serving :8091, pointed at the ONE shared
 node — the Pi's persistent regtest chain, never a local throwaway one
 (PLAN-one-regtest-node.md):
 
-    ../../../ui-automation/node-env.sh regtest python3 companion/server.py 8091
+    ../../../../ui-automation/node-env.sh regtest python3 docs/companion/server.py 8091
 
 and `cargo build -p notes-core --example notes_cli` done (target/debug).
 
@@ -35,7 +35,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 BASE = "http://localhost:8091"
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 NOTES_CLI = REPO / "target/debug/examples/notes_cli"
 SHOTS = Path(__file__).resolve().parent / "screenshots"
 SHOTS.mkdir(exist_ok=True)

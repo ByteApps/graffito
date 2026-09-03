@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local companion server for prime-graffito.
+"""Local companion server for Graffito (this page + the Passport Prime app).
 
 Serves the static companion page AND — when a node is configured — exposes
 a **remote** Bitcoin Core node (regtest or testnet4; reached over an SSH
@@ -21,7 +21,7 @@ Usage:
 --node/--network fall back to the CN_NODE_HOST/CN_NODE_PORT/CN_NETWORK
 environment variables when the flags are absent. CORE_RPC_USER and
 CORE_RPC_PASS are ALWAYS read from the environment, never from a flag —
-see ../../ui-automation/node-env.sh, which decrypts the Pi's RPC
+see ../../../ui-automation/node-env.sh, which decrypts the Pi's RPC
 credentials for a given network and execs a command with all five of
 these exported. This file is part of a PUBLIC repo: it must never read
 ../private/ or print a credential value.
