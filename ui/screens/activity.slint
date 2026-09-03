@@ -1,0 +1,101 @@
+// Screen.activity -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 11 · activity (transactions) ----------
+
+import { Ui, Activity } from "../globals.slint";
+import { Body, Caption, Mono, GhostButton, Header, Badge } from "../components.slint";
+import { Pal } from "../theme.slint";
+
+export component ActivityScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: "Activity";
+            show-sync: true;
+            net-busy: Ui.net-busy;
+            back => { Ui.nav-back-nonce += 1; }
+            sync => { Ui.refresh-notebooks(); }
+            busy-tapped => { Ui.sync-busy-toast(); }
+        }
+        Caption { text: Activity.activity-summary; }
+        Flickable {
+            viewport-height: act-col.preferred-height;
+            act-col := VerticalLayout {
+                spacing: 8px;
+                alignment: start;
+                for a in Ui.activity: Rectangle {
+                    height: ail.preferred-height;
+                    border-radius: 10px;
+                    background: Pal.card;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    ail := VerticalLayout {
+                        padding: 12px;
+                        spacing: 5px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: a.kind;
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: Pal.text;
+                            }
+                            if a.notebook != "": Badge { label: a.notebook; tint: Pal.muted; }
+                            Rectangle { }
+                            if a.replaced != "": Badge { label: a.replaced; tint: Pal.faint; }
+                            Badge {
+                                label: a.status;
+                                // Task #14: "dropped" reads as amber, same
+                                // warn tint "pending" uses (it's still a
+                                // pending record — the tx just genuinely
+                                // evaporated; Bump/Rebroadcast still work).
+                                tint: a.status == "confirmed" ? Pal.good
+                                    : ((a.status == "pending" || a.status == "dropped") ? Pal.warn : Pal.bad);
+                            }
+                        }
+                        Body { text: a.title; font-size: 12px; overflow: elide; }
+                        if a.status == "dropped": Caption { text: "dropped — bump fee to retry"; color: Pal.warn; }
+                        Caption { text: a.fee-line; }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Mono {
+                                text: a.txid;
+                                font-size: 10px;
+                                color: Pal.muted;
+                                wrap: no-wrap;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            if a.funded != "": Badge { label: a.funded; tint: Pal.accent; }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            if a.pending && a.bumpable: GhostButton {
+                                width: 96px;
+                                height: 30px;
+                                opacity: a.busy ? 0.5 : 1.0;
+                                text: a.busy ? "…" : "Speed up";
+                                clicked => { if (!a.busy) { Activity.act-bump-open(a.ref-id, a.is-note); } }
+                            }
+                            if a.pending: GhostButton {
+                                width: 108px;
+                                height: 30px;
+                                opacity: a.busy ? 0.5 : 1.0;
+                                text: a.busy ? "Sending…" : "Rebroadcast";
+                                clicked => { if (!a.busy) { Ui.act-retry(a.ref-id, a.is-note); } }
+                            }
+                            if a.explorer != "": GhostButton {
+                                width: 92px;
+                                height: 30px;
+                                text: "Explorer";
+                                clicked => { Ui.act-explorer(a.explorer); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if Ui.status != "": Caption { text: Ui.status; color: Pal.bad; }
+    }
