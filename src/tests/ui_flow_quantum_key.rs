@@ -54,7 +54,7 @@ fn generate_flow_produces_a_key_and_logs_ok() {
     app.global::<QuantumKeys>().set_pq_gen_extra("dice 4 2 6 1 3 5 harness entropy".into());
     assert!(st.pq_imported.is_none());
 
-    do_pq_generate(&app, &mut st);
+    st.do_pq_generate(&app);
 
     // Full-chain assertions:
     // 1. State holds a fresh keypair,
@@ -76,7 +76,7 @@ fn generate_flow_produces_a_key_and_logs_ok() {
     // typed entropy.
     let fp1 = app_core::pqkeys::fingerprint(kp);
     app.global::<QuantumKeys>().set_pq_gen_extra("dice 4 2 6 1 3 5 harness entropy".into());
-    do_pq_generate(&app, &mut st);
+    st.do_pq_generate(&app);
     let fp2 = app_core::pqkeys::fingerprint(st.pq_imported.as_ref().unwrap());
     assert_ne!(fp1, fp2, "two generates with identical entropy must differ (fresh TRNG)");
 
@@ -109,7 +109,7 @@ fn import_flow_stores_a_pasted_native_key() {
     .unwrap();
     app.global::<QuantumKeys>().set_pq_import_text(armor.clone().into());
 
-    do_pq_import(&app, &mut st);
+    st.do_pq_import(&app);
 
     assert!(app.global::<QuantumKeys>().get_pq_import_error().as_str().is_empty(), "import should not error");
     let kp = st.pq_imported.as_ref().expect("import populated State.pq_imported");
@@ -122,7 +122,7 @@ fn import_flow_stores_a_pasted_native_key() {
 
     // Garbage paste surfaces an error and leaves the key intact.
     app.global::<QuantumKeys>().set_pq_import_text("not a quantum key".into());
-    do_pq_import(&app, &mut st);
+    st.do_pq_import(&app);
     assert!(!app.global::<QuantumKeys>().get_pq_import_error().as_str().is_empty(), "garbage import must error");
     assert!(st.pq_imported.is_some(), "a failed import must not drop the existing key");
 
@@ -153,7 +153,7 @@ fn replace_guard_decision_gates_an_existing_key() {
     // No key yet -> the guard would run the action directly.
     assert!(st.pq_imported.is_none());
     app.global::<QuantumKeys>().set_pq_gen_level("768".into());
-    do_pq_generate(&app, &mut st);
+    st.do_pq_generate(&app);
     assert!(st.pq_imported.is_some());
 
     // Now a key exists -> the guard defers (this is the exact condition
