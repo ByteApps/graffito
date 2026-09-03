@@ -447,22 +447,29 @@ impl ScenarioBuilder {
     }
 }
 
+/// Which receive/change/spending-receive/spending-change indexes
+/// [`attach_wallet`] should fund (ascending, holes allowed) — grouped so the
+/// four related `Vec<u32>`s travel as one argument.
+pub struct UsedIndexes {
+    pub receive: Vec<u32>,
+    pub change: Vec<u32>,
+    pub spending_receive: Vec<u32>,
+    pub spending_change: Vec<u32>,
+}
+
 /// Build a [`ScenarioWallet`] for `material` (a mnemonic) at `account`,
 /// funding notebook receive/change indexes and BIP-84 spending indexes per
-/// the `used_*` args (ascending, holes allowed) — one confirmed funding tx
-/// per used index, into `builder`. `material_str` is the mnemonic's own
-/// string form (needed to derive the notebook account's watch descriptor
-/// via `keyexport::export_formats`).
+/// `used` (ascending, holes allowed) — one confirmed funding tx per used
+/// index, into `builder`. `material_str` is the mnemonic's own string form
+/// (needed to derive the notebook account's watch descriptor via
+/// `keyexport::export_formats`).
 pub fn attach_wallet(
     builder: &mut ScenarioBuilder,
     material_str: &str,
     network: Network,
     account: u32,
     gap: u32,
-    used_receive: Vec<u32>,
-    used_change: Vec<u32>,
-    used_spending_receive: Vec<u32>,
-    used_spending_change: Vec<u32>,
+    used: UsedIndexes,
     tip_height: u64,
 ) -> ScenarioWallet {
     use app_core::identity::{parse_key_material, realize, realize_change};
@@ -471,7 +478,7 @@ pub fn attach_wallet(
     let material = parse_key_material(material_str, network).expect("valid mnemonic");
     let funder = builder.taproot_addr("funder");
 
-    for &idx in &used_receive {
+    for &idx in &used.receive {
         let addr = realize(&material, network, account, idx).expect("realize notebook receive leaf").address;
         builder.add_tx(
             vec![InSpec::External { address: funder.clone(), value: 100_000 }],
@@ -479,7 +486,7 @@ pub fn attach_wallet(
             Some(tip_height.saturating_sub(10)),
         );
     }
-    for &idx in &used_change {
+    for &idx in &used.change {
         let addr = realize_change(&material, network, account, idx).expect("realize notebook change leaf").address;
         builder.add_tx(
             vec![InSpec::External { address: funder.clone(), value: 100_000 }],
@@ -489,7 +496,7 @@ pub fn attach_wallet(
     }
 
     let spending_src = spending::funding_source(&material, network, account).expect("spending funding_source");
-    for &idx in &used_spending_receive {
+    for &idx in &used.spending_receive {
         let addr = spending_src.derive(0, idx).expect("derive spending receive leaf").address;
         builder.add_tx(
             vec![InSpec::External { address: funder.clone(), value: 100_000 }],
@@ -497,7 +504,7 @@ pub fn attach_wallet(
             Some(tip_height.saturating_sub(8)),
         );
     }
-    for &idx in &used_spending_change {
+    for &idx in &used.spending_change {
         let addr = spending_src.derive(1, idx).expect("derive spending change leaf").address;
         builder.add_tx(
             vec![InSpec::External { address: funder.clone(), value: 100_000 }],
@@ -518,10 +525,10 @@ pub fn attach_wallet(
         spending: spending_src,
         account,
         gap,
-        used_receive,
-        used_change,
-        used_spending_receive,
-        used_spending_change,
+        used_receive: used.receive,
+        used_change: used.change,
+        used_spending_receive: used.spending_receive,
+        used_spending_change: used.spending_change,
     }
 }
 
@@ -755,8 +762,8 @@ fn assert_utxos_match_tolerant(
     mut got: Vec<(String, u32, u64, Option<u64>)>,
     sc_tip: u64,
 ) {
-    expected.sort_by(|a, b| (a.0.clone(), a.1).cmp(&(b.0.clone(), b.1)));
-    got.sort_by(|a, b| (a.0.clone(), a.1).cmp(&(b.0.clone(), b.1)));
+    expected.sort_by_key(|a| (a.0.clone(), a.1));
+    got.sort_by_key(|a| (a.0.clone(), a.1));
     assert_eq!(
         got.iter().map(|u| (u.0.clone(), u.1)).collect::<Vec<_>>(),
         expected.iter().map(|u| (u.0.clone(), u.1)).collect::<Vec<_>>(),
@@ -863,7 +870,7 @@ pub fn assert_chain_contract<T: Transport>(client: &ChainClient<T>, sc: &Scenari
     // esplora never 404s an address, only an unknown txid).
     let never_used = "scenario-address-with-no-history";
     if !sc.all_addresses().iter().any(|a| a == never_used) {
-        assert_eq!(client.address_used(never_used).unwrap(), false, "an untouched address is never 'used'");
+        assert!(!client.address_used(never_used).unwrap(), "an untouched address is never 'used'");
         assert!(client.utxos(never_used).unwrap().is_empty());
     }
 

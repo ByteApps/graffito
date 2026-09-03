@@ -679,10 +679,10 @@ mod tests {
         assert_eq!(dice_min_rolls(24).unwrap(), 99);
         // 99 rolls is 255.9 bits: the published 24-word threshold rounds DOWN
         // at 256. Guard the constant so nobody "fixes" it to 100.
-        assert!((99.0 * BITS_PER_ROLL) < 256.0);
-        assert!((100.0 * BITS_PER_ROLL) > 256.0);
-        assert!((50.0 * BITS_PER_ROLL) > 128.0);
-        assert!((75.0 * BITS_PER_ROLL) > 192.0);
+        const { assert!((99.0 * BITS_PER_ROLL) < 256.0) };
+        const { assert!((100.0 * BITS_PER_ROLL) > 256.0) };
+        const { assert!((50.0 * BITS_PER_ROLL) > 128.0) };
+        const { assert!((75.0 * BITS_PER_ROLL) > 192.0) };
     }
 
     #[test]

@@ -1965,10 +1965,13 @@ mod tests {
     /// `port: None`) — alongside every other shape the constructor accepts
     /// or must reject, so the whole parser is exercised in one place
     /// rather than one assertion per ad-hoc test.
+    /// One row of [`core_rpc_url_parsing_table`]: an input URL and either
+    /// the expected parsed `(scheme, host, port)` or `None` for "must Err".
+    type UrlCase = (&'static str, Option<(&'static str, &'static str, Option<u16>)>);
+
     #[test]
     fn core_rpc_url_parsing_table() {
-        // (input, expected Ok(scheme, host, port) or None for "must Err").
-        let cases: &[(&str, Option<(&str, &str, Option<u16>)>)] = &[
+        let cases: &[UrlCase] = &[
             // IPv4, with and without a port.
             ("http://192.168.1.50:8332", Some(("http", "192.168.1.50", Some(8332)))),
             ("http://192.168.1.50", Some(("http", "192.168.1.50", None))),

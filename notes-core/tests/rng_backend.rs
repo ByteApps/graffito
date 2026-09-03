@@ -63,7 +63,7 @@ fn assert_only_0_2(found: &BTreeSet<&str>, version_of: &BTreeMap<&str, &str>) ->
     }
     let bad: Vec<String> = found
         .iter()
-        .filter(|id| !version_of.get(*id).map_or(false, |v| v.starts_with("0.2.")))
+        .filter(|id| !version_of.get(*id).is_some_and(|v| v.starts_with("0.2.")))
         .map(|id| format!("{id} ({})", version_of.get(id).copied().unwrap_or("?")))
         .collect();
     if bad.is_empty() {
@@ -92,11 +92,9 @@ fn edge_is_linked(dep_kinds: &serde_json::Value) -> bool {
     dep_kinds
         .as_array()
         .map(|kinds| {
-            kinds.iter().any(|k| match k.get("kind").and_then(|v| v.as_str()) {
-                None => true,
-                Some("build") => true,
-                _ => false,
-            })
+            kinds
+                .iter()
+                .any(|k| matches!(k.get("kind").and_then(|v| v.as_str()), None | Some("build")))
         })
         .unwrap_or(false)
 }

@@ -21,7 +21,7 @@ mod common;
 use app_core::chain::ChainClient;
 use app_core::notes_core::Network;
 
-use common::{assert_chain_contract, attach_wallet, EsploraFake, InSpec, OutSpec, ScenarioBuilder};
+use common::{assert_chain_contract, attach_wallet, EsploraFake, InSpec, OutSpec, ScenarioBuilder, UsedIndexes};
 
 /// The canonical all-zeroes BIP-39 test mnemonic — already used elsewhere in
 /// this crate (`app-core/src/chain.rs`'s `SPENDING_MNEMONIC`,
@@ -134,10 +134,12 @@ fn contract_paginated_address_with_gap_limited_wallet() {
         Network::Regtest,
         0,
         3,
-        vec![0, 2],
-        vec![0],
-        vec![0, 1],
-        vec![0],
+        UsedIndexes {
+            receive: vec![0, 2],
+            change: vec![0],
+            spending_receive: vec![0, 1],
+            spending_change: vec![0],
+        },
         TIP,
     );
     let sc = b.with_wallet(wallet).build();

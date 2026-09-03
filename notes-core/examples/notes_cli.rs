@@ -177,7 +177,7 @@ fn main() {
                 dest_spk,
                 fee_rate,
                 locktime_for(None),
-                || generate_aux_rand(),
+                generate_aux_rand,
             )
             .unwrap();
             println!("{} {}", swept.txid_hex, swept.raw_hex);
@@ -201,7 +201,7 @@ fn main() {
                 max_or,
                 fee_rate,
                 locktime_for(Some(bundle.tip_height as u32)),
-                || generate_aux_rand(),
+                generate_aux_rand,
             )
             .unwrap();
             println!(
@@ -239,7 +239,7 @@ fn main() {
                 max_or,
                 fee_rate,
                 locktime_for(Some(bundle.tip_height as u32)),
-                || generate_aux_rand(),
+                generate_aux_rand,
             )
             .unwrap();
             println!(
@@ -302,7 +302,7 @@ fn main() {
                 max_or,
                 fee_rate,
                 locktime_for(Some(bundle.tip_height as u32)),
-                || generate_aux_rand(),
+                generate_aux_rand,
             )
             .unwrap();
             println!(
@@ -337,7 +337,7 @@ fn main() {
                 fee_rate,
                 locktime_for(Some(bundle.tip_height as u32)),
                 &identity.tweaked_seckey,
-                || generate_aux_rand(),
+                generate_aux_rand,
             )
             .unwrap();
             println!(

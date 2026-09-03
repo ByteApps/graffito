@@ -29,6 +29,6 @@ fn main() {
     let message = decoder.message().expect("message error").expect("no message");
     eprintln!("ur_type={ur_type}");
     let mut out = std::io::stdout();
-    out.write_all(hex::encode(&message).as_bytes()).unwrap();
+    out.write_all(hex::encode(message).as_bytes()).unwrap();
     out.write_all(b"\n").unwrap();
 }
