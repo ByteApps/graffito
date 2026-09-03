@@ -66,3 +66,8 @@
 # Never publish.
 /play
 /playstore
+
+# Companion test output + Python bytecode (companion/ is the canonical
+# source of the Pages tree in docs/companion/ — scripts/publish-companion.sh)
+/companion/tests/screenshots/
+__pycache__/

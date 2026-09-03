@@ -14,7 +14,7 @@
 #
 #   BACKEND  --esplora (default) | --core-rpc
 #            HOW THE APP talks to the chain. Esplora goes through
-#            ../prime-graffito/companion/server.py, a mempool.space-
+#            companion/server.py, a mempool.space-
 #            shaped shim pointed at the real node (`AnyTransport::Esplora`
 #            on the app side). --core-rpc has the app speak Bitcoin Core
 #            JSON-RPC directly (`AnyTransport::Core`, a
@@ -186,7 +186,6 @@ export CN_NODE_HOST CN_NODE_PORT CORE_RPC_USER CORE_RPC_PASS
 CN_CONFIRM_TIMEOUT="${CN_CONFIRM_TIMEOUT:-1800}"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-PRIME="$(cd "$REPO/../prime-graffito" && pwd)" || fail "needs ../prime-graffito"
 WORK="${E2E_WORK:-$(mktemp -d /tmp/graffito-e2e.XXXXXX)}"
 
 echo "== build both host binaries =="
@@ -487,7 +486,7 @@ pre_watch_fresh() { # addr... — rule 1: no-op for any address the shared
 if [[ "$BACKEND" == esplora ]]; then
     PORT="${E2E_PORT:-18791}"
     echo "== start companion server (Esplora shim) -> $NETWORK node =="
-    python3 "$PRIME/companion/server.py" "$PORT" --node "$CN_NODE_HOST:$CN_NODE_PORT" --network "$NETWORK" \
+    python3 "$REPO/companion/server.py" "$PORT" --node "$CN_NODE_HOST:$CN_NODE_PORT" --network "$NETWORK" \
         >"$WORK/server.log" 2>&1 &
     SERVER_PID=$!
     # server.py is killed by e2e_cleanup (the single EXIT trap above).
