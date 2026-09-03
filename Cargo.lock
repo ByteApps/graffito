@@ -2852,10 +2852,10 @@ dependencies = [
 [[package]]
 name = "graffito-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ByteApps/prime-graffito.git?rev=1abf76746a2e46bd13a456b54e7e78472d5bbfa1#1abf76746a2e46bd13a456b54e7e78472d5bbfa1"
 dependencies = [
  "notes-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4594,13 +4594,15 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 [[package]]
 name = "notes-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ByteApps/prime-graffito.git?rev=1abf76746a2e46bd13a456b54e7e78472d5bbfa1#1abf76746a2e46bd13a456b54e7e78472d5bbfa1"
 dependencies = [
  "argon2",
  "base64 0.22.1",
  "bech32",
+ "bip39",
+ "bitcoin",
  "bs58",
  "chacha20poly1305",
+ "foundation-ur",
  "getrandom 0.2.17",
  "hex",
  "hkdf",
@@ -6643,6 +6645,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
 dependencies = [
  "bitcoin_hashes 0.14.101",
+ "rand 0.8.6",
  "secp256k1-sys",
 ]
 

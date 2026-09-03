@@ -4,7 +4,7 @@
 # in this one script.
 #
 #   app role   = app-core/examples/cli.rs   (identity from APP_KEY)
-#   prime role = prime-graffito' notes_cli (identity from NOTES_APP_SEED)
+#   prime role = notes-core's notes_cli (identity from NOTES_APP_SEED)
 #   chain role = the shared PERSISTENT node described below
 #
 # PLAN-one-regtest-node.md (prime workspace root): there is only ONE
@@ -192,8 +192,8 @@ WORK="${E2E_WORK:-$(mktemp -d /tmp/graffito-e2e.XXXXXX)}"
 echo "== build both host binaries =="
 ( cd "$REPO" && cargo build -q -p app-core --example cli )
 APP="$REPO/target/debug/examples/cli"
-( cd "$PRIME" && cargo build -q -p notes-core --example notes_cli )
-NOTES="$PRIME/target/debug/examples/notes_cli"
+( cd "$REPO" && cargo build -q -p notes-core --example notes_cli )
+NOTES="$REPO/target/debug/examples/notes_cli"
 
 # The harness's OWN direct node access — used for connectivity checks and
 # (on testnet4, and on regtest in --core-rpc mode) for mining/funding.
