@@ -1,0 +1,181 @@
+// Screen.private-keys -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 19 · private keys (fresh Touch ID before entry) ----------
+
+import { Ui, PrivateKeys } from "../globals.slint";
+import { Caption, Mono, GhostButton, Header, QrArea, SelectPill } from "../components.slint";
+import { Pal } from "../theme.slint";
+
+export component PrivateKeysScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: "Private keys";
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Rectangle {
+            border-radius: 10px;
+            background: Pal.bad.with-alpha(0.12);
+            height: priv-warn.preferred-height + 20px;
+            priv-warn := Caption {
+                x: 12px;
+                y: 10px;
+                width: parent.width - 24px;
+                color: Pal.bad;
+                text: "Make sure no cameras or onlookers — anyone who captures a private key below controls the funds and can read every private note.";
+            }
+        }
+        if Ui.reveal-fingerprint != "": Mono {
+            text: Ui.reveal-fingerprint;
+            color: Pal.muted;
+        }
+        Flickable {
+            viewport-width: self.width;
+            viewport-height: priv-col.preferred-height;
+            priv-col := VerticalLayout {
+                width: parent.width;
+                spacing: 14px;
+                alignment: start;
+                HorizontalLayout {
+                    spacing: 6px;
+                    if PrivateKeys.reveal-has-recovery: SelectPill {
+                        text: "BIP-39";
+                        active: Ui.reveal-private-format == "recovery";
+                        clicked => { PrivateKeys.private-select("recovery"); }
+                    }
+                    if PrivateKeys.reveal-has-xprv: SelectPill {
+                        text: "xprv";
+                        active: Ui.reveal-private-format == "xprv";
+                        clicked => { PrivateKeys.private-select("xprv"); }
+                    }
+                    if PrivateKeys.reveal-has-hex: SelectPill {
+                        text: "hex";
+                        active: Ui.reveal-private-format == "hex";
+                        clicked => { PrivateKeys.private-select("hex"); }
+                    }
+                    if PrivateKeys.reveal-has-wif: SelectPill {
+                        text: "WIF";
+                        active: Ui.reveal-private-format == "wif";
+                        clicked => { PrivateKeys.private-select("wif"); }
+                    }
+                }
+                if Ui.reveal-private-format == "": Caption {
+                    text: "Tap a format to reveal it. Only one is ever shown at a time.";
+                    color: Pal.muted;
+                }
+
+                // ---- Notebook picker: hex/WIF only (seed/account-level
+                // formats don't vary per notebook) ----
+                if Ui.reveal-private-format == "hex" || Ui.reveal-private-format == "wif": VerticalLayout {
+                    spacing: 6px;
+                    Caption { text: "Notebook:"; color: Pal.muted; }
+                    for nb in PrivateKeys.reveal-nb-rows: Rectangle {
+                        height: 44px;
+                        nbp-ta := TouchArea { clicked => { PrivateKeys.private-pick-notebook(nb.index); } }
+                        Rectangle {
+                            border-radius: 10px;
+                            background: nb.index == PrivateKeys.reveal-nb-index
+                                ? Pal.accent.with-alpha(0.18)
+                                : (nbp-ta.has-hover ? Pal.card-hover : Pal.card);
+                            border-width: 1px;
+                            border-color: nb.index == PrivateKeys.reveal-nb-index ? Pal.accent.with-alpha(0.55) : Pal.line;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 8px;
+                                Text {
+                                    text: nb.name;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: Pal.text;
+                                    overflow: elide;
+                                    horizontal-stretch: 2;
+                                    vertical-alignment: center;
+                                }
+                                Mono {
+                                    text: nb.addr;
+                                    color: Pal.muted;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    wrap: no-wrap;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- Recovery phrase: word grid + SeedQR toggle ----
+                if Ui.reveal-private-format == "recovery": VerticalLayout {
+                    spacing: 10px;
+                    if !PrivateKeys.reveal-show-seedqr: HorizontalLayout {
+                        spacing: 16px;
+                        Mono { text: PrivateKeys.reveal-words-col1; horizontal-stretch: 1; }
+                        Mono { text: PrivateKeys.reveal-words-col2; horizontal-stretch: 1; }
+                    }
+                    if PrivateKeys.reveal-show-seedqr: HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 200px;
+                            height: 200px;
+                            QrArea {
+                                img: PrivateKeys.reveal-seedqr-image;
+                                qr-size: 200px;
+                            }
+                            TouchArea {
+                                clicked => {
+                                    Ui.qr-zoom-image = PrivateKeys.reveal-seedqr-image;
+                                    Ui.qr-zoom-open = true;
+                                }
+                            }
+                        }
+                    }
+                    GhostButton {
+                        text: PrivateKeys.reveal-show-seedqr ? "Show words" : "Show as SeedQR";
+                        clicked => { PrivateKeys.reveal-show-seedqr = !PrivateKeys.reveal-show-seedqr; }
+                    }
+                }
+
+                // ---- xprv / hex / WIF: a single red-tinted value box ----
+                if Ui.reveal-private-format == "xprv" || Ui.reveal-private-format == "hex" || Ui.reveal-private-format == "wif": VerticalLayout {
+                    spacing: 10px;
+                    Rectangle {
+                        border-radius: 10px;
+                        background: Pal.warn.with-alpha(0.10);
+                        border-width: 1px;
+                        border-color: Pal.warn.with-alpha(0.4);
+                        height: pvv.preferred-height + 24px;
+                        pvv := Mono {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            text: PrivateKeys.reveal-private-value;
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 176px;
+                            height: 176px;
+                            QrArea {
+                                img: PrivateKeys.reveal-private-qr;
+                                qr-size: 176px;
+                            }
+                            TouchArea {
+                                clicked => {
+                                    Ui.qr-zoom-image = PrivateKeys.reveal-private-qr;
+                                    Ui.qr-zoom-open = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if Ui.reveal-private-format != "": GhostButton {
+                    text: "Copy";
+                    clicked => { PrivateKeys.copy-secret(PrivateKeys.reveal-private-value); }
+                }
+            }
+        }
+    }
