@@ -11,11 +11,11 @@
 import { ListView, Switch, AboutSlint } from "std-widgets.slint";
 import { Pal, Metrics } from "theme.slint";
 import { EditOps, EditField, EditArea } from "edit.slint";
-import { NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem } from "types.slint";
+import { Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem } from "types.slint";
 import { H1, Body, Caption, Mono, Card, PrimaryButton, GhostButton, IconButton, SvgIconButton, SyncButton, BackButton, Header, Badge, CopyButton, QrSpinner, QrArea, PencilButton, WebViewButton, ScanButton, SelectPill, Dropdown, SettingsCard, KvRow, DoorCard, CoinListPanel, TxConfirmView } from "components.slint";
 // Rust (src/lib.rs, via slint::include_modules!()) needs these re-exported
 // from the entry-point file.
-export { Metrics, EditOps, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem }
+export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem }
 
 export component AppWindow inherits Window {
     preferred-width: 480px;
@@ -27,9 +27,9 @@ export component AppWindow inherits Window {
     init => { EditOps.win-width = self.width; }
     changed width => { EditOps.win-width = self.width; }
 
-    // 0 onboard · 1 import · 2 backup · 3 quiz · 4 home · 5 note ·
-    // 6 compose · 7 contacts · 8 settings
-    in-out property <int> screen: 0;
+    // onboarding · import-key · backup-words · quiz · home · note ·
+    // compose · contacts · settings · … (see the `Screen` enum, types.slint)
+    in-out property <Screen> screen: Screen.onboarding;
     in-out property <string> status; // in-out: back buttons clear stale messages
 
     // Ambient "a network operation is in flight" signal — Rust flips this
@@ -627,11 +627,11 @@ export component AppWindow inherits Window {
     // Screen 16 serves both flows: "sweep" (dest from the picker) and
     // "consolidate" (dest = self, opened from the Coins screen).
     in-out property <string> sweep-kind: "sweep";
-    // Which screen the funding-wallet manager returns to (6 compose, 16 sweep).
-    in-out property <int> funding-return: 6;
-    // Where compose (screen 6) returns on back: 7 = picker (default/normal
-    // flow), 5 = note view (opened via Reply).
-    in-out property <int> compose-return: 7;
+    // Which screen the funding-wallet manager returns to (compose, sweep).
+    in-out property <Screen> funding-return: Screen.compose;
+    // Where compose returns on back: contacts = picker (default/normal
+    // flow), note = note view (opened via Reply).
+    in-out property <Screen> compose-return: Screen.contacts;
 
     // A key is saved in this device's keychain (probed at boot WITHOUT
     // unlocking it — reading it would prompt for Face ID and block launch).
@@ -860,7 +860,7 @@ export component AppWindow inherits Window {
     // Where settings/activity return on back: the screen they were opened
     // from (the notebook list or a notebook's home). Set by their open
     // callbacks in Rust.
-    in-out property <int> return-screen: 4;
+    in-out property <Screen> return-screen: Screen.home;
 
     // ---------- notebooks (screen 17 = the main list; 4 = one notebook) ----------
     in-out property <[NotebookItem]> notebooks;
@@ -913,7 +913,7 @@ export component AppWindow inherits Window {
     // truth: the chevrons call nav-back() too); unhandled (onboarding/home)
     // rejects the key so Android's default runs, which moves the task to
     // the background instead of quitting.
-    callback back-logged(bool, int); // Rust: `cb: sys-back` log line
+    callback back-logged(bool, Screen); // Rust: `cb: sys-back` log line
     function nav-back() -> bool {
         // Overlays first, topmost (= last window child) before the rest —
         // back closes the same thing a tap on Cancel / the dim would.
@@ -928,20 +928,20 @@ export component AppWindow inherits Window {
         if (root.nb-rename-index >= 0) { root.nb-rename-cancel(); return true; }
         if (root.scanning) { root.cancel-scan(); return true; }
         // Screens: one branch per header chevron.
-        if (root.screen == 1 || root.screen == 2) { root.screen = 0; return true; }
+        if (root.screen == Screen.import-key || root.screen == Screen.backup-words) { root.screen = Screen.onboarding; return true; }
         // Entropy-source door → back to onboarding; dice entry → back to the
         // door (so "This device" is still one tap away mid-roll).
-        if (root.screen == 27) { root.screen = 0; return true; }
-        if (root.screen == 28) { root.screen = 27; return true; }
-        if (root.screen == 4) { root.open-notebooks(); return true; }
-        if (root.screen == 3) { root.screen = 2; return true; }
-        if (root.screen == 5) { root.go-home(); return true; }
-        if (root.screen == 8 || root.screen == 11) {
+        if (root.screen == Screen.entropy-source) { root.screen = Screen.onboarding; return true; }
+        if (root.screen == Screen.dice) { root.screen = Screen.entropy-source; return true; }
+        if (root.screen == Screen.home) { root.open-notebooks(); return true; }
+        if (root.screen == Screen.quiz) { root.screen = Screen.backup-words; return true; }
+        if (root.screen == Screen.note) { root.go-home(); return true; }
+        if (root.screen == Screen.settings || root.screen == Screen.activity) {
             // Back to wherever settings/activity was opened from.
-            if (root.return-screen == 17) { root.open-notebooks(); } else { root.go-home(); }
+            if (root.return-screen == Screen.notebooks) { root.open-notebooks(); } else { root.go-home(); }
             return true;
         }
-        if (root.screen == 6) {
+        if (root.screen == Screen.compose) {
             // Clear the typed address on the way back — it's saved in recents
             // now, so leaving it in the field is redundant. Status too: its
             // message belonged to this screen.
@@ -950,75 +950,75 @@ export component AppWindow inherits Window {
             root.screen = root.compose-return;
             return true;
         }
-        if (root.screen == 7) {
+        if (root.screen == Screen.contacts) {
             if (root.pick-mode == "sweep") {
                 root.pick-mode = "compose";
-                root.screen = 8;
+                root.screen = Screen.settings;
             } else if (root.picking-extra) {
                 // "+ Add recipient" reopened the picker on top of compose —
                 // back returns to compose, not home.
                 root.picking-extra = false;
-                root.screen = 6;
+                root.screen = Screen.compose;
             } else {
                 root.go-home();
             }
             return true;
         }
-        if (root.screen == 9) { root.account-cancel(); return true; }
-        if (root.screen == 10) { root.screen = 8; return true; }
-        if (root.screen == 12) { root.open-funding(); return true; }
-        if (root.screen == 13) { root.screen = root.watch-only ? 8 : 6; return true; }
-        if (root.screen == 14) { root.screen = 13; return true; }
-        if (root.screen == 15) { root.screen = root.funding-return; return true; }
-        if (root.screen == 16) {
+        if (root.screen == Screen.account-picker) { root.account-cancel(); return true; }
+        if (root.screen == Screen.coins) { root.screen = Screen.settings; return true; }
+        if (root.screen == Screen.funding-wallet) { root.open-funding(); return true; }
+        if (root.screen == Screen.export-psbt) { root.screen = root.watch-only ? Screen.settings : Screen.compose; return true; }
+        if (root.screen == Screen.import-signed-psbt) { root.screen = Screen.export-psbt; return true; }
+        if (root.screen == Screen.funding-wallets) { root.screen = root.funding-return; return true; }
+        if (root.screen == Screen.sweep) {
             // Clear the typed address + any stale status on the way back —
             // success messages otherwise linger red on the picker. Sweep
             // returns to its destination picker, consolidate to the coins.
             root.contact-input = "";
             root.status = "";
             if (root.sweep-kind == "consolidate") {
-                root.screen = 10;
+                root.screen = Screen.coins;
             } else {
                 root.pick-mode = "sweep";
-                root.screen = 7;
+                root.screen = Screen.contacts;
             }
             return true;
         }
         // Pay-from (screen 20): reached only from compose's compact row —
         // back always returns to compose, draft untouched (no field wipes,
         // unlike screen 6's own back-to-picker branch above).
-        if (root.screen == 20) { root.screen = 6; return true; }
+        if (root.screen == Screen.pay-from) { root.screen = Screen.compose; return true; }
         // Change (screen 21): reached only from compose's second nav row —
         // back returns to compose too (a sibling of the Pay-from row, not
         // nested under screen 20).
-        if (root.screen == 21) { root.screen = 6; return true; }
-        if (root.screen == 18 || root.screen == 19) {
+        if (root.screen == Screen.change) { root.screen = Screen.compose; return true; }
+        if (root.screen == Screen.public-keys || root.screen == Screen.private-keys) {
             root.reveal-hide();
-            root.screen = 8;
+            root.screen = Screen.settings;
             return true;
         }
-        if (root.screen == 29) {
+        if (root.screen == Screen.quantum-keys) {
             root.pq-show-backup-confirm = false;
             root.pq-show-replace-confirm = false;
             if (root.pq-show-export-private-confirm) {
                 root.pq-imported-hide-private();
             }
             root.pq-show-export-private-confirm = false;
-            root.screen = 8;
+            root.screen = Screen.settings;
             return true;
         }
         // Terms & disclaimer: the first-run accept gate can't be skipped with
         // back; the read-only re-view returns to Settings.
-        if (root.screen == 24) {
+        if (root.screen == Screen.terms) {
             if (root.terms-accept-mode) { return false; }
-            root.screen = 8;
+            root.screen = Screen.settings;
             return true;
         }
-        if (root.screen == 25) { root.screen = 8; return true; } // info → Settings
+        if (root.screen == Screen.info) { root.screen = Screen.settings; return true; } // info → Settings
         // Universal confirm screen: back always cancels (never a bare nav —
         // Rust's on_confirm_cancel clears the pending broadcast + props and
         // picks the return screen), so Android back can't quit from here.
-        if (root.screen == 26) { root.confirm-cancel(); return true; }
+        if (root.screen == Screen.confirm) { root.confirm-cancel(); return true; }
         return false; // 0 onboarding / 17 notebook list: nothing to go back to
     }
     // Focus must never be nobody's, or key events (incl. Back) are dropped
@@ -1077,7 +1077,7 @@ export component AppWindow inherits Window {
     TouchArea { clicked => { back-scope.focus(); } }
 
     // ---------- 0 · onboarding ----------
-    if screen == 0: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.onboarding: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 24px;
         spacing: 14px;
         alignment: start;
@@ -1142,7 +1142,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 1 · import ----------
-    if screen == 1: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.import-key: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1186,7 +1186,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 2 · backup ----------
-    if screen == 2: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.backup-words: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1307,7 +1307,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 3 · quiz ----------
-    if screen == 3: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.quiz: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1323,7 +1323,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 4 · home ----------
-    if screen == 4: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.home: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         HorizontalLayout {
@@ -1554,7 +1554,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 17 · notebooks (the main screen) ----------
-    if screen == 17: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.notebooks: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         HorizontalLayout {
@@ -1702,7 +1702,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 5 · note view ----------
-    if screen == 5: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.note: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -1824,7 +1824,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 6 · compose ----------
-    if screen == 6: Rectangle {
+    if screen == Screen.compose: Rectangle {
         // Background tap layer: a tap on any empty area moves focus to
         // back-scope, which dismisses the on-screen keyboard. Interactive
         // children (the note editor, pills, buttons) sit on top in the
@@ -2321,7 +2321,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 7 · contacts ----------
-    if screen == 7: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.contacts: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -2472,7 +2472,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 8 · settings ----------
-    if screen == 8: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.settings: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -2908,7 +2908,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 9 · account picker ----------
-    if screen == 9: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.account-picker: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -3006,7 +3006,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 10 · coins ----------
-    if screen == 10: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.coins: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -3141,7 +3141,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 11 · activity (transactions) ----------
-    if screen == 11: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.activity: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -3235,7 +3235,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 12 · funding wallet (external PSBT source) ----------
-    if screen == 12: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.funding-wallet: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -3287,7 +3287,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 13 · export PSBT (sign externally) ----------
-    if screen == 13: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.export-psbt: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -3348,7 +3348,7 @@ export component AppWindow inherits Window {
     // 2026-07-17): once a scanned/loaded PSBT validates, Rust navigates
     // straight to the universal confirm screen (26) — this screen never
     // shows a confirm view or a Broadcast button itself anymore.
-    if screen == 14: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.import-signed-psbt: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -3370,7 +3370,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 15 · funding wallets (manager list) ----------
-    if screen == 15: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.funding-wallets: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -3456,7 +3456,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 16 · sweep (compose-like, minus the note text) ----------
-    if screen == 16: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.sweep: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -3541,7 +3541,7 @@ export component AppWindow inherits Window {
                     border-width: 1px;
                     border-color: root.funding-ready ? Pal.line : Pal.accent.with-alpha(0.5);
                     height: 44px;
-                    sftap := TouchArea { clicked => { root.funding-return = 16; root.open-funding(); } }
+                    sftap := TouchArea { clicked => { root.funding-return = Screen.sweep; root.open-funding(); } }
                     HorizontalLayout {
                         padding-left: 12px;
                         padding-right: 12px;
@@ -3744,7 +3744,7 @@ export component AppWindow inherits Window {
                     tint-hover: (root.funding-ready && root.wallet-scan-busy) ? Pal.faint : Pal.accent-hover;
                     clicked => {
                         if (!root.funding-ready) {
-                            root.funding-return = 16;
+                            root.funding-return = Screen.sweep;
                             root.open-funding();
                         } else if (!root.wallet-scan-busy) {
                             root.sweep-send();
@@ -3759,7 +3759,7 @@ export component AppWindow inherits Window {
     // ---------- 20 · pay from (funding-unification: picker + coin control +
     // custom change, moved off compose wholesale — Sal 2026-07-16 iPhone
     // build-8 review). Reached only from compose's compact "Pay from" row;
-    // back (nav-back, screen == 20) always returns to compose with the
+    // back (nav-back, screen == Screen.pay-from) always returns to compose with the
     // draft untouched. Independent-expand rework (2026-07-18, Sal's iPhone
     // feedback): Notebook/Spending/each external wallet expand and collapse
     // on their own — a header tap ONLY shows/hides a section, it never
@@ -3770,7 +3770,7 @@ export component AppWindow inherits Window {
     // beneath it (no `alignment: start` + the Flickable gets
     // `vertical-stretch: 1`, same pattern as the universal confirm screen,
     // commit c3ec2d5). ----------
-    if screen == 20: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.pay-from: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -3995,7 +3995,7 @@ export component AppWindow inherits Window {
                 }
                 GhostButton {
                     text: "+ External wallet…";
-                    clicked => { root.funding-return = 20; root.open-funding(); }
+                    clicked => { root.funding-return = Screen.pay-from; root.open-funding(); }
                 }
                 if root.mixed-linkage-hint: Caption {
                     text: "This note spends coins from more than one wallet — their addresses become publicly linked on-chain.";
@@ -4012,7 +4012,7 @@ export component AppWindow inherits Window {
     // the existing validated text input. Defaults (never overridden once an
     // explicit pick is made this session) come from app-core's
     // `mixed::resolve_change_default`.
-    if screen == 21: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.change: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -4156,7 +4156,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 18 · public keys (watch-only-safe, no re-auth) ----------
-    if screen == 18: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.public-keys: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -4254,7 +4254,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 19 · private keys (fresh Touch ID before entry) ----------
-    if screen == 19: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.private-keys: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -4428,7 +4428,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 29 · quantum keys (Settings -> ML-KEM receive key + import) ----------
-    if screen == 29: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.quantum-keys: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -4594,7 +4594,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 24 · terms & disclaimer (first-run accept gate + re-view) ----------
-    if screen == 24: VerticalLayout { padding-top: root.safe-top + 20px; padding-bottom: root.safe-bottom + 10px;
+    if screen == Screen.terms: VerticalLayout { padding-top: root.safe-top + 20px; padding-bottom: root.safe-bottom + 10px;
         padding: 24px;
         spacing: 16px;
         // View mode (opened from Settings) gets a normal header + back chevron.
@@ -4629,7 +4629,7 @@ export component AppWindow inherits Window {
     }
 
     // ---------- 25 · info (About / Privacy / Help / Q&A) ----------
-    if screen == 25: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.info: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         Header {
@@ -4655,7 +4655,7 @@ export component AppWindow inherits Window {
     // N-word seed" door — creation no longer generates immediately, because
     // "the device rolled it for you, trust us" is exactly the thing a bitcoin
     // user may not want to trust.
-    if screen == 27: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.entropy-source: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         alignment: start;
@@ -4691,7 +4691,7 @@ export component AppWindow inherits Window {
     // reason — at any moment you can check the number on screen against
     // `echo -n <rolls> | shasum -a 256` and see the device isn't inventing
     // anything.
-    if screen == 28: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.dice: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 10px;
         alignment: start;
@@ -4810,7 +4810,7 @@ export component AppWindow inherits Window {
     // before anything hits the wire — full decoded tx, Broadcast is the
     // only way out besides Cancel. Funding-unification follow-up,
     // 2026-07-17.
-    if screen == 26: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
+    if screen == Screen.confirm: VerticalLayout { padding-top: root.safe-top + 14px; padding-bottom: root.safe-bottom;
         padding: 20px;
         spacing: 12px;
         // No `alignment: start` here: the detail view stretches to fill so
