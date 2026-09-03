@@ -2,6 +2,43 @@
 // SDK bridge in src/lib.rs. Split out of app.slint (U1,
 // PLAN-graffito-app-arch.md) as a pure file move: no value changes.
 
+// The app's router (U2, PLAN-graffito-app-arch.md) — was a bare `int` with
+// 56 Slint and 86 Rust integer comparisons/assignments; now one enum, in
+// the app's historical screen-number order (each comment is that screen's
+// old int, still referenced by the ui-automation suites' comments). 22/23
+// never existed. Slint's kebab-case variant names generate CamelCase Rust
+// ones (e.g. `account-picker` -> `Screen::AccountPicker`).
+export enum Screen {
+    onboarding,          // 0
+    import-key,          // 1
+    backup-words,        // 2
+    quiz,                // 3
+    home,                // 4
+    note,                // 5
+    compose,             // 6
+    contacts,            // 7
+    settings,            // 8
+    account-picker,      // 9
+    coins,               // 10
+    activity,            // 11
+    funding-wallet,      // 12
+    export-psbt,         // 13
+    import-signed-psbt,  // 14
+    funding-wallets,     // 15
+    sweep,               // 16
+    notebooks,           // 17
+    public-keys,         // 18
+    private-keys,        // 19
+    pay-from,            // 20
+    change,              // 21
+    terms,               // 24
+    info,                // 25
+    confirm,             // 26
+    entropy-source,      // 27
+    dice,                // 28
+    quantum-keys,        // 29
+}
+
 // `locked`: a post-quantum note this device hasn't decrypted yet
 // (NoteRecord.locked.is_some() — text stays None until Store::unlock_note
 // succeeds). Distinct from `private`, which just means "encrypted" —
