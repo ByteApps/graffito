@@ -20,6 +20,9 @@ use crate::sign::schnorr_sign;
 use crate::tx::{write_varint, Transaction, TxOut, Utxo};
 use crate::Error;
 
+/// Raw (unknown-key) PSBT key/value pairs, as read from a key-value map.
+type KvPairs = Vec<(Vec<u8>, Vec<u8>)>;
+
 const MAGIC: [u8; 5] = [0x70, 0x73, 0x62, 0x74, 0xff]; // "psbt\xff"
 const PSBT_GLOBAL_UNSIGNED_TX: u8 = 0x00;
 const PSBT_IN_WITNESS_UTXO: u8 = 0x01;
@@ -494,7 +497,7 @@ impl<'a> Reader<'a> {
 
     /// Read a PSBT key-value map up to its `0x00` separator. Each pair is
     /// `<keylen><key><vallen><val>`; a zero keylen ends the map.
-    fn read_map(&mut self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+    fn read_map(&mut self) -> Result<KvPairs, Error> {
         let mut kvs = Vec::new();
         loop {
             let klen = self.varint()? as usize;
