@@ -1,0 +1,157 @@
+// Screen.change -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 21 · change destination (funding-unification UI rework) ----------
+// Moved off the Pay-from screen onto its own screen, reached from a
+// second compose nav row. Single-select rows; "Custom address…" reveals
+// the existing validated text input. Defaults (never overridden once an
+// explicit pick is made this session) come from app-core's
+// `mixed::resolve_change_default`.
+
+import { Ui, Change } from "../globals.slint";
+import { Caption, Header, Badge, ScanButton } from "../components.slint";
+import { EditField } from "../edit.slint";
+import { Pal } from "../theme.slint";
+
+export component ChangeScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Change";
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Flickable {
+            viewport-height: change-scr-col.preferred-height;
+            // Dismiss layer (see the global one under back-scope) — the
+            // custom change-address field lives in here.
+            TouchArea {
+                width: parent.width;
+                height: change-scr-col.preferred-height;
+                clicked => { Ui.focus-back-scope-nonce += 1; }
+            }
+            change-scr-col := VerticalLayout {
+                spacing: 10px;
+                alignment: start;
+                if Ui.spending-capable && Ui.spending-enabled: Rectangle {
+                    height: chg-sp-row.preferred-height;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: Ui.change-choice == "spending" ? Pal.accent : Pal.line;
+                    background: Ui.change-choice == "spending" ? Pal.accent.with-alpha(0.10) : Pal.card;
+                    TouchArea { clicked => { Change.change-pick("spending"); } }
+                    chg-sp-row := VerticalLayout {
+                        padding: 10px;
+                        spacing: 3px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            Text {
+                                text: "Spending wallet · fresh change";
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: Ui.change-choice == "spending" ? Pal.accent : Pal.text;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            if Change.change-default-choice == "spending": Badge { label: "default"; tint: Pal.accent; }
+                        }
+                        if Change.change-spending-line != "": Caption { text: Change.change-spending-line; }
+                        if Change.change-default-choice == "spending": Caption { text: Change.change-default-reason; }
+                        Caption { text: "Never used before — keeps your funds unlinked."; }
+                    }
+                }
+                Rectangle {
+                    height: chg-nb-row.preferred-height;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: Ui.change-choice == "notebook" ? Pal.accent : Pal.line;
+                    background: Ui.change-choice == "notebook" ? Pal.accent.with-alpha(0.10) : Pal.card;
+                    TouchArea { clicked => { Change.change-pick("notebook"); } }
+                    chg-nb-row := VerticalLayout {
+                        padding: 10px;
+                        spacing: 3px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            Text {
+                                text: "Notebook";
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: Ui.change-choice == "notebook" ? Pal.accent : Pal.text;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            if Change.change-default-choice == "notebook": Badge { label: "default"; tint: Pal.accent; }
+                        }
+                        if Change.change-notebook-line != "": Caption { text: Change.change-notebook-line; }
+                        if Change.change-default-choice == "notebook": Caption { text: Change.change-default-reason; }
+                        Caption { text: "Reuses your public notebook address."; }
+                    }
+                }
+                for fw in Ui.funding-wallets: Rectangle {
+                    height: chg-fw-row.preferred-height;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: Ui.change-choice == "wallet:" + fw.id ? Pal.accent : Pal.line;
+                    background: Ui.change-choice == "wallet:" + fw.id ? Pal.accent.with-alpha(0.10) : Pal.card;
+                    TouchArea { clicked => { Change.change-pick("wallet:" + fw.id); } }
+                    chg-fw-row := VerticalLayout {
+                        padding: 10px;
+                        spacing: 3px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            Text {
+                                text: fw.label + " change";
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: Ui.change-choice == "wallet:" + fw.id ? Pal.accent : Pal.text;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            if Change.change-default-choice == "wallet:" + fw.id: Badge { label: "default"; tint: Pal.accent; }
+                        }
+                        if fw.change-addr != "": Caption { text: fw.change-addr; }
+                        if Change.change-default-choice == "wallet:" + fw.id: Caption { text: Change.change-default-reason; }
+                        Caption { text: fw.label + "'s change chain."; }
+                    }
+                }
+                Rectangle {
+                    height: chg-custom-row.preferred-height;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: Ui.change-choice == "custom" ? Pal.accent : Pal.line;
+                    background: Ui.change-choice == "custom" ? Pal.accent.with-alpha(0.10) : Pal.card;
+                    TouchArea { clicked => { Change.change-pick("custom"); } }
+                    chg-custom-row := VerticalLayout {
+                        padding: 10px;
+                        spacing: 3px;
+                        Text {
+                            text: "Custom address…";
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: Ui.change-choice == "custom" ? Pal.accent : Pal.text;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                    }
+                }
+                if Ui.change-choice == "custom": HorizontalLayout {
+                    spacing: 8px;
+                    EditField {
+                        text <=> Ui.change-address;
+                        placeholder-text: "change address";
+                        edited => { Ui.compose-changed(); }
+                    }
+                    ScanButton { clicked => { Change.change-scan(); } }
+                }
+                if Ui.change-choice == "custom": Caption {
+                    text: "Leaves this wallet — the coin won't be tracked here.";
+                    color: Pal.warn;
+                }
+                if Change.change-error != "": Caption { text: Change.change-error; color: Pal.bad; }
+                Caption { text: "Current: " + Ui.change-dest-label; }
+            }
+        }
+    }
