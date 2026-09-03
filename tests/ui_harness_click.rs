@@ -13,7 +13,6 @@ use std::rc::Rc;
 use graffito::AppWindow;
 use i_slint_backend_testing::ElementHandle;
 use slint::platform::PointerEventButton;
-use slint::ComponentHandle;
 
 #[test]
 fn single_click_reaches_the_handler_headless() {

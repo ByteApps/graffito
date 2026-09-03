@@ -107,7 +107,7 @@ pub fn capture_frames(
 
         // QR detection is the expensive step — run it every other frame so the
         // preview stays smooth (still ~15 scans/sec at 30 fps).
-        if frames % 2 == 0 {
+        if frames.is_multiple_of(2) {
             let mut prepared =
                 rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| raw[y * w + x]);
             for grid in prepared.detect_grids() {
