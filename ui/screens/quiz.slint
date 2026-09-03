@@ -1,0 +1,24 @@
+// Screen.quiz -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 3 · quiz ----------
+
+import { Ui, Quiz } from "../globals.slint";
+import { Body, Caption, PrimaryButton, Header } from "../components.slint";
+import { EditField } from "../edit.slint";
+import { Pal } from "../theme.slint";
+
+export component QuizScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Spot check";
+            show-back: true;
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Body { text: Quiz.quiz-prompt; }
+        EditField { text <=> Quiz.quiz-answer; placeholder-text: "word  word  word"; }
+        PrimaryButton { text: "Verify"; clicked => { Quiz.quiz-submit(Quiz.quiz-answer); } }
+        Caption { text: Ui.status; color: Pal.bad; }
+    }
