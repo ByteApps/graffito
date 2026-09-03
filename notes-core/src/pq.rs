@@ -603,7 +603,7 @@ pub const PW_MAX_T: u32 = 16;
 /// `t` are capped at [`PW_MAX_M_LOG2`]/[`PW_MAX_T`] (see those consts for
 /// the threat model); `t`/`p` need to be >= 1 (Argon2's own minimums).
 fn validate_pw_params(t: u32, m_log2: u8, p: u32) -> Result<(), Error> {
-    if t < 1 || p < 1 || p > 0x00ff_ffff {
+    if t < 1 || !(1..=0x00ff_ffff).contains(&p) {
         return Err(Error::Decode("pq: invalid argon2 params"));
     }
     if t > PW_MAX_T {

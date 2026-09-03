@@ -25,7 +25,7 @@ use crate::{Error, DUST_LIMIT};
 /// height in `[tip-100, tip]`. That would need randomness inside the
 /// builders, making every build non-deterministic and every byte-exact
 /// test pin need a seeded RNG — a poor trade for a marginal gain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum LockTimePolicy {
     /// Anti-fee-sniping: the last chain height we know about. This is the
@@ -35,6 +35,7 @@ pub enum LockTimePolicy {
     /// the most recently imported sync bundle and may be stale. A stale
     /// height is still perfectly valid — the transaction is simply already
     /// final — it just buys proportionally less anti-sniping protection.
+    #[default]
     Tip,
     /// Always `0`: no locktime constraint. This crate's behavior before
     /// anti-fee-sniping existed, kept as an explicit opt-out.
@@ -43,12 +44,6 @@ pub enum LockTimePolicy {
     /// interpreted by consensus as a UNIX timestamp rather than a height;
     /// that is the caller's choice and is passed through untouched.
     Custom { height: u32 },
-}
-
-impl Default for LockTimePolicy {
-    fn default() -> Self {
-        LockTimePolicy::Tip
-    }
 }
 
 impl LockTimePolicy {
@@ -122,7 +117,7 @@ pub fn select_note_inputs(
 ) -> Result<Vec<Utxo>, Error> {
     let sent: u64 = if recipient_spk_len.is_some() { recipient_amount } else { 0 };
     let mut candidates = available.to_vec();
-    candidates.sort_by(|a, b| b.value.cmp(&a.value));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.value));
     let mut selected: Vec<Utxo> = Vec::new();
     let mut in_value: u64 = 0;
     for utxo in candidates {
@@ -157,7 +152,7 @@ pub fn select_note_inputs_multi(
     fee_rate: f64,
 ) -> Result<Vec<Utxo>, Error> {
     let mut candidates = available.to_vec();
-    candidates.sort_by(|a, b| b.value.cmp(&a.value));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.value));
     let mut selected: Vec<Utxo> = Vec::new();
     let mut in_value: u64 = 0;
     for utxo in candidates {
@@ -636,7 +631,7 @@ pub fn build_note_tx_with_change(
     let payload_lens: Vec<usize> = payloads.iter().map(Vec::len).collect();
     let sent: u64 = if recipient_spk.is_some() { recipient_amount } else { 0 };
     let mut candidates = available.to_vec();
-    candidates.sort_by(|a, b| b.value.cmp(&a.value));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.value));
 
     // `change_spk` is the notes address's own spk — used for BOTH the
     // input prevout scripts (sighash) and, by default, the change output.
@@ -756,7 +751,7 @@ pub fn build_note_tx_multi_with_change(
     let recipient_lens: Vec<usize> = recipients.iter().map(|(spk, _)| spk.len()).collect();
     let sent: u64 = recipients.iter().map(|(_, amount)| amount).sum();
     let mut candidates = available.to_vec();
-    candidates.sort_by(|a, b| b.value.cmp(&a.value));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.value));
 
     let change_spk = p2tr_script_pubkey(output_x);
     let change_out_spk = change_out.map(<[u8]>::to_vec).unwrap_or_else(|| change_spk.clone());

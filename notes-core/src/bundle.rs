@@ -21,6 +21,14 @@ use crate::tx::{
 };
 use crate::{Error, Network};
 
+/// OP_RETURN-chunk payloads plus the optional gift-output scriptPubKey a
+/// directed note's payload construction produces.
+type SealedNotePayloads = (Vec<Vec<u8>>, Option<Vec<u8>>);
+
+/// OP_RETURN-chunk payloads plus each recipient's scriptPubKey in output
+/// order, as produced by the multi-recipient payload construction.
+type SealedNotePayloadsMulti = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 /// Everything derived from the app seed that the app needs at runtime.
 pub struct Identity {
     pub internal_x: [u8; 32],
@@ -544,7 +552,7 @@ fn tx_notebook_anchor(tx: &OnchainTx, notebook_spks: &[Vec<u8>]) -> Option<Vec<u
     }
     tx.input_prevout_spks.iter().find_map(|spk_hex| {
         let spk = hex::decode(spk_hex).ok()?;
-        if notebook_spks.iter().any(|s| *s == spk) {
+        if notebook_spks.contains(&spk) {
             Some(spk)
         } else {
             None
@@ -578,7 +586,7 @@ fn extract_notes_inner(
         let is_own = tx.spends_from_self
             || tx.input_prevout_spks.iter().any(|spk_hex| {
                 hex::decode(spk_hex)
-                    .map(|spk| self_spks.iter().any(|s| *s == spk))
+                    .map(|spk| self_spks.contains(&spk))
                     .unwrap_or(false)
             });
         let mut received = if is_own {
@@ -923,7 +931,7 @@ pub fn sealed_note_payloads(
     recipient: Option<&Recipient>,
     outpoint: [u8; 36],
     max_op_return_bytes: usize,
-) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>), Error> {
+) -> Result<SealedNotePayloads, Error> {
     let body = if private {
         if let Some(r) = recipient {
             let recipient_x = r.p2tr_x.ok_or(Error::RecipientNotTaproot)?;
@@ -966,7 +974,7 @@ pub fn sealed_note_payloads_multi(
     outpoint: [u8; 36],
     content_key: [u8; 32],
     max_op_return_bytes: usize,
-) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), Error> {
+) -> Result<SealedNotePayloadsMulti, Error> {
     let mut deduped: Vec<&Recipient> = Vec::new();
     for r in recipients {
         if !deduped.iter().any(|existing| existing.address == r.address) {
@@ -1024,6 +1032,7 @@ fn compose_inner(
 }
 
 /// Compose path: text → (sealed) body → enveloped payloads → signed tx.
+#[allow(clippy::too_many_arguments)]
 pub fn compose_note(
     identity: &Identity,
     utxos: &[Utxo],
@@ -1086,6 +1095,7 @@ pub fn compose_note_with_change(
 /// only the recipient (and the sender, reciprocally) can read them; private
 /// therefore requires a taproot recipient. Public directed notes go to any
 /// segwit address.
+#[allow(clippy::too_many_arguments)]
 pub fn compose_directed_note(
     identity: &Identity,
     utxos: &[Utxo],
@@ -1265,6 +1275,7 @@ pub fn compose_note_pq_exact(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn compose_note_exact(
     identity: &Identity,
     inputs: &[Utxo],
