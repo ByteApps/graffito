@@ -11,7 +11,7 @@ fn activated_stub(tag: &str, material: &str) -> State {
     let dir = std::env::temp_dir().join(format!("cn-activate-watch-{tag}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     st.data_dir = dir;
-    activate(&mut st, material, false).unwrap_or_else(|e| panic!("activate({tag}) failed: {e}"));
+    st.activate(material, false).unwrap_or_else(|e| panic!("activate({tag}) failed: {e}"));
     st
 }
 
