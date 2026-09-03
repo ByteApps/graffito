@@ -1,0 +1,60 @@
+// Screen.funding-wallet -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 12 · funding wallet (external PSBT source) ----------
+
+import { Ui, FundingWalletScreen } from "../globals.slint";
+import { Body, Caption, PrimaryButton, GhostButton, Header, ScanButton } from "../components.slint";
+import { EditField } from "../edit.slint";
+import { Pal } from "../theme.slint";
+
+export component FundingWalletDetailScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Add wallet";
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Caption {
+            text: "Paste or scan an output descriptor / xpub, or scan your hardware wallet's account-export QR. Its key never leaves that wallet — you'll sign there.";
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            EditField {
+                text <=> FundingWalletScreen.funding-descriptor;
+                placeholder-text: "tr([…]xpub…/<0;1>/*)  or  xpub…";
+                edited => { FundingWalletScreen.funding-changed(self.text); }
+            }
+            ScanButton { clicked => { FundingWalletScreen.funding-scan(); } }
+        }
+        if Ui.desktop-platform: HorizontalLayout {
+            alignment: start;
+            GhostButton {
+                width: 140px;
+                text: "Load from file…";
+                clicked => { FundingWalletScreen.funding-file(); }
+            }
+        }
+        if FundingWalletScreen.funding-feedback != "": Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: FundingWalletScreen.funding-valid ? Pal.good.with-alpha(0.5) : Pal.bad.with-alpha(0.5);
+            height: fbl.preferred-height;
+            fbl := VerticalLayout {
+                padding: 14px;
+                Body {
+                    text: FundingWalletScreen.funding-feedback;
+                    color: FundingWalletScreen.funding-valid ? Pal.good : Pal.bad;
+                }
+            }
+        }
+        PrimaryButton {
+            text: "Save & use";
+            tint: FundingWalletScreen.funding-valid ? Pal.accent : Pal.faint;
+            tint-hover: FundingWalletScreen.funding-valid ? Pal.accent-hover : Pal.faint;
+            clicked => { if (FundingWalletScreen.funding-valid) { FundingWalletScreen.funding-use(); } }
+        }
+        if Ui.status != "": Caption { text: Ui.status; color: Pal.bad; }
+    }
