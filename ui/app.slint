@@ -34,6 +34,7 @@ import { ImportSignedPsbtScreen } from "screens/import-signed-psbt.slint";
 import { FundingWalletsScreen } from "screens/funding-wallets.slint";
 import { SweepScreen } from "screens/sweep.slint";
 import { NotebooksScreen } from "screens/notebooks.slint";
+import { PublicKeysScreen } from "screens/public-keys.slint";
 // Rust (src/lib.rs, via slint::include_modules!()) needs these re-exported
 // from the entry-point file.
 export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem, Ui, Modals, Info, Terms, Settings, BackupWords, ImportKey, Quiz, Home, Note, Compose, Change, PayFrom, Sweep, FundingWalletScreen, ExportPsbt, Confirm, Coins, AccountPicker, PublicKeys, PrivateKeys, QuantumKeys, Activity, Onboarding, Dice, EntropySource, Contacts, FundingWallets, ImportSignedPsbt, Notebooks }
@@ -672,103 +673,7 @@ export component AppWindow inherits Window {
         }
     }
 
-    // ---------- 18 · public keys (watch-only-safe, no re-auth) ----------
-    if Ui.screen == Screen.public-keys: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
-        padding: 20px;
-        spacing: 12px;
-        Header {
-            title: "Public keys";
-            back => { root.nav-back(); }
-        }
-        Flickable {
-            viewport-width: self.width;
-            viewport-height: pub-col.preferred-height;
-            pub-col := VerticalLayout {
-                width: parent.width;
-                spacing: 14px;
-                alignment: start;
-                Caption {
-                    text: "Watch-only — these can't spend your funds or read a private note. But an xpub or descriptor reveals every address in this notebook, so anyone you share it with can see its full balance and transaction history and track your activity. Share only with people you trust.";
-                    color: Pal.warn;
-                }
-                if Ui.reveal-fingerprint != "": Mono {
-                    text: Ui.reveal-fingerprint;
-                    color: Pal.muted;
-                }
-                if Ui.reveal-public-hint != "": Caption { text: Ui.reveal-public-hint; color: Pal.warn; }
-                // Collapsed by default — tap a row header to expand its value +
-                // QR; both can be open at once.
-                for row[idx] in PublicKeys.reveal-public-rows: VerticalLayout {
-                    spacing: 6px;
-                    Rectangle {
-                        height: 46px;
-                        border-radius: 10px;
-                        background: Pal.card;
-                        border-width: 1px;
-                        border-color: Pal.line;
-                        HorizontalLayout {
-                            padding-left: 14px;
-                            padding-right: 14px;
-                            spacing: 8px;
-                            Text {
-                                text: row.label;
-                                color: Pal.text;
-                                font-size: 14px;
-                                font-weight: 600;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-                            Image {
-                                source: row.expanded ? @image-url("icons/caret-up.svg") : @image-url("icons/caret-down.svg");
-                                colorize: Pal.muted;
-                                width: 16px;
-                                height: 16px;
-                            }
-                        }
-                        TouchArea {
-                            clicked => {
-                                PublicKeys.reveal-public-rows[idx].expanded = !PublicKeys.reveal-public-rows[idx].expanded;
-                            }
-                        }
-                    }
-                    if row.expanded: VerticalLayout {
-                        spacing: 6px;
-                        Rectangle {
-                            border-radius: 10px;
-                            background: Pal.card;
-                            border-width: 1px;
-                            border-color: Pal.line;
-                            height: pkv.preferred-height + 24px;
-                            pkv := Mono {
-                                x: 12px;
-                                y: 12px;
-                                width: parent.width - 24px;
-                                text: row.value;
-                            }
-                        }
-                        HorizontalLayout {
-                            alignment: center;
-                            Rectangle {
-                                width: 176px;
-                                height: 176px;
-                                QrArea {
-                                    img: row.qr;
-                                    qr-size: 176px;
-                                }
-                                TouchArea {
-                                    clicked => {
-                                        Ui.qr-zoom-image = row.qr;
-                                        Ui.qr-zoom-open = true;
-                                    }
-                                }
-                            }
-                        }
-                        GhostButton { text: "Copy"; clicked => { Ui.copy-value(row.value); } }
-                    }
-                }
-            }
-        }
-    }
+    if Ui.screen == Screen.public-keys: PublicKeysScreen { }
 
     // ---------- 19 · private keys (fresh Touch ID before entry) ----------
     if Ui.screen == Screen.private-keys: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
