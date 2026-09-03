@@ -12,7 +12,10 @@
 
 use crate::*;
 
-/// These three tests share process-global state: the
+/// These tests (plus the U8 self-note ML-KEM compose leg in
+/// `ui_flow_selfpq_kem.rs`, and the locked-note-unlock leg in
+/// `ui_flow_locked_note_unlock.rs` — both reach `ensure_pq_imported_loaded`,
+/// which touches the SAME keychain slot) share process-global state: the
 /// `GRAFFITO_KEYCHAIN_MEMORY` env var (set at entry, REMOVED at exit)
 /// and the single in-memory `pq-imported` keychain slot. Under the
 /// default parallel runner, one test's `remove_var` landed mid-flight in
@@ -23,9 +26,12 @@ use crate::*;
 /// holds this lock for its whole body; a panicking test poisons it,
 /// and the next one just takes the poisoned guard (the state it
 /// re-initializes anyway) rather than failing on the poison.
-static KEYCHAIN_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// `pub(crate)` so every module that touches this same keychain slot
+/// serializes on the ONE lock — a second, module-private mutex would not
+/// stop them racing each other.
+pub(crate) static KEYCHAIN_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn keychain_env_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn keychain_env_lock() -> std::sync::MutexGuard<'static, ()> {
     KEYCHAIN_ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
