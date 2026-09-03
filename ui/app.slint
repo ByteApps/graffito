@@ -21,6 +21,7 @@ import { ImportKeyScreen } from "screens/import-key.slint";
 import { BackupWordsScreen } from "screens/backup-words.slint";
 import { QuizScreen } from "screens/quiz.slint";
 import { HomeScreen } from "screens/home.slint";
+import { NoteScreen } from "screens/note.slint";
 // Rust (src/lib.rs, via slint::include_modules!()) needs these re-exported
 // from the entry-point file.
 export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem, Ui, Modals, Info, Terms, Settings, BackupWords, ImportKey, Quiz, Home, Note, Compose, Change, PayFrom, Sweep, FundingWalletScreen, ExportPsbt, Confirm, Coins, AccountPicker, PublicKeys, PrivateKeys, QuantumKeys, Activity, Onboarding, Dice, EntropySource, Contacts, FundingWallets, ImportSignedPsbt, Notebooks }
@@ -382,127 +383,7 @@ export component AppWindow inherits Window {
         }
     }
 
-    // ---------- 5 · note view ----------
-    if Ui.screen == Screen.note: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
-        padding: 20px;
-        spacing: 12px;
-        alignment: start;
-        Header {
-            title: "Note";
-            show-sync: true;
-            net-busy: Ui.net-busy;
-            back => { root.nav-back(); }
-            sync => { Ui.refresh(); }
-            busy-tapped => { Ui.sync-busy-toast(); }
-        }
-        Card {
-            height: nd.preferred-height + 32px;
-            nd := Mono {
-                x: 16px;
-                y: 16px;
-                width: parent.width - 32px;
-                text: Note.note-detail;
-                font-size: 12px;
-            }
-        }
-        // ---- locked-note unlock (post-quantum) ----
-        if Ui.note-locked && Note.note-unlock-needs-password: Rectangle {
-            border-radius: 10px;
-            background: Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            height: unlock-col.preferred-height;
-            unlock-col := VerticalLayout {
-                padding: 12px;
-                spacing: 8px;
-                Image {
-                    source: @image-url("icons/lock.svg");
-                    colorize: Pal.warn;
-                    width: 16px;
-                    height: 16px;
-                    horizontal-alignment: left;
-                }
-                Caption {
-                    text: Ui.note-unlock-caption != ""
-                        ? Ui.note-unlock-caption
-                        : "This note is locked. Enter its passphrase to view it.";
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    EditField {
-                        horizontal-stretch: 1;
-                        text <=> Note.note-unlock-passphrase;
-                        placeholder-text: "passphrase";
-                        accepted => { Note.unlock-note(); }
-                    }
-                    PrimaryButton {
-                        width: 100px;
-                        text: Note.note-unlock-busy ? "…" : "Unlock";
-                        clicked => { Note.unlock-note(); }
-                    }
-                }
-            }
-        }
-        if Ui.note-locked && !Note.note-unlock-needs-password: Rectangle {
-            border-radius: 10px;
-            background: Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            height: unlock-hint-col.preferred-height;
-            unlock-hint-col := VerticalLayout {
-                padding: 12px;
-                spacing: 8px;
-                HorizontalLayout {
-                    spacing: 6px;
-                    Image {
-                        source: @image-url("icons/lock.svg");
-                        colorize: Pal.muted;
-                        width: 16px;
-                        height: 16px;
-                    }
-                    Caption { text: Ui.note-unlock-caption; }
-                }
-                // SELF-note ML-KEM-only (PLAN-graffito-self-pw.md): unlike
-                // the unrecoverable directed cases this block otherwise
-                // renders, the author can still retry against an
-                // already-imported quantum key with no password to type.
-                if Ui.note-unlock-show-button: PrimaryButton {
-                    width: 100px;
-                    text: Note.note-unlock-busy ? "…" : "Unlock";
-                    clicked => { Note.unlock-note(); }
-                }
-            }
-        }
-        HorizontalLayout {
-            spacing: 10px;
-            GhostButton { text: "Copy text"; clicked => { Ui.copy-text("note-text", Note.note-detail); } }
-            GhostButton { text: "Copy txid"; clicked => { Ui.copy-text("txid", Note.note-txid); } }
-        }
-        if Note.note-pending: Caption {
-            text: "Still unconfirmed — speed it up or rebroadcast from Activity (the pulse icon on the home screen).";
-        }
-        if Note.note-web-url != "": GhostButton {
-            text: "Open in web viewer";
-            clicked => { Note.open-note-web(); }
-        }
-        if Note.note-reply-address != "" || Note.note-reply-set.length > 1: HorizontalLayout {
-            spacing: 10px;
-            if Note.note-reply-address != "": GhostButton {
-                text: "Reply";
-                clicked => { Note.reply-to-note(); }
-            }
-            // Hidden when the reply set has <= 1 entry — nothing beyond
-            // plain Reply to add (a single-recipient note, or a self-note).
-            if Note.note-reply-set.length > 1: GhostButton {
-                text: "Reply all";
-                clicked => { Note.reply-all-to-note(); }
-            }
-        }
-        Caption { text: Ui.status; }
-        if Note.note-web-url == "": Caption {
-            text: "Web viewer link unavailable on regtest.";
-        }
-    }
+    if Ui.screen == Screen.note: NoteScreen { }
 
     // ---------- 6 · compose ----------
     if Ui.screen == Screen.compose: Rectangle {
