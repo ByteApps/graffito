@@ -1,0 +1,53 @@
+// Screen.import-key -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 1 · import ----------
+
+import { Ui, ImportKey } from "../globals.slint";
+import { Body, Caption, PrimaryButton, GhostButton, Header } from "../components.slint";
+import { EditArea } from "../edit.slint";
+import { Pal } from "../theme.slint";
+import { Switch } from "std-widgets.slint";
+
+export component ImportKeyScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Import key";
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Caption { text: "Mnemonic (12/18/24 words), xprv, WIF, 32-byte hex — or an account xpub for a watch-only notebook (public notes and balance; private notes stay sealed, no composing)."; }
+        EditArea {
+            height: 110px;
+            text <=> ImportKey.import-text;
+            edited => { ImportKey.import-changed(self.text); }
+        }
+        if ImportKey.import-suggestions != "": Caption {
+            text: ImportKey.import-suggestions;
+            color: Pal.accent;
+        }
+        if ImportKey.import-feedback != "": Body {
+            text: ImportKey.import-feedback;
+            font-size: 12px;
+            // Rust sets the flag alongside the text (string-matching the
+            // feedback here rotted once already).
+            color: ImportKey.import-feedback-ok ? Pal.good : Pal.warn;
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            GhostButton { text: "Paste"; clicked => { ImportKey.paste-import(); } }
+            GhostButton { text: "Scan QR"; clicked => { ImportKey.import-scan(); } }
+            if Ui.desktop-platform: GhostButton { text: "From file…"; clicked => { ImportKey.import-file(); } }
+        }
+        if Ui.apple-platform && Ui.icloud-enabled: Switch {
+            text: "Back up to iCloud";
+            checked <=> Ui.icloud-backup;
+            toggled => { Ui.set-icloud-backup(Ui.icloud-backup); }
+        }
+        if Ui.apple-platform && !Ui.icloud-enabled: Caption {
+            text: "iCloud backup is off — sign into iCloud (with iCloud Keychain) to back up this key automatically.";
+            color: Pal.warn;
+        }
+        PrimaryButton { text: "Import"; clicked => { ImportKey.import-confirm(ImportKey.import-text); } }
+    }
