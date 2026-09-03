@@ -1,0 +1,106 @@
+// Screen.account-picker -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 9 · account picker ----------
+
+import { Ui, AccountPicker, Notebooks } from "../globals.slint";
+import { Caption, Mono, GhostButton, Header, Badge } from "../components.slint";
+import { EditField } from "../edit.slint";
+import { Pal } from "../theme.slint";
+
+export component AccountPickerScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: AccountPicker.account-pick-mode == "notebook" ? "New notebook"
+                : (AccountPicker.account-pick-mode == "wconsol" ? "Consolidate to" : "Choose account");
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Caption {
+            text: AccountPicker.account-pick-mode == "notebook"
+                ? "Name it, then pick its address — the account's next receive addresses. Used addresses already have on-chain history — picking one adopts its notes."
+                : (AccountPicker.account-pick-mode == "wconsol"
+                    ? "Where should every coin end up? Pick one of your notebooks, or a used/new address — it becomes a notebook you can name from the list."
+                    : "One seed holds many BIP-86 accounts — separate wallets with their own notebooks, switchable here. Notebooks live inside an account.");
+        }
+        // Create mode only: the name lives right here — tapping an
+        // address creates immediately (no second dialog). The consolidate
+        // picker deliberately has NO name field: most picks are existing
+        // notebooks (a typed name would be dead input); a fresh destination
+        // takes the default "Notebook <index+1>", renameable from the list.
+        if AccountPicker.account-pick-mode == "notebook": EditField {
+            text <=> AccountPicker.nb-create-name;
+            placeholder-text: "name (optional — empty = the row's name)";
+        }
+        for a in AccountPicker.accounts: Rectangle {
+            // Rows already added as notebooks are informational-only when
+            // CREATING (can't re-add); as a consolidate DESTINATION they
+            // are first-class choices.
+            property <bool> row-disabled: a.pill == "notebook" && AccountPicker.account-pick-mode == "notebook";
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: a.active ? Pal.accent : Pal.line;
+            background: at.has-hover && !self.row-disabled ? Pal.card-hover : Pal.card;
+            opacity: self.row-disabled ? 0.45 : 1.0;
+            height: al.preferred-height;
+            at := TouchArea {
+                enabled: !parent.row-disabled;
+                clicked => { AccountPicker.pick-account(a.index); }
+            }
+            al := VerticalLayout {
+                padding: 14px;
+                spacing: 4px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        // Notebook rows are 1-based, matching the default
+                        // name a created notebook gets ("Notebook <index+1>");
+                        // account rows keep their raw account number.
+                        text: (AccountPicker.account-pick-mode == "notebook" || AccountPicker.account-pick-mode == "wconsol"
+                            ? "Notebook " + (a.index + 1) : "Account " + a.index);
+                        font-size: 14px;
+                        font-weight: 700;
+                        color: a.active ? Pal.accent : Pal.text;
+                    }
+                    if a.pill != "": Badge {
+                        label: a.pill;
+                        tint: a.pill == "new" ? Pal.good
+                            : (a.pill == "used" ? Pal.warn : Pal.muted);
+                    }
+                    Rectangle { }
+                    if a.balance != "": Caption { text: a.balance; vertical-alignment: center; }
+                    if a.active: Badge { label: "current"; tint: Pal.accent; }
+                }
+                Mono {
+                    text: a.address;
+                    font-size: 10px;
+                    color: Pal.muted;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            GhostButton {
+                width: 90px;
+                text: "‹ Prev";
+                clicked => { AccountPicker.accounts-page(-1); }
+            }
+            Caption {
+                // Notebook rows are 1-based (they match the default name a
+                // created notebook gets); account rows keep raw numbering.
+                text: AccountPicker.account-pick-mode == "notebook" || AccountPicker.account-pick-mode == "wconsol"
+                    ? "notebooks " + (AccountPicker.account-page * 5 + 1) + " – " + (AccountPicker.account-page * 5 + 5)
+                    : "accounts " + (AccountPicker.account-page * 5) + " – " + (AccountPicker.account-page * 5 + 4);
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            GhostButton {
+                width: 90px;
+                text: "Next ›";
+                clicked => { AccountPicker.accounts-page(1); }
+            }
+        }
+    }
