@@ -1,0 +1,64 @@
+// Screen.export-psbt -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 13 · export PSBT (sign externally) ----------
+
+import { Ui, ExportPsbt } from "../globals.slint";
+import { Caption, PrimaryButton, GhostButton, Header } from "../components.slint";
+import { Pal } from "../theme.slint";
+
+export component ExportPsbtScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Sign externally";
+            // Funding flow came from compose (6); watch spends from settings (8).
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Caption {
+            text: Ui.desktop-platform
+                ? "Scan this with your wallet (or save the file), sign it there, then bring the signed PSBT back."
+                : "Scan this with your wallet, sign it there, then bring the signed PSBT back.";
+        }
+        if ExportPsbt.psbt-cost-line != "": Text {
+            text: ExportPsbt.psbt-cost-line;
+            font-size: 13px;
+            font-weight: 600;
+            color: Pal.accent;
+            horizontal-alignment: center;
+        }
+        // Square card snug around the code — the old full-width card left
+        // walls of white either side of the QR.
+        HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: 312px;
+                height: 312px;
+                border-radius: 14px;
+                background: #FFFFFF;
+                Image {
+                    source: ExportPsbt.psbt-qr;
+                    width: 288px;
+                    height: 288px;
+                    x: (parent.width - 288px) / 2;
+                    y: (parent.height - 288px) / 2;
+                    image-rendering: pixelated;
+                }
+            }
+        }
+        if ExportPsbt.psbt-frame-label != "": Caption {
+            text: ExportPsbt.psbt-frame-label;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            if Ui.desktop-platform: GhostButton { text: "Save .psbt"; clicked => { ExportPsbt.psbt-save(); } }
+            GhostButton { text: "Copy"; clicked => { Ui.psbt-copy(); } }
+        }
+        PrimaryButton {
+            text: "I've signed it — Review";
+            clicked => { ExportPsbt.psbt-goto-import(); }
+        }
+        if Ui.status != "": Caption { text: Ui.status; color: Pal.bad; }
+    }

@@ -29,6 +29,7 @@ import { AccountPickerScreen } from "screens/account-picker.slint";
 import { CoinsScreen } from "screens/coins.slint";
 import { ActivityScreen } from "screens/activity.slint";
 import { FundingWalletDetailScreen } from "screens/funding-wallet.slint";
+import { ExportPsbtScreen } from "screens/export-psbt.slint";
 // Rust (src/lib.rs, via slint::include_modules!()) needs these re-exported
 // from the entry-point file.
 export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem, Ui, Modals, Info, Terms, Settings, BackupWords, ImportKey, Quiz, Home, Note, Compose, Change, PayFrom, Sweep, FundingWalletScreen, ExportPsbt, Confirm, Coins, AccountPicker, PublicKeys, PrivateKeys, QuantumKeys, Activity, Onboarding, Dice, EntropySource, Contacts, FundingWallets, ImportSignedPsbt, Notebooks }
@@ -406,62 +407,7 @@ export component AppWindow inherits Window {
 
     if Ui.screen == Screen.funding-wallet: FundingWalletDetailScreen { }
 
-    // ---------- 13 · export PSBT (sign externally) ----------
-    if Ui.screen == Screen.export-psbt: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
-        padding: 20px;
-        spacing: 12px;
-        alignment: start;
-        Header {
-            title: "Sign externally";
-            // Funding flow came from compose (6); watch spends from settings (8).
-            back => { root.nav-back(); }
-        }
-        Caption {
-            text: Ui.desktop-platform
-                ? "Scan this with your wallet (or save the file), sign it there, then bring the signed PSBT back."
-                : "Scan this with your wallet, sign it there, then bring the signed PSBT back.";
-        }
-        if ExportPsbt.psbt-cost-line != "": Text {
-            text: ExportPsbt.psbt-cost-line;
-            font-size: 13px;
-            font-weight: 600;
-            color: Pal.accent;
-            horizontal-alignment: center;
-        }
-        // Square card snug around the code — the old full-width card left
-        // walls of white either side of the QR.
-        HorizontalLayout {
-            alignment: center;
-            Rectangle {
-                width: 312px;
-                height: 312px;
-                border-radius: 14px;
-                background: #FFFFFF;
-                Image {
-                    source: ExportPsbt.psbt-qr;
-                    width: 288px;
-                    height: 288px;
-                    x: (parent.width - 288px) / 2;
-                    y: (parent.height - 288px) / 2;
-                    image-rendering: pixelated;
-                }
-            }
-        }
-        if ExportPsbt.psbt-frame-label != "": Caption {
-            text: ExportPsbt.psbt-frame-label;
-            horizontal-alignment: center;
-        }
-        HorizontalLayout {
-            spacing: 10px;
-            if Ui.desktop-platform: GhostButton { text: "Save .psbt"; clicked => { ExportPsbt.psbt-save(); } }
-            GhostButton { text: "Copy"; clicked => { Ui.psbt-copy(); } }
-        }
-        PrimaryButton {
-            text: "I've signed it — Review";
-            clicked => { ExportPsbt.psbt-goto-import(); }
-        }
-        if Ui.status != "": Caption { text: Ui.status; color: Pal.bad; }
-    }
+    if Ui.screen == Screen.export-psbt: ExportPsbtScreen { }
 
     // ---------- 14 · import signed PSBT ----------
     // ONLY the load-signed-PSBT stage (funding-unification follow-up,
