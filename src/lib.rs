@@ -49,6 +49,50 @@ use zeroize::{Zeroize, Zeroizing};
 
 slint::include_modules!();
 
+/// The `Screen` enum's kebab-case names — the ONE table (U2,
+/// PLAN-graffito-app-arch.md) driving `--render`'s CLI parser, its PNG
+/// file names, and the `cb: sys-back` log line. Order matches the enum's
+/// declaration (types.slint), which is the app's historical screen-number
+/// order.
+const SCREENS: &[(Screen, &str)] = &[
+    (Screen::Onboarding, "onboarding"),
+    (Screen::ImportKey, "import-key"),
+    (Screen::BackupWords, "backup-words"),
+    (Screen::Quiz, "quiz"),
+    (Screen::Home, "home"),
+    (Screen::Note, "note"),
+    (Screen::Compose, "compose"),
+    (Screen::Contacts, "contacts"),
+    (Screen::Settings, "settings"),
+    (Screen::AccountPicker, "account-picker"),
+    (Screen::Coins, "coins"),
+    (Screen::Activity, "activity"),
+    (Screen::FundingWallet, "funding-wallet"),
+    (Screen::ExportPsbt, "export-psbt"),
+    (Screen::ImportSignedPsbt, "import-signed-psbt"),
+    (Screen::FundingWallets, "funding-wallets"),
+    (Screen::Sweep, "sweep"),
+    (Screen::Notebooks, "notebooks"),
+    (Screen::PublicKeys, "public-keys"),
+    (Screen::PrivateKeys, "private-keys"),
+    (Screen::PayFrom, "pay-from"),
+    (Screen::Change, "change"),
+    (Screen::Terms, "terms"),
+    (Screen::Info, "info"),
+    (Screen::Confirm, "confirm"),
+    (Screen::EntropySource, "entropy-source"),
+    (Screen::Dice, "dice"),
+    (Screen::QuantumKeys, "quantum-keys"),
+];
+
+fn screen_name(screen: Screen) -> &'static str {
+    SCREENS.iter().find(|(s, _)| *s == screen).map(|(_, n)| *n).unwrap_or("?")
+}
+
+fn screen_by_name(name: &str) -> Option<Screen> {
+    SCREENS.iter().find(|(_, n)| *n == name).map(|(s, _)| *s)
+}
+
 const KEYCHAIN_ACCOUNT: &str = "identity-key";
 /// An externally imported ML-KEM secret key (Settings → Quantum keys →
 /// "Import a key"), Keychain-stored exactly like `KEYCHAIN_ACCOUNT` (crash-
@@ -766,7 +810,7 @@ struct PendingBroadcast {
     /// deliberately doesn't, like the human note-kind label) and just
     /// carried through by `show_confirm`.
     context: String,
-    return_screen: i32,
+    return_screen: Screen,
     payload: PendingPayload,
 }
 
@@ -1073,7 +1117,7 @@ fn activate_restored(window: &AppWindow, s: &mut State, material: String, onboar
             update_home(window, s);
             update_notebook_list(window, s);
             window.set_status("".into());
-            window.set_screen(17);
+            window.set_screen(Screen::Notebooks);
             refresh_async(window, s);
             spending_refresh_async(window, s);
         }
@@ -3418,7 +3462,7 @@ fn show_notebook_picker(w: &AppWindow, st: &State, page: u32, mode: &str) {
     w.set_account_page(page as i32);
     w.set_accounts(VecModel::from_slice(&rows));
     w.set_account_pick_mode(mode.into());
-    w.set_screen(9);
+    w.set_screen(Screen::AccountPicker);
 
     // Probe used/new on a worker thread; results fill the pills in via the
     // apply-pending-picker-probe trampoline (offline / no rows → plain rows).
@@ -3456,7 +3500,7 @@ fn show_notebook_picker(w: &AppWindow, st: &State, page: u32, mode: &str) {
 fn show_account_picker(w: &AppWindow, material: &str, network: Network, page: u32, active: Option<u32>) {
     w.set_account_page(page as i32);
     w.set_accounts(VecModel::from_slice(&account_rows(material, network, page, active)));
-    w.set_screen(9);
+    w.set_screen(Screen::AccountPicker);
 }
 
 /// Push the device-level contacts list into the "Send to" recents list.
@@ -3727,7 +3771,7 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
     st.pq_passphrase_verified = false;
     st.pq_passphrase_generated = None;
     st.pq_recipient_cache = None;
-    w.set_screen(6);
+    w.set_screen(Screen::Compose);
     refresh_compose(w, st);
 }
 
@@ -3800,14 +3844,14 @@ fn add_recipient_chip(w: &AppWindow, st: &mut State, addr: &str) {
     if already {
         println!("cb: add-chip dup");
         w.set_status("already added".into());
-        w.set_screen(6);
+        w.set_screen(Screen::Compose);
         return;
     }
     let total = 1 + st.to_addresses_extra.len();
     if total >= 255 {
         println!("cb: add-chip err=limit");
         w.set_status("recipient limit reached (255)".into());
-        w.set_screen(6);
+        w.set_screen(Screen::Compose);
         return;
     }
     st.touch_contact(&a);
@@ -3816,7 +3860,7 @@ fn add_recipient_chip(w: &AppWindow, st: &mut State, addr: &str) {
     st.to_addresses_extra.push(a.clone());
     println!("cb: add-chip n={}", st.to_addresses_extra.len() + 1);
     refresh_to_chips(w, st);
-    w.set_screen(6);
+    w.set_screen(Screen::Compose);
     refresh_compose(w, st);
 }
 
@@ -3899,7 +3943,7 @@ fn stage_new_mnemonic(w: &AppWindow, s: &mut State, phrase: String) {
     s.icloud_backup = avail;
     w.set_icloud_backup(avail);
     w.set_icloud_enabled(avail);
-    w.set_screen(2);
+    w.set_screen(Screen::BackupWords);
 }
 
 /// Repaint the dice screen: counter, remaining, the LIVE hash, and whether
@@ -4192,10 +4236,10 @@ fn go_home_or_list(w: &AppWindow, st: &State) {
         .unwrap_or(false);
     if listed {
         update_home(w, st);
-        w.set_screen(4);
+        w.set_screen(Screen::Home);
     } else {
         update_notebook_list(w, st);
-        w.set_screen(17);
+        w.set_screen(Screen::Notebooks);
     }
 }
 
@@ -4259,7 +4303,7 @@ fn set_sweep_dest(w: &AppWindow, st: &mut State, a: String) {
     refresh_sweep_locktime_panel(w, st);
     w.set_status("".into());
     update_sweep_screen(w, st);
-    w.set_screen(16);
+    w.set_screen(Screen::Sweep);
 }
 
 /// The per-notebook self-consolidate flow (screen 16, kind
@@ -4300,7 +4344,7 @@ fn open_notebook_consolidate(w: &AppWindow, st: &mut State) {
     refresh_sweep_locktime_panel(w, st);
     w.set_status("".into());
     update_sweep_screen(w, st);
-    w.set_screen(16);
+    w.set_screen(Screen::Sweep);
 }
 
 /// A (possibly inactive) notebook's store (by receive index within the
@@ -5946,7 +5990,7 @@ fn apply_sweep_broadcast_result(w: &AppWindow, st: &mut State, r: SweepBroadcast
                 .into(),
             );
             update_notebook_list(w, st);
-            w.set_screen(17); // wallet-level flow → the list
+            w.set_screen(Screen::Notebooks); // wallet-level flow → the list
         }
         Err(e) => {
             println!("cb: sweep broadcast err={e}");
@@ -6006,7 +6050,7 @@ fn apply_consolidate_broadcast_result(w: &AppWindow, st: &mut State, r: Consolid
             st.save_store();
             println!("cb: consolidate txid={txid} value={} fee={}", snap.value, snap.fee);
             w.set_status(format!("consolidating: {}…", &txid[..12.min(txid.len())]).into());
-            w.set_screen(4); // done — home, like the PSBT flow
+            w.set_screen(Screen::Home); // done — home, like the PSBT flow
             update_home(w, st);
         }
         Err(e) => {
@@ -6144,7 +6188,7 @@ fn apply_wconsol_broadcast_result(w: &AppWindow, st: &mut State, r: WConsolBroad
                 )
                 .into(),
             );
-            w.set_screen(17);
+            w.set_screen(Screen::Notebooks);
         }
         Err(e) => {
             println!("cb: wallet-consolidate broadcast err={e}");
@@ -6234,9 +6278,9 @@ fn apply_psbt_broadcast_result(w: &AppWindow, st: &mut State, r: PsbtBroadcastRe
             if wallet_flow {
                 refresh(w, st); // active store first — the list rows read disk + memory
                 update_notebook_list(w, st);
-                w.set_screen(17);
+                w.set_screen(Screen::Notebooks);
             } else {
-                w.set_screen(4);
+                w.set_screen(Screen::Home);
                 refresh(w, st);
             }
         }
@@ -6463,12 +6507,12 @@ fn apply_notebook_compose_result(w: &AppWindow, st: &mut State, r: NotebookCompo
             st.mixed_selected.clear();
             st.change_choice.clear();
             w.set_change_choice("".into());
-            w.set_screen(4);
+            w.set_screen(Screen::Home);
             refresh_async(w, st);
         }
         Err(e) => {
             println!("cb: compose broadcast err={e}");
-            w.set_return_screen(4);
+            w.set_return_screen(Screen::Home);
             update_activity(w, st);
             let base = st.base_url().unwrap_or_default();
             w.set_status(
@@ -6479,7 +6523,7 @@ fn apply_notebook_compose_result(w: &AppWindow, st: &mut State, r: NotebookCompo
                 .into(),
             );
             show_toast(w, "Broadcast failed — note saved. Retry from this list.");
-            w.set_screen(11);
+            w.set_screen(Screen::Activity);
         }
     }
 }
@@ -6602,7 +6646,7 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
             st.mixed_selected.clear();
             st.change_choice.clear();
             w.set_change_choice("".into());
-            w.set_screen(4);
+            w.set_screen(Screen::Home);
             refresh_async(w, st);
         }
         // Universal confirm screen (2026-07-17): nothing was recorded, so
@@ -6613,7 +6657,7 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
         Err(e) => {
             let base = st.base_url().unwrap_or_default();
             w.set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
-            w.set_screen(6);
+            w.set_screen(Screen::Compose);
         }
     }
 }
@@ -6771,7 +6815,7 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
             st.mixed_selected.clear();
             st.change_choice.clear();
             w.set_change_choice("".into());
-            w.set_screen(4);
+            w.set_screen(Screen::Home);
             refresh_async(w, st);
         }
         Err(e) => {
@@ -7156,7 +7200,7 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
             continue;
         };
         apply_active_bundle(w, st, bundle, &r.statuses, &r.dropped_lookup, &r.dropped_unspent, r.new_stats);
-        if w.get_screen() == 20 {
+        if w.get_screen() == Screen::PayFrom {
             update_funding_screen_ui(w, st);
             log_funding_refresh(st);
             // A landed notebook rescan must repaint the (now possibly
@@ -7164,7 +7208,7 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
             // summary balance — independent-expand rework, 2026-07-18.
             update_payfrom_panels(w, st);
         }
-        if w.get_screen() == 6 {
+        if w.get_screen() == Screen::Compose {
             w.set_pay_from_balance(balance_text_for(st, w.get_pay_from().as_str()).into());
         }
     }
@@ -7616,13 +7660,13 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
             }
         }
         update_spending_ui(w, st);
-        if w.get_screen() == 16 && w.get_sweep_kind() == "sweep" {
+        if w.get_screen() == Screen::Sweep && w.get_sweep_kind() == "sweep" {
             // A wallet-sweep preview computed before the scan landed shows
             // notebook coins only (Sal 2026-07-17) — recompute it so the
             // spending coins join the inputs summary and fee preview.
             update_sweep_screen(w, st);
         }
-        if w.get_screen() == 6 {
+        if w.get_screen() == Screen::Compose {
             // CHANGE 5: a user already sitting on compose when the scan
             // lands sees the default upgrade to "spending" too — but only
             // absent an explicit pick this session (payfrom_manual).
@@ -7633,7 +7677,7 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
                 refresh_compose(w, st);
             }
         }
-        if w.get_screen() == 20 {
+        if w.get_screen() == Screen::PayFrom {
             log_funding_refresh(st);
             // funding-unification UI rework: a landed scan must repaint the
             // Spending panel (independent-expand rework, 2026-07-18: it now
@@ -9839,7 +9883,7 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
     // funding-unification UI rework: tapping a wallet row on the Pay-from
     // screen (20) selects + expands it IN PLACE — it must not navigate away
     // like the screen-15/16 entry points do.
-    let stay_on_payfrom = w.get_screen() == 20;
+    let stay_on_payfrom = w.get_screen() == Screen::PayFrom;
     let net = st.network;
     let Some(idx) = st.funding_wallets.iter().position(|fw| fw.id == id) else { return };
     let descriptor = st.funding_wallets[idx].descriptor.clone();
@@ -9898,10 +9942,10 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
                 w.set_pay_from_balance(format!("{} sats", commas(st.funding_wallets[idx].balance)).into());
                 println!("cb: pay-from wallet:{label}");
                 refresh_compose(w, st);
-            } else if w.get_funding_return() == 16 {
+            } else if w.get_funding_return() == Screen::Sweep {
                 // Came from the sweep screen — return there, funding armed.
                 w.set_sweep_fund_external(true);
-                w.set_screen(16);
+                w.set_screen(Screen::Sweep);
                 update_sweep_screen(w, st);
             } else {
                 w.set_fund_external(true);
@@ -9912,7 +9956,7 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
                 w.set_pay_from_balance(format!("{} sats", commas(st.funding_wallets[idx].balance)).into());
                 println!("cb: pay-from wallet:{label}");
                 w.set_spend_expanded(true);
-                w.set_screen(6);
+                w.set_screen(Screen::Compose);
                 refresh_compose(w, st);
             }
         }
@@ -10035,7 +10079,7 @@ fn save_funding_descriptors(w: &AppWindow, st: &mut State, descriptors: &[String
         st.save_funding_wallets();
     }
     refresh_funding_list(w, st);
-    w.set_screen(15);
+    w.set_screen(Screen::FundingWallets);
     added
 }
 
@@ -10301,7 +10345,7 @@ fn note_context(directed: bool, private: bool, network: Network) -> String {
 /// show_confirm populated it; only when the confirm screen actually
 /// navigated.
 fn note_subdust_fold_warn(w: &AppWindow, change: u64, fee: u64, vsize: u64, rate: f64) {
-    if change != 0 || w.get_screen() != 26 {
+    if change != 0 || w.get_screen() != Screen::Confirm {
         return;
     }
     let nominal = (vsize as f64 * rate).ceil() as u64;
@@ -10529,7 +10573,7 @@ fn show_confirm(w: &AppWindow, st: &mut State, pending: PendingBroadcast, ctx: a
     let return_screen = w.get_screen();
     w.set_status("".into());
     st.pending_broadcast = Some(PendingBroadcast { return_screen, ..pending });
-    w.set_screen(26);
+    w.set_screen(Screen::Confirm);
 }
 
 /// Stage A for a wallet-level sweep (screen 16, `sweep-kind == "sweep"`,
@@ -10818,7 +10862,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
                 txid: tx.txid_hex.clone(),
                 vsize: tx.vsize,
                 context: format!("Sweep to {}… · {}", &dest[..14.min(dest.len())], net.as_str()),
-                return_screen: 16, // overwritten by show_confirm
+                return_screen: Screen::Sweep, // overwritten by show_confirm
                 payload: PendingPayload::Sweep { snap },
             };
             show_confirm(w, s, pending, ctx);
@@ -10899,7 +10943,7 @@ fn build_consolidate_confirm(w: &AppWindow, s: &mut State, rate: f64) {
                 txid: tx.txid_hex.clone(),
                 vsize: tx.vsize,
                 context: format!("Consolidate · {}", net.as_str()),
-                return_screen: 16, // overwritten by show_confirm
+                return_screen: Screen::Sweep, // overwritten by show_confirm
                 payload: PendingPayload::Consolidate { snap },
             };
             show_confirm(w, s, pending, ctx);
@@ -11131,7 +11175,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
             "Consolidate wallet · {} — One transaction spends every notebook's coins — all their addresses become publicly linked on-chain.",
             net.as_str()
         ),
-        return_screen: 9, // overwritten by show_confirm
+        return_screen: Screen::AccountPicker, // overwritten by show_confirm
         payload: PendingPayload::WConsol { snap },
     };
     show_confirm(w, s, pending, ctx);
@@ -11167,7 +11211,7 @@ fn enter_rebroadcast_confirm(w: &AppWindow, st: &mut State, ref_id: String, is_n
         txid,
         vsize,
         context: format!("Rebroadcast · {}", net.as_str()),
-        return_screen: 11, // overwritten by show_confirm
+        return_screen: Screen::Activity, // overwritten by show_confirm
         payload: PendingPayload::Rebroadcast { ref_id },
     };
     show_confirm(w, st, pending, ctx);
@@ -11188,7 +11232,7 @@ fn show_psbt_sign_screen(w: &AppWindow, st: &mut State, built: BuiltPsbt, cost_l
     st.signed_psbt = None;
     w.set_psbt_signed(false);
     w.set_status("".into());
-    w.set_screen(13);
+    w.set_screen(Screen::ExportPsbt);
 }
 
 /// Validate + summarize a signed PSBT into the confirmation screen.
@@ -11324,7 +11368,7 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
         txid,
         vsize,
         context,
-        return_screen: 14, // overwritten by show_confirm
+        return_screen: Screen::ImportSignedPsbt, // overwritten by show_confirm
         payload: PendingPayload::Psbt,
     };
     show_confirm(w, st, pending, confirm_ctx);
@@ -11383,14 +11427,17 @@ pub fn run() {
     // Headless design preview: `--render <out-dir> <screen>[,<screen>...]`
     // renders each screen to a PNG via the software renderer (no window).
     // macOS-only dev tool (the software renderer isn't in the mobile builds).
+    // Screen names are the kebab-case `SCREENS` table entries.
     #[cfg(target_os = "macos")]
     {
         if args.get(1).map(String::as_str) == Some("--render") {
             let out_dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
-            let screens: Vec<i32> = args
+            let screens: Vec<Screen> = args
                 .get(3)
-                .map(|s| s.split(',').filter_map(|n| n.trim().parse().ok()).collect())
-                .unwrap_or_else(|| vec![6, 12, 13, 26]);
+                .map(|s| s.split(',').filter_map(|n| screen_by_name(n.trim())).collect())
+                .unwrap_or_else(|| {
+                    vec![Screen::Compose, Screen::FundingWallet, Screen::ExportPsbt, Screen::Confirm]
+                });
             render_previews(480, 900, &screens, &out_dir);
             return;
         }
@@ -11820,7 +11867,7 @@ pub fn run() {
                     // notebook's home is one tap in.
                     update_home(&window, &s);
                     update_notebook_list(&window, &s);
-                    window.set_screen(17);
+                    window.set_screen(Screen::Notebooks);
                     // Initial sync AFTER the first frame. Blocking the launch
                     // path on network I/O gets the app killed by the iOS
                     // launch watchdog (black screen, then 0x8badf00d) when
@@ -11911,7 +11958,7 @@ pub fn run() {
     window.set_disclaimer_body(DISCLAIMER.into());
     if !st.borrow().terms_accepted {
         window.set_terms_accept_mode(true);
-        window.set_screen(24);
+        window.set_screen(Screen::Terms);
     }
 
     // System back (Android): the ui-side nav-back() already navigated; this
@@ -11919,7 +11966,7 @@ pub fn run() {
     // state borrow — nav-back may have gone through a state-borrowing
     // callback (go-home etc.) synchronously before this fires.
     window.on_back_logged(|handled, screen| {
-        println!("cb: sys-back handled={handled} screen={screen}");
+        println!("cb: sys-back handled={handled} screen={}", screen_name(screen));
     });
 
     macro_rules! cb {
@@ -11968,7 +12015,7 @@ pub fn run() {
         s.icloud_backup = avail;
         w.set_icloud_backup(avail);
         w.set_icloud_enabled(avail);
-        w.set_screen(1);
+        w.set_screen(Screen::ImportKey);
     });
 
     // Creating a seed is now TWO steps: this door only records the length and
@@ -11981,7 +12028,7 @@ pub fn run() {
         s.dice_rolls = Zeroizing::new(String::new());
         w.set_new_word_count(words);
         w.set_seed_from_dice(false);
-        w.set_screen(27);
+        w.set_screen(Screen::EntropySource);
     });
 
     cb!(on_pick_entropy_source, |w, s, kind: SharedString| {
@@ -11997,7 +12044,7 @@ pub fn run() {
                 // which now confirms.
                 w.set_seed_from_dice(true);
                 update_dice_ui(&w, &s);
-                w.set_screen(28);
+                w.set_screen(Screen::Dice);
             }
             _ => match generate_mnemonic(words) {
                 Ok(m) => {
@@ -12177,7 +12224,7 @@ pub fn run() {
         );
         s.quiz_indices = picks;
         w.set_quiz_answer("".into());
-        w.set_screen(3);
+        w.set_screen(Screen::Quiz);
     });
 
     cb!(on_quiz_submit, |w, s, answer: SharedString| {
@@ -12210,7 +12257,7 @@ pub fn run() {
                 // archive.
                 ensure_first_onboarded_notebook(&mut s);
                 update_notebook_list(&w, &s);
-                w.set_screen(17);
+                w.set_screen(Screen::Notebooks);
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s); // CHANGE 5
             }
@@ -12279,11 +12326,11 @@ pub fn run() {
                 if hierarchical {
                     ensure_first_onboarded_notebook(&mut s);
                     update_notebook_list(&w, &s);
-                    w.set_screen(17);
+                    w.set_screen(Screen::Notebooks);
                     refresh_async(&w, &mut s);
                     spending_refresh_async(&w, &mut s);
                 } else {
-                    w.set_screen(4);
+                    w.set_screen(Screen::Home);
                     update_home(&w, &s);
                     refresh_async(&w, &mut s);
                 }
@@ -12463,7 +12510,7 @@ pub fn run() {
         for r in results {
             if s.account != r.account
                 || w.get_account_page() != r.page as i32
-                || w.get_screen() != 9
+                || w.get_screen() != Screen::AccountPicker
             {
                 println!("cb: picker-probe stale-drop");
                 continue;
@@ -12626,7 +12673,7 @@ pub fn run() {
                 }
             };
             w.set_note_web_url(web.into());
-            w.set_screen(5);
+            w.set_screen(Screen::Note);
         }
     });
 
@@ -12779,7 +12826,7 @@ pub fn run() {
             spending_refresh_async(&w, &mut s);
         }
         w.set_status("".into());
-        w.set_screen(10);
+        w.set_screen(Screen::Coins);
     });
 
     // Coins screen "spending" segment: scan on first view (data otherwise
@@ -12793,10 +12840,10 @@ pub fn run() {
 
     cb!(on_open_activity, |w, s| {
         println!("cb: open-activity");
-        w.set_return_screen(if w.get_screen() == 17 { 17 } else { 4 });
+        w.set_return_screen(if w.get_screen() == Screen::Notebooks { Screen::Notebooks } else { Screen::Home });
         update_activity(&w, &s);
         w.set_status("".into());
-        w.set_screen(11);
+        w.set_screen(Screen::Activity);
     });
 
     // Universal confirm screen (2026-07-17): stage A resolves the raw hex
@@ -13090,7 +13137,7 @@ pub fn run() {
                     txid,
                     vsize,
                     context: format!("Speed-up · {}", net.as_str()),
-                    return_screen: 11, // overwritten by show_confirm
+                    return_screen: Screen::Activity, // overwritten by show_confirm
                     payload: PendingPayload::Bump { ref_id: ref_id.clone(), fee, new_rate, bumped },
                 };
                 show_confirm(&w, &mut s, pending, ctx);
@@ -13132,7 +13179,7 @@ pub fn run() {
         pull_icloud_contacts_on_open(&w, &mut s);
         w.set_contact_input("".into());
         w.set_status("".into());
-        w.set_screen(7);
+        w.set_screen(Screen::Contacts);
     });
 
     // Send-to picker header "Sync now" (sync-status UI, 2026-07-20).
@@ -13164,7 +13211,7 @@ pub fn run() {
         pull_icloud_contacts_on_open(&w, &mut s);
         w.set_contact_input("".into());
         w.set_status("".into());
-        w.set_screen(7);
+        w.set_screen(Screen::Contacts);
     });
 
     // Funding-unification M3: Settings spending-wallet card "Sweep notebook
@@ -13290,7 +13337,7 @@ pub fn run() {
                     txid: tx.txid_hex.clone(),
                     vsize: tx.vsize,
                     context: format!("Consolidate spending coins · {}", net.as_str()),
-                    return_screen: 10, // overwritten by show_confirm
+                    return_screen: Screen::Coins, // overwritten by show_confirm
                     payload: PendingPayload::SpendingConsolidate { snap },
                 };
                 show_confirm(&w, &mut s, pending, ctx);
@@ -13370,9 +13417,9 @@ pub fn run() {
         w.set_status("".into());
         if on && s.funding.is_none() {
             // No funding wallet active yet — pick one; Back returns here.
-            w.set_funding_return(16);
+            w.set_funding_return(Screen::Sweep);
             refresh_funding_list(&w, &s);
-            w.set_screen(15);
+            w.set_screen(Screen::FundingWallets);
             return;
         }
         update_sweep_screen(&w, &mut s);
@@ -13560,7 +13607,7 @@ pub fn run() {
             add_recipient_chip(&w, &mut s, addr.as_str());
             return;
         }
-        w.set_compose_return(7);
+        w.set_compose_return(Screen::Contacts);
         pick_contact_core(&w, &mut s, addr.as_str());
     });
 
@@ -13570,7 +13617,7 @@ pub fn run() {
             return;
         }
         println!("cb: reply to={addr}");
-        w.set_compose_return(5);
+        w.set_compose_return(Screen::Note);
         pick_contact_core(&w, &mut s, &addr);
     });
 
@@ -13578,7 +13625,7 @@ pub fn run() {
         let addrs: Vec<String> = w.get_note_reply_set().iter().map(|c| c.address.to_string()).collect();
         let Some((first, rest)) = addrs.split_first() else { return };
         println!("cb: reply-all to={} n={}", addrs.join(","), addrs.len());
-        w.set_compose_return(5);
+        w.set_compose_return(Screen::Note);
         // pick_contact_core resets the compose session (clearing any prior
         // to_addresses_extra) before we seed the rest as extra chips.
         pick_contact_core(&w, &mut s, first);
@@ -13605,7 +13652,7 @@ pub fn run() {
         w.set_status("".into());
         w.set_pick_mode("compose".into());
         pull_icloud_contacts_on_open(&w, &mut s);
-        w.set_screen(7);
+        w.set_screen(Screen::Contacts);
     });
 
     cb!(on_remove_chip, |w, s, addr: SharedString| {
@@ -14049,9 +14096,13 @@ pub fn run() {
     cb!(on_accept_terms, |w, s| {
         s.terms_accepted = true;
         s.save_config();
+        // `target` stays the old int purely for the log line below, which is
+        // NOT part of U2's log-contract change (only `cb: sys-back` is) —
+        // `target_screen` is the real Screen value passed to the window.
         let target = if s.material.is_some() { 17 } else { 0 };
+        let target_screen = if s.material.is_some() { Screen::Notebooks } else { Screen::Onboarding };
         w.set_terms_accept_mode(false);
-        w.set_screen(target);
+        w.set_screen(target_screen);
         println!("cb: accept-terms target={target}");
     });
 
@@ -14075,7 +14126,7 @@ pub fn run() {
         // Slint Royalty-free license makes it a condition of the grant, so
         // this flag is load-bearing, not cosmetic — see THIRD-PARTY.md.
         w.set_info_show_slint(kind.as_str() == "about");
-        w.set_screen(25);
+        w.set_screen(Screen::Info);
         println!("cb: open-info {kind}");
     });
 
@@ -14089,9 +14140,9 @@ pub fn run() {
         refresh_compose(&w, &mut s);
         // Turning it on with no wallet active → go to the saved-wallets list.
         if on && s.funding.is_none() {
-            w.set_funding_return(6);
+            w.set_funding_return(Screen::Compose);
             refresh_funding_list(&w, &s);
-            w.set_screen(15);
+            w.set_screen(Screen::FundingWallets);
         }
     });
 
@@ -14109,7 +14160,7 @@ pub fn run() {
         println!("cb: open-funding");
         w.set_status("".into());
         refresh_funding_list(&w, &s);
-        w.set_screen(15);
+        w.set_screen(Screen::FundingWallets);
     });
 
     // funding-unification: compose's compact "Pay from" row → the dedicated
@@ -14146,7 +14197,7 @@ pub fn run() {
         update_funding_screen_ui(&w, &s);
         update_payfrom_panels(&w, &mut s);
         refresh_funding_list(&w, &s);
-        w.set_screen(20);
+        w.set_screen(Screen::PayFrom);
     });
 
     // Independent-expand rework (2026-07-18, Sal's iPhone feedback #1/#3): a
@@ -14203,7 +14254,7 @@ pub fn run() {
         // session, else app-core's resolved default) — a screenshot-
         // independent way to assert change-default behavior in e2e.
         println!("cb: change-open default={}", w.get_change_choice());
-        w.set_screen(21);
+        w.set_screen(Screen::Change);
     });
 
     cb!(on_change_pick, |w, s, choice: SharedString| {
@@ -14217,7 +14268,7 @@ pub fn run() {
         update_change_label(&w, &mut s);
         refresh_compose(&w, &mut s);
         if choice.as_str() != "custom" {
-            w.set_screen(6);
+            w.set_screen(Screen::Compose);
         }
     });
 
@@ -14239,7 +14290,7 @@ pub fn run() {
         w.set_funding_descriptor("".into());
         w.set_funding_feedback("".into());
         w.set_funding_valid(false);
-        w.set_screen(12);
+        w.set_screen(Screen::FundingWallet);
     });
 
     cb!(on_use_funding_wallet, |w, s, id: SharedString| {
@@ -14568,7 +14619,7 @@ pub fn run() {
     cb!(on_psbt_goto_import, |w, s| {
         let _ = &mut s;
         w.set_status("".into());
-        w.set_screen(14);
+        w.set_screen(Screen::ImportSignedPsbt);
     });
 
     cb!(on_psbt_loaded, |w, s, text: SharedString| {
@@ -15033,7 +15084,7 @@ pub fn run() {
         }
         let kind = s.pending_broadcast.as_ref().map(|p| p.kind).unwrap_or("?");
         println!("cb: confirm cancel kind={kind}");
-        let return_screen = s.pending_broadcast.take().map(|p| p.return_screen).unwrap_or(4);
+        let return_screen = s.pending_broadcast.take().map(|p| p.return_screen).unwrap_or(Screen::Home);
         w.set_confirm_warn("".into());
         w.set_confirm_txid("".into());
         w.set_confirm_context("".into());
@@ -15332,7 +15383,7 @@ pub fn run() {
                     txid: composed.tx.txid_hex.clone(),
                     vsize: composed.tx.vsize,
                     context: note_context(to.is_some(), private, net),
-                    return_screen: 6, // overwritten by show_confirm
+                    return_screen: Screen::Compose, // overwritten by show_confirm
                     payload: PendingPayload::Compose {
                         composed,
                         text: text.clone(),
@@ -15586,7 +15637,7 @@ pub fn run() {
             txid,
             vsize,
             context: note_context(to.is_some(), private, net),
-            return_screen: 6, // overwritten by show_confirm
+            return_screen: Screen::Compose, // overwritten by show_confirm
             payload: PendingPayload::ComposeSpending {
                 text: text.clone(),
                 private,
@@ -16038,7 +16089,7 @@ pub fn run() {
             txid,
             vsize,
             context: note_context(to.is_some(), private, net),
-            return_screen: 6, // overwritten by show_confirm
+            return_screen: Screen::Compose, // overwritten by show_confirm
             payload: PendingPayload::ComposeMixed {
                 text: text.clone(),
                 private,
@@ -16062,7 +16113,7 @@ pub fn run() {
     });
 
     cb!(on_settings_open, |w, s| {
-        w.set_return_screen(if w.get_screen() == 17 { 17 } else { 4 });
+        w.set_return_screen(if w.get_screen() == Screen::Notebooks { Screen::Notebooks } else { Screen::Home });
         println!("cb: settings-open");
         clear_reveal(&w, &mut s);
         w.set_status("".into());
@@ -16084,7 +16135,7 @@ pub fn run() {
         // Fresh entry from the list starts at the top; returning from a Settings
         // sub-screen (via nav-back, which doesn't call this) keeps its position.
         w.set_settings_scroll_y(0.0);
-        w.set_screen(8);
+        w.set_screen(Screen::Settings);
     });
 
     cb!(on_open_account_picker, |w, s| {
@@ -16195,7 +16246,7 @@ pub fn run() {
                     w.set_nb_create_name("".into());
                     w.set_status("".into());
                     update_notebook_list(&w, &s);
-                    w.set_screen(17);
+                    w.set_screen(Screen::Notebooks);
                 }
                 Err(e) => w.set_status(e.to_string().into()),
             }
@@ -16229,7 +16280,7 @@ pub fn run() {
                 }
                 w.set_status("".into());
                 update_notebook_list(&w, &s);
-                w.set_screen(17);
+                w.set_screen(Screen::Notebooks);
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s);
             }
@@ -16244,7 +16295,7 @@ pub fn run() {
             w.set_nb_create_name("".into());
             s.wconsol = None;
             w.set_status("".into());
-            w.set_screen(8);
+            w.set_screen(Screen::Settings);
             return;
         }
         if w.get_account_pick_mode() == "notebook" {
@@ -16253,14 +16304,14 @@ pub fn run() {
             w.set_nb_create_name("".into());
             w.set_status("".into());
             update_notebook_list(&w, &s);
-            w.set_screen(17);
+            w.set_screen(Screen::Notebooks);
             return;
         }
         if s.pending_import.take().is_some() {
-            w.set_screen(1); // abandon import → back to the import form
+            w.set_screen(Screen::ImportKey); // abandon import → back to the import form
         } else {
             update_home(&w, &s);
-            w.set_screen(8); // came from settings
+            w.set_screen(Screen::Settings); // came from settings
         }
     });
 
@@ -16305,7 +16356,7 @@ pub fn run() {
         clear_reveal(&w, &mut s);
         w.set_status("".into());
         w.set_import_text("".into());
-        w.set_screen(0);
+        w.set_screen(Screen::Onboarding);
     });
 
     cb!(on_reveal_hide, |w, s| {
@@ -16708,7 +16759,7 @@ pub fn run() {
                 "No key material cached this session — open Private keys once (it re-authenticates), or restart the app."
                     .into(),
             );
-            w.set_screen(18);
+            w.set_screen(Screen::PublicKeys);
             println!("cb: reveal-public no-material");
             return;
         };
@@ -16753,7 +16804,7 @@ pub fn run() {
                 println!("cb: reveal-public err");
             }
         }
-        w.set_screen(18);
+        w.set_screen(Screen::PublicKeys);
     });
 
     // ---- Private keys (screen 19): ALWAYS a fresh biometric — never the
@@ -16795,7 +16846,7 @@ pub fn run() {
                         println!("cb: reveal-private ok");
                         s.reveal_formats = Some(f);
                         w.set_status("".into());
-                        w.set_screen(19);
+                        w.set_screen(Screen::PrivateKeys);
                     }
                     Err(e) => {
                         println!("cb: reveal-private err");
@@ -16908,7 +16959,7 @@ pub fn run() {
         w.set_pq_imported_private_qr(slint::Image::default());
         s.pq_pending_replace = None;
         update_pq_keys_screen(&w, &s);
-        w.set_screen(29);
+        w.set_screen(Screen::QuantumKeys);
         // Log-contract landing signal (graffito-app-selfpq.sh) — emitted
         // LAST, after ensure_pq_imported_loaded (which blocks on a
         // SecurityAgent keychain prompt on a freshly-resigned debug build)
@@ -17113,7 +17164,7 @@ pub fn run() {
         }
         w.set_status("".into());
         update_notebook_list(&w, &s);
-        w.set_screen(17);
+        w.set_screen(Screen::Notebooks);
     });
 
     cb!(on_open_notebook, |w, s, index: i32| {
@@ -17125,7 +17176,7 @@ pub fn run() {
         match activate(&mut s, &material, false) {
             Ok(()) => {
                 update_home(&w, &s);
-                w.set_screen(4); // paint first — the scan runs in the background
+                w.set_screen(Screen::Home); // paint first — the scan runs in the background
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s); // CHANGE 5: was missing — Sal's finding
             }
@@ -17238,7 +17289,7 @@ pub fn run() {
             std::time::Duration::from_secs(60),
             move || {
                 if let Some(w) = weak.upgrade() {
-                    if w.get_screen() == 4 {
+                    if w.get_screen() == Screen::Home {
                         let mut s = st.borrow_mut();
                         if s.ident.is_some() {
                             // MUST be the async refresh: slint timers keep
@@ -17258,11 +17309,11 @@ pub fn run() {
         );
     }
 
-    // Design-preview harness: `CN_PREVIEW=<screen>` boots straight into a
-    // funding screen with mock data so the UI can be screenshotted and
+    // Design-preview harness: `CN_PREVIEW=<screen-name>` boots straight into
+    // a funding screen with mock data so the UI can be screenshotted and
     // iterated without wiring or clicking through onboarding. Dev-only.
     if let Ok(scr) = std::env::var("CN_PREVIEW") {
-        if let Ok(n) = scr.parse::<i32>() {
+        if let Some(n) = screen_by_name(scr.trim()) {
             preview_mock(&window);
             window.set_screen(n);
         }
@@ -17407,10 +17458,11 @@ fn preview_mock(w: &AppWindow) {
     w.set_funding_wallets(VecModel::from_slice(&wallets));
 }
 
-/// Render each screen to `<out_dir>/screen-<n>.png` via the software renderer,
-/// with no on-screen window — for headless design iteration. macOS-only.
+/// Render each screen to `<out_dir>/screen-<name>.png` via the software
+/// renderer, with no on-screen window — for headless design iteration.
+/// macOS-only.
 #[cfg(target_os = "macos")]
-fn render_previews(w: u32, h: u32, screens: &[i32], out_dir: &str) {
+fn render_previews(w: u32, h: u32, screens: &[Screen], out_dir: &str) {
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
     use std::rc::Rc;
 
@@ -17436,6 +17488,7 @@ fn render_previews(w: u32, h: u32, screens: &[i32], out_dir: &str) {
     app.set_ready(true);
 
     for &n in screens {
+        let name = screen_name(n);
         preview_mock(&app);
         app.set_screen(n);
         slint::platform::update_timers_and_animations();
@@ -17455,13 +17508,13 @@ fn render_previews(w: u32, h: u32, screens: &[i32], out_dir: &str) {
             rgb.push((g << 2) | (g >> 4));
             rgb.push((b << 3) | (b >> 2));
         }
-        let path = format!("{out_dir}/screen-{n}.png");
+        let path = format!("{out_dir}/screen-{name}.png");
         let file = std::fs::File::create(&path).expect("create png");
         let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
         enc.set_color(png::ColorType::Rgb);
         enc.set_depth(png::BitDepth::Eight);
         enc.write_header().unwrap().write_image_data(&rgb).unwrap();
-        eprintln!("rendered screen {n} -> {path}");
+        eprintln!("rendered screen {name} -> {path}");
     }
 }
 
