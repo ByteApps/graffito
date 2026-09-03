@@ -1,0 +1,105 @@
+// Screen.public-keys -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 18 · public keys (watch-only-safe, no re-auth) ----------
+
+import { Ui, PublicKeys } from "../globals.slint";
+import { Caption, Mono, GhostButton, Header, QrArea } from "../components.slint";
+import { Pal } from "../theme.slint";
+
+export component PublicKeysScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: "Public keys";
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Flickable {
+            viewport-width: self.width;
+            viewport-height: pub-col.preferred-height;
+            pub-col := VerticalLayout {
+                width: parent.width;
+                spacing: 14px;
+                alignment: start;
+                Caption {
+                    text: "Watch-only — these can't spend your funds or read a private note. But an xpub or descriptor reveals every address in this notebook, so anyone you share it with can see its full balance and transaction history and track your activity. Share only with people you trust.";
+                    color: Pal.warn;
+                }
+                if Ui.reveal-fingerprint != "": Mono {
+                    text: Ui.reveal-fingerprint;
+                    color: Pal.muted;
+                }
+                if Ui.reveal-public-hint != "": Caption { text: Ui.reveal-public-hint; color: Pal.warn; }
+                // Collapsed by default — tap a row header to expand its value +
+                // QR; both can be open at once.
+                for row[idx] in PublicKeys.reveal-public-rows: VerticalLayout {
+                    spacing: 6px;
+                    Rectangle {
+                        height: 46px;
+                        border-radius: 10px;
+                        background: Pal.card;
+                        border-width: 1px;
+                        border-color: Pal.line;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            spacing: 8px;
+                            Text {
+                                text: row.label;
+                                color: Pal.text;
+                                font-size: 14px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Image {
+                                source: row.expanded ? @image-url("../icons/caret-up.svg") : @image-url("../icons/caret-down.svg");
+                                colorize: Pal.muted;
+                                width: 16px;
+                                height: 16px;
+                            }
+                        }
+                        TouchArea {
+                            clicked => {
+                                PublicKeys.reveal-public-rows[idx].expanded = !PublicKeys.reveal-public-rows[idx].expanded;
+                            }
+                        }
+                    }
+                    if row.expanded: VerticalLayout {
+                        spacing: 6px;
+                        Rectangle {
+                            border-radius: 10px;
+                            background: Pal.card;
+                            border-width: 1px;
+                            border-color: Pal.line;
+                            height: pkv.preferred-height + 24px;
+                            pkv := Mono {
+                                x: 12px;
+                                y: 12px;
+                                width: parent.width - 24px;
+                                text: row.value;
+                            }
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 176px;
+                                height: 176px;
+                                QrArea {
+                                    img: row.qr;
+                                    qr-size: 176px;
+                                }
+                                TouchArea {
+                                    clicked => {
+                                        Ui.qr-zoom-image = row.qr;
+                                        Ui.qr-zoom-open = true;
+                                    }
+                                }
+                            }
+                        }
+                        GhostButton { text: "Copy"; clicked => { Ui.copy-value(row.value); } }
+                    }
+                }
+            }
+        }
+    }
