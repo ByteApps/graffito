@@ -1,0 +1,93 @@
+// Screen.funding-wallets -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 15 · funding wallets (manager list) ----------
+
+import { Ui, FundingWallets } from "../globals.slint";
+import { Caption, PrimaryButton, IconButton, SvgIconButton, Header, Badge, PencilButton } from "../components.slint";
+import { Pal } from "../theme.slint";
+
+export component FundingWalletsScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Funding wallets";
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Caption {
+            text: "Watch-only wallets that can pay for your notes. Tap one to use it, or add another.";
+        }
+        if Ui.funding-wallets.length == 0: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: 60px;
+            Caption {
+                text: "No funding wallets yet — add one below.";
+                horizontal-alignment: center;
+                x: 0; width: parent.width;
+                y: (parent.height - self.preferred-height) / 2;
+            }
+        }
+        Flickable {
+            viewport-height: fw-col.preferred-height;
+            fw-col := VerticalLayout {
+                spacing: 8px;
+                alignment: start;
+                for fw in Ui.funding-wallets: Rectangle {
+                    height: fw-row.preferred-height;
+                    border-radius: 10px;
+                    background: fwta.has-hover ? Pal.card-hover : Pal.card;
+                    border-width: 1px;
+                    border-color: fw.active ? Pal.accent : Pal.line;
+                    fwta := TouchArea { clicked => { FundingWallets.use-funding-wallet(fw.id); } }
+                    fw-row := HorizontalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            horizontal-stretch: 1;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                Text {
+                                    text: fw.label;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: Pal.text;
+                                    overflow: elide;
+                                }
+                                if fw.active: Badge { label: "active"; tint: Pal.accent; }
+                            }
+                            Caption { text: fw.meta; }
+                        }
+                        PencilButton { clicked => { FundingWallets.fund-rename-start(fw.id, fw.label); } }
+                        SvgIconButton {
+                            icon: "refresh";
+                            size: 14px;
+                            width: 32px;
+                            height: 32px;
+                            clicked => { FundingWallets.refresh-funding-wallet(fw.id); }
+                        }
+                        IconButton {
+                            glyph: "×";
+                            glyph-size: 18px;
+                            glyph-color: Pal.bad;
+                            width: 32px;
+                            height: 32px;
+                            clicked => { FundingWallets.remove-funding-wallet(fw.id); }
+                        }
+                    }
+                }
+            }
+        }
+        Rectangle { }
+        PrimaryButton {
+            text: "+  Add wallet";
+            clicked => { FundingWallets.add-funding-wallet(); }
+        }
+        if Ui.status != "": Caption { text: Ui.status; color: Pal.bad; }
+    }
