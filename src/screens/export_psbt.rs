@@ -25,11 +25,8 @@ pub(crate) fn show_psbt_sign_screen(&mut self, w: &AppWindow, built: BuiltPsbt, 
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_psbt_save(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let Some(built) = s.built_psbt.as_ref() else { return };
+        let Some(built) = self.built_psbt.as_ref() else { return };
         let bytes = built.to_bytes();
         if let Some(path) = platform::save_file("note.psbt") {
             match std::fs::write(&path, &bytes) {
@@ -39,11 +36,7 @@ pub(crate) fn on_psbt_save(&mut self, w: &AppWindow) {
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_psbt_goto_import(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let _ = &mut s;
         w.global::<Ui>().set_status("".into());
         w.global::<Ui>().set_screen(Screen::ImportSignedPsbt);
     }

@@ -42,20 +42,14 @@ pub(crate) fn update_dice_ui(&self, w: &AppWindow) {
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_dice_undo(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.dice_rolls.pop();
-        s.update_dice_ui(w);
+        self.dice_rolls.pop();
+        self.update_dice_ui(w);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_dice_continue(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let words = s.new_word_count;
-        let rolls = s.dice_rolls.clone();
+        let words = self.new_word_count;
+        let rolls = self.dice_rolls.clone();
         match app_core::identity::mnemonic_from_dice(&rolls, words) {
             Ok(m) => {
                 // Count + the (already on-screen, therefore non-secret) hash
@@ -67,14 +61,14 @@ pub(crate) fn on_dice_continue(&mut self, w: &AppWindow) {
                         &app_core::identity::dice_entropy(&rolls).unwrap_or([0u8; 32])[..4]
                     )
                 );
-                s.stage_new_mnemonic(w, m.to_string());
+                self.stage_new_mnemonic(w, m.to_string());
                 // The rolls ARE the seed, so drop them the moment the mnemonic
                 // exists — holding them for the rest of the session would keep
                 // a second copy of the secret in memory for no reason. Nothing
                 // can navigate back to the dice screen from here (back on the
                 // words screen goes to onboarding), so there is nothing to
                 // preserve them for.
-                s.dice_rolls = Zeroizing::new(String::new());
+                self.dice_rolls = Zeroizing::new(String::new());
             }
             Err(e) => {
                 println!("cb: dice-continue err");

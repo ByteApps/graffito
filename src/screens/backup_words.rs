@@ -4,11 +4,8 @@
 use crate::*;
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_regenerate_words(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let count = s
+        let count = self
             .pending_mnemonic
             .as_ref()
             .map(|m| m.split(' ').count())
@@ -29,17 +26,14 @@ pub(crate) fn on_regenerate_words(&mut self, w: &AppWindow) {
                 }
                 println!("cb: regenerate-words count={count}");
                 w.global::<Ui>().set_backup_words(grid.into());
-                s.pending_mnemonic = Some(phrase);
+                self.pending_mnemonic = Some(phrase);
             }
             Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_backup_continue(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let Some(phrase) = s.pending_mnemonic.clone() else { return };
+        let Some(phrase) = self.pending_mnemonic.clone() else { return };
         let count = phrase.split(' ').count();
         let mut idx = [0u8; 3];
         // `idx` is NOT key material — it only selects which 3 of the
@@ -70,7 +64,7 @@ pub(crate) fn on_backup_continue(&mut self, w: &AppWindow) {
             )
             .into(),
         );
-        s.quiz_indices = picks;
+        self.quiz_indices = picks;
         w.global::<Quiz>().set_quiz_answer("".into());
         w.global::<Ui>().set_screen(Screen::Quiz);
     }

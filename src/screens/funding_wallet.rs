@@ -35,12 +35,8 @@ pub(crate) fn log_funding_refresh(&self) {
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_funding_changed(&mut self, w: &AppWindow, text: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let net = s.network;
-        let _ = &mut s;
+        let net = self.network;
         let t = text.trim();
         if t.is_empty() {
             w.global::<FundingWalletScreen>().set_funding_feedback("".into());
@@ -65,17 +61,14 @@ pub(crate) fn on_funding_changed(&mut self, w: &AppWindow, text: SharedString) {
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_funding_use(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         // A UR hardware-wallet export imports its account(s) into the list.
-        if s.try_import_ur_account(w, &w.global::<FundingWalletScreen>().get_funding_descriptor()) {
+        if self.try_import_ur_account(w, &w.global::<FundingWalletScreen>().get_funding_descriptor()) {
             return;
         }
         // Otherwise: validate the descriptor, save to the list if new, activate.
         let input = extract_descriptor(&w.global::<FundingWalletScreen>().get_funding_descriptor());
-        let net = s.network;
+        let net = self.network;
         let wallet = match FundingWallet::create(&input, "", net) {
             Ok(fw) => fw,
             Err(e) => {
@@ -83,37 +76,34 @@ pub(crate) fn on_funding_use(&mut self, w: &AppWindow) {
                 return;
             }
         };
-        if !s.funding_wallets.iter().any(|x| x.id == wallet.id) {
-            s.funding_wallets.push(wallet.clone());
-            s.save_funding_wallets();
+        if !self.funding_wallets.iter().any(|x| x.id == wallet.id) {
+            self.funding_wallets.push(wallet.clone());
+            self.save_funding_wallets();
         }
-        s.activate_funding_wallet(w, &wallet.id);
+        self.activate_funding_wallet(w, &wallet.id);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_funding_file(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         if let Some(path) =
             platform::pick_file(&[("Descriptor / wallet export", &["txt", "json", "desc", "ur"])])
         {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
-                    if s.try_import_ur_account(w, &content) {
+                    if self.try_import_ur_account(w, &content) {
                         return;
                     }
                     // A wallet-export file can list several script-type descriptors.
                     let descs = extract_all_descriptors(&content);
                     if descs.len() > 1 {
-                        let added = s.save_funding_descriptors(w, &descs);
-                        w.global::<Ui>().set_status(format!("imported {added} wallet(s) from file — pick one").into());
+                        let added = self.save_funding_descriptors(w, &descs);
+                        w.global::<Ui>().set_status(format!("imported {added} wallet(self) from file — pick one").into());
                     } else {
                         let d = descs.into_iter().next().unwrap_or_default();
                         w.global::<FundingWalletScreen>().set_funding_descriptor(d.clone().into());
                         // U4: direct call — on_funding_changed is a method
                         // now, so invoking it via Slint would re-enter this
                         // same &mut self borrow synchronously.
-                        s.on_funding_changed(w, d.into());
+                        self.on_funding_changed(w, d.into());
                     }
                 }
                 Err(e) => w.global::<Ui>().set_status(format!("read failed: {e}").into()),

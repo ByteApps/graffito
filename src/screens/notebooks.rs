@@ -169,28 +169,25 @@ pub(crate) fn update_notebook_list(&self, w: &AppWindow) {
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_settings_open(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         w.global::<Ui>().set_return_screen(if w.global::<Ui>().get_screen() == Screen::Notebooks { Screen::Notebooks } else { Screen::Home });
         println!("cb: settings-open");
-        s.clear_reveal(w);
+        self.clear_reveal(w);
         w.global::<Ui>().set_status("".into());
         w.global::<Settings>().set_chunk_custom(false);
-        s.load_backend_settings(w);
-        s.refresh_node_health(w);
+        self.load_backend_settings(w);
+        self.refresh_node_health(w);
         // Settings shows identity/network/note-size fields that used to be set
         // only by update_home; onboarding now lands on the list (not a home),
         // so populate them here too or the "Change account…" row (gated on
         // settings-hierarchical) is missing on the first Settings visit.
-        s.update_settings_identity(w);
-        s.update_spending_ui(w);
-        if s.spending_capable
-            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
-            && !s.spending_scanned
+        self.update_settings_identity(w);
+        self.update_spending_ui(w);
+        if self.spending_capable
+            && self.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
+            && !self.spending_scanned
         {
-            s.spending_refresh_async(w);
+            self.spending_refresh_async(w);
         }
         // Fresh entry from the list starts at the top; returning from a Settings
         // sub-screen (via nav-back, which doesn't call this) keeps its position.
@@ -198,75 +195,62 @@ pub(crate) fn on_settings_open(&mut self, w: &AppWindow) {
         w.global::<Ui>().set_screen(Screen::Settings);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_open_notebook(&mut self, w: &AppWindow, index: i32) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+        let Some(material) = self.material.as_ref().map(|z| String::from(z.as_str())) else {
             return;
         };
-        s.nb_index = index.max(0) as u32;
-        println!("cb: open-notebook index={}", s.nb_index);
-        match s.activate(&material, false) {
+        self.nb_index = index.max(0) as u32;
+        println!("cb: open-notebook index={}", self.nb_index);
+        match self.activate(&material, false) {
             Ok(()) => {
-                s.update_home(w);
+                self.update_home(w);
                 w.global::<Ui>().set_screen(Screen::Home); // paint first — the scan runs in the background
-                s.refresh_async(w);
-                s.spending_refresh_async(w); // CHANGE 5: was missing — Sal's finding
+                self.refresh_async(w);
+                self.spending_refresh_async(w); // CHANGE 5: was missing — Sal's finding
             }
             Err(e) => w.global::<Ui>().set_status(e.to_string().into()),
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_create_notebook(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         // Address-first, then name-first: "+ New notebook" opens the
         // account picker (used/new pills + balances) so recovering a used
         // address is a visible choice; the naming dialog follows the pick.
         // Nothing is derived or persisted until the dialog's Create.
-        let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+        let Some(material) = self.material.as_ref().map(|z| String::from(z.as_str())) else {
             return;
         };
-        if !is_multi_notebook(&material, s.network) {
+        if !is_multi_notebook(&material, self.network) {
             return; // button is hidden; a stray call must not add phantom rows
         }
         println!("cb: create-notebook picker open");
         w.global::<AccountPicker>().set_nb_create_name("".into());
-        s.show_notebook_picker(w, 0, "notebook");
+        self.show_notebook_picker(w, 0, "notebook");
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_nb_rename_start(&mut self, w: &AppWindow, index: i32, _display: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let _ = &mut s;
         // Prefill the RAW local name (the display name may be the address
         // short form, which must not become a name by accident).
-        let raw = s
+        let raw = self
             .notebooks
             .as_ref()
-            .and_then(|ix| ix.get(s.account, index.max(0) as u32))
+            .and_then(|ix| ix.get(self.account, index.max(0) as u32))
             .map(|m| m.name.clone())
             .unwrap_or_default();
         w.global::<Modals>().set_nb_rename_input(raw.into());
         w.global::<Ui>().set_nb_rename_index(index);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_nb_archive(&mut self, w: &AppWindow, index: i32, archived: bool) {
-    #[allow(unused_mut)]
-    let mut s = self;
         let index = index.max(0) as u32;
-        if s.notebooks.is_none() {
+        if self.notebooks.is_none() {
             return;
         }
         if archived {
             // One guard only: funds never disappear from view silently —
             // sweep first. Archiving EVERY notebook is allowed (the list
             // shows its empty state); Restore brings any of them back.
-            let balance = s.notebook_store(index).map(|st2| st2.balance()).unwrap_or(0);
+            let balance = self.notebook_store(index).map(|st2| st2.balance()).unwrap_or(0);
             if balance > 0 {
                 w.global::<Ui>().set_status(
                     format!(
@@ -278,13 +262,13 @@ pub(crate) fn on_nb_archive(&mut self, w: &AppWindow, index: i32, archived: bool
                 return;
             }
         }
-        let account = s.account;
-        if let Some(ix) = s.notebooks.as_mut() {
+        let account = self.account;
+        if let Some(ix) = self.notebooks.as_mut() {
             ix.set_archived(account, index, archived);
-            s.save_notebooks();
+            self.save_notebooks();
             println!("cb: archive-notebook index={index} archived={archived}");
         }
         w.global::<Ui>().set_status("".into());
-        s.update_notebook_list(w);
+        self.update_notebook_list(w);
     }
 }

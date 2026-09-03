@@ -540,49 +540,43 @@ pub(crate) fn build_wconsol_confirm(&mut self, w: &AppWindow, wc: WConsol) {
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_spending_scan_deep(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.spending_scan_deep_async(w);
+        self.spending_scan_deep_async(w);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_spending_consolidate_open(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        if s.wallet_tx_busy || s.pending_broadcast.is_some() {
+        if self.wallet_tx_busy || self.pending_broadcast.is_some() {
             return;
         }
         // The fee rate used to build this tx comes from `s.fees.hour`
         // below — lazily (re)fetch first (network-efficiency, 2026-07-23).
-        s.refresh_fees_price(w);
-        s.ensure_spending_source();
-        let Some(src) = s.spending_source.clone() else {
+        self.refresh_fees_price(w);
+        self.ensure_spending_source();
+        let Some(src) = self.spending_source.clone() else {
             w.global::<Ui>().set_status("spending wallet unavailable for this identity".into());
             return;
         };
-        let coins = s.spending_coins.clone();
+        let coins = self.spending_coins.clone();
         if coins.len() < 2 {
             w.global::<Ui>().set_status("nothing to consolidate (need 2+ spending coins)".into());
             return;
         }
-        if s.base_url().is_none() {
+        if self.base_url().is_none() {
             w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
             return;
         }
-        let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+        let Some(material_str) = self.material.as_ref().map(|z| String::from(z.as_str())) else {
             return;
         };
-        let net = s.network;
+        let net = self.network;
         let Ok(material) = parse_key_material(&material_str, net) else { return };
-        let Some(next_receive) = s.store.as_ref().map(|st| st.spending.next_receive) else { return };
+        let Some(next_receive) = self.store.as_ref().map(|st| st.spending.next_receive) else { return };
         let Ok(dest) = src.derive(0, next_receive) else {
             w.global::<Ui>().set_status("couldn't derive the destination address".into());
             return;
         };
-        let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
-        let account = s.account;
+        let rate = self.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
+        let account = self.account;
         // Deliberately the device default, not `effective_lock_time()`:
         // this is the Coins screen's direct "Consolidate spending coins…"
         // shortcut, not compose (6) or sweep/consolidate (16) — nothing
@@ -593,14 +587,14 @@ pub(crate) fn on_spending_consolidate_open(&mut self, w: &AppWindow) {
             Some((&material, net, account, &coins)),
             dest.spk.clone(),
             rate,
-            s.lock_time(),
+            self.lock_time(),
         );
         match built {
             Ok(tx) => {
                 let spent: Vec<(String, u32, u64)> =
                     coins.iter().map(|c| (c.txid.clone(), c.vout, c.value)).collect();
                 let snap = SpendingConsolidateSnapshot {
-                    fp8: s.notebooks_fp8.clone().unwrap_or_default(),
+                    fp8: self.notebooks_fp8.clone().unwrap_or_default(),
                     network: net,
                     account,
                     dest_index: next_receive,
@@ -623,7 +617,7 @@ pub(crate) fn on_spending_consolidate_open(&mut self, w: &AppWindow) {
                         },
                     );
                 }
-                let (mut self_spks, mut spending_spks) = s.confirm_self_spks();
+                let (mut self_spks, mut spending_spks) = self.confirm_self_spks();
                 // Fresh spending receive address, not yet "used" bookkeeping
                 // — push its spk on top so it classifies "self".
                 self_spks.push(dest.spk.clone());
@@ -638,7 +632,7 @@ pub(crate) fn on_spending_consolidate_open(&mut self, w: &AppWindow) {
                     recipient_name: None,
                     recipients: Vec::new(),
                     note_preview: None,
-                    tip_height: s.confirm_tip_height(),
+                    tip_height: self.confirm_tip_height(),
                 };
                 let pending = PendingBroadcast {
                     kind: "spending-consolidate",
@@ -649,29 +643,26 @@ pub(crate) fn on_spending_consolidate_open(&mut self, w: &AppWindow) {
                     return_screen: Screen::Coins, // overwritten by show_confirm
                     payload: PendingPayload::SpendingConsolidate { snap },
                 };
-                s.show_confirm(w, pending, ctx);
+                self.show_confirm(w, pending, ctx);
             }
             Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_consolidate_wallet_open(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         // The destination-pick handler prices the tx off `s.fees.hour`
         // shortly after this opens the account picker — lazily (re)fetch
         // now so it's ready (network-efficiency, 2026-07-23).
-        s.refresh_fees_price(w);
+        self.refresh_fees_price(w);
         // Keyed AND watch identities take the same wallet-level flow
         // (rev-3 follow-up 1): snapshot every active notebook's coins,
         // pick the destination notebook, confirm. Watch identities sign
         // the one resulting PSBT externally (screens 13/14).
-        let Some(ix) = &s.notebooks else { return };
+        let Some(ix) = &self.notebooks else { return };
         let mut sources: Vec<(u32, Vec<app_core::notes_core::tx::Utxo>, u64)> = Vec::new();
         let mut coins_total = 0usize;
-        for m in ix.active(s.account) {
-            let Some(store) = s.notebook_store(m.index) else { continue };
+        for m in ix.active(self.account) {
+            let Some(store) = self.notebook_store(m.index) else { continue };
             let coins = store.available_utxos();
             if coins.is_empty() {
                 continue;
@@ -688,7 +679,7 @@ pub(crate) fn on_consolidate_wallet_open(&mut self, w: &AppWindow) {
             "cb: wallet-consolidate open coins={coins_total} notebooks={}",
             sources.len()
         );
-        s.wconsol = Some(WConsol {
+        self.wconsol = Some(WConsol {
             sources,
             dest_index: 0,
             dest_addr: String::new(),
@@ -697,6 +688,6 @@ pub(crate) fn on_consolidate_wallet_open(&mut self, w: &AppWindow) {
             vsize: 0,
         });
         w.global::<AccountPicker>().set_nb_create_name("".into());
-        s.show_notebook_picker(w, 0, "wconsol");
+        self.show_notebook_picker(w, 0, "wconsol");
     }
 }
