@@ -79,3 +79,13 @@ mod core_rpc_wiring_contract;
 #[path = "core_rpc_settings.rs"]
 mod core_rpc_settings_tests;
 mod ui_flow_quantum_key;
+
+/// U8 (PLAN-graffito-app-arch.md): in-process ports of the never-calibrated
+/// pq compose legs of the coordinate Mac suite
+/// (ui-automation/tests/graffito-app-selfpq.sh, SUPERSEDED — see its own
+/// header) — self-note + passphrase, self-note + ML-KEM, and locked-note
+/// unlock. Same real State/AppWindow flow as `ui_flow_quantum_key`, no
+/// window/coordinates/keychain prompt.
+mod ui_flow_selfpq_passphrase;
+mod ui_flow_selfpq_kem;
+mod ui_flow_locked_note_unlock;
