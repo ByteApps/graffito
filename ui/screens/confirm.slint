@@ -1,0 +1,62 @@
+// Screen.confirm -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 26 · Confirm & broadcast (universal) ----------
+// Every broadcast path (compose/spending/mixed/signed-PSBT) lands here
+// before anything hits the wire — full decoded tx, Broadcast is the
+// only way out besides Cancel. Funding-unification follow-up,
+// 2026-07-17.
+
+import { Ui, Confirm } from "../globals.slint";
+import { Caption, PrimaryButton, Header, QrSpinner, TxConfirmView } from "../components.slint";
+import { Pal } from "../theme.slint";
+
+export component ConfirmScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        // No `alignment: start` here: the detail view stretches to fill so
+        // the Broadcast button stays PINNED at the bottom — a long tx
+        // (mixed sweep, many inputs) scrolls inside TxConfirmView instead
+        // of pushing Broadcast off-screen (and the e2e tap point is one
+        // constant, not per-tx-shape).
+        Header {
+            title: "Confirm & broadcast";
+            back => { Ui.confirm-cancel(); }
+        }
+        if Confirm.confirm-context != "": Caption { text: Confirm.confirm-context; }
+        TxConfirmView {
+            vertical-stretch: 1;
+            note: Confirm.confirm-note;
+            inputs: Confirm.confirm-inputs;
+            outputs: Confirm.confirm-outputs;
+            fee-line: Confirm.confirm-fee-line;
+            lock-time-line: Confirm.confirm-locktime-line;
+            warn: Ui.confirm-warn;
+            txid: Confirm.confirm-txid;
+        }
+        Rectangle {
+            height: 46px;
+            PrimaryButton {
+                width: 100%;
+                height: 100%;
+                text: Confirm.wallet-tx-busy ? "Broadcasting…" : "Broadcast";
+                tint: Confirm.wallet-tx-busy ? Pal.faint : Pal.accent;
+                clicked => { if (!Confirm.wallet-tx-busy) { Confirm.confirm-broadcast(); } }
+            }
+            // A label swap alone was too subtle on a slow/dying connection
+            // (Sal 2026-07-18: the button "did nothing" for several seconds
+            // on weak cellular before the error landed) — pair it with the
+            // same rotating spinner.svg QrSpinner already used elsewhere for
+            // in-flight work, plus the reassurance caption below.
+            if Confirm.wallet-tx-busy: QrSpinner {
+                width: 22px;
+                height: 22px;
+                x: parent.width - self.width - 14px;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+        if Confirm.wallet-tx-busy: Caption {
+            text: "Sending to your node — a weak connection can take up to 30 seconds.";
+        }
+        if Ui.status != "": Caption { text: Ui.status; color: Pal.bad; }
+    }
