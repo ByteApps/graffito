@@ -1,0 +1,973 @@
+import { Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem } from "types.slint";
+
+// U3a: per-screen + Ui/Modals globals extracted from AppWindow (ui/app.slint).
+// AppWindow declares zero properties/callbacks of its own now; every screen block
+// (still inline in app.slint until the extraction unit) reads/writes these globals.
+
+export global Ui {
+    // onboarding · import-key · backup-words · quiz · home · note ·
+    // compose · contacts · settings · … (see the `Screen` enum, types.slint)
+    in-out property <Screen> screen: Screen.onboarding;
+    in-out property <string> status; // in-out: back buttons clear stale messages
+    // Ambient "a network operation is in flight" signal — Rust flips this
+    // from a process-global op counter (NetOpGuard) around every worker
+    // thread that touches ChainClient/transport. Consumed by each header's
+    // `SyncButton` (spins while active; the operation queue's coalescing +
+    // serial scan lane is what keeps the on-time honest).
+    in-out property <bool> net-busy: false;
+    // Scan-freshness gate (update_scan_gate in Rust): true while any scan
+    // that feeds a money-flow's coin cache is in flight (notebook refresh /
+    // spending scan / wallet-wide stores refresh). Money-flow Sign buttons
+    // disable on it — signing a mid-scan coin cache builds a tx that can
+    // only fail loudly on broadcast (missing-inputs). Distinct from
+    // net-busy, which also covers broadcasts and probes.
+    in-out property <bool> wallet-scan-busy: false;
+    // Transient "Copied" toast (auto-dismisses ~1.5s after the LAST copy).
+    // Every copy affordance (copy-text/copy-value/psbt-copy) funnels here from
+    // Rust; toast-nonce bumps on each show. toast-ticks is a countdown (in
+    // toast-timer intervals) decremented by the timer and reset by the
+    // toast-nonce changed-handler below — a repeat copy while the toast is
+    // still open just pushes the countdown back out, no timer restart needed
+    // (toggling a running Timer's `running` off/on within one callback does
+    // NOT reset its elapsed time in Slint: the net value is unchanged within
+    // the same evaluation, so the runtime never sees a rising edge to restart
+    // from — confirmed empirically 2026-07-15, don't reintroduce that pattern).
+    in-out property <string> toast-text;
+    in-out property <bool> toast-open;
+    in-out property <int> toast-nonce;
+    in-out property <int> toast-ticks;
+    // Shared "busy tap" toast for every header SyncButton (2026-07-22):
+    // tapping the ↻ while `net-busy` is true doesn't fire another sync
+    // (the SCAN_LANE would coalesce it anyway) — it just tells the user
+    // one is already running. Self-handled purely in Slint, no Rust needed.
+    callback sync-busy-toast();
+    // Safe-area insets (set from Rust on iOS: status bar / Dynamic Island /
+    // home indicator). 0 on macOS. Applied as padding on each screen root.
+    in property <length> safe-top: 0px;
+    in property <length> safe-bottom: 0px;
+    // iCloud Keychain backup opt-in (current stored state) + restore-availability.
+    in-out property <bool> icloud-backup: false;
+    // iCloud is available on this device (signed in) so backup CAN work — gates
+    // the "Back up to iCloud" toggle; when false we disable it and say so.
+    in property <bool> icloud-enabled: false;
+    in property <bool> terms-accept-mode;
+    // Apple-only UI (iCloud Keychain sync) — hidden on Android, where the
+    // keystore is device-bound and there is no iCloud.
+    in property <bool> apple-platform: true;
+    // Desktop-only UI (native file dialogs via rfd) — hidden on iOS/Android,
+    // where platform::pick_file/save_file return None and the QR + clipboard
+    // paths carry the flows instead.
+    in property <bool> desktop-platform: true;
+    // What the reveal prompt authenticates with, per platform ("Touch ID" /
+    // "Face ID" / "biometrics") — copy only, the gating is in keychain.rs.
+    in property <string> biometric-name: "Touch ID";
+    in property <string> backup-words;
+    in property <string> address;
+    in property <[NoteItem]> notes;
+    in-out property <string> note-view-id;
+    // ---- locked-note unlock (post-quantum note view) ----
+    // True while NoteRecord.locked is Some — text stays hidden until
+    // Store::unlock_note/unlock_note_view succeeds. `note-unlock-needs-
+    // password`: a passphrase field + Unlock button apply (FLAG_PW set,
+    // and — for a received note — the FLAG_MLKEM half either isn't set or
+    // this device already holds the key, so a password is genuinely the
+    // missing piece). When false and `note-locked` is true,
+    // `note-unlock-caption` explains why nothing can be typed to fix it
+    // (KEM-only and this device lacks the key, or an own DIRECTED note
+    // sealed with ML-KEM — the sender can never reopen that layer). A
+    // SELF-note (PLAN-graffito-self-pw.md) is different: its author always
+    // holds the enc key, so an Unlock tap can still succeed against an
+    // already-imported quantum key even with no password to type —
+    // `note-unlock-show-button` (true only for that case) adds the button
+    // to the caption-only block too, which the unrecoverable DIRECTED
+    // cases above never get.
+    in property <bool> note-locked;
+    in property <bool> note-unlock-show-button;
+    in property <string> note-unlock-caption;
+    // The primary recipient's contact name / address, or "Self (my
+    // notebook)" — NO "To: " prefix (Sal, 2026-07-19: the compose screen's
+    // "To" section caption carries that now; see the uniform To rows).
+    in property <string> to-label;
+    // True while the send-to picker (screen 7) is collecting an EXTRA
+    // recipient (opened via "+ Add recipient") rather than picking the
+    // primary one.
+    in-out property <bool> picking-extra: false;
+    in property <string> cost-fold;   // "+227 sats" (dust-rule leftover)
+    in property <string> cost-total;  // "~330 sats" (fee + leftover, fold only)
+    in property <string> compose-stage; // "signing" | "broadcasting" | ""
+    // Directed-note gift: is the current note directed, the sats to gift, and
+    // whether the collapsible gift section is open.
+    in property <bool> directed;
+    // Header status chip on the (always-visible) section header row.
+    in property <bool> pq-quantum-resistant;
+    // "Note too large to broadcast" dialog (per-tx ~100 kB ceiling).
+    in-out property <bool> show-oversize-modal;
+    in-out property <string> change-address;
+    in-out property <bool> change-expanded;
+    in property <string> change-amount;
+    in property <[SpendCoin]> spend-coins;
+    in property <string> spend-title;
+    in-out property <bool> spend-expanded;
+    in property <bool> spend-enough: true;
+    // ---- external funding (pay a note from another wallet via PSBT) ----
+    in-out property <bool> fund-external;      // compose toggle
+    in property <bool> funding-ready;          // a valid source with coins is loaded
+    in property <bool> psbt-signed;            // an imported signed PSBT validated
+    // ---- universal confirm screen (26), funding-unification follow-up ----
+    in property <string> confirm-warn;         // amber warning banner text, "" = none
+    in property <[FundingWalletRow]> funding-wallets;   // saved wallet manager
+    in-out property <string> fund-rename-id;            // non-empty = rename modal open
+    // ---- internal spending wallet (funding-unification M3, PLAN-chain-notes-funding-unification.md) ----
+    // Same BIP-84 branch of the SAME seed as the notebook's BIP-86 leaf,
+    // signed fully in-app — no PSBT round trip. HD identities only.
+    in property <bool> spending-capable;      // material can derive m/84' (mnemonic / master xprv)
+    in-out property <bool> spending-enabled;  // the persisted Settings toggle
+    in property <string> spending-balance-line;
+    in-out property <string> coins-segment: "notebook";      // "notebook" | "spending"
+    // Compose "Pay from" picker: "notebook" (default) | "spending" | "wallet"
+    // (an external funding wallet — `fund-external` still drives its own
+    // panel/flow, unchanged; `pay-from` only decides which pill is lit and
+    // the header label).
+    in-out property <string> pay-from: "notebook";
+    in-out property <bool> payfrom-expanded;
+    // Short "<n> sats" figure for the compose compact row AND the funding
+    // screen's Notebook row — always fits, always elided (never widens the
+    // row). Updated whenever the selected source's balance changes.
+    in property <string> pay-from-balance;
+    in-out property <bool> spend-from-wallet;   // internal spending-wallet compose mode
+    in-out property <string> payfrom-expanded-source: "";
+    in property <string> payfrom-selected-line;
+    // Selected coins span more than one wallet — shows the linkage-hint line.
+    in property <bool> mixed-linkage-hint: false;
+    // Resolved change destination (default or explicit pick), for the
+    // compose nav row and the Change screen header — always elided.
+    in property <string> change-dest-label: "Notebook";
+    // Explicit change pick made this compose session; "" = default resolution
+    // applies (see app-core's resolve_change_default). Never reset by a
+    // refresh once the user has chosen — only a fresh compose clears it.
+    in-out property <string> change-choice: "";
+    // shared camera-scan overlay (every "Scan QR" path uses it)
+    in-out property <bool> scanning;
+    callback cancel-scan();
+    in property <[ContactItem]> contacts;
+    in-out property <string> contact-input;
+    in-out property <string> rename-address;
+    in property <string> rename-pq-display;
+    callback contact-pq-set(string);
+    callback contact-pq-remove();
+    in-out property <string> confirm-remove-address;
+    // Watch-only identity (account-xpub import): no signing key, no private
+    // notes — compose/sweep/consolidate/bump are hidden everywhere.
+    in property <bool> watch-only;
+    in-out property <bool> show-reset-confirm;
+    // Tap-to-enlarge QR overlay: any QR sets qr-zoom-image + opens it, so a
+    // small on-card QR can be scanned by another device. One shared overlay.
+    in-out property <bool> qr-zoom-open;
+    in-out property <image> qr-zoom-image;
+    // Bitcoin node picker: option labels, in order
+    // `<network Esplora presets…>, "Bitcoin Core", "Custom…"` (U12 — the
+    // storage-only `bitcoind+http(s)://host:port` prefix, see
+    // `PLAN-chain-notes-app-core-rpc.md` §2.5, never appears in this UI;
+    // `node-address-text` below is a bare `host:port`). Row order means the
+    // last two indices are always the UI-managed rows regardless of how
+    // many presets a network has (zero on regtest, so there it's exactly
+    // "Bitcoin Core", "Custom…").
+    in property <[string]> node-options;
+    in-out property <int> node-index;
+    in-out property <string> node-address-text;
+    // True when the CONFIGURED node (not just the row being browsed) is a
+    // Bitcoin Core RPC base — drives the "Bitcoin node · Bitcoin Core" title
+    // suffix via `node-backend-label` below.
+    in property <bool> node-is-core;
+    // "Bitcoin Core" / "Esplora" — small label next to the picker.
+    in property <string> node-backend-label;
+    in property <bool> node-health-warn;
+    // ---- Reveal keys (Settings "Dangerous area" -> screens 18/19) ----
+    // Shared header: "<xfp> · account N" (or just "account N" when the
+    // fingerprint isn't known — an account-level xprv import).
+    in property <string> reveal-fingerprint;
+    in property <string> reveal-public-hint;
+    in property <string> reveal-private-format;   // "" | recovery | xprv | hex | wif
+    in-out property <bool> pq-show-backup-confirm;
+    in property <string> pq-import-fp;
+    in property <string> pq-import-source;
+    // Replace guard: Generate/Import over an EXISTING "My quantum key"
+    // routes through this confirm instead of acting immediately — Rust
+    // tracks which action is pending and `pq-replace-confirm` performs it.
+    in-out property <bool> pq-show-replace-confirm;
+    callback pq-replace-confirm();
+    in-out property <bool> pq-show-export-private-confirm;
+    callback pq-imported-hide-private();
+    in property <[CoinItem]> coins;
+    in property <string> coins-summary;
+    in property <[ActivityItem]> activity;
+    in-out property <bool> show-bump-dialog;
+    in-out property <string> bump-ref;
+    in-out property <bool> bump-is-note;
+    in-out property <string> sweep-dest;
+    in-out property <string> sweep-rate: "1";
+    // Sweep flow (picker → dedicated screen 15, compose-like): the send-to
+    // picker doubles as the sweep destination picker via pick-mode.
+    in-out property <string> pick-mode: "compose";   // "compose" | "sweep"
+    // Screen 16 serves both flows: "sweep" (dest from the picker) and
+    // "consolidate" (dest = self, opened from the Coins screen).
+    in-out property <string> sweep-kind: "sweep";
+    // Which screen the funding-wallet manager returns to (compose, sweep).
+    in-out property <Screen> funding-return: Screen.compose;
+    // Where compose returns on back: contacts = picker (default/normal
+    // flow), note = note view (opened via Reply).
+    in-out property <Screen> compose-return: Screen.contacts;
+    // ---- dice-roll entropy (screens 27 + 28) ----
+    // The word count chosen on the onboarding door, carried through the
+    // entropy-source screen so both paths know what to build.
+    in-out property <int> new-word-count: 12;
+    // Rolls typed so far, the live SHA256 of them, and how many are still
+    // needed. `dice-hash` is shown deliberately: it is what makes the mode
+    // verifiable — the user can run the same digits through any SHA-256 tool
+    // and get this exact value. Rust never logs the rolls themselves.
+    in property <int> dice-count: 0;
+    in property <string> dice-hash;
+    in-out property <bool> show-dice-clear-confirm: false;
+    callback dice-roll(int);
+    callback dice-clear();
+    callback set-icloud-backup(bool);
+    callback refresh();
+    callback refresh-notebooks();   // notebook-list header: rescan every notebook
+    callback copy-text(string, string);
+    callback consolidate-open();           // coins → consolidate screen (16)
+    callback open-activity();
+    callback act-retry(string, bool);
+    callback act-explorer(string);
+    callback start-rename(string, string, bool);
+    callback cancel-rename();
+    callback cancel-remove();
+    callback compose-changed();
+    callback paste-compose();
+    callback refresh-coins();
+    // external funding (PSBT)
+    callback toggle-fund-external(bool);
+    callback open-funding();       // compose → saved funding-wallets list
+    callback fund-rename-cancel();
+    callback funding-import-ur(string);   // a scanned UR account string → import
+    callback funding-clear();      // forget the funding wallet
+    callback set-pay-from(string);         // compose picker: "notebook" | "spending"
+    callback set-coins-segment(string);    // Coins screen: "notebook" | "spending"
+    // Internal: a background spending-wallet scan finished — same
+    // trampoline pattern as apply-pending-refresh.
+    callback apply-pending-spending-refresh();
+    // Internal: a background wallet-wide rescan finished (Coins screen /
+    // notebook-list ↻, watchdog fix 2026-07-20) — same trampoline pattern.
+    callback apply-pending-wallet-stores-refresh();
+    callback psbt-copy();          // copy PSBT base64
+    callback psbt-loaded(string);  // internal: a scanned PSBT string → validate + confirm
+    callback psbt-broadcast();     // finalize + broadcast the signed PSBT
+    callback confirm-cancel();     // universal confirm screen (26) — back/Cancel
+    callback account-cancel();
+    callback reveal-hide();            // back/Done from 18 or 19: wipes every revealed value
+    callback copy-value(string);       // copy a revealed format to the clipboard
+    callback go-home();
+    // Internal: a background scan finished — Rust invokes this from the
+    // event loop to apply the result (never called from UI elements).
+    callback apply-pending-refresh();
+    // Internal: a notebook gap-discovery walk finished (seed re-import) —
+    // same trampoline pattern as apply-pending-refresh.
+    callback apply-pending-discovery();
+    // Deferred auto-unlock finished on its worker thread — apply on the UI
+    // thread (see UNLOCK_RESULT in lib.rs).
+    callback apply-pending-unlock();
+    // Create-notebook picker: used/new address probes finished on a worker
+    // thread; fill in the pills without blocking the tap that opened it.
+    callback apply-pending-picker-probe();
+    // A Bitcoin Core preflight check (`refresh_node_health` in lib.rs)
+    // finished on a worker thread — fills in the node-health caption.
+    callback apply-pending-node-health();
+    // Async sign+broadcast (2026-07-16): a compose send's build+broadcast
+    // finished on a worker thread — same trampoline pattern.
+    callback apply-pending-compose();
+    // A Rebroadcast (act-retry) finished on a worker thread.
+    callback apply-pending-act-retry();
+    // A Rebroadcast's own raw-hex fetch (sub-case (b): chain-recovered/
+    // watch record, no locally cached hex) finished on a worker thread —
+    // enters the universal confirm screen on success.
+    callback apply-pending-rebroadcast-fetch();
+    // A Speed-up (RBF bump) broadcast finished on a worker thread.
+    callback apply-pending-act-bump();
+    // CHANGE 4: a consolidate/sweep/wallet-consolidate/psbt broadcast
+    // finished on a worker thread — same trampoline pattern, one callback
+    // draining all four result queues (mirrors apply-pending-compose).
+    callback apply-pending-wallet-tx();
+    // iCloud-contacts feature (2026-07-20): the OTHER device just synced a
+    // contacts change in — same trampoline pattern as apply-pending-refresh,
+    // but the source event is an NSUbiquitousKeyValueStore notification
+    // (any thread) rather than a worker-thread scan.
+    callback apply-pending-icloud-contacts();
+    // Where settings/activity return on back: the screen they were opened
+    // from (the notebook list or a notebook's home). Set by their open
+    // callbacks in Rust.
+    in-out property <Screen> return-screen: Screen.home;
+    // ---------- notebooks (screen 17 = the main list; 4 = one notebook) ----------
+    in-out property <[NotebookItem]> notebooks;
+    // -1 = rename dialog closed · >= 0 = renaming that account. (Creation
+    // never dialogs — the picker's inline name field covers it.)
+    in-out property <int> nb-rename-index: -1;
+    // sender filter (home): exclusions persist per notebook, all-on default
+    in-out property <[SenderItem]> senders;
+    callback open-notebooks();
+    callback nb-rename-cancel();
+    // ---------- system back (Android hardware/gesture back) ----------
+    // slint delivers Android's back button/gesture as Key.Back to whatever
+    // has keyboard focus and lets it bubble up from there — so back-scope
+    // below wraps every child of the window, and holds focus itself whenever
+    // no field does (key events aren't delivered at all while nothing has
+    // focus; the changed-handlers below re-take it). Handled = navigate
+    // exactly like the current screen's header chevron (single source of
+    // truth: the chevrons call nav-back() too); unhandled (onboarding/home)
+    // rejects the key so Android's default runs, which moves the task to
+    // the background instead of quitting.
+    callback back-logged(bool, Screen); // Rust: `cb: sys-back` log line
+
+    // Moved verbatim from AppWindow (was: `sync-busy-toast => {...}` directly
+    // on root) -- self-implemented callback, now self-implemented in Ui.
+    sync-busy-toast => {
+        toast-text = "Syncing with the network…";
+        toast-nonce += 1;
+        toast-open = true;
+    }
+    // A repeat copy while the toast is still showing resets the countdown
+    // (see toast-ticks above) instead of cutting the dismiss short.
+    // (moved from AppWindow: `changed toast-nonce => { root.toast-ticks = 6; }`)
+    changed toast-nonce => { toast-ticks = 6; }
+}
+
+export global Modals {
+    // Set true by Rust once the safe-area inset is known; until then a splash
+    // cover hides the content so it never slides down from under the status
+    // bar on cold start.
+    in property <bool> ready: false;
+    in property <bool> oversize-offer-bump; // true → offer to switch to Standard
+    in property <string> oversize-message;
+    in-out property <string> fund-rename-input;
+    in-out property <image> camera-frame;
+    in-out property <float> scan-progress;   // 0..1 multi-frame reassembly
+    in property <string> scan-hint: "Point the QR code at the camera";
+    in-out property <string> rename-input;
+    // Whether the contact being (re)named should push to iCloud — the
+    // "Save to iCloud" checkbox in the rename dialog is driven by this
+    // property; on-start-rename seeds it from the contact's current
+    // `synced` flag, defaulting unchecked for a never-synced contact.
+    in-out property <bool> rename-synced;
+    // Quantum key on this contact (rename dialog "Quantum key" section):
+    // `rename-pq-display` is "" while none is set, else "<level> · <fp>"
+    // (`pqkeys::contact_pq_display`) — seeded by `start-rename`, refreshed
+    // after `contact-pq-set`/`contact-pq-remove`.
+    in-out property <string> rename-pq-input;
+    in property <string> rename-pq-error;
+    callback contact-pq-file();
+    in property <string> confirm-remove-name;
+    callback pq-copy-private();
+    callback pq-save-private();
+    callback pq-replace-cancel();
+    in property <string> pq-imported-private-value;
+    in property <image> pq-imported-private-qr;
+    callback pq-imported-reveal-private();
+    callback pq-imported-copy-private();
+    in property <string> bump-kind;
+    in property <string> bump-current;
+    in property <string> bump-min;
+    in property <string> bump-error;
+    in property <string> bump-new-fee;
+    in-out property <string> bump-rate;
+    callback act-bump-rate-changed(string);
+    callback act-bump-confirm();
+    callback save-rename(string);
+    callback remove-contact(string);
+    callback fund-rename-save(string);
+    callback reset-identity();
+    callback oversize-bump(); // raise chunk size to Standard from the compose dialog
+    in-out property <string> nb-rename-input;
+    callback nb-rename-save(string);
+}
+
+export global Info {
+    // Info screens (25) — About / Privacy / Help / Q&A share one screen; Rust
+    // sets the title + body. Terms & disclaimer (24) is its own screen: it's the
+    // first-run accept gate (terms-accept-mode = true → shows Accept, no back)
+    // and, from Settings, a read-only re-view (terms-accept-mode = false).
+    in property <string> info-title;
+    in property <string> info-body;
+    // True only for the About entry, which is the screen the Slint license
+    // requires the attribution on -- not Privacy/Help/Q&A/Terms.
+    in property <bool> info-show-slint;
+}
+
+export global Terms {
+    in property <string> disclaimer-body;
+    callback accept-terms();        // first-run disclaimer gate → proceed
+}
+
+export global Settings {
+    // Settings scroll position, preserved across sub-screen visits (Rust resets
+    // it to 0 on a fresh open from the list; nav-back keeps it).
+    in-out property <length> settings-scroll-y: 0;
+    in property <string> spending-address;    // next unused receive address
+    in property <image> spending-qr;
+    in property <string> settings-network;
+    in property <string> settings-identity;
+    // True while the identity key sits in the ungated fallback keychain item
+    // rather than behind an OS-enforced ACL (audit M2) — normal for unsigned
+    // dev builds, a real warning anywhere else.
+    in property <bool> key-protection-degraded;
+    in property <bool> settings-hierarchical;
+    in-out property <string> chunk-text;
+    in-out property <bool> chunk-custom;
+    // nLockTime policy (anti-fee-sniping): "tip" | "zero" | "custom".
+    in-out property <string> locktime-mode: "tip";
+    in-out property <string> locktime-text;
+    // What the current policy would actually put on the wire right now.
+    in-out property <string> locktime-effective;
+    in-out property <string> node-custom-text;
+    // The "Bitcoin Core" row is selected (second-to-last option) — purely a
+    // function of the dropdown, computed here rather than threaded from
+    // Rust so picking the row reveals its fields immediately, before any
+    // address has been typed/submitted. Drives the address/credentials/
+    // switch/health-caption rows below; NOT the same thing as
+    // `node-is-core` (the ACTUALLY ACTIVE backend, which only updates once
+    // an address is submitted — see `update_node_backend_ui` in lib.rs).
+    out property <bool> node-core-row-selected: Ui.node-index == Ui.node-options.length - 2;
+    // The three URL fields below (Core address, custom Esplora URL, custom
+    // explorer URL) used to submit ONLY on `accepted` — Return, or Done on
+    // the mobile keyboard. Typing an address and then tapping somewhere
+    // else silently threw it away, which the global keyboard-dismiss layer
+    // (2026-08-01) made much easier to hit: tapping the background is now
+    // the natural way to put the keyboard down, and it is not a commit.
+    // Sal hit exactly this — RPC credentials came back on the next Settings
+    // visit but the node address didn't, because only the credentials had
+    // actually been stored. Each field now also commits when it LOSES
+    // FOCUS, gated on these dirty flags so a field that was merely tapped
+    // (or committed already, since the handler rewrites it to canonical
+    // form) doesn't re-submit and re-run a node health check.
+    in-out property <bool> node-address-dirty: false;
+    in-out property <bool> node-custom-dirty: false;
+    in-out property <bool> explorer-custom-dirty: false;
+    in-out property <string> node-core-user;
+    in-out property <string> node-core-pass;
+    // "Save credentials" switch (plan §2.4 / U10) — per-network preference,
+    // default true (preserves the pre-U10 unconditional-Keychain behavior).
+    // On: the fields above persist to the Keychain, exactly as before. Off:
+    // they live in memory for this session only (gone on relaunch) and any
+    // previously stored Keychain item for this network is deleted
+    // immediately on the OFF transition.
+    in-out property <bool> node-core-save-creds;
+    // Preflight summary (pruned / txindex / IBD / scanning), or "" before
+    // the first check / when the node isn't Core. `node-health-warn` picks
+    // the warning tint for a caption that needs one (pruned, no txindex);
+    // an all-clear line stays the muted caption color.
+    in property <string> node-health-text;
+    // Block-explorer picker: same shape.
+    in property <[string]> explorer-options;
+    in-out property <int> explorer-index;
+    in-out property <string> explorer-custom-text;
+    // Public keys (18): derived from the cached session material, NO
+    // fresh biometric. Both rows (xpub + descriptor) shown at once, each
+    // with its own QR. `reveal-public-hint` explains an empty list (no
+    // cached material, or a derive error) instead of a blank screen.
+    in property <bool> reveal-can-public;   // false for single-key (wif/hex) imports — no xpub/descriptor
+    // ---- Quantum keys (Settings "Dangerous area" -> screen 29) ----
+    // Hidden for watch-only identities (gated on `!watch-only` in the
+    // Settings card, same as "Private keys" — no leaf secret there, so no
+    // derived ML-KEM receive key either).
+    callback open-pq-keys();
+    // Settings Coins card only: aggregates notebook + spending pools (the
+    // card has no segments); the Coins screen's segmented views keep the
+    // per-pool `coins-summary` above.
+    in property <string> coins-summary-settings;
+    callback open-info(string);     // "about" | "privacy" | "help" | "faq" | "terms"
+    callback open-source();         // Settings → About & help → opens the GitHub repo
+    callback sweep-open();                 // settings → destination picker
+    callback open-coins();
+    // internal spending wallet (funding-unification M3)
+    callback set-spending-enabled(bool);   // Settings toggle
+    callback spending-refresh();           // manual refresh (Settings card + Coins segment)
+    callback spending-sweep-here();        // Settings card "Sweep notebook funds here"
+    callback set-network(string);
+    callback open-account-picker();
+    callback set-chunk(string);
+    callback set-locktime(string, string); // (mode, custom-height)
+    callback set-node-preset(int);
+    callback set-node-custom(string);
+    // Bitcoin Core node-address field (U12): a bare host/host:port/http(s)
+    // URL, normalized+stored as `bitcoind+http(s)://host:port` in Rust —
+    // the prefix never appears here.
+    callback set-node-address(string);
+    // Save Bitcoin Core RPC creds (user, pass) to the Keychain for the
+    // active network's configured node — never written to config.json.
+    callback set-node-core-creds(string, string);
+    // Toggle the "Save credentials" switch for the active network (plan
+    // §2.4 / U10): on persists to the Keychain, off deletes any stored
+    // item and keeps credentials in memory for this session only.
+    callback set-node-core-save-creds(bool);
+    callback set-explorer-preset(int);
+    callback set-explorer-custom(string);
+    callback reveal-public();          // Settings entry: derive from cached material, no auth, -> screen 18
+    callback reveal-private();         // Settings entry: FRESH biometric, only navigates (-> screen 19) on success
+}
+
+export global BackupWords {
+    // Backup screen: "Advanced" collapsible + optional user entropy ("salt").
+    in-out property <bool> advanced-expanded: false;
+    in-out property <string> entropy-salt;
+    // True when the pending seed came from dice — the backup screen hides its
+    // reroll/extra-entropy panel then, because rerolling would silently swap
+    // the user's verifiable dice seed for a device-random one.
+    in-out property <bool> seed-from-dice: false;
+    callback backup-continue();
+    callback regenerate-words();
+}
+
+export global ImportKey {
+    in-out property <string> import-text;
+    in property <string> import-feedback;
+    in property <bool> import-feedback-ok;
+    in property <string> import-suggestions;
+    callback import-changed(string);
+    callback import-confirm(string);
+    callback import-scan();
+    callback import-file();
+    callback paste-import();
+}
+
+export global Quiz {
+    in property <string> quiz-prompt;
+    in-out property <string> quiz-answer;
+    callback quiz-submit(string);
+}
+
+export global Home {
+    in property <image> address-qr;
+    in property <string> balance-line;
+    callback open-note(string);
+    callback open-note-web-url(string);
+    callback compose-open();
+    in-out property <string> notebook-title: "Graffito"; // home header = open notebook's name
+    in-out property <bool> filter-expanded;
+    in-out property <string> hidden-senders-label;    // "2 senders hidden", empty = none
+    callback toggle-sender(string, bool);
+}
+
+export global Note {
+    in property <string> note-detail;
+    in property <string> note-web-url;
+    in property <bool> note-pending;
+    in property <string> note-txid;
+    in property <string> note-reply-address;   // the note's single counterparty (received: the sender; own directed: its sole recipient); "" hides Reply
+    // Reply-all (multi-recipient): {sender} ∪ recipients minus me, sender
+    // first (notes-core's `reply_set`), contact names resolved. Hidden
+    // whenever length <= 1 — nothing to add beyond what plain Reply covers.
+    in property <[ContactItem]> note-reply-set;
+    in property <bool> note-unlock-needs-password;
+    in-out property <string> note-unlock-passphrase;
+    in property <bool> note-unlock-busy;
+    callback unlock-note();
+    callback open-note-web();
+    callback reply-to-note();
+    callback reply-all-to-note();
+}
+
+export global Compose {
+    // Multi-recipient directed notes: removable To-chips beyond the
+    // primary recipient (`to-label`) — the compose screen's "+ Add
+    // recipient" flow. Empty = today's ordinary single-recipient compose.
+    in property <[ContactItem]> to-chips;
+    in-out property <string> compose-text;
+    in-out property <bool> compose-private: true;
+    in-out property <string> rate-text;
+    in-out property <int> fee-tier: 1;
+    // Plain accent text under the rate box — ERROR/status messaging only
+    // since the structured cost card (build-17 follow-up, Sal 2026-07-18:
+    // "use sections key: value so it's more clear"): "Too large to
+    // broadcast…", "~N sats fee minimum", "funded from the external
+    // wallet". Rendered only while the structured props below are empty.
+    in property <string> cost-line;
+    // Structured cost breakdown card (key:value rows). An empty string
+    // hides that row; all-empty hides the whole card. `cost-fold`/
+    // `cost-total` only populate when the dust-rule fold prediction fires
+    // (Total == Fee otherwise — the row would be noise).
+    in property <string> cost-size;   // "1 chunk · ~151 vB"
+    in property <string> cost-fee;    // "~151 sats (~$0.00)" — NOMINAL fee
+    in property <string> cost-gift;   // "+330 sats" (directed: recipient output)
+    in property <string> cost-dust;   // "+330 sats" (funded shapes: dust-to-self)
+    // Async sign+broadcast (2026-07-16): true while a compose send
+    // (notebook/spending/mixed) is building or broadcasting — disables the
+    // Sign button and swaps its caption; compose-stage names the phase.
+    in property <bool> compose-sending;
+    out property <string> compose-progress-label: Ui.compose-stage == "broadcasting" ? "Broadcasting…" : "Signing…";
+    in-out property <string> gift-sats;
+    in-out property <bool> gift-expanded;
+    // ---- per-tx locktime override (compose screen 6) ----
+    // An override of the device-default policy above (Settings), reset to
+    // that default every time compose is (re)opened — never persisted.
+    // Same "mode" values as Settings: "tip" | "zero" | "custom".
+    in-out property <string> compose-locktime-mode: "tip";
+    in-out property <string> compose-locktime-height;
+    in property <string> compose-locktime-effective;
+    in-out property <bool> compose-locktime-expanded;
+    // Non-empty when the chosen height is above the current chain tip —
+    // the transaction would be non-final and get rejected. Shown
+    // regardless of expanded state (safety content).
+    in property <string> compose-locktime-warn;
+    // ---- post-quantum layers (compose screen 6, "Security" collapsible —
+    // visible for a private, single-recipient-or-self, notebook-funded,
+    // non-watch note — PLAN-graffito-self-pw.md extended this to self-notes
+    // too, 2026-08-22). LAST collapsible on the screen (Sal's e2e-drift
+    // rule: put new panels as late as possible so only the Sign/cost area
+    // below needs recalibration).
+    in-out property <bool> pq-expanded;
+    in property <string> pq-status-chip: Ui.pq-quantum-resistant ? "Quantum-resistant" : "Not quantum-resistant";
+    // Passphrase layer: toggle + text (two-way — the Generate button fills
+    // it from Rust) + a Rust-computed strength line + whether the CURRENT
+    // text is a verified (untouched-since-generate) phrase.
+    in-out property <bool> pq-passphrase-enabled;
+    in-out property <string> pq-passphrase-text;
+    in property <bool> pq-passphrase-verified;
+    in property <string> pq-passphrase-strength-line;
+    // true while the typed phrase sits under the weak threshold (lib.rs
+    // sets it alongside the strength line) — turns the caption red.
+    in property <bool> pq-passphrase-weak;
+    // ML-KEM layer: toggle, whether the resolved recipient has a usable
+    // key on file, and a caption — "<level> · <fingerprint>" when
+    // available+on, else a hint to add one in Contacts when unavailable.
+    in-out property <bool> pq-mlkem-enabled;
+    in property <bool> pq-mlkem-available;
+    in property <string> pq-mlkem-caption;
+    // Bottom-of-section summary line — `passphrase::security_label`
+    // verbatim, recomputed in Rust on any relevant change; never
+    // reimplemented here.
+    in property <string> pq-security-label;
+    callback pq-generate-passphrase();
+    callback pq-passphrase-changed(string);
+    callback pq-mlkem-toggled(bool);
+    // Fired whenever the Security panel's header is tapped, with the NEW
+    // expanded state — the sanctioned user-initiated door (LAUNCH-PATH
+    // rule) for lazily loading a self-note's imported quantum key from the
+    // Keychain: the ML-KEM switch itself starts disabled until that key is
+    // loaded, so opening the panel is the earliest tap Rust can hook.
+    callback pq-panel-toggled(bool);
+    in property <string> pay-from-label: "Notebook";
+    in property <string> payfrom-source-label: "Notebook";
+    callback add-recipient-open();   // compose "+ Add recipient" → picker
+    callback remove-chip(string);    // compose To-chip's × button
+    callback set-fee-tier(int);
+    callback compose-send();
+    callback fund-build();         // build the unsigned PSBT → export screen
+    callback spending-compose-send();      // compose picker "spending" primary action
+    // funding-unification: dedicated "Pay from" screen (20) — compose's
+    // picker/coin-control/change-address moved here wholesale, reached from
+    // a single compact row on compose.
+    callback open-funding-screen();        // compose row → screen 20
+    // Change now lives on its own screen (21), reached from a second compose
+    // nav row below "Pay from".
+    callback change-open();                // compose → screen 21
+    // Sign when the selection spans more than one wallet in one tx.
+    callback compose-send-mixed();
+    // Per-tx overrides of the above — compose (screen 6) and
+    // sweep/consolidate (screen 16) panels, same (mode, custom-height) shape.
+    callback set-compose-locktime(string, string);
+}
+
+export global Change {
+    in property <string> change-error;
+    // The ACTUAL default resolution (see app-core's resolve_change_default) —
+    // "spending" | "notebook" | "wallet:<id>" — independent of `change-choice`,
+    // which may be a user override; drives which row gets the "default" pill.
+    in property <string> change-default-choice: "";
+    // Human-readable reason the default row is the default, e.g. "the
+    // spending wallet is paying" / "no spending wallet enabled" / "<label>
+    // is paying".
+    in property <string> change-default-reason: "";
+    // Truncated notebook (identity) address, for the Notebook row's subtitle.
+    in property <string> change-notebook-line: "";
+    // Truncated fresh spending-wallet change address + index, e.g.
+    // "tb1p2ylq…q7ax · change #3" — "" when not derivable.
+    in property <string> change-spending-line: "";
+    callback change-scan();
+    callback change-pick(string);          // screen 21 row tap: an explicit choice
+}
+
+export global PayFrom {
+    in-out property <int> coin-strategy;
+    in property <string> spending-summary;    // "12,340 sats · 2 coins" or a call to action
+    in property <string> funding-notebook-balance;
+    // ---- multi-wallet coin selection (funding-unification UI rework) ----
+    // Coins nest under each wallet row on screen 20. Independent-expand
+    // rework (2026-07-18, Sal's iPhone feedback): Notebook and Spending
+    // expand/collapse independently via their own booleans below — opening
+    // one never hides another's selection, and a header tap ONLY toggles
+    // visibility (never selection). External wallets stay an accordion
+    // AMONG THEMSELVES (this app only ever keeps one external wallet's
+    // coins scanned/cached live at a time) — `payfrom-expanded-source` now
+    // tracks ONLY that slot: "" = none, "wallet:<id>" otherwise.
+    in-out property <bool> nb-expanded;
+    in-out property <bool> sp-expanded;
+    // Each section's OWN coin list + caption (independent-expand rework) —
+    // NOT the legacy singular `spend-coins`/`spend-title` below (those stay
+    // driven by whichever source is the compose engine's active pay-from,
+    // feeding the live fee/change preview; external wallets carry their own
+    // `coins`/`coin-title` directly on `FundingWalletRow` since they're a
+    // dynamic list).
+    in property <[SpendCoin]> nb-panel-coins;
+    in property <string> nb-panel-title;
+    in property <[SpendCoin]> sp-panel-coins;
+    in property <string> sp-panel-title;
+    // Pay-from screen summary card + compose row (Sal's iPhone bug cluster,
+    // 2026-07-18): ONE global verdict computed by Rust's `payfrom_state` from
+    // the TRUE cross-wallet selection — never a separately invented estimate,
+    // and never dependent on which panel is `payfrom-active-source`/expanded.
+    // "Selected" spans every source; "Required" is that selection's exact
+    // shape-appropriate fee estimate (always non-empty); "source-label" is
+    // the truthful "Notebook" / "Spending wallet" / <wallet label> / "N
+    // wallets" the compose row and summary card both render; tint by
+    // `spend-enough` everywhere (the SAME verdict gates Sign).
+    in property <string> payfrom-required-line;
+    // (source, "txid:vout") — `source` is now passed explicitly by the
+    // tapped panel itself (independent-expand rework, 2026-07-18): multiple
+    // Pay-from sections can be expanded at once, so there's no longer a
+    // single "currently expanded" source to infer it from.
+    callback toggle-coin(string, string);
+    callback set-coin-strategy(int);
+    callback funding-refresh();            // screen 20 header ↻ — async re-scan
+    // Multi-wallet coin selection (funding-unification UI rework): tapping a
+    // wallet row on screen 20 selects it AND expands its nested coin list.
+    callback payfrom-expand(string);
+}
+
+export global Sweep {
+    in property <string> funding-summary;      // one-line source summary (or a call to action)
+    in property <string> sweep-to-label;
+    in-out property <int> sweep-tier: 1;
+    in-out property <string> sweep-rate-text: "1";
+    in property <string> sweep-cost-line;
+    in property <string> sweep-inputs-title;
+    in-out property <bool> sweep-inputs-expanded;
+    in property <[SpendCoin]> sweep-coins;
+    in-out property <bool> sweep-fund-external;
+    // ---- per-tx locktime override (sweep/consolidate screen 16) ----
+    // Same contract as the compose panel above, reset to the device
+    // default every time this screen is (re)entered.
+    in-out property <string> sweep-locktime-mode: "tip";
+    in-out property <string> sweep-locktime-height;
+    in property <string> sweep-locktime-effective;
+    in-out property <bool> sweep-locktime-expanded;
+    in property <string> sweep-locktime-warn;
+    callback set-sweep-tier(int);
+    callback sweep-rate-changed();
+    callback toggle-sweep-fund-external(bool);
+    callback sweep-send();                 // screen 15 primary action
+    callback set-sweep-locktime(string, string);
+    in-out property <string> sweep-dest-note;   // linkage caveat, empty = none
+}
+
+export global FundingWalletScreen {
+    in-out property <string> funding-descriptor;
+    in property <string> funding-feedback;     // parse feedback on the entry screen
+    in property <bool> funding-valid;
+    callback funding-changed(string);
+    callback funding-scan();       // scan a descriptor/xpub/UR-account QR
+    callback funding-file();       // load a descriptor from file
+    callback funding-use();        // accept the source, scan its coins, back to compose
+}
+
+export global ExportPsbt {
+    in property <image> psbt-qr;               // current animated-UR frame
+    in property <string> psbt-frame-label;     // "frame 2 / 5" or "" for a single frame
+    in property <string> psbt-cost-line;       // "fee 240 sats · 1 input · 187 vB"
+    callback psbt-save();          // export the .psbt file
+    callback psbt-goto-import();   // export → import screen
+}
+
+export global Confirm {
+    in property <[PsbtRow]> confirm-inputs;
+    in property <[PsbtRow]> confirm-outputs;
+    in property <string> confirm-note;         // decoded note text (public) or placeholder
+    in property <string> confirm-fee-line;
+    // Byte-truth: decoded from the SIGNED tx itself, never from policy —
+    // "Locktime 146209 · block height" / "Locktime 0 · none". A future-tip
+    // locktime warning rides the existing `confirm-warn` channel below.
+    in property <string> confirm-locktime-line;
+    in property <string> confirm-txid;         // decoded from the signed raw tx
+    in property <string> confirm-context;      // one-liner under the header, e.g. "Public note · testnet4"
+    // CHANGE 4 (async wallet-tx broadcast, 2026-07-17): true while a
+    // sweep/consolidate/wallet-consolidate/spending-consolidate/psbt-
+    // broadcast has a POST in flight on a worker thread (build+sign stays
+    // synchronous) — the universal confirm screen's Broadcast button shows
+    // a busy caption and disables, and every entry point re-enters early.
+    in-out property <bool> wallet-tx-busy;
+    callback confirm-broadcast();  // universal confirm screen (26) — Broadcast tap
+}
+
+export global Coins {
+    in property <[SpendingCoinItem]> spending-coins-list;   // Coins screen "Spending" segment
+    callback spending-scan-deep();         // manual gap-20 deep scan (existing-funds discovery)
+    // wallet-level consolidate (Settings): dest picked on screen 9 in
+    // "wconsol" mode — picking a destination row IS the trigger (build +
+    // sign + universal confirm screen), no separate confirm tap.
+    callback consolidate-wallet-open();
+    // CHANGE 3 (2026-07-17): the Coins screen's spending segment gets its
+    // own consolidate — merges every spending coin into ONE at the next
+    // fresh spending receive address (signs in-app, no external wallet).
+    // The button tap IS the trigger (build + sign + universal confirm
+    // screen), no separate confirm tap.
+    callback spending-consolidate-open();
+}
+
+export global AccountPicker {
+    in property <[AccountItem]> accounts;
+    in-out property <int> account-page;
+    callback accounts-page(int);
+    callback pick-account(int);
+    // The account picker (screen 9) serves two flows: "switch" = import /
+    // settings account change (pick activates), "notebook" = the create-
+    // notebook flow (inline name field on top; tapping an address creates
+    // the notebook right away — rows already added are disabled).
+    in-out property <string> account-pick-mode: "switch";
+    in-out property <string> nb-create-name;
+}
+
+export global PublicKeys {
+    in-out property <[RevealRow]> reveal-public-rows;   // in-out: rows toggle their own `expanded`
+}
+
+export global PrivateKeys {
+    // Private keys (19): ALWAYS behind a fresh biometric (triggered from
+    // Settings, before navigating here). Adaptive availability — only
+    // formats this identity actually supports get a pill. Progressive
+    // disclosure: `reveal-private-format` is "" until the user taps a
+    // pill, and only that ONE format's value is ever on screen.
+    in property <bool> reveal-has-recovery;
+    in property <bool> reveal-has-xprv;
+    in property <bool> reveal-has-hex;
+    in property <bool> reveal-has-wif;
+    in property <string> reveal-private-value;    // Mono value / Copy payload
+    in property <image> reveal-private-qr;        // xprv/hex/wif QR
+    in property <string> reveal-words-col1;       // recovery phrase, first half
+    in property <string> reveal-words-col2;       // recovery phrase, second half
+    in-out property <bool> reveal-show-seedqr;    // recovery: words vs SeedQR toggle
+    in property <image> reveal-seedqr-image;
+    // Notebook picker for the hex/WIF single-key views only (Recovery
+    // phrase/Account xprv are index-independent — no picker). Populated
+    // whenever Private keys is (re)opened; default selection = the active
+    // notebook. Picking re-derives hex/WIF for THAT notebook, no re-auth.
+    in property <[NbPickRow]> reveal-nb-rows;
+    in-out property <int> reveal-nb-index;
+    callback private-select(string);   // pick which single format is shown: recovery | xprv | hex | wif
+    callback private-pick-notebook(int);  // hex/WIF only: re-derive for a different notebook, no re-auth
+    // Same, but for SPENDING material (recovery phrase / xprv / hex / WIF):
+    // routes to the concealed, local-only, expiring clipboard path. Public
+    // keys keep copy-value — an xpub is privacy-sensitive, not spendable.
+    callback copy-secret(string);
+}
+
+export global QuantumKeys {
+    // Level picker: "512" | "768" | "1024" — device-level (config.json
+    // "pq_level"), MlKem768 pre-selected by default.
+    in property <string> pq-key-level: "768";
+    callback pq-set-level(string);
+    in property <string> pq-key-fingerprint;
+    // Static per-level copy — sourced from `passphrase::MlKemLevel::
+    // describe()` (pinned text) once at boot, never changes at runtime.
+    in property <string> pq-desc-512;
+    in property <string> pq-desc-768;
+    in property <string> pq-desc-1024;
+    callback pq-copy-public();
+    callback pq-save-public();
+    // "My quantum key" — a separate, NON-seed-derived ML-KEM keypair held
+    // in the keychain (`pq-imported` account) — generate OR import,
+    // shared lifecycle (PLAN-graffito-quantum-key.md). `pq-import-fp` is
+    // the CURRENT key's display line ("ML-KEM-768 · fp"), empty when none
+    // is present; `pq-import-source` names where it came from ("Generated
+    // on this device" or an import source, only set right after a
+    // successful generate/import this session).
+    in-out property <string> pq-import-text;
+    callback pq-import-paste();
+    callback pq-import-file();
+    callback pq-import-submit();
+    callback pq-import-remove();
+    in property <string> pq-import-error;
+    // Generate a fresh key: its own level picker (independent of the
+    // notebook receive-key picker above) + optional extra entropy, mixed
+    // WITH the device CSPRNG, never in place of it.
+    in-out property <string> pq-gen-level: "768";
+    in-out property <string> pq-gen-extra;
+    callback pq-generate();
+    // Export: public half is a plain QR/copy (share freely); the private
+    // seed armor sits behind its own reveal warning, QR'd, and copies via
+    // the CONCEALED/expiring clipboard (never the plain one).
+    in property <image> pq-imported-public-qr;
+    callback pq-imported-copy-public();
+}
+
+export global Activity {
+    in property <string> activity-summary;
+    callback act-bump-open(string, bool);
+}
+
+export global Onboarding {
+    // A key is saved in this device's keychain (probed at boot WITHOUT
+    // unlocking it — reading it would prompt for Face ID and block launch).
+    in property <bool> saved-key-present;
+    // Onboarding's "Restore saved key" door. The prompt happens on THIS tap,
+    // never during launch.
+    callback restore-saved-key();
+    callback door-import();
+    callback door-create(int);
+}
+
+export global Dice {
+    in property <int> dice-needed: 50;
+    in property <string> dice-hash2;
+    // Set once enough rolls are in AND the distribution isn't obviously
+    // skewed; drives the Continue button.
+    in property <bool> dice-ready: false;
+    in property <string> dice-warning;
+    callback dice-undo();
+    callback dice-continue();
+}
+
+export global EntropySource {
+    callback pick-entropy-source(string);
+}
+
+export global Contacts {
+    // Contacts sync-status UI (2026-07-20): send-to picker header button —
+    // force a re-merge + push right now (see `sync_contacts_now` in
+    // lib.rs), so the user can confirm/retry sync without waiting for the
+    // next contact edit or app restart.
+    callback sync-contacts-now();
+    callback pick-contact(string);
+    callback contact-scan();
+    callback confirm-remove(string, string);
+}
+
+export global FundingWallets {
+    callback add-funding-wallet();     // list → add-wallet entry screen
+    callback use-funding-wallet(string);   // pick a saved wallet (scans it)
+    callback remove-funding-wallet(string);
+    callback refresh-funding-wallet(string);
+    callback fund-rename-start(string, string);   // (id, current-label)
+}
+
+export global ImportSignedPsbt {
+    callback psbt-import-file();
+    callback psbt-import-scan();
+}
+
+export global Notebooks {
+    callback settings-open();
+    in-out property <[NotebookItem]> archived-notebooks;
+    in-out property <bool> show-archived;
+    in-out property <string> archived-toggle-label;   // "Archived (2)" — preformatted
+    in-out property <bool> can-create-notebook;       // hierarchical identities only
+    callback open-notebook(int);
+    callback create-notebook();
+    callback nb-rename-start(int, string);
+    callback nb-archive(int, bool);
+}
