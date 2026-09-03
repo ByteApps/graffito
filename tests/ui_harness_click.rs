@@ -10,9 +10,10 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use graffito::{AppWindow, Screen};
+use graffito::{AppWindow, QuantumKeys, Screen, Ui};
 use i_slint_backend_testing::ElementHandle;
 use slint::platform::PointerEventButton;
+use slint::ComponentHandle;
 
 #[test]
 fn single_click_reaches_the_handler_headless() {
@@ -28,14 +29,14 @@ fn single_click_reaches_the_handler_headless() {
 
     slint::spawn_local(async move {
         let app = AppWindow::new().expect("AppWindow");
-        app.set_screen(Screen::QuantumKeys);
+        app.global::<Ui>().set_screen(Screen::QuantumKeys);
 
         let fired = Rc::new(Cell::new(false));
         {
             let fired = fired.clone();
             // "Copy public key" -> pq-copy-public() (unconditional GhostButton
             // on screen 29; "Save public key…" is desktop-gated and off here).
-            app.on_pq_copy_public(move || fired.set(true));
+            app.global::<QuantumKeys>().on_pq_copy_public(move || fired.set(true));
         }
 
         let button = ElementHandle::find_by_accessible_label(&app, "Copy public key")
