@@ -41,6 +41,7 @@ import { ChangeScreen } from "screens/change.slint";
 import { TermsScreen } from "screens/terms.slint";
 import { InfoScreen } from "screens/info.slint";
 import { ConfirmScreen } from "screens/confirm.slint";
+import { EntropySourceScreen } from "screens/entropy-source.slint";
 // Rust (src/lib.rs, via slint::include_modules!()) needs these re-exported
 // from the entry-point file.
 export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem, Ui, Modals, Info, Terms, Settings, BackupWords, ImportKey, Quiz, Home, Note, Compose, Change, PayFrom, Sweep, FundingWalletScreen, ExportPsbt, Confirm, Coins, AccountPicker, PublicKeys, PrivateKeys, QuantumKeys, Activity, Onboarding, Dice, EntropySource, Contacts, FundingWallets, ImportSignedPsbt, Notebooks }
@@ -458,40 +459,7 @@ export component AppWindow inherits Window {
 
     if Ui.screen == Screen.info: InfoScreen { }
 
-    // ---------- 27 · where does the entropy come from? ----------
-    // Two doors, same pattern as onboarding. Reached from every "Create a new
-    // N-word seed" door — creation no longer generates immediately, because
-    // "the device rolled it for you, trust us" is exactly the thing a bitcoin
-    // user may not want to trust.
-    if Ui.screen == Screen.entropy-source: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
-        padding: 20px;
-        spacing: 12px;
-        alignment: start;
-        Header {
-            title: "New " + Ui.new-word-count + "-word seed";
-            back => { root.nav-back(); }
-        }
-        Caption {
-            text: "Your seed is just a very large random number. Choose where that randomness comes from.";
-        }
-        Rectangle { height: 6px; }
-        DoorCard {
-            highlight: true;
-            title: "This device";
-            subtitle: "Uses the device's secure random number generator.";
-            clicked => { EntropySource.pick-entropy-source("device"); }
-        }
-        DoorCard {
-            title: "Dice rolls";
-            subtitle: "You roll a real die and enter each result. The seed is built from your rolls alone — nothing from this device is mixed in — so you can reproduce it yourself with any SHA-256 tool and check it matches.";
-            clicked => { EntropySource.pick-entropy-source("dice"); }
-        }
-        Rectangle { height: 4px; }
-        Caption {
-            color: Pal.muted;
-            text: "Dice take a few minutes, and they are more responsibility: the seed rests entirely on your rolls rather than on this device's randomness, so a fair die and honest rolls are what keep it strong.";
-        }
-    }
+    if Ui.screen == Screen.entropy-source: EntropySourceScreen { }
 
     // ---------- 28 · dice entry ----------
     // The roll counter and the LIVE hash are the point of this screen: the
