@@ -326,6 +326,17 @@ export global Ui {
     // the background instead of quitting.
     callback back-logged(bool, Screen); // Rust: `cb: sys-back` log line
 
+    // U3b bridges: a screen/modal extracted into its own file can no longer
+    // reach AppWindow's `back-scope` id or call its `nav-back()` function
+    // directly (Slint has no cross-file way to expose either, and a global
+    // callback's handler can only be set from inside the SAME global or
+    // from Rust — not from another component's element content). Same
+    // trick as `back-scope`'s own `mirror-screen <=> Ui.screen` two-way
+    // bindings below: a nonce property here, bumped by the extracted
+    // screen/modal, mirrored + watched with `changed` back in AppWindow.
+    in-out property <int> focus-back-scope-nonce: 0; // bump to give focus back to back-scope
+    in-out property <int> nav-back-nonce: 0;         // bump to run AppWindow's nav-back()
+
     // Moved verbatim from AppWindow (was: `sync-busy-toast => {...}` directly
     // on root) -- self-implemented callback, now self-implemented in Ui.
     sync-busy-toast => {
