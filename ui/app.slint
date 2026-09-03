@@ -30,6 +30,7 @@ import { CoinsScreen } from "screens/coins.slint";
 import { ActivityScreen } from "screens/activity.slint";
 import { FundingWalletDetailScreen } from "screens/funding-wallet.slint";
 import { ExportPsbtScreen } from "screens/export-psbt.slint";
+import { ImportSignedPsbtScreen } from "screens/import-signed-psbt.slint";
 // Rust (src/lib.rs, via slint::include_modules!()) needs these re-exported
 // from the entry-point file.
 export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem, Ui, Modals, Info, Terms, Settings, BackupWords, ImportKey, Quiz, Home, Note, Compose, Change, PayFrom, Sweep, FundingWalletScreen, ExportPsbt, Confirm, Coins, AccountPicker, PublicKeys, PrivateKeys, QuantumKeys, Activity, Onboarding, Dice, EntropySource, Contacts, FundingWallets, ImportSignedPsbt, Notebooks }
@@ -409,31 +410,7 @@ export component AppWindow inherits Window {
 
     if Ui.screen == Screen.export-psbt: ExportPsbtScreen { }
 
-    // ---------- 14 · import signed PSBT ----------
-    // ONLY the load-signed-PSBT stage (funding-unification follow-up,
-    // 2026-07-17): once a scanned/loaded PSBT validates, Rust navigates
-    // straight to the universal confirm screen (26) — this screen never
-    // shows a confirm view or a Broadcast button itself anymore.
-    if Ui.screen == Screen.import-signed-psbt: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
-        padding: 20px;
-        spacing: 12px;
-        alignment: start;
-        Header {
-            title: "Review + broadcast";
-            back => { root.nav-back(); }
-        }
-        Caption {
-            text: Ui.desktop-platform
-                ? "Load the signed PSBT from your wallet — file or QR."
-                : "Scan the signed PSBT from your wallet.";
-        }
-        HorizontalLayout {
-            spacing: 10px;
-            if Ui.desktop-platform: GhostButton { text: "Load .psbt file"; clicked => { ImportSignedPsbt.psbt-import-file(); } }
-            GhostButton { text: "Scan QR"; clicked => { ImportSignedPsbt.psbt-import-scan(); } }
-        }
-        if Ui.status != "": Caption { text: Ui.status; color: Pal.bad; }
-    }
+    if Ui.screen == Screen.import-signed-psbt: ImportSignedPsbtScreen { }
 
     // ---------- 15 · funding wallets (manager list) ----------
     if Ui.screen == Screen.funding-wallets: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;

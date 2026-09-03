@@ -1,0 +1,33 @@
+// Screen.import-signed-psbt -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 14 · import signed PSBT ----------
+// ONLY the load-signed-PSBT stage (funding-unification follow-up,
+// 2026-07-17): once a scanned/loaded PSBT validates, Rust navigates
+// straight to the universal confirm screen (26) — this screen never
+// shows a confirm view or a Broadcast button itself anymore.
+
+import { Ui, ImportSignedPsbt } from "../globals.slint";
+import { Caption, GhostButton, Header } from "../components.slint";
+import { Pal } from "../theme.slint";
+
+export component ImportSignedPsbtScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        alignment: start;
+        Header {
+            title: "Review + broadcast";
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Caption {
+            text: Ui.desktop-platform
+                ? "Load the signed PSBT from your wallet — file or QR."
+                : "Scan the signed PSBT from your wallet.";
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            if Ui.desktop-platform: GhostButton { text: "Load .psbt file"; clicked => { ImportSignedPsbt.psbt-import-file(); } }
+            GhostButton { text: "Scan QR"; clicked => { ImportSignedPsbt.psbt-import-scan(); } }
+        }
+        if Ui.status != "": Caption { text: Ui.status; color: Pal.bad; }
+    }
