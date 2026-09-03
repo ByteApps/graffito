@@ -78,179 +78,85 @@ pub(crate) fn on_refresh(&mut self, w: &AppWindow) {
         s.refresh_async(w);
     }
 
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_refresh(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.apply_refresh_results(w);
+/// The UI-thread half of [`show_notebook_picker`]'s worker — one finished
+/// used/new probe. (account, page, screen) guards staleness (paging or
+/// switching account/screen drops it); moved verbatim out of
+/// `on_apply_pending_picker_probe` (U5), just applied to one already-owned
+/// result instead of a freshly-drained `Vec`.
+pub(crate) fn apply_picker_probe_result(&mut self, w: &AppWindow, r: PickerProbeResult) {
+    let s = self;
+    if s.account != r.account
+        || w.global::<AccountPicker>().get_account_page() != r.page as i32
+        || w.global::<Ui>().get_screen() != Screen::AccountPicker
+    {
+        println!("cb: picker-probe stale-drop");
+        return;
     }
-
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_compose(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.apply_compose_results(w);
-    }
-
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_act_retry(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.apply_act_retry_results(w);
-    }
-
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_rebroadcast_fetch(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.apply_pending_rebroadcast_fetch_results(w);
-    }
-
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_act_bump(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.apply_act_bump_results(w);
-    }
-
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_wallet_tx(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.apply_pending_wallet_tx_results(w);
-    }
-
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_spending_refresh(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.apply_spending_refresh_results(w);
-    }
-
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_wallet_stores_refresh(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.apply_wallet_stores_refresh_results(w);
-    }
-
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_icloud_contacts(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.apply_icloud_contacts_merge(w);
-    }
-
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_picker_probe(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let results: Vec<PickerProbeResult> =
-            PICKER_PROBE_RESULTS.lock().expect("picker probe mutex").drain(..).collect();
-        for r in results {
-            if s.account != r.account
-                || w.global::<AccountPicker>().get_account_page() != r.page as i32
-                || w.global::<Ui>().get_screen() != Screen::AccountPicker
+    let model = w.global::<AccountPicker>().get_accounts();
+    for i in 0..model.row_count() {
+        if let Some(mut row) = model.row_data(i) {
+            if let Some((_, pill, bal)) =
+                r.rows.iter().find(|(idx, ..)| *idx == row.index as u32)
             {
-                println!("cb: picker-probe stale-drop");
-                continue;
-            }
-            let model = w.global::<AccountPicker>().get_accounts();
-            for i in 0..model.row_count() {
-                if let Some(mut row) = model.row_data(i) {
-                    if let Some((_, pill, bal)) =
-                        r.rows.iter().find(|(idx, ..)| *idx == row.index as u32)
-                    {
-                        row.pill = (*pill).into();
-                        row.balance = bal.clone().into();
-                        model.set_row_data(i, row);
-                    }
-                }
+                row.pill = (*pill).into();
+                row.balance = bal.clone().into();
+                model.set_row_data(i, row);
             }
         }
     }
+}
 
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_node_health(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let results: Vec<NodeHealthResult> =
-            NODE_HEALTH_RESULTS.lock().expect("node health mutex").drain(..).collect();
-        for r in results {
-            if s.network != r.network || s.base_url().as_deref() != Some(r.base.as_str()) {
-                println!("cb: node-health stale-drop");
-                continue;
-            }
-            w.global::<Settings>().set_node_health_text(r.text);
-            w.global::<Ui>().set_node_health_warn(r.warn);
-        }
+/// The UI-thread half of [`refresh_node_health`] — one finished Bitcoin
+/// Core preflight check. Moved out of `on_apply_pending_node_health` (U5)
+/// — same body, applied to one already-owned result.
+pub(crate) fn apply_node_health_result(&mut self, w: &AppWindow, r: NodeHealthResult) {
+    let s = self;
+    if s.network != r.network || s.base_url().as_deref() != Some(r.base.as_str()) {
+        println!("cb: node-health stale-drop");
+        return;
     }
+    w.global::<Settings>().set_node_health_text(r.text);
+    w.global::<Ui>().set_node_health_warn(r.warn);
+}
 
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_unlock(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let taken = UNLOCK_RESULT.lock().expect("unlock result mutex").take();
-        match taken {
-            // Boot path, not onboarding: never create a notebook here.
-            Some(Ok(Some(m))) => s.activate_restored(w, m, false),
-            Some(Ok(None)) => {
-                println!("cb: unlock none");
-                s.saved_key_present = false;
-                w.global::<Onboarding>().set_saved_key_present(false);
-            }
-            // Both failure branches REVEAL the door. The auto-unlock branch
-            // never runs the `identity_exists` probe (it went straight for the
-            // key), so `saved_key_present` is still false here — and the status
-            // line tells the user to "tap Restore" on a door that isn't
-            // rendered. We know an item exists: that is why we tried to unlock
-            // it. (Until 2026-07-26 the separate "Restore from iCloud" door
-            // accidentally covered this, but only for a SYNCED key.)
-            Some(Err(e)) if e == "cancelled" => {
-                // Left on onboarding with the door there, so a mis-tapped or
-                // timed-out prompt is one tap from retrying.
-                println!("cb: unlock cancelled");
-                s.saved_key_present = true;
-                w.global::<Onboarding>().set_saved_key_present(true);
-                w.global::<Ui>().set_status("unlock cancelled — tap Restore to try again".into());
-            }
-            Some(Err(e)) => {
-                println!("cb: unlock err={e}");
-                s.saved_key_present = true;
-                w.global::<Onboarding>().set_saved_key_present(true);
-                w.global::<Ui>().set_status(format!("keychain: {e}").into());
-            }
-            None => {}
+/// The UI-thread half of the deferred auto-unlock — mirrors
+/// `read_saved_material`'s error handling, but with the result already in
+/// hand. Moved out of `on_apply_pending_unlock` (U5) — same body, applied
+/// to the worker's result directly (no `Mutex<Option<..>>` wrapper needed
+/// now that [`post`] only ever schedules a job when there IS a result).
+pub(crate) fn apply_unlock_result(&mut self, w: &AppWindow, r: Result<Option<String>, String>) {
+    let s = self;
+    match r {
+        // Boot path, not onboarding: never create a notebook here.
+        Ok(Some(m)) => s.activate_restored(w, m, false),
+        Ok(None) => {
+            println!("cb: unlock none");
+            s.saved_key_present = false;
+            w.global::<Onboarding>().set_saved_key_present(false);
+        }
+        // Both failure branches REVEAL the door. The auto-unlock branch
+        // never runs the `identity_exists` probe (it went straight for the
+        // key), so `saved_key_present` is still false here — and the status
+        // line tells the user to "tap Restore" on a door that isn't
+        // rendered. We know an item exists: that is why we tried to unlock
+        // it. (Until 2026-07-26 the separate "Restore from iCloud" door
+        // accidentally covered this, but only for a SYNCED key.)
+        Err(e) if e == "cancelled" => {
+            // Left on onboarding with the door there, so a mis-tapped or
+            // timed-out prompt is one tap from retrying.
+            println!("cb: unlock cancelled");
+            s.saved_key_present = true;
+            w.global::<Onboarding>().set_saved_key_present(true);
+            w.global::<Ui>().set_status("unlock cancelled — tap Restore to try again".into());
+        }
+        Err(e) => {
+            println!("cb: unlock err={e}");
+            s.saved_key_present = true;
+            w.global::<Onboarding>().set_saved_key_present(true);
+            w.global::<Ui>().set_status(format!("keychain: {e}").into());
         }
     }
-
-#[allow(unused_variables)]
-pub(crate) fn on_apply_pending_discovery(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let results: Vec<DiscoveryResult> =
-            DISCOVERY_RESULTS.lock().expect("discovery results mutex").drain(..).collect();
-        for r in results {
-            if s.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
-                || s.network != r.network
-                || s.account != r.account
-            {
-                println!("cb: notebook-discovery stale-drop");
-                continue;
-            }
-            let mut added = 0;
-            for index in &r.found {
-                if s.notebooks.as_ref().and_then(|ix| ix.get(r.account, *index)).is_none() {
-                    s.ensure_notebook(*index);
-                    added += 1;
-                }
-            }
-            println!("cb: notebook-discovery found={} added={added}", r.found.len());
-            if added > 0 {
-                s.update_notebook_list(w);
-            }
-        }
-    }
+}
 
 #[allow(unused_variables)]
 pub(crate) fn on_copy_text(&mut self, w: &AppWindow, kind: SharedString, text: SharedString) {
@@ -342,10 +248,8 @@ pub(crate) fn on_act_retry(&mut self, w: &AppWindow, ref_id: SharedString, is_no
             let result = last_txid
                 .ok_or_else(|| "nothing to rebroadcast".to_string())
                 .and_then(|t| client.and_then(|c| c.fetch_tx_hex(&t).map_err(|e| format!("{e}"))));
-            REBROADCAST_FETCH_RESULTS.lock().expect("rebroadcast fetch results mutex").push(
-                RebroadcastFetchResult { ref_id: ref_id_s, is_note, identity_addr, result },
-            );
-            let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_rebroadcast_fetch());
+            let r = RebroadcastFetchResult { ref_id: ref_id_s, is_note, identity_addr, result };
+            post(&weak, move |w, st| st.apply_rebroadcast_fetch_result(w, r));
         });
     }
 
@@ -606,11 +510,11 @@ pub(crate) fn on_psbt_broadcast(&mut self, w: &AppWindow) {
             let result = open_client(&base, net, creds)
                 .map_err(|e| e.to_string())
                 .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
-            PSBT_BROADCAST_RESULTS
-                .lock()
-                .expect("psbt broadcast results mutex")
-                .push(PsbtBroadcastResult { snap, result });
-            let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
+            let r = PsbtBroadcastResult { snap, result };
+            post(&weak, move |w, st| {
+                st.clear_wallet_tx_busy(w);
+                st.apply_psbt_broadcast_result(w, r);
+            });
         });
     }
 

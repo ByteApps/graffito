@@ -639,13 +639,8 @@ pub(crate) fn refresh_node_health(&mut self, w: &AppWindow) {
             },
             Err(e) => (format!("couldn't reach the node — {e}"), true),
         };
-        NODE_HEALTH_RESULTS.lock().expect("node health mutex").push(NodeHealthResult {
-            network,
-            base: base.clone(),
-            text: text.into(),
-            warn,
-        });
-        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_node_health());
+        let r = NodeHealthResult { network, base: base.clone(), text: text.into(), warn };
+        post(&weak, move |w, st| st.apply_node_health_result(w, r));
     });
 }
 
@@ -878,7 +873,7 @@ pub(crate) fn on_sweep_open(&mut self, w: &AppWindow) {
         // stale: coins may have arrived since, or gap-discovery may not have
         // reached the funded index yet, which showed ONLY notebook coins in
         // the sweep preview until the user backed out and re-entered. The scan
-        // runs while the user is on the picker; apply_spending_refresh_results
+        // runs while the user is on the picker; apply_spending_refresh_result
         // repaints screen 16 with the spending coins when it lands.
         if s.spending_capable
             && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)

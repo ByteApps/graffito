@@ -1,8 +1,61 @@
 //! Async result-queue plumbing — moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md); U5 replaces the queue statics with one
-//! generic type.
+//! PLAN-graffito-app-arch.md). U5 replaced the 17 former per-kind result
+//! queues + 13 per-kind Slint callbacks + the hand-drains that applied
+//! them with ONE generic trampoline: every worker thread now
+//! boxes an `FnOnce(&AppWindow, &mut State)` closure over its own single
+//! result and hands it to [`post`], which pushes it onto [`QUEUE`] and
+//! schedules the ONE `Ui::apply-pending` callback. [`State::apply_pending`]
+//! drains the whole queue and runs every job in push (== completion)
+//! order — true FIFO across every kind, not just within one.
 
 use crate::*;
+
+/// One deferred unit of work: apply an already-finished background result
+/// (a scan, a broadcast, a probe, …) to live `State` on the UI thread.
+/// Built on a worker thread (or, for the iCloud-contacts observer, any
+/// thread) with everything it needs already captured/moved in — `Send`
+/// because nothing it captures ever crosses threads un-`Send` (`State`
+/// itself is only ever touched from the UI thread, as the `&mut State`
+/// parameter [`State::apply_pending`] hands each job when it finally runs).
+pub(crate) type Job = Box<dyn FnOnce(&AppWindow, &mut State) + Send>;
+
+/// The one shared FIFO queue every async worker posts a finished result
+/// onto — see [`post`] / [`State::apply_pending`].
+pub(crate) static QUEUE: std::sync::Mutex<Vec<Job>> = std::sync::Mutex::new(Vec::new());
+
+/// Queue `job` to run against live `State` on the UI thread, and schedule
+/// the shared `Ui::apply-pending` trampoline via the same `slint::Weak` +
+/// `upgrade_in_event_loop` pattern every async worker already used before
+/// U5 (one callback per kind) — now just the one callback for every kind.
+/// Pushing to [`QUEUE`] happens synchronously, before scheduling the
+/// invoke, so by the time the UI thread's callback runs, every job posted
+/// so far (from this or any other worker) is already queued in arrival
+/// order.
+pub(crate) fn post(weak: &slint::Weak<AppWindow>, job: impl FnOnce(&AppWindow, &mut State) + Send + 'static) {
+    QUEUE.lock().expect("pending queue mutex").push(Box::new(job));
+    let weak = weak.clone();
+    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending());
+}
+
+/// Take every job currently queued, leaving [`QUEUE`] empty — called only
+/// from [`State::apply_pending`], which runs the batch with the lock
+/// already released (a job may itself post another job).
+fn take_all() -> Vec<Job> {
+    std::mem::take(&mut *QUEUE.lock().expect("pending queue mutex"))
+}
+
+impl State {
+/// The ONE `Ui::apply-pending` trampoline target (U5): runs every job
+/// queued by [`post`] since the last call, in FIFO arrival order. Takes
+/// the whole batch under the lock via [`take_all`], then runs it with the
+/// lock released — a job may itself post another job (e.g. re-arming a
+/// scan), which must never deadlock against this same lock.
+pub(crate) fn apply_pending(&mut self, w: &AppWindow) {
+    for job in take_all() {
+        job(w, self);
+    }
+}
+}
 
 /// Process-global "how many logical network operations are in flight"
 /// counter, driving the ambient `net-busy` dot beside a screen's title
@@ -16,8 +69,8 @@ pub(crate) static NET_OPS: AtomicUsize = AtomicUsize::new(0);
 
 /// RAII guard for one logical network operation — see [`NET_OPS`]. Push
 /// the new busy state to the UI thread via the same `slint::Weak` +
-/// `upgrade_in_event_loop` trampoline every async worker already uses
-/// (`REFRESH_RESULTS` et al.); logs `cb: net-ops n=<count>` ONLY on the
+/// `upgrade_in_event_loop` trampoline every async worker already uses;
+/// logs `cb: net-ops n=<count>` ONLY on the
 /// 0→1 and →0 transitions (counts only, matching the `cb:` log contract —
 /// never per-request).
 pub(crate) struct NetOpGuard {
@@ -56,7 +109,7 @@ impl Drop for NetOpGuard {
 /// closures for whatever is currently RUNNING or QUEUED (the pure Lane
 /// only ever tracks keys/ids, never the work itself). `HashMap::new` isn't
 /// `const`, hence `LazyLock` rather than a plain `Mutex::new(..)` static
-/// like the `*_RESULTS` ones below.
+/// like [`QUEUE`].
 ///
 /// **Deliberate priority bypass**: ONLY the four scan-class spawn sites
 /// migrated to this lane (`refresh_async`, `spending_refresh_async`,
@@ -178,7 +231,6 @@ pub(crate) struct RefreshResult {
     pub(crate) dropped_unspent: HashMap<(String, u32), bool>,
 }
 
-pub(crate) static REFRESH_RESULTS: std::sync::Mutex<Vec<RefreshResult>> = std::sync::Mutex::new(Vec::new());
 
 /// Build a `ChainClient` against `base`, picking the Esplora or Bitcoin
 /// Core RPC backend by URL scheme (`app_core::chain::AnyTransport`, the
@@ -259,7 +311,7 @@ pub(crate) fn open_client_watched(
 /// Which ↻ tap kicked off a [`wallet_stores_refresh_async`] scan — drives
 /// the final `cb: refresh-coins|refresh-notebooks notebooks=<n>` log label
 /// and each tap's own post-scan UI work in
-/// `apply_wallet_stores_refresh_results`.
+/// `apply_wallet_stores_refresh_result`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalletStoresPurpose {
     Coins,
@@ -276,7 +328,7 @@ pub(crate) struct NotebookBundleResult {
 /// A finished wallet-wide rescan (every ACTIVE notebook, kicked off by the
 /// Coins screen's or notebook-list's ↻), waiting to be applied on the UI
 /// thread — see `wallet_stores_refresh_async`/
-/// `apply_wallet_stores_refresh_results`. Coarse staleness guard: (fp8,
+/// `apply_wallet_stores_refresh_result`. Coarse staleness guard: (fp8,
 /// network, account) — an identity/account switch mid-scan drops the whole
 /// result, same pattern as [`SpendingRefreshResult`]. `current_address`
 /// additionally guards just the snapshot-time-active notebook's slice: a
@@ -293,7 +345,7 @@ pub(crate) struct WalletStoresRefreshResult {
     /// (txid, confirmed?)/dropped-check results for the snapshot-time
     /// active notebook only — same shape as [`RefreshResult`]'s fields,
     /// gathered so applying its slice matches `refresh()`/
-    /// `apply_refresh_results` exactly.
+    /// `apply_refresh_result` exactly.
     pub(crate) current_statuses: Vec<(String, Option<bool>)>,
     pub(crate) current_dropped_lookup: HashMap<String, TxLookupStatus>,
     pub(crate) current_dropped_unspent: HashMap<(String, u32), bool>,
@@ -310,8 +362,6 @@ pub(crate) struct WalletStoresRefreshResult {
     pub(crate) change: Result<Vec<ChangeCoin>, String>,
 }
 
-pub(crate) static WALLET_STORES_REFRESH_RESULTS: std::sync::Mutex<Vec<WalletStoresRefreshResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// One finished notebook gap-discovery walk (worker thread), waiting to be
 /// applied on the UI thread. The identity/network/account snapshot guards
@@ -323,7 +373,6 @@ pub(crate) struct DiscoveryResult {
     pub(crate) found: Vec<u32>,
 }
 
-pub(crate) static DISCOVERY_RESULTS: std::sync::Mutex<Vec<DiscoveryResult>> = std::sync::Mutex::new(Vec::new());
 
 /// A finished rebroadcast raw-hex fetch (`on_act_retry`'s sub-case (b): a
 /// chain-recovered/watch record with no locally cached hex) — waiting to
@@ -338,8 +387,6 @@ pub(crate) struct RebroadcastFetchResult {
     pub(crate) result: Result<String, String>,
 }
 
-pub(crate) static REBROADCAST_FETCH_RESULTS: std::sync::Mutex<Vec<RebroadcastFetchResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// A finished Activity Rebroadcast (`on_act_retry`) broadcast POST, waiting
 /// to be applied on the UI thread — clears `State.act_pending_ref` and
@@ -350,7 +397,6 @@ pub(crate) struct ActRetryResult {
     pub(crate) result: Result<String, String>,
 }
 
-pub(crate) static ACT_RETRY_RESULTS: std::sync::Mutex<Vec<ActRetryResult>> = std::sync::Mutex::new(Vec::new());
 
 /// A finished Activity Speed-up (`on_act_bump_confirm`) broadcast POST. The
 /// re-sign (bump_*_build at stage A, record_bumped_* + save at the
@@ -367,7 +413,6 @@ pub(crate) struct ActBumpResult {
     pub(crate) result: Result<String, String>,
 }
 
-pub(crate) static ACT_BUMP_RESULTS: std::sync::Mutex<Vec<ActBumpResult>> = std::sync::Mutex::new(Vec::new());
 
 /// Non-`result` half of [`SweepBroadcastResult`] — built on the UI thread
 /// before spawning (owns everything the apply side needs), moved into the
@@ -416,8 +461,6 @@ pub(crate) struct SweepBroadcastResult {
     pub(crate) result: Result<String, String>,
 }
 
-pub(crate) static SWEEP_BROADCAST_RESULTS: std::sync::Mutex<Vec<SweepBroadcastResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// Non-`result` half of a single-notebook consolidate broadcast (screen 16,
 /// kind "consolidate") — same shape as [`SweepSnapshot`], one store instead
@@ -438,8 +481,6 @@ pub(crate) struct ConsolidateBroadcastResult {
     pub(crate) result: Result<String, String>,
 }
 
-pub(crate) static CONSOLIDATE_BROADCAST_RESULTS: std::sync::Mutex<Vec<ConsolidateBroadcastResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// Non-`result` half of a wallet-consolidate broadcast (Settings/Coins →
 /// "Consolidate wallet…", keyed non-watch path) — spans potentially several
@@ -471,8 +512,6 @@ pub(crate) struct WConsolBroadcastResult {
     pub(crate) result: Result<String, String>,
 }
 
-pub(crate) static WCONSOL_BROADCAST_RESULTS: std::sync::Mutex<Vec<WConsolBroadcastResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// Non-`result` half of a psbt-broadcast (screen 14 "Broadcast" — the
 /// watch/external-sign flow's finalize+broadcast button, also used by
@@ -494,8 +533,6 @@ pub(crate) struct PsbtBroadcastResult {
     pub(crate) result: Result<String, String>,
 }
 
-pub(crate) static PSBT_BROADCAST_RESULTS: std::sync::Mutex<Vec<PsbtBroadcastResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// Non-`result` half of a spending-wallet consolidate broadcast (CHANGE 3,
 /// Coins screen spending segment "Consolidate spending coins…") — merges
@@ -527,8 +564,6 @@ pub(crate) struct SpendingConsolidateResult {
     pub(crate) result: Result<String, String>,
 }
 
-pub(crate) static SPENDING_CONSOLIDATE_RESULTS: std::sync::Mutex<Vec<SpendingConsolidateResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// Notebook path (`on_compose_send`): `compose_and_record` already wrote the
 /// note Pending + locked its inputs BEFORE broadcast was attempted (existing
@@ -549,8 +584,6 @@ pub(crate) struct NotebookComposeResult {
     pub(crate) result: Result<String, String>,
 }
 
-pub(crate) static NOTEBOOK_COMPOSE_RESULTS: std::sync::Mutex<Vec<NotebookComposeResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// Spending-wallet path (`on_spending_compose_send`): unlike the notebook
 /// path, nothing is recorded until broadcast actually succeeds — a failure
@@ -576,8 +609,6 @@ pub(crate) struct SpendingComposeResult {
     pub(crate) result: Result<String, String>,
 }
 
-pub(crate) static SPENDING_COMPOSE_RESULTS: std::sync::Mutex<Vec<SpendingComposeResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// Mixed-source path (`on_compose_send_mixed`): same "nothing recorded until
 /// broadcast succeeds" shape as spending — a failure is safe to retry from
@@ -608,8 +639,6 @@ pub(crate) struct MixedComposeResult {
     pub(crate) result: Result<String, String>,
 }
 
-pub(crate) static MIXED_COMPOSE_RESULTS: std::sync::Mutex<Vec<MixedComposeResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// Finished used/new address probes for the create-notebook picker (worker
 /// thread). Applied to the picker rows on the UI thread; the (account, page)
@@ -621,12 +650,10 @@ pub(crate) struct PickerProbeResult {
     pub(crate) rows: Vec<(u32, &'static str, String)>,
 }
 
-pub(crate) static PICKER_PROBE_RESULTS: std::sync::Mutex<Vec<PickerProbeResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// Finished Bitcoin Core preflight check (`PLAN-chain-notes-app-core-rpc.md`
 /// §2.2/§2.3/U4, surfaced §3/U6). `network`+`base` are the snapshot the
-/// worker started against — `on_apply_pending_node_health` drops a stale
+/// worker started against — `State::apply_node_health_result` drops a stale
 /// result (network switched, or the node URL changed) rather than paint it
 /// over a config the user has since moved on from.
 pub(crate) struct NodeHealthResult {
@@ -636,8 +663,6 @@ pub(crate) struct NodeHealthResult {
     pub(crate) warn: bool,
 }
 
-pub(crate) static NODE_HEALTH_RESULTS: std::sync::Mutex<Vec<NodeHealthResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// One finished spending-wallet scan (worker thread), waiting to be applied
 /// on the UI thread. (fp8, network, account) guards staleness — switching
@@ -662,8 +687,6 @@ pub(crate) struct SpendingRefreshResult {
     pub(crate) scan: Result<app_core::funding::FundingScan, String>,
 }
 
-pub(crate) static SPENDING_REFRESH_RESULTS: std::sync::Mutex<Vec<SpendingRefreshResult>> =
-    std::sync::Mutex::new(Vec::new());
 
 impl State {
 /// Push the scan-freshness gate to the UI: `wallet-scan-busy` is true while
@@ -687,7 +710,7 @@ pub(crate) fn update_scan_gate(&self, w: &AppWindow) {
 /// Apply one (already network-fetched) bundle to a NON-active notebook's
 /// store file on disk — the per-notebook body of a wallet-wide rescan for
 /// every notebook except the one currently open (see
-/// `wallet_stores_refresh_async`/`apply_wallet_stores_refresh_results`,
+/// `wallet_stores_refresh_async`/`apply_wallet_stores_refresh_result`,
 /// and the doc comment on the old synchronous `refresh_wallet_stores` this
 /// replaced). `material` is parsed once by the caller for the whole batch.
 /// Best-effort: any failure (realize/apply) is silently skipped, exactly
@@ -737,8 +760,7 @@ pub(crate) fn apply_bundle_to_notebook_file(&self, material: &app_core::identity
 /// `refresh_async`: snapshot everything the worker needs (base url, every
 /// active notebook's address, the snapshot-time-active notebook's
 /// pending-tx/dropped-check inputs), fetch every bundle on a worker
-/// thread, and apply through [`WALLET_STORES_REFRESH_RESULTS`] + the
-/// `apply-pending-wallet-stores-refresh` trampoline — never touching the
+/// thread, and apply through [`WalletStoresRefreshResult`] + [`post`] — never touching the
 /// UI thread with network I/O. A second tap while one is already in flight
 /// is ignored (simpler than overlapping store-file writes) rather than
 /// queued; see [`WalletStoresRefreshResult`]'s doc comment for the
@@ -832,24 +854,20 @@ pub(crate) fn wallet_stores_refresh_async(&mut self, w: &AppWindow, purpose: Wal
                     .collect();
                 let current_statuses = pending_txids.iter().map(|t| (t.clone(), None)).collect();
                 drop(material_for_change); // Zeroizing, same as the success path.
-                WALLET_STORES_REFRESH_RESULTS
-                    .lock()
-                    .expect("wallet stores refresh mutex")
-                    .push(WalletStoresRefreshResult {
-                        purpose,
-                        fp8,
-                        network,
-                        account,
-                        current_index,
-                        current_address,
-                        current_statuses,
-                        current_dropped_lookup: HashMap::new(),
-                        current_dropped_unspent: HashMap::new(),
-                        results,
-                        change: Err(msg),
-                    });
-                let _ =
-                    weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_stores_refresh());
+                let r = WalletStoresRefreshResult {
+                    purpose,
+                    fp8,
+                    network,
+                    account,
+                    current_index,
+                    current_address,
+                    current_statuses,
+                    current_dropped_lookup: HashMap::new(),
+                    current_dropped_unspent: HashMap::new(),
+                    results,
+                    change: Err(msg),
+                };
+                post(&weak, move |w, st| st.apply_wallet_stores_refresh_result(w, r));
                 return;
             }
         };
@@ -883,23 +901,20 @@ pub(crate) fn wallet_stores_refresh_async(&mut self, w: &AppWindow, purpose: Wal
             }
         };
         drop(material_for_change); // Zeroizing — wiped as soon as the scan is done
-        WALLET_STORES_REFRESH_RESULTS
-            .lock()
-            .expect("wallet stores refresh mutex")
-            .push(WalletStoresRefreshResult {
-                purpose,
-                fp8,
-                network,
-                account,
-                current_index,
-                current_address,
-                current_statuses,
-                current_dropped_lookup,
-                current_dropped_unspent,
-                results,
-                change,
-            });
-        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_stores_refresh());
+        let r = WalletStoresRefreshResult {
+            purpose,
+            fp8,
+            network,
+            account,
+            current_index,
+            current_address,
+            current_statuses,
+            current_dropped_lookup,
+            current_dropped_unspent,
+            results,
+            change,
+        };
+        post(&weak, move |w, st| st.apply_wallet_stores_refresh_result(w, r));
     };
     if scan_lane_submit(key, job) {
         st.scan_gate.set_wallet_stores(true);
@@ -911,81 +926,78 @@ pub(crate) fn wallet_stores_refresh_async(&mut self, w: &AppWindow, purpose: Wal
 /// The UI-thread half of `on_act_retry`'s sub-case (b): clear the transient
 /// fetch guard, drop a stale result, and either enter the confirm screen
 /// (fetch succeeded) or report the failure — same shape as
-/// `apply_spending_refresh_results`.
-pub(crate) fn apply_pending_rebroadcast_fetch_results(&mut self, w: &AppWindow) {
+/// `apply_spending_refresh_result`. Moved out of
+/// `apply_pending_rebroadcast_fetch_results` (U5) — same body, applied to
+/// one already-owned result; the trailing `update_activity` used to run
+/// once per drained batch, now once per posted result (same effect: this
+/// queue only ever carries one item per fetch).
+pub(crate) fn apply_rebroadcast_fetch_result(&mut self, w: &AppWindow, r: RebroadcastFetchResult) {
     let st = self;
-    let results: Vec<RebroadcastFetchResult> =
-        REBROADCAST_FETCH_RESULTS.lock().expect("rebroadcast fetch results mutex").drain(..).collect();
-    for r in results {
-        st.act_pending_ref = None;
-        if st.ident.as_ref().map(|i| i.address.as_str()) != Some(r.identity_addr.as_str()) {
-            println!("cb: rebroadcast-fetch stale-drop");
-            continue;
+    st.act_pending_ref = None;
+    if st.ident.as_ref().map(|i| i.address.as_str()) != Some(r.identity_addr.as_str()) {
+        println!("cb: rebroadcast-fetch stale-drop");
+        st.update_activity(w);
+        return;
+    }
+    match r.result {
+        Ok(raw) if !raw.is_empty() => st.enter_rebroadcast_confirm(w, r.ref_id, r.is_note, raw),
+        Ok(_) => {
+            println!("cb: act-retry ref={} err=nothing-to-rebroadcast", r.ref_id);
+            w.global::<Ui>().set_status("nothing to rebroadcast".into());
         }
-        match r.result {
-            Ok(raw) if !raw.is_empty() => st.enter_rebroadcast_confirm(w, r.ref_id, r.is_note, raw),
-            Ok(_) => {
-                println!("cb: act-retry ref={} err=nothing-to-rebroadcast", r.ref_id);
-                w.global::<Ui>().set_status("nothing to rebroadcast".into());
-            }
-            Err(e) => {
-                println!("cb: act-retry ref={} err={e}", r.ref_id);
-                w.global::<Ui>().set_status(format!("couldn't rebroadcast: {}", friendly_net_err(&e)).into());
-            }
+        Err(e) => {
+            println!("cb: act-retry ref={} err={e}", r.ref_id);
+            w.global::<Ui>().set_status(format!("couldn't rebroadcast: {}", friendly_net_err(&e)).into());
         }
     }
     st.update_activity(w);
 }
 
-pub(crate) fn apply_act_retry_results(&mut self, w: &AppWindow) {
+/// Moved out of `apply_act_retry_results` (U5) — same body, applied to one
+/// already-owned result.
+pub(crate) fn apply_act_retry_result(&mut self, w: &AppWindow, r: ActRetryResult) {
     let st = self;
-    let results: Vec<ActRetryResult> =
-        ACT_RETRY_RESULTS.lock().expect("act-retry results mutex").drain(..).collect();
-    for r in results {
-        st.act_pending_ref = None;
-        match r.result {
-            Ok(txid) => {
-                println!("cb: act-retry ref={} txid={txid} ok", r.ref_id);
-                w.global::<Ui>().set_status(format!("rebroadcast {}…", &txid[..12.min(txid.len())]).into());
-                show_toast(w, &format!("Rebroadcast ok · {}", &txid[..8.min(txid.len())]));
-            }
-            Err(e) => {
-                println!("cb: act-retry ref={} err={e}", r.ref_id);
-                let base = st.base_url().unwrap_or_default();
-                w.global::<Ui>().set_status(
-                    format!("rebroadcast failed: {}", friendly_broadcast_err(&e, &base)).into(),
-                );
-                show_toast(w, "Rebroadcast failed");
-            }
+    st.act_pending_ref = None;
+    match r.result {
+        Ok(txid) => {
+            println!("cb: act-retry ref={} txid={txid} ok", r.ref_id);
+            w.global::<Ui>().set_status(format!("rebroadcast {}…", &txid[..12.min(txid.len())]).into());
+            show_toast(w, &format!("Rebroadcast ok · {}", &txid[..8.min(txid.len())]));
+        }
+        Err(e) => {
+            println!("cb: act-retry ref={} err={e}", r.ref_id);
+            let base = st.base_url().unwrap_or_default();
+            w.global::<Ui>().set_status(
+                format!("rebroadcast failed: {}", friendly_broadcast_err(&e, &base)).into(),
+            );
+            show_toast(w, "Rebroadcast failed");
         }
     }
     st.update_activity(w);
 }
 
-pub(crate) fn apply_act_bump_results(&mut self, w: &AppWindow) {
+/// Moved out of `apply_act_bump_results` (U5) — same body, applied to one
+/// already-owned result.
+pub(crate) fn apply_act_bump_result(&mut self, w: &AppWindow, r: ActBumpResult) {
     let st = self;
-    let results: Vec<ActBumpResult> =
-        ACT_BUMP_RESULTS.lock().expect("act-bump results mutex").drain(..).collect();
-    for r in results {
-        st.act_pending_ref = None;
-        match r.result {
-            Ok(bt) => {
-                println!(
-                    "cb: act-bump ref={} txid={} fee={} rate={:.1} ok",
-                    r.ref_id, r.txid, r.fee, r.new_rate
-                );
-                w.global::<Ui>().set_status(format!("sped up: {}…", &bt[..12.min(bt.len())]).into());
-                show_toast(w, &format!("Sped up · {}", &bt[..8.min(bt.len())]));
-            }
-            Err(e) => {
-                println!("cb: act-bump ref={} broadcast err={e}", r.ref_id);
-                let base = st.base_url().unwrap_or_default();
-                w.global::<Ui>().set_status(
-                    format!("signed but broadcast failed: {}", friendly_broadcast_err(&e, &base))
-                        .into(),
-                );
-                show_toast(w, "Speed-up broadcast failed");
-            }
+    st.act_pending_ref = None;
+    match r.result {
+        Ok(bt) => {
+            println!(
+                "cb: act-bump ref={} txid={} fee={} rate={:.1} ok",
+                r.ref_id, r.txid, r.fee, r.new_rate
+            );
+            w.global::<Ui>().set_status(format!("sped up: {}…", &bt[..12.min(bt.len())]).into());
+            show_toast(w, &format!("Sped up · {}", &bt[..8.min(bt.len())]));
+        }
+        Err(e) => {
+            println!("cb: act-bump ref={} broadcast err={e}", r.ref_id);
+            let base = st.base_url().unwrap_or_default();
+            w.global::<Ui>().set_status(
+                format!("signed but broadcast failed: {}", friendly_broadcast_err(&e, &base))
+                    .into(),
+            );
+            show_toast(w, "Speed-up broadcast failed");
         }
     }
     st.update_activity(w);
@@ -1409,52 +1421,19 @@ pub(crate) fn apply_spending_consolidate_result(&mut self, w: &AppWindow, r: Spe
     }
 }
 
-/// Drains the CHANGE-4 wallet-tx result queues and applies each on the UI
-/// thread — the shared `apply-pending-wallet-tx` trampoline target. Also
-/// clears the shared busy flag.
-pub(crate) fn apply_pending_wallet_tx_results(&mut self, w: &AppWindow) {
-    let st = self;
-    let sweep: Vec<SweepBroadcastResult> =
-        SWEEP_BROADCAST_RESULTS.lock().expect("sweep broadcast results mutex").drain(..).collect();
-    let consolidate: Vec<ConsolidateBroadcastResult> = CONSOLIDATE_BROADCAST_RESULTS
-        .lock()
-        .expect("consolidate broadcast results mutex")
-        .drain(..)
-        .collect();
-    let wconsol: Vec<WConsolBroadcastResult> =
-        WCONSOL_BROADCAST_RESULTS.lock().expect("wconsol broadcast results mutex").drain(..).collect();
-    let psbt: Vec<PsbtBroadcastResult> =
-        PSBT_BROADCAST_RESULTS.lock().expect("psbt broadcast results mutex").drain(..).collect();
-    let spending_consolidate: Vec<SpendingConsolidateResult> = SPENDING_CONSOLIDATE_RESULTS
-        .lock()
-        .expect("spending consolidate results mutex")
-        .drain(..)
-        .collect();
-    if sweep.is_empty()
-        && consolidate.is_empty()
-        && wconsol.is_empty()
-        && psbt.is_empty()
-        && spending_consolidate.is_empty()
-    {
-        return;
-    }
-    st.wallet_tx_busy = false;
+/// CHANGE 4's shared busy flag: gates screen 26's Broadcast button across
+/// every wallet-tx kind (sweep/consolidate/wallet-consolidate/psbt/
+/// spending-consolidate) AND every compose kind (notebook/spending/mixed
+/// compose also broadcast through the universal confirm screen — see
+/// [`State::clear_compose_busy`]). The old combined
+/// `apply_pending_wallet_tx_results` cleared it once per drained BATCH
+/// (after confirming the batch wasn't empty); U5 posts one job per result,
+/// so this runs once per landed broadcast instead — same end state
+/// (idempotent to call more than once), since in practice only one
+/// broadcast is ever in flight at a time.
+pub(crate) fn clear_wallet_tx_busy(&mut self, w: &AppWindow) {
+    self.wallet_tx_busy = false;
     w.global::<Confirm>().set_wallet_tx_busy(false);
-    for r in sweep {
-        st.apply_sweep_broadcast_result(w, r);
-    }
-    for r in consolidate {
-        st.apply_consolidate_broadcast_result(w, r);
-    }
-    for r in wconsol {
-        st.apply_wconsol_broadcast_result(w, r);
-    }
-    for r in psbt {
-        st.apply_psbt_broadcast_result(w, r);
-    }
-    for r in spending_consolidate {
-        st.apply_spending_consolidate_result(w, r);
-    }
 }
 
 pub(crate) fn apply_notebook_compose_result(&mut self, w: &AppWindow, r: NotebookComposeResult) {
@@ -1741,47 +1720,29 @@ pub(crate) fn apply_mixed_compose_result(&mut self, w: &AppWindow, r: MixedCompo
     }
 }
 
-/// Drains all three compose-result queues and applies each on the UI
-/// thread — the shared `apply-pending-compose` trampoline target. Also
-/// clears the busy/progress state common to every path.
-pub(crate) fn apply_compose_results(&mut self, w: &AppWindow) {
-    let st = self;
-    let nb: Vec<NotebookComposeResult> =
-        NOTEBOOK_COMPOSE_RESULTS.lock().expect("notebook compose results mutex").drain(..).collect();
-    let sp: Vec<SpendingComposeResult> =
-        SPENDING_COMPOSE_RESULTS.lock().expect("spending compose results mutex").drain(..).collect();
-    let mx: Vec<MixedComposeResult> =
-        MIXED_COMPOSE_RESULTS.lock().expect("mixed compose results mutex").drain(..).collect();
-    if nb.is_empty() && sp.is_empty() && mx.is_empty() {
-        return;
-    }
-    st.compose_busy = false;
+/// The busy/progress state common to every compose path (notebook/
+/// spending/mixed). The old combined `apply_compose_results` cleared this
+/// once per drained BATCH (after confirming it wasn't empty); U5 posts one
+/// job per result, so this runs once per landed compose broadcast instead
+/// — same end state. Universal confirm screen (2026-07-17): every compose
+/// broadcast now fires from screen 26, gated on `wallet_tx_busy`, not
+/// `compose_busy` — see `on_confirm_broadcast`. Clears
+/// [`State::clear_wallet_tx_busy`] too, alongside the (now largely
+/// vestigial) compose flags, so a failed spending/mixed attempt leaves
+/// screen 26's Broadcast button tappable again.
+pub(crate) fn clear_compose_busy(&mut self, w: &AppWindow) {
+    self.compose_busy = false;
     w.global::<Compose>().set_compose_sending(false);
     w.global::<Ui>().set_compose_stage("".into());
-    // Universal confirm screen (2026-07-17): every compose broadcast now
-    // fires from screen 26, gated on wallet_tx_busy, not compose_busy — see
-    // `on_confirm_broadcast`. Unset it here alongside the (now largely
-    // vestigial) compose flags so a failed spending/mixed attempt leaves
-    // screen 26's Broadcast button tappable again.
-    st.wallet_tx_busy = false;
-    w.global::<Confirm>().set_wallet_tx_busy(false);
-    for r in nb {
-        st.apply_notebook_compose_result(w, r);
-    }
-    for r in sp {
-        st.apply_spending_compose_result(w, r);
-    }
-    for r in mx {
-        st.apply_mixed_compose_result(w, r);
-    }
+    self.clear_wallet_tx_busy(w);
 }
 
 /// Kick off receive-chain notebook gap discovery on a worker thread when
 /// activate() flagged a fresh index file (seed re-import; rev-3
 /// follow-up 2). Needs a configured node — with none the flag stays
 /// pending, so setting a node later (any refresh) retries. Results land
-/// through [`DISCOVERY_RESULTS`] + the `apply-pending-discovery`
-/// trampoline; callers are all post-first-frame (iOS launch rule).
+/// through [`DiscoveryResult`] + [`post`]; callers are all post-first-frame
+/// (iOS launch rule).
 ///
 /// Goes through the [`SCAN_LANE`] queue (2026-07-21) keyed
 /// `discovery/<fp8>/<account>` — no gate counter here (discovery has
@@ -1834,14 +1795,38 @@ pub(crate) fn maybe_start_discovery(&mut self, w: &AppWindow) {
             })
             .unwrap_or_default();
         drop(material_str); // Zeroizing — wiped as soon as the walk is done
-        DISCOVERY_RESULTS
-            .lock()
-            .expect("discovery results mutex")
-            .push(DiscoveryResult { fp8, network, account, found });
-        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_discovery());
+        let r = DiscoveryResult { fp8, network, account, found };
+        post(&weak, move |w, st| st.apply_discovery_result(w, r));
     };
     if scan_lane_submit(key, job) {
         st.discovery_pending = false;
+    }
+}
+
+/// The UI-thread half of [`maybe_start_discovery`] — one finished
+/// notebook gap-discovery walk. (fp8, network, account) guards staleness
+/// (an identity switch mid-probe drops the result); moved verbatim out of
+/// `on_apply_pending_discovery` (U5), just applied to one already-owned
+/// result instead of a freshly-drained `Vec`.
+pub(crate) fn apply_discovery_result(&mut self, w: &AppWindow, r: DiscoveryResult) {
+    let st = self;
+    if st.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
+        || st.network != r.network
+        || st.account != r.account
+    {
+        println!("cb: notebook-discovery stale-drop");
+        return;
+    }
+    let mut added = 0;
+    for index in &r.found {
+        if st.notebooks.as_ref().and_then(|ix| ix.get(r.account, *index)).is_none() {
+            st.ensure_notebook(*index);
+            added += 1;
+        }
+    }
+    println!("cb: notebook-discovery found={} added={added}", r.found.len());
+    if added > 0 {
+        st.update_notebook_list(w);
     }
 }
 
@@ -1850,8 +1835,8 @@ pub(crate) fn maybe_start_discovery(&mut self, w: &AppWindow) {
 /// scanned synchronously — the screen never painted until it finished).
 /// The screen paints immediately with "syncing…", the worker fetches the
 /// bundle + pending-tx statuses, and the result comes back through
-/// [`REFRESH_RESULTS`] + the `apply-pending-refresh` trampoline callback
-/// (the UI thread applies it with full State access, exactly like the
+/// [`RefreshResult`] + [`post`] (the UI thread applies it with full State
+/// access, exactly like the
 /// synchronous refresh did).
 ///
 /// Goes through the [`SCAN_LANE`] operation queue (2026-07-21) keyed
@@ -1896,15 +1881,15 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
         let client = match open_client_watched(&base, network, creds, &core_watch) {
             Ok(c) => c,
             Err(e) => {
-                REFRESH_RESULTS.lock().expect("refresh results mutex").push(RefreshResult {
+                let r = RefreshResult {
                     address,
                     bundle: Some(Err(e.to_string())),
                     new_stats: None,
                     statuses: Vec::new(),
                     dropped_lookup: HashMap::new(),
                     dropped_unspent: HashMap::new(),
-                });
-                let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_refresh());
+                };
+                post(&weak, move |w, st| st.apply_refresh_result(w, r));
                 return;
             }
         };
@@ -1923,15 +1908,15 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
             // fee-showing screens now, which fetch them lazily themselves
             // (`refresh_fees_price`), so the short-circuit fetches nothing
             // at all.
-            REFRESH_RESULTS.lock().expect("refresh results mutex").push(RefreshResult {
+            let r = RefreshResult {
                 address,
                 bundle: None,
                 new_stats: None,
                 statuses: Vec::new(),
                 dropped_lookup: HashMap::new(),
                 dropped_unspent: HashMap::new(),
-            });
-            let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_refresh());
+            };
+            post(&weak, move |w, st| st.apply_refresh_result(w, r));
             return;
         }
         let bundle = client.build_bundle(&address, None).map_err(|e| format!("{e}"));
@@ -1940,15 +1925,15 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
             .map(|t| (t.clone(), client.fetch_tx_status(t)))
             .collect();
         let (dropped_lookup, dropped_unspent) = fetch_dropped_checks(&client, &address, &dropped_checks);
-        REFRESH_RESULTS.lock().expect("refresh results mutex").push(RefreshResult {
+        let r = RefreshResult {
             address,
             bundle: Some(bundle),
             new_stats,
             statuses,
             dropped_lookup,
             dropped_unspent,
-        });
-        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_refresh());
+        };
+        post(&weak, move |w, st| st.apply_refresh_result(w, r));
     };
     if scan_lane_submit(key, job) {
         w.global::<Ui>().set_status("syncing…".into());
@@ -1958,8 +1943,8 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
 }
 
 /// Apply one already-fetched bundle to the CURRENTLY ACTIVE notebook's live
-/// `State.store` — the shared core of [`apply_refresh_results`] (a single
-/// open-notebook scan) and [`apply_wallet_stores_refresh_results`]'s
+/// `State.store` — the shared core of [`apply_refresh_result`] (a single
+/// open-notebook scan) and [`apply_wallet_stores_refresh_result`]'s
 /// snapshot-time-active slice (a wallet-wide scan). Fees/usd, apply_bundle,
 /// resolved pending-spend statuses, dropped-pending detection, save, the
 /// `cb: refresh …` log line, and `update_home` — exactly what the
@@ -1988,7 +1973,7 @@ pub(crate) fn apply_active_bundle(&mut self, w: &AppWindow, bundle: Result<app_c
             // Spending-self-notes fix (Unit A): derived once for this apply
             // — a single-notebook scan, so no cross-notebook reuse needed
             // here (the wallet-wide caller derives it once itself; see
-            // `apply_wallet_stores_refresh_results`).
+            // `apply_wallet_stores_refresh_result`).
             let spending_window_spks = st.spending_window_spks_for();
             let mlkem_secrets = mlkem_secrets_for(st.ident.as_ref().unwrap(), st.pq_imported.as_ref());
             let applied = match &keyed {
@@ -2059,43 +2044,41 @@ pub(crate) fn apply_active_bundle(&mut self, w: &AppWindow, bundle: Result<app_c
 }
 
 /// The UI-thread half of [`refresh_async`]: identical bookkeeping to the
-/// synchronous [`refresh`], fed from the worker's results.
-pub(crate) fn apply_refresh_results(&mut self, w: &AppWindow) {
+/// synchronous [`refresh`], fed from the worker's result. Moved out of
+/// `apply_refresh_results` (U5) — same body, applied to one already-owned
+/// result instead of a freshly-drained `Vec`.
+pub(crate) fn apply_refresh_result(&mut self, w: &AppWindow, r: RefreshResult) {
     let st = self;
-    let results: Vec<RefreshResult> =
-        REFRESH_RESULTS.lock().expect("refresh results mutex").drain(..).collect();
-    for r in results {
-        // Every drained result releases its scan-gate slot — BEFORE the
-        // staleness guard, or a stale-dropped scan would wedge the gate.
-        st.scan_gate.drain_notebook();
-        st.update_scan_gate(w);
-        if st.ident.as_ref().map(|i| i.address.as_str()) != Some(r.address.as_str()) {
-            println!("cb: refresh stale-drop address={}", &r.address[..12.min(r.address.len())]);
-            continue;
-        }
-        let Some(bundle) = r.bundle else {
-            // Stats pre-check short-circuit: nothing moved on-chain or in
-            // the mempool since the stamped fingerprint — no bundle was
-            // fetched, the store is already current. Fees/USD are no
-            // longer fetched here at all (network-efficiency, 2026-07-23)
-            // — the fee-showing screens fetch them lazily on open.
-            println!("cb: refresh unchanged");
-            w.global::<Ui>().set_status("up to date".into());
-            st.update_home(w);
-            continue;
-        };
-        st.apply_active_bundle(w, bundle, &r.statuses, &r.dropped_lookup, &r.dropped_unspent, r.new_stats);
-        if w.global::<Ui>().get_screen() == Screen::PayFrom {
-            st.update_funding_screen_ui(w);
-            st.log_funding_refresh();
-            // A landed notebook rescan must repaint the (now possibly
-            // independently expanded) Notebook panel, not just the row's
-            // summary balance — independent-expand rework, 2026-07-18.
-            st.update_payfrom_panels(w);
-        }
-        if w.global::<Ui>().get_screen() == Screen::Compose {
-            w.global::<Ui>().set_pay_from_balance(st.balance_text_for(w.global::<Ui>().get_pay_from().as_str()).into());
-        }
+    // Releases its scan-gate slot BEFORE the staleness guard, or a
+    // stale-dropped scan would wedge the gate.
+    st.scan_gate.drain_notebook();
+    st.update_scan_gate(w);
+    if st.ident.as_ref().map(|i| i.address.as_str()) != Some(r.address.as_str()) {
+        println!("cb: refresh stale-drop address={}", &r.address[..12.min(r.address.len())]);
+        return;
+    }
+    let Some(bundle) = r.bundle else {
+        // Stats pre-check short-circuit: nothing moved on-chain or in
+        // the mempool since the stamped fingerprint — no bundle was
+        // fetched, the store is already current. Fees/USD are no
+        // longer fetched here at all (network-efficiency, 2026-07-23)
+        // — the fee-showing screens fetch them lazily on open.
+        println!("cb: refresh unchanged");
+        w.global::<Ui>().set_status("up to date".into());
+        st.update_home(w);
+        return;
+    };
+    st.apply_active_bundle(w, bundle, &r.statuses, &r.dropped_lookup, &r.dropped_unspent, r.new_stats);
+    if w.global::<Ui>().get_screen() == Screen::PayFrom {
+        st.update_funding_screen_ui(w);
+        st.log_funding_refresh();
+        // A landed notebook rescan must repaint the (now possibly
+        // independently expanded) Notebook panel, not just the row's
+        // summary balance — independent-expand rework, 2026-07-18.
+        st.update_payfrom_panels(w);
+    }
+    if w.global::<Ui>().get_screen() == Screen::Compose {
+        w.global::<Ui>().set_pay_from_balance(st.balance_text_for(w.global::<Ui>().get_pay_from().as_str()).into());
     }
 }
 
@@ -2109,85 +2092,81 @@ pub(crate) fn apply_refresh_results(&mut self, w: &AppWindow) {
 /// handlers' `scanned + 1` — unconditionally, even if its own fetch failed
 /// (that failure already surfaced via `apply_active_bundle`'s status/err
 /// line and the plain `cb: refresh err=…`).
-pub(crate) fn apply_wallet_stores_refresh_results(&mut self, w: &AppWindow) {
+pub(crate) fn apply_wallet_stores_refresh_result(&mut self, w: &AppWindow, r: WalletStoresRefreshResult) {
     let st = self;
-    let results: Vec<WalletStoresRefreshResult> =
-        WALLET_STORES_REFRESH_RESULTS.lock().expect("wallet stores refresh mutex").drain(..).collect();
-    for r in results {
-        st.scan_gate.set_wallet_stores(false);
-        st.update_scan_gate(w);
-        let label = r.purpose.label();
-        if st.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
-            || st.network != r.network
-            || st.account != r.account
-        {
-            println!("cb: {label} stale-drop");
-            w.global::<Ui>().set_status("".into());
-            continue;
-        }
-        // Taproot change-chain coins (unit 3): folds into the SAME (fp8,
-        // network, account) staleness guard above — no separate guard
-        // needed. On error, leave `st.change_coins` at its last-known value
-        // (same "don't clobber on failure" rule the spending scan uses)
-        // rather than blanking a screen the user is actively looking at.
-        match r.change {
-            Ok(coins) => {
-                println!("cb: change-coins n={}", coins.len());
-                st.change_coins = coins;
-                // Stamp the context so activate() knows these coins belong to
-                // the CURRENT (fp8, network, account) and may survive a
-                // same-context notebook switch (unit 7 fix).
-                st.change_coins_ctx = Some((r.fp8.clone(), r.network, r.account));
-            }
-            Err(e) => println!("cb: change-scan err={e}"),
-        }
-        let material =
-            st.material.as_deref().and_then(|m| parse_key_material(m, st.network).ok());
-        let notebook_spks = st.notebook_spks_for();
-        // Spending-self-notes fix (Unit A): derived ONCE for this whole
-        // wallet-wide pass and reused across every notebook below — the
-        // spending wallet is account-level, so re-deriving per notebook
-        // would repeat the same ~2×upto secp derivations for nothing.
-        let spending_window_spks = st.spending_window_spks_for();
-        let now_active_addr = st.ident.as_ref().map(|i| i.address.clone());
-        let mut scanned = 0usize;
-        for nr in &r.results {
-            // The snapshot-time-active notebook applies to the LIVE store
-            // only if it's STILL the active one — a notebook switch mid-
-            // scan (same account, so the coarse guard above passed) must
-            // never misapply a stale bundle onto whatever's open now.
-            let is_live_current = r.current_index == Some(nr.index)
-                && r.current_address.is_some()
-                && now_active_addr.as_deref() == r.current_address.as_deref();
-            if is_live_current {
-                st.apply_active_bundle(w, nr.bundle.clone(), &r.current_statuses, &r.current_dropped_lookup, &r.current_dropped_unspent, // The wallet-wide refresh doesn't stats-pre-check (yet)
-                    // — leave the store's fingerprint stamp alone.
-                    None, );
-            } else if let (Ok(bundle), Some(material)) = (&nr.bundle, &material) {
-                if st.apply_bundle_to_notebook_file(material, &notebook_spks, &spending_window_spks, nr.index, bundle, ) {
-                    scanned += 1;
-                }
-            }
-        }
-        scanned += 1; // the snapshot-time-active notebook, unconditionally
-        println!("cb: {label} notebooks={scanned}");
+    st.scan_gate.set_wallet_stores(false);
+    st.update_scan_gate(w);
+    let label = r.purpose.label();
+    if st.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
+        || st.network != r.network
+        || st.account != r.account
+    {
+        println!("cb: {label} stale-drop");
         w.global::<Ui>().set_status("".into());
-        // Repaint the Coins screen/card regardless of which ↻ kicked this
-        // scan off — `update_wallet_coins` is a pure re-derive from `st`
-        // (no side effects), and the change coins it now folds in just
-        // landed above.
-        st.update_wallet_coins(w);
-        match r.purpose {
-            WalletStoresPurpose::Coins => {
-                if st.spending_capable
-                    && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false)
-                {
-                    st.spending_refresh_async(w);
-                }
-                st.refresh_compose(w);
-            }
-            WalletStoresPurpose::Notebooks => st.update_notebook_list(w),
+        return;
+    }
+    // Taproot change-chain coins (unit 3): folds into the SAME (fp8,
+    // network, account) staleness guard above — no separate guard
+    // needed. On error, leave `st.change_coins` at its last-known value
+    // (same "don't clobber on failure" rule the spending scan uses)
+    // rather than blanking a screen the user is actively looking at.
+    match r.change {
+        Ok(coins) => {
+            println!("cb: change-coins n={}", coins.len());
+            st.change_coins = coins;
+            // Stamp the context so activate() knows these coins belong to
+            // the CURRENT (fp8, network, account) and may survive a
+            // same-context notebook switch (unit 7 fix).
+            st.change_coins_ctx = Some((r.fp8.clone(), r.network, r.account));
         }
+        Err(e) => println!("cb: change-scan err={e}"),
+    }
+    let material =
+        st.material.as_deref().and_then(|m| parse_key_material(m, st.network).ok());
+    let notebook_spks = st.notebook_spks_for();
+    // Spending-self-notes fix (Unit A): derived ONCE for this whole
+    // wallet-wide pass and reused across every notebook below — the
+    // spending wallet is account-level, so re-deriving per notebook
+    // would repeat the same ~2×upto secp derivations for nothing.
+    let spending_window_spks = st.spending_window_spks_for();
+    let now_active_addr = st.ident.as_ref().map(|i| i.address.clone());
+    let mut scanned = 0usize;
+    for nr in &r.results {
+        // The snapshot-time-active notebook applies to the LIVE store
+        // only if it's STILL the active one — a notebook switch mid-
+        // scan (same account, so the coarse guard above passed) must
+        // never misapply a stale bundle onto whatever's open now.
+        let is_live_current = r.current_index == Some(nr.index)
+            && r.current_address.is_some()
+            && now_active_addr.as_deref() == r.current_address.as_deref();
+        if is_live_current {
+            st.apply_active_bundle(w, nr.bundle.clone(), &r.current_statuses, &r.current_dropped_lookup, &r.current_dropped_unspent, // The wallet-wide refresh doesn't stats-pre-check (yet)
+                // — leave the store's fingerprint stamp alone.
+                None, );
+        } else if let (Ok(bundle), Some(material)) = (&nr.bundle, &material) {
+            if st.apply_bundle_to_notebook_file(material, &notebook_spks, &spending_window_spks, nr.index, bundle, ) {
+                scanned += 1;
+            }
+        }
+    }
+    scanned += 1; // the snapshot-time-active notebook, unconditionally
+    println!("cb: {label} notebooks={scanned}");
+    w.global::<Ui>().set_status("".into());
+    // Repaint the Coins screen/card regardless of which ↻ kicked this
+    // scan off — `update_wallet_coins` is a pure re-derive from `st`
+    // (no side effects), and the change coins it now folds in just
+    // landed above.
+    st.update_wallet_coins(w);
+    match r.purpose {
+        WalletStoresPurpose::Coins => {
+            if st.spending_capable
+                && st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false)
+            {
+                st.spending_refresh_async(w);
+            }
+            st.refresh_compose(w);
+        }
+        WalletStoresPurpose::Notebooks => st.update_notebook_list(w),
     }
 }
 
@@ -2329,9 +2308,8 @@ pub(crate) fn refresh_fees_price(&mut self, _w: &AppWindow) {
 /// Kick off a spending-wallet coin scan on a worker thread (funding-
 /// unification M3) — never block the UI thread with the chain call. A
 /// no-op when the identity can't derive a spending wallet, or none is
-/// configured (no node). Results land through [`SPENDING_REFRESH_RESULTS`]
-/// + the `apply-pending-spending-refresh` trampoline, exactly like
-///   [`refresh_async`].
+/// configured (no node). Results land through [`SpendingRefreshResult`] +
+/// [`post`], exactly like [`refresh_async`].
 ///
 /// Also goes through the [`SCAN_LANE`] queue (2026-07-21) keyed
 /// `spscan/<fp8>/<network>/<account>` — a SECOND, general layer behind
@@ -2418,11 +2396,8 @@ pub(crate) fn spending_scan_async(&mut self, w: &AppWindow, gap: u32) {
             client.and_then(|c| c.scan_funding(&src, gap).map_err(|e| e.to_string()))
         });
         drop(material); // Zeroizing — wiped as soon as the scan is done
-        SPENDING_REFRESH_RESULTS
-            .lock()
-            .expect("spending refresh mutex")
-            .push(SpendingRefreshResult { fp8, network, account, scan });
-        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_spending_refresh());
+        let r = SpendingRefreshResult { fp8, network, account, scan };
+        post(&weak, move |w, st| st.apply_spending_refresh_result(w, r));
     };
     if scan_lane_submit(key, job) {
         w.global::<Ui>().set_status("scanning spending wallet…".into());
@@ -2433,7 +2408,7 @@ pub(crate) fn spending_scan_async(&mut self, w: &AppWindow, gap: u32) {
 
 /// Derive `spending_source` on demand from the session key material. The
 /// descriptor needs no network scan — it was only ever populated by
-/// [`apply_spending_refresh_results`], which made scan-independent flows
+/// [`apply_spending_refresh_result`], which made scan-independent flows
 /// ("Sweep notebook funds here", spending consolidate — both only need the
 /// descriptor + a store index) fail with "not scanned yet" when tapped
 /// before a fresh session's first scan landed.
@@ -2452,82 +2427,78 @@ pub(crate) fn ensure_spending_source(&mut self) {
 /// The UI-thread half of [`spending_refresh_async`]: cache the coins +
 /// source, log the result, and repaint every screen that shows the
 /// spending wallet (Settings card, compose picker, Coins segment).
-pub(crate) fn apply_spending_refresh_results(&mut self, w: &AppWindow) {
+pub(crate) fn apply_spending_refresh_result(&mut self, w: &AppWindow, r: SpendingRefreshResult) {
     let st = self;
-    let results: Vec<SpendingRefreshResult> =
-        SPENDING_REFRESH_RESULTS.lock().expect("spending refresh mutex").drain(..).collect();
-    for r in results {
-        // Release the scan-gate slot BEFORE the staleness guard — a
-        // stale-dropped scan must not wedge the gate closed.
-        st.scan_gate.drain_spending();
-        st.update_scan_gate(w);
-        if st.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
-            || st.network != r.network
-            || st.account != r.account
-        {
-            println!("cb: spending-refresh stale-drop");
-            continue;
-        }
-        match r.scan {
-            Ok(scan) => {
-                // Discovery bookkeeping (used addresses + next indexes) comes
-                // from the SAME merged scan now (network-efficiency merge,
-                // 2026-07-23) — apply it before the coins, same order the old
-                // separate discovery step ran in.
-                if let Some(store) = st.store.as_mut() {
-                    store.spending_apply_discovery(
-                        scan.used.clone(),
-                        scan.next_receive_index,
-                        scan.next_change_index,
-                    );
+    // Release the scan-gate slot BEFORE the staleness guard — a
+    // stale-dropped scan must not wedge the gate closed.
+    st.scan_gate.drain_spending();
+    st.update_scan_gate(w);
+    if st.notebooks_fp8.as_deref() != Some(r.fp8.as_str())
+        || st.network != r.network
+        || st.account != r.account
+    {
+        println!("cb: spending-refresh stale-drop");
+        return;
+    }
+    match r.scan {
+        Ok(scan) => {
+            // Discovery bookkeeping (used addresses + next indexes) comes
+            // from the SAME merged scan now (network-efficiency merge,
+            // 2026-07-23) — apply it before the coins, same order the old
+            // separate discovery step ran in.
+            if let Some(store) = st.store.as_mut() {
+                store.spending_apply_discovery(
+                    scan.used.clone(),
+                    scan.next_receive_index,
+                    scan.next_change_index,
+                );
+            }
+            st.save_spending();
+            st.spending_coins = scan.utxos;
+            if let Some(material) = st.material.as_ref() {
+                if let Ok(m) = parse_key_material(material.as_str(), st.network) {
+                    st.spending_source = app_core::spending::funding_source(&m, st.network, st.account).ok();
                 }
-                st.save_spending();
-                st.spending_coins = scan.utxos;
-                if let Some(material) = st.material.as_ref() {
-                    if let Ok(m) = parse_key_material(material.as_str(), st.network) {
-                        st.spending_source = app_core::spending::funding_source(&m, st.network, st.account).ok();
-                    }
-                }
-                st.save_store();
-                st.spending_scanned = true;
-                let balance: u64 = st.spending_coins.iter().map(|c| c.value).sum();
-                println!("cb: spending-refresh utxos={} balance={balance}", st.spending_coins.len());
-                w.global::<Ui>().set_status("".into());
             }
-            Err(e) => {
-                println!("cb: spending-refresh err={e}");
-                w.global::<Ui>().set_status(format!("spending wallet scan failed: {}", friendly_net_err(&e)).into());
-            }
+            st.save_store();
+            st.spending_scanned = true;
+            let balance: u64 = st.spending_coins.iter().map(|c| c.value).sum();
+            println!("cb: spending-refresh utxos={} balance={balance}", st.spending_coins.len());
+            w.global::<Ui>().set_status("".into());
         }
-        st.update_spending_ui(w);
-        if w.global::<Ui>().get_screen() == Screen::Sweep && w.global::<Ui>().get_sweep_kind() == "sweep" {
-            // A wallet-sweep preview computed before the scan landed shows
-            // notebook coins only (Sal 2026-07-17) — recompute it so the
-            // spending coins join the inputs summary and fee preview.
-            st.update_sweep_screen(w);
+        Err(e) => {
+            println!("cb: spending-refresh err={e}");
+            w.global::<Ui>().set_status(format!("spending wallet scan failed: {}", friendly_net_err(&e)).into());
         }
-        if w.global::<Ui>().get_screen() == Screen::Compose {
-            // CHANGE 5: a user already sitting on compose when the scan
-            // lands sees the default upgrade to "spending" too — but only
-            // absent an explicit pick this session (payfrom_manual).
-            if !st.payfrom_manual && w.global::<Ui>().get_pay_from() != "spending" {
-                st.resolve_payfrom_default(w);
-            }
-            if w.global::<Ui>().get_pay_from() == "spending" {
-                st.refresh_compose(w);
-            }
+    }
+    st.update_spending_ui(w);
+    if w.global::<Ui>().get_screen() == Screen::Sweep && w.global::<Ui>().get_sweep_kind() == "sweep" {
+        // A wallet-sweep preview computed before the scan landed shows
+        // notebook coins only (Sal 2026-07-17) — recompute it so the
+        // spending coins join the inputs summary and fee preview.
+        st.update_sweep_screen(w);
+    }
+    if w.global::<Ui>().get_screen() == Screen::Compose {
+        // CHANGE 5: a user already sitting on compose when the scan
+        // lands sees the default upgrade to "spending" too — but only
+        // absent an explicit pick this session (payfrom_manual).
+        if !st.payfrom_manual && w.global::<Ui>().get_pay_from() != "spending" {
+            st.resolve_payfrom_default(w);
         }
-        if w.global::<Ui>().get_screen() == Screen::PayFrom {
-            st.log_funding_refresh();
-            // funding-unification UI rework: a landed scan must repaint the
-            // Spending panel (independent-expand rework, 2026-07-18: it now
-            // reads its own `sp-panel-coins`/`sp-panel-title`, not the
-            // legacy singular `spend-coins`/`spend-title` — those stay
-            // driven by whichever source is `payfrom_active_source`), or the
-            // panel shows stale "0 coins" under a since-scanned wallet.
+        if w.global::<Ui>().get_pay_from() == "spending" {
             st.refresh_compose(w);
-            st.update_payfrom_panels(w);
         }
+    }
+    if w.global::<Ui>().get_screen() == Screen::PayFrom {
+        st.log_funding_refresh();
+        // funding-unification UI rework: a landed scan must repaint the
+        // Spending panel (independent-expand rework, 2026-07-18: it now
+        // reads its own `sp-panel-coins`/`sp-panel-title`, not the
+        // legacy singular `spend-coins`/`spend-title` — those stay
+        // driven by whichever source is `payfrom_active_source`), or the
+        // panel shows stale "0 coins" under a since-scanned wallet.
+        st.refresh_compose(w);
+        st.update_payfrom_panels(w);
     }
 }
 
@@ -2579,4 +2550,59 @@ pub(crate) fn update_spending_ui(&self, w: &AppWindow) {
         .collect();
     w.global::<Coins>().set_spending_coins_list(VecModel::from_slice(&rows));
 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// U5's core claim: FIFO across every kind, not just within one — see
+    /// [`post`]'s and [`State::apply_pending`]'s doc comments. Three jobs
+    /// are posted (via the real [`post`], from three separate threads
+    /// joined before the next is spawned, so push order is deterministic)
+    /// and must apply in that exact order when `apply_pending` drains the
+    /// queue. `post` pushes onto [`QUEUE`] synchronously, before it merely
+    /// SCHEDULES the event-loop invoke (never awaited here), so this
+    /// asserts the ordering `post`/`apply_pending` provide without
+    /// depending on Slint's event loop ever running that invoke — this
+    /// test drives `apply_pending` directly, the same way the real
+    /// `Ui::apply-pending` callback does.
+    #[test]
+    fn apply_pending_runs_jobs_in_fifo_arrival_order() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().expect("AppWindow");
+        let weak = app.as_weak();
+
+        let order: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Sequential spawn+join (not three concurrently-running threads):
+        // the ordering claim is about PUSH order, not about which thread
+        // happens to finish its work first — joining each before the next
+        // is spawned pins push order to 0, 1, 2 deterministically.
+        for tag in 0..3u32 {
+            let o = order.clone();
+            let w = weak.clone();
+            std::thread::spawn(move || {
+                post(&w, move |_w, _st| {
+                    o.lock().expect("order mutex").push(tag);
+                });
+            })
+            .join()
+            .expect("post thread");
+        }
+
+        let mut st = State::test_stub(
+            Network::Regtest,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        st.apply_pending(&app);
+
+        assert_eq!(*order.lock().expect("order mutex"), vec![0, 1, 2]);
+        // apply_pending must leave the queue empty behind it.
+        assert!(QUEUE.lock().expect("pending queue mutex").is_empty());
+    }
 }

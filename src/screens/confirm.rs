@@ -697,7 +697,7 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
         match pending.payload {
             PendingPayload::Psbt => {
                 // Self-managed: reads State.signed_psbt directly, sets its
-                // own wallet_tx_busy, pushes PSBT_BROADCAST_RESULTS. Leaving
+                // own wallet_tx_busy, posts its own PsbtBroadcastResult. Leaving
                 // `pending_broadcast` in place lets a failed POST be retried
                 // by tapping Broadcast again (re-invokes this same path).
                 // U4: `on_psbt_broadcast` is a method now (not a fresh
@@ -761,10 +761,11 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                     let result = open_client(&base, net, creds)
                         .map_err(|e| e.to_string())
                         .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
-                    NOTEBOOK_COMPOSE_RESULTS.lock().expect("notebook compose results mutex").push(
-                        NotebookComposeResult { note_id, fee, vsize, to, private, pq_flags, result },
-                    );
-                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_compose());
+                    let r = NotebookComposeResult { note_id, fee, vsize, to, private, pq_flags, result };
+                    post(&weak, move |w, st| {
+                        st.clear_compose_busy(w);
+                        st.apply_notebook_compose_result(w, r);
+                    });
                 });
             }
             PendingPayload::ComposeSpending {
@@ -798,26 +799,27 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                     let result = open_client(&base, net, creds)
                         .map_err(|e| e.to_string())
                         .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
-                    SPENDING_COMPOSE_RESULTS.lock().expect("spending compose results mutex").push(
-                        SpendingComposeResult {
-                            text,
-                            private,
-                            to,
-                            recipients,
-                            gift,
-                            raw,
-                            txid,
-                            vsize,
-                            built_fee,
-                            built_change,
-                            spent_outpoints,
-                            change_index,
-                            change_raw,
-                            source,
-                            result,
-                        },
-                    );
-                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_compose());
+                    let r = SpendingComposeResult {
+                        text,
+                        private,
+                        to,
+                        recipients,
+                        gift,
+                        raw,
+                        txid,
+                        vsize,
+                        built_fee,
+                        built_change,
+                        spent_outpoints,
+                        change_index,
+                        change_raw,
+                        source,
+                        result,
+                    };
+                    post(&weak, move |w, st| {
+                        st.clear_compose_busy(w);
+                        st.apply_spending_compose_result(w, r);
+                    });
                 });
             }
             PendingPayload::ComposeMixed {
@@ -855,30 +857,31 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                     let result = open_client(&base, net, creds)
                         .map_err(|e| e.to_string())
                         .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
-                    MIXED_COMPOSE_RESULTS.lock().expect("mixed compose results mutex").push(
-                        MixedComposeResult {
-                            text,
-                            private,
-                            to,
-                            recipients,
-                            gift,
-                            raw,
-                            txid,
-                            vsize,
-                            built_fee,
-                            built_change,
-                            change_default,
-                            notebook_spent,
-                            spent_spending,
-                            change_spent,
-                            payloads_len,
-                            recipient_count,
-                            change_index,
-                            spending_source,
-                            result,
-                        },
-                    );
-                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_compose());
+                    let r = MixedComposeResult {
+                        text,
+                        private,
+                        to,
+                        recipients,
+                        gift,
+                        raw,
+                        txid,
+                        vsize,
+                        built_fee,
+                        built_change,
+                        change_default,
+                        notebook_spent,
+                        spent_spending,
+                        change_spent,
+                        payloads_len,
+                        recipient_count,
+                        change_index,
+                        spending_source,
+                        result,
+                    };
+                    post(&weak, move |w, st| {
+                        st.clear_compose_busy(w);
+                        st.apply_mixed_compose_result(w, r);
+                    });
                 });
             }
             // ---- sweep / consolidate / wconsol / spending-consolidate:
@@ -887,9 +890,9 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
             // (`pending.return_screen`) — mirroring the removed confirm
             // modals, which closed in place while the broadcast ran in the
             // background — then spawns the pre-existing thread-spawn
-            // verbatim, pushing into the SAME result queue their (UNTOUCHED)
-            // `apply_*_broadcast_result` already drains via the shared
-            // `apply-pending-wallet-tx` trampoline.
+            // verbatim, posting a job that clears the shared busy flag
+            // (`State::clear_wallet_tx_busy`) and applies via their
+            // (UNTOUCHED) `apply_*_broadcast_result`.
             PendingPayload::Sweep { snap } => {
                 let Some(base) = s.base_url() else {
                     w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
@@ -908,11 +911,11 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                     let result = open_client(&base, net, creds)
                         .map_err(|e| e.to_string())
                         .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
-                    SWEEP_BROADCAST_RESULTS
-                        .lock()
-                        .expect("sweep broadcast results mutex")
-                        .push(SweepBroadcastResult { snap, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
+                    let r = SweepBroadcastResult { snap, result };
+                    post(&weak, move |w, st| {
+                        st.clear_wallet_tx_busy(w);
+                        st.apply_sweep_broadcast_result(w, r);
+                    });
                 });
             }
             PendingPayload::Consolidate { snap } => {
@@ -933,11 +936,11 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                     let result = open_client(&base, net, creds)
                         .map_err(|e| e.to_string())
                         .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
-                    CONSOLIDATE_BROADCAST_RESULTS
-                        .lock()
-                        .expect("consolidate broadcast results mutex")
-                        .push(ConsolidateBroadcastResult { snap, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
+                    let r = ConsolidateBroadcastResult { snap, result };
+                    post(&weak, move |w, st| {
+                        st.clear_wallet_tx_busy(w);
+                        st.apply_consolidate_broadcast_result(w, r);
+                    });
                 });
             }
             PendingPayload::WConsol { snap } => {
@@ -958,11 +961,11 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                     let result = open_client(&base, net, creds)
                         .map_err(|e| e.to_string())
                         .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
-                    WCONSOL_BROADCAST_RESULTS
-                        .lock()
-                        .expect("wconsol broadcast results mutex")
-                        .push(WConsolBroadcastResult { snap, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
+                    let r = WConsolBroadcastResult { snap, result };
+                    post(&weak, move |w, st| {
+                        st.clear_wallet_tx_busy(w);
+                        st.apply_wconsol_broadcast_result(w, r);
+                    });
                 });
             }
             PendingPayload::SpendingConsolidate { snap } => {
@@ -983,11 +986,11 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                     let result = open_client(&base, net, creds)
                         .map_err(|e| e.to_string())
                         .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
-                    SPENDING_CONSOLIDATE_RESULTS
-                        .lock()
-                        .expect("spending consolidate results mutex")
-                        .push(SpendingConsolidateResult { snap, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
+                    let r = SpendingConsolidateResult { snap, result };
+                    post(&weak, move |w, st| {
+                        st.clear_wallet_tx_busy(w);
+                        st.apply_spending_consolidate_result(w, r);
+                    });
                 });
             }
             // ---- bump / rebroadcast: stage B re-arms `act_pending_ref`
@@ -1007,7 +1010,7 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                 // fee/vsize/raw_hex update, and (notes) the ledger change
                 // swap — then save, exactly like the Compose arm. A failed
                 // POST leaves a retryable record with the replacement hex
-                // in hand (`apply_act_bump_results` behavior, unchanged).
+                // in hand (`apply_act_bump_result` behavior, unchanged).
                 // PLAN-pnte-redesign.md: a note bump RENAMES the record's
                 // id to the replacement's txid (the note id IS the txid),
                 // so the busy-row marker below must follow the rename — a
@@ -1038,11 +1041,8 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                     let result = open_client(&base, net, creds)
                         .map_err(|e| e.to_string())
                         .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
-                    ACT_BUMP_RESULTS
-                        .lock()
-                        .expect("act-bump results mutex")
-                        .push(ActBumpResult { ref_id, txid, fee, new_rate, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_act_bump());
+                    let r = ActBumpResult { ref_id, txid, fee, new_rate, result };
+                    post(&weak, move |w, st| st.apply_act_bump_result(w, r));
                 });
             }
             PendingPayload::Rebroadcast { ref_id } => {
@@ -1063,11 +1063,8 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                     let result = open_client(&base, net, creds)
                         .map_err(|e| e.to_string())
                         .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
-                    ACT_RETRY_RESULTS
-                        .lock()
-                        .expect("act-retry results mutex")
-                        .push(ActRetryResult { ref_id, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_act_retry());
+                    let r = ActRetryResult { ref_id, result };
+                    post(&weak, move |w, st| st.apply_act_retry_result(w, r));
                 });
             }
         }

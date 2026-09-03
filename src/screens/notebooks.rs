@@ -35,7 +35,7 @@ pub(crate) fn show_notebook_picker(&self, w: &AppWindow, page: u32, mode: &str) 
     w.global::<Ui>().set_screen(Screen::AccountPicker);
 
     // Probe used/new on a worker thread; results fill the pills in via the
-    // apply-pending-picker-probe trampoline (offline / no rows → plain rows).
+    // shared apply-pending trampoline (offline / no rows → plain rows).
     let Some(base) = st.base_url() else { return };
     if to_probe.is_empty() {
         return;
@@ -59,11 +59,8 @@ pub(crate) fn show_notebook_picker(&self, w: &AppWindow, page: u32, mode: &str) 
                 }
             }
         }
-        PICKER_PROBE_RESULTS
-            .lock()
-            .expect("picker probe mutex")
-            .push(PickerProbeResult { account, page, rows: results });
-        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_picker_probe());
+        let r = PickerProbeResult { account, page, rows: results };
+        post(&weak, move |w, st| st.apply_picker_probe_result(w, r));
     });
 }
 
