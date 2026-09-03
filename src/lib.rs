@@ -155,7 +155,7 @@ impl NetOpGuard {
         if prev == 0 {
             println!("cb: net-ops n=1");
             let w = weak.clone();
-            let _ = w.upgrade_in_event_loop(|w| w.set_net_busy(true));
+            let _ = w.upgrade_in_event_loop(|w| w.global::<Ui>().set_net_busy(true));
         }
         NetOpGuard { weak }
     }
@@ -167,7 +167,7 @@ impl Drop for NetOpGuard {
         if prev == 1 {
             println!("cb: net-ops n=0");
             let weak = self.weak.clone();
-            let _ = weak.upgrade_in_event_loop(|w| w.set_net_busy(false));
+            let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().set_net_busy(false));
         }
     }
 }
@@ -280,14 +280,14 @@ fn spawn_scan_lane_worker(id: app_core::netq::JobId, key: String, job: Box<dyn F
 /// `State.scan_gate`. Call after every counter/flag change.
 fn update_scan_gate(w: &AppWindow, st: &State) {
     let busy = st.scan_gate.busy();
-    if busy != w.get_wallet_scan_busy() {
+    if busy != w.global::<Ui>().get_wallet_scan_busy() {
         // Transition-only, like `cb: net-ops` — and a log contract: the UI
         // e2e suites wait for `busy=false` before tapping a money-flow
         // Sign (rapid ↻ retaps can queue several scans on a slow server;
         // the gate stays closed until EVERY one lands).
         println!("cb: scan-gate busy={busy}");
     }
-    w.set_wallet_scan_busy(busy);
+    w.global::<Ui>().set_wallet_scan_busy(busy);
 }
 
 /// The last OBSERVED outcome of pushing `State.contacts` to iCloud's KV
@@ -1052,17 +1052,17 @@ fn read_saved_material(window: &AppWindow) -> Option<String> {
             // Probed present but gone by the time we read it (deleted from
             // another device, or an iCloud item that vanished).
             println!("cb: unlock none");
-            window.set_saved_key_present(false);
+            window.global::<Onboarding>().set_saved_key_present(false);
             None
         }
         Err(e) if e == "cancelled" => {
             println!("cb: unlock cancelled");
-            window.set_status("unlock cancelled — tap Restore to try again".into());
+            window.global::<Ui>().set_status("unlock cancelled — tap Restore to try again".into());
             None
         }
         Err(e) => {
             println!("cb: unlock err={e}");
-            window.set_status(format!("keychain: {e}").into());
+            window.global::<Ui>().set_status(format!("keychain: {e}").into());
             None
         }
     }
@@ -1088,7 +1088,7 @@ fn activate_restored(window: &AppWindow, s: &mut State, material: String, onboar
             // this cannot prompt.
             let synced = keychain::is_synced(KEYCHAIN_ACCOUNT);
             s.icloud_backup = synced;
-            window.set_icloud_backup(synced);
+            window.global::<Ui>().set_icloud_backup(synced);
             // Restoring from the onboarding door is an ONBOARDING EXIT, and
             // every other one (create-seed, import, iCloud restore) ensures
             // the account's notebook 0 — I added this path and skipped it, so
@@ -1116,14 +1116,14 @@ fn activate_restored(window: &AppWindow, s: &mut State, material: String, onboar
             println!("cb: unlock ok auto-unlock=1");
             update_home(window, s);
             update_notebook_list(window, s);
-            window.set_status("".into());
-            window.set_screen(Screen::Notebooks);
+            window.global::<Ui>().set_status("".into());
+            window.global::<Ui>().set_screen(Screen::Notebooks);
             refresh_async(window, s);
             spending_refresh_async(window, s);
         }
         Err(e) => {
             println!("cb: unlock activate-err={e}");
-            window.set_status(format!("stored key failed: {e}").into());
+            window.global::<Ui>().set_status(format!("stored key failed: {e}").into());
         }
     }
 }
@@ -1623,9 +1623,9 @@ fn now_ms() -> u64 {
 /// while a toast is still on screen extends the ~1.5s auto-dismiss window
 /// (the countdown reset lives in app.slint's `changed toast-nonce` handler).
 fn show_toast(w: &AppWindow, text: &str) {
-    w.set_toast_text(text.into());
-    w.set_toast_nonce(w.get_toast_nonce() + 1);
-    w.set_toast_open(true);
+    w.global::<Ui>().set_toast_text(text.into());
+    w.global::<Ui>().set_toast_nonce(w.global::<Ui>().get_toast_nonce() + 1);
+    w.global::<Ui>().set_toast_open(true);
 }
 
 fn spendable_inputs(store: &Store) -> Vec<app_core::store::TxInput> {
@@ -1981,7 +1981,7 @@ fn watch_spend_build(
     let Some(src) = st.ident.as_ref().and_then(|i| i.watch_source()).cloned() else { return };
     let coins = watch_wallet_coins(st);
     if coins.is_empty() || (kind == "consolidate" && coins.len() < 2) {
-        w.set_status(
+        w.global::<Ui>().set_status(
             if kind == "consolidate" { "nothing to consolidate (need 2+ coins)" } else { "nothing to sweep" }.into(),
         );
         return;
@@ -2033,7 +2033,7 @@ fn watch_spend_build(
             );
             show_psbt_sign_screen(w, st, built, cost);
         }
-        Err(e) => w.set_status(format!("{e}").into()),
+        Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
     }
 }
 
@@ -2044,7 +2044,7 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
     // lazily (re)fetch first (network-efficiency, 2026-07-23).
     refresh_fees_price(w, st);
     let Some(base) = st.base_url() else {
-        w.set_status("no Bitcoin node — set one in Settings".into());
+        w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
         return;
     };
     let txid = {
@@ -2060,7 +2060,7 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
         }
     };
     let Some(txid) = txid else {
-        w.set_status("transaction not found".into());
+        w.global::<Ui>().set_status("transaction not found".into());
         return;
     };
     // Unit 6 defense-in-depth (mirrors keyed CHANGE 2's `mixed_inputs`
@@ -2075,7 +2075,7 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
             .map(|s| s.txs.iter().any(|t| t.txids.contains(&ref_id) && t.mixed_inputs))
             .unwrap_or(false)
     {
-        w.set_status(
+        w.global::<Ui>().set_status(
             "this sweep included a change-chain coin — it can't be sped up (rebroadcast still works)"
                 .into(),
         );
@@ -2090,14 +2090,14 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
     let client = match open_client(&base, st.network, creds) {
         Ok(c) => c,
         Err(e) => {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
             return;
         }
     };
     match client.fetch_tx_io(&txid, |a| index_by_addr.get(a).copied()) {
         Ok((coins, outputs, confirmed)) => {
             if confirmed {
-                w.set_status("already confirmed — nothing to speed up".into());
+                w.global::<Ui>().set_status("already confirmed — nothing to speed up".into());
                 return;
             }
             let in_v: u64 = coins.iter().map(|c| c.value).sum();
@@ -2109,18 +2109,18 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
             let fast = st.fees.as_ref().map(|f| f.fastest).unwrap_or(min_rate);
             let recommended = fast.max(min_rate);
             println!("cb: bump-open ref={ref_id} old={old_rate:.1} min={min_rate:.1} watch=1");
-            w.set_bump_ref(ref_id.clone().into());
-            w.set_bump_is_note(is_note);
-            w.set_bump_kind(if is_note { "Note transaction" } else { "Sweep / consolidate" }.into());
-            w.set_bump_current(format!("Currently {old_rate:.1} sat/vB · {old_fee} sats fee").into());
-            w.set_bump_min(format!("Minimum {min_rate:.1} sat/vB — RBF must add ≥1 sat/vB.").into());
-            w.set_bump_error("".into());
-            w.set_bump_rate(format!("{recommended:.1}").into());
-            w.set_bump_new_fee(new_fee_line(recommended, vsize, old_fee).into());
+            w.global::<Ui>().set_bump_ref(ref_id.clone().into());
+            w.global::<Ui>().set_bump_is_note(is_note);
+            w.global::<Modals>().set_bump_kind(if is_note { "Note transaction" } else { "Sweep / consolidate" }.into());
+            w.global::<Modals>().set_bump_current(format!("Currently {old_rate:.1} sat/vB · {old_fee} sats fee").into());
+            w.global::<Modals>().set_bump_min(format!("Minimum {min_rate:.1} sat/vB — RBF must add ≥1 sat/vB.").into());
+            w.global::<Modals>().set_bump_error("".into());
+            w.global::<Modals>().set_bump_rate(format!("{recommended:.1}").into());
+            w.global::<Modals>().set_bump_new_fee(new_fee_line(recommended, vsize, old_fee).into());
             st.watch_bump = Some(WatchBump { ref_id, is_note, txid, coins, outputs, old_fee, vsize });
-            w.set_show_bump_dialog(true);
+            w.global::<Ui>().set_show_bump_dialog(true);
         }
-        Err(e) => w.set_status(format!("can't fetch the pending tx: {}", friendly_net_err(&e.to_string())).into()),
+        Err(e) => w.global::<Ui>().set_status(format!("can't fetch the pending tx: {}", friendly_net_err(&e.to_string())).into()),
     }
 }
 
@@ -2128,12 +2128,12 @@ fn watch_bump_open(w: &AppWindow, st: &mut State, ref_id: String, is_note: bool)
 /// delta out of our own output) and open the external-sign screen.
 fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
     let Some(wb) = st.watch_bump.take() else {
-        w.set_bump_error("bump context lost — reopen the dialog".into());
+        w.global::<Modals>().set_bump_error("bump context lost — reopen the dialog".into());
         return;
     };
     let min_rate = (wb.old_fee as f64 / wb.vsize.max(1) as f64) + 1.0;
     if new_rate + 1e-9 < min_rate {
-        w.set_bump_error(format!("below the {min_rate:.1} sat/vB minimum").into());
+        w.global::<Modals>().set_bump_error(format!("below the {min_rate:.1} sat/vB minimum").into());
         st.watch_bump = Some(wb);
         return;
     }
@@ -2157,7 +2157,7 @@ fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
                 .map(|(i, _)| i)
         });
     let Some(reduce) = reduce else {
-        w.set_bump_error("no output can absorb the fee bump".into());
+        w.global::<Modals>().set_bump_error("no output can absorb the fee bump".into());
         return;
     };
     // Deliberately the DEVICE default, not `effective_lock_time()`: the
@@ -2167,7 +2167,7 @@ fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
     // compose/sweep session into this replacement with no UI indication.
     match build_watch_bump_psbt(&src, &wb.coins, &wb.outputs, reduce, new_rate, st.lock_time()) {
         Ok(built) => {
-            w.set_show_bump_dialog(false);
+            w.global::<Ui>().set_show_bump_dialog(false);
             let dest = st.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
             let cost = format!(
                 "speed-up · replaces {}… · new fee {} sats · sign with your external wallet",
@@ -2191,7 +2191,7 @@ fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
             show_psbt_sign_screen(w, st, built, cost);
         }
         Err(e) => {
-            w.set_bump_error(format!("{e}").into());
+            w.global::<Modals>().set_bump_error(format!("{e}").into());
             st.watch_bump = Some(wb);
         }
     }
@@ -2201,10 +2201,10 @@ fn watch_bump_confirm(w: &AppWindow, st: &mut State, new_rate: f64) {
 /// custom sat/vB field — the compose mapping, mirrored.
 fn resolve_sweep_rate(w: &AppWindow, st: &State) -> f64 {
     let f = st.fees.clone().unwrap_or_default();
-    match w.get_sweep_tier() {
+    match w.global::<Sweep>().get_sweep_tier() {
         0 => f.economy.max(1.0),
         2 => f.fastest.max(1.0),
-        3 => w.get_sweep_rate_text().trim().parse().unwrap_or(0.0),
+        3 => w.global::<Sweep>().get_sweep_rate_text().trim().parse().unwrap_or(0.0),
         _ => f.hour.max(1.0),
     }
 }
@@ -2222,7 +2222,7 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
     // notebook's coins ride — scoped to the ACTIVE account, keyed AND
     // watch alike (rev-3 follow-up 1). Consolidate (kind) stays on the
     // active store (the legacy screen-16 flow).
-    let wallet_mode = w.get_sweep_kind().as_str() == "sweep";
+    let wallet_mode = w.global::<Ui>().get_sweep_kind().as_str() == "sweep";
     let spendable: Vec<app_core::store::LedgerUtxo> = if wallet_mode {
         let mut v = Vec::new();
         if let Some(ix) = &st.notebooks {
@@ -2276,9 +2276,9 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
         tag: "".into(),
     }));
     rows.sort_by_key(|r| r.value.parse::<u64>().unwrap_or(0));
-    w.set_sweep_coins(VecModel::from_slice(&rows));
+    w.global::<Sweep>().set_sweep_coins(VecModel::from_slice(&rows));
     let plural = if n == 1 { "" } else { "s" };
-    w.set_sweep_inputs_title(
+    w.global::<Sweep>().set_sweep_inputs_title(
         if sp_n > 0 {
             format!(
                 "Inputs · {n} notebook coin{plural} + {sp_n} spending coin{} · {total} sats (all)",
@@ -2291,22 +2291,23 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
     );
 
     if n == 0 && sp_n == 0 {
-        w.set_sweep_cost_line("nothing to sweep — no spendable coins".into());
+        w.global::<Sweep>().set_sweep_cost_line("nothing to sweep — no spendable coins".into());
         return;
     }
     let rate = resolve_sweep_rate(w, st);
     if rate <= 0.0 {
-        w.set_sweep_cost_line("enter a fee rate".into());
+        w.global::<Sweep>().set_sweep_cost_line("enter a fee rate".into());
         return;
     }
     let dest_spk_len = w
+        .global::<Ui>()
         .get_sweep_dest()
         .to_string()
         .parse_dest_len(net)
         .unwrap_or(34);
-    if w.get_sweep_fund_external() {
+    if w.global::<Sweep>().get_sweep_fund_external() {
         if st.funding.is_none() || st.funding_coins.is_empty() {
-            w.set_sweep_cost_line(format!("sweeps {total} sats in full — pick a funding wallet for the fee").into());
+            w.global::<Sweep>().set_sweep_cost_line(format!("sweeps {total} sats in full — pick a funding wallet for the fee").into());
             return;
         }
         // notes inputs (taproot) + funding inputs + dest + funding change.
@@ -2322,12 +2323,12 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
         let fee = (vsize as f64 * rate).ceil() as u64;
         let funding_total: u64 = st.funding_coins.iter().map(|c| c.value).sum();
         if funding_total < fee {
-            w.set_sweep_cost_line(
+            w.global::<Sweep>().set_sweep_cost_line(
                 format!("funding wallet holds {funding_total} sats — fee needs ~{fee}").into(),
             );
             return;
         }
-        w.set_sweep_cost_line(
+        w.global::<Sweep>().set_sweep_cost_line(
             format!(
                 "destination receives {total} sats in full · fee ~{fee} sats from the funding wallet ({} sats change back)",
                 funding_total.saturating_sub(fee)
@@ -2350,15 +2351,15 @@ fn update_sweep_screen(w: &AppWindow, st: &mut State) {
         };
         let fee = (vsize as f64 * rate).ceil() as u64;
         if total <= fee {
-            w.set_sweep_cost_line(format!("balance {total} sats can't cover the ~{fee} sat fee").into());
+            w.global::<Sweep>().set_sweep_cost_line(format!("balance {total} sats can't cover the ~{fee} sat fee").into());
             return;
         }
-        let line = if w.get_sweep_kind().as_str() == "consolidate" {
+        let line = if w.global::<Ui>().get_sweep_kind().as_str() == "consolidate" {
             format!("combines {n} coins → 1 · fee ~{fee} sats · keeps {}", total - fee)
         } else {
             format!("sweeps {total} sats · fee ~{fee} sats · destination receives {}", total - fee)
         };
-        w.set_sweep_cost_line(line.into());
+        w.global::<Sweep>().set_sweep_cost_line(line.into());
     }
 }
 
@@ -2410,13 +2411,13 @@ fn refresh_note_unlock_ui(w: &AppWindow, n: &app_core::store::NoteRecord) {
     use app_core::notes_core::envelope::{FLAG_MLKEM, FLAG_PW};
 
     let locked = n.locked.is_some();
-    w.set_note_locked(locked);
-    w.set_note_unlock_busy(false);
-    w.set_note_unlock_show_button(false);
+    w.global::<Ui>().set_note_locked(locked);
+    w.global::<Note>().set_note_unlock_busy(false);
+    w.global::<Ui>().set_note_unlock_show_button(false);
     if !locked {
-        w.set_note_unlock_needs_password(false);
-        w.set_note_unlock_caption("".into());
-        w.set_note_unlock_passphrase("".into());
+        w.global::<Note>().set_note_unlock_needs_password(false);
+        w.global::<Ui>().set_note_unlock_caption("".into());
+        w.global::<Note>().set_note_unlock_passphrase("".into());
         return;
     }
     let is_self =
@@ -2424,8 +2425,8 @@ fn refresh_note_unlock_ui(w: &AppWindow, n: &app_core::store::NoteRecord) {
     if is_self {
         let needs_password = n.pq_flags & FLAG_PW != 0;
         let needs_mlkem = n.pq_flags & FLAG_MLKEM != 0;
-        w.set_note_unlock_needs_password(needs_password);
-        w.set_note_unlock_caption(
+        w.global::<Note>().set_note_unlock_needs_password(needs_password);
+        w.global::<Ui>().set_note_unlock_caption(
             if needs_mlkem && needs_password {
                 "Also needs your quantum key to reopen — you'll be asked if it isn't \
                  loaded. Losing either the password or the key loses this note forever."
@@ -2439,24 +2440,24 @@ fn refresh_note_unlock_ui(w: &AppWindow, n: &app_core::store::NoteRecord) {
             }
             .into(),
         );
-        w.set_note_unlock_show_button(true);
-        w.set_note_unlock_passphrase("".into());
+        w.global::<Ui>().set_note_unlock_show_button(true);
+        w.global::<Note>().set_note_unlock_passphrase("".into());
         return;
     }
     let sender_kem_locked = !n.received && (n.pq_flags & FLAG_MLKEM != 0);
     if sender_kem_locked {
-        w.set_note_unlock_needs_password(false);
-        w.set_note_unlock_caption("Can't re-read this note — it's sealed to the recipient's key.".into());
+        w.global::<Note>().set_note_unlock_needs_password(false);
+        w.global::<Ui>().set_note_unlock_caption("Can't re-read this note — it's sealed to the recipient's key.".into());
     } else if n.pq_flags & FLAG_PW != 0 {
-        w.set_note_unlock_needs_password(true);
-        w.set_note_unlock_caption("".into());
+        w.global::<Note>().set_note_unlock_needs_password(true);
+        w.global::<Ui>().set_note_unlock_caption("".into());
     } else {
-        w.set_note_unlock_needs_password(false);
-        w.set_note_unlock_caption(
+        w.global::<Note>().set_note_unlock_needs_password(false);
+        w.global::<Ui>().set_note_unlock_caption(
             "Sealed to a quantum key this device doesn't hold.".into(),
         );
     }
-    w.set_note_unlock_passphrase("".into());
+    w.global::<Note>().set_note_unlock_passphrase("".into());
 }
 
 /// Build screen 5's detail text block for note `n` — shared by
@@ -2523,16 +2524,16 @@ fn load_backend_settings(w: &AppWindow, st: &State) {
     let net = st.network;
     let (n_opts, n_idx, n_custom, n_core_addr) =
         fill_node(node_presets(net), st.node_urls.get(net.as_str()).map(String::as_str));
-    w.set_node_options(VecModel::from_slice(&n_opts));
-    w.set_node_index(n_idx);
-    w.set_node_custom_text(n_custom);
-    w.set_node_address_text(n_core_addr);
+    w.global::<Ui>().set_node_options(VecModel::from_slice(&n_opts));
+    w.global::<Ui>().set_node_index(n_idx);
+    w.global::<Settings>().set_node_custom_text(n_custom);
+    w.global::<Ui>().set_node_address_text(n_core_addr);
 
     let (e_opts, e_idx, e_custom) =
         fill(explorer_presets(net), st.explorers.get(net.as_str()).map(String::as_str));
-    w.set_explorer_options(VecModel::from_slice(&e_opts));
-    w.set_explorer_index(e_idx);
-    w.set_explorer_custom_text(e_custom);
+    w.global::<Settings>().set_explorer_options(VecModel::from_slice(&e_opts));
+    w.global::<Settings>().set_explorer_index(e_idx);
+    w.global::<Settings>().set_explorer_custom_text(e_custom);
 }
 
 /// [`load_backend_settings`]'s node-dropdown counterpart to its local
@@ -2721,14 +2722,14 @@ fn display_core_url(base: &str) -> String {
 fn update_node_backend_ui(w: &AppWindow, st: &State) {
     let base = st.base_url();
     let is_core = base.as_deref().is_some_and(|b| b.starts_with("bitcoind+"));
-    w.set_node_is_core(is_core);
-    w.set_node_backend_label(base.as_deref().map(node_backend_label).unwrap_or("Esplora").into());
+    w.global::<Ui>().set_node_is_core(is_core);
+    w.global::<Ui>().set_node_backend_label(base.as_deref().map(node_backend_label).unwrap_or("Esplora").into());
     // "Save credentials" switch (plan §2.4 / U10): a device-level per-network
     // preference, so it's meaningful even for an Esplora base (set it before
     // the early return) — the user may flip it before ever pointing at a
     // Core node.
     let persist = st.core_rpc_should_persist(st.network);
-    w.set_node_core_save_creds(persist);
+    w.global::<Settings>().set_node_core_save_creds(persist);
     if !is_core {
         // Only the HEALTH line is about the active backend. The credential
         // fields are NOT: U12 reveals them as soon as "Bitcoin Core" is
@@ -2739,8 +2740,8 @@ fn update_node_backend_ui(w: &AppWindow, st: &State) {
         // most visibly the "Save credentials" button (Sal 2026-08-01):
         // it saves, then refreshes health, and the refresh emptied both
         // fields even though the save had succeeded.
-        w.set_node_health_text("".into());
-        w.set_node_health_warn(false);
+        w.global::<Settings>().set_node_health_text("".into());
+        w.global::<Ui>().set_node_health_warn(false);
     }
     // Credentials are per-NETWORK and independent of which backend is
     // currently active, so they are resolved the same way either way.
@@ -2751,20 +2752,20 @@ fn update_node_backend_ui(w: &AppWindow, st: &State) {
     if persist {
         match keychain::load_rpc_creds(st.network.as_str()) {
             Ok(Some((user, pass))) => {
-                w.set_node_core_user(user.into());
-                w.set_node_core_pass(pass.into());
+                w.global::<Settings>().set_node_core_user(user.into());
+                w.global::<Settings>().set_node_core_pass(pass.into());
             }
             Ok(None) => {
-                w.set_node_core_user("".into());
-                w.set_node_core_pass("".into());
+                w.global::<Settings>().set_node_core_user("".into());
+                w.global::<Settings>().set_node_core_pass("".into());
             }
             Err(e) => {
                 // Never expected — this item carries no ACL — but degrade to
                 // blank fields rather than propagate a Keychain error into
                 // Settings; the user can just retype credentials.
                 println!("cb: rpc-creds load err={e}");
-                w.set_node_core_user("".into());
-                w.set_node_core_pass("".into());
+                w.global::<Settings>().set_node_core_user("".into());
+                w.global::<Settings>().set_node_core_pass("".into());
             }
         }
     } else {
@@ -2773,12 +2774,12 @@ fn update_node_backend_ui(w: &AppWindow, st: &State) {
         // was typed yet since launch).
         match st.core_rpc_session_creds.get(st.network.as_str()) {
             Some((user, pass)) => {
-                w.set_node_core_user(user.clone().into());
-                w.set_node_core_pass(pass.to_string().into());
+                w.global::<Settings>().set_node_core_user(user.clone().into());
+                w.global::<Settings>().set_node_core_pass(pass.to_string().into());
             }
             None => {
-                w.set_node_core_user("".into());
-                w.set_node_core_pass("".into());
+                w.global::<Settings>().set_node_core_user("".into());
+                w.global::<Settings>().set_node_core_pass("".into());
             }
         }
     }
@@ -2869,12 +2870,12 @@ fn refresh_node_health(w: &AppWindow, st: &mut State) {
     // pre-existing ON-but-never-saved case identically.
     let creds = core_rpc_creds_for(st, &base, network);
     if creds.is_none() {
-        w.set_node_health_text("enter RPC credentials to connect".into());
-        w.set_node_health_warn(true);
+        w.global::<Settings>().set_node_health_text("enter RPC credentials to connect".into());
+        w.global::<Ui>().set_node_health_warn(true);
         return;
     }
-    w.set_node_health_text("checking node…".into());
-    w.set_node_health_warn(false);
+    w.global::<Settings>().set_node_health_text("checking node…".into());
+    w.global::<Ui>().set_node_health_warn(false);
     let weak = w.as_weak();
     std::thread::spawn(move || {
         let _net_guard = NetOpGuard::new(weak.clone());
@@ -2896,7 +2897,7 @@ fn refresh_node_health(w: &AppWindow, st: &mut State) {
             text: text.into(),
             warn,
         });
-        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_node_health());
+        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_node_health());
     });
 }
 
@@ -3013,7 +3014,7 @@ fn update_activity(w: &AppWindow, st: &State) {
     items.sort_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
     let list: Vec<ActivityItem> = items.into_iter().map(|(_, _, it)| it).collect();
     let pending = list.iter().filter(|i| i.pending).count();
-    w.set_activity_summary(
+    w.global::<Activity>().set_activity_summary(
         if list.is_empty() {
             "No transactions yet.".to_string()
         } else {
@@ -3021,7 +3022,7 @@ fn update_activity(w: &AppWindow, st: &State) {
         }
         .into(),
     );
-    w.set_activity(VecModel::from_slice(&list));
+    w.global::<Ui>().set_activity(VecModel::from_slice(&list));
 }
 
 fn normalize_addr(raw: &str) -> String {
@@ -3459,10 +3460,10 @@ fn show_notebook_picker(w: &AppWindow, st: &State, page: u32, mode: &str) {
             to_probe.push((index, row.address.to_string()));
         }
     }
-    w.set_account_page(page as i32);
-    w.set_accounts(VecModel::from_slice(&rows));
-    w.set_account_pick_mode(mode.into());
-    w.set_screen(Screen::AccountPicker);
+    w.global::<AccountPicker>().set_account_page(page as i32);
+    w.global::<AccountPicker>().set_accounts(VecModel::from_slice(&rows));
+    w.global::<AccountPicker>().set_account_pick_mode(mode.into());
+    w.global::<Ui>().set_screen(Screen::AccountPicker);
 
     // Probe used/new on a worker thread; results fill the pills in via the
     // apply-pending-picker-probe trampoline (offline / no rows → plain rows).
@@ -3493,14 +3494,14 @@ fn show_notebook_picker(w: &AppWindow, st: &State, page: u32, mode: &str) {
             .lock()
             .expect("picker probe mutex")
             .push(PickerProbeResult { account, page, rows: results });
-        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_picker_probe());
+        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_picker_probe());
     });
 }
 
 fn show_account_picker(w: &AppWindow, material: &str, network: Network, page: u32, active: Option<u32>) {
-    w.set_account_page(page as i32);
-    w.set_accounts(VecModel::from_slice(&account_rows(material, network, page, active)));
-    w.set_screen(Screen::AccountPicker);
+    w.global::<AccountPicker>().set_account_page(page as i32);
+    w.global::<AccountPicker>().set_accounts(VecModel::from_slice(&account_rows(material, network, page, active)));
+    w.global::<Ui>().set_screen(Screen::AccountPicker);
 }
 
 /// Push the device-level contacts list into the "Send to" recents list.
@@ -3539,7 +3540,7 @@ fn refresh_contacts(w: &AppWindow, st: &State) {
             pq: c.mlkem_ek.is_some(),
         })
         .collect();
-    w.set_contacts(VecModel::from_slice(&contacts));
+    w.global::<Ui>().set_contacts(VecModel::from_slice(&contacts));
 }
 
 /// The rename dialog's "Quantum key" display line for the contact at
@@ -3681,8 +3682,8 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
         // Uniform To section (Sal, 2026-07-19): the row shows just the
         // name/address now — the "To" CAPTION above it carries that label,
         // so the value itself drops the "To: " prefix.
-        w.set_to_label("Self (my notebook)".into());
-        w.set_directed(false);
+        w.global::<Ui>().set_to_label("Self (my notebook)".into());
+        w.global::<Ui>().set_directed(false);
         println!("cb: pick-contact to=self");
     } else {
         let mut a = normalize_addr(addr);
@@ -3692,7 +3693,7 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
                 a = lower;
             } else {
                 println!("cb: pick-contact err=bad-address");
-                w.set_status(format!("not a valid {} address", st.network.as_str()).into());
+                w.global::<Ui>().set_status(format!("not a valid {} address", st.network.as_str()).into());
                 return;
             }
         }
@@ -3712,33 +3713,33 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
             .find(|c| c.address == a && !c.name.is_empty())
             .map(|c| c.name.clone())
             .unwrap_or_else(|| a.clone());
-        w.set_to_label(display.into());
+        w.global::<Ui>().set_to_label(display.into());
         st.to_address = Some(a);
-        w.set_directed(true);
+        w.global::<Ui>().set_directed(true);
     }
     let rate = st.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
     if st.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
-        w.set_compose_private(false); // no sealing key on this device
+        w.global::<Compose>().set_compose_private(false); // no sealing key on this device
     }
-    w.set_fee_tier(1);
-    w.set_rate_text(format!("{rate}").into());
-    w.set_change_address("".into());
-    w.set_change_expanded(false);
-    w.set_spend_expanded(false);
+    w.global::<Compose>().set_fee_tier(1);
+    w.global::<Compose>().set_rate_text(format!("{rate}").into());
+    w.global::<Ui>().set_change_address("".into());
+    w.global::<Ui>().set_change_expanded(false);
+    w.global::<Ui>().set_spend_expanded(false);
     st.coins_overridden = false;
     st.consolidate_coins = false;
-    w.set_coin_strategy(0);
-    w.set_gift_sats(format!("{DUST_SATS}").into());
-    w.set_gift_expanded(false);
+    w.global::<PayFrom>().set_coin_strategy(0);
+    w.global::<Compose>().set_gift_sats(format!("{DUST_SATS}").into());
+    w.global::<Compose>().set_gift_expanded(false);
     st.selected_coins.clear();
-    w.set_status("".into());
-    w.set_payfrom_expanded(false);
+    w.global::<Ui>().set_status("".into());
+    w.global::<Ui>().set_payfrom_expanded(false);
     // Funding-unification UI rework: fresh compose session, fresh
     // cross-wallet coin memory + change pick (an explicit change choice
     // from a PRIOR note must never leak into this one).
     st.mixed_selected.clear();
     st.change_choice.clear();
-    w.set_change_choice("".into());
+    w.global::<Ui>().set_change_choice("".into());
     st.payfrom_manual = false; // a fresh compose session — see resolve_payfrom_default
     // Independent-expand rework (2026-07-18): visual expansion + the
     // external-wallet peek cache are per-compose-session UI state, never
@@ -3752,26 +3753,26 @@ fn pick_contact_core(w: &AppWindow, st: &mut State, addr: &str) {
     // one (mirrors every other per-compose-session reset above).
     st.to_addresses_extra.clear();
     st.picking_extra = false;
-    w.set_picking_extra(false);
+    w.global::<Ui>().set_picking_extra(false);
     refresh_to_chips(w, st);
     resolve_payfrom_default(w, st);
     // A fresh compose session — the locktime override never survives past
     // the screen it was set on (see `reset_tx_lock_time_override`'s doc
     // comment).
     st.reset_tx_lock_time_override();
-    w.set_compose_locktime_expanded(false);
+    w.global::<Compose>().set_compose_locktime_expanded(false);
     refresh_compose_locktime_panel(w, st);
     // Post-quantum layers: a fresh compose session starts fresh too — a
     // passphrase or ML-KEM choice from a PRIOR note must never leak into
     // this one, same rule as every other field reset above.
-    w.set_pq_expanded(false);
-    w.set_pq_passphrase_enabled(false);
-    w.set_pq_passphrase_text("".into());
-    w.set_pq_mlkem_enabled(false);
+    w.global::<Compose>().set_pq_expanded(false);
+    w.global::<Compose>().set_pq_passphrase_enabled(false);
+    w.global::<Compose>().set_pq_passphrase_text("".into());
+    w.global::<Compose>().set_pq_mlkem_enabled(false);
     st.pq_passphrase_verified = false;
     st.pq_passphrase_generated = None;
     st.pq_recipient_cache = None;
-    w.set_screen(Screen::Compose);
+    w.global::<Ui>().set_screen(Screen::Compose);
     refresh_compose(w, st);
 }
 
@@ -3795,7 +3796,7 @@ fn refresh_to_chips(w: &AppWindow, st: &State) {
             ContactItem { address: a.clone().into(), name: name.into(), synced: false, sync_status: 0, pq: false }
         })
         .collect();
-    w.set_to_chips(VecModel::from_slice(&rows));
+    w.global::<Compose>().set_to_chips(VecModel::from_slice(&rows));
 }
 
 /// Multi-select: append `addr` to `st.to_addresses_extra` (validated,
@@ -3809,7 +3810,7 @@ fn refresh_to_chips(w: &AppWindow, st: &State) {
 fn add_recipient_chip(w: &AppWindow, st: &mut State, addr: &str) {
     let mut a = normalize_addr(addr);
     if a == "self" || a.is_empty() {
-        w.set_status("pick an address".into());
+        w.global::<Ui>().set_status("pick an address".into());
         return;
     }
     let parsed = match Recipient::parse(st.network, &a) {
@@ -3823,7 +3824,7 @@ fn add_recipient_chip(w: &AppWindow, st: &mut State, addr: &str) {
                 }
                 Err(_) => {
                     println!("cb: add-chip err=bad-address");
-                    w.set_status(format!("not a valid {} address", st.network.as_str()).into());
+                    w.global::<Ui>().set_status(format!("not a valid {} address", st.network.as_str()).into());
                     return;
                 }
             }
@@ -3833,25 +3834,25 @@ fn add_recipient_chip(w: &AppWindow, st: &mut State, addr: &str) {
     // (notes-core's `Error::RecipientNotTaproot`, surfaced when Sign is
     // tapped) — checked proactively here too, before it's even added as a
     // chip, since private+non-taproot is knowable immediately.
-    if w.get_compose_private() && parsed.p2tr_x.is_none() {
+    if w.global::<Compose>().get_compose_private() && parsed.p2tr_x.is_none() {
         println!("cb: add-chip err=not-taproot");
-        w.set_status("private directed notes need a taproot (bc1p…) recipient".into());
+        w.global::<Ui>().set_status("private directed notes need a taproot (bc1p…) recipient".into());
         return;
     }
     let already = st.to_address.as_deref() == Some(a.as_str()) || st.to_addresses_extra.iter().any(|x| x == &a);
     st.picking_extra = false;
-    w.set_picking_extra(false);
+    w.global::<Ui>().set_picking_extra(false);
     if already {
         println!("cb: add-chip dup");
-        w.set_status("already added".into());
-        w.set_screen(Screen::Compose);
+        w.global::<Ui>().set_status("already added".into());
+        w.global::<Ui>().set_screen(Screen::Compose);
         return;
     }
     let total = 1 + st.to_addresses_extra.len();
     if total >= 255 {
         println!("cb: add-chip err=limit");
-        w.set_status("recipient limit reached (255)".into());
-        w.set_screen(Screen::Compose);
+        w.global::<Ui>().set_status("recipient limit reached (255)".into());
+        w.global::<Ui>().set_screen(Screen::Compose);
         return;
     }
     st.touch_contact(&a);
@@ -3860,7 +3861,7 @@ fn add_recipient_chip(w: &AppWindow, st: &mut State, addr: &str) {
     st.to_addresses_extra.push(a.clone());
     println!("cb: add-chip n={}", st.to_addresses_extra.len() + 1);
     refresh_to_chips(w, st);
-    w.set_screen(Screen::Compose);
+    w.global::<Ui>().set_screen(Screen::Compose);
     refresh_compose(w, st);
 }
 
@@ -3935,15 +3936,15 @@ fn stage_new_mnemonic(w: &AppWindow, s: &mut State, phrase: String) {
         // Never set outside automation.
         println!("cb-test: words={phrase}");
     }
-    w.set_backup_words(grid.into());
+    w.global::<Ui>().set_backup_words(grid.into());
     s.pending_mnemonic = Some(phrase);
     // New key on an online device → default the iCloud backup ON when iCloud
     // is available (the user can still turn it off).
     let avail = keychain::icloud_available();
     s.icloud_backup = avail;
-    w.set_icloud_backup(avail);
-    w.set_icloud_enabled(avail);
-    w.set_screen(Screen::BackupWords);
+    w.global::<Ui>().set_icloud_backup(avail);
+    w.global::<Ui>().set_icloud_enabled(avail);
+    w.global::<Ui>().set_screen(Screen::BackupWords);
 }
 
 /// Repaint the dice screen: counter, remaining, the LIVE hash, and whether
@@ -3960,10 +3961,10 @@ fn update_dice_ui(w: &AppWindow, s: &State) {
     let need = dice_min_rolls(s.new_word_count).unwrap_or(99);
     let hex_all = dice_entropy(rolls).map(hex::encode).unwrap_or_default();
     let (a, b) = hex_all.split_at(hex_all.len().min(32));
-    w.set_dice_count(count as i32);
-    w.set_dice_needed(need as i32);
-    w.set_dice_hash(a.into());
-    w.set_dice_hash2(b.into());
+    w.global::<Ui>().set_dice_count(count as i32);
+    w.global::<Dice>().set_dice_needed(need as i32);
+    w.global::<Ui>().set_dice_hash(a.into());
+    w.global::<Dice>().set_dice_hash2(b.into());
 
     // Distribution sanity, same spirit as the reference implementations: a
     // face appearing far more than its 1/6 share usually means a loaded die or
@@ -3973,12 +3974,12 @@ fn update_dice_ui(w: &AppWindow, s: &State) {
     // sequence.
     let counts = dice_face_counts(rolls);
     let skewed = count >= 20 && counts.iter().any(|&c| c * 10 > count * 3);
-    w.set_dice_warning(if skewed {
+    w.global::<Dice>().set_dice_warning(if skewed {
         "One number is coming up more than 30% of the time — if that's a real die, keep rolling.".into()
     } else {
         "".into()
     });
-    w.set_dice_ready(count >= need);
+    w.global::<Dice>().set_dice_ready(count >= need);
 }
 
 fn ensure_first_onboarded_notebook(s: &mut State) {
@@ -4007,22 +4008,22 @@ fn ensure_first_onboarded_notebook(s: &mut State) {
 /// clearing them is the wipe.
 fn clear_reveal(w: &AppWindow, s: &mut State) {
     let empty: Vec<RevealRow> = Vec::new();
-    w.set_reveal_public_rows(VecModel::from_slice(&empty));
-    w.set_reveal_public_hint("".into());
-    w.set_reveal_fingerprint("".into());
-    w.set_reveal_has_recovery(false);
-    w.set_reveal_has_xprv(false);
-    w.set_reveal_has_hex(false);
-    w.set_reveal_has_wif(false);
-    w.set_reveal_private_format("".into());
-    w.set_reveal_private_value("".into());
-    w.set_reveal_private_qr(slint::Image::default());
-    w.set_reveal_words_col1("".into());
-    w.set_reveal_words_col2("".into());
-    w.set_reveal_show_seedqr(false);
-    w.set_reveal_seedqr_image(slint::Image::default());
-    w.set_reveal_nb_rows(VecModel::from_slice(&Vec::<NbPickRow>::new()));
-    w.set_reveal_nb_index(0);
+    w.global::<PublicKeys>().set_reveal_public_rows(VecModel::from_slice(&empty));
+    w.global::<Ui>().set_reveal_public_hint("".into());
+    w.global::<Ui>().set_reveal_fingerprint("".into());
+    w.global::<PrivateKeys>().set_reveal_has_recovery(false);
+    w.global::<PrivateKeys>().set_reveal_has_xprv(false);
+    w.global::<PrivateKeys>().set_reveal_has_hex(false);
+    w.global::<PrivateKeys>().set_reveal_has_wif(false);
+    w.global::<Ui>().set_reveal_private_format("".into());
+    w.global::<PrivateKeys>().set_reveal_private_value("".into());
+    w.global::<PrivateKeys>().set_reveal_private_qr(slint::Image::default());
+    w.global::<PrivateKeys>().set_reveal_words_col1("".into());
+    w.global::<PrivateKeys>().set_reveal_words_col2("".into());
+    w.global::<PrivateKeys>().set_reveal_show_seedqr(false);
+    w.global::<PrivateKeys>().set_reveal_seedqr_image(slint::Image::default());
+    w.global::<PrivateKeys>().set_reveal_nb_rows(VecModel::from_slice(&Vec::<NbPickRow>::new()));
+    w.global::<PrivateKeys>().set_reveal_nb_index(0);
     s.reveal_formats = None;
 }
 
@@ -4078,12 +4079,12 @@ fn pq_import_source_label(source: &app_core::pgp_import::ImportSource) -> String
 /// gets a blank fingerprint; the card itself is hidden in that case
 /// (`!root.watch-only` in app.slint), so this is just defense in depth.
 fn update_pq_keys_screen(w: &AppWindow, st: &State) {
-    w.set_pq_key_level(pq_level_str(st.pq_level).into());
+    w.global::<QuantumKeys>().set_pq_key_level(pq_level_str(st.pq_level).into());
     let fingerprint = st.ident.as_ref().and_then(|i| i.leaf_secret()).map(|ls| {
         let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(st.pq_level));
         app_core::pqkeys::fingerprint(&kp)
     });
-    w.set_pq_key_fingerprint(fingerprint.unwrap_or_default().into());
+    w.global::<QuantumKeys>().set_pq_key_fingerprint(fingerprint.unwrap_or_default().into());
     let import_line = st.pq_imported.as_ref().map(|kp| {
         format!(
             "{} · {}",
@@ -4091,7 +4092,7 @@ fn update_pq_keys_screen(w: &AppWindow, st: &State) {
             app_core::pqkeys::fingerprint(kp)
         )
     });
-    w.set_pq_import_fp(import_line.unwrap_or_default().into());
+    w.global::<Ui>().set_pq_import_fp(import_line.unwrap_or_default().into());
     // "My quantum key"'s public armor never needs a warning — show its QR
     // whenever a key is present so it's ready to share/scan immediately,
     // no separate reveal step (unlike the private half below screen 29's
@@ -4100,7 +4101,7 @@ fn update_pq_keys_screen(w: &AppWindow, st: &State) {
         .pq_imported
         .as_ref()
         .and_then(|kp| qr::qr_image(&app_core::notes_core::pq::export_public(kp.alg(), kp.ek())));
-    w.set_pq_imported_public_qr(public_qr.unwrap_or_default());
+    w.global::<QuantumKeys>().set_pq_imported_public_qr(public_qr.unwrap_or_default());
 }
 
 /// Generate a fresh "My quantum key" — deliberately NOT seed-derived
@@ -4111,15 +4112,15 @@ fn update_pq_keys_screen(w: &AppWindow, st: &State) {
 /// `on_pq_replace_confirm` once the replace guard is confirmed — never
 /// called while a key exists without that confirm having fired first.
 fn do_pq_generate(w: &AppWindow, s: &mut State) {
-    let level = pq_level_from_str(w.get_pq_gen_level().as_str())
+    let level = pq_level_from_str(w.global::<QuantumKeys>().get_pq_gen_level().as_str())
         .unwrap_or(app_core::passphrase::MlKemLevel::DEFAULT);
-    let extra = w.get_pq_gen_extra().to_string();
-    w.set_pq_import_error("".into());
+    let extra = w.global::<QuantumKeys>().get_pq_gen_extra().to_string();
+    w.global::<QuantumKeys>().set_pq_import_error("".into());
     let (kp, armor) = match app_core::pqkeys::generate_native_private(level, extra.as_bytes()) {
         Ok(v) => v,
         Err(e) => {
             println!("cb: pq-key-generate err={e}");
-            w.set_pq_import_error(e.to_string().into());
+            w.global::<QuantumKeys>().set_pq_import_error(e.to_string().into());
             return;
         }
     };
@@ -4127,14 +4128,14 @@ fn do_pq_generate(w: &AppWindow, s: &mut State) {
         Ok(()) => {
             let fp = app_core::pqkeys::fingerprint(&kp);
             println!("cb: pq-key-generate ok level={} fp={fp}", pq_level_str(level));
-            w.set_pq_gen_extra("".into());
-            w.set_pq_import_source("Generated on this device".into());
+            w.global::<QuantumKeys>().set_pq_gen_extra("".into());
+            w.global::<Ui>().set_pq_import_source("Generated on this device".into());
             s.pq_imported = Some(kp);
             update_pq_keys_screen(w, s);
         }
         Err(e) => {
             println!("cb: pq-key-generate err={e}");
-            w.set_pq_import_error(format!("couldn't save this key: {e}").into());
+            w.global::<QuantumKeys>().set_pq_import_error(format!("couldn't save this key: {e}").into());
         }
     }
 }
@@ -4145,13 +4146,13 @@ fn do_pq_generate(w: &AppWindow, s: &mut State) {
 /// convention: direct when no key exists yet, or from
 /// `on_pq_replace_confirm` after the replace guard fires.
 fn do_pq_import(w: &AppWindow, s: &mut State) {
-    let text = w.get_pq_import_text().to_string();
-    w.set_pq_import_error("".into());
+    let text = w.global::<QuantumKeys>().get_pq_import_text().to_string();
+    w.global::<QuantumKeys>().set_pq_import_error("".into());
     let imported = match app_core::pgp_import::parse_mlkem_key(&text) {
         Ok(v) => v,
         Err(e) => {
             println!("cb: pq-key-import err={e}");
-            w.set_pq_import_error(e.to_string().into());
+            w.global::<QuantumKeys>().set_pq_import_error(e.to_string().into());
             return;
         }
     };
@@ -4159,7 +4160,7 @@ fn do_pq_import(w: &AppWindow, s: &mut State) {
         Ok(v) => v,
         Err(e) => {
             println!("cb: pq-key-import err={e}");
-            w.set_pq_import_error(e.into());
+            w.global::<QuantumKeys>().set_pq_import_error(e.into());
             return;
         }
     };
@@ -4167,14 +4168,14 @@ fn do_pq_import(w: &AppWindow, s: &mut State) {
         Ok(()) => {
             let fp = app_core::pqkeys::fingerprint(&kp);
             println!("cb: pq-key-import ok fp={fp}");
-            w.set_pq_import_text("".into());
-            w.set_pq_import_source(pq_import_source_label(&imported.source).into());
+            w.global::<QuantumKeys>().set_pq_import_text("".into());
+            w.global::<Ui>().set_pq_import_source(pq_import_source_label(&imported.source).into());
             s.pq_imported = Some(kp);
             update_pq_keys_screen(w, s);
         }
         Err(e) => {
             println!("cb: pq-key-import err={e}");
-            w.set_pq_import_error(format!("couldn't save this key: {e}").into());
+            w.global::<QuantumKeys>().set_pq_import_error(format!("couldn't save this key: {e}").into());
         }
     }
 }
@@ -4219,7 +4220,7 @@ fn private_nb_rows(st: &State) -> Vec<NbPickRow> {
 /// notebooks), so whichever changes last always shows the right value.
 fn derive_leaf_value(s: &State, w: &AppWindow, which: &str) -> Option<String> {
     let material = s.material.as_ref().map(|z| String::from(z.as_str()))?;
-    let index = w.get_reveal_nb_index() as u32;
+    let index = w.global::<PrivateKeys>().get_reveal_nb_index() as u32;
     let f = app_core::keyexport::export_formats(&material, s.network, s.account, index).ok()?;
     match which {
         "hex" => f.leaf_hex.as_ref().map(|z| z.as_str().to_string()),
@@ -4236,10 +4237,10 @@ fn go_home_or_list(w: &AppWindow, st: &State) {
         .unwrap_or(false);
     if listed {
         update_home(w, st);
-        w.set_screen(Screen::Home);
+        w.global::<Ui>().set_screen(Screen::Home);
     } else {
         update_notebook_list(w, st);
-        w.set_screen(Screen::Notebooks);
+        w.global::<Ui>().set_screen(Screen::Notebooks);
     }
 }
 
@@ -4256,7 +4257,7 @@ fn set_sweep_dest(w: &AppWindow, st: &mut State, a: String) {
     match own_index {
         Some(acct) => {
             println!("cb: sweep-pick to={a} (notebook {acct})");
-            w.set_sweep_to_label(
+            w.global::<Sweep>().set_sweep_to_label(
                 format!(
                     "Everything to: {} · {}",
                     st.notebook_display_name(acct),
@@ -4264,7 +4265,7 @@ fn set_sweep_dest(w: &AppWindow, st: &mut State, a: String) {
                 )
                 .into(),
             );
-            w.set_sweep_dest_note(
+            w.global::<Sweep>().set_sweep_dest_note(
                 "Heads up: sweeping between your own notebooks publicly links their addresses on-chain.".into(),
             );
         }
@@ -4279,31 +4280,31 @@ fn set_sweep_dest(w: &AppWindow, st: &mut State, a: String) {
                 .find(|c| c.address == a)
                 .map(|c| c.name.clone())
                 .filter(|n| !n.is_empty());
-            w.set_sweep_to_label(
+            w.global::<Sweep>().set_sweep_to_label(
                 match &name {
                     Some(n) => format!("Everything to: {n} · {a}"),
                     None => format!("Everything to: {a}"),
                 }
                 .into(),
             );
-            w.set_sweep_dest_note("".into());
+            w.global::<Sweep>().set_sweep_dest_note("".into());
         }
     }
-    w.set_sweep_dest(a.into());
-    w.set_sweep_tier(1);
+    w.global::<Ui>().set_sweep_dest(a.into());
+    w.global::<Sweep>().set_sweep_tier(1);
     let rate = st.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
-    w.set_sweep_rate_text(format!("{rate}").into());
-    w.set_sweep_fund_external(false);
-    w.set_sweep_inputs_expanded(false);
+    w.global::<Sweep>().set_sweep_rate_text(format!("{rate}").into());
+    w.global::<Sweep>().set_sweep_fund_external(false);
+    w.global::<Sweep>().set_sweep_inputs_expanded(false);
     // A fresh sweep session — the locktime override never survives past
     // the screen it was set on (see `reset_tx_lock_time_override`'s doc
     // comment).
     st.reset_tx_lock_time_override();
-    w.set_sweep_locktime_expanded(false);
+    w.global::<Sweep>().set_sweep_locktime_expanded(false);
     refresh_sweep_locktime_panel(w, st);
-    w.set_status("".into());
+    w.global::<Ui>().set_status("".into());
     update_sweep_screen(w, st);
-    w.set_screen(Screen::Sweep);
+    w.global::<Ui>().set_screen(Screen::Sweep);
 }
 
 /// The per-notebook self-consolidate flow (screen 16, kind
@@ -4319,32 +4320,32 @@ fn open_notebook_consolidate(w: &AppWindow, st: &mut State) {
         .map(|s| s.utxos.iter().filter(|u| !u.pending_spend).count())
         .unwrap_or(0);
     if spendable < 2 {
-        w.set_status("nothing to consolidate (need 2+ coins)".into());
+        w.global::<Ui>().set_status("nothing to consolidate (need 2+ coins)".into());
         return;
     }
     let Some(addr) = st.ident.as_ref().map(|i| i.address.clone()) else { return };
     println!("cb: consolidate-open coins={spendable}");
-    w.set_sweep_kind("consolidate".into());
-    w.set_sweep_dest(addr.clone().into());
-    w.set_sweep_dest_note("".into());
+    w.global::<Ui>().set_sweep_kind("consolidate".into());
+    w.global::<Ui>().set_sweep_dest(addr.clone().into());
+    w.global::<Sweep>().set_sweep_dest_note("".into());
     let nb_name = st
         .ident
         .as_ref()
         .map(|i| st.notebook_display_name(i.index))
         .unwrap_or_else(|| "this notebook".into());
-    w.set_sweep_to_label(format!("Consolidate within {nb_name} · {}", addr_short(&addr)).into());
-    w.set_sweep_tier(1);
+    w.global::<Sweep>().set_sweep_to_label(format!("Consolidate within {nb_name} · {}", addr_short(&addr)).into());
+    w.global::<Sweep>().set_sweep_tier(1);
     let rate = st.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
-    w.set_sweep_rate_text(format!("{rate}").into());
-    w.set_sweep_fund_external(false);
-    w.set_sweep_inputs_expanded(false);
+    w.global::<Sweep>().set_sweep_rate_text(format!("{rate}").into());
+    w.global::<Sweep>().set_sweep_fund_external(false);
+    w.global::<Sweep>().set_sweep_inputs_expanded(false);
     // A fresh consolidate session — same reset rule as `set_sweep_dest`.
     st.reset_tx_lock_time_override();
-    w.set_sweep_locktime_expanded(false);
+    w.global::<Sweep>().set_sweep_locktime_expanded(false);
     refresh_sweep_locktime_panel(w, st);
-    w.set_status("".into());
+    w.global::<Ui>().set_status("".into());
     update_sweep_screen(w, st);
-    w.set_screen(Screen::Sweep);
+    w.global::<Ui>().set_screen(Screen::Sweep);
 }
 
 /// A (possibly inactive) notebook's store (by receive index within the
@@ -4384,7 +4385,7 @@ fn sender_label(st: &State, key: &str) -> String {
 /// sender filter, so the row preview matches what opening it reveals.
 fn update_notebook_list(w: &AppWindow, st: &State) {
     let Some(ix) = &st.notebooks else { return };
-    w.set_can_create_notebook(
+    w.global::<Notebooks>().set_can_create_notebook(
         st.material
             .as_deref()
             .map(|m| is_multi_notebook(m, st.network))
@@ -4441,9 +4442,9 @@ fn update_notebook_list(w: &AppWindow, st: &State) {
         }
     }
     println!("cb: notebooks list n={} archived={}", active_rows.len(), archived_rows.len());
-    w.set_notebooks(VecModel::from_slice(&active_rows));
-    w.set_archived_notebooks(VecModel::from_slice(&archived_rows));
-    w.set_archived_toggle_label(
+    w.global::<Ui>().set_notebooks(VecModel::from_slice(&active_rows));
+    w.global::<Notebooks>().set_archived_notebooks(VecModel::from_slice(&archived_rows));
+    w.global::<Notebooks>().set_archived_toggle_label(
         if archived_rows.is_empty() {
             String::new()
         } else {
@@ -4544,10 +4545,10 @@ fn refresh_compose_locktime_panel(w: &AppWindow, st: &State) {
     let policy = st.tx_lock_time_override.unwrap_or(st.lock_time_policy);
     let tip = st.store.as_ref().map(|s| s.tip_height);
     let (mode, height, effective, warn) = locktime_panel_values(policy, tip);
-    w.set_compose_locktime_mode(mode.into());
-    w.set_compose_locktime_height(height.into());
-    w.set_compose_locktime_effective(effective.into());
-    w.set_compose_locktime_warn(warn.into());
+    w.global::<Compose>().set_compose_locktime_mode(mode.into());
+    w.global::<Compose>().set_compose_locktime_height(height.into());
+    w.global::<Compose>().set_compose_locktime_effective(effective.into());
+    w.global::<Compose>().set_compose_locktime_warn(warn.into());
 }
 
 /// Whether the compose screen's post-quantum "Security" section applies at
@@ -4562,7 +4563,7 @@ fn refresh_compose_locktime_panel(w: &AppWindow, st: &State) {
 /// Rust caller that needs to know whether pq layers are even reachable
 /// right now.
 fn pq_compose_eligible(w: &AppWindow, st: &State) -> bool {
-    w.get_compose_private()
+    w.global::<Compose>().get_compose_private()
         && st.to_addresses_extra.is_empty()
         && st.ident.as_ref().map(|i| !i.is_watch()).unwrap_or(false)
         && st.payfrom_active_source == "notebook"
@@ -4587,10 +4588,10 @@ fn refresh_compose_pq(
         // the outward-facing props at their inert defaults so nothing
         // stale lingers if the section becomes reachable again mid-session
         // (e.g. the user removes an extra recipient chip).
-        w.set_pq_quantum_resistant(false);
-        w.set_pq_security_label("".into());
-        w.set_pq_mlkem_available(false);
-        w.set_pq_mlkem_caption("".into());
+        w.global::<Ui>().set_pq_quantum_resistant(false);
+        w.global::<Compose>().set_pq_security_label("".into());
+        w.global::<Compose>().set_pq_mlkem_available(false);
+        w.global::<Compose>().set_pq_mlkem_caption("".into());
         return (0, None);
     }
 
@@ -4644,19 +4645,19 @@ fn refresh_compose_pq(
             ),
         }
     };
-    w.set_pq_mlkem_available(mlkem_available);
-    w.set_pq_mlkem_caption(mlkem_caption.into());
+    w.global::<Compose>().set_pq_mlkem_available(mlkem_available);
+    w.global::<Compose>().set_pq_mlkem_caption(mlkem_caption.into());
     // The recipient changed out from under an enabled toggle (picked a
     // different contact without one) — don't leave it silently on for a
     // layer that can no longer apply.
-    if !mlkem_available && w.get_pq_mlkem_enabled() {
-        w.set_pq_mlkem_enabled(false);
+    if !mlkem_available && w.global::<Compose>().get_pq_mlkem_enabled() {
+        w.global::<Compose>().set_pq_mlkem_enabled(false);
     }
-    let mlkem_on = mlkem_available && w.get_pq_mlkem_enabled();
+    let mlkem_on = mlkem_available && w.global::<Compose>().get_pq_mlkem_enabled();
 
     // ---- passphrase layer ----
-    let passphrase_on = w.get_pq_passphrase_enabled();
-    let passphrase_text = w.get_pq_passphrase_text().to_string();
+    let passphrase_on = w.global::<Compose>().get_pq_passphrase_enabled();
+    let passphrase_text = w.global::<Compose>().get_pq_passphrase_text().to_string();
     let (passphrase_bits, strength_line) = if passphrase_on {
         let strength = if st.pq_passphrase_verified {
             passphrase::check_generated()
@@ -4672,7 +4673,7 @@ fn refresh_compose_pq(
         let weak = !st.pq_passphrase_verified
             && !passphrase_text.is_empty()
             && strength.bits < 45.0;
-        w.set_pq_passphrase_weak(weak);
+        w.global::<Compose>().set_pq_passphrase_weak(weak);
         let line = if st.pq_passphrase_verified {
             format!("{:.0}-bit generated phrase", strength.bits)
         } else if weak {
@@ -4690,8 +4691,8 @@ fn refresh_compose_pq(
     } else {
         (None, String::new())
     };
-    w.set_pq_passphrase_verified(passphrase_on && st.pq_passphrase_verified);
-    w.set_pq_passphrase_strength_line(strength_line.into());
+    w.global::<Compose>().set_pq_passphrase_verified(passphrase_on && st.pq_passphrase_verified);
+    w.global::<Compose>().set_pq_passphrase_strength_line(strength_line.into());
 
     // ---- combined label (Rust-computed, never reimplemented in slint) --
     let choice = SecurityChoice {
@@ -4706,8 +4707,8 @@ fn refresh_compose_pq(
     // here, and the patch went stale; the whole table is pinned in
     // app-core/tests/security_label_contract.rs). Nothing to override.
     let (quantum_resistant, label) = passphrase::describe(&choice);
-    w.set_pq_quantum_resistant(quantum_resistant);
-    w.set_pq_security_label(label.into());
+    w.global::<Ui>().set_pq_quantum_resistant(quantum_resistant);
+    w.global::<Compose>().set_pq_security_label(label.into());
 
     let flags = (if passphrase_on { FLAG_PW } else { 0 }) | (if mlkem_on { FLAG_MLKEM } else { 0 });
     let alg = if mlkem_on { mlkem_level.map(app_core::pqkeys::pq_alg) } else { None };
@@ -4720,28 +4721,28 @@ fn refresh_sweep_locktime_panel(w: &AppWindow, st: &State) {
     let policy = st.tx_lock_time_override.unwrap_or(st.lock_time_policy);
     let tip = st.store.as_ref().map(|s| s.tip_height);
     let (mode, height, effective, warn) = locktime_panel_values(policy, tip);
-    w.set_sweep_locktime_mode(mode.into());
-    w.set_sweep_locktime_height(height.into());
-    w.set_sweep_locktime_effective(effective.into());
-    w.set_sweep_locktime_warn(warn.into());
+    w.global::<Sweep>().set_sweep_locktime_mode(mode.into());
+    w.global::<Sweep>().set_sweep_locktime_height(height.into());
+    w.global::<Sweep>().set_sweep_locktime_effective(effective.into());
+    w.global::<Sweep>().set_sweep_locktime_warn(warn.into());
 }
 
 fn update_settings_identity(w: &AppWindow, st: &State) {
     let policy = st.lock_time_policy;
-    w.set_locktime_mode(policy.as_str().into());
-    w.set_locktime_text(st.lock_time().to_string().into());
-    w.set_locktime_effective(
+    w.global::<Settings>().set_locktime_mode(policy.as_str().into());
+    w.global::<Settings>().set_locktime_text(st.lock_time().to_string().into());
+    w.global::<Settings>().set_locktime_effective(
         locktime_caption(policy, st.store.as_ref().map(|s| s.tip_height)).into(),
     );
-    w.set_settings_network(st.network.as_str().into());
+    w.global::<Settings>().set_settings_network(st.network.as_str().into());
     // Runs on every activate, including the import paths that never paint
     // home — see `update_identity_flags`.
     update_identity_flags(w, st);
     // Audit M2: surface a key-protection downgrade instead of letting it pass
     // silently. Recomputed here because this runs after every activate /
     // identity change, which is exactly when the answer can change.
-    w.set_key_protection_degraded(st.ident.is_some() && keychain::protection_degraded());
-    w.set_settings_hierarchical(
+    w.global::<Settings>().set_key_protection_degraded(st.ident.is_some() && keychain::protection_degraded());
+    w.global::<Settings>().set_settings_hierarchical(
         st.material
             .as_deref()
             .map(|m| is_hierarchical(m, st.network))
@@ -4763,7 +4764,7 @@ fn update_settings_identity(w: &AppWindow, st: &State) {
         } else {
             String::new()
         };
-        w.set_settings_identity(
+        w.global::<Settings>().set_settings_identity(
             format!(
                 "{}{} · {}{acct_part} · {} notebook{}{}",
                 i.kind,
@@ -4777,7 +4778,7 @@ fn update_settings_identity(w: &AppWindow, st: &State) {
         );
     }
     if let Some(store) = &st.store {
-        w.set_chunk_text(store.chunk_size.to_string().into());
+        w.global::<Settings>().set_chunk_text(store.chunk_size.to_string().into());
     }
 }
 
@@ -4797,11 +4798,11 @@ fn update_settings_identity(w: &AppWindow, st: &State) {
 /// been there. Boot was always fine — it calls `update_home` before landing.
 fn update_identity_flags(w: &AppWindow, st: &State) {
     let Some(ident) = &st.ident else { return };
-    w.set_watch_only(ident.is_watch());
+    w.global::<Ui>().set_watch_only(ident.is_watch());
     // Single-key imports (wif/hex) have no account-level public material —
     // no xpub/descriptor to export — so hide the "Public keys" entry rather
     // than route to a dead-end hint (mirrors hiding Private for watch-only).
-    w.set_reveal_can_public(!matches!(ident.kind, "wif" | "hex"));
+    w.global::<Settings>().set_reveal_can_public(!matches!(ident.kind, "wif" | "hex"));
 }
 
 fn update_home(w: &AppWindow, st: &State) {
@@ -4809,12 +4810,12 @@ fn update_home(w: &AppWindow, st: &State) {
     let Some(store) = &st.store else { return };
     let watch = ident.is_watch();
     update_identity_flags(w, st);
-    w.set_notebook_title(st.notebook_display_name(ident.index).into());
-    w.set_address(ident.address.as_str().into());
+    w.global::<Home>().set_notebook_title(st.notebook_display_name(ident.index).into());
+    w.global::<Ui>().set_address(ident.address.as_str().into());
     if let Some(img) = qr::qr_image(&ident.address.to_uppercase()) {
-        w.set_address_qr(img);
+        w.global::<Home>().set_address_qr(img);
     }
-    w.set_balance_line(
+    w.global::<Home>().set_balance_line(
         format!("{} sats · block {}", commas(store.balance()), commas(store.tip_height))
             .into(),
     );
@@ -4831,8 +4832,8 @@ fn update_home(w: &AppWindow, st: &State) {
         })
         .collect();
     let hidden = senders.iter().filter(|s| s.excluded).count();
-    w.set_senders(VecModel::from_slice(&senders));
-    w.set_hidden_senders_label(
+    w.global::<Ui>().set_senders(VecModel::from_slice(&senders));
+    w.global::<Home>().set_hidden_senders_label(
         match hidden {
             0 => String::new(),
             1 => "1 sender hidden".into(),
@@ -4889,7 +4890,7 @@ fn update_home(w: &AppWindow, st: &State) {
         })
         .collect();
     items.sort_by_key(|i| i.badge == "confirmed");
-    w.set_notes(VecModel::from_slice(&items));
+    w.global::<Ui>().set_notes(VecModel::from_slice(&items));
     refresh_contacts(w, st);
     update_settings_identity(w, st);
     load_backend_settings(w, st);
@@ -4943,7 +4944,7 @@ fn update_wallet_coins(w: &AppWindow, st: &State) {
         spendable += c.value;
     }
     let n = coins.len();
-    w.set_coins(VecModel::from_slice(&coins));
+    w.global::<Ui>().set_coins(VecModel::from_slice(&coins));
     // The aggregate (both pools) belongs ONLY on the Settings Coins card,
     // which has no segments of its own. The Coins SCREEN's notebook segment
     // and the notebook-consolidate confirm keep the notebook-only line —
@@ -4959,8 +4960,8 @@ fn update_wallet_coins(w: &AppWindow, st: &State) {
     } else {
         None
     };
-    w.set_coins_summary(app_core::mixed::coins_summary_line(n, spendable, notebooks, None).into());
-    w.set_coins_summary_settings(
+    w.global::<Ui>().set_coins_summary(app_core::mixed::coins_summary_line(n, spendable, notebooks, None).into());
+    w.global::<Settings>().set_coins_summary_settings(
         app_core::mixed::coins_summary_line(n, spendable, notebooks, spending_state).into(),
     );
 }
@@ -5542,7 +5543,7 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
         return;
     }
     let Some(base) = st.base_url() else {
-        w.set_status("no Bitcoin node for this network — set one in Settings".into());
+        w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
         return;
     };
     let Some(fp8) = st.notebooks_fp8.clone() else { return };
@@ -5632,7 +5633,7 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
                         change: Err(msg),
                     });
                 let _ =
-                    weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_stores_refresh());
+                    weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_stores_refresh());
                 return;
             }
         };
@@ -5682,12 +5683,12 @@ fn wallet_stores_refresh_async(w: &AppWindow, st: &mut State, purpose: WalletSto
                 results,
                 change,
             });
-        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_stores_refresh());
+        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_stores_refresh());
     };
     if scan_lane_submit(key, job) {
         st.scan_gate.set_wallet_stores(true);
         update_scan_gate(w, st);
-        w.set_status("syncing…".into());
+        w.global::<Ui>().set_status("syncing…".into());
     }
 }
 
@@ -5741,11 +5742,11 @@ fn apply_pending_rebroadcast_fetch_results(w: &AppWindow, st: &mut State) {
             Ok(raw) if !raw.is_empty() => enter_rebroadcast_confirm(w, st, r.ref_id, r.is_note, raw),
             Ok(_) => {
                 println!("cb: act-retry ref={} err=nothing-to-rebroadcast", r.ref_id);
-                w.set_status("nothing to rebroadcast".into());
+                w.global::<Ui>().set_status("nothing to rebroadcast".into());
             }
             Err(e) => {
                 println!("cb: act-retry ref={} err={e}", r.ref_id);
-                w.set_status(format!("couldn't rebroadcast: {}", friendly_net_err(&e)).into());
+                w.global::<Ui>().set_status(format!("couldn't rebroadcast: {}", friendly_net_err(&e)).into());
             }
         }
     }
@@ -5770,13 +5771,13 @@ fn apply_act_retry_results(w: &AppWindow, st: &mut State) {
         match r.result {
             Ok(txid) => {
                 println!("cb: act-retry ref={} txid={txid} ok", r.ref_id);
-                w.set_status(format!("rebroadcast {}…", &txid[..12.min(txid.len())]).into());
+                w.global::<Ui>().set_status(format!("rebroadcast {}…", &txid[..12.min(txid.len())]).into());
                 show_toast(w, &format!("Rebroadcast ok · {}", &txid[..8.min(txid.len())]));
             }
             Err(e) => {
                 println!("cb: act-retry ref={} err={e}", r.ref_id);
                 let base = st.base_url().unwrap_or_default();
-                w.set_status(
+                w.global::<Ui>().set_status(
                     format!("rebroadcast failed: {}", friendly_broadcast_err(&e, &base)).into(),
                 );
                 show_toast(w, "Rebroadcast failed");
@@ -5813,13 +5814,13 @@ fn apply_act_bump_results(w: &AppWindow, st: &mut State) {
                     "cb: act-bump ref={} txid={} fee={} rate={:.1} ok",
                     r.ref_id, r.txid, r.fee, r.new_rate
                 );
-                w.set_status(format!("sped up: {}…", &bt[..12.min(bt.len())]).into());
+                w.global::<Ui>().set_status(format!("sped up: {}…", &bt[..12.min(bt.len())]).into());
                 show_toast(w, &format!("Sped up · {}", &bt[..8.min(bt.len())]));
             }
             Err(e) => {
                 println!("cb: act-bump ref={} broadcast err={e}", r.ref_id);
                 let base = st.base_url().unwrap_or_default();
-                w.set_status(
+                w.global::<Ui>().set_status(
                     format!("signed but broadcast failed: {}", friendly_broadcast_err(&e, &base))
                         .into(),
                 );
@@ -5981,7 +5982,7 @@ fn apply_sweep_broadcast_result(w: &AppWindow, st: &mut State, r: SweepBroadcast
                 if spending_n > 0 { format!(" spending={spending_n}") } else { String::new() },
                 if change_n > 0 { format!(" change={change_n}") } else { String::new() }
             );
-            w.set_status(
+            w.global::<Ui>().set_status(
                 format!(
                     "swept the wallet — {} sats to {}…",
                     commas(snap.value),
@@ -5990,12 +5991,12 @@ fn apply_sweep_broadcast_result(w: &AppWindow, st: &mut State, r: SweepBroadcast
                 .into(),
             );
             update_notebook_list(w, st);
-            w.set_screen(Screen::Notebooks); // wallet-level flow → the list
+            w.global::<Ui>().set_screen(Screen::Notebooks); // wallet-level flow → the list
         }
         Err(e) => {
             println!("cb: sweep broadcast err={e}");
             let base = st.base_url().unwrap_or_default();
-            w.set_status(
+            w.global::<Ui>().set_status(
                 format!("sweep broadcast failed: {}", friendly_broadcast_err(&e, &base)).into(),
             );
         }
@@ -6049,14 +6050,14 @@ fn apply_consolidate_broadcast_result(w: &AppWindow, st: &mut State, r: Consolid
             }
             st.save_store();
             println!("cb: consolidate txid={txid} value={} fee={}", snap.value, snap.fee);
-            w.set_status(format!("consolidating: {}…", &txid[..12.min(txid.len())]).into());
-            w.set_screen(Screen::Home); // done — home, like the PSBT flow
+            w.global::<Ui>().set_status(format!("consolidating: {}…", &txid[..12.min(txid.len())]).into());
+            w.global::<Ui>().set_screen(Screen::Home); // done — home, like the PSBT flow
             update_home(w, st);
         }
         Err(e) => {
             println!("cb: consolidate broadcast err={e}");
             let base = st.base_url().unwrap_or_default();
-            w.set_status(
+            w.global::<Ui>().set_status(
                 format!("consolidate broadcast failed: {}", friendly_broadcast_err(&e, &base))
                     .into(),
             );
@@ -6180,7 +6181,7 @@ fn apply_wconsol_broadcast_result(w: &AppWindow, st: &mut State, r: WConsolBroad
                 snap.value,
                 snap.fee
             );
-            w.set_status(
+            w.global::<Ui>().set_status(
                 format!(
                     "consolidated — {} sats now at {}",
                     commas(snap.value),
@@ -6188,12 +6189,12 @@ fn apply_wconsol_broadcast_result(w: &AppWindow, st: &mut State, r: WConsolBroad
                 )
                 .into(),
             );
-            w.set_screen(Screen::Notebooks);
+            w.global::<Ui>().set_screen(Screen::Notebooks);
         }
         Err(e) => {
             println!("cb: wallet-consolidate broadcast err={e}");
             let base = st.base_url().unwrap_or_default();
-            w.set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
+            w.global::<Ui>().set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
         }
     }
 }
@@ -6267,26 +6268,26 @@ fn apply_psbt_broadcast_result(w: &AppWindow, st: &mut State, r: PsbtBroadcastRe
             } else {
                 println!("cb: fund-broadcast txid={txid} ok");
             }
-            w.set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
+            w.global::<Ui>().set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
             st.funding_coins.clear();
             st.built_psbt = None;
             st.signed_psbt = None;
             st.ur_frames.clear();
-            w.set_compose_text("".into());
-            w.set_fund_external(false);
-            w.set_psbt_signed(false);
+            w.global::<Compose>().set_compose_text("".into());
+            w.global::<Ui>().set_fund_external(false);
+            w.global::<Ui>().set_psbt_signed(false);
             if wallet_flow {
                 refresh(w, st); // active store first — the list rows read disk + memory
                 update_notebook_list(w, st);
-                w.set_screen(Screen::Notebooks);
+                w.global::<Ui>().set_screen(Screen::Notebooks);
             } else {
-                w.set_screen(Screen::Home);
+                w.global::<Ui>().set_screen(Screen::Home);
                 refresh(w, st);
             }
         }
         Err(e) => {
             let base = st.base_url().unwrap_or_default();
-            w.set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
+            w.global::<Ui>().set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
         }
     }
 }
@@ -6399,7 +6400,7 @@ fn apply_spending_consolidate_result(w: &AppWindow, st: &mut State, r: SpendingC
         Err(e) => {
             println!("cb: spending-consolidate broadcast err={e}");
             let base = st.base_url().unwrap_or_default();
-            w.set_status(
+            w.global::<Ui>().set_status(
                 format!("consolidate failed: {}", friendly_broadcast_err(&e, &base)).into(),
             );
             show_toast(w, "Broadcast failed");
@@ -6436,7 +6437,7 @@ fn apply_pending_wallet_tx_results(w: &AppWindow, st: &mut State) {
         return;
     }
     st.wallet_tx_busy = false;
-    w.set_wallet_tx_busy(false);
+    w.global::<Confirm>().set_wallet_tx_busy(false);
     for r in sweep {
         apply_sweep_broadcast_result(w, st, r);
     }
@@ -6497,25 +6498,25 @@ fn apply_notebook_compose_result(w: &AppWindow, st: &mut State, r: NotebookCompo
             if r.pq_flags != 0 {
                 println!("cb: pq-compose flags={}", r.pq_flags);
             }
-            w.set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
-            w.set_compose_text("".into());
-            w.set_change_address("".into());
-            w.set_change_expanded(false);
-            w.set_spend_expanded(false);
+            w.global::<Ui>().set_status(format!("broadcast {}…", &txid[..12.min(txid.len())]).into());
+            w.global::<Compose>().set_compose_text("".into());
+            w.global::<Ui>().set_change_address("".into());
+            w.global::<Ui>().set_change_expanded(false);
+            w.global::<Ui>().set_spend_expanded(false);
             st.coins_overridden = false;
             st.selected_coins.clear();
             st.mixed_selected.clear();
             st.change_choice.clear();
-            w.set_change_choice("".into());
-            w.set_screen(Screen::Home);
+            w.global::<Ui>().set_change_choice("".into());
+            w.global::<Ui>().set_screen(Screen::Home);
             refresh_async(w, st);
         }
         Err(e) => {
             println!("cb: compose broadcast err={e}");
-            w.set_return_screen(Screen::Home);
+            w.global::<Ui>().set_return_screen(Screen::Home);
             update_activity(w, st);
             let base = st.base_url().unwrap_or_default();
-            w.set_status(
+            w.global::<Ui>().set_status(
                 format!(
                     "broadcast failed: {} — note saved, retry from here",
                     friendly_broadcast_err(&e, &base)
@@ -6523,7 +6524,7 @@ fn apply_notebook_compose_result(w: &AppWindow, st: &mut State, r: NotebookCompo
                 .into(),
             );
             show_toast(w, "Broadcast failed — note saved. Retry from this list.");
-            w.set_screen(Screen::Activity);
+            w.global::<Ui>().set_screen(Screen::Activity);
         }
     }
 }
@@ -6635,18 +6636,18 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
                 r.to.as_deref().unwrap_or("self"), r.private,
                 if r.recipients.len() > 1 { format!(" recipients={}", r.recipients.len()) } else { String::new() }
             );
-            w.set_status(format!("broadcast {}…", &r.txid[..12.min(r.txid.len())]).into());
-            w.set_compose_text("".into());
-            w.set_change_address("".into());
-            w.set_change_expanded(false);
-            w.set_spend_expanded(false);
-            w.set_payfrom_expanded(false);
+            w.global::<Ui>().set_status(format!("broadcast {}…", &r.txid[..12.min(r.txid.len())]).into());
+            w.global::<Compose>().set_compose_text("".into());
+            w.global::<Ui>().set_change_address("".into());
+            w.global::<Ui>().set_change_expanded(false);
+            w.global::<Ui>().set_spend_expanded(false);
+            w.global::<Ui>().set_payfrom_expanded(false);
             st.coins_overridden = false;
             st.selected_coins.clear();
             st.mixed_selected.clear();
             st.change_choice.clear();
-            w.set_change_choice("".into());
-            w.set_screen(Screen::Home);
+            w.global::<Ui>().set_change_choice("".into());
+            w.global::<Ui>().set_screen(Screen::Home);
             refresh_async(w, st);
         }
         // Universal confirm screen (2026-07-17): nothing was recorded, so
@@ -6656,8 +6657,8 @@ fn apply_spending_compose_result(w: &AppWindow, st: &mut State, r: SpendingCompo
         // dropped `pending_broadcast` for every non-psbt kind once it fired).
         Err(e) => {
             let base = st.base_url().unwrap_or_default();
-            w.set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
-            w.set_screen(Screen::Compose);
+            w.global::<Ui>().set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
+            w.global::<Ui>().set_screen(Screen::Compose);
         }
     }
 }
@@ -6804,23 +6805,23 @@ fn apply_mixed_compose_result(w: &AppWindow, st: &mut State, r: MixedComposeResu
                 if change_n > 0 { format!(" change={change_n}") } else { String::new() },
                 if r.recipients.len() > 1 { format!(" recipients={}", r.recipients.len()) } else { String::new() }
             );
-            w.set_status(format!("broadcast {}…", &r.txid[..12.min(r.txid.len())]).into());
-            w.set_compose_text("".into());
-            w.set_change_address("".into());
-            w.set_change_expanded(false);
-            w.set_spend_expanded(false);
-            w.set_payfrom_expanded(false);
+            w.global::<Ui>().set_status(format!("broadcast {}…", &r.txid[..12.min(r.txid.len())]).into());
+            w.global::<Compose>().set_compose_text("".into());
+            w.global::<Ui>().set_change_address("".into());
+            w.global::<Ui>().set_change_expanded(false);
+            w.global::<Ui>().set_spend_expanded(false);
+            w.global::<Ui>().set_payfrom_expanded(false);
             st.coins_overridden = false;
             st.selected_coins.clear();
             st.mixed_selected.clear();
             st.change_choice.clear();
-            w.set_change_choice("".into());
-            w.set_screen(Screen::Home);
+            w.global::<Ui>().set_change_choice("".into());
+            w.global::<Ui>().set_screen(Screen::Home);
             refresh_async(w, st);
         }
         Err(e) => {
             let base = st.base_url().unwrap_or_default();
-            w.set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
+            w.global::<Ui>().set_status(format!("broadcast failed: {}", friendly_broadcast_err(&e, &base)).into());
         }
     }
 }
@@ -6839,15 +6840,15 @@ fn apply_compose_results(w: &AppWindow, st: &mut State) {
         return;
     }
     st.compose_busy = false;
-    w.set_compose_sending(false);
-    w.set_compose_stage("".into());
+    w.global::<Compose>().set_compose_sending(false);
+    w.global::<Ui>().set_compose_stage("".into());
     // Universal confirm screen (2026-07-17): every compose broadcast now
     // fires from screen 26, gated on wallet_tx_busy, not compose_busy — see
     // `on_confirm_broadcast`. Unset it here alongside the (now largely
     // vestigial) compose flags so a failed spending/mixed attempt leaves
     // screen 26's Broadcast button tappable again.
     st.wallet_tx_busy = false;
-    w.set_wallet_tx_busy(false);
+    w.global::<Confirm>().set_wallet_tx_busy(false);
     for r in nb {
         apply_notebook_compose_result(w, st, r);
     }
@@ -6948,7 +6949,7 @@ fn maybe_start_discovery(w: &AppWindow, st: &mut State) {
             .lock()
             .expect("discovery results mutex")
             .push(DiscoveryResult { fp8, network, account, found });
-        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_discovery());
+        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_discovery());
     };
     if scan_lane_submit(key, job) {
         st.discovery_pending = false;
@@ -6980,7 +6981,7 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
     }
     maybe_start_discovery(w, st);
     let Some(base) = st.base_url() else {
-        w.set_status("no Bitcoin node for this network — set one in Settings".into());
+        w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
         return;
     };
     let address = st.ident.as_ref().unwrap().address.clone();
@@ -7013,7 +7014,7 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
                     dropped_lookup: HashMap::new(),
                     dropped_unspent: HashMap::new(),
                 });
-                let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_refresh());
+                let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_refresh());
                 return;
             }
         };
@@ -7040,7 +7041,7 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
                 dropped_lookup: HashMap::new(),
                 dropped_unspent: HashMap::new(),
             });
-            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_refresh());
+            let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_refresh());
             return;
         }
         let bundle = client.build_bundle(&address, None).map_err(|e| format!("{e}"));
@@ -7057,10 +7058,10 @@ fn refresh_async(w: &AppWindow, st: &mut State) {
             dropped_lookup,
             dropped_unspent,
         });
-        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_refresh());
+        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_refresh());
     };
     if scan_lane_submit(key, job) {
-        w.set_status("syncing…".into());
+        w.global::<Ui>().set_status("syncing…".into());
         st.scan_gate.admit_notebook();
         update_scan_gate(w, st);
     }
@@ -7161,14 +7162,14 @@ fn apply_active_bundle(
                         st.store.as_ref().unwrap().tip_height
                     );
                     st.save_store();
-                    w.set_status(format!("synced · {} notes", stats.notes_seen).into());
+                    w.global::<Ui>().set_status(format!("synced · {} notes", stats.notes_seen).into());
                 }
-                Err(e) => w.set_status(format!("apply failed: {e}").into()),
+                Err(e) => w.global::<Ui>().set_status(format!("apply failed: {e}").into()),
             }
         }
         Err(e) => {
             println!("cb: refresh err={e}");
-            w.set_status("couldn't reach the network — tap refresh to retry".into());
+            w.global::<Ui>().set_status("couldn't reach the network — tap refresh to retry".into());
         }
     }
     update_home(w, st);
@@ -7195,12 +7196,12 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
             // longer fetched here at all (network-efficiency, 2026-07-23)
             // — the fee-showing screens fetch them lazily on open.
             println!("cb: refresh unchanged");
-            w.set_status("up to date".into());
+            w.global::<Ui>().set_status("up to date".into());
             update_home(w, st);
             continue;
         };
         apply_active_bundle(w, st, bundle, &r.statuses, &r.dropped_lookup, &r.dropped_unspent, r.new_stats);
-        if w.get_screen() == Screen::PayFrom {
+        if w.global::<Ui>().get_screen() == Screen::PayFrom {
             update_funding_screen_ui(w, st);
             log_funding_refresh(st);
             // A landed notebook rescan must repaint the (now possibly
@@ -7208,8 +7209,8 @@ fn apply_refresh_results(w: &AppWindow, st: &mut State) {
             // summary balance — independent-expand rework, 2026-07-18.
             update_payfrom_panels(w, st);
         }
-        if w.get_screen() == Screen::Compose {
-            w.set_pay_from_balance(balance_text_for(st, w.get_pay_from().as_str()).into());
+        if w.global::<Ui>().get_screen() == Screen::Compose {
+            w.global::<Ui>().set_pay_from_balance(balance_text_for(st, w.global::<Ui>().get_pay_from().as_str()).into());
         }
     }
 }
@@ -7236,7 +7237,7 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
             || st.account != r.account
         {
             println!("cb: {label} stale-drop");
-            w.set_status("".into());
+            w.global::<Ui>().set_status("".into());
             continue;
         }
         // Taproot change-chain coins (unit 3): folds into the SAME (fp8,
@@ -7300,7 +7301,7 @@ fn apply_wallet_stores_refresh_results(w: &AppWindow, st: &mut State) {
         }
         scanned += 1; // the snapshot-time-active notebook, unconditionally
         println!("cb: {label} notebooks={scanned}");
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
         // Repaint the Coins screen/card regardless of which ↻ kicked this
         // scan off — `update_wallet_coins` is a pure re-derive from `st`
         // (no side effects), and the change coins it now folds in just
@@ -7326,7 +7327,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
     }
     maybe_start_discovery(w, st);
     let Some(base) = st.base_url() else {
-        w.set_status("no Bitcoin node for this network — set one in Settings".into());
+        w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
         return;
     };
     let creds = core_rpc_creds_for(st, &base, st.network);
@@ -7334,7 +7335,7 @@ fn refresh(w: &AppWindow, st: &mut State) {
         Ok(c) => c,
         Err(e) => {
             println!("cb: refresh err={e}");
-            w.set_status("couldn't reach the network — tap refresh to retry".into());
+            w.global::<Ui>().set_status("couldn't reach the network — tap refresh to retry".into());
             update_home(w, st);
             return;
         }
@@ -7400,14 +7401,14 @@ fn refresh(w: &AppWindow, st: &mut State) {
                         st.store.as_ref().unwrap().tip_height
                     );
                     st.save_store();
-                    w.set_status(format!("synced · {} notes", stats.notes_seen).into());
+                    w.global::<Ui>().set_status(format!("synced · {} notes", stats.notes_seen).into());
                 }
-                Err(e) => w.set_status(format!("apply failed: {e}").into()),
+                Err(e) => w.global::<Ui>().set_status(format!("apply failed: {e}").into()),
             }
         }
         Err(e) => {
             println!("cb: refresh err={e}");
-            w.set_status("couldn't reach the network — tap refresh to retry".into());
+            w.global::<Ui>().set_status("couldn't reach the network — tap refresh to retry".into());
         }
     }
     update_home(w, st);
@@ -7584,10 +7585,10 @@ fn spending_scan_async(w: &AppWindow, st: &mut State, gap: u32) {
             .lock()
             .expect("spending refresh mutex")
             .push(SpendingRefreshResult { fp8, network, account, scan });
-        let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_spending_refresh());
+        let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_spending_refresh());
     };
     if scan_lane_submit(key, job) {
-        w.set_status("scanning spending wallet…".into());
+        w.global::<Ui>().set_status("scanning spending wallet…".into());
         st.scan_gate.admit_spending();
         update_scan_gate(w, st);
     }
@@ -7652,32 +7653,32 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
                 st.spending_scanned = true;
                 let balance: u64 = st.spending_coins.iter().map(|c| c.value).sum();
                 println!("cb: spending-refresh utxos={} balance={balance}", st.spending_coins.len());
-                w.set_status("".into());
+                w.global::<Ui>().set_status("".into());
             }
             Err(e) => {
                 println!("cb: spending-refresh err={e}");
-                w.set_status(format!("spending wallet scan failed: {}", friendly_net_err(&e)).into());
+                w.global::<Ui>().set_status(format!("spending wallet scan failed: {}", friendly_net_err(&e)).into());
             }
         }
         update_spending_ui(w, st);
-        if w.get_screen() == Screen::Sweep && w.get_sweep_kind() == "sweep" {
+        if w.global::<Ui>().get_screen() == Screen::Sweep && w.global::<Ui>().get_sweep_kind() == "sweep" {
             // A wallet-sweep preview computed before the scan landed shows
             // notebook coins only (Sal 2026-07-17) — recompute it so the
             // spending coins join the inputs summary and fee preview.
             update_sweep_screen(w, st);
         }
-        if w.get_screen() == Screen::Compose {
+        if w.global::<Ui>().get_screen() == Screen::Compose {
             // CHANGE 5: a user already sitting on compose when the scan
             // lands sees the default upgrade to "spending" too — but only
             // absent an explicit pick this session (payfrom_manual).
-            if !st.payfrom_manual && w.get_pay_from() != "spending" {
+            if !st.payfrom_manual && w.global::<Ui>().get_pay_from() != "spending" {
                 resolve_payfrom_default(w, st);
             }
-            if w.get_pay_from() == "spending" {
+            if w.global::<Ui>().get_pay_from() == "spending" {
                 refresh_compose(w, st);
             }
         }
-        if w.get_screen() == Screen::PayFrom {
+        if w.global::<Ui>().get_screen() == Screen::PayFrom {
             log_funding_refresh(st);
             // funding-unification UI rework: a landed scan must repaint the
             // Spending panel (independent-expand rework, 2026-07-18: it now
@@ -7697,32 +7698,32 @@ fn apply_spending_refresh_results(w: &AppWindow, st: &mut State) {
 /// derivation only — no chain call (callers that need fresh data call
 /// [`spending_refresh_async`] first).
 fn update_spending_ui(w: &AppWindow, st: &State) {
-    w.set_spending_capable(st.spending_capable);
+    w.global::<Ui>().set_spending_capable(st.spending_capable);
     let enabled = st.store.as_ref().map(|s| s.spending.enabled).unwrap_or(false);
-    w.set_spending_enabled(enabled);
+    w.global::<Ui>().set_spending_enabled(enabled);
     if !st.spending_capable {
-        w.set_spending_summary("".into());
-        w.set_spending_balance_line("".into());
-        w.set_spending_address("".into());
-        w.set_spending_qr(slint::Image::default());
+        w.global::<PayFrom>().set_spending_summary("".into());
+        w.global::<Ui>().set_spending_balance_line("".into());
+        w.global::<Settings>().set_spending_address("".into());
+        w.global::<Settings>().set_spending_qr(slint::Image::default());
         let empty: Vec<SpendingCoinItem> = Vec::new();
-        w.set_spending_coins_list(VecModel::from_slice(&empty));
+        w.global::<Coins>().set_spending_coins_list(VecModel::from_slice(&empty));
         return;
     }
     let n = st.spending_coins.len();
     let total: u64 = st.spending_coins.iter().map(|c| c.value).sum();
     if !st.spending_scanned {
-        w.set_spending_summary(if enabled { "tap to scan…".to_string() } else { String::new() }.into());
-        w.set_spending_balance_line("not scanned yet — tap refresh".into());
+        w.global::<PayFrom>().set_spending_summary(if enabled { "tap to scan…".to_string() } else { String::new() }.into());
+        w.global::<Ui>().set_spending_balance_line("not scanned yet — tap refresh".into());
     } else {
         let line = format!("{} sats · {n} coin{}", commas(total), if n == 1 { "" } else { "s" });
-        w.set_spending_summary(line.clone().into());
-        w.set_spending_balance_line(line.into());
+        w.global::<PayFrom>().set_spending_summary(line.clone().into());
+        w.global::<Ui>().set_spending_balance_line(line.into());
     }
     if let (Some(src), Some(store)) = (st.spending_source.as_ref(), st.store.as_ref()) {
         if let Ok(d) = src.derive(0, store.spending.next_receive) {
-            w.set_spending_address(d.address.clone().into());
-            w.set_spending_qr(qr::qr_image(&d.address.to_uppercase()).unwrap_or_default());
+            w.global::<Settings>().set_spending_address(d.address.clone().into());
+            w.global::<Settings>().set_spending_qr(qr::qr_image(&d.address.to_uppercase()).unwrap_or_default());
         }
     }
     let exb = st.explorer_base();
@@ -7736,7 +7737,7 @@ fn update_spending_ui(w: &AppWindow, st: &State) {
             status: if c.confirmed { "confirmed" } else { "unconfirmed" }.into(),
         })
         .collect();
-    w.set_spending_coins_list(VecModel::from_slice(&rows));
+    w.global::<Coins>().set_spending_coins_list(VecModel::from_slice(&rows));
 }
 
 /// Estimated (chunks, vsize) for a note. `estimate_note_cost` assumes a
@@ -7971,22 +7972,22 @@ fn suggested_coins(
 fn apply_pay_from(w: &AppWindow, st: &mut State, kind: &str) {
     match kind {
         "spending" => {
-            w.set_pay_from("spending".into());
-            w.set_pay_from_label("Spending wallet".into());
-            w.set_fund_external(false);
-            w.set_spend_from_wallet(true);
+            w.global::<Ui>().set_pay_from("spending".into());
+            w.global::<Compose>().set_pay_from_label("Spending wallet".into());
+            w.global::<Ui>().set_fund_external(false);
+            w.global::<Ui>().set_spend_from_wallet(true);
             if !st.spending_scanned {
                 spending_refresh_async(w, st);
             }
         }
         _ => {
-            w.set_pay_from("notebook".into());
-            w.set_pay_from_label("Notebook".into());
-            w.set_fund_external(false);
-            w.set_spend_from_wallet(false);
+            w.global::<Ui>().set_pay_from("notebook".into());
+            w.global::<Compose>().set_pay_from_label("Notebook".into());
+            w.global::<Ui>().set_fund_external(false);
+            w.global::<Ui>().set_spend_from_wallet(false);
         }
     }
-    w.set_pay_from_balance(balance_text_for(st, kind).into());
+    w.global::<Ui>().set_pay_from_balance(balance_text_for(st, kind).into());
 }
 
 /// Coins remembered under `source` in the cross-wallet selection memory
@@ -8131,9 +8132,9 @@ fn mixed_compose_args(w: &AppWindow, st: &State) -> Result<MixedComposeArgs, Str
 
     // Change: an explicit "custom" pick overrides; otherwise the resolved
     // default already reflected in `change-choice`.
-    let choice = w.get_change_choice().to_string();
+    let choice = w.global::<Ui>().get_change_choice().to_string();
     let change_override = if choice == "custom" {
-        let addr = normalize_addr(w.get_change_address().as_str());
+        let addr = normalize_addr(w.global::<Ui>().get_change_address().as_str());
         if addr.is_empty() {
             None
         } else {
@@ -8257,11 +8258,11 @@ fn payfrom_panel_coins(st: &State, source: &str) -> (Vec<SpendCoin>, String) {
 /// landed scan) — cheap (bounded by UTXO count), never touches selection.
 fn update_payfrom_panels(w: &AppWindow, st: &mut State) {
     let (nb_coins, nb_title) = payfrom_panel_coins(st, "notebook");
-    w.set_nb_panel_coins(VecModel::from_slice(&nb_coins));
-    w.set_nb_panel_title(nb_title.into());
+    w.global::<PayFrom>().set_nb_panel_coins(VecModel::from_slice(&nb_coins));
+    w.global::<PayFrom>().set_nb_panel_title(nb_title.into());
     let (sp_coins, sp_title) = payfrom_panel_coins(st, "spending");
-    w.set_sp_panel_coins(VecModel::from_slice(&sp_coins));
-    w.set_sp_panel_title(sp_title.into());
+    w.global::<PayFrom>().set_sp_panel_coins(VecModel::from_slice(&sp_coins));
+    w.global::<PayFrom>().set_sp_panel_title(sp_title.into());
 }
 
 /// Scan a saved wallet PURELY to populate its Pay-from screen coin list
@@ -8283,20 +8284,20 @@ fn payfrom_scan_wallet_for_display(w: &AppWindow, st: &mut State, id: &str) {
     let src = match FundingSource::parse(&descriptor, net) {
         Ok(src) => src,
         Err(e) => {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
             return;
         }
     };
     let Some(base) = st.base_url() else {
-        w.set_status("no Bitcoin node — set one in Settings".into());
+        w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
         return;
     };
-    w.set_status("scanning funding wallet…".into());
+    w.global::<Ui>().set_status("scanning funding wallet…".into());
     let creds = core_rpc_creds_for(st, &base, net);
     let client = match open_client(&base, net, creds) {
         Ok(c) => c,
         Err(e) => {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
             return;
         }
     };
@@ -8309,10 +8310,10 @@ fn payfrom_scan_wallet_for_display(w: &AppWindow, st: &mut State, id: &str) {
             st.save_funding_wallets();
             let empty = scan.utxos.is_empty();
             st.payfrom_wallet_coins.insert(id.to_string(), scan.utxos);
-            w.set_status(if empty { "wallet has no spendable coins yet".to_string() } else { String::new() }.into());
+            w.global::<Ui>().set_status(if empty { "wallet has no spendable coins yet".to_string() } else { String::new() }.into());
         }
         Err(e) => {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
         }
     }
 }
@@ -8335,7 +8336,7 @@ fn promote_wallet_active(w: &AppWindow, st: &mut State, id: &str) {
         let src = match FundingSource::parse(&descriptor, net) {
             Ok(src) => src,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
@@ -8346,11 +8347,11 @@ fn promote_wallet_active(w: &AppWindow, st: &mut State, id: &str) {
     }
     let label = st.funding_wallets[idx].label.clone();
     let balance = st.funding_wallets[idx].balance;
-    w.set_fund_external(true);
-    w.set_spend_from_wallet(false);
-    w.set_pay_from(format!("wallet:{id}").into());
-    w.set_pay_from_label(label.clone().into());
-    w.set_pay_from_balance(format!("{} sats", commas(balance)).into());
+    w.global::<Ui>().set_fund_external(true);
+    w.global::<Ui>().set_spend_from_wallet(false);
+    w.global::<Ui>().set_pay_from(format!("wallet:{id}").into());
+    w.global::<Compose>().set_pay_from_label(label.clone().into());
+    w.global::<Ui>().set_pay_from_balance(format!("{} sats", commas(balance)).into());
     println!("cb: pay-from wallet:{label}");
 }
 
@@ -8489,13 +8490,13 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
         [nb_total > 0, sp_total > 0, ext_total > 0, chg_total > 0].into_iter().filter(|b| *b).count();
 
     // ---- shared compose context ----
-    let text = w.get_compose_text().to_string();
+    let text = w.global::<Compose>().get_compose_text().to_string();
     let text_for_est: String = if text.is_empty() { "x".to_string() } else { text.clone() };
-    let private = w.get_compose_private();
-    let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
+    let private = w.global::<Compose>().get_compose_private();
+    let rate: f64 = w.global::<Compose>().get_rate_text().trim().parse().unwrap_or(1.0);
     let recipient = st.to_address.as_deref().and_then(|a| Recipient::parse(net, a).ok());
     let gift = if recipient.is_some() {
-        w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+        w.global::<Compose>().get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
     } else {
         0
     };
@@ -8513,7 +8514,7 @@ fn payfrom_state(w: &AppWindow, st: &State) -> PayfromState {
     // `gift` is already 0 for a self-note, so this is 0 there regardless
     // of the `.max(1)` below (empty `recipient_spk_lens`).
     let total_sent = gift * recipient_spk_lens.len().max(1) as u64;
-    let change_raw = w.get_change_address().to_string();
+    let change_raw = w.global::<Ui>().get_change_address().to_string();
     let change_trim = change_raw.trim();
     let custom_change = if change_trim.is_empty() { None } else { Recipient::parse(net, change_trim).ok() };
     // An explicitly-typed change address that DOESN'T parse is invalid —
@@ -8761,14 +8762,14 @@ fn sync_and_finalize_payfrom(w: &AppWindow, st: &mut State) {
     // fund sufficiency — AND it in here rather than duplicating it into
     // every branch's own `enough` computation.
     let enough = pf.enough && !st.compose_oversize;
-    w.set_spend_enough(enough);
-    w.set_payfrom_required_line(pf.required_line.into());
-    w.set_payfrom_selected_line(format!("{} sats", commas(pf.selected)).into());
-    w.set_payfrom_source_label(pf.source_label.clone().into());
+    w.global::<Ui>().set_spend_enough(enough);
+    w.global::<PayFrom>().set_payfrom_required_line(pf.required_line.into());
+    w.global::<Ui>().set_payfrom_selected_line(format!("{} sats", commas(pf.selected)).into());
+    w.global::<Compose>().set_payfrom_source_label(pf.source_label.clone().into());
     // The linkage hint doubles as the Sign-button dispatch selector for the
     // mixed path — derived from the verdict's shape, same source of truth
     // as everything else here.
-    w.set_mixed_linkage_hint(pf.shape == PayfromShape::Mixed);
+    w.global::<Ui>().set_mixed_linkage_hint(pf.shape == PayfromShape::Mixed);
     println!(
         "cb: payfrom state src={} required={} selected={} enough={}",
         pf.source_label,
@@ -8801,10 +8802,10 @@ fn sync_and_finalize_payfrom(w: &AppWindow, st: &mut State) {
         PayfromShape::Empty | PayfromShape::Mixed => None,
     };
     if let Some(src) = desired {
-        let flags_agree = w.get_pay_from().as_str() == src
+        let flags_agree = w.global::<Ui>().get_pay_from().as_str() == src
             && st.payfrom_active_source == src
-            && w.get_fund_external() == src.starts_with("wallet:")
-            && w.get_spend_from_wallet() == (src == "spending");
+            && w.global::<Ui>().get_fund_external() == src.starts_with("wallet:")
+            && w.global::<Ui>().get_spend_from_wallet() == (src == "spending");
         if !flags_agree && !st.payfrom_aligning {
             st.payfrom_aligning = true;
             println!("cb: payfrom align src={src}");
@@ -8866,7 +8867,7 @@ fn update_change_label(w: &AppWindow, st: &mut State) {
         app_core::mixed::ChangeDefault::Notebook => "notebook".to_string(),
         app_core::mixed::ChangeDefault::Wallet(id) => format!("wallet:{id}"),
     };
-    w.set_change_default_choice(default_str.clone().into());
+    w.global::<Change>().set_change_default_choice(default_str.clone().into());
     let default_reason = match &default {
         app_core::mixed::ChangeDefault::Spending => "the spending wallet is paying".to_string(),
         app_core::mixed::ChangeDefault::Notebook => "no spending wallet enabled".to_string(),
@@ -8880,9 +8881,9 @@ fn update_change_label(w: &AppWindow, st: &mut State) {
             format!("{label} is paying")
         }
     };
-    w.set_change_default_reason(default_reason.into());
+    w.global::<Change>().set_change_default_reason(default_reason.into());
     let notebook_line = addr_short(&st.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default());
-    w.set_change_notebook_line(notebook_line.into());
+    w.global::<Change>().set_change_notebook_line(notebook_line.into());
     let spending_line = if st.spending_capable && spending_enabled {
         if let (Some(src), Some(store)) = (st.spending_source.as_ref(), st.store.as_ref()) {
             src.derive(1, store.spending.next_change)
@@ -8895,18 +8896,18 @@ fn update_change_label(w: &AppWindow, st: &mut State) {
     } else {
         String::new()
     };
-    w.set_change_spending_line(spending_line.into());
+    w.global::<Change>().set_change_spending_line(spending_line.into());
     // An explicit pick this session (including "custom") always wins; the
     // default only applies while `change_choice` is unset.
     let choice = if st.change_choice.is_empty() { default_str } else { st.change_choice.clone() };
-    w.set_change_choice(choice.clone().into());
+    w.global::<Ui>().set_change_choice(choice.clone().into());
 
     let label = if choice == "spending" {
         "a fresh spending address".to_string()
     } else if choice == "notebook" {
         "your notebook address".to_string()
     } else if choice == "custom" {
-        let addr = w.get_change_address().to_string();
+        let addr = w.global::<Ui>().get_change_address().to_string();
         if addr.trim().is_empty() {
             "custom address".to_string()
         } else {
@@ -8921,7 +8922,7 @@ fn update_change_label(w: &AppWindow, st: &mut State) {
     } else {
         "your address".to_string()
     };
-    w.set_change_dest_label(label.into());
+    w.global::<Ui>().set_change_dest_label(label.into());
 }
 
 /// Short "<n> sats" figure for the compose compact "Pay from" row and the
@@ -8953,7 +8954,7 @@ fn balance_text_for(st: &State, kind: &str) -> String {
 /// [`refresh_async`]/[`spending_refresh_async`] first (the funding-refresh
 /// callback does both).
 fn update_funding_screen_ui(w: &AppWindow, st: &State) {
-    w.set_funding_notebook_balance(balance_text_for(st, "notebook").into());
+    w.global::<PayFrom>().set_funding_notebook_balance(balance_text_for(st, "notebook").into());
 }
 
 /// `cb: funding-refresh` — logged whenever a background scan the funding
@@ -8991,19 +8992,19 @@ fn set_cost_card(
     dust: String,
     fold_total: Option<(u64, u64)>,
 ) {
-    w.set_cost_line("".into());
-    w.set_cost_size(size.into());
-    w.set_cost_fee(fee.into());
-    w.set_cost_gift(gift.into());
-    w.set_cost_dust(dust.into());
+    w.global::<Compose>().set_cost_line("".into());
+    w.global::<Compose>().set_cost_size(size.into());
+    w.global::<Compose>().set_cost_fee(fee.into());
+    w.global::<Compose>().set_cost_gift(gift.into());
+    w.global::<Compose>().set_cost_dust(dust.into());
     match fold_total {
         Some((folded, total)) => {
-            w.set_cost_fold(format!("+{} sats", commas(folded)).into());
-            w.set_cost_total(format!("~{} sats", commas(total)).into());
+            w.global::<Ui>().set_cost_fold(format!("+{} sats", commas(folded)).into());
+            w.global::<Ui>().set_cost_total(format!("~{} sats", commas(total)).into());
         }
         None => {
-            w.set_cost_fold("".into());
-            w.set_cost_total("".into());
+            w.global::<Ui>().set_cost_fold("".into());
+            w.global::<Ui>().set_cost_total("".into());
         }
     }
 }
@@ -9013,13 +9014,13 @@ fn set_cost_card(
 /// accent `cost_line` text, structured card hidden — these render exactly
 /// as they did before the card existed.
 fn set_cost_status(w: &AppWindow, text: String) {
-    w.set_cost_size("".into());
-    w.set_cost_fee("".into());
-    w.set_cost_gift("".into());
-    w.set_cost_dust("".into());
-    w.set_cost_fold("".into());
-    w.set_cost_total("".into());
-    w.set_cost_line(text.into());
+    w.global::<Compose>().set_cost_size("".into());
+    w.global::<Compose>().set_cost_fee("".into());
+    w.global::<Compose>().set_cost_gift("".into());
+    w.global::<Compose>().set_cost_dust("".into());
+    w.global::<Ui>().set_cost_fold("".into());
+    w.global::<Ui>().set_cost_total("".into());
+    w.global::<Compose>().set_cost_line(text.into());
 }
 
 fn refresh_compose(w: &AppWindow, st: &mut State) {
@@ -9035,12 +9036,12 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     // neither layer is on).
     let pq_est = refresh_compose_pq(w, st);
     let net = st.network;
-    let text = w.get_compose_text().to_string();
-    let private = w.get_compose_private();
-    let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
+    let text = w.global::<Compose>().get_compose_text().to_string();
+    let private = w.global::<Compose>().get_compose_private();
+    let rate: f64 = w.global::<Compose>().get_rate_text().trim().parse().unwrap_or(1.0);
     // Keep the compact "Pay from" row's balance current regardless of which
     // branch below runs (notebook / spending / external).
-    w.set_pay_from_balance(balance_text_for(st, w.get_pay_from().as_str()).into());
+    w.global::<Ui>().set_pay_from_balance(balance_text_for(st, w.global::<Ui>().get_pay_from().as_str()).into());
     // MIXED selection (TestFlight build-20 fix, 2026-07-18): a selection
     // spanning 2+ wallets dispatches Sign to `on_compose_send_mixed`
     // (`assemble_mixed_note_psbt`), so its preview must dry-run THAT
@@ -9070,14 +9071,14 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     }
     // External-funding mode: the coin panel shows the funding wallet's coins,
     // not the self-funded store coins. Handled on its own isolated path.
-    if w.get_fund_external() {
+    if w.global::<Ui>().get_fund_external() {
         funding_compose_ui(w, st, &text);
         sync_and_finalize_payfrom(w, st);
         return;
     }
     // Internal spending-wallet mode (funding-unification M3): same idea,
     // but the source is the identity's OWN BIP-84 wallet, signed in-app.
-    if w.get_spend_from_wallet() {
+    if w.global::<Ui>().get_spend_from_wallet() {
         spending_compose_ui(w, st, &text);
         sync_and_finalize_payfrom(w, st);
         return;
@@ -9101,13 +9102,13 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     };
     let n_recipients = recipient_spk_lens.len();
     // Directed notes send a "gift" to EACH recipient (>= dust); self-notes send 0.
-    let gift = w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS);
+    let gift = w.global::<Compose>().get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS);
     let sent = if spk_len.is_some() { gift * n_recipients.max(1) as u64 } else { 0 };
 
     // Change-address destination label + validation. A valid custom change
     // address also yields its scriptPubKey length so the fee/change preview
     // sizes the real change output (not the assumed taproot one).
-    let change_raw = w.get_change_address().to_string();
+    let change_raw = w.global::<Ui>().get_change_address().to_string();
     let change_trim = change_raw.trim();
     let (change_dest, change_err, change_spk_len) = if change_trim.is_empty() {
         ("your address".to_string(), String::new(), None)
@@ -9125,7 +9126,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             ),
         }
     };
-    w.set_change_error(change_err.clone().into());
+    w.global::<Change>().set_change_error(change_err.clone().into());
 
     // Pay-from screen summary card / Sign gate: computed ONCE, centrally, by
     // `payfrom_state` inside `sync_and_finalize_payfrom` below — from the
@@ -9175,9 +9176,9 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             tag: "".into(),
         });
     }
-    w.set_spend_coins(VecModel::from_slice(&coins));
+    w.global::<Ui>().set_spend_coins(VecModel::from_slice(&coins));
     let plural = if sel_count == 1 { "" } else { "s" };
-    w.set_spend_title(format!("Spending {sel_count} coin{plural} · {sel_total} sats").into());
+    w.global::<Ui>().set_spend_title(format!("Spending {sel_count} coin{plural} · {sel_total} sats").into());
 
     if text.is_empty() {
         // The rate box + cost line are always visible now (fee-tier
@@ -9193,7 +9194,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
             .map(|fee| format!("~{} sats fee minimum", commas(fee)))
             .unwrap_or_default();
         set_cost_status(w, min_line);
-        w.set_change_amount(format!("Change to {change_dest}").into());
+        w.global::<Ui>().set_change_amount(format!("Change to {change_dest}").into());
         st.compose_oversize = false;
         sync_and_finalize_payfrom(w, st);
         return;
@@ -9250,7 +9251,7 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
                 String::new(), // no dust-to-self on the self-funded notebook shape
                 fold.map(|(nominal, folded)| (folded, nominal + folded)),
             );
-            w.set_change_amount(format!("Change to {change_dest} · ~{change} sats").into());
+            w.global::<Ui>().set_change_amount(format!("Change to {change_dest} · ~{change} sats").into());
         }
         // Over the per-tx broadcast ceiling: vsize > 100 kB (Ok arm) or the
         // body needs > 255 chunks (Err arm). Sign is gated off via
@@ -9272,24 +9273,24 @@ fn refresh_compose(w: &AppWindow, st: &mut State) {
     if over && !st.compose_oversize {
         match fit {
             FitCheck::FitsAtStandard => {
-                w.set_oversize_offer_bump(true);
-                w.set_oversize_message(
+                w.global::<Modals>().set_oversize_offer_bump(true);
+                w.global::<Modals>().set_oversize_message(
                     "This note doesn't fit at your current chunk size. \
                      Switch to Standard (a single large chunk) to fit it in one transaction?"
                         .into(),
                 );
-                w.set_show_oversize_modal(true);
+                w.global::<Ui>().set_show_oversize_modal(true);
             }
             FitCheck::HardWall => {
-                w.set_oversize_offer_bump(false);
-                w.set_oversize_message(
+                w.global::<Modals>().set_oversize_offer_bump(false);
+                w.global::<Modals>().set_oversize_message(
                     "This note is too large to broadcast. A single Bitcoin transaction \
                      can't exceed ~100 kB (the network relay limit), whatever the chunk \
                      size. Shorten the note, or split it across several notes. \
                      Multi-transaction notes are planned for a future release."
                         .into(),
                 );
-                w.set_show_oversize_modal(true);
+                w.global::<Ui>().set_show_oversize_modal(true);
             }
             FitCheck::Ok => {}
         }
@@ -9324,18 +9325,18 @@ fn funding_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     let total: u64 = st.funding_coins.iter().map(|c| c.value).sum();
     let n = st.funding_coins.len();
     let ready = st.funding.is_some() && n > 0;
-    w.set_funding_ready(ready);
+    w.global::<Ui>().set_funding_ready(ready);
 
     // Summary card = which wallet + how much (its first receive address is a
     // recognisable handle for a multi-address wallet).
     match &st.funding {
         Some(src) => {
             let addr0 = src.derive(0, 0).map(|d| d.address).unwrap_or_default();
-            w.set_funding_summary(
+            w.global::<Sweep>().set_funding_summary(
                 format!("{} · {} · {n} coin{} · {total} sats", src.kind.label(), short_addr(&addr0), if n == 1 { "" } else { "s" }).into(),
             );
         }
-        None => w.set_funding_summary("Set a funding wallet".into()),
+        None => w.global::<Sweep>().set_funding_summary("Set a funding wallet".into()),
     }
 
     let source_key = st
@@ -9378,8 +9379,8 @@ fn funding_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         .filter(|c| sel.contains(&(c.txid.clone(), c.vout)))
         .map(|c| c.value)
         .sum();
-    w.set_spend_coins(VecModel::from_slice(&coins));
-    w.set_spend_title(
+    w.global::<Ui>().set_spend_coins(VecModel::from_slice(&coins));
+    w.global::<Ui>().set_spend_title(
         format!("Funding {sel_count}/{n} coin{} · {} sats", if n == 1 { "" } else { "s" }, commas(sel_total)).into(),
     );
     set_cost_status(w, if text.is_empty() { String::new() } else { "funded from the external wallet".to_string() });
@@ -9389,16 +9390,16 @@ fn funding_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
 
     // Change: blank = the funding wallet's own change; a valid custom address
     // overrides it. Same validation/label pattern as the self-funded path.
-    let change_trim = w.get_change_address().trim().to_string();
+    let change_trim = w.global::<Ui>().get_change_address().trim().to_string();
     if change_trim.is_empty() {
-        w.set_change_amount("Change to funding wallet".into());
-        w.set_change_error("".into());
+        w.global::<Ui>().set_change_amount("Change to funding wallet".into());
+        w.global::<Change>().set_change_error("".into());
     } else if Recipient::parse(net, &normalize_addr(&change_trim)).is_ok() {
-        w.set_change_amount(format!("Change to {}…", &change_trim[..14.min(change_trim.len())]).into());
-        w.set_change_error("".into());
+        w.global::<Ui>().set_change_amount(format!("Change to {}…", &change_trim[..14.min(change_trim.len())]).into());
+        w.global::<Change>().set_change_error("".into());
     } else {
-        w.set_change_amount("Change: ⚠ invalid".into());
-        w.set_change_error(format!("Not a valid {} address.", net.as_str()).into());
+        w.global::<Ui>().set_change_amount("Change: ⚠ invalid".into());
+        w.global::<Change>().set_change_error(format!("Not a valid {} address.", net.as_str()).into());
     }
 }
 
@@ -9445,8 +9446,8 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         .filter(|c| sel.contains(&(c.txid.clone(), c.vout)))
         .map(|c| c.value)
         .sum();
-    w.set_spend_coins(VecModel::from_slice(&coins));
-    w.set_spend_title(
+    w.global::<Ui>().set_spend_coins(VecModel::from_slice(&coins));
+    w.global::<Ui>().set_spend_title(
         format!(
             "Spending wallet · {sel_count}/{n} coin{} · {} sats",
             if n == 1 { "" } else { "s" },
@@ -9457,19 +9458,19 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
 
     // Change destination: blank = a fresh spending-wallet address; a valid
     // custom address overrides it — same pattern as the other two panels.
-    let change_trim = w.get_change_address().trim().to_string();
+    let change_trim = w.global::<Ui>().get_change_address().trim().to_string();
     let change_override_spk = if change_trim.is_empty() {
-        w.set_change_error("".into());
+        w.global::<Change>().set_change_error("".into());
         None
     } else {
         match Recipient::parse(net, &normalize_addr(&change_trim)) {
             Ok(r) => {
-                w.set_change_error("".into());
+                w.global::<Change>().set_change_error("".into());
                 Some(r.spk)
             }
             Err(_) => {
-                w.set_change_amount("Change: ⚠ invalid".into());
-                w.set_change_error(format!("Not a valid {} address.", net.as_str()).into());
+                w.global::<Ui>().set_change_amount("Change: ⚠ invalid".into());
+                w.global::<Change>().set_change_error(format!("Not a valid {} address.", net.as_str()).into());
                 return;
             }
         }
@@ -9477,17 +9478,17 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
 
     if n == 0 {
         set_cost_status(w, String::new());
-        w.set_change_amount("Spending wallet has no coins yet — fund its receive address in Settings.".into());
+        w.global::<Ui>().set_change_amount("Spending wallet has no coins yet — fund its receive address in Settings.".into());
         return;
     }
     if sel_count == 0 {
         set_cost_status(w, String::new());
-        w.set_change_amount("No coins selected — select at least one below.".into());
+        w.global::<Ui>().set_change_amount("No coins selected — select at least one below.".into());
         return;
     }
     if text.is_empty() {
         set_cost_status(w, String::new());
-        w.set_change_amount(
+        w.global::<Ui>().set_change_amount(
             if change_override_spk.is_some() {
                 format!("Change to {}…", &change_trim[..14.min(change_trim.len())])
             } else {
@@ -9507,7 +9508,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     };
     let recipient = st.to_address.as_deref().and_then(|a| Recipient::parse(net, a).ok());
     let gift = if recipient.is_some() {
-        w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+        w.global::<Compose>().get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
     } else {
         0
     };
@@ -9517,7 +9518,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     let recipients = app_core::compose::parse_dedupe_recipients(net, st.to_address.as_deref(), &extra_recipients)
         .unwrap_or_default();
     let n_recipients = recipients.len();
-    let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
+    let rate: f64 = w.global::<Compose>().get_rate_text().trim().parse().unwrap_or(1.0);
     let change_index = store.spending.next_change;
     let has_custom_change = change_override_spk.is_some();
     // Spend exactly the coins selected in the coin-control list below —
@@ -9538,7 +9539,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     let np = NoteParams {
         identity: &identity,
         text,
-        private: w.get_compose_private(),
+        private: w.global::<Compose>().get_compose_private(),
         recipient: recipient.as_ref(),
         max_op_return_bytes: store.chunk_size,
         network: net,
@@ -9565,7 +9566,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                 let payload_and_lens = if n_recipients >= 2 {
                     let mut content_key = [0u8; 32]; // preview only — lengths don't depend on the seal
                     app_core::notes_core::bundle::sealed_note_payloads_multi(
-                        &identity, text, w.get_compose_private(), &recipients, [0u8; 36], content_key,
+                        &identity, text, w.global::<Compose>().get_compose_private(), &recipients, [0u8; 36], content_key,
                         store.chunk_size,
                     )
                     .ok()
@@ -9573,7 +9574,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                     .inspect(|_| content_key.zeroize())
                 } else {
                     app_core::notes_core::bundle::sealed_note_payloads(
-                        &identity, text, w.get_compose_private(), recipient.as_ref(), [0u8; 36],
+                        &identity, text, w.global::<Compose>().get_compose_private(), recipient.as_ref(), [0u8; 36],
                         store.chunk_size,
                     )
                     .ok()
@@ -9621,7 +9622,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                 // Total = the byte-true fee the tx pays (nominal + leftover).
                 fold.map(|(_, folded)| (folded, built.fee)),
             );
-            w.set_change_amount(
+            w.global::<Ui>().set_change_amount(
                 if has_custom_change {
                     format!(
                         "Change to {}… · ~{} sats",
@@ -9636,7 +9637,7 @@ fn spending_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         }
         Err(e) => {
             set_cost_status(w, String::new());
-            w.set_change_amount(format!("{e}").into());
+            w.global::<Ui>().set_change_amount(format!("{e}").into());
         }
     }
 }
@@ -9662,14 +9663,14 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
         Err(_) => {
             // Same invalid-custom-change rendering the other branches use.
             set_cost_status(w, String::new());
-            w.set_change_amount("Change: ⚠ invalid".into());
-            w.set_change_error(format!("Not a valid {} address.", net.as_str()).into());
+            w.global::<Ui>().set_change_amount("Change: ⚠ invalid".into());
+            w.global::<Change>().set_change_error(format!("Not a valid {} address.", net.as_str()).into());
             return;
         }
     };
-    w.set_change_error("".into());
+    w.global::<Change>().set_change_error("".into());
     let change_dest = if args.change_override.is_some() {
-        let t = w.get_change_address().trim().to_string();
+        let t = w.global::<Ui>().get_change_address().trim().to_string();
         format!("{}…", &t[..14.min(t.len())])
     } else {
         match &args.change_default {
@@ -9680,7 +9681,7 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     };
     if text.is_empty() {
         set_cost_status(w, String::new());
-        w.set_change_amount(format!("Change to {change_dest}").into());
+        w.global::<Ui>().set_change_amount(format!("Change to {change_dest}").into());
         return;
     }
     let Some(identity) = st.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
@@ -9689,7 +9690,7 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     };
     let recipient = st.to_address.as_deref().and_then(|a| Recipient::parse(net, a).ok());
     let gift = if recipient.is_some() {
-        w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+        w.global::<Compose>().get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
     } else {
         0
     };
@@ -9699,18 +9700,18 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
     let recipients = app_core::compose::parse_dedupe_recipients(net, st.to_address.as_deref(), &extra_recipients)
         .unwrap_or_default();
     let n_recipients = recipients.len();
-    let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(1.0);
+    let rate: f64 = w.global::<Compose>().get_rate_text().trim().parse().unwrap_or(1.0);
     let chunk = st.store.as_ref().map(|s| s.chunk_size).unwrap_or(DEFAULT_CHUNK);
     // Preview outpoint is all-zero, like every other preview dry-run —
     // payload LENGTHS (all the fee math consumes) don't depend on the AAD.
     let sealed = if n_recipients >= 2 {
         let content_key = [0u8; 32]; // preview only — lengths don't depend on the seal
         app_core::notes_core::bundle::sealed_note_payloads_multi(
-            &identity, text, w.get_compose_private(), &recipients, [0u8; 36], content_key, chunk,
+            &identity, text, w.global::<Compose>().get_compose_private(), &recipients, [0u8; 36], content_key, chunk,
         )
     } else {
         app_core::notes_core::bundle::sealed_note_payloads(
-            &identity, text, w.get_compose_private(), recipient.as_ref(), [0u8; 36], chunk,
+            &identity, text, w.global::<Compose>().get_compose_private(), recipient.as_ref(), [0u8; 36], chunk,
         )
         .map(|(p, spk)| (p, spk.into_iter().collect::<Vec<Vec<u8>>>()))
     };
@@ -9798,11 +9799,11 @@ fn mixed_compose_ui(w: &AppWindow, st: &mut State, text: &str) {
                 if built.dust_to_self > 0 { format!("+{} sats", commas(built.dust_to_self)) } else { String::new() },
                 fold.map(|(_, folded)| (folded, built.fee)),
             );
-            w.set_change_amount(format!("Change to {change_dest} · ~{} sats", commas(built.change)).into());
+            w.global::<Ui>().set_change_amount(format!("Change to {change_dest} · ~{} sats", commas(built.change)).into());
         }
         Err(e) => {
             set_cost_status(w, String::new());
-            w.set_change_amount(format!("{e}").into());
+            w.global::<Ui>().set_change_amount(format!("{e}").into());
         }
     }
 }
@@ -9814,7 +9815,7 @@ fn scan_preview(weak: slint::Weak<AppWindow>) -> impl FnMut(&[u8], u32, u32) {
     move |rgba: &[u8], pw: u32, ph: u32| {
         let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(pw, ph);
         buf.make_mut_bytes().copy_from_slice(rgba);
-        let _ = weak.upgrade_in_event_loop(move |w| w.set_camera_frame(slint::Image::from_rgba8(buf)));
+        let _ = weak.upgrade_in_event_loop(move |w| w.global::<Modals>().set_camera_frame(slint::Image::from_rgba8(buf)));
     }
 }
 
@@ -9823,9 +9824,9 @@ fn scan_preview(weak: slint::Weak<AppWindow>) -> impl FnMut(&[u8], u32, u32) {
 fn begin_scan(weak: &slint::Weak<AppWindow>, cancel: &Arc<AtomicBool>, hint: &str) {
     cancel.store(false, Ordering::Relaxed);
     if let Some(w) = weak.upgrade() {
-        w.set_scan_hint(hint.into());
-        w.set_scan_progress(0.0);
-        w.set_scanning(true);
+        w.global::<Modals>().set_scan_hint(hint.into());
+        w.global::<Modals>().set_scan_progress(0.0);
+        w.global::<Ui>().set_scanning(true);
     }
 }
 
@@ -9867,7 +9868,7 @@ fn refresh_funding_list(w: &AppWindow, st: &State) {
             }
         })
         .collect();
-    w.set_funding_wallets(VecModel::from_slice(&rows));
+    w.global::<Ui>().set_funding_wallets(VecModel::from_slice(&rows));
 }
 
 /// Make a saved wallet the active funding source: scan it, cache its balance,
@@ -9883,27 +9884,27 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
     // funding-unification UI rework: tapping a wallet row on the Pay-from
     // screen (20) selects + expands it IN PLACE — it must not navigate away
     // like the screen-15/16 entry points do.
-    let stay_on_payfrom = w.get_screen() == Screen::PayFrom;
+    let stay_on_payfrom = w.global::<Ui>().get_screen() == Screen::PayFrom;
     let net = st.network;
     let Some(idx) = st.funding_wallets.iter().position(|fw| fw.id == id) else { return };
     let descriptor = st.funding_wallets[idx].descriptor.clone();
     let src = match FundingSource::parse(&descriptor, net) {
         Ok(src) => src,
         Err(e) => {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
             return;
         }
     };
     let Some(base) = st.base_url() else {
-        w.set_status("no Bitcoin node — set one in Settings".into());
+        w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
         return;
     };
-    w.set_status("scanning funding wallet…".into());
+    w.global::<Ui>().set_status("scanning funding wallet…".into());
     let creds = core_rpc_creds_for(st, &base, net);
     let client = match open_client(&base, net, creds) {
         Ok(c) => c,
         Err(e) => {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
             return;
         }
     };
@@ -9932,37 +9933,37 @@ fn activate_funding_wallet(w: &AppWindow, st: &mut State, id: &str) {
             } else {
                 remembered
             };
-            w.set_status(if empty { "wallet has no spendable coins yet".to_string() } else { String::new() }.into());
+            w.global::<Ui>().set_status(if empty { "wallet has no spendable coins yet".to_string() } else { String::new() }.into());
             if stay_on_payfrom {
-                w.set_fund_external(true);
-                w.set_spend_from_wallet(false);
+                w.global::<Ui>().set_fund_external(true);
+                w.global::<Ui>().set_spend_from_wallet(false);
                 let label = st.funding_wallets[idx].label.clone();
-                w.set_pay_from(format!("wallet:{id}").into());
-                w.set_pay_from_label(label.clone().into());
-                w.set_pay_from_balance(format!("{} sats", commas(st.funding_wallets[idx].balance)).into());
+                w.global::<Ui>().set_pay_from(format!("wallet:{id}").into());
+                w.global::<Compose>().set_pay_from_label(label.clone().into());
+                w.global::<Ui>().set_pay_from_balance(format!("{} sats", commas(st.funding_wallets[idx].balance)).into());
                 println!("cb: pay-from wallet:{label}");
                 refresh_compose(w, st);
-            } else if w.get_funding_return() == Screen::Sweep {
+            } else if w.global::<Ui>().get_funding_return() == Screen::Sweep {
                 // Came from the sweep screen — return there, funding armed.
-                w.set_sweep_fund_external(true);
-                w.set_screen(Screen::Sweep);
+                w.global::<Sweep>().set_sweep_fund_external(true);
+                w.global::<Ui>().set_screen(Screen::Sweep);
                 update_sweep_screen(w, st);
             } else {
-                w.set_fund_external(true);
-                w.set_spend_from_wallet(false);
+                w.global::<Ui>().set_fund_external(true);
+                w.global::<Ui>().set_spend_from_wallet(false);
                 let label = st.funding_wallets[idx].label.clone();
-                w.set_pay_from(format!("wallet:{id}").into());
-                w.set_pay_from_label(label.clone().into());
-                w.set_pay_from_balance(format!("{} sats", commas(st.funding_wallets[idx].balance)).into());
+                w.global::<Ui>().set_pay_from(format!("wallet:{id}").into());
+                w.global::<Compose>().set_pay_from_label(label.clone().into());
+                w.global::<Ui>().set_pay_from_balance(format!("{} sats", commas(st.funding_wallets[idx].balance)).into());
                 println!("cb: pay-from wallet:{label}");
-                w.set_spend_expanded(true);
-                w.set_screen(Screen::Compose);
+                w.global::<Ui>().set_spend_expanded(true);
+                w.global::<Ui>().set_screen(Screen::Compose);
                 refresh_compose(w, st);
             }
         }
         Err(e) => {
             println!("cb: funding-wallet scan err={e}");
-            w.set_status(format!("scan failed: {}", friendly_net_err(&e.to_string())).into());
+            w.global::<Ui>().set_status(format!("scan failed: {}", friendly_net_err(&e.to_string())).into());
         }
     }
 }
@@ -9980,27 +9981,27 @@ fn try_import_ur_account(w: &AppWindow, st: &mut State, text: &str) -> bool {
     let (ty, bytes) = match app_core::ur::decode_ur_string(t) {
         Ok(x) => x,
         Err(e) => {
-            w.set_status(format!("UR: {e}").into());
+            w.global::<Ui>().set_status(format!("UR: {e}").into());
             return true;
         }
     };
     if ty == "crypto-psbt" {
-        w.set_status("that's a transaction QR, not a wallet".into());
+        w.global::<Ui>().set_status("that's a transaction QR, not a wallet".into());
         return true;
     }
     match app_core::ur_account::descriptors_from_ur(&ty, &bytes, net) {
         Ok(descs) if !descs.is_empty() => {
             let ds: Vec<String> = descs.iter().map(|d| d.descriptor.clone()).collect();
             let added = save_funding_descriptors(w, st, &ds);
-            w.set_status(format!("imported {added} account(s) from {ty}").into());
+            w.global::<Ui>().set_status(format!("imported {added} account(s) from {ty}").into());
             true
         }
         Ok(_) => {
-            w.set_status("no taproot/segwit accounts in that export".into());
+            w.global::<Ui>().set_status("no taproot/segwit accounts in that export".into());
             true
         }
         Err(e) => {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
             true
         }
     }
@@ -10079,7 +10080,7 @@ fn save_funding_descriptors(w: &AppWindow, st: &mut State, descriptors: &[String
         st.save_funding_wallets();
     }
     refresh_funding_list(w, st);
-    w.set_screen(Screen::FundingWallets);
+    w.global::<Ui>().set_screen(Screen::FundingWallets);
     added
 }
 
@@ -10171,7 +10172,7 @@ fn load_signed_psbt(w: &AppWindow, st: &mut State, data: &[u8]) {
     };
     match psbt {
         Ok(p) => set_confirm_from_psbt(w, st, p),
-        Err(e) => w.set_status(format!("import: {e}").into()),
+        Err(e) => w.global::<Ui>().set_status(format!("import: {e}").into()),
     }
 }
 
@@ -10345,7 +10346,7 @@ fn note_context(directed: bool, private: bool, network: Network) -> String {
 /// show_confirm populated it; only when the confirm screen actually
 /// navigated.
 fn note_subdust_fold_warn(w: &AppWindow, change: u64, fee: u64, vsize: u64, rate: f64) {
-    if change != 0 || w.get_screen() != Screen::Confirm {
+    if change != 0 || w.global::<Ui>().get_screen() != Screen::Confirm {
         return;
     }
     let nominal = (vsize as f64 * rate).ceil() as u64;
@@ -10360,8 +10361,8 @@ fn note_subdust_fold_warn(w: &AppWindow, change: u64, fee: u64, vsize: u64, rate
         commas(folded),
         DUST_SATS
     );
-    let existing = w.get_confirm_warn().to_string();
-    w.set_confirm_warn(if existing.is_empty() { msg.into() } else { format!("{existing}; {msg}").into() });
+    let existing = w.global::<Ui>().get_confirm_warn().to_string();
+    w.global::<Ui>().set_confirm_warn(if existing.is_empty() { msg.into() } else { format!("{existing}; {msg}").into() });
 }
 
 /// `ConfirmCtx.prevouts` for a notebook compose's spent coins — every input
@@ -10537,7 +10538,7 @@ fn show_confirm(w: &AppWindow, st: &mut State, pending: PendingBroadcast, ctx: a
         Ok(s) => s,
         Err(e) => {
             println!("cb: confirm summarize err={e}");
-            w.set_status(format!("confirm: {e}").into());
+            w.global::<Ui>().set_status(format!("confirm: {e}").into());
             return;
         }
     };
@@ -10551,14 +10552,14 @@ fn show_confirm(w: &AppWindow, st: &mut State, pending: PendingBroadcast, ctx: a
             })
             .collect()
     };
-    w.set_confirm_inputs(VecModel::from_slice(&to_rows(&sum.inputs)));
-    w.set_confirm_outputs(VecModel::from_slice(&to_rows(&sum.outputs)));
-    w.set_confirm_note(ctx.note_preview.clone().unwrap_or_default().into());
-    w.set_confirm_fee_line(sum.fee_line.clone().into());
-    w.set_confirm_locktime_line(sum.lock_time_line.clone().into());
-    w.set_confirm_warn(sum.warn.clone().unwrap_or_default().into());
-    w.set_confirm_txid(sum.txid.clone().into());
-    w.set_confirm_context(pending.context.clone().into());
+    w.global::<Confirm>().set_confirm_inputs(VecModel::from_slice(&to_rows(&sum.inputs)));
+    w.global::<Confirm>().set_confirm_outputs(VecModel::from_slice(&to_rows(&sum.outputs)));
+    w.global::<Confirm>().set_confirm_note(ctx.note_preview.clone().unwrap_or_default().into());
+    w.global::<Confirm>().set_confirm_fee_line(sum.fee_line.clone().into());
+    w.global::<Confirm>().set_confirm_locktime_line(sum.lock_time_line.clone().into());
+    w.global::<Ui>().set_confirm_warn(sum.warn.clone().unwrap_or_default().into());
+    w.global::<Confirm>().set_confirm_txid(sum.txid.clone().into());
+    w.global::<Confirm>().set_confirm_context(pending.context.clone().into());
     println!(
         "cb: confirm show kind={} txid={} fee={} vsize={} inputs={} outputs={} lock_time={} warn={}",
         pending.kind,
@@ -10570,10 +10571,10 @@ fn show_confirm(w: &AppWindow, st: &mut State, pending: PendingBroadcast, ctx: a
         sum.lock_time,
         i32::from(sum.warn.is_some()),
     );
-    let return_screen = w.get_screen();
-    w.set_status("".into());
+    let return_screen = w.global::<Ui>().get_screen();
+    w.global::<Ui>().set_status("".into());
     st.pending_broadcast = Some(PendingBroadcast { return_screen, ..pending });
-    w.set_screen(Screen::Confirm);
+    w.global::<Ui>().set_screen(Screen::Confirm);
 }
 
 /// Stage A for a wallet-level sweep (screen 16, `sweep-kind == "sweep"`,
@@ -10594,11 +10595,11 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
         return; // caller already routes watch identities to watch_spend_build
     }
     if s.base_url().is_none() {
-        w.set_status("no Bitcoin node — set one in Settings".into());
+        w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
         return;
     }
     let Ok(recipient) = Recipient::parse(net, &dest) else {
-        w.set_status(format!("not a valid {} address", net.as_str()).into());
+        w.global::<Ui>().set_status(format!("not a valid {} address", net.as_str()).into());
         return;
     };
     let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
@@ -10678,7 +10679,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
         }
     }
     if idents.is_empty() && spending_coins_for_sweep.is_empty() && change_idents.is_empty() {
-        w.set_status("nothing to sweep".into());
+        w.global::<Ui>().set_status("nothing to sweep".into());
         return;
     }
     let mut all_inputs: Vec<app_core::store::TxInput> = Vec::new();
@@ -10867,7 +10868,7 @@ fn build_sweep_confirm(w: &AppWindow, s: &mut State, dest: String, rate: f64) {
             };
             show_confirm(w, s, pending, ctx);
         }
-        Err(e) => w.set_status(format!("sweep: {e}").into()),
+        Err(e) => w.global::<Ui>().set_status(format!("sweep: {e}").into()),
     }
 }
 
@@ -10885,20 +10886,20 @@ fn build_consolidate_confirm(w: &AppWindow, s: &mut State, rate: f64) {
         return; // caller already routes watch identities to watch_spend_build
     }
     if s.base_url().is_none() {
-        w.set_status("no Bitcoin node — set one in Settings".into());
+        w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
         return;
     }
     let Some(self_addr) = s.ident.as_ref().map(|i| i.address.clone()) else { return };
     let Ok(me) = Recipient::parse(net, &self_addr) else { return };
     let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-        w.set_status("no identity".into());
+        w.global::<Ui>().set_status("no identity".into());
         return;
     };
     let nb_index = s.ident.as_ref().map(|i| i.index).unwrap_or(0);
     let name = s.notebook_display_name(nb_index);
     let Some(store) = s.store.as_mut() else { return };
     if store.available_utxos().len() < 2 {
-        w.set_status("nothing to consolidate (need 2+ coins)".into());
+        w.global::<Ui>().set_status("nothing to consolidate (need 2+ coins)".into());
         return;
     }
     let inputs = spendable_inputs(store);
@@ -10948,7 +10949,7 @@ fn build_consolidate_confirm(w: &AppWindow, s: &mut State, rate: f64) {
             };
             show_confirm(w, s, pending, ctx);
         }
-        Err(e) => w.set_status(format!("consolidate: {e}").into()),
+        Err(e) => w.global::<Ui>().set_status(format!("consolidate: {e}").into()),
     }
 }
 
@@ -10975,7 +10976,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
     // as the old `on_wallet_consolidate` modal handler did unconditionally
     // at its top, so a later "Change account…" open isn't left in
     // "wconsol" mode.
-    w.set_account_pick_mode("switch".into());
+    w.global::<AccountPicker>().set_account_pick_mode("switch".into());
     if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
         // Watch: ONE external-sign PSBT over every source notebook's
         // coins — each input's key origin carries its own receive index,
@@ -10988,7 +10989,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
         let dest_spk = match Recipient::parse(s.network, &wc.dest_addr) {
             Ok(r) => r.spk,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
@@ -11041,7 +11042,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
                 );
                 show_psbt_sign_screen(w, s, built, cost);
             }
-            Err(e) => w.set_status(format!("{e}").into()),
+            Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
         }
         return;
     }
@@ -11050,7 +11051,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
     };
     let Ok(material) = parse_key_material(&material_str, s.network) else { return };
     if s.base_url().is_none() {
-        w.set_status("no Bitcoin node for this network — set one in Settings".into());
+        w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
         return;
     }
     // Realize every source's full identity; a failure aborts cleanly.
@@ -11059,13 +11060,13 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
         let ident = match realize(&material, s.network, s.account, *index) {
             Ok(i) => i,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
         let addr = ident.address.clone();
         let Some(full) = ident.full().map(|i| i.clone_fields()) else {
-            w.set_status("wallet consolidate needs the full key".into());
+            w.global::<Ui>().set_status("wallet consolidate needs the full key".into());
             return;
         };
         idents.push((*index, full, coins.clone(), addr));
@@ -11073,7 +11074,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
     let dest_spk = match Recipient::parse(s.network, &wc.dest_addr) {
         Ok(r) => r.spk,
         Err(e) => {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
             return;
         }
     };
@@ -11094,7 +11095,7 @@ fn build_wconsol_confirm(w: &AppWindow, s: &mut State, wc: WConsol) {
     ) {
         Ok(t) => t,
         Err(e) => {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
             return;
         }
     };
@@ -11222,17 +11223,17 @@ fn enter_rebroadcast_confirm(w: &AppWindow, st: &mut State, ref_id: String, is_n
 /// watch-mode spend flows.
 fn show_psbt_sign_screen(w: &AppWindow, st: &mut State, built: BuiltPsbt, cost_line: String) {
     let frames = app_core::ur::encode_psbt(&built.to_bytes(), 300);
-    w.set_psbt_cost_line(cost_line.into());
-    w.set_psbt_qr(qr::qr_image(&frames[0]).unwrap_or_default());
-    w.set_psbt_frame_label(
+    w.global::<ExportPsbt>().set_psbt_cost_line(cost_line.into());
+    w.global::<ExportPsbt>().set_psbt_qr(qr::qr_image(&frames[0]).unwrap_or_default());
+    w.global::<ExportPsbt>().set_psbt_frame_label(
         if frames.len() > 1 { format!("frame 1 / {}", frames.len()).into() } else { "".into() },
     );
     st.ur_frames = frames;
     st.built_psbt = Some(built);
     st.signed_psbt = None;
-    w.set_psbt_signed(false);
-    w.set_status("".into());
-    w.set_screen(Screen::ExportPsbt);
+    w.global::<Ui>().set_psbt_signed(false);
+    w.global::<Ui>().set_status("".into());
+    w.global::<Ui>().set_screen(Screen::ExportPsbt);
 }
 
 /// Validate + summarize a signed PSBT into the confirmation screen.
@@ -11244,11 +11245,11 @@ fn show_psbt_sign_screen(w: &AppWindow, st: &mut State, built: BuiltPsbt, cost_l
 /// by the confirm screen's navigation.
 fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
     let Some(built) = st.built_psbt.as_ref() else {
-        w.set_status("build a transaction first".into());
+        w.global::<Ui>().set_status("build a transaction first".into());
         return;
     };
     if let Err(e) = validate_signed(&psbt, &built.txid) {
-        w.set_status(format!("{e}").into());
+        w.global::<Ui>().set_status(format!("{e}").into());
         return;
     }
     let Some(output_x) = st.ident.as_ref().map(|i| i.output_x()) else { return };
@@ -11278,7 +11279,7 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
     let sum = match summarize(&psbt, &sum_ctx) {
         Ok(s) => s,
         Err(e) => {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
             return;
         }
     };
@@ -11338,7 +11339,7 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
     let (raw, txid, vsize) = match finalize_extract(psbt.clone()) {
         Ok(x) => x,
         Err(e) => {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
             return;
         }
     };
@@ -11361,7 +11362,7 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
     };
 
     st.signed_psbt = Some(psbt);
-    w.set_psbt_signed(true);
+    w.global::<Ui>().set_psbt_signed(true);
     let pending = PendingBroadcast {
         kind: "psbt",
         raw_hex: raw,
@@ -11380,17 +11381,17 @@ fn set_confirm_from_psbt(w: &AppWindow, st: &mut State, psbt: bitcoin::Psbt) {
 fn apply_safe_area(win: &AppWindow) {
     let scale = win.window().scale_factor();
     let (top, bottom) = platform::safe_area_insets(scale);
-    if (win.get_safe_top() - top).abs() > 0.5 || (win.get_safe_bottom() - bottom).abs() > 0.5 {
+    if (win.global::<Ui>().get_safe_top() - top).abs() > 0.5 || (win.global::<Ui>().get_safe_bottom() - bottom).abs() > 0.5 {
         println!("cb: safe-area top={top:.1} bottom={bottom:.1} scale={scale:.2}");
     }
-    win.set_safe_top(top);
-    win.set_safe_bottom(bottom);
+    win.global::<Ui>().set_safe_top(top);
+    win.global::<Ui>().set_safe_bottom(bottom);
     // Reveal the UI once the inset is known — immediately on desktop (no
     // insets), or as soon as a mobile window reports a real top inset. Until
     // then a splash cover hides the content so it never visibly slides down
     // from under the status bar on cold start.
     if !platform::has_insets() || top > 0.0 {
-        win.set_ready(true);
+        win.global::<Modals>().set_ready(true);
     }
 }
 
@@ -11702,9 +11703,9 @@ pub fn run() {
     }
     let window = AppWindow::new().expect("window");
     // iCloud UI is Apple-only; Android's keystore is device-bound.
-    window.set_apple_platform(cfg!(target_vendor = "apple"));
-    window.set_desktop_platform(cfg!(target_os = "macos"));
-    window.set_biometric_name(
+    window.global::<Ui>().set_apple_platform(cfg!(target_vendor = "apple"));
+    window.global::<Ui>().set_desktop_platform(cfg!(target_os = "macos"));
+    window.global::<Ui>().set_biometric_name(
         if cfg!(target_os = "ios") {
             "Face ID"
         } else if cfg!(target_os = "android") {
@@ -11723,9 +11724,9 @@ pub fn run() {
     // Quantum keys (screen 29) level-picker captions — pinned copy from
     // `passphrase::MlKemLevel::describe()`, set once (never changes at
     // runtime, so no need to re-derive it on every screen open).
-    window.set_pq_desc_512(app_core::passphrase::MlKemLevel::MlKem512.describe().into());
-    window.set_pq_desc_768(app_core::passphrase::MlKemLevel::MlKem768.describe().into());
-    window.set_pq_desc_1024(app_core::passphrase::MlKemLevel::MlKem1024.describe().into());
+    window.global::<QuantumKeys>().set_pq_desc_512(app_core::passphrase::MlKemLevel::MlKem512.describe().into());
+    window.global::<QuantumKeys>().set_pq_desc_768(app_core::passphrase::MlKemLevel::MlKem768.describe().into());
+    window.global::<QuantumKeys>().set_pq_desc_1024(app_core::passphrase::MlKemLevel::MlKem1024.describe().into());
 
     // EditOps: UTF-8 byte-offset text helpers + platform clipboard for the
     // EditField/EditArea widgets (offsets come from TextInput's cursor API
@@ -11867,7 +11868,7 @@ pub fn run() {
                     // notebook's home is one tap in.
                     update_home(&window, &s);
                     update_notebook_list(&window, &s);
-                    window.set_screen(Screen::Notebooks);
+                    window.global::<Ui>().set_screen(Screen::Notebooks);
                     // Initial sync AFTER the first frame. Blocking the launch
                     // path on network I/O gets the app killed by the iOS
                     // launch watchdog (black screen, then 0x8badf00d) when
@@ -11889,7 +11890,7 @@ pub fn run() {
                         }
                     });
                 }
-                Err(e) => window.set_status(format!("stored key failed: {e}").into()),
+                Err(e) => window.global::<Ui>().set_status(format!("stored key failed: {e}").into()),
             }
         } else if s.auto_unlock {
             // Opted in already, so don't ask again — but still AFTER the first
@@ -11915,7 +11916,7 @@ pub fn run() {
                         "unlock your Graffito identity",
                     );
                     *UNLOCK_RESULT.lock().expect("unlock result mutex") = Some(r);
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_unlock());
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_unlock());
                 });
             });
         } else {
@@ -11930,7 +11931,7 @@ pub fn run() {
                     let found = keychain::identity_exists(KEYCHAIN_ACCOUNT);
                     println!("cb: probe saved-key={}", u8::from(found));
                     // Window-only: no State borrow crosses the thread.
-                    let _ = weak.upgrade_in_event_loop(move |w| w.set_saved_key_present(found));
+                    let _ = weak.upgrade_in_event_loop(move |w| w.global::<Onboarding>().set_saved_key_present(found));
                 });
             });
         }
@@ -11947,33 +11948,33 @@ pub fn run() {
         let icloud_avail = keychain::icloud_available();
         let has_key = s.material.is_some();
         s.icloud_backup = if has_key { synced } else { icloud_avail };
-        window.set_icloud_backup(s.icloud_backup);
-        window.set_icloud_enabled(icloud_avail); // iCloud usable for new backups
+        window.global::<Ui>().set_icloud_backup(s.icloud_backup);
+        window.global::<Ui>().set_icloud_enabled(icloud_avail); // iCloud usable for new backups
     }
 
     // First-run disclaimer gate: before anything else, a fresh install (or an
     // upgrade that predates the gate) must accept the terms. The key/notebook
     // state was already loaded above, so accepting just reveals the screen the
     // boot would otherwise have shown (list if a key exists, else onboarding).
-    window.set_disclaimer_body(DISCLAIMER.into());
+    window.global::<Terms>().set_disclaimer_body(DISCLAIMER.into());
     if !st.borrow().terms_accepted {
-        window.set_terms_accept_mode(true);
-        window.set_screen(Screen::Terms);
+        window.global::<Ui>().set_terms_accept_mode(true);
+        window.global::<Ui>().set_screen(Screen::Terms);
     }
 
     // System back (Android): the ui-side nav-back() already navigated; this
     // just emits the log-contract line (screen = where back landed us). No
     // state borrow — nav-back may have gone through a state-borrowing
     // callback (go-home etc.) synchronously before this fires.
-    window.on_back_logged(|handled, screen| {
+    window.global::<Ui>().on_back_logged(|handled, screen| {
         println!("cb: sys-back handled={handled} screen={}", screen_name(screen));
     });
 
     macro_rules! cb {
-        ($name:ident, |$w:ident, $s:ident $(, $arg:ident : $ty:ty)*| $body:block) => {{
+        ($global:ident, $name:ident, |$w:ident, $s:ident $(, $arg:ident : $ty:ty)*| $body:block) => {{
             let st = st.clone();
             let weak = window.as_weak();
-            window.$name(move |$($arg : $ty),*| {
+            window.global::<$global>().$name(move |$($arg : $ty),*| {
                 // Not every callback body uses both the window handle and a
                 // mutable state borrow — `#[allow]` here (once, at the
                 // macro definition) rather than at each of the ~170 call
@@ -11996,7 +11997,7 @@ pub fn run() {
     {
         let st_restore = st.clone();
         let weak = window.as_weak();
-        window.on_restore_saved_key(move || {
+        window.global::<Onboarding>().on_restore_saved_key(move || {
             let w = weak.unwrap();
             println!("cb: restore-saved-key");
             if let Some(m) = read_saved_material(&w) {
@@ -12006,32 +12007,32 @@ pub fn run() {
         });
     }
 
-    cb!(on_door_import, |w, s| {
+    cb!(Onboarding, on_door_import, |w, s| {
         println!("cb: door=import");
-        w.set_import_feedback("".into());
+        w.global::<ImportKey>().set_import_feedback("".into());
         // Default the iCloud backup ON for the imported key when iCloud is
         // available (parity with create; the toggle stays user-overridable).
         let avail = keychain::icloud_available();
         s.icloud_backup = avail;
-        w.set_icloud_backup(avail);
-        w.set_icloud_enabled(avail);
-        w.set_screen(Screen::ImportKey);
+        w.global::<Ui>().set_icloud_backup(avail);
+        w.global::<Ui>().set_icloud_enabled(avail);
+        w.global::<Ui>().set_screen(Screen::ImportKey);
     });
 
     // Creating a seed is now TWO steps: this door only records the length and
     // opens the entropy-source screen (27). Generating immediately would deny
     // the user the one choice they may actually care about — where the
     // randomness came from.
-    cb!(on_door_create, |w, s, words: i32| {
+    cb!(Onboarding, on_door_create, |w, s, words: i32| {
         println!("cb: door=create words={words}");
         s.new_word_count = words as usize;
         s.dice_rolls = Zeroizing::new(String::new());
-        w.set_new_word_count(words);
-        w.set_seed_from_dice(false);
-        w.set_screen(Screen::EntropySource);
+        w.global::<Ui>().set_new_word_count(words);
+        w.global::<BackupWords>().set_seed_from_dice(false);
+        w.global::<Ui>().set_screen(Screen::EntropySource);
     });
 
-    cb!(on_pick_entropy_source, |w, s, kind: SharedString| {
+    cb!(EntropySource, on_pick_entropy_source, |w, s, kind: SharedString| {
         let words = s.new_word_count;
         println!("cb: entropy-source {kind} words={words}");
         match kind.as_str() {
@@ -12042,39 +12043,39 @@ pub fn run() {
                 // no warning and no undo. A fresh sequence starts at
                 // `door_create` (a genuinely new seed) or via "Start over",
                 // which now confirms.
-                w.set_seed_from_dice(true);
+                w.global::<BackupWords>().set_seed_from_dice(true);
                 update_dice_ui(&w, &s);
-                w.set_screen(Screen::Dice);
+                w.global::<Ui>().set_screen(Screen::Dice);
             }
             _ => match generate_mnemonic(words) {
                 Ok(m) => {
-                    w.set_seed_from_dice(false);
+                    w.global::<BackupWords>().set_seed_from_dice(false);
                     stage_new_mnemonic(&w, &mut s, m.to_string());
                 }
-                Err(e) => w.set_status(format!("{e}").into()),
+                Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
             },
         }
     });
 
-    cb!(on_dice_roll, |w, s, face: i32| {
+    cb!(Ui, on_dice_roll, |w, s, face: i32| {
         if (1..=6).contains(&face) {
             s.dice_rolls.push(char::from_digit(face as u32, 10).expect("1..=6 is a digit"));
             update_dice_ui(&w, &s);
         }
     });
 
-    cb!(on_dice_undo, |w, s| {
+    cb!(Dice, on_dice_undo, |w, s| {
         s.dice_rolls.pop();
         update_dice_ui(&w, &s);
     });
 
-    cb!(on_dice_clear, |w, s| {
+    cb!(Ui, on_dice_clear, |w, s| {
         s.dice_rolls = Zeroizing::new(String::new());
         println!("cb: dice-clear");
         update_dice_ui(&w, &s);
     });
 
-    cb!(on_dice_continue, |w, s| {
+    cb!(Dice, on_dice_continue, |w, s| {
         let words = s.new_word_count;
         let rolls = s.dice_rolls.clone();
         match app_core::identity::mnemonic_from_dice(&rolls, words) {
@@ -12099,20 +12100,20 @@ pub fn run() {
             }
             Err(e) => {
                 println!("cb: dice-continue err");
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
             }
         }
     });
 
     // "New words" (↻) on the backup screen: reroll a fresh mnemonic of the same
     // length, in case the user didn't like the ones shown.
-    cb!(on_regenerate_words, |w, s| {
+    cb!(BackupWords, on_regenerate_words, |w, s| {
         let count = s
             .pending_mnemonic
             .as_ref()
             .map(|m| m.split(' ').count())
             .unwrap_or(12);
-        let salt = w.get_entropy_salt().to_string();
+        let salt = w.global::<BackupWords>().get_entropy_salt().to_string();
         match generate_mnemonic_with_salt(count, &salt) {
             Ok(m) => {
                 let phrase = m.to_string();
@@ -12127,16 +12128,16 @@ pub fn run() {
                     println!("cb-test: words={phrase}");
                 }
                 println!("cb: regenerate-words count={count}");
-                w.set_backup_words(grid.into());
+                w.global::<Ui>().set_backup_words(grid.into());
                 s.pending_mnemonic = Some(phrase);
             }
-            Err(e) => w.set_status(format!("{e}").into()),
+            Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
         }
     });
 
     // iCloud backup toggle (backup screen + Settings). Sets the sync mode; if a
     // key is already stored this session, re-stores it with the new mode.
-    cb!(on_set_icloud_backup, |w, s, enabled: bool| {
+    cb!(Ui, on_set_icloud_backup, |w, s, enabled: bool| {
         s.icloud_backup = enabled;
         println!("cb: set-icloud-backup {enabled}");
         if let Some(material) = s.material.clone() {
@@ -12144,15 +12145,15 @@ pub fn run() {
                 Ok(()) => {
                     // Re-stored under a new sync mode — still a saved key.
                     s.saved_key_present = true;
-                    w.set_saved_key_present(true);
-                    w.set_status(
+                    w.global::<Onboarding>().set_saved_key_present(true);
+                    w.global::<Ui>().set_status(
                         if enabled { "iCloud backup on" } else { "iCloud backup off" }.into(),
                     );
                 }
                 Err(e) => {
-                    w.set_status(format!("iCloud: {e}").into());
+                    w.global::<Ui>().set_status(format!("iCloud: {e}").into());
                     s.icloud_backup = !enabled;
-                    w.set_icloud_backup(!enabled);
+                    w.global::<Ui>().set_icloud_backup(!enabled);
                 }
             }
         }
@@ -12162,7 +12163,7 @@ pub fn run() {
     // per (identity, account) — M3.1: in the notebooks index, shared by
     // every notebook of the account — survives restarts, resets to off on
     // a fresh identity.
-    cb!(on_set_spending_enabled, |w, s, on: bool| {
+    cb!(Settings, on_set_spending_enabled, |w, s, on: bool| {
         println!("cb: set-spending enabled={on}");
         if let Some(store) = s.store.as_mut() {
             store.spending_set_enabled(on);
@@ -12174,14 +12175,14 @@ pub fn run() {
         }
     });
 
-    cb!(on_spending_refresh, |w, s| {
+    cb!(Settings, on_spending_refresh, |w, s| {
         spending_refresh_async(&w, &mut s);
     });
 
     // "Scan for existing funds…" manual deep scan (network-efficiency
     // follow-up): gap-20 full discovery for a seed used elsewhere with gaps
     // the shallow automatic scan wouldn't reach.
-    cb!(on_spending_scan_deep, |w, s| {
+    cb!(Coins, on_spending_scan_deep, |w, s| {
         spending_scan_deep_async(&w, &mut s);
     });
 
@@ -12190,7 +12191,7 @@ pub fn run() {
     // onboarding door — so the separate handler only duplicated the door and
     // left different state behind. See `activate_restored`.)
 
-    cb!(on_backup_continue, |w, s| {
+    cb!(BackupWords, on_backup_continue, |w, s| {
         let Some(phrase) = s.pending_mnemonic.clone() else { return };
         let count = phrase.split(' ').count();
         let mut idx = [0u8; 3];
@@ -12213,7 +12214,7 @@ pub fn run() {
         if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
             println!("cb-test: quiz={} {} {}", picks[0] + 1, picks[1] + 1, picks[2] + 1);
         }
-        w.set_quiz_prompt(
+        w.global::<Quiz>().set_quiz_prompt(
             format!(
                 "Type words #{}, #{} and #{} (space separated):",
                 picks[0] + 1,
@@ -12223,11 +12224,11 @@ pub fn run() {
             .into(),
         );
         s.quiz_indices = picks;
-        w.set_quiz_answer("".into());
-        w.set_screen(Screen::Quiz);
+        w.global::<Quiz>().set_quiz_answer("".into());
+        w.global::<Ui>().set_screen(Screen::Quiz);
     });
 
-    cb!(on_quiz_submit, |w, s, answer: SharedString| {
+    cb!(Quiz, on_quiz_submit, |w, s, answer: SharedString| {
         let Some(phrase) = s.pending_mnemonic.clone() else { return };
         let words: Vec<&str> = phrase.split(' ').collect();
         let expect: Vec<&str> = s.quiz_indices.iter().map(|i| words[*i]).collect();
@@ -12236,7 +12237,7 @@ pub fn run() {
         let ok = got == expect;
         println!("cb: quiz ok={ok}");
         if !ok {
-            w.set_status("mismatch — check your written words and try again".into());
+            w.global::<Ui>().set_status("mismatch — check your written words and try again".into());
             return;
         }
         // A freshly created seed is a NEW identity — start at account 0, never
@@ -12247,7 +12248,7 @@ pub fn run() {
         match activate(&mut s, &phrase, true) {
             Ok(()) => {
                 s.pending_mnemonic = None;
-                w.set_status("".into());
+                w.global::<Ui>().set_status("".into());
                 // Onboarding unification (Sal 2026-07-21, superseding the
                 // 2026-07-11 empty-list rule): creating a seed behaves
                 // exactly like importing one — the account's notebook 0
@@ -12257,19 +12258,19 @@ pub fn run() {
                 // archive.
                 ensure_first_onboarded_notebook(&mut s);
                 update_notebook_list(&w, &s);
-                w.set_screen(Screen::Notebooks);
+                w.global::<Ui>().set_screen(Screen::Notebooks);
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s); // CHANGE 5
             }
-            Err(e) => w.set_status(e.to_string().into()),
+            Err(e) => w.global::<Ui>().set_status(e.to_string().into()),
         }
     });
 
-    cb!(on_import_changed, |w, s, text: SharedString| {
+    cb!(ImportKey, on_import_changed, |w, s, text: SharedString| {
         let t = text.trim().to_string();
         if t.is_empty() {
-            w.set_import_feedback("".into());
-            w.set_import_suggestions("".into());
+            w.global::<ImportKey>().set_import_feedback("".into());
+            w.global::<ImportKey>().set_import_suggestions("".into());
             return;
         }
         // Word autocomplete for the mnemonic path.
@@ -12285,7 +12286,7 @@ pub fn run() {
         } else {
             String::new()
         };
-        w.set_import_suggestions(sugg.into());
+        w.global::<ImportKey>().set_import_suggestions(sugg.into());
         let (fb, ok) = match parse_key_material(&t, s.network) {
             Ok(m) if is_hierarchical(&t, s.network) => {
                 (format!("{} OK — you'll choose an account next", m.kind()), true)
@@ -12305,11 +12306,11 @@ pub fn run() {
             },
             Err(e) => (format!("{e}"), false),
         };
-        w.set_import_feedback_ok(ok);
-        w.set_import_feedback(fb.into());
+        w.global::<ImportKey>().set_import_feedback_ok(ok);
+        w.global::<ImportKey>().set_import_feedback(fb.into());
     });
 
-    cb!(on_import_confirm, |w, s, text: SharedString| {
+    cb!(ImportKey, on_import_confirm, |w, s, text: SharedString| {
         // Sal 2026-07-22: a SEED (hierarchical: mnemonic/xprv) no longer
         // branches into the account picker — it activates account 0 directly,
         // auto-creates its first notebook, and lands on the notebook LIST.
@@ -12322,23 +12323,23 @@ pub fn run() {
         match activate(&mut s, text.trim(), true) {
             Ok(()) => {
                 println!("cb: import ok");
-                w.set_import_text("".into());
+                w.global::<ImportKey>().set_import_text("".into());
                 if hierarchical {
                     ensure_first_onboarded_notebook(&mut s);
                     update_notebook_list(&w, &s);
-                    w.set_screen(Screen::Notebooks);
+                    w.global::<Ui>().set_screen(Screen::Notebooks);
                     refresh_async(&w, &mut s);
                     spending_refresh_async(&w, &mut s);
                 } else {
-                    w.set_screen(Screen::Home);
+                    w.global::<Ui>().set_screen(Screen::Home);
                     update_home(&w, &s);
                     refresh_async(&w, &mut s);
                 }
             }
             Err(e) => {
                 println!("cb: import err={e}");
-                w.set_import_feedback_ok(false);
-                w.set_import_feedback(e.to_string().into());
+                w.global::<ImportKey>().set_import_feedback_ok(false);
+                w.global::<ImportKey>().set_import_feedback(e.to_string().into());
             }
         }
     });
@@ -12348,17 +12349,17 @@ pub fn run() {
     {
         let sc = scan_cancel.clone();
         let weak = window.as_weak();
-        window.on_cancel_scan(move || {
+        window.global::<Ui>().on_cancel_scan(move || {
             sc.store(true, Ordering::Relaxed);
             if let Some(w) = weak.upgrade() {
-                w.set_scanning(false);
+                w.global::<Ui>().set_scanning(false);
             }
         });
     }
     {
         let weak = window.as_weak();
         let scan_cancel = scan_cancel.clone();
-        window.on_import_scan(move || {
+        window.global::<ImportKey>().on_import_scan(move || {
             println!("cb: import-scan start");
             let weak = weak.clone();
             let cancel = scan_cancel.clone();
@@ -12377,14 +12378,14 @@ pub fn run() {
                     }
                 };
                 let _ = weak.upgrade_in_event_loop(move |w| {
-                    w.set_scanning(false);
+                    w.global::<Ui>().set_scanning(false);
                     if !text.is_empty() {
                         println!("cb: import-scan ok len={}", text.len());
-                        w.set_import_text(text.clone().into());
-                        w.invoke_import_changed(text.into());
+                        w.global::<ImportKey>().set_import_text(text.clone().into());
+                        w.global::<ImportKey>().invoke_import_changed(text.into());
                     } else {
-                        w.set_import_feedback_ok(false);
-                        w.set_import_feedback("scan: no QR seen".into());
+                        w.global::<ImportKey>().set_import_feedback_ok(false);
+                        w.global::<ImportKey>().set_import_feedback("scan: no QR seen".into());
                     }
                 });
             });
@@ -12394,101 +12395,101 @@ pub fn run() {
     // Paste from the system clipboard — Slint's iOS text fields don't surface
     // the native paste menu, so this reads UIPasteboard directly. Deferred to
     // the event loop so import-changed re-runs without a State double-borrow.
-    cb!(on_paste_import, |w, s| {
+    cb!(ImportKey, on_paste_import, |w, s| {
         let _ = &mut s;
         match platform::clipboard_text() {
             Some(text) => {
                 let _ = w.as_weak().upgrade_in_event_loop(move |w| {
-                    w.set_import_text(text.clone().into());
-                    w.invoke_import_changed(text.into());
+                    w.global::<ImportKey>().set_import_text(text.clone().into());
+                    w.global::<ImportKey>().invoke_import_changed(text.into());
                 });
             }
             None => {
-                w.set_import_feedback_ok(false);
-                w.set_import_feedback("clipboard empty".into());
+                w.global::<ImportKey>().set_import_feedback_ok(false);
+                w.global::<ImportKey>().set_import_feedback("clipboard empty".into());
             }
         }
     });
 
     // Paste into the compose note (appends clipboard to the current text).
-    cb!(on_paste_compose, |w, s| {
+    cb!(Ui, on_paste_compose, |w, s| {
         let _ = &mut s;
         if let Some(text) = platform::clipboard_text() {
-            let combined = format!("{}{}", w.get_compose_text(), text);
+            let combined = format!("{}{}", w.global::<Compose>().get_compose_text(), text);
             let _ = w.as_weak().upgrade_in_event_loop(move |w| {
-                w.set_compose_text(combined.clone().into());
-                w.invoke_compose_changed();
+                w.global::<Compose>().set_compose_text(combined.clone().into());
+                w.global::<Ui>().invoke_compose_changed();
             });
         }
     });
 
-    cb!(on_import_file, |w, s| {
+    cb!(ImportKey, on_import_file, |w, s| {
         let _ = &mut s;
         if let Some(path) = platform::pick_file(&[]) {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
                     println!("cb: import-file len={}", text.trim().len());
-                    w.set_import_text(text.trim().into());
-                    w.invoke_import_changed(text.trim().into());
+                    w.global::<ImportKey>().set_import_text(text.trim().into());
+                    w.global::<ImportKey>().invoke_import_changed(text.trim().into());
                 }
                 Err(e) => {
-                    w.set_import_feedback_ok(false);
-                    w.set_import_feedback(format!("file: {e}").into());
+                    w.global::<ImportKey>().set_import_feedback_ok(false);
+                    w.global::<ImportKey>().set_import_feedback(format!("file: {e}").into());
                 }
             }
         }
     });
 
-    cb!(on_refresh, |w, s| {
+    cb!(Ui, on_refresh, |w, s| {
         refresh_async(&w, &mut s);
     });
 
     // Trampoline: a finished background scan invokes this from the event
     // loop; the UI thread applies it with full State access.
-    cb!(on_apply_pending_refresh, |w, s| {
+    cb!(Ui, on_apply_pending_refresh, |w, s| {
         apply_refresh_results(&w, &mut s);
     });
 
     // Trampoline: an async compose send (notebook/spending/mixed) finished
     // building+broadcasting on a worker thread.
-    cb!(on_apply_pending_compose, |w, s| {
+    cb!(Ui, on_apply_pending_compose, |w, s| {
         apply_compose_results(&w, &mut s);
     });
 
     // Trampoline: an Activity Rebroadcast finished on a worker thread.
-    cb!(on_apply_pending_act_retry, |w, s| {
+    cb!(Ui, on_apply_pending_act_retry, |w, s| {
         apply_act_retry_results(&w, &mut s);
     });
 
     // Trampoline: `on_act_retry`'s sub-case (b) raw-hex fetch (chain-
     // recovered/watch record, no local hex) landed on a worker thread.
-    cb!(on_apply_pending_rebroadcast_fetch, |w, s| {
+    cb!(Ui, on_apply_pending_rebroadcast_fetch, |w, s| {
         apply_pending_rebroadcast_fetch_results(&w, &mut s);
     });
 
     // Trampoline: an Activity Speed-up (RBF) broadcast finished on a worker
     // thread (the re-sign itself stays synchronous — fast, no network; only
     // the broadcast POST is async).
-    cb!(on_apply_pending_act_bump, |w, s| {
+    cb!(Ui, on_apply_pending_act_bump, |w, s| {
         apply_act_bump_results(&w, &mut s);
     });
 
     // Trampoline: an async consolidate/sweep/wallet-consolidate/psbt
     // broadcast (CHANGE 4) finished on a worker thread.
-    cb!(on_apply_pending_wallet_tx, |w, s| {
+    cb!(Ui, on_apply_pending_wallet_tx, |w, s| {
         apply_pending_wallet_tx_results(&w, &mut s);
     });
 
     // Trampoline: a finished spending-wallet scan (funding-unification M3)
     // landed — same pattern as apply-pending-refresh.
-    cb!(on_apply_pending_spending_refresh, |w, s| {
+    cb!(Ui, on_apply_pending_spending_refresh, |w, s| {
         apply_spending_refresh_results(&w, &mut s);
     });
 
     // Trampoline: a finished wallet-wide rescan (Coins screen / notebook-
     // list ↻, watchdog fix 2026-07-20) landed — same pattern as
     // apply-pending-refresh.
-    cb!(on_apply_pending_wallet_stores_refresh, |w, s| {
+    cb!(Ui, on_apply_pending_wallet_stores_refresh, |w, s| {
         apply_wallet_stores_refresh_results(&w, &mut s);
     });
 
@@ -12496,7 +12497,7 @@ pub fn run() {
     // from the user's OTHER device) landed — re-merge the freshly-synced
     // blob into the live device-level contacts list and refresh the
     // picker so the change appears without restarting the app.
-    cb!(on_apply_pending_icloud_contacts, |w, s| {
+    cb!(Ui, on_apply_pending_icloud_contacts, |w, s| {
         apply_icloud_contacts_merge(&w, &mut s);
     });
 
@@ -12504,18 +12505,18 @@ pub fn run() {
     // picker landed — fill in the pills/balances without having blocked the
     // tap. Guarded by account/page/screen so a stale probe (user paged or
     // left) is dropped.
-    cb!(on_apply_pending_picker_probe, |w, s| {
+    cb!(Ui, on_apply_pending_picker_probe, |w, s| {
         let results: Vec<PickerProbeResult> =
             PICKER_PROBE_RESULTS.lock().expect("picker probe mutex").drain(..).collect();
         for r in results {
             if s.account != r.account
-                || w.get_account_page() != r.page as i32
-                || w.get_screen() != Screen::AccountPicker
+                || w.global::<AccountPicker>().get_account_page() != r.page as i32
+                || w.global::<Ui>().get_screen() != Screen::AccountPicker
             {
                 println!("cb: picker-probe stale-drop");
                 continue;
             }
-            let model = w.get_accounts();
+            let model = w.global::<AccountPicker>().get_accounts();
             for i in 0..model.row_count() {
                 if let Some(mut row) = model.row_data(i) {
                     if let Some((_, pill, bal)) =
@@ -12534,7 +12535,7 @@ pub fn run() {
     // Dropped when stale — the network or the configured node changed since
     // the check started (e.g. the user switched networks, or edited the
     // node URL again before the first check returned).
-    cb!(on_apply_pending_node_health, |w, s| {
+    cb!(Ui, on_apply_pending_node_health, |w, s| {
         let results: Vec<NodeHealthResult> =
             NODE_HEALTH_RESULTS.lock().expect("node health mutex").drain(..).collect();
         for r in results {
@@ -12542,8 +12543,8 @@ pub fn run() {
                 println!("cb: node-health stale-drop");
                 continue;
             }
-            w.set_node_health_text(r.text);
-            w.set_node_health_warn(r.warn);
+            w.global::<Settings>().set_node_health_text(r.text);
+            w.global::<Ui>().set_node_health_warn(r.warn);
         }
     });
 
@@ -12553,7 +12554,7 @@ pub fn run() {
     // is what the user meant by importing the seed.
     // Deferred auto-unlock landed. Mirrors read_saved_material's error
     // handling, but on the UI thread with the result already in hand.
-    cb!(on_apply_pending_unlock, |w, s| {
+    cb!(Ui, on_apply_pending_unlock, |w, s| {
         let taken = UNLOCK_RESULT.lock().expect("unlock result mutex").take();
         match taken {
             // Boot path, not onboarding: never create a notebook here.
@@ -12561,7 +12562,7 @@ pub fn run() {
             Some(Ok(None)) => {
                 println!("cb: unlock none");
                 s.saved_key_present = false;
-                w.set_saved_key_present(false);
+                w.global::<Onboarding>().set_saved_key_present(false);
             }
             // Both failure branches REVEAL the door. The auto-unlock branch
             // never runs the `identity_exists` probe (it went straight for the
@@ -12575,20 +12576,20 @@ pub fn run() {
                 // timed-out prompt is one tap from retrying.
                 println!("cb: unlock cancelled");
                 s.saved_key_present = true;
-                w.set_saved_key_present(true);
-                w.set_status("unlock cancelled — tap Restore to try again".into());
+                w.global::<Onboarding>().set_saved_key_present(true);
+                w.global::<Ui>().set_status("unlock cancelled — tap Restore to try again".into());
             }
             Some(Err(e)) => {
                 println!("cb: unlock err={e}");
                 s.saved_key_present = true;
-                w.set_saved_key_present(true);
-                w.set_status(format!("keychain: {e}").into());
+                w.global::<Onboarding>().set_saved_key_present(true);
+                w.global::<Ui>().set_status(format!("keychain: {e}").into());
             }
             None => {}
         }
     });
 
-    cb!(on_apply_pending_discovery, |w, s| {
+    cb!(Ui, on_apply_pending_discovery, |w, s| {
         let results: Vec<DiscoveryResult> =
             DISCOVERY_RESULTS.lock().expect("discovery results mutex").drain(..).collect();
         for r in results {
@@ -12613,7 +12614,7 @@ pub fn run() {
         }
     });
 
-    cb!(on_open_note, |w, s, id: SharedString| {
+    cb!(Home, on_open_note, |w, s, id: SharedString| {
         let Some(store) = &s.store else { return };
         if let Some(n) = store.notes.iter().find(|n| n.note_id.as_str() == id.as_str()) {
             println!("cb: open-note id={} status={:?}", n.note_id, n.status);
@@ -12625,10 +12626,10 @@ pub fn run() {
             // "Copy text" button (copies this whole block) and the
             // dedicated "Copy txid" button (`note-txid`, set below).
             let detail = format_note_detail(n, watch, None);
-            w.set_note_detail(detail.into());
-            w.set_note_view_id(n.note_id.clone().into());
-            w.set_note_pending(n.status == NoteStatus::Pending && n.raw_hex.is_some());
-            w.set_note_txid(n.txids.last().cloned().unwrap_or_default().into());
+            w.global::<Note>().set_note_detail(detail.into());
+            w.global::<Ui>().set_note_view_id(n.note_id.clone().into());
+            w.global::<Note>().set_note_pending(n.status == NoteStatus::Pending && n.raw_hex.is_some());
+            w.global::<Note>().set_note_txid(n.txids.last().cloned().unwrap_or_default().into());
             refresh_note_unlock_ui(&w, n);
             // Reply-all set ({sender} ∪ recipients minus me) — meaningful
             // for both a received note (sender + other recipients) and an
@@ -12647,7 +12648,7 @@ pub fn run() {
             } else {
                 String::new()
             };
-            w.set_note_reply_address(reply_addr.into());
+            w.global::<Note>().set_note_reply_address(reply_addr.into());
             let reply_rows: Vec<ContactItem> = full_set
                 .iter()
                 .map(|a| {
@@ -12660,7 +12661,7 @@ pub fn run() {
                     ContactItem { address: a.clone().into(), name: name.into(), synced: false, sync_status: 0, pq: false }
                 })
                 .collect();
-            w.set_note_reply_set(VecModel::from_slice(&reply_rows));
+            w.global::<Note>().set_note_reply_set(VecModel::from_slice(&reply_rows));
             let web = match s.network {
                 Network::Regtest => String::new(),
                 net => {
@@ -12672,14 +12673,14 @@ pub fn run() {
                     )
                 }
             };
-            w.set_note_web_url(web.into());
-            w.set_screen(Screen::Note);
+            w.global::<Note>().set_note_web_url(web.into());
+            w.global::<Ui>().set_screen(Screen::Note);
         }
     });
 
     // Screen 5's "Unlock" tap. Never logs the typed passphrase — only
     // ok/err, matching the `cb:` log contract's "no secrets in logs" rule.
-    cb!(on_unlock_note, |w, s| {
+    cb!(Note, on_unlock_note, |w, s| {
         // User-initiated tap — the LAUNCH-PATH rule's other sanctioned door
         // (besides opening the Quantum keys screen, and — since
         // PLAN-graffito-self-pw.md — the Security panel's own header tap)
@@ -12687,14 +12688,14 @@ pub fn run() {
         // session. Runs before the borrows below so it never conflicts
         // with them.
         ensure_pq_imported_loaded(&mut s);
-        let note_id = w.get_note_view_id().to_string();
+        let note_id = w.global::<Ui>().get_note_view_id().to_string();
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()) else {
-            w.set_status("no identity".into());
+            w.global::<Ui>().set_status("no identity".into());
             return;
         };
         let identity = identity.clone_fields();
-        let password = w.get_note_unlock_passphrase().to_string();
-        w.set_note_unlock_busy(true);
+        let password = w.global::<Note>().get_note_unlock_passphrase().to_string();
+        w.global::<Note>().set_note_unlock_busy(true);
 
         // A SELF-note's locked body goes through the VIEW-ONLY path
         // (PLAN-graffito-self-pw.md): `unlock_note`/`unlock_sent` refuse it
@@ -12724,7 +12725,7 @@ pub fn run() {
                 ),
                 None => Err(app_core::Error::Store("no store".into())),
             };
-            w.set_note_unlock_busy(false);
+            w.global::<Note>().set_note_unlock_busy(false);
             match result {
                 Ok(text) => {
                     println!("cb: unlock-note ok view-only");
@@ -12733,17 +12734,17 @@ pub fn run() {
                         s.store.as_ref().and_then(|store| store.notes.iter().find(|n| n.note_id == note_id))
                     {
                         let detail = format_note_detail(n, watch, Some(text.as_str()));
-                        w.set_note_detail(detail.into());
+                        w.global::<Note>().set_note_detail(detail.into());
                     }
-                    w.set_note_locked(false);
-                    w.set_note_unlock_needs_password(false);
-                    w.set_note_unlock_show_button(false);
-                    w.set_note_unlock_caption("".into());
-                    w.set_note_unlock_passphrase("".into());
+                    w.global::<Ui>().set_note_locked(false);
+                    w.global::<Note>().set_note_unlock_needs_password(false);
+                    w.global::<Ui>().set_note_unlock_show_button(false);
+                    w.global::<Ui>().set_note_unlock_caption("".into());
+                    w.global::<Note>().set_note_unlock_passphrase("".into());
                 }
                 Err(e) => {
                     println!("cb: unlock-note err={e}");
-                    w.set_status(format!("couldn't unlock: {e}").into());
+                    w.global::<Ui>().set_status(format!("couldn't unlock: {e}").into());
                 }
             }
             return;
@@ -12754,24 +12755,24 @@ pub fn run() {
             Some(store) => store.unlock_note(&note_id, &identity, &secrets, Some(password.as_str())),
             None => Err(app_core::Error::Store("no store".into())),
         };
-        w.set_note_unlock_busy(false);
+        w.global::<Note>().set_note_unlock_busy(false);
         match result {
             Ok(_text) => {
                 println!("cb: unlock-note ok");
                 s.save_store();
                 update_home(&w, &s);
-                w.invoke_open_note(note_id.into());
+                w.global::<Home>().invoke_open_note(note_id.into());
             }
             Err(e) => {
                 println!("cb: unlock-note err={e}");
-                w.set_status(format!("couldn't unlock: {e}").into());
+                w.global::<Ui>().set_status(format!("couldn't unlock: {e}").into());
             }
         }
     });
 
-    cb!(on_open_note_web, |w, s| {
+    cb!(Note, on_open_note_web, |w, s| {
         let _ = &mut s;
-        let url = w.get_note_web_url().to_string();
+        let url = w.global::<Note>().get_note_web_url().to_string();
         if url.is_empty() {
             return;
         }
@@ -12779,7 +12780,7 @@ pub fn run() {
         let _ = platform::open_url(&url);
     });
 
-    cb!(on_copy_text, |w, s, kind: SharedString, text: SharedString| {
+    cb!(Ui, on_copy_text, |w, s, kind: SharedString, text: SharedString| {
         let _ = &mut s;
         let ok = platform::set_clipboard_text(text.as_str());
         println!("cb: copy kind={kind} len={} ok={ok}", text.len());
@@ -12797,7 +12798,7 @@ pub fn run() {
         show_toast(&w, msg);
     });
 
-    cb!(on_set_fee_tier, |w, s, tier: i32| {
+    cb!(Compose, on_set_fee_tier, |w, s, tier: i32| {
         let f = s.fees.clone().unwrap_or_default();
         let rate = match tier {
             0 => f.economy,
@@ -12805,45 +12806,45 @@ pub fn run() {
             _ => f.hour,
         }
         .max(1.0);
-        w.set_fee_tier(tier);
+        w.global::<Compose>().set_fee_tier(tier);
         // Custom (tier 3, also reached by editing the always-visible rate
         // box) keeps whatever the field already holds — Rust never
         // overwrites it while tier == 3 (same rule as sweep's
         // on_set_sweep_tier), so auto-selecting custom on edit can't fight
         // the user's typing.
         if tier != 3 {
-            w.set_rate_text(format!("{rate}").into());
+            w.global::<Compose>().set_rate_text(format!("{rate}").into());
         }
         println!("cb: fee-tier {tier} rate={rate}");
         refresh_compose(&w, &mut s);
     });
 
-    cb!(on_open_coins, |w, s| {
+    cb!(Settings, on_open_coins, |w, s| {
         println!("cb: open-coins");
         update_home(&w, &s);
         update_spending_ui(&w, &s);
-        if w.get_coins_segment() == "spending" && s.spending_capable && !s.spending_scanned {
+        if w.global::<Ui>().get_coins_segment() == "spending" && s.spending_capable && !s.spending_scanned {
             spending_refresh_async(&w, &mut s);
         }
-        w.set_status("".into());
-        w.set_screen(Screen::Coins);
+        w.global::<Ui>().set_status("".into());
+        w.global::<Ui>().set_screen(Screen::Coins);
     });
 
     // Coins screen "spending" segment: scan on first view (data otherwise
     // stays "as of the last scan", matching the notebook segment's rule).
-    cb!(on_set_coins_segment, |w, s, seg: SharedString| {
-        w.set_coins_segment(seg.clone());
+    cb!(Ui, on_set_coins_segment, |w, s, seg: SharedString| {
+        w.global::<Ui>().set_coins_segment(seg.clone());
         if seg.as_str() == "spending" && s.spending_capable && !s.spending_scanned {
             spending_refresh_async(&w, &mut s);
         }
     });
 
-    cb!(on_open_activity, |w, s| {
+    cb!(Ui, on_open_activity, |w, s| {
         println!("cb: open-activity");
-        w.set_return_screen(if w.get_screen() == Screen::Notebooks { Screen::Notebooks } else { Screen::Home });
+        w.global::<Ui>().set_return_screen(if w.global::<Ui>().get_screen() == Screen::Notebooks { Screen::Notebooks } else { Screen::Home });
         update_activity(&w, &s);
-        w.set_status("".into());
-        w.set_screen(Screen::Activity);
+        w.global::<Ui>().set_status("".into());
+        w.global::<Ui>().set_screen(Screen::Activity);
     });
 
     // Universal confirm screen (2026-07-17): stage A resolves the raw hex
@@ -12853,7 +12854,7 @@ pub fn run() {
     // Rebroadcast`, mirroring `on_act_bump_confirm` below); it's only
     // touched transiently to guard sub-case (b)'s own network fetch
     // against a double-tap, cleared the moment the fetch result lands.
-    cb!(on_act_retry, |w, s, ref_id: SharedString, is_note: bool| {
+    cb!(Ui, on_act_retry, |w, s, ref_id: SharedString, is_note: bool| {
         if s.act_pending_ref.is_some() || s.wallet_tx_busy || s.pending_broadcast.is_some() {
             return;
         }
@@ -12883,7 +12884,7 @@ pub fn run() {
         // fetch; land on the confirm screen from the fetch-result
         // trampoline (mirrors `spending_refresh_async`).
         let Some(base) = s.base_url() else {
-            w.set_status("no Bitcoin node — set one in Settings".into());
+            w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
             return;
         };
         let net = s.network;
@@ -12901,11 +12902,11 @@ pub fn run() {
             REBROADCAST_FETCH_RESULTS.lock().expect("rebroadcast fetch results mutex").push(
                 RebroadcastFetchResult { ref_id: ref_id_s, is_note, identity_addr, result },
             );
-            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_rebroadcast_fetch());
+            let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_rebroadcast_fetch());
         });
     });
 
-    cb!(on_act_bump_open, |w, s, ref_id: SharedString, is_note: bool| {
+    cb!(Activity, on_act_bump_open, |w, s, ref_id: SharedString, is_note: bool| {
         // The bump dialog prices off `st.fees.fastest` — lazily (re)fetch
         // before either branch below reads it (network-efficiency,
         // 2026-07-23). `watch_bump_open` also calls this — the 60s cache
@@ -12920,11 +12921,11 @@ pub fn run() {
         // mixed record (`ActivityItem.bumpable`), but refuse here too
         // rather than trust the tap origin.
         if !is_note && store.txs.iter().any(|t| t.txids.iter().any(|x| x == ref_id.as_str()) && t.mixed_inputs) {
-            w.set_status("this sweep mixed notebook + spending coins — it can't be sped up (rebroadcast still works)".into());
+            w.global::<Ui>().set_status("this sweep mixed notebook + spending coins — it can't be sped up (rebroadcast still works)".into());
             return;
         }
         let Some((old_rate, fee, vsize)) = tx_rate(store, ref_id.as_str(), is_note) else {
-            w.set_status("can't determine current fee rate".into());
+            w.global::<Ui>().set_status("can't determine current fee rate".into());
             return;
         };
         // BIP-125: the replacement must add at least 1 sat/vB (incremental
@@ -12933,26 +12934,26 @@ pub fn run() {
         let fast = s.fees.as_ref().map(|f| f.fastest).unwrap_or(min_rate);
         let recommended = fast.max(min_rate);
         println!("cb: bump-open ref={ref_id} old={old_rate:.1} min={min_rate:.1}");
-        w.set_bump_ref(ref_id.clone());
-        w.set_bump_is_note(is_note);
-        w.set_bump_kind(if is_note { "Note transaction" } else { "Sweep / consolidate" }.into());
-        w.set_bump_current(format!("Currently {old_rate:.1} sat/vB · {fee} sats fee").into());
-        w.set_bump_min(format!("Minimum {min_rate:.1} sat/vB — RBF must add ≥1 sat/vB.").into());
-        w.set_bump_error("".into());
-        w.set_bump_rate(format!("{recommended:.1}").into());
-        w.set_bump_new_fee(new_fee_line(recommended, vsize, fee).into());
-        w.set_show_bump_dialog(true);
+        w.global::<Ui>().set_bump_ref(ref_id.clone());
+        w.global::<Ui>().set_bump_is_note(is_note);
+        w.global::<Modals>().set_bump_kind(if is_note { "Note transaction" } else { "Sweep / consolidate" }.into());
+        w.global::<Modals>().set_bump_current(format!("Currently {old_rate:.1} sat/vB · {fee} sats fee").into());
+        w.global::<Modals>().set_bump_min(format!("Minimum {min_rate:.1} sat/vB — RBF must add ≥1 sat/vB.").into());
+        w.global::<Modals>().set_bump_error("".into());
+        w.global::<Modals>().set_bump_rate(format!("{recommended:.1}").into());
+        w.global::<Modals>().set_bump_new_fee(new_fee_line(recommended, vsize, fee).into());
+        w.global::<Ui>().set_show_bump_dialog(true);
     });
 
-    cb!(on_act_bump_rate_changed, |w, s, rate_s: SharedString| {
-        let ref_id = w.get_bump_ref().to_string();
-        let is_note = w.get_bump_is_note();
+    cb!(Modals, on_act_bump_rate_changed, |w, s, rate_s: SharedString| {
+        let ref_id = w.global::<Ui>().get_bump_ref().to_string();
+        let is_note = w.global::<Ui>().get_bump_is_note();
         if let Some(wb) =
             s.watch_bump.as_ref().filter(|wb| wb.ref_id == ref_id && wb.is_note == is_note)
         {
             match rate_s.trim().parse::<f64>() {
-                Ok(r) if r > 0.0 => w.set_bump_new_fee(new_fee_line(r, wb.vsize, wb.old_fee).into()),
-                _ => w.set_bump_new_fee("".into()),
+                Ok(r) if r > 0.0 => w.global::<Modals>().set_bump_new_fee(new_fee_line(r, wb.vsize, wb.old_fee).into()),
+                _ => w.global::<Modals>().set_bump_new_fee("".into()),
             }
             return;
         }
@@ -12961,8 +12962,8 @@ pub fn run() {
             return;
         };
         match rate_s.trim().parse::<f64>() {
-            Ok(r) if r > 0.0 => w.set_bump_new_fee(new_fee_line(r, vsize, old_fee).into()),
-            _ => w.set_bump_new_fee("".into()),
+            Ok(r) if r > 0.0 => w.global::<Modals>().set_bump_new_fee(new_fee_line(r, vsize, old_fee).into()),
+            _ => w.global::<Modals>().set_bump_new_fee("".into()),
         }
     });
 
@@ -12974,19 +12975,19 @@ pub fn run() {
     // broadcast POST) — NOT set here, so it must never gate stage A;
     // `pending_broadcast`/`wallet_tx_busy` are the re-entrancy guard for
     // the build+navigate step instead.
-    cb!(on_act_bump_confirm, |w, s| {
+    cb!(Modals, on_act_bump_confirm, |w, s| {
         if s.act_pending_ref.is_some() || s.wallet_tx_busy || s.pending_broadcast.is_some() {
             return;
         }
-        let ref_id = w.get_bump_ref().to_string();
-        let is_note = w.get_bump_is_note();
-        let Ok(new_rate) = w.get_bump_rate().trim().parse::<f64>() else {
-            w.set_bump_error("enter a number".into());
+        let ref_id = w.global::<Ui>().get_bump_ref().to_string();
+        let is_note = w.global::<Ui>().get_bump_is_note();
+        let Ok(new_rate) = w.global::<Modals>().get_bump_rate().trim().parse::<f64>() else {
+            w.global::<Modals>().set_bump_error("enter a number".into());
             return;
         };
         let net = s.network;
         if s.base_url().is_none() {
-            w.set_bump_error("no Bitcoin node — set one in Settings".into());
+            w.global::<Modals>().set_bump_error("no Bitcoin node — set one in Settings".into());
             return;
         }
         if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
@@ -12997,22 +12998,22 @@ pub fn run() {
         if !is_note
             && s.store.as_ref().map(|st| st.txs.iter().any(|t| t.txids.iter().any(|x| x == &ref_id) && t.mixed_inputs)).unwrap_or(false)
         {
-            w.set_bump_error("this sweep mixed notebook + spending coins — it can't be sped up".into());
+            w.global::<Modals>().set_bump_error("this sweep mixed notebook + spending coins — it can't be sped up".into());
             return;
         }
         let min_rate = match s.store.as_ref().and_then(|st| tx_rate(st, &ref_id, is_note)) {
             Some((old_rate, _, _)) => old_rate + 1.0,
             None => {
-                w.set_bump_error("transaction no longer pending".into());
+                w.global::<Modals>().set_bump_error("transaction no longer pending".into());
                 return;
             }
         };
         if new_rate + 1e-9 < min_rate {
-            w.set_bump_error(format!("below the {min_rate:.1} sat/vB minimum").into());
+            w.global::<Modals>().set_bump_error(format!("below the {min_rate:.1} sat/vB minimum").into());
             return;
         }
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-            w.set_bump_error("no identity".into());
+            w.global::<Modals>().set_bump_error("no identity".into());
             return;
         };
         // Multi-key records (wallet sweep/consolidate) carry per-input
@@ -13115,7 +13116,7 @@ pub fn run() {
                 // `save_store()` at the Broadcast tap, re-arms
                 // `act_pending_ref` right before the POST, and spawns the
                 // SAME worker pushing `ActBumpResult`.
-                w.set_show_bump_dialog(false);
+                w.global::<Ui>().set_show_bump_dialog(false);
                 let prevouts = stored_record_prevouts(&s, &ref_id, is_note);
                 let expected_change = stored_record_expected_change(&s, &ref_id, is_note);
                 let (self_spks, spending_spks) = confirm_self_spks(&s);
@@ -13144,12 +13145,12 @@ pub fn run() {
             }
             Err(e) => {
                 println!("cb: act-bump ref={ref_id} err={e}");
-                w.set_bump_error(format!("{e}").into());
+                w.global::<Modals>().set_bump_error(format!("{e}").into());
             }
         }
     });
 
-    cb!(on_act_explorer, |w, s, url: SharedString| {
+    cb!(Ui, on_act_explorer, |w, s, url: SharedString| {
         let _ = &mut s;
         if url.is_empty() {
             return;
@@ -13158,13 +13159,13 @@ pub fn run() {
         let _ = platform::open_url(url.as_str());
     });
 
-    cb!(on_open_source, |w, s| {
+    cb!(Settings, on_open_source, |w, s| {
         let _ = (&w, &mut s);
         println!("cb: open-source");
         let _ = platform::open_url(SOURCE_URL);
     });
 
-    cb!(on_open_note_web_url, |w, s, url: SharedString| {
+    cb!(Home, on_open_note_web_url, |w, s, url: SharedString| {
         let _ = &mut s;
         if url.is_empty() {
             return;
@@ -13173,21 +13174,21 @@ pub fn run() {
         let _ = platform::open_url(url.as_str());
     });
 
-    cb!(on_compose_open, |w, s| {
+    cb!(Home, on_compose_open, |w, s| {
         println!("cb: compose-open");
-        w.set_pick_mode("compose".into());
+        w.global::<Ui>().set_pick_mode("compose".into());
         pull_icloud_contacts_on_open(&w, &mut s);
-        w.set_contact_input("".into());
-        w.set_status("".into());
-        w.set_screen(Screen::Contacts);
+        w.global::<Ui>().set_contact_input("".into());
+        w.global::<Ui>().set_status("".into());
+        w.global::<Ui>().set_screen(Screen::Contacts);
     });
 
     // Send-to picker header "Sync now" (sync-status UI, 2026-07-20).
-    cb!(on_sync_contacts_now, |w, s| {
+    cb!(Contacts, on_sync_contacts_now, |w, s| {
         sync_contacts_now(&w, &mut s);
     });
 
-    cb!(on_sweep_open, |w, s| {
+    cb!(Settings, on_sweep_open, |w, s| {
         println!("cb: sweep-open");
         // The send-to picker's sweep entry lands on screen 16 (fee tiers
         // shown) once a destination is picked — lazily (re)fetch here so
@@ -13206,12 +13207,12 @@ pub fn run() {
         {
             spending_refresh_async(&w, &mut s);
         }
-        w.set_sweep_kind("sweep".into());
-        w.set_pick_mode("sweep".into());
+        w.global::<Ui>().set_sweep_kind("sweep".into());
+        w.global::<Ui>().set_pick_mode("sweep".into());
         pull_icloud_contacts_on_open(&w, &mut s);
-        w.set_contact_input("".into());
-        w.set_status("".into());
-        w.set_screen(Screen::Contacts);
+        w.global::<Ui>().set_contact_input("".into());
+        w.global::<Ui>().set_status("".into());
+        w.global::<Ui>().set_screen(Screen::Contacts);
     });
 
     // Funding-unification M3: Settings spending-wallet card "Sweep notebook
@@ -13219,17 +13220,17 @@ pub fn run() {
     // 16), just pre-picking the destination = the spending wallet's next
     // receive address. `pending_spending_sweep_index` tells on_sweep's
     // success handler to mark that address used (fresh-address discipline).
-    cb!(on_spending_sweep_here, |w, s| {
+    cb!(Settings, on_spending_sweep_here, |w, s| {
         ensure_spending_source(&mut s);
         let Some(src) = s.spending_source.clone() else {
-            w.set_status("spending wallet unavailable for this identity".into());
+            w.global::<Ui>().set_status("spending wallet unavailable for this identity".into());
             return;
         };
         let Some(idx) = s.store.as_ref().map(|st| st.spending.next_receive) else { return };
         let Ok(d) = src.derive(0, idx) else { return };
         s.pending_spending_sweep_index = Some(idx);
-        w.set_sweep_kind("sweep".into());
-        w.set_pick_mode("sweep".into());
+        w.global::<Ui>().set_sweep_kind("sweep".into());
+        w.global::<Ui>().set_pick_mode("sweep".into());
         set_sweep_dest(&w, &mut s, d.address);
     });
 
@@ -13241,7 +13242,7 @@ pub fn run() {
     // off to the universal confirm screen. Stage B
     // (`on_confirm_broadcast`/`PendingPayload::SpendingConsolidate`) is
     // the pre-existing thread-spawn, moved verbatim.
-    cb!(on_spending_consolidate_open, |w, s| {
+    cb!(Coins, on_spending_consolidate_open, |w, s| {
         if s.wallet_tx_busy || s.pending_broadcast.is_some() {
             return;
         }
@@ -13250,16 +13251,16 @@ pub fn run() {
         refresh_fees_price(&w, &mut s);
         ensure_spending_source(&mut s);
         let Some(src) = s.spending_source.clone() else {
-            w.set_status("spending wallet unavailable for this identity".into());
+            w.global::<Ui>().set_status("spending wallet unavailable for this identity".into());
             return;
         };
         let coins = s.spending_coins.clone();
         if coins.len() < 2 {
-            w.set_status("nothing to consolidate (need 2+ spending coins)".into());
+            w.global::<Ui>().set_status("nothing to consolidate (need 2+ spending coins)".into());
             return;
         }
         if s.base_url().is_none() {
-            w.set_status("no Bitcoin node for this network — set one in Settings".into());
+            w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
             return;
         }
         let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
@@ -13269,7 +13270,7 @@ pub fn run() {
         let Ok(material) = parse_key_material(&material_str, net) else { return };
         let Some(next_receive) = s.store.as_ref().map(|st| st.spending.next_receive) else { return };
         let Ok(dest) = src.derive(0, next_receive) else {
-            w.set_status("couldn't derive the destination address".into());
+            w.global::<Ui>().set_status("couldn't derive the destination address".into());
             return;
         };
         let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
@@ -13342,15 +13343,15 @@ pub fn run() {
                 };
                 show_confirm(&w, &mut s, pending, ctx);
             }
-            Err(e) => w.set_status(format!("{e}").into()),
+            Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
         }
     });
 
-    cb!(on_consolidate_open, |w, s| {
+    cb!(Ui, on_consolidate_open, |w, s| {
         open_notebook_consolidate(&w, &mut s);
     });
 
-    cb!(on_consolidate_wallet_open, |w, s| {
+    cb!(Coins, on_consolidate_wallet_open, |w, s| {
         // The destination-pick handler prices the tx off `s.fees.hour`
         // shortly after this opens the account picker — lazily (re)fetch
         // now so it's ready (network-efficiency, 2026-07-23).
@@ -13373,7 +13374,7 @@ pub fn run() {
             sources.push((m.index, coins, value));
         }
         if coins_total < 2 {
-            w.set_status("nothing to consolidate (need 2+ coins across the wallet)".into());
+            w.global::<Ui>().set_status("nothing to consolidate (need 2+ coins across the wallet)".into());
             return;
         }
         println!(
@@ -13388,12 +13389,12 @@ pub fn run() {
             fee: 0,
             vsize: 0,
         });
-        w.set_nb_create_name("".into());
+        w.global::<AccountPicker>().set_nb_create_name("".into());
         show_notebook_picker(&w, &s, 0, "wconsol");
     });
 
-    cb!(on_set_sweep_tier, |w, s, tier: i32| {
-        w.set_sweep_tier(tier);
+    cb!(Sweep, on_set_sweep_tier, |w, s, tier: i32| {
+        w.global::<Sweep>().set_sweep_tier(tier);
         let f = s.fees.clone().unwrap_or_default();
         let rate = match tier {
             0 => f.economy,
@@ -13402,58 +13403,58 @@ pub fn run() {
         }
         .max(1.0);
         if tier != 3 {
-            w.set_sweep_rate_text(format!("{rate}").into());
+            w.global::<Sweep>().set_sweep_rate_text(format!("{rate}").into());
         }
         println!("cb: sweep-tier {tier} rate={rate}");
         update_sweep_screen(&w, &mut s);
     });
 
-    cb!(on_sweep_rate_changed, |w, s| {
+    cb!(Sweep, on_sweep_rate_changed, |w, s| {
         update_sweep_screen(&w, &mut s);
     });
 
-    cb!(on_toggle_sweep_fund_external, |w, s, on: bool| {
+    cb!(Sweep, on_toggle_sweep_fund_external, |w, s, on: bool| {
         println!("cb: sweep-fund-external {on}");
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
         if on && s.funding.is_none() {
             // No funding wallet active yet — pick one; Back returns here.
-            w.set_funding_return(Screen::Sweep);
+            w.global::<Ui>().set_funding_return(Screen::Sweep);
             refresh_funding_list(&w, &s);
-            w.set_screen(Screen::FundingWallets);
+            w.global::<Ui>().set_screen(Screen::FundingWallets);
             return;
         }
         update_sweep_screen(&w, &mut s);
     });
 
-    cb!(on_sweep_send, |w, s| {
+    cb!(Sweep, on_sweep_send, |w, s| {
         // Scan-freshness gate (belt to the UI button's braces — an e2e tap
         // or a race can land on a just-disabled button): never build a
         // sweep/consolidate off a coin cache a scan is about to replace.
-        if w.get_wallet_scan_busy() {
+        if w.global::<Ui>().get_wallet_scan_busy() {
             println!("cb: sign-gate busy kind=sweep");
-            w.set_status("still syncing — one moment".into());
+            w.global::<Ui>().set_status("still syncing — one moment".into());
             return;
         }
-        let dest = w.get_sweep_dest().to_string();
+        let dest = w.global::<Ui>().get_sweep_dest().to_string();
         let net = s.network;
         let Ok(recipient) = Recipient::parse(net, &dest) else {
-            w.set_status(format!("not a valid {} address", net.as_str()).into());
+            w.global::<Ui>().set_status(format!("not a valid {} address", net.as_str()).into());
             return;
         };
         let rate = resolve_sweep_rate(&w, &s);
         if rate <= 0.0 {
-            w.set_status("enter a fee rate".into());
+            w.global::<Ui>().set_status("enter a fee rate".into());
             return;
         }
-        if w.get_sweep_fund_external() {
+        if w.global::<Sweep>().get_sweep_fund_external() {
             // Fee from the funding wallet: the FULL balance rides to the
             // destination, funding change returns to the funding wallet.
             let Some(fund_src) = s.funding.clone() else {
-                w.set_status("set a funding wallet first".into());
+                w.global::<Ui>().set_status("set a funding wallet first".into());
                 return;
             };
             if s.funding_coins.is_empty() {
-                w.set_status("funding wallet has no spendable coins".into());
+                w.global::<Ui>().set_status("funding wallet has no spendable coins".into());
                 return;
             }
             // Watch identities sweep the whole WALLET (every active
@@ -13478,7 +13479,7 @@ pub fn run() {
                     .unwrap_or_default()
             };
             if notes_coins.is_empty() {
-                w.set_status("nothing to sweep".into());
+                w.global::<Ui>().set_status("nothing to sweep".into());
                 return;
             }
             let inputs: Vec<app_core::store::TxInput> = notes_coins
@@ -13518,7 +13519,7 @@ pub fn run() {
                         match sign_own_taproot_inputs(&mut built.psbt, &id.output_x, &id.tweaked_seckey) {
                             Ok(k) => println!("cb: sweep-own-signed inputs={k}"),
                             Err(e) => {
-                                w.set_status(format!("{e}").into());
+                                w.global::<Ui>().set_status(format!("{e}").into());
                                 return;
                             }
                         }
@@ -13529,7 +13530,7 @@ pub fn run() {
                     );
                     s.watch_note = None;
                     s.watch_spend = Some(WatchSpend {
-                        kind: if w.get_sweep_kind().as_str() == "consolidate" { "consolidate" } else { "sweep" },
+                        kind: if w.global::<Ui>().get_sweep_kind().as_str() == "consolidate" { "consolidate" } else { "sweep" },
                         dest: dest.clone(),
                         dest_spk_hex: hex::encode(&recipient.spk),
                         value: built.sent_to_recipient,
@@ -13550,11 +13551,11 @@ pub fn run() {
                     );
                     show_psbt_sign_screen(&w, &mut s, built, cost);
                 }
-                Err(e) => w.set_status(format!("{e}").into()),
+                Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
             }
             return;
         }
-        let consolidate = w.get_sweep_kind().as_str() == "consolidate";
+        let consolidate = w.global::<Ui>().get_sweep_kind().as_str() == "consolidate";
         if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
             let kind = if consolidate { "consolidate" } else { "sweep" };
             watch_spend_build(&w, &mut s, kind, dest, recipient.spk.clone(), rate);
@@ -13575,13 +13576,13 @@ pub fn run() {
         }
     });
 
-    cb!(on_pick_contact, |w, s, addr: SharedString| {
+    cb!(Contacts, on_pick_contact, |w, s, addr: SharedString| {
         // Sweep mode: the picker chooses the sweep DESTINATION, then opens
         // the compose-like sweep screen (16) instead of compose.
-        if w.get_pick_mode().as_str() == "sweep" {
+        if w.global::<Ui>().get_pick_mode().as_str() == "sweep" {
             let mut a = normalize_addr(addr.as_str());
             if a == "self" || a.is_empty() {
-                w.set_status("pick a destination address".into());
+                w.global::<Ui>().set_status("pick a destination address".into());
                 return;
             }
             if Recipient::parse(s.network, &a).is_err() {
@@ -13590,7 +13591,7 @@ pub fn run() {
                     a = lower;
                 } else {
                     println!("cb: sweep-pick err=bad-address");
-                    w.set_status(format!("not a valid {} address", s.network.as_str()).into());
+                    w.global::<Ui>().set_status(format!("not a valid {} address", s.network.as_str()).into());
                     return;
                 }
             }
@@ -13607,25 +13608,25 @@ pub fn run() {
             add_recipient_chip(&w, &mut s, addr.as_str());
             return;
         }
-        w.set_compose_return(Screen::Contacts);
+        w.global::<Ui>().set_compose_return(Screen::Contacts);
         pick_contact_core(&w, &mut s, addr.as_str());
     });
 
-    cb!(on_reply_to_note, |w, s| {
-        let addr = w.get_note_reply_address().to_string();
+    cb!(Note, on_reply_to_note, |w, s| {
+        let addr = w.global::<Note>().get_note_reply_address().to_string();
         if addr.is_empty() {
             return;
         }
         println!("cb: reply to={addr}");
-        w.set_compose_return(Screen::Note);
+        w.global::<Ui>().set_compose_return(Screen::Note);
         pick_contact_core(&w, &mut s, &addr);
     });
 
-    cb!(on_reply_all_to_note, |w, s| {
-        let addrs: Vec<String> = w.get_note_reply_set().iter().map(|c| c.address.to_string()).collect();
+    cb!(Note, on_reply_all_to_note, |w, s| {
+        let addrs: Vec<String> = w.global::<Note>().get_note_reply_set().iter().map(|c| c.address.to_string()).collect();
         let Some((first, rest)) = addrs.split_first() else { return };
         println!("cb: reply-all to={} n={}", addrs.join(","), addrs.len());
-        w.set_compose_return(Screen::Note);
+        w.global::<Ui>().set_compose_return(Screen::Note);
         // pick_contact_core resets the compose session (clearing any prior
         // to_addresses_extra) before we seed the rest as extra chips.
         pick_contact_core(&w, &mut s, first);
@@ -13634,7 +13635,7 @@ pub fn run() {
         refresh_compose(&w, &mut s);
     });
 
-    cb!(on_add_recipient_open, |w, s| {
+    cb!(Compose, on_add_recipient_open, |w, s| {
         // Multi-select stays notebook-funded-compose only (watch-only has
         // no multi-recipient PSBT builder yet — a later unit).
         if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
@@ -13642,20 +13643,20 @@ pub fn run() {
         }
         let total = 1 + s.to_addresses_extra.len();
         if total >= 255 {
-            w.set_status("recipient limit reached (255)".into());
+            w.global::<Ui>().set_status("recipient limit reached (255)".into());
             return;
         }
         println!("cb: add-recipient-open");
         s.picking_extra = true;
-        w.set_picking_extra(true);
-        w.set_contact_input("".into());
-        w.set_status("".into());
-        w.set_pick_mode("compose".into());
+        w.global::<Ui>().set_picking_extra(true);
+        w.global::<Ui>().set_contact_input("".into());
+        w.global::<Ui>().set_status("".into());
+        w.global::<Ui>().set_pick_mode("compose".into());
         pull_icloud_contacts_on_open(&w, &mut s);
-        w.set_screen(Screen::Contacts);
+        w.global::<Ui>().set_screen(Screen::Contacts);
     });
 
-    cb!(on_remove_chip, |w, s, addr: SharedString| {
+    cb!(Compose, on_remove_chip, |w, s, addr: SharedString| {
         let a = addr.to_string();
         s.to_addresses_extra.retain(|x| x != &a);
         println!("cb: remove-chip n={}", s.to_addresses_extra.len() + 1);
@@ -13666,7 +13667,7 @@ pub fn run() {
     {
         let weak = window.as_weak();
         let scan_cancel = scan_cancel.clone();
-        window.on_contact_scan(move || {
+        window.global::<Contacts>().on_contact_scan(move || {
             println!("cb: contact-scan start");
             let weak = weak.clone();
             let cancel = scan_cancel.clone();
@@ -13678,17 +13679,17 @@ pub fn run() {
                     _ => String::new(),
                 };
                 let _ = weak.upgrade_in_event_loop(move |w| {
-                    w.set_scanning(false);
+                    w.global::<Ui>().set_scanning(false);
                     if text.is_empty() {
-                        w.set_status("scan: no QR seen".into());
+                        w.global::<Ui>().set_status("scan: no QR seen".into());
                     } else {
                         println!("cb: contact-scan ok");
                         let a = normalize_addr(&text);
                         // Prefill so a failed validation leaves it editable,
                         // then pick directly — a valid scan goes straight
                         // to Compose (the Prime picker behavior).
-                        w.set_contact_input(a.clone().into());
-                        w.invoke_pick_contact(a.into());
+                        w.global::<Ui>().set_contact_input(a.clone().into());
+                        w.global::<Contacts>().invoke_pick_contact(a.into());
                     }
                 });
             });
@@ -13698,7 +13699,7 @@ pub fn run() {
     {
         let weak = window.as_weak();
         let scan_cancel = scan_cancel.clone();
-        window.on_change_scan(move || {
+        window.global::<Change>().on_change_scan(move || {
             println!("cb: change-scan start");
             let weak = weak.clone();
             let cancel = scan_cancel.clone();
@@ -13710,14 +13711,14 @@ pub fn run() {
                     _ => String::new(),
                 };
                 let _ = weak.upgrade_in_event_loop(move |w| {
-                    w.set_scanning(false);
+                    w.global::<Ui>().set_scanning(false);
                     if text.is_empty() {
-                        w.set_status("scan: no QR seen".into());
+                        w.global::<Ui>().set_status("scan: no QR seen".into());
                     } else {
                         println!("cb: change-scan ok");
-                        w.set_change_address(normalize_addr(&text).into());
-                        w.set_change_expanded(true);
-                        w.invoke_compose_changed();
+                        w.global::<Ui>().set_change_address(normalize_addr(&text).into());
+                        w.global::<Ui>().set_change_expanded(true);
+                        w.global::<Ui>().invoke_compose_changed();
                     }
                 });
             });
@@ -13728,7 +13729,7 @@ pub fn run() {
     {
         let weak = window.as_weak();
         let scan_cancel = scan_cancel.clone();
-        window.on_funding_scan(move || {
+        window.global::<FundingWalletScreen>().on_funding_scan(move || {
             println!("cb: funding-scan start");
             let weak = weak.clone();
             let cancel = scan_cancel.clone();
@@ -13749,7 +13750,7 @@ pub fn run() {
                         let complete = dec.receive(t).unwrap_or(false);
                         parts.push(t.to_string());
                         let p = dec.progress();
-                        let _ = pweak.upgrade_in_event_loop(move |w| w.set_scan_progress(p));
+                        let _ = pweak.upgrade_in_event_loop(move |w| w.global::<Modals>().set_scan_progress(p));
                         complete
                     } else {
                         single = Some(t.to_string());
@@ -13765,19 +13766,19 @@ pub fn run() {
                     _ => None,
                 };
                 let _ = weak.upgrade_in_event_loop(move |w| {
-                    w.set_scanning(false);
+                    w.global::<Ui>().set_scanning(false);
                     match result {
                         Some(Err(ur)) => {
                             println!("cb: funding-scan ur (multi-frame)");
-                            w.invoke_funding_import_ur(ur.into());
+                            w.global::<Ui>().invoke_funding_import_ur(ur.into());
                         }
                         Some(Ok(desc)) => {
                             println!("cb: funding-scan ok");
                             let t: SharedString = extract_descriptor(&desc).into();
-                            w.set_funding_descriptor(t.clone());
-                            w.invoke_funding_changed(t);
+                            w.global::<FundingWalletScreen>().set_funding_descriptor(t.clone());
+                            w.global::<FundingWalletScreen>().invoke_funding_changed(t);
                         }
-                        None => w.set_status("scan: no complete QR seen".into()),
+                        None => w.global::<Ui>().set_status("scan: no complete QR seen".into()),
                     }
                 });
             });
@@ -13790,7 +13791,7 @@ pub fn run() {
     {
         let weak = window.as_weak();
         let scan_cancel = scan_cancel.clone();
-        window.on_psbt_import_scan(move || {
+        window.global::<ImportSignedPsbt>().on_psbt_import_scan(move || {
             println!("cb: psbt-scan start");
             let weak = weak.clone();
             let cancel = scan_cancel.clone();
@@ -13809,7 +13810,7 @@ pub fn run() {
                     if t.to_lowercase().starts_with("ur:") {
                         let _ = dec.receive(t);
                         let p = dec.progress();
-                        let _ = pweak.upgrade_in_event_loop(move |w| w.set_scan_progress(p));
+                        let _ = pweak.upgrade_in_event_loop(move |w| w.global::<Modals>().set_scan_progress(p));
                         dec.is_complete()
                     } else {
                         single = Some(t.to_string());
@@ -13821,55 +13822,55 @@ pub fn run() {
                     _ => None,
                 };
                 let _ = weak.upgrade_in_event_loop(move |w| {
-                    w.set_scanning(false);
+                    w.global::<Ui>().set_scanning(false);
                     match result {
                         Some(text) => {
                             println!("cb: psbt-scan ok");
-                            w.invoke_psbt_loaded(text.into());
+                            w.global::<Ui>().invoke_psbt_loaded(text.into());
                         }
-                        None => w.set_status("scan: no complete PSBT seen".into()),
+                        None => w.global::<Ui>().set_status("scan: no complete PSBT seen".into()),
                     }
                 });
             });
         });
     }
 
-    cb!(on_start_rename, |w, s, addr: SharedString, name: SharedString, synced: bool| {
+    cb!(Ui, on_start_rename, |w, s, addr: SharedString, name: SharedString, synced: bool| {
         let _ = &mut s;
         println!("cb: rename-start addr={addr}");
-        w.set_status("".into());
-        w.set_rename_address(addr.clone());
-        w.set_rename_input(name);
-        w.set_rename_synced(synced);
-        w.set_rename_pq_input("".into());
-        w.set_rename_pq_error("".into());
-        w.set_rename_pq_display(contact_pq_display_for(&s, addr.as_str()).into());
+        w.global::<Ui>().set_status("".into());
+        w.global::<Ui>().set_rename_address(addr.clone());
+        w.global::<Modals>().set_rename_input(name);
+        w.global::<Modals>().set_rename_synced(synced);
+        w.global::<Modals>().set_rename_pq_input("".into());
+        w.global::<Modals>().set_rename_pq_error("".into());
+        w.global::<Ui>().set_rename_pq_display(contact_pq_display_for(&s, addr.as_str()).into());
     });
 
-    cb!(on_save_rename, |w, s, name: SharedString| {
-        let addr = w.get_rename_address().to_string();
-        let synced = w.get_rename_synced();
+    cb!(Modals, on_save_rename, |w, s, name: SharedString| {
+        let addr = w.global::<Ui>().get_rename_address().to_string();
+        let synced = w.global::<Modals>().get_rename_synced();
         s.name_contact(&addr, name.trim(), synced);
         s.save_contacts();
         println!("cb: save-contact addr={addr} name-len={}", name.trim().len());
-        w.set_status("".into());
-        w.set_rename_address("".into());
-        w.set_rename_input("".into());
-        w.set_rename_synced(false);
-        w.set_rename_pq_input("".into());
-        w.set_rename_pq_display("".into());
-        w.set_rename_pq_error("".into());
+        w.global::<Ui>().set_status("".into());
+        w.global::<Ui>().set_rename_address("".into());
+        w.global::<Modals>().set_rename_input("".into());
+        w.global::<Modals>().set_rename_synced(false);
+        w.global::<Modals>().set_rename_pq_input("".into());
+        w.global::<Ui>().set_rename_pq_display("".into());
+        w.global::<Modals>().set_rename_pq_error("".into());
         update_home(&w, &s);
     });
 
-    cb!(on_cancel_rename, |w, s| {
+    cb!(Ui, on_cancel_rename, |w, s| {
         let _ = &mut s;
-        w.set_rename_address("".into());
-        w.set_rename_input("".into());
-        w.set_rename_synced(false);
-        w.set_rename_pq_input("".into());
-        w.set_rename_pq_display("".into());
-        w.set_rename_pq_error("".into());
+        w.global::<Ui>().set_rename_address("".into());
+        w.global::<Modals>().set_rename_input("".into());
+        w.global::<Modals>().set_rename_synced(false);
+        w.global::<Modals>().set_rename_pq_input("".into());
+        w.global::<Ui>().set_rename_pq_display("".into());
+        w.global::<Modals>().set_rename_pq_error("".into());
     });
 
     // Contact quantum key: paste/file -> `pqkeys::set_contact_pq_key` ->
@@ -13877,8 +13878,8 @@ pub fn run() {
     // rides `Contact` serde + the iCloud blob). Applied immediately (not
     // deferred to the dialog's own Save), same as the "Save to iCloud"
     // checkbox — both are contact-record edits independent of the name.
-    cb!(on_contact_pq_set, |w, s, input: SharedString| {
-        let addr = w.get_rename_address().to_string();
+    cb!(Ui, on_contact_pq_set, |w, s, input: SharedString| {
+        let addr = w.global::<Ui>().get_rename_address().to_string();
         if addr.is_empty() {
             return;
         }
@@ -13894,20 +13895,20 @@ pub fn run() {
             Ok(fp) => {
                 s.save_contacts();
                 println!("cb: contact-pq-key ok fp={fp}");
-                w.set_rename_pq_error("".into());
-                w.set_rename_pq_input("".into());
-                w.set_rename_pq_display(contact_pq_display_for(&s, &addr).into());
+                w.global::<Modals>().set_rename_pq_error("".into());
+                w.global::<Modals>().set_rename_pq_input("".into());
+                w.global::<Ui>().set_rename_pq_display(contact_pq_display_for(&s, &addr).into());
                 refresh_contacts(&w, &s);
             }
             Err(e) => {
                 println!("cb: contact-pq-key err={e}");
-                w.set_rename_pq_error(e.to_string().into());
+                w.global::<Modals>().set_rename_pq_error(e.to_string().into());
             }
         }
     });
 
-    cb!(on_contact_pq_remove, |w, s| {
-        let addr = w.get_rename_address().to_string();
+    cb!(Ui, on_contact_pq_remove, |w, s| {
+        let addr = w.global::<Ui>().get_rename_address().to_string();
         if addr.is_empty() {
             return;
         }
@@ -13920,46 +13921,46 @@ pub fn run() {
             contact.mlkem_ek = None;
             s.save_contacts();
             println!("cb: contact-pq-key removed");
-            w.set_rename_pq_display("".into());
+            w.global::<Ui>().set_rename_pq_display("".into());
             refresh_contacts(&w, &s);
         }
     });
 
-    cb!(on_contact_pq_file, |w, s| {
+    cb!(Modals, on_contact_pq_file, |w, s| {
         let _ = &mut s;
         if let Some(path) = platform::pick_file(&[("Key", &["asc", "txt", "pgp", "gpg"])]) {
             match std::fs::read_to_string(&path) {
-                Ok(text) => w.set_rename_pq_input(text.trim().into()),
-                Err(e) => w.set_rename_pq_error(format!("file: {e}").into()),
+                Ok(text) => w.global::<Modals>().set_rename_pq_input(text.trim().into()),
+                Err(e) => w.global::<Modals>().set_rename_pq_error(format!("file: {e}").into()),
             }
         }
     });
 
-    cb!(on_confirm_remove, |w, s, addr: SharedString, name: SharedString| {
+    cb!(Contacts, on_confirm_remove, |w, s, addr: SharedString, name: SharedString| {
         let _ = &mut s;
         println!("cb: confirm-remove addr={addr}");
-        w.set_confirm_remove_name(name);
-        w.set_confirm_remove_address(addr);
+        w.global::<Modals>().set_confirm_remove_name(name);
+        w.global::<Ui>().set_confirm_remove_address(addr);
     });
 
-    cb!(on_cancel_remove, |w, s| {
+    cb!(Ui, on_cancel_remove, |w, s| {
         let _ = &mut s;
-        w.set_confirm_remove_address("".into());
+        w.global::<Ui>().set_confirm_remove_address("".into());
     });
 
-    cb!(on_remove_contact, |w, s, addr: SharedString| {
+    cb!(Modals, on_remove_contact, |w, s, addr: SharedString| {
         s.remove_contact(addr.as_str());
         s.save_contacts();
         println!("cb: remove-contact addr={addr}");
-        w.set_status("".into());
-        w.set_confirm_remove_address("".into());
-        if w.get_rename_address() == addr {
-            w.set_rename_address("".into());
+        w.global::<Ui>().set_status("".into());
+        w.global::<Ui>().set_confirm_remove_address("".into());
+        if w.global::<Ui>().get_rename_address() == addr {
+            w.global::<Ui>().set_rename_address("".into());
         }
         update_home(&w, &s);
     });
 
-    cb!(on_compose_changed, |w, s| {
+    cb!(Ui, on_compose_changed, |w, s| {
         refresh_compose(&w, &mut s);
     });
 
@@ -13967,17 +13968,17 @@ pub fn run() {
     // button is the ONLY door to a verified (certified quantum-resistant)
     // passphrase — see passphrase::generate's doc and the
     // SecurityChoice::passphrase_verified rule it exists to satisfy.
-    cb!(on_pq_generate_passphrase, |w, s| {
+    cb!(Compose, on_pq_generate_passphrase, |w, s| {
         match app_core::passphrase::generate() {
             Ok((phrase, bits)) => {
-                w.set_pq_passphrase_text(phrase.clone().into());
+                w.global::<Compose>().set_pq_passphrase_text(phrase.clone().into());
                 s.pq_passphrase_generated = Some(phrase);
                 s.pq_passphrase_verified = true;
                 println!("cb: pq-generate bits={}", bits as u64);
                 refresh_compose(&w, &mut s);
             }
             Err(e) => {
-                w.set_status(format!("couldn't generate a passphrase: {e}").into());
+                w.global::<Ui>().set_status(format!("couldn't generate a passphrase: {e}").into());
             }
         }
     });
@@ -13987,13 +13988,13 @@ pub fn run() {
     // anything else (including reverting back to a substring of it) reads
     // as unverified, matching `passphrase_verified`'s doc: "unedited
     // since".
-    cb!(on_pq_passphrase_changed, |w, s, text: SharedString| {
+    cb!(Compose, on_pq_passphrase_changed, |w, s, text: SharedString| {
         let text = text.to_string();
         s.pq_passphrase_verified = s.pq_passphrase_generated.as_deref() == Some(text.as_str());
         refresh_compose(&w, &mut s);
     });
 
-    cb!(on_pq_mlkem_toggled, |w, s, _on: bool| {
+    cb!(Compose, on_pq_mlkem_toggled, |w, s, _on: bool| {
         refresh_compose(&w, &mut s);
     });
 
@@ -14006,7 +14007,7 @@ pub fn run() {
     // cached, or a directed note that never needs this key at all) —
     // `ensure_pq_imported_loaded` itself short-circuits once loaded. Never
     // called on close (LAUNCH-PATH rule: only ever from a deliberate tap).
-    cb!(on_pq_panel_toggled, |w, s, opened: bool| {
+    cb!(Compose, on_pq_panel_toggled, |w, s, opened: bool| {
         if opened {
             ensure_pq_imported_loaded(&mut s);
             refresh_compose(&w, &mut s);
@@ -14025,7 +14026,7 @@ pub fn run() {
     // a coin tap, never a header tap — also makes its wallet the compose
     // engine's active/primary pay-from source (Sal's rule: only an
     // explicit pick may do that).
-    cb!(on_toggle_coin, |w, s, source: SharedString, outpoint: SharedString| {
+    cb!(PayFrom, on_toggle_coin, |w, s, source: SharedString, outpoint: SharedString| {
         let source = source.to_string();
         let op = outpoint.as_str();
         if let Some((txid, vout)) = op.rsplit_once(':') {
@@ -14067,12 +14068,12 @@ pub fn run() {
         }
     });
 
-    cb!(on_set_coin_strategy, |w, s, strategy: i32| {
+    cb!(PayFrom, on_set_coin_strategy, |w, s, strategy: i32| {
         // 0 = fewest coins (largest-first), 1 = consolidate (smallest-first).
         // Re-applies the suggestion (clears any manual override).
         s.consolidate_coins = strategy == 1;
         s.coins_overridden = false;
-        w.set_coin_strategy(strategy);
+        w.global::<PayFrom>().set_coin_strategy(strategy);
         println!("cb: coin-strategy {}", if strategy == 1 { "consolidate" } else { "fewest" });
         refresh_compose(&w, &mut s);
     });
@@ -14082,18 +14083,18 @@ pub fn run() {
     // `wallet_stores_refresh_async`'s doc comment. The spending-wallet
     // kickoff + notebook-list rebuild now happen in
     // `apply_wallet_stores_refresh_results` once the scan actually lands.
-    cb!(on_refresh_coins, |w, s| {
+    cb!(Ui, on_refresh_coins, |w, s| {
         wallet_stores_refresh_async(&w, &mut s, WalletStoresPurpose::Coins);
     });
 
     // Notebook-list (main screen) header ↻: rescan every active notebook and
     // rebuild the list so balances / note counts / unread badges are current.
-    cb!(on_refresh_notebooks, |w, s| {
+    cb!(Ui, on_refresh_notebooks, |w, s| {
         wallet_stores_refresh_async(&w, &mut s, WalletStoresPurpose::Notebooks);
     });
 
     // First-run disclaimer accepted → persist + reveal the real first screen.
-    cb!(on_accept_terms, |w, s| {
+    cb!(Terms, on_accept_terms, |w, s| {
         s.terms_accepted = true;
         s.save_config();
         // `target` stays the old int purely for the log line below, which is
@@ -14101,13 +14102,13 @@ pub fn run() {
         // `target_screen` is the real Screen value passed to the window.
         let target = if s.material.is_some() { 17 } else { 0 };
         let target_screen = if s.material.is_some() { Screen::Notebooks } else { Screen::Onboarding };
-        w.set_terms_accept_mode(false);
-        w.set_screen(target_screen);
+        w.global::<Ui>().set_terms_accept_mode(false);
+        w.global::<Ui>().set_screen(target_screen);
         println!("cb: accept-terms target={target}");
     });
 
     // About / Privacy / Help / Q&A — one info screen, content set per button.
-    cb!(on_open_info, |w, s, kind: slint::SharedString| {
+    cb!(Settings, on_open_info, |w, s, kind: slint::SharedString| {
         let _ = &mut s;
         let (title, body): (&str, String) = match kind.as_str() {
             "about" => ("About", about_body()),
@@ -14120,47 +14121,47 @@ pub fn run() {
             "terms" => ("Terms & disclaimer", DISCLAIMER.to_string()),
             _ => return,
         };
-        w.set_info_title(title.into());
-        w.set_info_body(body.as_str().into());
+        w.global::<Info>().set_info_title(title.into());
+        w.global::<Info>().set_info_body(body.as_str().into());
         // The Slint attribution rides the About entry only. Section 2 of the
         // Slint Royalty-free license makes it a condition of the grant, so
         // this flag is load-bearing, not cosmetic — see THIRD-PARTY.md.
-        w.set_info_show_slint(kind.as_str() == "about");
-        w.set_screen(Screen::Info);
+        w.global::<Info>().set_info_show_slint(kind.as_str() == "about");
+        w.global::<Ui>().set_screen(Screen::Info);
         println!("cb: open-info {kind}");
     });
 
     // ---------- external funding (PSBT) ----------
-    cb!(on_toggle_fund_external, |w, s, on: bool| {
+    cb!(Ui, on_toggle_fund_external, |w, s, on: bool| {
         println!("cb: fund-external {on}");
         if !on {
             s.funding_coins.clear();
         }
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
         refresh_compose(&w, &mut s);
         // Turning it on with no wallet active → go to the saved-wallets list.
         if on && s.funding.is_none() {
-            w.set_funding_return(Screen::Compose);
+            w.global::<Ui>().set_funding_return(Screen::Compose);
             refresh_funding_list(&w, &s);
-            w.set_screen(Screen::FundingWallets);
+            w.global::<Ui>().set_screen(Screen::FundingWallets);
         }
     });
 
     // Funding-unification M3: compose "Pay from" picker — "notebook" or
     // "spending". External wallets are picked via use-funding-wallet
     // directly (they need a scan first, same as before this milestone).
-    cb!(on_set_pay_from, |w, s, kind: SharedString| {
+    cb!(Ui, on_set_pay_from, |w, s, kind: SharedString| {
         println!("cb: pay-from {kind}");
         s.payfrom_manual = true; // explicit pick — CHANGE 5 stops re-defaulting it
         apply_pay_from(&w, &mut s, kind.as_str());
         refresh_compose(&w, &mut s);
     });
 
-    cb!(on_open_funding, |w, s| {
+    cb!(Ui, on_open_funding, |w, s| {
         println!("cb: open-funding");
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
         refresh_funding_list(&w, &s);
-        w.set_screen(Screen::FundingWallets);
+        w.global::<Ui>().set_screen(Screen::FundingWallets);
     });
 
     // funding-unification: compose's compact "Pay from" row → the dedicated
@@ -14171,16 +14172,16 @@ pub fn run() {
     // selected coin starts open so the user sees it, the rest start
     // collapsed. This is the ONLY place auto-selection-driven expansion
     // happens; a header tap thereafter only shows/hides (`on_payfrom_expand`).
-    cb!(on_open_funding_screen, |w, s| {
+    cb!(Compose, on_open_funding_screen, |w, s| {
         println!("cb: funding-open");
         // Screen 20 (pay-from) shows fee tiers via the compose cost line —
         // lazily (re)fetch (network-efficiency, 2026-07-23).
         refresh_fees_price(&w, &mut s);
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
         s.nb_expanded = !mixed_coins_for(&s, "notebook").is_empty();
         s.sp_expanded = !mixed_coins_for(&s, "spending").is_empty();
-        w.set_nb_expanded(s.nb_expanded);
-        w.set_sp_expanded(s.sp_expanded);
+        w.global::<PayFrom>().set_nb_expanded(s.nb_expanded);
+        w.global::<PayFrom>().set_sp_expanded(s.sp_expanded);
         println!("cb: payfrom expand wallet=notebook expanded={}", s.nb_expanded);
         println!("cb: payfrom expand wallet=spending expanded={}", s.sp_expanded);
         let wallet_open = s
@@ -14190,14 +14191,14 @@ pub fn run() {
             .map(|fw| format!("wallet:{}", fw.id))
             .unwrap_or_default();
         s.payfrom_expanded_source = wallet_open;
-        w.set_payfrom_expanded_source(s.payfrom_expanded_source.clone().into());
+        w.global::<Ui>().set_payfrom_expanded_source(s.payfrom_expanded_source.clone().into());
         if !s.payfrom_expanded_source.is_empty() {
             println!("cb: payfrom expand wallet={} expanded=true", s.payfrom_expanded_source);
         }
         update_funding_screen_ui(&w, &s);
         update_payfrom_panels(&w, &mut s);
         refresh_funding_list(&w, &s);
-        w.set_screen(Screen::PayFrom);
+        w.global::<Ui>().set_screen(Screen::PayFrom);
     });
 
     // Independent-expand rework (2026-07-18, Sal's iPhone feedback #1/#3): a
@@ -14211,17 +14212,17 @@ pub fn run() {
     // only ever keeps ONE external wallet's coins scanned/cached live at a
     // time (`payfrom_wallet_coins`/`funding_coins`, a pre-existing scope
     // boundary) — but expanding one never touches Notebook/Spending.
-    cb!(on_payfrom_expand, |w, s, source: SharedString| {
+    cb!(PayFrom, on_payfrom_expand, |w, s, source: SharedString| {
         let key = source.to_string();
         match key.as_str() {
             "notebook" => {
                 s.nb_expanded = !s.nb_expanded;
-                w.set_nb_expanded(s.nb_expanded);
+                w.global::<PayFrom>().set_nb_expanded(s.nb_expanded);
                 println!("cb: payfrom expand wallet=notebook expanded={}", s.nb_expanded);
             }
             "spending" => {
                 s.sp_expanded = !s.sp_expanded;
-                w.set_sp_expanded(s.sp_expanded);
+                w.global::<PayFrom>().set_sp_expanded(s.sp_expanded);
                 println!("cb: payfrom expand wallet=spending expanded={}", s.sp_expanded);
                 if s.sp_expanded && !s.spending_scanned {
                     spending_refresh_async(&w, &mut s);
@@ -14230,7 +14231,7 @@ pub fn run() {
             _ => {
                 let collapsing = s.payfrom_expanded_source == key;
                 s.payfrom_expanded_source = if collapsing { String::new() } else { key.clone() };
-                w.set_payfrom_expanded_source(s.payfrom_expanded_source.clone().into());
+                w.global::<Ui>().set_payfrom_expanded_source(s.payfrom_expanded_source.clone().into());
                 println!("cb: payfrom expand wallet={key} expanded={}", !collapsing);
                 if !collapsing {
                     if let Some(id) = key.strip_prefix("wallet:") {
@@ -14245,30 +14246,30 @@ pub fn run() {
 
     // Change now lives on its own screen (21), reached from a second
     // compose nav row below "Pay from" (funding-unification UI rework).
-    cb!(on_change_open, |w, s| {
-        w.set_status("".into());
+    cb!(Compose, on_change_open, |w, s| {
+        w.global::<Ui>().set_status("".into());
         refresh_funding_list(&w, &s);
         update_change_label(&w, &mut s);
         // Logged AFTER resolution so `default=<choice>` reflects the
         // effective destination (an explicit pick if one was made this
         // session, else app-core's resolved default) — a screenshot-
         // independent way to assert change-default behavior in e2e.
-        println!("cb: change-open default={}", w.get_change_choice());
-        w.set_screen(Screen::Change);
+        println!("cb: change-open default={}", w.global::<Ui>().get_change_choice());
+        w.global::<Ui>().set_screen(Screen::Change);
     });
 
-    cb!(on_change_pick, |w, s, choice: SharedString| {
+    cb!(Change, on_change_pick, |w, s, choice: SharedString| {
         println!("cb: change-pick {choice}");
         s.change_choice = choice.to_string();
-        w.set_change_choice(choice.clone());
+        w.global::<Ui>().set_change_choice(choice.clone());
         if choice.as_str() != "custom" {
-            w.set_change_address("".into());
-            w.set_change_error("".into());
+            w.global::<Ui>().set_change_address("".into());
+            w.global::<Change>().set_change_error("".into());
         }
         update_change_label(&w, &mut s);
         refresh_compose(&w, &mut s);
         if choice.as_str() != "custom" {
-            w.set_screen(Screen::Compose);
+            w.global::<Ui>().set_screen(Screen::Compose);
         }
     });
 
@@ -14277,27 +14278,27 @@ pub fn run() {
     // refresh_async/spending_refresh_async — never blocks the UI thread.
     // Each landing logs its own `cb: funding-refresh …` (see
     // apply_refresh_results / apply_spending_refresh_results).
-    cb!(on_funding_refresh, |w, s| {
+    cb!(PayFrom, on_funding_refresh, |w, s| {
         refresh_async(&w, &mut s);
         if s.spending_capable && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false) {
             spending_refresh_async(&w, &mut s);
         }
     });
 
-    cb!(on_add_funding_wallet, |w, s| {
+    cb!(FundingWallets, on_add_funding_wallet, |w, s| {
         let _ = &mut s;
-        w.set_status("".into());
-        w.set_funding_descriptor("".into());
-        w.set_funding_feedback("".into());
-        w.set_funding_valid(false);
-        w.set_screen(Screen::FundingWallet);
+        w.global::<Ui>().set_status("".into());
+        w.global::<FundingWalletScreen>().set_funding_descriptor("".into());
+        w.global::<FundingWalletScreen>().set_funding_feedback("".into());
+        w.global::<FundingWalletScreen>().set_funding_valid(false);
+        w.global::<Ui>().set_screen(Screen::FundingWallet);
     });
 
-    cb!(on_use_funding_wallet, |w, s, id: SharedString| {
+    cb!(FundingWallets, on_use_funding_wallet, |w, s, id: SharedString| {
         activate_funding_wallet(&w, &mut s, id.as_str());
     });
 
-    cb!(on_remove_funding_wallet, |w, s, id: SharedString| {
+    cb!(FundingWallets, on_remove_funding_wallet, |w, s, id: SharedString| {
         println!("cb: remove-funding-wallet");
         s.funding_wallets.retain(|fw| fw.id != id.as_str());
         if s.active_funding_id.as_deref() == Some(id.as_str()) {
@@ -14309,16 +14310,16 @@ pub fn run() {
         refresh_funding_list(&w, &s);
     });
 
-    cb!(on_refresh_funding_wallet, |w, s, id: SharedString| {
+    cb!(FundingWallets, on_refresh_funding_wallet, |w, s, id: SharedString| {
         let net = s.network;
         let Some(idx) = s.funding_wallets.iter().position(|fw| fw.id == id.as_str()) else { return };
         let descriptor = s.funding_wallets[idx].descriptor.clone();
         let Some(base) = s.base_url() else {
-            w.set_status("no Bitcoin node — set one in Settings".into());
+            w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
             return;
         };
         let Ok(src) = FundingSource::parse(&descriptor, net) else { return };
-        w.set_status("scanning…".into());
+        w.global::<Ui>().set_status("scanning…".into());
         let creds = core_rpc_creds_for(&s, &base, net);
         if let Ok(client) = open_client(&base, net, creds) {
             if let Ok(scan) = client.scan_funding(&src, 20) {
@@ -14329,18 +14330,18 @@ pub fn run() {
                 s.save_funding_wallets();
             }
         }
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
         refresh_funding_list(&w, &s);
     });
 
-    cb!(on_fund_rename_start, |w, s, id: SharedString, label: SharedString| {
+    cb!(FundingWallets, on_fund_rename_start, |w, s, id: SharedString, label: SharedString| {
         let _ = &mut s;
-        w.set_fund_rename_input(label);
-        w.set_fund_rename_id(id);
+        w.global::<Modals>().set_fund_rename_input(label);
+        w.global::<Ui>().set_fund_rename_id(id);
     });
 
-    cb!(on_fund_rename_save, |w, s, text: SharedString| {
-        let id = w.get_fund_rename_id().to_string();
+    cb!(Modals, on_fund_rename_save, |w, s, text: SharedString| {
+        let id = w.global::<Ui>().get_fund_rename_id().to_string();
         let name = text.trim();
         if !name.is_empty() {
             if let Some(fw) = s.funding_wallets.iter_mut().find(|fw| fw.id == id) {
@@ -14348,54 +14349,54 @@ pub fn run() {
             }
             s.save_funding_wallets();
         }
-        w.set_fund_rename_id("".into());
+        w.global::<Ui>().set_fund_rename_id("".into());
         refresh_funding_list(&w, &s);
     });
 
-    cb!(on_fund_rename_cancel, |w, s| {
+    cb!(Ui, on_fund_rename_cancel, |w, s| {
         let _ = &mut s;
-        w.set_fund_rename_id("".into());
+        w.global::<Ui>().set_fund_rename_id("".into());
     });
 
-    cb!(on_funding_changed, |w, s, text: SharedString| {
+    cb!(FundingWalletScreen, on_funding_changed, |w, s, text: SharedString| {
         let net = s.network;
         let _ = &mut s;
         let t = text.trim();
         if t.is_empty() {
-            w.set_funding_feedback("".into());
-            w.set_funding_valid(false);
+            w.global::<FundingWalletScreen>().set_funding_feedback("".into());
+            w.global::<FundingWalletScreen>().set_funding_valid(false);
             return;
         }
         if t.to_lowercase().starts_with("ur:") {
-            w.set_funding_feedback("Hardware-wallet export (UR) — press Save & use to import.".into());
-            w.set_funding_valid(true);
+            w.global::<FundingWalletScreen>().set_funding_feedback("Hardware-wallet export (UR) — press Save & use to import.".into());
+            w.global::<FundingWalletScreen>().set_funding_valid(true);
             return;
         }
         match FundingSource::parse(&extract_descriptor(t), net) {
             Ok(src) => {
                 let a0 = src.derive(0, 0).map(|d| d.address).unwrap_or_default();
-                w.set_funding_feedback(format!("{} wallet · first address\n{a0}", src.kind.label()).into());
-                w.set_funding_valid(true);
+                w.global::<FundingWalletScreen>().set_funding_feedback(format!("{} wallet · first address\n{a0}", src.kind.label()).into());
+                w.global::<FundingWalletScreen>().set_funding_valid(true);
             }
             Err(e) => {
-                w.set_funding_feedback(format!("{e}").into());
-                w.set_funding_valid(false);
+                w.global::<FundingWalletScreen>().set_funding_feedback(format!("{e}").into());
+                w.global::<FundingWalletScreen>().set_funding_valid(false);
             }
         }
     });
 
-    cb!(on_funding_use, |w, s| {
+    cb!(FundingWalletScreen, on_funding_use, |w, s| {
         // A UR hardware-wallet export imports its account(s) into the list.
-        if try_import_ur_account(&w, &mut s, &w.get_funding_descriptor()) {
+        if try_import_ur_account(&w, &mut s, &w.global::<FundingWalletScreen>().get_funding_descriptor()) {
             return;
         }
         // Otherwise: validate the descriptor, save to the list if new, activate.
-        let input = extract_descriptor(&w.get_funding_descriptor());
+        let input = extract_descriptor(&w.global::<FundingWalletScreen>().get_funding_descriptor());
         let net = s.network;
         let wallet = match FundingWallet::create(&input, "", net) {
             Ok(fw) => fw,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
@@ -14406,7 +14407,7 @@ pub fn run() {
         activate_funding_wallet(&w, &mut s, &wallet.id);
     });
 
-    cb!(on_funding_file, |w, s| {
+    cb!(FundingWalletScreen, on_funding_file, |w, s| {
         if let Some(path) =
             platform::pick_file(&[("Descriptor / wallet export", &["txt", "json", "desc", "ur"])])
         {
@@ -14419,43 +14420,43 @@ pub fn run() {
                     let descs = extract_all_descriptors(&content);
                     if descs.len() > 1 {
                         let added = save_funding_descriptors(&w, &mut s, &descs);
-                        w.set_status(format!("imported {added} wallet(s) from file — pick one").into());
+                        w.global::<Ui>().set_status(format!("imported {added} wallet(s) from file — pick one").into());
                     } else {
                         let d = descs.into_iter().next().unwrap_or_default();
-                        w.set_funding_descriptor(d.clone().into());
-                        w.invoke_funding_changed(d.into());
+                        w.global::<FundingWalletScreen>().set_funding_descriptor(d.clone().into());
+                        w.global::<FundingWalletScreen>().invoke_funding_changed(d.into());
                     }
                 }
-                Err(e) => w.set_status(format!("read failed: {e}").into()),
+                Err(e) => w.global::<Ui>().set_status(format!("read failed: {e}").into()),
             }
         }
     });
 
-    cb!(on_funding_import_ur, |w, s, text: SharedString| {
+    cb!(Ui, on_funding_import_ur, |w, s, text: SharedString| {
         try_import_ur_account(&w, &mut s, text.as_str());
     });
 
-    cb!(on_funding_clear, |w, s| {
+    cb!(Ui, on_funding_clear, |w, s| {
         s.funding = None;
         s.funding_coins.clear();
         s.built_psbt = None;
         s.signed_psbt = None;
-        w.set_funding_descriptor("".into());
-        w.set_funding_feedback("".into());
-        w.set_funding_valid(false);
+        w.global::<FundingWalletScreen>().set_funding_descriptor("".into());
+        w.global::<FundingWalletScreen>().set_funding_feedback("".into());
+        w.global::<FundingWalletScreen>().set_funding_valid(false);
         refresh_compose(&w, &mut s);
     });
 
-    cb!(on_fund_build, |w, s| {
-        let text = w.get_compose_text().to_string();
-        let private = w.get_compose_private();
-        let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(0.0);
+    cb!(Compose, on_fund_build, |w, s| {
+        let text = w.global::<Compose>().get_compose_text().to_string();
+        let private = w.global::<Compose>().get_compose_private();
+        let rate: f64 = w.global::<Compose>().get_rate_text().trim().parse().unwrap_or(0.0);
         if text.is_empty() || rate <= 0.0 {
-            w.set_status("empty note or bad fee rate".into());
+            w.global::<Ui>().set_status("empty note or bad fee rate".into());
             return;
         }
         if s.funding.is_none() || s.funding_coins.is_empty() {
-            w.set_status("set a funding wallet first".into());
+            w.global::<Ui>().set_status("set a funding wallet first".into());
             return;
         }
         let net = s.network;
@@ -14464,7 +14465,7 @@ pub fn run() {
             Some(a) => match Recipient::parse(net, a) {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    w.set_status(format!("{e}").into());
+                    w.global::<Ui>().set_status(format!("{e}").into());
                     return;
                 }
             },
@@ -14472,14 +14473,14 @@ pub fn run() {
         };
         // Change destination: blank field = the funding wallet's own change
         // address; a valid custom address overrides it.
-        let change_raw = normalize_addr(w.get_change_address().as_str());
+        let change_raw = normalize_addr(w.global::<Ui>().get_change_address().as_str());
         let change_override = if change_raw.is_empty() {
             None
         } else {
             match Recipient::parse(net, &change_raw) {
                 Ok(r) => Some(r.spk),
                 Err(_) => {
-                    w.set_status(format!("change address isn't a valid {} address", net.as_str()).into());
+                    w.global::<Ui>().set_status(format!("change address isn't a valid {} address", net.as_str()).into());
                     return;
                 }
             }
@@ -14495,12 +14496,12 @@ pub fn run() {
             // scan caveat: a rescan attributes an externally funded PUBLIC
             // note as received-from-funder — the local record keeps it own.
             if private {
-                w.set_status("watch-only identities can only compose public notes".into());
+                w.global::<Ui>().set_status("watch-only identities can only compose public notes".into());
                 return;
             }
             let output_x = s.ident.as_ref().map(|i| i.output_x()).unwrap_or_default();
             let gift = if recipient.is_some() {
-                w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+                w.global::<Compose>().get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
             } else {
                 0
             };
@@ -14510,7 +14511,7 @@ pub fn run() {
             let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
                 Ok(rc) => rc,
                 Err(e) => {
-                    w.set_status(format!("{e}").into());
+                    w.global::<Ui>().set_status(format!("{e}").into());
                     return;
                 }
             };
@@ -14563,12 +14564,12 @@ pub fn run() {
                     );
                     show_psbt_sign_screen(&w, &mut s, built, cost);
                 }
-                Err(e) => w.set_status(format!("{e}").into()),
+                Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
             }
             return;
         }
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-            w.set_status("no identity".into());
+            w.global::<Ui>().set_status("no identity".into());
             return;
         };
         let np = NoteParams {
@@ -14589,68 +14590,68 @@ pub fn run() {
                 show_psbt_sign_screen(&w, &mut s, built, cost);
                 println!("cb: fund-build ok");
             }
-            Err(e) => w.set_status(format!("{e}").into()),
+            Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
         }
     });
 
-    cb!(on_psbt_save, |w, s| {
+    cb!(ExportPsbt, on_psbt_save, |w, s| {
         let Some(built) = s.built_psbt.as_ref() else { return };
         let bytes = built.to_bytes();
         if let Some(path) = platform::save_file("note.psbt") {
             match std::fs::write(&path, &bytes) {
-                Ok(()) => w.set_status("saved .psbt".into()),
-                Err(e) => w.set_status(format!("save failed: {e}").into()),
+                Ok(()) => w.global::<Ui>().set_status("saved .psbt".into()),
+                Err(e) => w.global::<Ui>().set_status(format!("save failed: {e}").into()),
             }
         }
     });
 
-    cb!(on_psbt_copy, |w, s| {
+    cb!(Ui, on_psbt_copy, |w, s| {
         let b64 = s.built_psbt.as_ref().map(|b| b.to_base64()).unwrap_or_default();
         if b64.is_empty() {
             return;
         }
         let ok = platform::set_clipboard_text(&b64);
         if !ok {
-            w.set_status("copy failed".into());
+            w.global::<Ui>().set_status("copy failed".into());
         }
         show_toast(&w, if ok { "PSBT copied" } else { "Copy failed" });
     });
 
-    cb!(on_psbt_goto_import, |w, s| {
+    cb!(ExportPsbt, on_psbt_goto_import, |w, s| {
         let _ = &mut s;
-        w.set_status("".into());
-        w.set_screen(Screen::ImportSignedPsbt);
+        w.global::<Ui>().set_status("".into());
+        w.global::<Ui>().set_screen(Screen::ImportSignedPsbt);
     });
 
-    cb!(on_psbt_loaded, |w, s, text: SharedString| {
+    cb!(Ui, on_psbt_loaded, |w, s, text: SharedString| {
         load_signed_psbt(&w, &mut s, text.as_bytes());
     });
 
-    cb!(on_psbt_import_file, |w, s| {
+    cb!(ImportSignedPsbt, on_psbt_import_file, |w, s| {
         if let Some(path) = platform::pick_file(&[("PSBT", &["psbt", "txt"])]) {
             match std::fs::read(&path) {
                 Ok(bytes) => load_signed_psbt(&w, &mut s, &bytes),
-                Err(e) => w.set_status(format!("read failed: {e}").into()),
+                Err(e) => w.global::<Ui>().set_status(format!("read failed: {e}").into()),
             }
         }
     });
 
-    cb!(on_psbt_broadcast, |w, s| {
+    cb!(Ui, on_psbt_broadcast, |w, s| {
         if s.wallet_tx_busy {
             return;
         }
         let Some(psbt) = s.signed_psbt.clone() else {
-            w.set_status("no signed PSBT".into());
+            w.global::<Ui>().set_status("no signed PSBT".into());
             return;
         };
         let Some(base) = s.base_url() else {
-            w.set_status("no Bitcoin node — set one in Settings".into());
+            w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
             return;
         };
         let (raw, txid, vsize) = match finalize_extract(psbt) {
             Ok(x) => x,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
@@ -14662,7 +14663,7 @@ pub fn run() {
             vsize,
         };
         s.wallet_tx_busy = true;
-        w.set_wallet_tx_busy(true);
+        w.global::<Confirm>().set_wallet_tx_busy(true);
         let creds = core_rpc_creds_for(&s, &base, net);
         let weak = w.as_weak();
         std::thread::spawn(move || {
@@ -14674,7 +14675,7 @@ pub fn run() {
                 .lock()
                 .expect("psbt broadcast results mutex")
                 .push(PsbtBroadcastResult { snap, result });
-            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+            let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
         });
     });
 
@@ -14691,7 +14692,7 @@ pub fn run() {
     // three compose kinds, stage B is the exact record/spawn tail their
     // Stage-A callbacks used to run immediately after signing — moved here
     // so a Cancel tap (before Broadcast) never runs it at all.
-    cb!(on_confirm_broadcast, |w, s| {
+    cb!(Confirm, on_confirm_broadcast, |w, s| {
         if s.wallet_tx_busy {
             return;
         }
@@ -14706,11 +14707,11 @@ pub fn run() {
                 // `on_psbt_broadcast` takes its own `st.borrow_mut()` — drop
                 // ours first or the shared RefCell double-borrows and panics.
                 drop(s);
-                w.invoke_psbt_broadcast();
+                w.global::<Ui>().invoke_psbt_broadcast();
             }
             PendingPayload::Compose { composed, text, private, change_to, created_at, to } => {
                 let Some(base) = s.base_url() else {
-                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
                 let net = s.network;
@@ -14749,7 +14750,7 @@ pub fn run() {
                 s.save_contacts();
                 s.pending_broadcast = None;
                 s.wallet_tx_busy = true;
-                w.set_wallet_tx_busy(true);
+                w.global::<Confirm>().set_wallet_tx_busy(true);
                 let note_id = composed.note_id.clone();
                 let fee = composed.tx.fee;
                 let vsize = composed.tx.vsize;
@@ -14765,7 +14766,7 @@ pub fn run() {
                     NOTEBOOK_COMPOSE_RESULTS.lock().expect("notebook compose results mutex").push(
                         NotebookComposeResult { note_id, fee, vsize, to, private, pq_flags, result },
                     );
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_compose());
                 });
             }
             PendingPayload::ComposeSpending {
@@ -14782,13 +14783,13 @@ pub fn run() {
                 source,
             } => {
                 let Some(base) = s.base_url() else {
-                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
                 let net = s.network;
                 s.pending_broadcast = None;
                 s.wallet_tx_busy = true;
-                w.set_wallet_tx_busy(true);
+                w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
                 let txid = pending.txid.clone();
                 let vsize = pending.vsize;
@@ -14818,7 +14819,7 @@ pub fn run() {
                             result,
                         },
                     );
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_compose());
                 });
             }
             PendingPayload::ComposeMixed {
@@ -14839,13 +14840,13 @@ pub fn run() {
                 spending_source,
             } => {
                 let Some(base) = s.base_url() else {
-                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
                 let net = s.network;
                 s.pending_broadcast = None;
                 s.wallet_tx_busy = true;
-                w.set_wallet_tx_busy(true);
+                w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
                 let txid = pending.txid.clone();
                 let vsize = pending.vsize;
@@ -14879,7 +14880,7 @@ pub fn run() {
                             result,
                         },
                     );
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_compose());
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_compose());
                 });
             }
             // ---- sweep / consolidate / wconsol / spending-consolidate:
@@ -14893,14 +14894,14 @@ pub fn run() {
             // `apply-pending-wallet-tx` trampoline.
             PendingPayload::Sweep { snap } => {
                 let Some(base) = s.base_url() else {
-                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
                 let net = s.network;
                 s.pending_broadcast = None;
-                w.set_screen(pending.return_screen);
+                w.global::<Ui>().set_screen(pending.return_screen);
                 s.wallet_tx_busy = true;
-                w.set_wallet_tx_busy(true);
+                w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
                 let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
@@ -14913,19 +14914,19 @@ pub fn run() {
                         .lock()
                         .expect("sweep broadcast results mutex")
                         .push(SweepBroadcastResult { snap, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
                 });
             }
             PendingPayload::Consolidate { snap } => {
                 let Some(base) = s.base_url() else {
-                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
                 let net = s.network;
                 s.pending_broadcast = None;
-                w.set_screen(pending.return_screen);
+                w.global::<Ui>().set_screen(pending.return_screen);
                 s.wallet_tx_busy = true;
-                w.set_wallet_tx_busy(true);
+                w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
                 let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
@@ -14938,19 +14939,19 @@ pub fn run() {
                         .lock()
                         .expect("consolidate broadcast results mutex")
                         .push(ConsolidateBroadcastResult { snap, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
                 });
             }
             PendingPayload::WConsol { snap } => {
                 let Some(base) = s.base_url() else {
-                    w.set_status("no Bitcoin node for this network — set one in Settings".into());
+                    w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
                     return;
                 };
                 let net = snap.network;
                 s.pending_broadcast = None;
-                w.set_screen(pending.return_screen);
+                w.global::<Ui>().set_screen(pending.return_screen);
                 s.wallet_tx_busy = true;
-                w.set_wallet_tx_busy(true);
+                w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
                 let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
@@ -14963,19 +14964,19 @@ pub fn run() {
                         .lock()
                         .expect("wconsol broadcast results mutex")
                         .push(WConsolBroadcastResult { snap, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
                 });
             }
             PendingPayload::SpendingConsolidate { snap } => {
                 let Some(base) = s.base_url() else {
-                    w.set_status("no Bitcoin node for this network — set one in Settings".into());
+                    w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
                     return;
                 };
                 let net = s.network;
                 s.pending_broadcast = None;
-                w.set_screen(pending.return_screen);
+                w.global::<Ui>().set_screen(pending.return_screen);
                 s.wallet_tx_busy = true;
-                w.set_wallet_tx_busy(true);
+                w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
                 let creds = core_rpc_creds_for(&s, &base, net);
                 let weak = w.as_weak();
@@ -14988,7 +14989,7 @@ pub fn run() {
                         .lock()
                         .expect("spending consolidate results mutex")
                         .push(SpendingConsolidateResult { snap, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_wallet_tx());
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
                 });
             }
             // ---- bump / rebroadcast: stage B re-arms `act_pending_ref`
@@ -14998,7 +14999,7 @@ pub fn run() {
             // functions already drain.
             PendingPayload::Bump { ref_id, fee, new_rate, bumped } => {
                 let Some(base) = s.base_url() else {
-                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
                 let net = s.network;
@@ -15027,7 +15028,7 @@ pub fn run() {
                 }
                 s.save_store();
                 s.pending_broadcast = None;
-                w.set_screen(pending.return_screen);
+                w.global::<Ui>().set_screen(pending.return_screen);
                 s.act_pending_ref = Some(renamed_note_id.clone().unwrap_or_else(|| ref_id.clone()));
                 update_activity(&w, &s);
                 let raw = pending.raw_hex.clone();
@@ -15043,17 +15044,17 @@ pub fn run() {
                         .lock()
                         .expect("act-bump results mutex")
                         .push(ActBumpResult { ref_id, txid, fee, new_rate, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_act_bump());
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_act_bump());
                 });
             }
             PendingPayload::Rebroadcast { ref_id } => {
                 let Some(base) = s.base_url() else {
-                    w.set_status("no Bitcoin node — set one in Settings".into());
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
                 let net = s.network;
                 s.pending_broadcast = None;
-                w.set_screen(pending.return_screen);
+                w.global::<Ui>().set_screen(pending.return_screen);
                 s.act_pending_ref = Some(ref_id.clone());
                 update_activity(&w, &s);
                 let raw = pending.raw_hex.clone();
@@ -15068,13 +15069,13 @@ pub fn run() {
                         .lock()
                         .expect("act-retry results mutex")
                         .push(ActRetryResult { ref_id, result });
-                    let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_act_retry());
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_act_retry());
                 });
             }
         }
     });
 
-    cb!(on_confirm_cancel, |w, s| {
+    cb!(Ui, on_confirm_cancel, |w, s| {
         // Busy-guard: a broadcast already in flight can't be canceled out
         // from under itself (mirrors the Broadcast-tap guard above) — the
         // psbt kind in particular delegates to on_psbt_broadcast's own
@@ -15085,13 +15086,13 @@ pub fn run() {
         let kind = s.pending_broadcast.as_ref().map(|p| p.kind).unwrap_or("?");
         println!("cb: confirm cancel kind={kind}");
         let return_screen = s.pending_broadcast.take().map(|p| p.return_screen).unwrap_or(Screen::Home);
-        w.set_confirm_warn("".into());
-        w.set_confirm_txid("".into());
-        w.set_confirm_context("".into());
-        w.set_confirm_note("".into());
-        w.set_confirm_inputs(VecModel::<PsbtRow>::from_slice(&[]));
-        w.set_confirm_outputs(VecModel::<PsbtRow>::from_slice(&[]));
-        w.set_status("".into());
+        w.global::<Ui>().set_confirm_warn("".into());
+        w.global::<Confirm>().set_confirm_txid("".into());
+        w.global::<Confirm>().set_confirm_context("".into());
+        w.global::<Confirm>().set_confirm_note("".into());
+        w.global::<Confirm>().set_confirm_inputs(VecModel::<PsbtRow>::from_slice(&[]));
+        w.global::<Confirm>().set_confirm_outputs(VecModel::<PsbtRow>::from_slice(&[]));
+        w.global::<Ui>().set_status("".into());
         if kind == "psbt" {
             // Zero-trace for the PSBT path means discarding the loaded
             // signed PSBT too — nothing was recorded, and re-showing a
@@ -15099,51 +15100,51 @@ pub fn run() {
             // built PSBT / UR export (screen 13) is untouched, so backing
             // further out and re-exporting still works.
             s.signed_psbt = None;
-            w.set_psbt_signed(false);
+            w.global::<Ui>().set_psbt_signed(false);
         }
-        w.set_screen(return_screen);
+        w.global::<Ui>().set_screen(return_screen);
     });
 
-    cb!(on_compose_send, |w, s| {
+    cb!(Compose, on_compose_send, |w, s| {
         // Async sign+broadcast (2026-07-16): re-entrancy guard so a
         // double-tap on Sign can't double-broadcast.
         if s.compose_busy {
             return;
         }
         // Scan-freshness gate — see on_sweep_send.
-        if w.get_wallet_scan_busy() {
+        if w.global::<Ui>().get_wallet_scan_busy() {
             println!("cb: sign-gate busy kind=compose");
-            w.set_status("still syncing — one moment".into());
+            w.global::<Ui>().set_status("still syncing — one moment".into());
             return;
         }
-        let text = w.get_compose_text().to_string();
-        let private = w.get_compose_private();
-        let rate: f64 = w.get_rate_text().parse().unwrap_or(0.0);
+        let text = w.global::<Compose>().get_compose_text().to_string();
+        let private = w.global::<Compose>().get_compose_private();
+        let rate: f64 = w.global::<Compose>().get_rate_text().parse().unwrap_or(0.0);
         if text.is_empty() || rate <= 0.0 {
-            w.set_status("empty note or bad fee rate".into());
+            w.global::<Ui>().set_status("empty note or bad fee rate".into());
             return;
         }
         // Optional custom change address (empty = back to self).
-        let change_addr = normalize_addr(w.get_change_address().as_str());
+        let change_addr = normalize_addr(w.global::<Ui>().get_change_address().as_str());
         if !change_addr.is_empty() && Recipient::parse(s.network, &change_addr).is_err() {
-            w.set_status(format!("change address isn't a valid {} address", s.network.as_str()).into());
+            w.global::<Ui>().set_status(format!("change address isn't a valid {} address", s.network.as_str()).into());
             return;
         }
         let net = s.network;
         let to = s.to_address.clone();
         if s.base_url().is_none() {
-            w.set_status("no Bitcoin node — set one in Settings".into());
+            w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
             return;
         }
-        if !w.get_spend_enough() {
-            w.set_status("selected coins don't cover the note + fee".into());
+        if !w.global::<Ui>().get_spend_enough() {
+            w.global::<Ui>().set_status("selected coins don't cover the note + fee".into());
             return;
         }
         if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
             // Watch compose: PUBLIC note as an external-sign PSBT over the
             // selected coins; recorded on broadcast like a keyed compose.
             if private {
-                w.set_status("watch-only identities can only compose public notes".into());
+                w.global::<Ui>().set_status("watch-only identities can only compose public notes".into());
                 return;
             }
             let Some(src) = s.ident.as_ref().and_then(|i| i.watch_source()).cloned() else { return };
@@ -15151,14 +15152,14 @@ pub fn run() {
                 Some(a) => match Recipient::parse(net, a) {
                     Ok(r) => Some(r),
                     Err(e) => {
-                        w.set_status(format!("{e}").into());
+                        w.global::<Ui>().set_status(format!("{e}").into());
                         return;
                     }
                 },
                 None => None,
             };
             let gift = if recipient.is_some() {
-                w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+                w.global::<Compose>().get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
             } else {
                 0
             };
@@ -15172,7 +15173,7 @@ pub fn run() {
             let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
                 Ok(r) => r,
                 Err(e) => {
-                    w.set_status(format!("{e}").into());
+                    w.global::<Ui>().set_status(format!("{e}").into());
                     return;
                 }
             };
@@ -15191,7 +15192,7 @@ pub fn run() {
                 .collect();
             if coins.is_empty() {
                 println!("cb: compose-send bail=no-coins src=watch");
-                w.set_status("no coins selected".into());
+                w.global::<Ui>().set_status("no coins selected".into());
                 return;
             }
             let chunk = store.chunk_size;
@@ -15241,12 +15242,12 @@ pub fn run() {
                     );
                     show_psbt_sign_screen(&w, &mut s, built, cost);
                 }
-                Err(e) => w.set_status(format!("{e}").into()),
+                Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
             }
             return;
         }
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-            w.set_status("no identity".into());
+            w.global::<Ui>().set_status("no identity".into());
             return;
         };
         // Universal confirm screen (2026-07-17): stage A builds + signs
@@ -15260,7 +15261,7 @@ pub fn run() {
         let created_at = now();
         let gift_amount = to
             .as_ref()
-            .map(|_| w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS));
+            .map(|_| w.global::<Compose>().get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS));
         let change_to = (!change_addr.is_empty()).then(|| change_addr.clone());
         // Multi-recipient (notebook-funded compose only, see State::
         // to_addresses_extra): the compose screen's removable To-chips,
@@ -15275,17 +15276,17 @@ pub fn run() {
         // since Sign is a separate tap that could race a recipient/private
         // change made after the section last repainted.
         let pq_eligible = pq_compose_eligible(&w, &s);
-        let pq_password = if pq_eligible && w.get_pq_passphrase_enabled() {
-            let p = w.get_pq_passphrase_text().to_string();
+        let pq_password = if pq_eligible && w.global::<Compose>().get_pq_passphrase_enabled() {
+            let p = w.global::<Compose>().get_pq_passphrase_text().to_string();
             if p.trim().is_empty() {
-                w.set_status("enter a passphrase, or turn off the passphrase layer".into());
+                w.global::<Ui>().set_status("enter a passphrase, or turn off the passphrase layer".into());
                 return;
             }
             Some(p)
         } else {
             None
         };
-        let pq_mlkem = if pq_eligible && w.get_pq_mlkem_enabled() {
+        let pq_mlkem = if pq_eligible && w.global::<Compose>().get_pq_mlkem_enabled() {
             match to.as_deref() {
                 Some(addr) => {
                     let net_str = s.network.as_str();
@@ -15297,7 +15298,7 @@ pub fn run() {
                     match armor.as_deref().map(app_core::notes_core::pq::import_public) {
                         Some(Ok(pair)) => Some(pair),
                         _ => {
-                            w.set_status(
+                            w.global::<Ui>().set_status(
                                 "couldn't read this contact's quantum key — try again, or turn off quantum encryption".into(),
                             );
                             return;
@@ -15314,7 +15315,7 @@ pub fn run() {
                 None => match s.pq_imported.as_ref() {
                     Some(kp) => Some((kp.alg(), kp.ek().to_vec())),
                     None => {
-                        w.set_status(
+                        w.global::<Ui>().set_status(
                             "no quantum key — add one in Settings, or turn off quantum encryption".into(),
                         );
                         return;
@@ -15339,7 +15340,7 @@ pub fn run() {
             pq_mlkem,
         };
         let Some(store) = s.store.as_ref() else {
-            w.set_status("no store".into());
+            w.global::<Ui>().set_status("no store".into());
             return;
         };
         match app_core::compose::compose_note(store, &identity, net, &req) {
@@ -15398,7 +15399,7 @@ pub fn run() {
             }
             Err(e) => {
                 println!("cb: compose err={e}");
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
             }
         }
     });
@@ -15409,26 +15410,26 @@ pub fn run() {
     // (`sign_own_wpkh_inputs` — no PSBT export/import round trip), and
     // broadcast in one tap. Mirrors `examples/cli.rs`'s `note-spend-funded`
     // recipe exactly.
-    cb!(on_spending_compose_send, |w, s| {
+    cb!(Compose, on_spending_compose_send, |w, s| {
         if s.compose_busy {
             return;
         }
         // Scan-freshness gate — see on_sweep_send.
-        if w.get_wallet_scan_busy() {
+        if w.global::<Ui>().get_wallet_scan_busy() {
             println!("cb: sign-gate busy kind=spending-compose");
-            w.set_status("still syncing — one moment".into());
+            w.global::<Ui>().set_status("still syncing — one moment".into());
             return;
         }
-        let text = w.get_compose_text().to_string();
-        let private = w.get_compose_private();
-        let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(0.0);
+        let text = w.global::<Compose>().get_compose_text().to_string();
+        let private = w.global::<Compose>().get_compose_private();
+        let rate: f64 = w.global::<Compose>().get_rate_text().trim().parse().unwrap_or(0.0);
         if text.is_empty() || rate <= 0.0 {
-            w.set_status("empty note or bad fee rate".into());
+            w.global::<Ui>().set_status("empty note or bad fee rate".into());
             return;
         }
         let net = s.network;
         if s.base_url().is_none() {
-            w.set_status("no Bitcoin node — set one in Settings".into());
+            w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
             return;
         }
         let to = s.to_address.clone();
@@ -15436,7 +15437,7 @@ pub fn run() {
             Some(a) => match Recipient::parse(net, a) {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    w.set_status(format!("{e}").into());
+                    w.global::<Ui>().set_status(format!("{e}").into());
                     return;
                 }
             },
@@ -15449,30 +15450,30 @@ pub fn run() {
         let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
             Ok(r) => r,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
         let recipient_addrs: Vec<String> =
             if recipients.len() >= 2 { recipients.iter().map(|r| r.address.clone()).collect() } else { Vec::new() };
-        let change_raw = normalize_addr(w.get_change_address().as_str());
+        let change_raw = normalize_addr(w.global::<Ui>().get_change_address().as_str());
         let change_override = if change_raw.is_empty() {
             None
         } else {
             match Recipient::parse(net, &change_raw) {
                 Ok(r) => Some(r.spk),
                 Err(_) => {
-                    w.set_status(format!("change address isn't a valid {} address", net.as_str()).into());
+                    w.global::<Ui>().set_status(format!("change address isn't a valid {} address", net.as_str()).into());
                     return;
                 }
             }
         };
         let Some(source) = s.spending_source.clone() else {
-            w.set_status("spending wallet not scanned yet".into());
+            w.global::<Ui>().set_status("spending wallet not scanned yet".into());
             return;
         };
         if s.spending_coins.is_empty() {
-            w.set_status("spending wallet has no coins — fund it from Settings".into());
+            w.global::<Ui>().set_status("spending wallet has no coins — fund it from Settings".into());
             return;
         }
         // Spend exactly the coins selected in the funding screen's coin
@@ -15492,26 +15493,26 @@ pub fn run() {
             .collect();
         if selected_spending_coins.is_empty() {
             println!("cb: compose-send bail=no-coins src=spending");
-            w.set_status("no coins selected".into());
+            w.global::<Ui>().set_status("no coins selected".into());
             return;
         }
         let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
-            w.set_status("no identity".into());
+            w.global::<Ui>().set_status("no identity".into());
             return;
         };
         let Ok(key_material) = parse_key_material(&material_str, net) else {
-            w.set_status("identity parse failed".into());
+            w.global::<Ui>().set_status("identity parse failed".into());
             return;
         };
         let account = s.account;
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-            w.set_status("no identity".into());
+            w.global::<Ui>().set_status("no identity".into());
             return;
         };
         let Some(change_index) = s.store.as_ref().map(|st| st.spending.next_change) else { return };
         let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
         let gift = if recipient.is_some() {
-            w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+            w.global::<Compose>().get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
         } else {
             0
         };
@@ -15538,7 +15539,7 @@ pub fn run() {
         let built = match built {
             Ok(b) => b,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
@@ -15552,11 +15553,11 @@ pub fn run() {
         ) {
             Ok(n) if n > 0 => {}
             Ok(_) => {
-                w.set_status("no spending-wallet inputs signed".into());
+                w.global::<Ui>().set_status("no spending-wallet inputs signed".into());
                 return;
             }
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
@@ -15573,7 +15574,7 @@ pub fn run() {
         let (raw, txid, vsize) = match finalize_extract(psbt) {
             Ok(x) => x,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
@@ -15664,30 +15665,30 @@ pub fn run() {
     // the existing external-sign screens 13/14 (the funded-sweep test in
     // app-core's psbt_build already proves that pattern: our own
     // signatures plus an external signer's, on one PSBT).
-    cb!(on_compose_send_mixed, |w, s| {
+    cb!(Compose, on_compose_send_mixed, |w, s| {
         if s.compose_busy {
             return;
         }
         // Scan-freshness gate — see on_sweep_send.
-        if w.get_wallet_scan_busy() {
+        if w.global::<Ui>().get_wallet_scan_busy() {
             println!("cb: sign-gate busy kind=mixed-compose");
-            w.set_status("still syncing — one moment".into());
+            w.global::<Ui>().set_status("still syncing — one moment".into());
             return;
         }
-        let text = w.get_compose_text().to_string();
-        let private = w.get_compose_private();
-        let rate: f64 = w.get_rate_text().trim().parse().unwrap_or(0.0);
+        let text = w.global::<Compose>().get_compose_text().to_string();
+        let private = w.global::<Compose>().get_compose_private();
+        let rate: f64 = w.global::<Compose>().get_rate_text().trim().parse().unwrap_or(0.0);
         if text.is_empty() || rate <= 0.0 {
-            w.set_status("empty note or bad fee rate".into());
+            w.global::<Ui>().set_status("empty note or bad fee rate".into());
             return;
         }
         if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
-            w.set_status("watch-only identities can't mix sources".into());
+            w.global::<Ui>().set_status("watch-only identities can't mix sources".into());
             return;
         }
         let net = s.network;
         if s.base_url().is_none() {
-            w.set_status("no Bitcoin node — set one in Settings".into());
+            w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
             return;
         }
         let to = s.to_address.clone();
@@ -15695,14 +15696,14 @@ pub fn run() {
             Some(a) => match Recipient::parse(net, a) {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    w.set_status(format!("{e}").into());
+                    w.global::<Ui>().set_status(format!("{e}").into());
                     return;
                 }
             },
             None => None,
         };
         let gift = if recipient.is_some() {
-            w.get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
+            w.global::<Compose>().get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
         } else {
             0
         };
@@ -15713,14 +15714,14 @@ pub fn run() {
         let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
             Ok(r) => r,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
         let recipient_addrs: Vec<String> =
             if recipients.len() >= 2 { recipients.iter().map(|r| r.address.clone()).collect() } else { Vec::new() };
         let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
-            w.set_status("no identity".into());
+            w.global::<Ui>().set_status("no identity".into());
             return;
         };
         let notebook_spk = p2tr_script_pubkey(&identity.output_x);
@@ -15733,14 +15734,14 @@ pub fn run() {
             match mixed_compose_args(&w, &s) {
                 Ok(a) => a,
                 Err(e) => {
-                    w.set_status(e.into());
+                    w.global::<Ui>().set_status(e.into());
                     return;
                 }
             };
 
         if coins.is_empty() {
             println!("cb: compose-send bail=no-coins src=mixed");
-            w.set_status("no coins selected".into());
+            w.global::<Ui>().set_status("no coins selected".into());
             return;
         }
         // A change-ONLY selection is single-source by `spans_multiple_wallets`'s
@@ -15751,7 +15752,7 @@ pub fn run() {
         let has_change = coins.iter().any(|c| matches!(c.source, app_core::mixed::CoinSource::Change));
         if !has_change && !app_core::mixed::spans_multiple_wallets(&coins) {
             println!("cb: compose-send bail=single-source src=mixed");
-            w.set_status("selection is single-source — use the Sign button on that source instead".into());
+            w.global::<Ui>().set_status("selection is single-source — use the Sign button on that source instead".into());
             return;
         }
         let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
@@ -15766,7 +15767,7 @@ pub fn run() {
             let c = &coins[0];
             let mut txid = [0u8; 32];
             if let Err(e) = hex::decode_to_slice(&c.txid, &mut txid) {
-                w.set_status(format!("bad coin txid: {e}").into());
+                w.global::<Ui>().set_status(format!("bad coin txid: {e}").into());
                 return;
             }
             txid.reverse();
@@ -15786,7 +15787,7 @@ pub fn run() {
             let content_key = match app_core::compose::fresh_content_key() {
                 Ok(k) => k,
                 Err(e) => {
-                    w.set_status(format!("{e}").into());
+                    w.global::<Ui>().set_status(format!("{e}").into());
                     return;
                 }
             };
@@ -15806,7 +15807,7 @@ pub fn run() {
         let (payloads, recipient_spks) = match payloads_and_spks {
             Ok(p) => p,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
@@ -15828,7 +15829,7 @@ pub fn run() {
         ) {
             Ok(b) => b,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
@@ -15838,7 +15839,7 @@ pub fn run() {
         if let Err(e) =
             app_core::psbt_build::sign_own_taproot_inputs(&mut built.psbt, &identity.output_x, &identity.tweaked_seckey)
         {
-            w.set_status(format!("{e}").into());
+            w.global::<Ui>().set_status(format!("{e}").into());
             return;
         }
         // Taproot CHANGE-chain owners (unit 5): group the selected coins by
@@ -15849,11 +15850,11 @@ pub fn run() {
         // loop iteration, never escaping this scope.
         if has_change {
             let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
-                w.set_status("no identity".into());
+                w.global::<Ui>().set_status("no identity".into());
                 return;
             };
             let Ok(key_material) = parse_key_material(&material_str, net) else {
-                w.set_status("identity parse failed".into());
+                w.global::<Ui>().set_status("identity parse failed".into());
                 return;
             };
             let mut seen_idx: Vec<u32> = Vec::new();
@@ -15865,18 +15866,18 @@ pub fn run() {
                 let owner = match realize_change(&key_material, net, s.account, c.index) {
                     Ok(o) => o,
                     Err(e) => {
-                        w.set_status(format!("{e}").into());
+                        w.global::<Ui>().set_status(format!("{e}").into());
                         return;
                     }
                 };
                 let Some(owner_identity) = owner.full() else {
-                    w.set_status("change-chain identity has no key".into());
+                    w.global::<Ui>().set_status("change-chain identity has no key".into());
                     return;
                 };
                 if let Err(e) = app_core::psbt_build::sign_own_taproot_inputs(
                     &mut built.psbt, &owner_identity.output_x, &owner_identity.tweaked_seckey,
                 ) {
-                    w.set_status(format!("{e}").into());
+                    w.global::<Ui>().set_status(format!("{e}").into());
                     return;
                 }
             }
@@ -15884,17 +15885,17 @@ pub fn run() {
         let spending_funding_utxos = app_core::mixed::spending_funding_utxos(&coins);
         if !spending_funding_utxos.is_empty() {
             let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
-                w.set_status("no identity".into());
+                w.global::<Ui>().set_status("no identity".into());
                 return;
             };
             let Ok(key_material) = parse_key_material(&material_str, net) else {
-                w.set_status("identity parse failed".into());
+                w.global::<Ui>().set_status("identity parse failed".into());
                 return;
             };
             if let Err(e) = app_core::psbt_build::sign_own_wpkh_inputs(
                 &mut built.psbt, &key_material, net, s.account, &spending_funding_utxos,
             ) {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         }
@@ -15975,7 +15976,7 @@ pub fn run() {
         let (raw, txid, vsize) = match finalize_extract(psbt) {
             Ok(x) => x,
             Err(e) => {
-                w.set_status(format!("{e}").into());
+                w.global::<Ui>().set_status(format!("{e}").into());
                 return;
             }
         };
@@ -16049,9 +16050,9 @@ pub fn run() {
         // derived and not yet "used" bookkeeping, so — like the spending
         // path — it must be added on top of `confirm_self_spks`'s set. A
         // notebook-default change needs no augmentation (already covered).
-        let choice = w.get_change_choice().to_string();
+        let choice = w.global::<Ui>().get_change_choice().to_string();
         let expected_change = if choice == "custom" {
-            Some(normalize_addr(w.get_change_address().as_str()))
+            Some(normalize_addr(w.global::<Ui>().get_change_address().as_str()))
         } else {
             if change_default == app_core::mixed::ChangeDefault::Spending && built_change > 0 {
                 if let Some(src) = s.spending_source.as_ref() {
@@ -16112,12 +16113,12 @@ pub fn run() {
         note_subdust_fold_warn(&w, built_change, built_fee, vsize as u64, rate);
     });
 
-    cb!(on_settings_open, |w, s| {
-        w.set_return_screen(if w.get_screen() == Screen::Notebooks { Screen::Notebooks } else { Screen::Home });
+    cb!(Notebooks, on_settings_open, |w, s| {
+        w.global::<Ui>().set_return_screen(if w.global::<Ui>().get_screen() == Screen::Notebooks { Screen::Notebooks } else { Screen::Home });
         println!("cb: settings-open");
         clear_reveal(&w, &mut s);
-        w.set_status("".into());
-        w.set_chunk_custom(false);
+        w.global::<Ui>().set_status("".into());
+        w.global::<Settings>().set_chunk_custom(false);
         load_backend_settings(&w, &s);
         refresh_node_health(&w, &mut s);
         // Settings shows identity/network/note-size fields that used to be set
@@ -16134,21 +16135,21 @@ pub fn run() {
         }
         // Fresh entry from the list starts at the top; returning from a Settings
         // sub-screen (via nav-back, which doesn't call this) keeps its position.
-        w.set_settings_scroll_y(0.0);
-        w.set_screen(Screen::Settings);
+        w.global::<Settings>().set_settings_scroll_y(0.0);
+        w.global::<Ui>().set_screen(Screen::Settings);
     });
 
-    cb!(on_open_account_picker, |w, s| {
+    cb!(Settings, on_open_account_picker, |w, s| {
         let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else { return };
         println!("cb: account-picker open");
         let page = s.account / 5;
-        w.set_account_pick_mode("switch".into());
+        w.global::<AccountPicker>().set_account_pick_mode("switch".into());
         show_account_picker(&w, &material, s.network, page, Some(s.account));
     });
 
-    cb!(on_accounts_page, |w, s, delta: i32| {
-        let page = (w.get_account_page() + delta).max(0) as u32;
-        let mode = w.get_account_pick_mode();
+    cb!(AccountPicker, on_accounts_page, |w, s, delta: i32| {
+        let page = (w.global::<AccountPicker>().get_account_page() + delta).max(0) as u32;
+        let mode = w.global::<AccountPicker>().get_account_pick_mode();
         if mode == "notebook" || mode == "wconsol" {
             show_notebook_picker(&w, &s, page, mode.as_str());
             return;
@@ -16163,8 +16164,8 @@ pub fn run() {
         show_account_picker(&w, &material, s.network, page, active);
     });
 
-    cb!(on_pick_account, |w, s, idx: i32| {
-        if w.get_account_pick_mode() == "wconsol" {
+    cb!(AccountPicker, on_pick_account, |w, s, idx: i32| {
+        if w.global::<AccountPicker>().get_account_pick_mode() == "wconsol" {
             if s.wallet_tx_busy || s.pending_broadcast.is_some() {
                 return;
             }
@@ -16205,7 +16206,7 @@ pub fn run() {
             let rate = s.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
             let fee = (vsize as f64 * rate).ceil() as u64;
             if total <= fee || total - fee < DUST_SATS {
-                w.set_status("not enough across the wallet to cover the fee".into());
+                w.global::<Ui>().set_status("not enough across the wallet to cover the fee".into());
                 s.wconsol = None;
                 return;
             }
@@ -16217,7 +16218,7 @@ pub fn run() {
             build_wconsol_confirm(&w, &mut s, wc);
             return;
         }
-        if w.get_account_pick_mode() == "notebook" {
+        if w.global::<AccountPicker>().get_account_pick_mode() == "notebook" {
             // Create flow: the inline name field is already filled (or
             // left empty, taking the default "Notebook <index+1>") —
             // tapping an address creates right away.
@@ -16225,7 +16226,7 @@ pub fn run() {
             if s.notebooks.as_ref().and_then(|ix| ix.get(s.account, index)).is_some() {
                 return; // row is disabled in the UI; never re-add
             }
-            let name = w.get_nb_create_name().trim().to_string();
+            let name = w.global::<AccountPicker>().get_nb_create_name().trim().to_string();
             println!("cb: create-notebook index={index}");
             let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
                 return;
@@ -16242,13 +16243,13 @@ pub fn run() {
                             println!("cb: rename-notebook index={index}");
                         }
                     }
-                    w.set_account_pick_mode("switch".into());
-                    w.set_nb_create_name("".into());
-                    w.set_status("".into());
+                    w.global::<AccountPicker>().set_account_pick_mode("switch".into());
+                    w.global::<AccountPicker>().set_nb_create_name("".into());
+                    w.global::<Ui>().set_status("".into());
                     update_notebook_list(&w, &s);
-                    w.set_screen(Screen::Notebooks);
+                    w.global::<Ui>().set_screen(Screen::Notebooks);
                 }
-                Err(e) => w.set_status(e.to_string().into()),
+                Err(e) => w.global::<Ui>().set_status(e.to_string().into()),
             }
             return;
         }
@@ -16278,44 +16279,44 @@ pub fn run() {
                 if empty {
                     ensure_first_onboarded_notebook(&mut s);
                 }
-                w.set_status("".into());
+                w.global::<Ui>().set_status("".into());
                 update_notebook_list(&w, &s);
-                w.set_screen(Screen::Notebooks);
+                w.global::<Ui>().set_screen(Screen::Notebooks);
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s);
             }
-            Err(e) => w.set_status(e.to_string().into()),
+            Err(e) => w.global::<Ui>().set_status(e.to_string().into()),
         }
     });
 
-    cb!(on_account_cancel, |w, s| {
-        if w.get_account_pick_mode() == "wconsol" {
+    cb!(Ui, on_account_cancel, |w, s| {
+        if w.global::<AccountPicker>().get_account_pick_mode() == "wconsol" {
             // Abandon wallet consolidate: back to settings, untouched.
-            w.set_account_pick_mode("switch".into());
-            w.set_nb_create_name("".into());
+            w.global::<AccountPicker>().set_account_pick_mode("switch".into());
+            w.global::<AccountPicker>().set_nb_create_name("".into());
             s.wconsol = None;
-            w.set_status("".into());
-            w.set_screen(Screen::Settings);
+            w.global::<Ui>().set_status("".into());
+            w.global::<Ui>().set_screen(Screen::Settings);
             return;
         }
-        if w.get_account_pick_mode() == "notebook" {
+        if w.global::<AccountPicker>().get_account_pick_mode() == "notebook" {
             // Abandon create → back to the notebook list, untouched.
-            w.set_account_pick_mode("switch".into());
-            w.set_nb_create_name("".into());
-            w.set_status("".into());
+            w.global::<AccountPicker>().set_account_pick_mode("switch".into());
+            w.global::<AccountPicker>().set_nb_create_name("".into());
+            w.global::<Ui>().set_status("".into());
             update_notebook_list(&w, &s);
-            w.set_screen(Screen::Notebooks);
+            w.global::<Ui>().set_screen(Screen::Notebooks);
             return;
         }
         if s.pending_import.take().is_some() {
-            w.set_screen(Screen::ImportKey); // abandon import → back to the import form
+            w.global::<Ui>().set_screen(Screen::ImportKey); // abandon import → back to the import form
         } else {
             update_home(&w, &s);
-            w.set_screen(Screen::Settings); // came from settings
+            w.global::<Ui>().set_screen(Screen::Settings); // came from settings
         }
     });
 
-    cb!(on_reset_identity, |w, s| {
+    cb!(Modals, on_reset_identity, |w, s| {
         println!("cb: reset-identity");
         let _ = keychain::delete_secret(KEYCHAIN_ACCOUNT);
         // Privacy: local stores cache decrypted note text — delete them.
@@ -16342,29 +16343,29 @@ pub fn run() {
         s.to_address = None;
         s.to_addresses_extra.clear();
         s.picking_extra = false;
-        w.set_picking_extra(false);
+        w.global::<Ui>().set_picking_extra(false);
         s.icloud_backup = false;
-        w.set_icloud_backup(false);
+        w.global::<Ui>().set_icloud_backup(false);
         // The key is gone, so there is nothing to restore and nothing to
         // auto-unlock — leaving either set would show a "Restore saved key"
         // door pointing at an item we just deleted.
         s.auto_unlock = false;
         s.saved_key_present = false;
-        w.set_saved_key_present(false);
+        w.global::<Onboarding>().set_saved_key_present(false);
         s.save_config();
-        w.set_show_reset_confirm(false);
+        w.global::<Ui>().set_show_reset_confirm(false);
         clear_reveal(&w, &mut s);
-        w.set_status("".into());
-        w.set_import_text("".into());
-        w.set_screen(Screen::Onboarding);
+        w.global::<Ui>().set_status("".into());
+        w.global::<ImportKey>().set_import_text("".into());
+        w.global::<Ui>().set_screen(Screen::Onboarding);
     });
 
-    cb!(on_reveal_hide, |w, s| {
+    cb!(Ui, on_reveal_hide, |w, s| {
         clear_reveal(&w, &mut s);
         println!("cb: hide-reveal");
     });
 
-    cb!(on_set_network, |w, s, net: SharedString| {
+    cb!(Settings, on_set_network, |w, s, net: SharedString| {
         let Some(n) = Network::from_str_opt(net.as_str()) else { return };
         if n == s.network {
             return;
@@ -16406,13 +16407,13 @@ pub fn run() {
                     refresh_async(&w, &mut s);
                     spending_refresh_async(&w, &mut s); // CHANGE 5
                 }
-                Err(e) => w.set_status(format!("network switch: {e}").into()),
+                Err(e) => w.global::<Ui>().set_status(format!("network switch: {e}").into()),
             }
         }
-        w.set_settings_network(s.network.as_str().into());
+        w.global::<Settings>().set_settings_network(s.network.as_str().into());
     });
 
-    cb!(on_set_chunk, |w, s, t: SharedString| {
+    cb!(Settings, on_set_chunk, |w, s, t: SharedString| {
         match t.trim().parse::<usize>() {
             Ok(n) if (20..=100_000).contains(&n) => {
                 if let Some(store) = &mut s.store {
@@ -16422,24 +16423,24 @@ pub fn run() {
                 s.chunk = Some(n); // device-level: every notebook, on activate
                 s.save_config();
                 println!("cb: set-chunk-size {n} ok");
-                w.set_chunk_text(n.to_string().into());
+                w.global::<Settings>().set_chunk_text(n.to_string().into());
                 if n == 100_000 || n == 80 {
-                    w.set_chunk_custom(false);
+                    w.global::<Settings>().set_chunk_custom(false);
                 }
-                w.set_status("".into());
+                w.global::<Ui>().set_status("".into());
             }
             _ => {
                 println!("cb: set-chunk-size err=range");
-                w.set_status("chunk bytes must be 20..=100000".into());
+                w.global::<Ui>().set_status("chunk bytes must be 20..=100000".into());
             }
         }
     });
 
-    cb!(on_set_locktime, |w, s, mode: SharedString, height: SharedString| {
+    cb!(Settings, on_set_locktime, |w, s, mode: SharedString, height: SharedString| {
         let policy = parse_locktime_mode(mode.as_str(), height.as_str());
         let Some(policy) = policy else {
             println!("cb: set-locktime err=range");
-            w.set_status("locktime must be a block height below 500000000".into());
+            w.global::<Ui>().set_status("locktime must be a block height below 500000000".into());
             return;
         };
         s.lock_time_policy = policy;
@@ -16450,10 +16451,10 @@ pub fn run() {
         s.save_config();
         let effective = s.lock_time();
         println!("cb: set-locktime {} effective={effective} ok", policy.as_str());
-        w.set_locktime_mode(policy.as_str().into());
-        w.set_locktime_text(effective.to_string().into());
-        w.set_locktime_effective(locktime_caption(policy, s.store.as_ref().map(|st| st.tip_height)).into());
-        w.set_status("".into());
+        w.global::<Settings>().set_locktime_mode(policy.as_str().into());
+        w.global::<Settings>().set_locktime_text(effective.to_string().into());
+        w.global::<Settings>().set_locktime_effective(locktime_caption(policy, s.store.as_ref().map(|st| st.tip_height)).into());
+        w.global::<Ui>().set_status("".into());
     });
 
     // Compose screen (6) locktime override panel — a per-tx override of
@@ -16461,46 +16462,46 @@ pub fn run() {
     // config.json/store, reset to the device default every time compose is
     // (re)opened (`pick_contact_core`). Shares `parse_locktime_mode`'s
     // validation and `locktime_caption`'s wording with Settings.
-    cb!(on_set_compose_locktime, |w, s, mode: SharedString, height: SharedString| {
+    cb!(Compose, on_set_compose_locktime, |w, s, mode: SharedString, height: SharedString| {
         let Some(policy) = parse_locktime_mode(mode.as_str(), height.as_str()) else {
             println!("cb: compose-locktime err=range");
-            w.set_status("locktime must be a block height below 500000000".into());
+            w.global::<Ui>().set_status("locktime must be a block height below 500000000".into());
             return;
         };
         s.tx_lock_time_override = Some(policy);
         let effective = s.effective_lock_time();
         println!("cb: compose-locktime {} effective={effective} ok", policy.as_str());
         refresh_compose_locktime_panel(&w, &s);
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
     });
 
     // Sweep/consolidate screen (16) locktime override panel — same
     // contract as the compose one above, reset on `set_sweep_dest`/
     // `open_notebook_consolidate`.
-    cb!(on_set_sweep_locktime, |w, s, mode: SharedString, height: SharedString| {
+    cb!(Sweep, on_set_sweep_locktime, |w, s, mode: SharedString, height: SharedString| {
         let Some(policy) = parse_locktime_mode(mode.as_str(), height.as_str()) else {
             println!("cb: sweep-locktime err=range");
-            w.set_status("locktime must be a block height below 500000000".into());
+            w.global::<Ui>().set_status("locktime must be a block height below 500000000".into());
             return;
         };
         s.tx_lock_time_override = Some(policy);
         let effective = s.effective_lock_time();
         println!("cb: sweep-locktime {} effective={effective} ok", policy.as_str());
         refresh_sweep_locktime_panel(&w, &s);
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
     });
 
     // Compose "too large" dialog: raise the chunk size to Standard and reprice
     // the draft in place. Only offered when the note actually fits at Standard.
-    cb!(on_oversize_bump, |w, s| {
+    cb!(Modals, on_oversize_bump, |w, s| {
         if let Some(store) = &mut s.store {
             store.chunk_size = DEFAULT_CHUNK;
         }
         s.save_store();
         println!("cb: set-chunk-size {DEFAULT_CHUNK} ok (oversize-bump)");
-        w.set_chunk_text(DEFAULT_CHUNK.to_string().into());
-        w.set_chunk_custom(false);
-        w.set_show_oversize_modal(false);
+        w.global::<Settings>().set_chunk_text(DEFAULT_CHUNK.to_string().into());
+        w.global::<Settings>().set_chunk_custom(false);
+        w.global::<Ui>().set_show_oversize_modal(false);
         refresh_compose(&w, &mut s);
     });
 
@@ -16510,7 +16511,7 @@ pub fn run() {
     // their own text field (the Slint side already moved node-index) and
     // write nothing yet; the value follows when the user submits it via
     // set-node-address / set-node-custom respectively.
-    cb!(on_set_node_preset, |w, s, i: i32| {
+    cb!(Settings, on_set_node_preset, |w, s, i: i32| {
         let net = s.network.as_str().to_string();
         let presets = node_presets(s.network);
         let i = i as usize;
@@ -16526,7 +16527,7 @@ pub fn run() {
         } else {
             println!("cb: set-node-preset custom");
         }
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
         // Every preset is Esplora — this both clears a previously-active
         // Core node's credential fields/health line and is a no-op (no
         // network call) whenever the picker was already on Esplora.
@@ -16543,7 +16544,7 @@ pub fn run() {
     // rewritten to the canonical `display_core_url` form so what's on
     // screen always matches what got stored; on a malformed input nothing
     // is written and the field is left as typed so the user can fix it.
-    cb!(on_set_node_address, |w, s, t: SharedString| {
+    cb!(Settings, on_set_node_address, |w, s, t: SharedString| {
         let net = s.network.as_str().to_string();
         match compose_core_url(t.trim(), s.network) {
             Ok((v, inline_creds)) => {
@@ -16570,18 +16571,18 @@ pub fn run() {
                         }
                     }
                 }
-                w.set_node_address_text(display_core_url(&v).into());
-                w.set_status("".into());
+                w.global::<Ui>().set_node_address_text(display_core_url(&v).into());
+                w.global::<Ui>().set_status("".into());
             }
             Err(msg) => {
                 println!("cb: set-node-address err={msg}");
-                w.set_status(format!("Bitcoin node address: {msg}").into());
+                w.global::<Ui>().set_status(format!("Bitcoin node address: {msg}").into());
             }
         }
         refresh_node_health(&w, &mut s);
     });
 
-    cb!(on_set_node_custom, |w, s, t: SharedString| {
+    cb!(Settings, on_set_node_custom, |w, s, t: SharedString| {
         let net = s.network.as_str().to_string();
         // Strip any inline `user:pass@` userinfo BEFORE it ever reaches
         // config.json or this `cb:` log line (plan §2.4 — "the stored node
@@ -16618,7 +16619,7 @@ pub fn run() {
                 Err(e) => println!("cb: set-node-custom inline-creds redacted stored=err ({e})"),
             }
         }
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
         refresh_node_health(&w, &mut s);
     });
 
@@ -16631,7 +16632,7 @@ pub fn run() {
     // config.json, never logged (length only). Clearing both fields
     // deletes/clears the stored or session credential instead of writing
     // an empty one.
-    cb!(on_set_node_core_creds, |w, s, user: SharedString, pass: SharedString| {
+    cb!(Settings, on_set_node_core_creds, |w, s, user: SharedString, pass: SharedString| {
         let net = s.network.as_str().to_string();
         let user = user.trim().to_string();
         let pass = pass.to_string();
@@ -16653,7 +16654,7 @@ pub fn run() {
             ),
             Err(e) => println!("cb: set-node-core-creds err={e}"),
         }
-        w.set_status(if result.is_ok() { "".into() } else { "couldn't save RPC credentials".into() });
+        w.global::<Ui>().set_status(if result.is_ok() { "".into() } else { "couldn't save RPC credentials".into() });
         refresh_node_health(&w, &mut s);
         if result.is_err() {
             // A FAILED save stored nothing, so the refresh above resolves
@@ -16662,8 +16663,8 @@ pub fn run() {
             // it back so they can fix the cause and press Save again
             // (reproducible on any unsigned dev build, where SecItemAdd
             // returns -34018).
-            w.set_node_core_user(user.as_str().into());
-            w.set_node_core_pass(pass.as_str().into());
+            w.global::<Settings>().set_node_core_user(user.as_str().into());
+            w.global::<Settings>().set_node_core_pass(pass.as_str().into());
         }
     });
 
@@ -16677,11 +16678,11 @@ pub fn run() {
     // or the on-screen fields) and clears the session copy. A failed
     // Keychain op reverts the on-screen toggle rather than claiming
     // success.
-    cb!(on_set_node_core_save_creds, |w, s, enabled: bool| {
+    cb!(Settings, on_set_node_core_save_creds, |w, s, enabled: bool| {
         let net = s.network.as_str().to_string();
         let net_key = net.clone();
-        let user = w.get_node_core_user().to_string();
-        let pass = w.get_node_core_pass().to_string();
+        let user = w.global::<Settings>().get_node_core_user().to_string();
+        let pass = w.global::<Settings>().get_node_core_pass().to_string();
         let result = apply_core_rpc_persist_toggle(
             enabled,
             &user,
@@ -16704,7 +16705,7 @@ pub fn run() {
                 println!("cb: set-node-core-save-creds {enabled} ok");
             }
             Err(e) => {
-                w.set_node_core_save_creds(!enabled);
+                w.global::<Settings>().set_node_core_save_creds(!enabled);
                 println!("cb: set-node-core-save-creds {enabled} err={e}");
             }
         }
@@ -16712,7 +16713,7 @@ pub fn run() {
         refresh_node_health(&w, &mut s);
     });
 
-    cb!(on_set_explorer_preset, |w, s, i: i32| {
+    cb!(Settings, on_set_explorer_preset, |w, s, i: i32| {
         let net = s.network.as_str().to_string();
         let presets = explorer_presets(s.network);
         let i = i as usize;
@@ -16727,10 +16728,10 @@ pub fn run() {
         } else {
             println!("cb: set-explorer-preset custom");
         }
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
     });
 
-    cb!(on_set_explorer_custom, |w, s, t: SharedString| {
+    cb!(Settings, on_set_explorer_custom, |w, s, t: SharedString| {
         let net = s.network.as_str().to_string();
         let v = t.trim().to_string();
         if v.is_empty() {
@@ -16741,25 +16742,25 @@ pub fn run() {
         s.save_config();
         update_activity(&w, &s); // refresh live Explorer links
         println!("cb: set-explorer-custom {}", if v.is_empty() { "default" } else { &v });
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
     });
 
     // ---- Public keys (screen 18): derived from the SESSION-CACHED
     // material only — never a fresh biometric. Watch-only identities show
     // whatever public material `export_formats` yields (their `material`
     // IS the xpub/descriptor string itself, so this works unchanged).
-    cb!(on_reveal_public, |w, s| {
+    cb!(Settings, on_reveal_public, |w, s| {
         let material = std::env::var("APP_KEY")
             .ok()
             .or_else(|| s.material.as_ref().map(|z| String::from(z.as_str())));
         let Some(material) = material else {
-            w.set_reveal_public_rows(VecModel::from_slice(&Vec::<RevealRow>::new()));
-            w.set_reveal_fingerprint("".into());
-            w.set_reveal_public_hint(
+            w.global::<PublicKeys>().set_reveal_public_rows(VecModel::from_slice(&Vec::<RevealRow>::new()));
+            w.global::<Ui>().set_reveal_fingerprint("".into());
+            w.global::<Ui>().set_reveal_public_hint(
                 "No key material cached this session — open Private keys once (it re-authenticates), or restart the app."
                     .into(),
             );
-            w.set_screen(Screen::PublicKeys);
+            w.global::<Ui>().set_screen(Screen::PublicKeys);
             println!("cb: reveal-public no-material");
             return;
         };
@@ -16787,24 +16788,24 @@ pub fn run() {
                     None => format!("account {}", s.account),
                 };
                 println!("cb: reveal-public ok rows={}", rows.len());
-                w.set_reveal_fingerprint(fp_line.into());
-                w.set_reveal_public_rows(VecModel::from_slice(&rows));
+                w.global::<Ui>().set_reveal_fingerprint(fp_line.into());
+                w.global::<PublicKeys>().set_reveal_public_rows(VecModel::from_slice(&rows));
                 // A single hex/WIF key import has a leaf key but no account
                 // node — legitimately nothing public to export. Explain the
                 // empty screen instead of leaving it blank.
-                w.set_reveal_public_hint(if rows.is_empty() {
+                w.global::<Ui>().set_reveal_public_hint(if rows.is_empty() {
                     "This key has no account-level public material — a single hex/WIF import can't yield a watch-only xpub or descriptor.".into()
                 } else {
                     "".into()
                 });
             }
             Err(e) => {
-                w.set_reveal_public_rows(VecModel::from_slice(&Vec::<RevealRow>::new()));
-                w.set_reveal_public_hint(format!("Couldn't derive public keys: {e}").into());
+                w.global::<PublicKeys>().set_reveal_public_rows(VecModel::from_slice(&Vec::<RevealRow>::new()));
+                w.global::<Ui>().set_reveal_public_hint(format!("Couldn't derive public keys: {e}").into());
                 println!("cb: reveal-public err");
             }
         }
-        w.set_screen(Screen::PublicKeys);
+        w.global::<Ui>().set_screen(Screen::PublicKeys);
     });
 
     // ---- Private keys (screen 19): ALWAYS a fresh biometric — never the
@@ -16814,7 +16815,7 @@ pub fn run() {
     // `s.reveal_formats` so the picker (`private-select`) never re-prompts
     // — but nothing is shown until the user taps a pill (progressive
     // disclosure).
-    cb!(on_reveal_private, |w, s| {
+    cb!(Settings, on_reveal_private, |w, s| {
         match keychain::reveal_secret(KEYCHAIN_ACCOUNT, "reveal your keys") {
             Ok(Some(secret)) => {
                 match app_core::keyexport::export_formats(&secret, s.network, s.account, s.nb_index)
@@ -16824,47 +16825,47 @@ pub fn run() {
                             Some(fp) => format!("{fp} · account {}", s.account),
                             None => format!("account {}", s.account),
                         };
-                        w.set_reveal_fingerprint(fp_line.into());
-                        w.set_reveal_has_recovery(f.mnemonic.is_some());
-                        w.set_reveal_has_xprv(f.account_xprv.is_some());
-                        w.set_reveal_has_hex(f.leaf_hex.is_some());
-                        w.set_reveal_has_wif(f.leaf_wif.is_some());
+                        w.global::<Ui>().set_reveal_fingerprint(fp_line.into());
+                        w.global::<PrivateKeys>().set_reveal_has_recovery(f.mnemonic.is_some());
+                        w.global::<PrivateKeys>().set_reveal_has_xprv(f.account_xprv.is_some());
+                        w.global::<PrivateKeys>().set_reveal_has_hex(f.leaf_hex.is_some());
+                        w.global::<PrivateKeys>().set_reveal_has_wif(f.leaf_wif.is_some());
                         // Nothing selected yet — the screen shows only the
                         // pills until one is tapped.
-                        w.set_reveal_private_format("".into());
-                        w.set_reveal_private_value("".into());
-                        w.set_reveal_private_qr(slint::Image::default());
-                        w.set_reveal_words_col1("".into());
-                        w.set_reveal_words_col2("".into());
-                        w.set_reveal_show_seedqr(false);
-                        w.set_reveal_seedqr_image(slint::Image::default());
+                        w.global::<Ui>().set_reveal_private_format("".into());
+                        w.global::<PrivateKeys>().set_reveal_private_value("".into());
+                        w.global::<PrivateKeys>().set_reveal_private_qr(slint::Image::default());
+                        w.global::<PrivateKeys>().set_reveal_words_col1("".into());
+                        w.global::<PrivateKeys>().set_reveal_words_col2("".into());
+                        w.global::<PrivateKeys>().set_reveal_show_seedqr(false);
+                        w.global::<PrivateKeys>().set_reveal_seedqr_image(slint::Image::default());
                         // Hex/WIF picker: the active account's notebooks,
                         // defaulting to the active notebook. Hidden in the UI
                         // for recovery/xprv, but harmless to populate always.
-                        w.set_reveal_nb_rows(VecModel::from_slice(&private_nb_rows(&s)));
-                        w.set_reveal_nb_index(s.nb_index as i32);
+                        w.global::<PrivateKeys>().set_reveal_nb_rows(VecModel::from_slice(&private_nb_rows(&s)));
+                        w.global::<PrivateKeys>().set_reveal_nb_index(s.nb_index as i32);
                         println!("cb: reveal-private ok");
                         s.reveal_formats = Some(f);
-                        w.set_status("".into());
-                        w.set_screen(Screen::PrivateKeys);
+                        w.global::<Ui>().set_status("".into());
+                        w.global::<Ui>().set_screen(Screen::PrivateKeys);
                     }
                     Err(e) => {
                         println!("cb: reveal-private err");
-                        w.set_status(format!("export: {e}").into());
+                        w.global::<Ui>().set_status(format!("export: {e}").into());
                     }
                 }
             }
             Ok(None) => {
                 println!("cb: reveal-private no-key");
-                w.set_status("(no key in keychain — APP_KEY env session?)".into());
+                w.global::<Ui>().set_status("(no key in keychain — APP_KEY env session?)".into());
             }
             Err(e) if e == "cancelled" => {
                 println!("cb: reveal-private cancelled");
-                w.set_status("authentication cancelled".into());
+                w.global::<Ui>().set_status("authentication cancelled".into());
             }
             Err(e) => {
                 println!("cb: reveal-private err");
-                w.set_status(format!("keychain: {e}").into());
+                w.global::<Ui>().set_status(format!("keychain: {e}").into());
             }
         }
     });
@@ -16875,19 +16876,19 @@ pub fn run() {
     // whichever notebook the picker currently has selected (not always
     // the active notebook) so switching back to a pill after picking a
     // different notebook shows the right value.
-    cb!(on_private_select, |w, s, fmt: SharedString| {
+    cb!(PrivateKeys, on_private_select, |w, s, fmt: SharedString| {
         let fmt = fmt.as_str();
         if fmt == "hex" || fmt == "wif" {
             let Some(v) = derive_leaf_value(&s, &w, fmt) else { return };
-            w.set_reveal_show_seedqr(false);
-            w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
-            w.set_reveal_private_value(v.into());
-            w.set_reveal_private_format(fmt.into());
+            w.global::<PrivateKeys>().set_reveal_show_seedqr(false);
+            w.global::<PrivateKeys>().set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
+            w.global::<PrivateKeys>().set_reveal_private_value(v.into());
+            w.global::<Ui>().set_reveal_private_format(fmt.into());
             println!("cb: private-select fmt={fmt}");
             return;
         }
         let Some(f) = s.reveal_formats.as_ref() else { return };
-        w.set_reveal_show_seedqr(false);
+        w.global::<PrivateKeys>().set_reveal_show_seedqr(false);
         match fmt {
             "recovery" => {
                 let Some(words) = f.mnemonic.as_ref().map(|z| z.as_str().to_string()) else {
@@ -16901,26 +16902,26 @@ pub fn run() {
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
-                w.set_reveal_words_col1(col(0..half).into());
-                w.set_reveal_words_col2(col(half..list.len()).into());
+                w.global::<PrivateKeys>().set_reveal_words_col1(col(0..half).into());
+                w.global::<PrivateKeys>().set_reveal_words_col2(col(half..list.len()).into());
                 if let Ok(m) = bip39::Mnemonic::parse(&words) {
                     let digits = app_core::seedqr::encode_standard(&m);
-                    w.set_reveal_seedqr_image(qr::qr_image(&digits).unwrap_or_default());
+                    w.global::<PrivateKeys>().set_reveal_seedqr_image(qr::qr_image(&digits).unwrap_or_default());
                 }
-                w.set_reveal_private_value(words.into());
-                w.set_reveal_private_qr(slint::Image::default());
+                w.global::<PrivateKeys>().set_reveal_private_value(words.into());
+                w.global::<PrivateKeys>().set_reveal_private_qr(slint::Image::default());
             }
             "xprv" => {
                 let Some(v) = f.account_xprv.as_ref().map(|z| z.as_str().to_string()) else {
                     return;
                 };
-                w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
-                w.set_reveal_private_value(v.into());
+                w.global::<PrivateKeys>().set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
+                w.global::<PrivateKeys>().set_reveal_private_value(v.into());
             }
             // hex/wif are handled above (picker-aware, returns early).
             _ => return,
         }
-        w.set_reveal_private_format(fmt.into());
+        w.global::<Ui>().set_reveal_private_format(fmt.into());
         println!("cb: private-select fmt={fmt}");
     });
 
@@ -16928,38 +16929,38 @@ pub fn run() {
     // its leaf key from the session-cached material — NO re-auth. A no-op
     // for recovery/xprv (the picker is hidden for those, and the shown
     // format is index-independent anyway).
-    cb!(on_private_pick_notebook, |w, s, index: i32| {
-        w.set_reveal_nb_index(index);
+    cb!(PrivateKeys, on_private_pick_notebook, |w, s, index: i32| {
+        w.global::<PrivateKeys>().set_reveal_nb_index(index);
         println!("cb: private-pick-notebook index={index}");
-        let fmt = w.get_reveal_private_format().to_string();
+        let fmt = w.global::<Ui>().get_reveal_private_format().to_string();
         if fmt != "hex" && fmt != "wif" {
             return;
         }
         let Some(v) = derive_leaf_value(&s, &w, &fmt) else { return };
-        w.set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
-        w.set_reveal_private_value(v.into());
+        w.global::<PrivateKeys>().set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
+        w.global::<PrivateKeys>().set_reveal_private_value(v.into());
     });
 
     // ---- Quantum keys (Settings -> screen 29) ----------------------------
 
-    cb!(on_open_pq_keys, |w, s| {
+    cb!(Settings, on_open_pq_keys, |w, s| {
         // User-initiated — the LAUNCH-PATH rule's other sanctioned door for
         // loading an imported ML-KEM secret from the Keychain this session
         // (a no-op once already cached).
         ensure_pq_imported_loaded(&mut s);
-        w.set_pq_import_text("".into());
-        w.set_pq_import_error("".into());
-        w.set_pq_import_source("".into());
-        w.set_pq_show_backup_confirm(false);
-        w.set_pq_gen_level("768".into());
-        w.set_pq_gen_extra("".into());
-        w.set_pq_show_replace_confirm(false);
-        w.set_pq_show_export_private_confirm(false);
-        w.set_pq_imported_private_value("".into());
-        w.set_pq_imported_private_qr(slint::Image::default());
+        w.global::<QuantumKeys>().set_pq_import_text("".into());
+        w.global::<QuantumKeys>().set_pq_import_error("".into());
+        w.global::<Ui>().set_pq_import_source("".into());
+        w.global::<Ui>().set_pq_show_backup_confirm(false);
+        w.global::<QuantumKeys>().set_pq_gen_level("768".into());
+        w.global::<QuantumKeys>().set_pq_gen_extra("".into());
+        w.global::<Ui>().set_pq_show_replace_confirm(false);
+        w.global::<Ui>().set_pq_show_export_private_confirm(false);
+        w.global::<Modals>().set_pq_imported_private_value("".into());
+        w.global::<Modals>().set_pq_imported_private_qr(slint::Image::default());
         s.pq_pending_replace = None;
         update_pq_keys_screen(&w, &s);
-        w.set_screen(Screen::QuantumKeys);
+        w.global::<Ui>().set_screen(Screen::QuantumKeys);
         // Log-contract landing signal (graffito-app-selfpq.sh) — emitted
         // LAST, after ensure_pq_imported_loaded (which blocks on a
         // SecurityAgent keychain prompt on a freshly-resigned debug build)
@@ -16967,7 +16968,7 @@ pub fn run() {
         println!("cb: pq-keys open");
     });
 
-    cb!(on_pq_set_level, |w, s, level: SharedString| {
+    cb!(QuantumKeys, on_pq_set_level, |w, s, level: SharedString| {
         let Some(level) = pq_level_from_str(level.as_str()) else { return };
         s.pq_level = level;
         s.save_config();
@@ -16975,7 +16976,7 @@ pub fn run() {
         update_pq_keys_screen(&w, &s);
     });
 
-    cb!(on_pq_copy_public, |w, s| {
+    cb!(QuantumKeys, on_pq_copy_public, |w, s| {
         let _ = &mut s;
         let Some(ls) = s.ident.as_ref().and_then(|i| i.leaf_secret()) else { return };
         let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(s.pq_level));
@@ -16985,7 +16986,7 @@ pub fn run() {
         show_toast(&w, if ok { "Copied" } else { "Copy failed" });
     });
 
-    cb!(on_pq_save_public, |w, s| {
+    cb!(QuantumKeys, on_pq_save_public, |w, s| {
         let _ = &mut s;
         let Some(ls) = s.ident.as_ref().and_then(|i| i.leaf_secret()) else { return };
         let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(s.pq_level));
@@ -16994,55 +16995,55 @@ pub fn run() {
             match std::fs::write(&path, armor.as_bytes()) {
                 Ok(()) => {
                     println!("cb: pq-key-export public len={}", armor.len());
-                    w.set_status("saved public key".into());
+                    w.global::<Ui>().set_status("saved public key".into());
                 }
-                Err(e) => w.set_status(format!("save failed: {e}").into()),
+                Err(e) => w.global::<Ui>().set_status(format!("save failed: {e}").into()),
             }
         }
     });
 
-    cb!(on_pq_copy_private, |w, s| {
+    cb!(Modals, on_pq_copy_private, |w, s| {
         let _ = &mut s;
         let Some(ls) = s.ident.as_ref().and_then(|i| i.leaf_secret()) else { return };
         let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(s.pq_level));
         let armor = app_core::pqkeys::export_private_armor(&kp);
         let ok = platform::set_clipboard_secret(&armor);
         println!("cb: pq-key-export private len={}", armor.len());
-        w.set_pq_show_backup_confirm(false);
+        w.global::<Ui>().set_pq_show_backup_confirm(false);
         show_toast(&w, if ok { "Copied" } else { "Copy failed" });
     });
 
-    cb!(on_pq_save_private, |w, s| {
+    cb!(Modals, on_pq_save_private, |w, s| {
         let _ = &mut s;
         let Some(ls) = s.ident.as_ref().and_then(|i| i.leaf_secret()) else { return };
         let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(s.pq_level));
         let armor = app_core::pqkeys::export_private_armor(&kp);
-        w.set_pq_show_backup_confirm(false);
+        w.global::<Ui>().set_pq_show_backup_confirm(false);
         if let Some(path) = platform::save_file("quantum-private-key.asc") {
             match std::fs::write(&path, armor.as_bytes()) {
                 Ok(()) => {
                     println!("cb: pq-key-export private len={}", armor.len());
-                    w.set_status("saved private key".into());
+                    w.global::<Ui>().set_status("saved private key".into());
                 }
-                Err(e) => w.set_status(format!("save failed: {e}").into()),
+                Err(e) => w.global::<Ui>().set_status(format!("save failed: {e}").into()),
             }
         }
     });
 
-    cb!(on_pq_import_paste, |w, s| {
+    cb!(QuantumKeys, on_pq_import_paste, |w, s| {
         let _ = &mut s;
         match platform::clipboard_text() {
-            Some(text) => w.set_pq_import_text(text.into()),
-            None => w.set_pq_import_error("clipboard empty".into()),
+            Some(text) => w.global::<QuantumKeys>().set_pq_import_text(text.into()),
+            None => w.global::<QuantumKeys>().set_pq_import_error("clipboard empty".into()),
         }
     });
 
-    cb!(on_pq_import_file, |w, s| {
+    cb!(QuantumKeys, on_pq_import_file, |w, s| {
         let _ = &mut s;
         if let Some(path) = platform::pick_file(&[("Key", &["asc", "txt", "pgp", "gpg"])]) {
             match std::fs::read_to_string(&path) {
-                Ok(text) => w.set_pq_import_text(text.trim().into()),
-                Err(e) => w.set_pq_import_error(format!("file: {e}").into()),
+                Ok(text) => w.global::<QuantumKeys>().set_pq_import_text(text.trim().into()),
+                Err(e) => w.global::<QuantumKeys>().set_pq_import_error(format!("file: {e}").into()),
             }
         }
     });
@@ -17053,26 +17054,26 @@ pub fn run() {
     // `on_pq_replace_confirm` runs whichever action was pending. The
     // pending action's own input (gen level/extra, or import text) is left
     // untouched in the Slint properties across the round trip.
-    cb!(on_pq_generate, |w, s| {
+    cb!(QuantumKeys, on_pq_generate, |w, s| {
         if s.pq_imported.is_some() {
             s.pq_pending_replace = Some(PqReplaceKind::Generate);
-            w.set_pq_show_replace_confirm(true);
+            w.global::<Ui>().set_pq_show_replace_confirm(true);
             return;
         }
         do_pq_generate(&w, &mut s);
     });
 
-    cb!(on_pq_import_submit, |w, s| {
+    cb!(QuantumKeys, on_pq_import_submit, |w, s| {
         if s.pq_imported.is_some() {
             s.pq_pending_replace = Some(PqReplaceKind::Import);
-            w.set_pq_show_replace_confirm(true);
+            w.global::<Ui>().set_pq_show_replace_confirm(true);
             return;
         }
         do_pq_import(&w, &mut s);
     });
 
-    cb!(on_pq_replace_confirm, |w, s| {
-        w.set_pq_show_replace_confirm(false);
+    cb!(Ui, on_pq_replace_confirm, |w, s| {
+        w.global::<Ui>().set_pq_show_replace_confirm(false);
         match s.pq_pending_replace.take() {
             Some(PqReplaceKind::Generate) => do_pq_generate(&w, &mut s),
             Some(PqReplaceKind::Import) => do_pq_import(&w, &mut s),
@@ -17080,16 +17081,16 @@ pub fn run() {
         }
     });
 
-    cb!(on_pq_replace_cancel, |w, s| {
+    cb!(Modals, on_pq_replace_cancel, |w, s| {
         s.pq_pending_replace = None;
-        w.set_pq_show_replace_confirm(false);
+        w.global::<Ui>().set_pq_show_replace_confirm(false);
     });
 
-    cb!(on_pq_import_remove, |w, s| {
+    cb!(QuantumKeys, on_pq_import_remove, |w, s| {
         let _ = keychain::delete_secret(PQ_IMPORTED_ACCOUNT);
         s.pq_imported = None;
-        w.set_pq_import_source("".into());
-        w.set_pq_import_error("".into());
+        w.global::<Ui>().set_pq_import_source("".into());
+        w.global::<QuantumKeys>().set_pq_import_error("".into());
         println!("cb: pq-key-remove");
         update_pq_keys_screen(&w, &s);
     });
@@ -17098,7 +17099,7 @@ pub fn run() {
     // private armor sits behind an explicit reveal warning and copies via
     // the concealed/expiring clipboard, never the plain one) ----
 
-    cb!(on_pq_imported_copy_public, |w, s| {
+    cb!(QuantumKeys, on_pq_imported_copy_public, |w, s| {
         let _ = &mut s;
         let Some(kp) = s.pq_imported.as_ref() else { return };
         let armor = app_core::notes_core::pq::export_public(kp.alg(), kp.ek());
@@ -17107,18 +17108,18 @@ pub fn run() {
         show_toast(&w, if ok { "Copied" } else { "Copy failed" });
     });
 
-    cb!(on_pq_imported_reveal_private, |w, s| {
+    cb!(Modals, on_pq_imported_reveal_private, |w, s| {
         let _ = &mut s;
         let Some(kp) = s.pq_imported.as_ref() else { return };
         let armor = app_core::pqkeys::export_private_armor(kp);
-        w.set_pq_imported_private_qr(qr::qr_image(&armor).unwrap_or_default());
-        w.set_pq_imported_private_value(armor.into());
+        w.global::<Modals>().set_pq_imported_private_qr(qr::qr_image(&armor).unwrap_or_default());
+        w.global::<Modals>().set_pq_imported_private_value(armor.into());
         println!("cb: pq-key-export private-reveal");
     });
 
-    cb!(on_pq_imported_copy_private, |w, s| {
+    cb!(Modals, on_pq_imported_copy_private, |w, s| {
         let _ = &mut s;
-        let armor = w.get_pq_imported_private_value().to_string();
+        let armor = w.global::<Modals>().get_pq_imported_private_value().to_string();
         if armor.is_empty() {
             return;
         }
@@ -17127,13 +17128,13 @@ pub fn run() {
         show_toast(&w, if ok { "Copied" } else { "Copy failed" });
     });
 
-    cb!(on_pq_imported_hide_private, |w, s| {
+    cb!(Ui, on_pq_imported_hide_private, |w, s| {
         let _ = &mut s;
-        w.set_pq_imported_private_value("".into());
-        w.set_pq_imported_private_qr(slint::Image::default());
+        w.global::<Modals>().set_pq_imported_private_value("".into());
+        w.global::<Modals>().set_pq_imported_private_qr(slint::Image::default());
     });
 
-    cb!(on_copy_value, |w, s, value: SharedString| {
+    cb!(Ui, on_copy_value, |w, s, value: SharedString| {
         let _ = &mut s;
         let ok = platform::set_clipboard_text(value.as_str());
         println!("cb: copy-value len={}", value.len());
@@ -17142,19 +17143,19 @@ pub fn run() {
 
     // Spending material (audit M3) — concealed/local-only/expiring clipboard,
     // never the plain broadcast one. Length only, as ever; never the value.
-    cb!(on_copy_secret, |w, s, value: SharedString| {
+    cb!(PrivateKeys, on_copy_secret, |w, s, value: SharedString| {
         let _ = &mut s;
         let ok = platform::set_clipboard_secret(value.as_str());
         println!("cb: copy-secret len={}", value.len());
         show_toast(&w, if ok { "Copied" } else { "Copy failed" });
     });
 
-    cb!(on_go_home, |w, s| {
+    cb!(Ui, on_go_home, |w, s| {
         clear_reveal(&w, &mut s);
         go_home_or_list(&w, &s);
     });
 
-    cb!(on_open_notebooks, |w, s| {
+    cb!(Ui, on_open_notebooks, |w, s| {
         // Leaving the open notebook: everything that was on screen counts
         // as read, so the list badge only flags what arrived since.
         if let Some(store) = s.store.as_mut() {
@@ -17162,12 +17163,12 @@ pub fn run() {
                 s.save_store();
             }
         }
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
         update_notebook_list(&w, &s);
-        w.set_screen(Screen::Notebooks);
+        w.global::<Ui>().set_screen(Screen::Notebooks);
     });
 
-    cb!(on_open_notebook, |w, s, index: i32| {
+    cb!(Notebooks, on_open_notebook, |w, s, index: i32| {
         let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
             return;
         };
@@ -17176,15 +17177,15 @@ pub fn run() {
         match activate(&mut s, &material, false) {
             Ok(()) => {
                 update_home(&w, &s);
-                w.set_screen(Screen::Home); // paint first — the scan runs in the background
+                w.global::<Ui>().set_screen(Screen::Home); // paint first — the scan runs in the background
                 refresh_async(&w, &mut s);
                 spending_refresh_async(&w, &mut s); // CHANGE 5: was missing — Sal's finding
             }
-            Err(e) => w.set_status(e.to_string().into()),
+            Err(e) => w.global::<Ui>().set_status(e.to_string().into()),
         }
     });
 
-    cb!(on_create_notebook, |w, s| {
+    cb!(Notebooks, on_create_notebook, |w, s| {
         // Address-first, then name-first: "+ New notebook" opens the
         // account picker (used/new pills + balances) so recovering a used
         // address is a visible choice; the naming dialog follows the pick.
@@ -17196,11 +17197,11 @@ pub fn run() {
             return; // button is hidden; a stray call must not add phantom rows
         }
         println!("cb: create-notebook picker open");
-        w.set_nb_create_name("".into());
+        w.global::<AccountPicker>().set_nb_create_name("".into());
         show_notebook_picker(&w, &s, 0, "notebook");
     });
 
-    cb!(on_nb_rename_start, |w, s, index: i32, _display: SharedString| {
+    cb!(Notebooks, on_nb_rename_start, |w, s, index: i32, _display: SharedString| {
         let _ = &mut s;
         // Prefill the RAW local name (the display name may be the address
         // short form, which must not become a name by accident).
@@ -17210,17 +17211,17 @@ pub fn run() {
             .and_then(|ix| ix.get(s.account, index.max(0) as u32))
             .map(|m| m.name.clone())
             .unwrap_or_default();
-        w.set_nb_rename_input(raw.into());
-        w.set_nb_rename_index(index);
+        w.global::<Modals>().set_nb_rename_input(raw.into());
+        w.global::<Ui>().set_nb_rename_index(index);
     });
 
-    cb!(on_nb_rename_save, |w, s, name: SharedString| {
-        let sel = w.get_nb_rename_index();
+    cb!(Modals, on_nb_rename_save, |w, s, name: SharedString| {
+        let sel = w.global::<Ui>().get_nb_rename_index();
         if sel < 0 {
             return;
         }
-        w.set_nb_rename_index(-1);
-        w.set_nb_rename_input("".into());
+        w.global::<Ui>().set_nb_rename_index(-1);
+        w.global::<Modals>().set_nb_rename_input("".into());
         let index = sel as u32;
         let account = s.account;
         if let Some(ix) = s.notebooks.as_mut() {
@@ -17230,17 +17231,17 @@ pub fn run() {
         }
         update_notebook_list(&w, &s);
         if s.ident.as_ref().map(|i| i.index) == Some(index) {
-            w.set_notebook_title(s.notebook_display_name(index).into());
+            w.global::<Home>().set_notebook_title(s.notebook_display_name(index).into());
         }
     });
 
-    cb!(on_nb_rename_cancel, |w, s| {
+    cb!(Ui, on_nb_rename_cancel, |w, s| {
         let _ = &mut s;
-        w.set_nb_rename_index(-1);
-        w.set_nb_rename_input("".into());
+        w.global::<Ui>().set_nb_rename_index(-1);
+        w.global::<Modals>().set_nb_rename_input("".into());
     });
 
-    cb!(on_nb_archive, |w, s, index: i32, archived: bool| {
+    cb!(Notebooks, on_nb_archive, |w, s, index: i32, archived: bool| {
         let index = index.max(0) as u32;
         if s.notebooks.is_none() {
             return;
@@ -17251,7 +17252,7 @@ pub fn run() {
             // shows its empty state); Restore brings any of them back.
             let balance = notebook_store(&s, index).map(|st2| st2.balance()).unwrap_or(0);
             if balance > 0 {
-                w.set_status(
+                w.global::<Ui>().set_status(
                     format!(
                         "this notebook holds {} sats — consolidate the wallet first (Coins)",
                         commas(balance)
@@ -17267,11 +17268,11 @@ pub fn run() {
             s.save_notebooks();
             println!("cb: archive-notebook index={index} archived={archived}");
         }
-        w.set_status("".into());
+        w.global::<Ui>().set_status("".into());
         update_notebook_list(&w, &s);
     });
 
-    cb!(on_toggle_sender, |w, s, key: SharedString, excluded: bool| {
+    cb!(Home, on_toggle_sender, |w, s, key: SharedString, excluded: bool| {
         let Some(store) = s.store.as_mut() else { return };
         store.set_excluded(key.as_str(), excluded);
         let hidden = store.excluded_senders.len();
@@ -17289,7 +17290,7 @@ pub fn run() {
             std::time::Duration::from_secs(60),
             move || {
                 if let Some(w) = weak.upgrade() {
-                    if w.get_screen() == Screen::Home {
+                    if w.global::<Ui>().get_screen() == Screen::Home {
                         let mut s = st.borrow_mut();
                         if s.ident.is_some() {
                             // MUST be the async refresh: slint timers keep
@@ -17315,7 +17316,7 @@ pub fn run() {
     if let Ok(scr) = std::env::var("CN_PREVIEW") {
         if let Some(n) = screen_by_name(scr.trim()) {
             preview_mock(&window);
-            window.set_screen(n);
+            window.global::<Ui>().set_screen(n);
         }
     }
 
@@ -17340,7 +17341,7 @@ pub fn run() {
         let w = window.as_weak();
         slint::Timer::single_shot(std::time::Duration::from_millis(700), move || {
             if let Some(win) = w.upgrade() {
-                win.set_ready(true);
+                win.global::<Modals>().set_ready(true);
             }
         });
     }
@@ -17368,7 +17369,7 @@ pub fn run() {
     {
         let weak = window.as_weak();
         icloud::start_observer(move || {
-            let _ = weak.upgrade_in_event_loop(|w| w.invoke_apply_pending_icloud_contacts());
+            let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_icloud_contacts());
         });
     }
 
@@ -17382,28 +17383,28 @@ fn preview_mock(w: &AppWindow) {
     // Screen 25 is content-driven, so without this it previews blank. Staged
     // as the About entry specifically, since that is the one the Slint
     // attribution rides on and the preview is how we check it still renders.
-    w.set_info_title("About".into());
-    w.set_info_body(about_body().as_str().into());
-    w.set_info_show_slint(true);
-    w.set_directed(true);
-    w.set_gift_sats("330".into());
-    w.set_backup_words(
+    w.global::<Info>().set_info_title("About".into());
+    w.global::<Info>().set_info_body(about_body().as_str().into());
+    w.global::<Info>().set_info_show_slint(true);
+    w.global::<Ui>().set_directed(true);
+    w.global::<Compose>().set_gift_sats("330".into());
+    w.global::<Ui>().set_backup_words(
         " 1. legal      2. winner    3. thank\n 4. year       5. wave      6. sausage\n 7. worth      8. useful    9. dawn\n10. absorb    11. pledge   12. yellow\n"
             .into(),
     );
-    w.set_fund_external(true);
-    w.set_funding_ready(true);
-    w.set_funding_summary("taproot · bcrt1p2caq…6hrewe · 2 coins · 220,000 sats".into());
-    w.set_change_amount("Change to funding wallet".into());
-    w.set_funding_descriptor("tr([a1b2c3d4/86h/1h/0h]tpub…/<0;1>/*)".into());
-    w.set_funding_feedback(
+    w.global::<Ui>().set_fund_external(true);
+    w.global::<Ui>().set_funding_ready(true);
+    w.global::<Sweep>().set_funding_summary("taproot · bcrt1p2caq…6hrewe · 2 coins · 220,000 sats".into());
+    w.global::<Ui>().set_change_amount("Change to funding wallet".into());
+    w.global::<FundingWalletScreen>().set_funding_descriptor("tr([a1b2c3d4/86h/1h/0h]tpub…/<0;1>/*)".into());
+    w.global::<FundingWalletScreen>().set_funding_feedback(
         "Taproot wallet · fingerprint a1b2c3d4 · first address\nbcrt1p2caqg0ht8m7dykfrx2lnrcc85kxs09m3vgur9fl6emljxktnu7es6hrewe"
             .into(),
     );
-    w.set_funding_valid(true);
-    w.set_to_label("bcrt1pxs94vakt8gnq…rqmeyu58".into());
-    w.set_compose_text("Happy birthday! Paid from cold storage.".into());
-    w.set_rate_text("2".into());
+    w.global::<FundingWalletScreen>().set_funding_valid(true);
+    w.global::<Ui>().set_to_label("bcrt1pxs94vakt8gnq…rqmeyu58".into());
+    w.global::<Compose>().set_compose_text("Happy birthday! Paid from cold storage.".into());
+    w.global::<Compose>().set_rate_text("2".into());
     // Worst case on purpose: EVERY row of the structured cost card
     // populated, including the dust-rule fold split (Sal's build-17
     // follow-up — the card replaced the long wrapped cost-line string).
@@ -17420,42 +17421,42 @@ fn preview_mock(w: &AppWindow) {
         SpendCoin { outpoint: "aa:0".into(), value: "200,000".into(), confirmed: true, selected: true, txid_short: "aaaa…aaaa".into(), explorer: "".into(), tag: "".into() },
         SpendCoin { outpoint: "bb:1".into(), value: "20,000".into(), confirmed: false, selected: false, txid_short: "bbbb…bbbb".into(), explorer: "".into(), tag: "".into() },
     ];
-    w.set_spend_coins(VecModel::from_slice(&coins));
-    w.set_spend_title("Spending 1 coin · 200,000 sats".into());
-    w.set_spend_expanded(true);
+    w.global::<Ui>().set_spend_coins(VecModel::from_slice(&coins));
+    w.global::<Ui>().set_spend_title("Spending 1 coin · 200,000 sats".into());
+    w.global::<Ui>().set_spend_expanded(true);
 
-    w.set_psbt_qr(qr::qr_image("UR:CRYPTO-PSBT/1-1/HKADCSJNCPFGAXHDMOCKPREVIEWFRAME").unwrap_or_default());
-    w.set_psbt_cost_line("fee 360 sats · 1 input · 180 vB".into());
-    w.set_psbt_frame_label("frame 1 / 1".into());
+    w.global::<ExportPsbt>().set_psbt_qr(qr::qr_image("UR:CRYPTO-PSBT/1-1/HKADCSJNCPFGAXHDMOCKPREVIEWFRAME").unwrap_or_default());
+    w.global::<ExportPsbt>().set_psbt_cost_line("fee 360 sats · 1 input · 180 vB".into());
+    w.global::<ExportPsbt>().set_psbt_frame_label("frame 1 / 1".into());
 
-    w.set_psbt_signed(true);
-    w.set_confirm_note("Happy birthday! Paid from cold storage.".into());
-    w.set_confirm_fee_line("360 sats · 2.0 sat/vB".into());
-    w.set_confirm_locktime_line("Locktime 146209 · block height".into());
-    w.set_confirm_warn("".into());
-    w.set_confirm_txid("aaaaaaaabbbbbbbbccccccccddddddddaaaaaaaabbbbbbbbccccccccdddddddd".into());
-    w.set_confirm_context("Directed note · regtest".into());
+    w.global::<Ui>().set_psbt_signed(true);
+    w.global::<Confirm>().set_confirm_note("Happy birthday! Paid from cold storage.".into());
+    w.global::<Confirm>().set_confirm_fee_line("360 sats · 2.0 sat/vB".into());
+    w.global::<Confirm>().set_confirm_locktime_line("Locktime 146209 · block height".into());
+    w.global::<Ui>().set_confirm_warn("".into());
+    w.global::<Confirm>().set_confirm_txid("aaaaaaaabbbbbbbbccccccccddddddddaaaaaaaabbbbbbbbccccccccdddddddd".into());
+    w.global::<Confirm>().set_confirm_context("Directed note · regtest".into());
     let ins = [PsbtRow {
         title: "bcrt1p2caqg0ht8m7dykfrx2lnrcc85kx…".into(),
         subtitle: "aaaaaaaa…aaaaaaaa : 0".into(),
         amount: "200,000".into(),
         kind: "input".into(),
     }];
-    w.set_confirm_inputs(VecModel::from_slice(&ins));
+    w.global::<Confirm>().set_confirm_inputs(VecModel::from_slice(&ins));
     let outs = [
         PsbtRow { title: "".into(), subtitle: "OP_RETURN · PNTE note".into(), amount: "0".into(), kind: "note".into() },
         PsbtRow { title: "bcrt1pxs94vakt8gnqrwhuxdscwkx5e…".into(), subtitle: "directed recipient".into(), amount: "330".into(), kind: "recipient".into() },
         PsbtRow { title: "bcrt1p8wpt9v4frpf3tkn0srd97pks…".into(), subtitle: "your notebook (keeps the note yours)".into(), amount: "330".into(), kind: "self".into() },
         PsbtRow { title: "bcrt1p2caqg0ht8m7dykfrx2lnrcc…".into(), subtitle: "change back to the funding wallet".into(), amount: "198,980".into(), kind: "change".into() },
     ];
-    w.set_confirm_outputs(VecModel::from_slice(&outs));
+    w.global::<Confirm>().set_confirm_outputs(VecModel::from_slice(&outs));
 
     let wallets = [
         FundingWalletRow { id: "aa".into(), label: "Signer · bc1p5cyxnux…".into(), meta: "taproot · 220,000 sats · 2 coins".into(), active: true, change_addr: "bc1p3qkhfe…uhk7".into(), coins: VecModel::from_slice(&[] as &[SpendCoin]), coin_title: "".into(), expanded: false },
         FundingWalletRow { id: "bb".into(), label: "Sparrow hot wallet".into(), meta: "segwit · 45,000 sats · 1 coin".into(), active: false, change_addr: "bc1qm34ls…dqfw".into(), coins: VecModel::from_slice(&[] as &[SpendCoin]), coin_title: "".into(), expanded: false },
         FundingWalletRow { id: "cc".into(), label: "segwit · tb1qr8k2p9…".into(), meta: "segwit · tap to scan for funds".into(), active: false, change_addr: "".into(), coins: VecModel::from_slice(&[] as &[SpendCoin]), coin_title: "".into(), expanded: false },
     ];
-    w.set_funding_wallets(VecModel::from_slice(&wallets));
+    w.global::<Ui>().set_funding_wallets(VecModel::from_slice(&wallets));
 }
 
 /// Render each screen to `<out_dir>/screen-<name>.png` via the software
@@ -17485,12 +17486,12 @@ fn render_previews(w: u32, h: u32, screens: &[Screen], out_dir: &str) {
     let app = AppWindow::new().expect("window");
     win.set_size(slint::PhysicalSize::new(w, h));
     // No safe-area pass runs headless — lift the splash cover directly.
-    app.set_ready(true);
+    app.global::<Modals>().set_ready(true);
 
     for &n in screens {
         let name = screen_name(n);
         preview_mock(&app);
-        app.set_screen(n);
+        app.global::<Ui>().set_screen(n);
         slint::platform::update_timers_and_animations();
         win.request_redraw();
         let mut buf = vec![Rgb565Pixel(0); (w * h) as usize];
