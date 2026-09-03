@@ -685,14 +685,11 @@ pub(crate) fn set_confirm_from_psbt(&mut self, w: &AppWindow, psbt: bitcoin::Psb
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        if s.wallet_tx_busy {
+        if self.wallet_tx_busy {
             return;
         }
-        let Some(pending) = s.pending_broadcast.clone() else { return };
+        let Some(pending) = self.pending_broadcast.clone() else { return };
         println!("cb: confirm broadcast kind={} txid={}", pending.kind, pending.txid);
         match pending.payload {
             PendingPayload::Psbt => {
@@ -705,21 +702,21 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                 // `drop(s); w.global::<Ui>().invoke_psbt_broadcast();` —
                 // sequential method calls on the same `&mut self` need no
                 // drop; that dance was only ever for the shared RefCell.
-                s.on_psbt_broadcast(w);
+                self.on_psbt_broadcast(w);
             }
             PendingPayload::Compose { composed, text, private, change_to, created_at, to } => {
-                let Some(base) = s.base_url() else {
+                let Some(base) = self.base_url() else {
                     w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
-                let net = s.network;
+                let net = self.network;
                 // Record-before-POST, moved here from stage A: exactly what
                 // `compose_and_record` used to do before its own broadcast
                 // call. Recording is one-shot, so drop `pending_broadcast`
                 // now — a failed POST is retried from Activity's
                 // Rebroadcast (existing `apply_notebook_compose_result`
                 // behavior, unchanged), never by re-tapping this button.
-                if let Some(store) = s.store.as_mut() {
+                if let Some(store) = self.store.as_mut() {
                     app_core::compose::record_composed_note(
                         store,
                         &text,
@@ -729,7 +726,7 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                         &composed,
                     );
                 }
-                s.save_store();
+                self.save_store();
                 // Device-level contacts (iCloud-contacts feature): touch
                 // every recipient here too — `record_composed_note` still
                 // touches the per-notebook `Store.contacts` internally (kept
@@ -738,23 +735,23 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                 // `State.contacts`.
                 if composed.recipients.is_empty() {
                     if let Some(addr) = &to {
-                        s.touch_contact(addr);
+                        self.touch_contact(addr);
                     }
                 } else {
                     for addr in &composed.recipients {
-                        s.touch_contact(addr);
+                        self.touch_contact(addr);
                     }
                 }
-                s.save_contacts();
-                s.pending_broadcast = None;
-                s.wallet_tx_busy = true;
+                self.save_contacts();
+                self.pending_broadcast = None;
+                self.wallet_tx_busy = true;
                 w.global::<Confirm>().set_wallet_tx_busy(true);
                 let note_id = composed.note_id.clone();
                 let fee = composed.tx.fee;
                 let vsize = composed.tx.vsize;
                 let pq_flags = composed.pq_flags;
                 let raw = pending.raw_hex.clone();
-                let creds = s.core_rpc_creds_for(&base, net);
+                let creds = self.core_rpc_creds_for(&base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
@@ -781,18 +778,18 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                 change_raw,
                 source,
             } => {
-                let Some(base) = s.base_url() else {
+                let Some(base) = self.base_url() else {
                     w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
-                let net = s.network;
-                s.pending_broadcast = None;
-                s.wallet_tx_busy = true;
+                let net = self.network;
+                self.pending_broadcast = None;
+                self.wallet_tx_busy = true;
                 w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
                 let txid = pending.txid.clone();
                 let vsize = pending.vsize;
-                let creds = s.core_rpc_creds_for(&base, net);
+                let creds = self.core_rpc_creds_for(&base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
@@ -839,18 +836,18 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                 change_index,
                 spending_source,
             } => {
-                let Some(base) = s.base_url() else {
+                let Some(base) = self.base_url() else {
                     w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
-                let net = s.network;
-                s.pending_broadcast = None;
-                s.wallet_tx_busy = true;
+                let net = self.network;
+                self.pending_broadcast = None;
+                self.wallet_tx_busy = true;
                 w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
                 let txid = pending.txid.clone();
                 let vsize = pending.vsize;
-                let creds = s.core_rpc_creds_for(&base, net);
+                let creds = self.core_rpc_creds_for(&base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
@@ -894,17 +891,17 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
             // (`State::clear_wallet_tx_busy`) and applies via their
             // (UNTOUCHED) `apply_*_broadcast_result`.
             PendingPayload::Sweep { snap } => {
-                let Some(base) = s.base_url() else {
+                let Some(base) = self.base_url() else {
                     w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
-                let net = s.network;
-                s.pending_broadcast = None;
+                let net = self.network;
+                self.pending_broadcast = None;
                 w.global::<Ui>().set_screen(pending.return_screen);
-                s.wallet_tx_busy = true;
+                self.wallet_tx_busy = true;
                 w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
-                let creds = s.core_rpc_creds_for(&base, net);
+                let creds = self.core_rpc_creds_for(&base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
@@ -919,17 +916,17 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                 });
             }
             PendingPayload::Consolidate { snap } => {
-                let Some(base) = s.base_url() else {
+                let Some(base) = self.base_url() else {
                     w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
-                let net = s.network;
-                s.pending_broadcast = None;
+                let net = self.network;
+                self.pending_broadcast = None;
                 w.global::<Ui>().set_screen(pending.return_screen);
-                s.wallet_tx_busy = true;
+                self.wallet_tx_busy = true;
                 w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
-                let creds = s.core_rpc_creds_for(&base, net);
+                let creds = self.core_rpc_creds_for(&base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
@@ -944,17 +941,17 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                 });
             }
             PendingPayload::WConsol { snap } => {
-                let Some(base) = s.base_url() else {
+                let Some(base) = self.base_url() else {
                     w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
                     return;
                 };
                 let net = snap.network;
-                s.pending_broadcast = None;
+                self.pending_broadcast = None;
                 w.global::<Ui>().set_screen(pending.return_screen);
-                s.wallet_tx_busy = true;
+                self.wallet_tx_busy = true;
                 w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
-                let creds = s.core_rpc_creds_for(&base, net);
+                let creds = self.core_rpc_creds_for(&base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
@@ -969,17 +966,17 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                 });
             }
             PendingPayload::SpendingConsolidate { snap } => {
-                let Some(base) = s.base_url() else {
+                let Some(base) = self.base_url() else {
                     w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
                     return;
                 };
-                let net = s.network;
-                s.pending_broadcast = None;
+                let net = self.network;
+                self.pending_broadcast = None;
                 w.global::<Ui>().set_screen(pending.return_screen);
-                s.wallet_tx_busy = true;
+                self.wallet_tx_busy = true;
                 w.global::<Confirm>().set_wallet_tx_busy(true);
                 let raw = pending.raw_hex.clone();
-                let creds = s.core_rpc_creds_for(&base, net);
+                let creds = self.core_rpc_creds_for(&base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
@@ -999,11 +996,11 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
             // the SAME broadcast worker their (UNTOUCHED) apply_act_*
             // functions already drain.
             PendingPayload::Bump { ref_id, fee, new_rate, bumped } => {
-                let Some(base) = s.base_url() else {
+                let Some(base) = self.base_url() else {
                     w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
-                let net = s.network;
+                let net = self.network;
                 // Record-before-POST, moved here from stage A (zero-trace
                 // cancel fix): apply the exact mutation the one-shot
                 // bump_* functions used to make — replacement txid append,
@@ -1017,7 +1014,7 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                 // sweep/consolidate bump keeps using `ref_id` (its identity
                 // is the whole `txids` history, never renamed).
                 let mut renamed_note_id: Option<String> = None;
-                if let Some(store) = s.store.as_mut() {
+                if let Some(store) = self.store.as_mut() {
                     match &bumped {
                         BumpedBuild::Note(c) => {
                             renamed_note_id = app_core::compose::record_bumped_note(store, &ref_id, c);
@@ -1027,14 +1024,14 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                         }
                     }
                 }
-                s.save_store();
-                s.pending_broadcast = None;
+                self.save_store();
+                self.pending_broadcast = None;
                 w.global::<Ui>().set_screen(pending.return_screen);
-                s.act_pending_ref = Some(renamed_note_id.clone().unwrap_or_else(|| ref_id.clone()));
-                s.update_activity(w);
+                self.act_pending_ref = Some(renamed_note_id.clone().unwrap_or_else(|| ref_id.clone()));
+                self.update_activity(w);
                 let raw = pending.raw_hex.clone();
                 let txid = pending.txid.clone();
-                let creds = s.core_rpc_creds_for(&base, net);
+                let creds = self.core_rpc_creds_for(&base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());
@@ -1046,17 +1043,17 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                 });
             }
             PendingPayload::Rebroadcast { ref_id } => {
-                let Some(base) = s.base_url() else {
+                let Some(base) = self.base_url() else {
                     w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
                     return;
                 };
-                let net = s.network;
-                s.pending_broadcast = None;
+                let net = self.network;
+                self.pending_broadcast = None;
                 w.global::<Ui>().set_screen(pending.return_screen);
-                s.act_pending_ref = Some(ref_id.clone());
-                s.update_activity(w);
+                self.act_pending_ref = Some(ref_id.clone());
+                self.update_activity(w);
                 let raw = pending.raw_hex.clone();
-                let creds = s.core_rpc_creds_for(&base, net);
+                let creds = self.core_rpc_creds_for(&base, net);
                 let weak = w.as_weak();
                 std::thread::spawn(move || {
                     let _net_guard = NetOpGuard::new(weak.clone());

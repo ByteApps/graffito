@@ -152,28 +152,22 @@ pub(crate) fn ensure_first_onboarded_notebook(&mut self) {
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_door_import(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         println!("cb: door=import");
         w.global::<ImportKey>().set_import_feedback("".into());
         // Default the iCloud backup ON for the imported key when iCloud is
         // available (parity with create; the toggle stays user-overridable).
         let avail = keychain::icloud_available();
-        s.icloud_backup = avail;
+        self.icloud_backup = avail;
         w.global::<Ui>().set_icloud_backup(avail);
         w.global::<Ui>().set_icloud_enabled(avail);
         w.global::<Ui>().set_screen(Screen::ImportKey);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_door_create(&mut self, w: &AppWindow, words: i32) {
-    #[allow(unused_mut)]
-    let mut s = self;
         println!("cb: door=create words={words}");
-        s.new_word_count = words as usize;
-        s.dice_rolls = Zeroizing::new(String::new());
+        self.new_word_count = words as usize;
+        self.dice_rolls = Zeroizing::new(String::new());
         w.global::<Ui>().set_new_word_count(words);
         w.global::<BackupWords>().set_seed_from_dice(false);
         w.global::<Ui>().set_screen(Screen::EntropySource);

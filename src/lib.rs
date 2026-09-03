@@ -2316,13 +2316,7 @@ pub fn run() {
             let st = st.clone();
             let weak = window.as_weak();
             window.global::<$global>().$name(move |$($arg : $ty),*| {
-                // Not every callback body uses both the window handle and a
-                // mutable state borrow — `#[allow]` here (once, at the
-                // macro definition) rather than at each of the ~170 call
-                // sites, which don't control whether their body needs `mut`.
-                #[allow(unused_variables, unused_mut)]
                 let $w = weak.unwrap();
-                #[allow(unused_variables, unused_mut)]
                 let mut $s = st.borrow_mut();
                 $body
             });

@@ -103,19 +103,16 @@ pub(crate) fn update_change_label(&mut self, w: &AppWindow) {
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_change_pick(&mut self, w: &AppWindow, choice: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
         println!("cb: change-pick {choice}");
-        s.change_choice = choice.to_string();
+        self.change_choice = choice.to_string();
         w.global::<Ui>().set_change_choice(choice.clone());
         if choice.as_str() != "custom" {
             w.global::<Ui>().set_change_address("".into());
             w.global::<Change>().set_change_error("".into());
         }
-        s.update_change_label(w);
-        s.refresh_compose(w);
+        self.update_change_label(w);
+        self.refresh_compose(w);
         if choice.as_str() != "custom" {
             w.global::<Ui>().set_screen(Screen::Compose);
         }

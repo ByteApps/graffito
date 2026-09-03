@@ -75,13 +75,10 @@ pub(crate) fn private_nb_rows(&self) -> Vec<NbPickRow> {
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_private_select(&mut self, w: &AppWindow, fmt: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
         let fmt = fmt.as_str();
         if fmt == "hex" || fmt == "wif" {
-            let Some(v) = s.derive_leaf_value(w, fmt) else { return };
+            let Some(v) = self.derive_leaf_value(w, fmt) else { return };
             w.global::<PrivateKeys>().set_reveal_show_seedqr(false);
             w.global::<PrivateKeys>().set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
             w.global::<PrivateKeys>().set_reveal_private_value(v.into());
@@ -89,7 +86,7 @@ pub(crate) fn on_private_select(&mut self, w: &AppWindow, fmt: SharedString) {
             println!("cb: private-select fmt={fmt}");
             return;
         }
-        let Some(f) = s.reveal_formats.as_ref() else { return };
+        let Some(f) = self.reveal_formats.as_ref() else { return };
         w.global::<PrivateKeys>().set_reveal_show_seedqr(false);
         match fmt {
             "recovery" => {
@@ -127,26 +124,19 @@ pub(crate) fn on_private_select(&mut self, w: &AppWindow, fmt: SharedString) {
         println!("cb: private-select fmt={fmt}");
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_private_pick_notebook(&mut self, w: &AppWindow, index: i32) {
-    #[allow(unused_mut)]
-    let mut s = self;
         w.global::<PrivateKeys>().set_reveal_nb_index(index);
         println!("cb: private-pick-notebook index={index}");
         let fmt = w.global::<Ui>().get_reveal_private_format().to_string();
         if fmt != "hex" && fmt != "wif" {
             return;
         }
-        let Some(v) = s.derive_leaf_value(w, &fmt) else { return };
+        let Some(v) = self.derive_leaf_value(w, &fmt) else { return };
         w.global::<PrivateKeys>().set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
         w.global::<PrivateKeys>().set_reveal_private_value(v.into());
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_copy_secret(&mut self, w: &AppWindow, value: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let _ = &mut s;
         let ok = platform::set_clipboard_secret(value.as_str());
         println!("cb: copy-secret len={}", value.len());
         show_toast(w, if ok { "Copied" } else { "Copy failed" });

@@ -4,10 +4,7 @@
 use crate::*;
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_import_changed(&mut self, w: &AppWindow, text: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
         let t = text.trim().to_string();
         if t.is_empty() {
             w.global::<ImportKey>().set_import_feedback("".into());
@@ -28,11 +25,11 @@ pub(crate) fn on_import_changed(&mut self, w: &AppWindow, text: SharedString) {
             String::new()
         };
         w.global::<ImportKey>().set_import_suggestions(sugg.into());
-        let (fb, ok) = match parse_key_material(&t, s.network) {
-            Ok(m) if is_hierarchical(&t, s.network) => {
+        let (fb, ok) = match parse_key_material(&t, self.network) {
+            Ok(m) if is_hierarchical(&t, self.network) => {
                 (format!("{} OK — you'll choose an account next", m.kind()), true)
             }
-            Ok(m) => match realize(&m, s.network, 0, 0) {
+            Ok(m) => match realize(&m, self.network, 0, 0) {
                 Ok(p) => {
                     let a = &p.address;
                     let label = if m.is_watch() {
@@ -51,33 +48,30 @@ pub(crate) fn on_import_changed(&mut self, w: &AppWindow, text: SharedString) {
         w.global::<ImportKey>().set_import_feedback(fb.into());
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_import_confirm(&mut self, w: &AppWindow, text: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
         // Sal 2026-07-22: a SEED (hierarchical: mnemonic/xprv) no longer
         // branches into the account picker — it activates account 0 directly,
         // auto-creates its first notebook, and lands on the notebook LIST.
         // Single-key imports (WIF/hex) are unchanged: activate() adds their one
         // intrinsic notebook and they land on its home.
-        let hierarchical = parse_key_material(text.trim(), s.network).is_ok()
-            && is_hierarchical(text.trim(), s.network);
-        s.account = 0;
-        s.nb_index = 0;
-        match s.activate(text.trim(), true) {
+        let hierarchical = parse_key_material(text.trim(), self.network).is_ok()
+            && is_hierarchical(text.trim(), self.network);
+        self.account = 0;
+        self.nb_index = 0;
+        match self.activate(text.trim(), true) {
             Ok(()) => {
                 println!("cb: import ok");
                 w.global::<ImportKey>().set_import_text("".into());
                 if hierarchical {
-                    s.ensure_first_onboarded_notebook();
-                    s.update_notebook_list(w);
+                    self.ensure_first_onboarded_notebook();
+                    self.update_notebook_list(w);
                     w.global::<Ui>().set_screen(Screen::Notebooks);
-                    s.refresh_async(w);
-                    s.spending_refresh_async(w);
+                    self.refresh_async(w);
+                    self.spending_refresh_async(w);
                 } else {
                     w.global::<Ui>().set_screen(Screen::Home);
-                    s.update_home(w);
-                    s.refresh_async(w);
+                    self.update_home(w);
+                    self.refresh_async(w);
                 }
             }
             Err(e) => {
@@ -88,11 +82,7 @@ pub(crate) fn on_import_confirm(&mut self, w: &AppWindow, text: SharedString) {
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_paste_import(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let _ = &mut s;
         match platform::clipboard_text() {
             Some(text) => {
                 let _ = w.as_weak().upgrade_in_event_loop(move |w| {
@@ -107,11 +97,7 @@ pub(crate) fn on_paste_import(&mut self, w: &AppWindow) {
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_import_file(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let _ = &mut s;
         if let Some(path) = platform::pick_file(&[]) {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {

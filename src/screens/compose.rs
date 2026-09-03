@@ -2251,11 +2251,8 @@ pub(crate) fn mixed_compose_ui(&mut self, w: &AppWindow, text: &str) {
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_set_fee_tier(&mut self, w: &AppWindow, tier: i32) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let f = s.fees.clone().unwrap_or_default();
+        let f = self.fees.clone().unwrap_or_default();
         let rate = match tier {
             0 => f.economy,
             2 => f.fastest,
@@ -2272,55 +2269,46 @@ pub(crate) fn on_set_fee_tier(&mut self, w: &AppWindow, tier: i32) {
             w.global::<Compose>().set_rate_text(format!("{rate}").into());
         }
         println!("cb: fee-tier {tier} rate={rate}");
-        s.refresh_compose(w);
+        self.refresh_compose(w);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_add_recipient_open(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         // Multi-select stays notebook-funded-compose only (watch-only has
         // no multi-recipient PSBT builder yet — a later unit).
-        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+        if self.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
             return;
         }
-        let total = 1 + s.to_addresses_extra.len();
+        let total = 1 + self.to_addresses_extra.len();
         if total >= 255 {
             w.global::<Ui>().set_status("recipient limit reached (255)".into());
             return;
         }
         println!("cb: add-recipient-open");
-        s.picking_extra = true;
+        self.picking_extra = true;
         w.global::<Ui>().set_picking_extra(true);
         w.global::<Ui>().set_contact_input("".into());
         w.global::<Ui>().set_status("".into());
         w.global::<Ui>().set_pick_mode("compose".into());
-        s.pull_icloud_contacts_on_open(w);
+        self.pull_icloud_contacts_on_open(w);
         w.global::<Ui>().set_screen(Screen::Contacts);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_remove_chip(&mut self, w: &AppWindow, addr: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
         let a = addr.to_string();
-        s.to_addresses_extra.retain(|x| x != &a);
-        println!("cb: remove-chip n={}", s.to_addresses_extra.len() + 1);
-        s.refresh_to_chips(w);
-        s.refresh_compose(w);
+        self.to_addresses_extra.retain(|x| x != &a);
+        println!("cb: remove-chip n={}", self.to_addresses_extra.len() + 1);
+        self.refresh_to_chips(w);
+        self.refresh_compose(w);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_pq_generate_passphrase(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         match app_core::passphrase::generate() {
             Ok((phrase, bits)) => {
                 w.global::<Compose>().set_pq_passphrase_text(phrase.clone().into());
-                s.pq_passphrase_generated = Some(phrase);
-                s.pq_passphrase_verified = true;
+                self.pq_passphrase_generated = Some(phrase);
+                self.pq_passphrase_verified = true;
                 println!("cb: pq-generate bits={}", bits as u64);
-                s.refresh_compose(w);
+                self.refresh_compose(w);
             }
             Err(e) => {
                 w.global::<Ui>().set_status(format!("couldn't generate a passphrase: {e}").into());
@@ -2328,71 +2316,56 @@ pub(crate) fn on_pq_generate_passphrase(&mut self, w: &AppWindow) {
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_pq_passphrase_changed(&mut self, w: &AppWindow, text: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
         let text = text.to_string();
-        s.pq_passphrase_verified = s.pq_passphrase_generated.as_deref() == Some(text.as_str());
-        s.refresh_compose(w);
+        self.pq_passphrase_verified = self.pq_passphrase_generated.as_deref() == Some(text.as_str());
+        self.refresh_compose(w);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_pq_mlkem_toggled(&mut self, w: &AppWindow, _on: bool) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.refresh_compose(w);
+        self.refresh_compose(w);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_pq_panel_toggled(&mut self, w: &AppWindow, opened: bool) {
-    #[allow(unused_mut)]
-    let mut s = self;
         if opened {
-            s.ensure_pq_imported_loaded();
-            s.refresh_compose(w);
+            self.ensure_pq_imported_loaded();
+            self.refresh_compose(w);
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_open_funding_screen(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         println!("cb: funding-open");
         // Screen 20 (pay-from) shows fee tiers via the compose cost line —
         // lazily (re)fetch (network-efficiency, 2026-07-23).
-        s.refresh_fees_price(w);
+        self.refresh_fees_price(w);
         w.global::<Ui>().set_status("".into());
-        s.nb_expanded = !s.mixed_coins_for("notebook").is_empty();
-        s.sp_expanded = !s.mixed_coins_for("spending").is_empty();
-        w.global::<PayFrom>().set_nb_expanded(s.nb_expanded);
-        w.global::<PayFrom>().set_sp_expanded(s.sp_expanded);
-        println!("cb: payfrom expand wallet=notebook expanded={}", s.nb_expanded);
-        println!("cb: payfrom expand wallet=spending expanded={}", s.sp_expanded);
-        let wallet_open = s
+        self.nb_expanded = !self.mixed_coins_for("notebook").is_empty();
+        self.sp_expanded = !self.mixed_coins_for("spending").is_empty();
+        w.global::<PayFrom>().set_nb_expanded(self.nb_expanded);
+        w.global::<PayFrom>().set_sp_expanded(self.sp_expanded);
+        println!("cb: payfrom expand wallet=notebook expanded={}", self.nb_expanded);
+        println!("cb: payfrom expand wallet=spending expanded={}", self.sp_expanded);
+        let wallet_open = self
             .funding_wallets
             .iter()
-            .find(|fw| !s.mixed_coins_for(&format!("wallet:{}", fw.id)).is_empty())
+            .find(|fw| !self.mixed_coins_for(&format!("wallet:{}", fw.id)).is_empty())
             .map(|fw| format!("wallet:{}", fw.id))
             .unwrap_or_default();
-        s.payfrom_expanded_source = wallet_open;
-        w.global::<Ui>().set_payfrom_expanded_source(s.payfrom_expanded_source.clone().into());
-        if !s.payfrom_expanded_source.is_empty() {
-            println!("cb: payfrom expand wallet={} expanded=true", s.payfrom_expanded_source);
+        self.payfrom_expanded_source = wallet_open;
+        w.global::<Ui>().set_payfrom_expanded_source(self.payfrom_expanded_source.clone().into());
+        if !self.payfrom_expanded_source.is_empty() {
+            println!("cb: payfrom expand wallet={} expanded=true", self.payfrom_expanded_source);
         }
-        s.update_funding_screen_ui(w);
-        s.update_payfrom_panels(w);
-        s.refresh_funding_list(w);
+        self.update_funding_screen_ui(w);
+        self.update_payfrom_panels(w);
+        self.refresh_funding_list(w);
         w.global::<Ui>().set_screen(Screen::PayFrom);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_change_open(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         w.global::<Ui>().set_status("".into());
-        s.refresh_funding_list(w);
-        s.update_change_label(w);
+        self.refresh_funding_list(w);
+        self.update_change_label(w);
         // Logged AFTER resolution so `default=<choice>` reflects the
         // effective destination (an explicit pick if one was made this
         // session, else app-core's resolved default) — a screenshot-
@@ -2401,10 +2374,7 @@ pub(crate) fn on_change_open(&mut self, w: &AppWindow) {
         w.global::<Ui>().set_screen(Screen::Change);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         let text = w.global::<Compose>().get_compose_text().to_string();
         let private = w.global::<Compose>().get_compose_private();
         let rate: f64 = w.global::<Compose>().get_rate_text().trim().parse().unwrap_or(0.0);
@@ -2412,12 +2382,12 @@ pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
             w.global::<Ui>().set_status("empty note or bad fee rate".into());
             return;
         }
-        if s.funding.is_none() || s.funding_coins.is_empty() {
+        if self.funding.is_none() || self.funding_coins.is_empty() {
             w.global::<Ui>().set_status("set a funding wallet first".into());
             return;
         }
-        let net = s.network;
-        let to = s.to_address.clone();
+        let net = self.network;
+        let to = self.to_address.clone();
         let recipient = match to.as_deref() {
             Some(a) => match Recipient::parse(net, a) {
                 Ok(r) => Some(r),
@@ -2442,12 +2412,12 @@ pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
                 }
             }
         };
-        let src = s.funding.clone().unwrap();
-        let coins = s.funding_coins.clone();
-        let change_index = s.funding_change_index;
+        let src = self.funding.clone().unwrap();
+        let coins = self.funding_coins.clone();
+        let change_index = self.funding_change_index;
         let plan =
             FundingPlan { source: &src, coins: &coins, change_index, fee_rate: rate, change_override };
-        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+        if self.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
             // Watch identity + funding wallet: PUBLIC note paid entirely by
             // the funding coins; both signatures happen externally. Frozen-
             // scan caveat: a rescan attributes an externally funded PUBLIC
@@ -2456,7 +2426,7 @@ pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
                 w.global::<Ui>().set_status("watch-only identities can only compose public notes".into());
                 return;
             }
-            let output_x = s.ident.as_ref().map(|i| i.output_x()).unwrap_or_default();
+            let output_x = self.ident.as_ref().map(|i| i.output_x()).unwrap_or_default();
             let gift = if recipient.is_some() {
                 w.global::<Compose>().get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
             } else {
@@ -2464,7 +2434,7 @@ pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
             };
             // Multi-recipient: the compose screen's extra To-chips — same
             // treatment as `on_compose_send`'s watch branch.
-            let extra_recipients: Vec<&str> = s.to_addresses_extra.iter().map(String::as_str).collect();
+            let extra_recipients: Vec<&str> = self.to_addresses_extra.iter().map(String::as_str).collect();
             let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
                 Ok(rc) => rc,
                 Err(e) => {
@@ -2475,9 +2445,9 @@ pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
             let recipients_out: Vec<(Vec<u8>, u64)> = recipients.iter().map(|rc| (rc.spk.clone(), gift)).collect();
             let recipient_addrs: Vec<String> =
                 if recipients.len() >= 2 { recipients.iter().map(|rc| rc.address.clone()).collect() } else { Vec::new() };
-            let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
+            let chunk = self.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
             match app_core::psbt_build::build_watch_funded_note_psbt_multi(
-                &output_x, &plan, &text, &recipients_out, chunk, s.effective_lock_time(),
+                &output_x, &plan, &text, &recipients_out, chunk, self.effective_lock_time(),
             ) {
                 Ok(built) => {
                     let payload_outputs = built
@@ -2487,8 +2457,8 @@ pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
                         .iter()
                         .filter(|o| o.script_pubkey.is_op_return())
                         .count();
-                    s.watch_spend = None;
-                    s.watch_note = Some(WatchNote {
+                    self.watch_spend = None;
+                    self.watch_note = Some(WatchNote {
                         text: text.clone(),
                         recipient: to.clone(),
                         recipients: recipient_addrs,
@@ -2497,7 +2467,7 @@ pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
                         fee: built.fee,
                         change: 0, // funding change isn't an own coin
                         spent: Vec::new(),
-                        funded: s.active_funding_pill(),
+                        funded: self.active_funding_pill(),
                         is_watch: true,
                         private: false,
                         dust_to_self: false,
@@ -2508,7 +2478,7 @@ pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
                     let cost = format!(
                         "public note · fee {} sats · {n} funding input{} · sign with your external wallet{}",
                         built.fee,
-                        if n == 1 { "" } else { "s" },
+                        if n == 1 { "" } else { "self" },
                         gift_cost_suffix(nr, gift),
                     );
                     // PLAN-pnte-redesign.md: the note id IS the txid.
@@ -2519,13 +2489,13 @@ pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
                         built.fee,
                         if nr >= 2 { format!(" recipients={nr}") } else { String::new() }
                     );
-                    s.show_psbt_sign_screen(w, built, cost);
+                    self.show_psbt_sign_screen(w, built, cost);
                 }
                 Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
             }
             return;
         }
-        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+        let Some(identity) = self.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
             w.global::<Ui>().set_status("no identity".into());
             return;
         };
@@ -2537,27 +2507,24 @@ pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
             max_op_return_bytes: DEFAULT_CHUNK,
             network: net,
         };
-        match build_funding_psbt(&plan, &np, s.effective_lock_time()) {
+        match build_funding_psbt(&plan, &np, self.effective_lock_time()) {
             Ok(built) => {
                 let n = coins.len();
                 let cost =
-                    format!("fee {} sats · {n} input{}", built.fee, if n == 1 { "" } else { "s" });
-                s.watch_spend = None; // this sign screen serves external funding
-                s.watch_note = None;
-                s.show_psbt_sign_screen(w, built, cost);
+                    format!("fee {} sats · {n} input{}", built.fee, if n == 1 { "" } else { "self" });
+                self.watch_spend = None; // this sign screen serves external funding
+                self.watch_note = None;
+                self.show_psbt_sign_screen(w, built, cost);
                 println!("cb: fund-build ok");
             }
             Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         // Async sign+broadcast (2026-07-16): re-entrancy guard so a
         // double-tap on Sign can't double-broadcast.
-        if s.compose_busy {
+        if self.compose_busy {
             return;
         }
         // Scan-freshness gate — see on_sweep_send.
@@ -2575,13 +2542,13 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
         }
         // Optional custom change address (empty = back to self).
         let change_addr = normalize_addr(w.global::<Ui>().get_change_address().as_str());
-        if !change_addr.is_empty() && Recipient::parse(s.network, &change_addr).is_err() {
-            w.global::<Ui>().set_status(format!("change address isn't a valid {} address", s.network.as_str()).into());
+        if !change_addr.is_empty() && Recipient::parse(self.network, &change_addr).is_err() {
+            w.global::<Ui>().set_status(format!("change address isn't a valid {} address", self.network.as_str()).into());
             return;
         }
-        let net = s.network;
-        let to = s.to_address.clone();
-        if s.base_url().is_none() {
+        let net = self.network;
+        let to = self.to_address.clone();
+        if self.base_url().is_none() {
             w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
             return;
         }
@@ -2589,14 +2556,14 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
             w.global::<Ui>().set_status("selected coins don't cover the note + fee".into());
             return;
         }
-        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+        if self.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
             // Watch compose: PUBLIC note as an external-sign PSBT over the
             // selected coins; recorded on broadcast like a keyed compose.
             if private {
                 w.global::<Ui>().set_status("watch-only identities can only compose public notes".into());
                 return;
             }
-            let Some(src) = s.ident.as_ref().and_then(|i| i.watch_source()).cloned() else { return };
+            let Some(src) = self.ident.as_ref().and_then(|i| i.watch_source()).cloned() else { return };
             let recipient = match to.as_deref() {
                 Some(a) => match Recipient::parse(net, a) {
                     Ok(r) => Some(r),
@@ -2618,7 +2585,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
             // concerns here; `public_multi_payloads`/`build_watch_note_psbt_
             // multi` hand-frame the same FLAG_MULTI body a keyed identity's
             // sealer would produce.
-            let extra_recipients: Vec<&str> = s.to_addresses_extra.iter().map(String::as_str).collect();
+            let extra_recipients: Vec<&str> = self.to_addresses_extra.iter().map(String::as_str).collect();
             let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2629,10 +2596,10 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
             let recipients_out: Vec<(Vec<u8>, u64)> = recipients.iter().map(|r| (r.spk.clone(), gift)).collect();
             let recipient_addrs: Vec<String> =
                 if recipients.len() >= 2 { recipients.iter().map(|r| r.address.clone()).collect() } else { Vec::new() };
-            let Some(store) = s.store.as_ref() else { return };
+            let Some(store) = self.store.as_ref() else { return };
             let sel: std::collections::HashSet<(String, u32)> =
-                s.selected_coins.iter().cloned().collect();
-            let nb = s.ident.as_ref().map(|i| i.index).unwrap_or(0);
+                self.selected_coins.iter().cloned().collect();
+            let nb = self.ident.as_ref().map(|i| i.index).unwrap_or(0);
             let coins: Vec<WatchCoin> = store
                 .utxos
                 .iter()
@@ -2646,7 +2613,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
             }
             let chunk = store.chunk_size;
             match build_watch_note_psbt_multi(
-                &src, &coins, &text, &recipients_out, chunk, rate, s.effective_lock_time(),
+                &src, &coins, &text, &recipients_out, chunk, rate, self.effective_lock_time(),
             ) {
                 Ok(built) => {
                     let payload_outputs = built
@@ -2656,8 +2623,8 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
                         .iter()
                         .filter(|o| o.script_pubkey.is_op_return())
                         .count();
-                    s.watch_spend = None;
-                    s.watch_note = Some(WatchNote {
+                    self.watch_spend = None;
+                    self.watch_note = Some(WatchNote {
                         text: text.clone(),
                         recipient: to.clone(),
                         recipients: recipient_addrs,
@@ -2689,13 +2656,13 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
                         built.fee,
                         if n >= 2 { format!(" recipients={n}") } else { String::new() }
                     );
-                    s.show_psbt_sign_screen(w, built, cost);
+                    self.show_psbt_sign_screen(w, built, cost);
                 }
                 Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
             }
             return;
         }
-        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+        let Some(identity) = self.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
             w.global::<Ui>().set_status("no identity".into());
             return;
         };
@@ -2706,7 +2673,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
         // calls `record_composed_note` + `save_store()` at the Broadcast
         // tap — exactly what `compose_and_record` used to do before its
         // own POST — then spawns the SAME broadcast worker below.
-        let coins_vec = s.selected_coins.clone();
+        let coins_vec = self.selected_coins.clone();
         let created_at = now();
         let gift_amount = to
             .as_ref()
@@ -2718,13 +2685,13 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
         // and for watch-only (the picker's "+ Add recipient" affordance is
         // hidden there) — so this stays the exact single-recipient flow,
         // byte-identical, for every path but this one.
-        let extra_recipients: Vec<&str> = s.to_addresses_extra.iter().map(String::as_str).collect();
+        let extra_recipients: Vec<&str> = self.to_addresses_extra.iter().map(String::as_str).collect();
         // Post-quantum layers (compose screen 6's Security section). Only
         // reachable when the section could even be showing — re-check
         // `pq_compose_eligible` rather than trusting the toggles blindly,
         // since Sign is a separate tap that could race a recipient/private
         // change made after the section last repainted.
-        let pq_eligible = s.pq_compose_eligible(w);
+        let pq_eligible = self.pq_compose_eligible(w);
         let pq_password = if pq_eligible && w.global::<Compose>().get_pq_passphrase_enabled() {
             let p = w.global::<Compose>().get_pq_passphrase_text().to_string();
             if p.trim().is_empty() {
@@ -2738,8 +2705,8 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
         let pq_mlkem = if pq_eligible && w.global::<Compose>().get_pq_mlkem_enabled() {
             match to.as_deref() {
                 Some(addr) => {
-                    let net_str = s.network.as_str();
-                    let armor = s
+                    let net_str = self.network.as_str();
+                    let armor = self
                         .contacts
                         .iter()
                         .find(|c| c.address == addr && (c.network == net_str || c.network.is_empty()))
@@ -2761,7 +2728,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
                 // (`on_pq_panel_toggled`); Sign is a separate tap that could
                 // race the key being removed since, so re-check here rather
                 // than trusting the toggle blindly.
-                None => match s.pq_imported.as_ref() {
+                None => match self.pq_imported.as_ref() {
                     Some(kp) => Some((kp.alg(), kp.ek().to_vec())),
                     None => {
                         w.global::<Ui>().set_status(
@@ -2783,28 +2750,28 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
             coins: (!coins_vec.is_empty()).then_some(coins_vec.as_slice()),
             fee_rate: rate,
             gift_amount,
-            lock_time: s.lock_time_override_value(),
+            lock_time: self.lock_time_override_value(),
             now: created_at,
             pq_password,
             pq_mlkem,
         };
-        let Some(store) = s.store.as_ref() else {
+        let Some(store) = self.store.as_ref() else {
             w.global::<Ui>().set_status("no store".into());
             return;
         };
         match app_core::compose::compose_note(store, &identity, net, &req) {
             Ok(composed) => {
-                let name = s.notebook_display_name(s.nb_index);
-                let identity_addr = s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
+                let name = self.notebook_display_name(self.nb_index);
+                let identity_addr = self.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
                 let prevouts = notebook_prevouts(
-                    s.store.as_ref().unwrap(),
+                    self.store.as_ref().unwrap(),
                     &identity_addr,
                     &name,
                     &composed.tx.spent_outpoints,
                 );
-                let (self_spks, spending_spks) = s.confirm_self_spks();
+                let (self_spks, spending_spks) = self.confirm_self_spks();
                 let contact_name = |a: &str| -> Option<String> {
-                    s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
+                    self.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
                 };
                 let recipient_name = to.as_deref().and_then(contact_name);
                 // Multi-recipient: `composed.recipients` is only populated
@@ -2824,7 +2791,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
                     recipient_name,
                     recipients,
                     note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
-                    tip_height: s.confirm_tip_height(),
+                    tip_height: self.confirm_tip_height(),
                 };
                 let (fchange, ffee, fvsize) = (composed.tx.change, composed.tx.fee, composed.tx.vsize);
                 let pending = PendingBroadcast {
@@ -2843,7 +2810,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
                         to: to.clone(),
                     },
                 };
-                s.show_confirm(w, pending, ctx);
+                self.show_confirm(w, pending, ctx);
                 note_subdust_fold_warn(w, fchange, ffee, fvsize as u64, rate);
             }
             Err(e) => {
@@ -2853,11 +2820,8 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        if s.compose_busy {
+        if self.compose_busy {
             return;
         }
         // Scan-freshness gate — see on_sweep_send.
@@ -2873,12 +2837,12 @@ pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
             w.global::<Ui>().set_status("empty note or bad fee rate".into());
             return;
         }
-        let net = s.network;
-        if s.base_url().is_none() {
+        let net = self.network;
+        if self.base_url().is_none() {
             w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
             return;
         }
-        let to = s.to_address.clone();
+        let to = self.to_address.clone();
         let recipient = match to.as_deref() {
             Some(a) => match Recipient::parse(net, a) {
                 Ok(r) => Some(r),
@@ -2892,7 +2856,7 @@ pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
         // Multi-recipient: the compose screen's extra To-chips — dropped
         // silently on this path before (Sal's report); now built the SAME
         // way the notebook path builds them (`compose::compose_note`).
-        let extra_recipients: Vec<&str> = s.to_addresses_extra.iter().map(String::as_str).collect();
+        let extra_recipients: Vec<&str> = self.to_addresses_extra.iter().map(String::as_str).collect();
         let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
             Ok(r) => r,
             Err(e) => {
@@ -2914,11 +2878,11 @@ pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
                 }
             }
         };
-        let Some(source) = s.spending_source.clone() else {
+        let Some(source) = self.spending_source.clone() else {
             w.global::<Ui>().set_status("spending wallet not scanned yet".into());
             return;
         };
-        if s.spending_coins.is_empty() {
+        if self.spending_coins.is_empty() {
             w.global::<Ui>().set_status("spending wallet has no coins — fund it from Settings".into());
             return;
         }
@@ -2926,12 +2890,12 @@ pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
         // control — same `selected_coins`/`coins_overridden` state the
         // notebook path uses; unselected defaults to every scanned coin
         // (matches the live preview in `spending_compose_ui`).
-        let spending_sel: std::collections::HashSet<(String, u32)> = if s.coins_overridden {
-            s.selected_coins.iter().cloned().collect()
+        let spending_sel: std::collections::HashSet<(String, u32)> = if self.coins_overridden {
+            self.selected_coins.iter().cloned().collect()
         } else {
-            s.spending_coins.iter().map(|c| (c.txid.clone(), c.vout)).collect()
+            self.spending_coins.iter().map(|c| (c.txid.clone(), c.vout)).collect()
         };
-        let selected_spending_coins: Vec<app_core::funding::FundingUtxo> = s
+        let selected_spending_coins: Vec<app_core::funding::FundingUtxo> = self
             .spending_coins
             .iter()
             .filter(|c| spending_sel.contains(&(c.txid.clone(), c.vout)))
@@ -2942,7 +2906,7 @@ pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
             w.global::<Ui>().set_status("no coins selected".into());
             return;
         }
-        let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+        let Some(material_str) = self.material.as_ref().map(|z| String::from(z.as_str())) else {
             w.global::<Ui>().set_status("no identity".into());
             return;
         };
@@ -2950,13 +2914,13 @@ pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
             w.global::<Ui>().set_status("identity parse failed".into());
             return;
         };
-        let account = s.account;
-        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+        let account = self.account;
+        let Some(identity) = self.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
             w.global::<Ui>().set_status("no identity".into());
             return;
         };
-        let Some(change_index) = s.store.as_ref().map(|st| st.spending.next_change) else { return };
-        let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
+        let Some(change_index) = self.store.as_ref().map(|st| st.spending.next_change) else { return };
+        let chunk = self.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
         let gift = if recipient.is_some() {
             w.global::<Compose>().get_gift_sats().trim().parse::<u64>().unwrap_or(DUST_SATS).max(DUST_SATS)
         } else {
@@ -2978,9 +2942,9 @@ pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
             network: net,
         };
         let built = if recipients.len() >= 2 {
-            app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift, s.effective_lock_time())
+            app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift, self.effective_lock_time())
         } else {
-            app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift, s.effective_lock_time())
+            app_core::psbt_build::build_funding_psbt_amount(&plan, &np, gift, self.effective_lock_time())
         };
         let built = match built {
             Ok(b) => b,
@@ -3031,7 +2995,7 @@ pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
         // thread-spawn, moved verbatim to the Broadcast tap.
         let built_fee = built.fee;
         let built_change = built.change;
-        let (mut self_spks, mut spending_spks) = s.confirm_self_spks();
+        let (mut self_spks, mut spending_spks) = self.confirm_self_spks();
         // A custom change override leaves the wallet entirely (classified
         // via `expected_change`, not self); the default spending-wallet
         // change address is freshly derived and not yet "used" bookkeeping,
@@ -3059,10 +3023,10 @@ pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
             );
         }
         let recipient_name = to.as_deref().and_then(|a| {
-            s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
+            self.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
         });
         let contact_name = |a: &str| -> Option<String> {
-            s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
+            self.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
         };
         let confirm_recipients: Vec<(String, Option<String>)> =
             recipient_addrs.iter().map(|a| (a.clone(), contact_name(a))).collect();
@@ -3076,7 +3040,7 @@ pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
             recipient_name,
             recipients: confirm_recipients,
             note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
-            tip_height: s.confirm_tip_height(),
+            tip_height: self.confirm_tip_height(),
         };
         let pending = PendingBroadcast {
             kind: "compose-spending",
@@ -3099,15 +3063,12 @@ pub(crate) fn on_spending_compose_send(&mut self, w: &AppWindow) {
                 source,
             },
         };
-        s.show_confirm(w, pending, ctx);
+        self.show_confirm(w, pending, ctx);
         note_subdust_fold_warn(w, built_change, built_fee, vsize as u64, rate);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        if s.compose_busy {
+        if self.compose_busy {
             return;
         }
         // Scan-freshness gate — see on_sweep_send.
@@ -3123,16 +3084,16 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
             w.global::<Ui>().set_status("empty note or bad fee rate".into());
             return;
         }
-        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+        if self.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
             w.global::<Ui>().set_status("watch-only identities can't mix sources".into());
             return;
         }
-        let net = s.network;
-        if s.base_url().is_none() {
+        let net = self.network;
+        if self.base_url().is_none() {
             w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
             return;
         }
-        let to = s.to_address.clone();
+        let to = self.to_address.clone();
         let recipient = match to.as_deref() {
             Some(a) => match Recipient::parse(net, a) {
                 Ok(r) => Some(r),
@@ -3151,7 +3112,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
         // Multi-recipient: the compose screen's extra To-chips — dropped
         // silently on this path before (Sal's report); now built the SAME
         // way the notebook path builds them.
-        let extra_recipients: Vec<&str> = s.to_addresses_extra.iter().map(String::as_str).collect();
+        let extra_recipients: Vec<&str> = self.to_addresses_extra.iter().map(String::as_str).collect();
         let recipients = match app_core::compose::parse_dedupe_recipients(net, to.as_deref(), &extra_recipients) {
             Ok(r) => r,
             Err(e) => {
@@ -3161,7 +3122,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
         };
         let recipient_addrs: Vec<String> =
             if recipients.len() >= 2 { recipients.iter().map(|r| r.address.clone()).collect() } else { Vec::new() };
-        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
+        let Some(identity) = self.ident.as_ref().and_then(|i| i.full()).map(|i| i.clone_fields()) else {
             w.global::<Ui>().set_status("no identity".into());
             return;
         };
@@ -3172,7 +3133,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
         // that makes preview and send structurally identical (TestFlight
         // build-20 fix, 2026-07-18).
         let MixedComposeArgs { coins, wallets_map, change_spks, change_default, change_override, change_index } =
-            match s.mixed_compose_args(w) {
+            match self.mixed_compose_args(w) {
                 Ok(a) => a,
                 Err(e) => {
                     w.global::<Ui>().set_status(e.into());
@@ -3196,7 +3157,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
             w.global::<Ui>().set_status("selection is single-source — use the Sign button on that source instead".into());
             return;
         }
-        let chunk = s.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
+        let chunk = self.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
 
         // PLAN-pnte-redesign.md: a private body's AAD binds the tx's FIRST
         // input's outpoint, not a synthetic id — `coins[0]` becomes that
@@ -3257,7 +3218,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
         let mut built = match app_core::mixed::assemble_mixed_note_psbt_multi_ext(
             &coins,
             notebook_spk,
-            s.spending_source.as_ref(),
+            self.spending_source.as_ref(),
             &wallets_map,
             &change_spks,
             &payloads,
@@ -3266,7 +3227,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
             change_override,
             change_index,
             rate,
-            s.effective_lock_time(),
+            self.effective_lock_time(),
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -3290,7 +3251,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
         // `Zeroizing` leaf secret) drops — and zeroizes — at the end of each
         // loop iteration, never escaping this scope.
         if has_change {
-            let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+            let Some(material_str) = self.material.as_ref().map(|z| String::from(z.as_str())) else {
                 w.global::<Ui>().set_status("no identity".into());
                 return;
             };
@@ -3304,7 +3265,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
                     continue;
                 }
                 seen_idx.push(c.index);
-                let owner = match realize_change(&key_material, net, s.account, c.index) {
+                let owner = match realize_change(&key_material, net, self.account, c.index) {
                     Ok(o) => o,
                     Err(e) => {
                         w.global::<Ui>().set_status(format!("{e}").into());
@@ -3325,7 +3286,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
         }
         let spending_funding_utxos = app_core::mixed::spending_funding_utxos(&coins);
         if !spending_funding_utxos.is_empty() {
-            let Some(material_str) = s.material.as_ref().map(|z| String::from(z.as_str())) else {
+            let Some(material_str) = self.material.as_ref().map(|z| String::from(z.as_str())) else {
                 w.global::<Ui>().set_status("no identity".into());
                 return;
             };
@@ -3334,7 +3295,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
                 return;
             };
             if let Err(e) = app_core::psbt_build::sign_own_wpkh_inputs(
-                &mut built.psbt, &key_material, net, s.account, &spending_funding_utxos,
+                &mut built.psbt, &key_material, net, self.account, &spending_funding_utxos,
             ) {
                 w.global::<Ui>().set_status(format!("{e}").into());
                 return;
@@ -3368,8 +3329,8 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
         if has_external {
             // Our own inputs are already signed above; export for the
             // external wallet to complete its own via screens 13/14.
-            s.watch_spend = None;
-            s.watch_note = Some(WatchNote {
+            self.watch_spend = None;
+            self.watch_note = Some(WatchNote {
                 text: text.clone(),
                 recipient: to.clone(),
                 recipients: recipient_addrs.clone(),
@@ -3387,7 +3348,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
             let n = coins.len();
             let nr = recipients.len();
             let sources: std::collections::HashSet<&str> =
-                s.mixed_selected.iter().map(|(src, _, _)| src.as_str()).collect();
+                self.mixed_selected.iter().map(|(src, _, _)| src.as_str()).collect();
             println!(
                 "cb: compose-mixed build txid={} fee={} inputs={n} sources={} external=1{}",
                 built.txid,
@@ -3401,10 +3362,10 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
             let cost = format!(
                 "mixed source · fee {} sats · {n} input{}{} · sign with your external wallet",
                 built.fee,
-                if n == 1 { "" } else { "s" },
+                if n == 1 { "" } else { "self" },
                 if nr >= 2 { gift_cost_suffix(nr, gift) } else { String::new() }
             );
-            s.show_psbt_sign_screen(w, built, cost);
+            self.show_psbt_sign_screen(w, built, cost);
             return;
         }
 
@@ -3426,7 +3387,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
             .filter(|c| matches!(c.source, app_core::mixed::CoinSource::Spending))
             .map(|c| (c.txid.clone(), c.vout))
             .collect();
-        let spending_source = s.spending_source.clone();
+        let spending_source = self.spending_source.clone();
         let built_fee = built.fee;
         let built_change = built.change;
         let payloads_len = payloads.len();
@@ -3435,8 +3396,8 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
         // count for every case (0 self-note / 1 ordinary / N multi).
         let recipient_count = recipients.len();
 
-        let identity_addr = s.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
-        let name = s.notebook_display_name(s.nb_index);
+        let identity_addr = self.ident.as_ref().map(|i| i.address.clone()).unwrap_or_default();
+        let name = self.notebook_display_name(self.nb_index);
         let mut prevouts: HashMap<String, app_core::confirm::PrevoutInfo> = HashMap::new();
         for c in &coins {
             let key = format!("{}:{}", c.txid, c.vout);
@@ -3452,7 +3413,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
                     );
                 }
                 app_core::mixed::CoinSource::Spending => {
-                    let addr = s
+                    let addr = self
                         .spending_coins
                         .iter()
                         .find(|sc| sc.txid == c.txid && sc.vout == c.vout)
@@ -3470,7 +3431,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
                 // — tagged "Change" (mirrors the sweep confirm's own
                 // `source: "Change"` label from unit 4).
                 app_core::mixed::CoinSource::Change => {
-                    let addr = s
+                    let addr = self
                         .change_coins
                         .iter()
                         .find(|cc| cc.txid == c.txid && cc.vout == c.vout)
@@ -3485,7 +3446,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
                 app_core::mixed::CoinSource::Wallet(_) => {}
             }
         }
-        let (mut self_spks, mut spending_spks) = s.confirm_self_spks();
+        let (mut self_spks, mut spending_spks) = self.confirm_self_spks();
         // A custom change override (screen 21 "custom") leaves the wallet
         // entirely; the default spending-wallet change address is freshly
         // derived and not yet "used" bookkeeping, so — like the spending
@@ -3496,7 +3457,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
             Some(normalize_addr(w.global::<Ui>().get_change_address().as_str()))
         } else {
             if change_default == app_core::mixed::ChangeDefault::Spending && built_change > 0 {
-                if let Some(src) = s.spending_source.as_ref() {
+                if let Some(src) = self.spending_source.as_ref() {
                     if let Ok(d) = src.derive(1, change_index) {
                         self_spks.push(d.spk.clone());
                         spending_spks.push(d.spk);
@@ -3506,10 +3467,10 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
             None
         };
         let recipient_name = to.as_deref().and_then(|a| {
-            s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
+            self.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
         });
         let contact_name = |a: &str| -> Option<String> {
-            s.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
+            self.contacts.iter().find(|c| c.address == a && !c.name.is_empty()).map(|c| c.name.clone())
         };
         let confirm_recipients: Vec<(String, Option<String>)> =
             recipient_addrs.iter().map(|a| (a.clone(), contact_name(a))).collect();
@@ -3523,7 +3484,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
             recipient_name,
             recipients: confirm_recipients,
             note_preview: Some(if private { "Private note (encrypted)".to_string() } else { text.clone() }),
-            tip_height: s.confirm_tip_height(),
+            tip_height: self.confirm_tip_height(),
         };
         let pending = PendingBroadcast {
             kind: "compose-mixed",
@@ -3550,23 +3511,20 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
                 spending_source,
             },
         };
-        s.show_confirm(w, pending, ctx);
+        self.show_confirm(w, pending, ctx);
         note_subdust_fold_warn(w, built_change, built_fee, vsize as u64, rate);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_set_compose_locktime(&mut self, w: &AppWindow, mode: SharedString, height: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
         let Some(policy) = parse_locktime_mode(mode.as_str(), height.as_str()) else {
             println!("cb: compose-locktime err=range");
             w.global::<Ui>().set_status("locktime must be a block height below 500000000".into());
             return;
         };
-        s.tx_lock_time_override = Some(policy);
-        let effective = s.effective_lock_time();
+        self.tx_lock_time_override = Some(policy);
+        let effective = self.effective_lock_time();
         println!("cb: compose-locktime {} effective={effective} ok", policy.as_str());
-        s.refresh_compose_locktime_panel(w);
+        self.refresh_compose_locktime_panel(w);
         w.global::<Ui>().set_status("".into());
     }
 }

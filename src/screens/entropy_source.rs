@@ -4,11 +4,8 @@
 use crate::*;
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_pick_entropy_source(&mut self, w: &AppWindow, kind: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let words = s.new_word_count;
+        let words = self.new_word_count;
         println!("cb: entropy-source {kind} words={words}");
         match kind.as_str() {
             "dice" => {
@@ -19,13 +16,13 @@ pub(crate) fn on_pick_entropy_source(&mut self, w: &AppWindow, kind: SharedStrin
                 // `door_create` (a genuinely new seed) or via "Start over",
                 // which now confirms.
                 w.global::<BackupWords>().set_seed_from_dice(true);
-                s.update_dice_ui(w);
+                self.update_dice_ui(w);
                 w.global::<Ui>().set_screen(Screen::Dice);
             }
             _ => match generate_mnemonic(words) {
                 Ok(m) => {
                     w.global::<BackupWords>().set_seed_from_dice(false);
-                    s.stage_new_mnemonic(w, m.to_string());
+                    self.stage_new_mnemonic(w, m.to_string());
                 }
                 Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
             },

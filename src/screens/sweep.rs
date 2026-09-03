@@ -547,12 +547,9 @@ pub(crate) fn build_sweep_confirm(&mut self, w: &AppWindow, dest: String, rate: 
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_set_sweep_tier(&mut self, w: &AppWindow, tier: i32) {
-    #[allow(unused_mut)]
-    let mut s = self;
         w.global::<Sweep>().set_sweep_tier(tier);
-        let f = s.fees.clone().unwrap_or_default();
+        let f = self.fees.clone().unwrap_or_default();
         let rate = match tier {
             0 => f.economy,
             2 => f.fastest,
@@ -563,36 +560,27 @@ pub(crate) fn on_set_sweep_tier(&mut self, w: &AppWindow, tier: i32) {
             w.global::<Sweep>().set_sweep_rate_text(format!("{rate}").into());
         }
         println!("cb: sweep-tier {tier} rate={rate}");
-        s.update_sweep_screen(w);
+        self.update_sweep_screen(w);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_sweep_rate_changed(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        s.update_sweep_screen(w);
+        self.update_sweep_screen(w);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_toggle_sweep_fund_external(&mut self, w: &AppWindow, on: bool) {
-    #[allow(unused_mut)]
-    let mut s = self;
         println!("cb: sweep-fund-external {on}");
         w.global::<Ui>().set_status("".into());
-        if on && s.funding.is_none() {
+        if on && self.funding.is_none() {
             // No funding wallet active yet — pick one; Back returns here.
             w.global::<Ui>().set_funding_return(Screen::Sweep);
-            s.refresh_funding_list(w);
+            self.refresh_funding_list(w);
             w.global::<Ui>().set_screen(Screen::FundingWallets);
             return;
         }
-        s.update_sweep_screen(w);
+        self.update_sweep_screen(w);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_sweep_send(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         // Scan-freshness gate (belt to the UI button's braces — an e2e tap
         // or a race can land on a just-disabled button): never build a
         // sweep/consolidate off a coin cache a scan is about to replace.
@@ -602,12 +590,12 @@ pub(crate) fn on_sweep_send(&mut self, w: &AppWindow) {
             return;
         }
         let dest = w.global::<Ui>().get_sweep_dest().to_string();
-        let net = s.network;
+        let net = self.network;
         let Ok(recipient) = Recipient::parse(net, &dest) else {
             w.global::<Ui>().set_status(format!("not a valid {} address", net.as_str()).into());
             return;
         };
-        let rate = s.resolve_sweep_rate(w);
+        let rate = self.resolve_sweep_rate(w);
         if rate <= 0.0 {
             w.global::<Ui>().set_status("enter a fee rate".into());
             return;
@@ -615,11 +603,11 @@ pub(crate) fn on_sweep_send(&mut self, w: &AppWindow) {
         if w.global::<Sweep>().get_sweep_fund_external() {
             // Fee from the funding wallet: the FULL balance rides to the
             // destination, funding change returns to the funding wallet.
-            let Some(fund_src) = s.funding.clone() else {
+            let Some(fund_src) = self.funding.clone() else {
                 w.global::<Ui>().set_status("set a funding wallet first".into());
                 return;
             };
-            if s.funding_coins.is_empty() {
+            if self.funding_coins.is_empty() {
                 w.global::<Ui>().set_status("funding wallet has no spendable coins".into());
                 return;
             }
@@ -627,12 +615,12 @@ pub(crate) fn on_sweep_send(&mut self, w: &AppWindow) {
             // notebook's coins, per-index key origins); a keyed identity
             // signs its own inputs with the one active key, so it stays on
             // the active store.
-            let watch = s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
+            let watch = self.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
             let notes_coins: Vec<WatchCoin> = if watch {
-                s.watch_wallet_coins()
+                self.watch_wallet_coins()
             } else {
-                let nb = s.ident.as_ref().map(|i| i.index).unwrap_or(0);
-                s.store
+                let nb = self.ident.as_ref().map(|i| i.index).unwrap_or(0);
+                self.store
                     .as_ref()
                     .map(|store| {
                         store
@@ -659,14 +647,14 @@ pub(crate) fn on_sweep_send(&mut self, w: &AppWindow) {
             // treatment as the self-paid watch sweep.
             let change_spent: Vec<(String, u32)> =
                 notes_coins.iter().filter(|c| c.chain == 1).map(|c| (c.txid.clone(), c.vout)).collect();
-            let Some(ident) = s.ident.as_ref() else { return };
+            let Some(ident) = self.ident.as_ref() else { return };
             let identity_spk = p2tr_script_pubkey(&ident.output_x());
             let identity_source = ident.watch_source().cloned();
-            let fund_coins = s.funding_coins.clone();
+            let fund_coins = self.funding_coins.clone();
             let plan = FundingPlan {
                 source: &fund_src,
                 coins: &fund_coins,
-                change_index: s.funding_change_index,
+                change_index: self.funding_change_index,
                 fee_rate: rate,
                 change_override: None,
             };
@@ -676,12 +664,12 @@ pub(crate) fn on_sweep_send(&mut self, w: &AppWindow) {
                 &notes_coins,
                 &plan,
                 recipient.spk.clone(),
-                s.effective_lock_time(),
+                self.effective_lock_time(),
             ) {
                 Ok(mut built) => {
                     // Keyed identity: the app signs its own inputs here and
                     // now — only the funding wallet still needs to sign.
-                    if let Some(id) = s.ident.as_ref().and_then(|i| i.full()) {
+                    if let Some(id) = self.ident.as_ref().and_then(|i| i.full()) {
                         match sign_own_taproot_inputs(&mut built.psbt, &id.output_x, &id.tweaked_seckey) {
                             Ok(k) => println!("cb: sweep-own-signed inputs={k}"),
                             Err(e) => {
@@ -694,8 +682,8 @@ pub(crate) fn on_sweep_send(&mut self, w: &AppWindow) {
                         "sweep · {} sats arrive in full · fee {} sats from the funding wallet",
                         built.sent_to_recipient, built.fee
                     );
-                    s.watch_note = None;
-                    s.watch_spend = Some(WatchSpend {
+                    self.watch_note = None;
+                    self.watch_spend = Some(WatchSpend {
                         kind: if w.global::<Ui>().get_sweep_kind().as_str() == "consolidate" { "consolidate" } else { "sweep" },
                         dest: dest.clone(),
                         dest_spk_hex: hex::encode(&recipient.spk),
@@ -715,16 +703,16 @@ pub(crate) fn on_sweep_send(&mut self, w: &AppWindow) {
                         fund_coins.len(),
                         if change_spent.is_empty() { String::new() } else { format!(" change={}", change_spent.len()) }
                     );
-                    s.show_psbt_sign_screen(w, built, cost);
+                    self.show_psbt_sign_screen(w, built, cost);
                 }
                 Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
             }
             return;
         }
         let consolidate = w.global::<Ui>().get_sweep_kind().as_str() == "consolidate";
-        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+        if self.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
             let kind = if consolidate { "consolidate" } else { "sweep" };
-            s.watch_spend_build(w, kind, dest, recipient.spk.clone(), rate);
+            self.watch_spend_build(w, kind, dest, recipient.spk.clone(), rate);
             return;
         }
         // Keyed, self-paid: build + sign now (stage A) and hand off to the
@@ -732,29 +720,26 @@ pub(crate) fn on_sweep_send(&mut self, w: &AppWindow) {
         // confirm modals used to gate this; Broadcast on screen 26 is the
         // only way out now (`on_confirm_broadcast`, kind "sweep"/
         // "consolidate").
-        if s.wallet_tx_busy || s.pending_broadcast.is_some() {
+        if self.wallet_tx_busy || self.pending_broadcast.is_some() {
             return;
         }
         if consolidate {
-            s.build_consolidate_confirm(w, rate);
+            self.build_consolidate_confirm(w, rate);
         } else {
-            s.build_sweep_confirm(w, dest, rate);
+            self.build_sweep_confirm(w, dest, rate);
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_set_sweep_locktime(&mut self, w: &AppWindow, mode: SharedString, height: SharedString) {
-    #[allow(unused_mut)]
-    let mut s = self;
         let Some(policy) = parse_locktime_mode(mode.as_str(), height.as_str()) else {
             println!("cb: sweep-locktime err=range");
             w.global::<Ui>().set_status("locktime must be a block height below 500000000".into());
             return;
         };
-        s.tx_lock_time_override = Some(policy);
-        let effective = s.effective_lock_time();
+        self.tx_lock_time_override = Some(policy);
+        let effective = self.effective_lock_time();
         println!("cb: sweep-locktime {} effective={effective} ok", policy.as_str());
-        s.refresh_sweep_locktime_panel(w);
+        self.refresh_sweep_locktime_panel(w);
         w.global::<Ui>().set_status("".into());
     }
 }

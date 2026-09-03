@@ -293,20 +293,17 @@ pub(crate) fn update_activity(&self, w: &AppWindow) {
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_act_bump_open(&mut self, w: &AppWindow, ref_id: SharedString, is_note: bool) {
-    #[allow(unused_mut)]
-    let mut s = self;
         // The bump dialog prices off `st.fees.fastest` — lazily (re)fetch
         // before either branch below reads it (network-efficiency,
         // 2026-07-23). `watch_bump_open` also calls this — the 60s cache
         // makes the second call here-or-there free either way.
-        s.refresh_fees_price(w);
-        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
-            s.watch_bump_open(w, ref_id.to_string(), is_note);
+        self.refresh_fees_price(w);
+        if self.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            self.watch_bump_open(w, ref_id.to_string(), is_note);
             return;
         }
-        let Some(store) = &s.store else { return };
+        let Some(store) = &self.store else { return };
         // CHANGE 2 defense-in-depth: the UI already hides Speed-up for a
         // mixed record (`ActivityItem.bumpable`), but refuse here too
         // rather than trust the tap origin.
@@ -321,7 +318,7 @@ pub(crate) fn on_act_bump_open(&mut self, w: &AppWindow, ref_id: SharedString, i
         // BIP-125: the replacement must add at least 1 sat/vB (incremental
         // relay) over the original, and pay a strictly higher total fee.
         let min_rate = old_rate + 1.0;
-        let fast = s.fees.as_ref().map(|f| f.fastest).unwrap_or(min_rate);
+        let fast = self.fees.as_ref().map(|f| f.fastest).unwrap_or(min_rate);
         let recommended = fast.max(min_rate);
         println!("cb: bump-open ref={ref_id} old={old_rate:.1} min={min_rate:.1}");
         w.global::<Ui>().set_bump_ref(ref_id.clone());

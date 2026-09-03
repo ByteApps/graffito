@@ -140,19 +140,16 @@ pub(crate) fn sender_label(&self, key: &str) -> String {
 }
 
 impl State {
-#[allow(unused_variables)]
 pub(crate) fn on_unlock_note(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         // User-initiated tap — the LAUNCH-PATH rule's other sanctioned door
         // (besides opening the Quantum keys screen, and — since
         // PLAN-graffito-self-pw.md — the Security panel's own header tap)
         // for loading an imported ML-KEM secret from the Keychain this
         // session. Runs before the borrows below so it never conflicts
         // with them.
-        s.ensure_pq_imported_loaded();
+        self.ensure_pq_imported_loaded();
         let note_id = w.global::<Ui>().get_note_view_id().to_string();
-        let Some(identity) = s.ident.as_ref().and_then(|i| i.full()) else {
+        let Some(identity) = self.ident.as_ref().and_then(|i| i.full()) else {
             w.global::<Ui>().set_status("no identity".into());
             return;
         };
@@ -164,7 +161,7 @@ pub(crate) fn on_unlock_note(&mut self, w: &AppWindow) {
         // (PLAN-graffito-self-pw.md): `unlock_note`/`unlock_sent` refuse it
         // outright (`is_self()` discriminates in notes-core), so this check
         // must happen before picking which store fn to call at all.
-        let is_self = s
+        let is_self = self
             .store
             .as_ref()
             .and_then(|store| store.notes.iter().find(|n| n.note_id == note_id))
@@ -178,8 +175,8 @@ pub(crate) fn on_unlock_note(&mut self, w: &AppWindow) {
             // factor). `unlock_note_view` takes `&self`, so nothing here
             // mutates the store — no `save_store()`, unlike the directed
             // path below.
-            let mlkem_secret = s.pq_imported.as_ref().map(|kp| kp.secret());
-            let result = match s.store.as_ref() {
+            let mlkem_secret = self.pq_imported.as_ref().map(|kp| kp.secret());
+            let result = match self.store.as_ref() {
                 Some(store) => store.unlock_note_view(
                     &note_id,
                     &identity,
@@ -192,9 +189,9 @@ pub(crate) fn on_unlock_note(&mut self, w: &AppWindow) {
             match result {
                 Ok(text) => {
                     println!("cb: unlock-note ok view-only");
-                    let watch = s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
+                    let watch = self.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
                     if let Some(n) =
-                        s.store.as_ref().and_then(|store| store.notes.iter().find(|n| n.note_id == note_id))
+                        self.store.as_ref().and_then(|store| store.notes.iter().find(|n| n.note_id == note_id))
                     {
                         let detail = format_note_detail(n, watch, Some(text.as_str()));
                         w.global::<Note>().set_note_detail(detail.into());
@@ -213,8 +210,8 @@ pub(crate) fn on_unlock_note(&mut self, w: &AppWindow) {
             return;
         }
 
-        let secrets = mlkem_secrets_for(s.ident.as_ref().unwrap(), s.pq_imported.as_ref());
-        let result = match s.store.as_mut() {
+        let secrets = mlkem_secrets_for(self.ident.as_ref().unwrap(), self.pq_imported.as_ref());
+        let result = match self.store.as_mut() {
             Some(store) => store.unlock_note(&note_id, &identity, &secrets, Some(password.as_str())),
             None => Err(app_core::Error::Store("no store".into())),
         };
@@ -222,13 +219,13 @@ pub(crate) fn on_unlock_note(&mut self, w: &AppWindow) {
         match result {
             Ok(_text) => {
                 println!("cb: unlock-note ok");
-                s.save_store();
-                s.update_home(w);
+                self.save_store();
+                self.update_home(w);
                 // U4: was `w.global::<Home>().invoke_open_note(...)` — that
                 // re-enters the SAME `&mut self` borrow now that on_open_note
                 // is a method rather than a fresh `st.borrow_mut()`, so call
                 // it directly instead of round-tripping through Slint.
-                s.on_open_note(w, note_id.into());
+                self.on_open_note(w, note_id.into());
             }
             Err(e) => {
                 println!("cb: unlock-note err={e}");
@@ -237,11 +234,7 @@ pub(crate) fn on_unlock_note(&mut self, w: &AppWindow) {
         }
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_open_note_web(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
-        let _ = &mut s;
         let url = w.global::<Note>().get_note_web_url().to_string();
         if url.is_empty() {
             return;
@@ -250,32 +243,26 @@ pub(crate) fn on_open_note_web(&mut self, w: &AppWindow) {
         let _ = platform::open_url(&url);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_reply_to_note(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         let addr = w.global::<Note>().get_note_reply_address().to_string();
         if addr.is_empty() {
             return;
         }
         println!("cb: reply to={addr}");
         w.global::<Ui>().set_compose_return(Screen::Note);
-        s.pick_contact_core(w, &addr);
+        self.pick_contact_core(w, &addr);
     }
 
-#[allow(unused_variables)]
 pub(crate) fn on_reply_all_to_note(&mut self, w: &AppWindow) {
-    #[allow(unused_mut)]
-    let mut s = self;
         let addrs: Vec<String> = w.global::<Note>().get_note_reply_set().iter().map(|c| c.address.to_string()).collect();
         let Some((first, rest)) = addrs.split_first() else { return };
         println!("cb: reply-all to={} n={}", addrs.join(","), addrs.len());
         w.global::<Ui>().set_compose_return(Screen::Note);
         // pick_contact_core resets the compose session (clearing any prior
         // to_addresses_extra) before we seed the rest as extra chips.
-        s.pick_contact_core(w, first);
-        s.to_addresses_extra = rest.to_vec();
-        s.refresh_to_chips(w);
-        s.refresh_compose(w);
+        self.pick_contact_core(w, first);
+        self.to_addresses_extra = rest.to_vec();
+        self.refresh_to_chips(w);
+        self.refresh_compose(w);
     }
 }
