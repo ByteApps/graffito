@@ -1,0 +1,808 @@
+// ui/modals.slint -- the AppWindow overlays extracted verbatim from
+// app.slint on 2026-09-03 (PLAN-graffito-app-arch.md U3b). Each stays
+// gated the same way it always was; app.slint instantiates them, in the
+// same order, as the LAST children of the window (z-order matters).
+
+import { Ui, Modals, Note } from "globals.slint";
+import { Body, Caption, Mono, PrimaryButton, GhostButton, IconButton, QrArea } from "components.slint";
+import { EditField } from "edit.slint";
+import { Pal } from "theme.slint";
+import { Switch } from "std-widgets.slint";
+
+// ScanningModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- shared camera-scan overlay (live preview) ----------
+export component ScanningModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.86);
+        z: 200;
+        TouchArea { }
+        VerticalLayout {
+            alignment: center;
+            spacing: 16px;
+            padding: 24px;
+            HorizontalLayout {
+                alignment: center;
+                Text {
+                    text: Modals.scan-hint;
+                    color: Pal.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                    max-width: 340px;
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 300px;
+                    height: 300px;
+                    border-radius: 16px;
+                    clip: true;
+                    background: #0a0a0a;
+                    border-width: 2px;
+                    border-color: Pal.accent;
+                    Image {
+                        source: Modals.camera-frame;
+                        width: 100%;
+                        height: 100%;
+                        image-fit: cover;
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 300px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: Pal.line;
+                    Rectangle {
+                        x: 0;
+                        y: 0;
+                        height: 100%;
+                        width: parent.width * clamp(Modals.scan-progress, 0, 1);
+                        background: Pal.accent;
+                        border-radius: 3px;
+                        animate width { duration: 150ms; }
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                Caption {
+                    text: Modals.scan-progress > 0.001
+                        ? "Collecting frames · \{round(Modals.scan-progress * 100)}%"
+                        : "Hold your phone steady and fill the frame.";
+                    horizontal-alignment: center;
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                GhostButton {
+                    text: "Cancel";
+                    min-width: 220px;
+                    clicked => { Ui.cancel-scan(); }
+                }
+            }
+        }
+    }
+
+// FundRenameModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- funding-wallet rename (modal overlay) ----------
+export component FundRenameModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { Ui.fund-rename-cancel(); } }
+        Rectangle {
+            width: 400px;
+            height: frl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            // Swallow clicks on the card body so they don't reach the dim
+            // (which cancels) — and drop the keyboard while we're here.
+            TouchArea { clicked => { Ui.focus-back-scope-nonce += 1; } }
+            frl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Name this wallet";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                EditField {
+                    text <=> Modals.fund-rename-input;
+                    placeholder-text: "wallet name";
+                    accepted(t) => { Modals.fund-rename-save(t); }
+                    init => {
+                        self.focus();
+                        self.select-all();
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { Ui.fund-rename-cancel(); } }
+                    PrimaryButton { text: "Save"; clicked => { Modals.fund-rename-save(Modals.fund-rename-input); } }
+                }
+            }
+        }
+    }
+
+// RenameAddressModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- rename dialog (modal overlay) ----------
+export component RenameAddressModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { Ui.cancel-rename(); } }
+        Rectangle {
+            width: 400px;
+            height: dl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            // Swallow clicks on the card body; also drops the keyboard.
+            TouchArea { clicked => { Ui.focus-back-scope-nonce += 1; } }
+            dl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Name this contact";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Mono {
+                    text: Ui.rename-address;
+                    font-size: 10px;
+                    color: Pal.muted;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+                rename-edit := EditField {
+                    text <=> Modals.rename-input;
+                    placeholder-text: "name (empty clears it)";
+                    accepted(t) => { Modals.save-rename(t); }
+                    init => {
+                        self.focus();
+                        self.select-all();
+                    }
+                }
+                if Ui.apple-platform: Rectangle {
+                    height: 30px;
+                    cbta := TouchArea { clicked => { Modals.rename-synced = !Modals.rename-synced; } }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        alignment: start;
+                        Rectangle {
+                            width: 20px; height: 20px;
+                            y: (parent.height - 20px) / 2;
+                            border-radius: 4px;
+                            border-width: 2px;
+                            border-color: Modals.rename-synced ? Pal.accent : Pal.muted;
+                            background: Modals.rename-synced ? Pal.accent : transparent;
+                            if Modals.rename-synced: Image {
+                                source: @image-url("icons/check.svg");
+                                colorize: Pal.on-accent;
+                                width: 14px; height: 14px;
+                                x: (parent.width - 14px) / 2;
+                                y: (parent.height - 14px) / 2;
+                            }
+                        }
+                        Text {
+                            text: "Save to iCloud";
+                            font-size: 13px;
+                            color: Pal.text;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: Pal.line; }
+                Text { text: "Quantum key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                if Ui.rename-pq-display != "": HorizontalLayout {
+                    spacing: 8px;
+                    Caption { text: Ui.rename-pq-display; horizontal-stretch: 1; wrap: word-wrap; }
+                    IconButton {
+                        glyph: "×";
+                        glyph-size: 18px;
+                        width: 28px;
+                        height: 28px;
+                        glyph-color: Pal.bad;
+                        clicked => { Ui.contact-pq-remove(); }
+                    }
+                }
+                if Ui.rename-pq-display == "": HorizontalLayout {
+                    spacing: 8px;
+                    EditField {
+                        horizontal-stretch: 1;
+                        text <=> Modals.rename-pq-input;
+                        placeholder-text: "paste their quantum public key";
+                        accepted(t) => { Ui.contact-pq-set(t); }
+                    }
+                    GhostButton { text: "Set"; width: 64px; clicked => { Ui.contact-pq-set(Modals.rename-pq-input); } }
+                }
+                if Ui.desktop-platform && Ui.rename-pq-display == "": GhostButton {
+                    text: "From file…";
+                    clicked => { Modals.contact-pq-file(); }
+                }
+                if Modals.rename-pq-error != "": Caption { text: Modals.rename-pq-error; color: Pal.bad; wrap: word-wrap; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { Ui.cancel-rename(); } }
+                    PrimaryButton { text: "Save"; clicked => { Modals.save-rename(Modals.rename-input); } }
+                }
+            }
+        }
+    }
+
+// NbRenameModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- notebook rename dialog (modal overlay) ----------
+export component NbRenameModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { Ui.nb-rename-cancel(); } }
+        Rectangle {
+            width: 400px;
+            height: nbl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            // Swallow clicks on the card body; also drops the keyboard.
+            TouchArea { clicked => { Ui.focus-back-scope-nonce += 1; } }
+            nbl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Name this notebook";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Caption { text: "The name stays on this device — it is never published."; }
+                nb-rename-edit := EditField {
+                    text <=> Modals.nb-rename-input;
+                    placeholder-text: "name (empty = address short form)";
+                    accepted(t) => { Modals.nb-rename-save(t); }
+                    init => {
+                        self.focus();
+                        self.select-all();
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { Ui.nb-rename-cancel(); } }
+                    PrimaryButton { text: "Save"; clicked => { Modals.nb-rename-save(Modals.nb-rename-input); } }
+                }
+            }
+        }
+    }
+
+// ConfirmRemoveAddressModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- remove-contact confirmation (modal overlay) ----------
+export component ConfirmRemoveAddressModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { Ui.cancel-remove(); } }
+        Rectangle {
+            width: 400px;
+            height: cl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { }
+            cl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Remove this contact?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                if Modals.confirm-remove-name != "": Body { text: Modals.confirm-remove-name; }
+                Mono {
+                    text: Ui.confirm-remove-address;
+                    font-size: 10px;
+                    color: Pal.muted;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+                Caption { text: "Only removes it from recents — sending to this address again re-adds it."; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { Ui.cancel-remove(); } }
+                    PrimaryButton {
+                        text: "Remove";
+                        tint: Pal.bad;
+                        tint-hover: #ff6b62;
+                        clicked => { Modals.remove-contact(Ui.confirm-remove-address); }
+                    }
+                }
+            }
+        }
+    }
+
+// DiceClearConfirmModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- reset-identity confirmation (modal overlay) ----------
+// Clearing dice rolls is unrecoverable and can throw away several minutes
+// of physical rolling, so it confirms — same rule as every other
+// destructive action here. Only armed above a handful of rolls; nagging
+// about discarding three of them would just be noise.
+export component DiceClearConfirmModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { Ui.show-dice-clear-confirm = false; } }
+        Rectangle {
+            width: 400px;
+            height: dcl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { clicked => { Ui.focus-back-scope-nonce += 1; } }
+            dcl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Discard " + Ui.dice-count + " rolls?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Body {
+                    text: "You'll start again from zero and have to re-roll them.";
+                    font-size: 12px;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton {
+                        text: "Keep rolling";
+                        clicked => { Ui.show-dice-clear-confirm = false; }
+                    }
+                    PrimaryButton {
+                        text: "Discard";
+                        tint: Pal.bad;
+                        clicked => {
+                            Ui.show-dice-clear-confirm = false;
+                            Ui.dice-clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+// PqBackupConfirmModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- backup quantum private key confirmation (modal overlay) ----------
+export component PqBackupConfirmModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { Ui.pq-show-backup-confirm = false; } }
+        Rectangle {
+            width: 400px;
+            height: pqbl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { clicked => { Ui.focus-back-scope-nonce += 1; } }
+            pqbl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Back up your quantum private key?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Caption {
+                    text: "Anyone who gets this key can read notes sealed to it. It already recovers from your seed phrase — only do this if you want a separate copy.";
+                    color: Pal.warn;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { Ui.pq-show-backup-confirm = false; } }
+                    GhostButton { text: "Copy"; clicked => { Modals.pq-copy-private(); } }
+                    if Ui.desktop-platform: GhostButton { text: "Save…"; clicked => { Modals.pq-save-private(); } }
+                }
+            }
+        }
+    }
+
+// PqReplaceConfirmModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---- Replace guard: Generate/Import over an existing "My quantum
+// key" (screen 29) ----
+export component PqReplaceConfirmModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { Modals.pq-replace-cancel(); } }
+        Rectangle {
+            width: 400px;
+            height: pqrepl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 220px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { clicked => { Ui.focus-back-scope-nonce += 1; } }
+            pqrepl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Replace your quantum key?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Caption {
+                    text: "Notes sealed to your CURRENT key become permanently unreadable unless you exported it first. This cannot be undone.";
+                    color: Pal.warn;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { Modals.pq-replace-cancel(); } }
+                    GhostButton { text: "Replace"; clicked => { Ui.pq-replace-confirm(); } }
+                }
+            }
+        }
+    }
+
+// PqExportPrivateConfirmModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---- Export "My quantum key" private armor (screen 29): a warning
+// step, then the QR/copy reveal — never shown without the warning
+// first. Copy uses the CONCEALED/expiring clipboard (never the plain
+// one) — same path spending material uses elsewhere.
+export component PqExportPrivateConfirmModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea {
+            clicked => {
+                Ui.pq-imported-hide-private();
+                Ui.pq-show-export-private-confirm = false;
+            }
+        }
+        Rectangle {
+            width: 400px;
+            height: pqexp.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 180px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { clicked => { Ui.focus-back-scope-nonce += 1; } }
+            pqexp := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                if Modals.pq-imported-private-value == "": VerticalLayout {
+                    spacing: 12px;
+                    Text {
+                        text: "Export your quantum private key?";
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: Pal.text;
+                    }
+                    Caption {
+                        text: "Anyone who gets this can read every quantum-sealed note you have. Use this to back it up, or to mirror the key onto another device — the Prime app imports this same armor.";
+                        color: Pal.warn;
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        GhostButton { text: "Cancel"; clicked => { Ui.pq-show-export-private-confirm = false; } }
+                        GhostButton { text: "Reveal"; clicked => { Modals.pq-imported-reveal-private(); } }
+                    }
+                }
+                if Modals.pq-imported-private-value != "": VerticalLayout {
+                    spacing: 12px;
+                    Text {
+                        text: "Your quantum private key";
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: Pal.text;
+                    }
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 176px;
+                            height: 176px;
+                            QrArea {
+                                img: Modals.pq-imported-private-qr;
+                                qr-size: 176px;
+                            }
+                            TouchArea {
+                                clicked => {
+                                    Ui.qr-zoom-image = Modals.pq-imported-private-qr;
+                                    Ui.qr-zoom-open = true;
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        GhostButton { text: "Copy"; clicked => { Modals.pq-imported-copy-private(); } }
+                        GhostButton {
+                            text: "Done";
+                            clicked => {
+                                Ui.pq-imported-hide-private();
+                                Ui.pq-show-export-private-confirm = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+// ResetConfirmModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+export component ResetConfirmModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { Ui.show-reset-confirm = false; } }
+        Rectangle {
+            width: 400px;
+            height: rl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 200px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { }
+            rl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Switch identity?";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Body {
+                    text: "This removes the current key from this device and returns to onboarding, where you can create a new seed or import a different key (and pick its account).";
+                    font-size: 12px;
+                }
+                Caption {
+                    text: "Your notes and funds stay on-chain. Re-import the same key + account and everything comes back. Make sure the backup is written down — without it, this identity is gone.";
+                    color: Pal.warn;
+                }
+                if Ui.icloud-backup: Caption {
+                    text: "iCloud backup is ON — this also deletes the key from iCloud, so it will NOT return on reinstall. Your written backup is the only recovery.";
+                    color: Pal.bad;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { Ui.show-reset-confirm = false; } }
+                    PrimaryButton {
+                        text: "Remove key & switch";
+                        tint: Pal.bad;
+                        tint-hover: #ff6b62;
+                        clicked => { Modals.reset-identity(); }
+                    }
+                }
+            }
+        }
+    }
+
+// OversizeModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- note-too-large dialog (modal overlay) ----------
+export component OversizeModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { Ui.show-oversize-modal = false; } }
+        Rectangle {
+            width: 400px;
+            height: ol.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 200px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            TouchArea { }
+            ol := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Note too large";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Body {
+                    text: Modals.oversize-message;
+                    font-size: 12px;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton {
+                        text: Modals.oversize-offer-bump ? "Cancel" : "OK";
+                        clicked => { Ui.show-oversize-modal = false; }
+                    }
+                    if Modals.oversize-offer-bump: PrimaryButton {
+                        text: "Switch to Standard";
+                        clicked => { Modals.oversize-bump(); }
+                    }
+                }
+            }
+        }
+    }
+
+// BumpDialogModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- speed-up (RBF bump) dialog ----------
+export component BumpDialogModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.55);
+        TouchArea { clicked => { Ui.show-bump-dialog = false; } }
+        Rectangle {
+            width: 400px;
+            height: bl.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: 200px;
+            border-radius: 14px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            // Swallow clicks on the card body; also drops the keyboard.
+            TouchArea { clicked => { Ui.focus-back-scope-nonce += 1; } }
+            bl := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "Speed up transaction";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Pal.text;
+                }
+                Body { text: Modals.bump-kind; font-size: 12px; }
+                Caption { text: Modals.bump-current; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    EditField {
+                        width: 96px;
+                        text <=> Modals.bump-rate;
+                        edited => { Modals.act-bump-rate-changed(self.text); }
+                    }
+                    Caption { text: "sat/vB"; vertical-alignment: center; }
+                }
+                Body { text: Modals.bump-new-fee; font-size: 13px; font-weight: 600; color: Pal.accent; }
+                Caption { text: Modals.bump-min; color: Pal.warn; }
+                if Modals.bump-error != "": Caption { text: Modals.bump-error; color: Pal.bad; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    GhostButton { text: "Cancel"; clicked => { Ui.show-bump-dialog = false; } }
+                    PrimaryButton { text: "Sign…"; clicked => { Modals.act-bump-confirm(); } }
+                }
+            }
+        }
+    }
+
+// QrZoomModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- QR zoom overlay (tap any QR to enlarge it for scanning) ----------
+// Any small on-card QR (address, SeedQR, key export) opens this; a tap
+// anywhere — the dim OR the enlarged code — closes it. The QR image is
+// native module resolution + `pixelated`, so blowing it up stays crisp.
+export component QrZoomModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000.with-alpha(0.82);
+        qr-zoom-card := Rectangle {
+            width: min(root.width - 48px, min(root.height - 168px, 380px));
+            height: self.width;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: white;
+            border-radius: 16px;
+            QrArea {
+                img: Ui.qr-zoom-image;
+                qr-size: parent.width - 36px;
+                x: 18px;
+                y: 18px;
+            }
+        }
+        Text {
+            text: "Tap to close";
+            x: (parent.width - self.width) / 2;
+            y: qr-zoom-card.y + qr-zoom-card.height + 18px;
+            color: white;
+            font-size: 14px;
+        }
+        // Dismiss layer on TOP so a tap anywhere — including on the enlarged
+        // QR — closes it (non-TouchArea siblings above would otherwise swallow
+        // the click).
+        TouchArea { clicked => { Ui.qr-zoom-open = false; } }
+    }
+
+// ToastModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+export component ToastModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        toast-pill := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: parent.height - self.height - 64px;
+            width: toast-label.preferred-width + 32px;
+            height: 36px;
+            border-radius: 18px;
+            background: Pal.card.with-alpha(0.96);
+            border-width: 1px;
+            border-color: Pal.line;
+            toast-label := Text {
+                width: parent.width;
+                height: parent.height;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                text: Ui.toast-text;
+                color: Pal.text;
+                font-size: 13px;
+                font-weight: 600;
+            }
+        }
+    }
+
+// SplashModal -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// Splash cover — the topmost child, so it hides everything until Rust
+// flips `ready` (once the safe-area inset is known). Prevents the content
+// from visibly sliding down from under the status bar on cold start.
+export component SplashModal inherits Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Pal.bg;
+    }
+
