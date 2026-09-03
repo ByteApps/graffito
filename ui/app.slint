@@ -39,6 +39,7 @@ import { PrivateKeysScreen } from "screens/private-keys.slint";
 import { PayFromScreen } from "screens/pay-from.slint";
 import { ChangeScreen } from "screens/change.slint";
 import { TermsScreen } from "screens/terms.slint";
+import { InfoScreen } from "screens/info.slint";
 // Rust (src/lib.rs, via slint::include_modules!()) needs these re-exported
 // from the entry-point file.
 export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem, Ui, Modals, Info, Terms, Settings, BackupWords, ImportKey, Quiz, Home, Note, Compose, Change, PayFrom, Sweep, FundingWalletScreen, ExportPsbt, Confirm, Coins, AccountPicker, PublicKeys, PrivateKeys, QuantumKeys, Activity, Onboarding, Dice, EntropySource, Contacts, FundingWallets, ImportSignedPsbt, Notebooks }
@@ -454,27 +455,7 @@ export component AppWindow inherits Window {
 
     if Ui.screen == Screen.terms: TermsScreen { }
 
-    // ---------- 25 · info (About / Privacy / Help / Q&A) ----------
-    if Ui.screen == Screen.info: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
-        padding: 20px;
-        spacing: 12px;
-        Header {
-            title: Info.info-title;
-            back => { root.nav-back(); }
-        }
-        Flickable {
-            viewport-width: self.width;
-            viewport-height: info-body-t.preferred-height;
-            info-body-t := Body {
-                width: parent.width;
-                text: Info.info-body;
-                font-size: 17px;
-            }
-        }
-        if Info.info-show-slint: AboutSlint {
-            height: 110px;
-        }
-    }
+    if Ui.screen == Screen.info: InfoScreen { }
 
     // ---------- 27 · where does the entropy come from? ----------
     // Two doors, same pattern as onboarding. Reached from every "Create a new

@@ -1,0 +1,29 @@
+// Screen.info -- extracted verbatim from app.slint on 2026-09-03
+// (PLAN-graffito-app-arch.md U3b).
+//
+// ---------- 25 · info (About / Privacy / Help / Q&A) ----------
+
+import { Ui, Info } from "../globals.slint";
+import { Body, Header } from "../components.slint";
+import { AboutSlint } from "std-widgets.slint";
+
+export component InfoScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
+        padding: 20px;
+        spacing: 12px;
+        Header {
+            title: Info.info-title;
+            back => { Ui.nav-back-nonce += 1; }
+        }
+        Flickable {
+            viewport-width: self.width;
+            viewport-height: info-body-t.preferred-height;
+            info-body-t := Body {
+                width: parent.width;
+                text: Info.info-body;
+                font-size: 17px;
+            }
+        }
+        if Info.info-show-slint: AboutSlint {
+            height: 110px;
+        }
+    }
