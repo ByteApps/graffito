@@ -16,15 +16,17 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-# BOTH prime-graffito git deps MUST pin the SAME rev: two revs of one repo
-# would give cargo two notes-core sources and `pq::MlKemAlg` type clashes.
-# notes-core is byte-identical between e0c7bd1 (the previous pin) and this
-# rev, so tx construction is unchanged (PLAN-graffito-arch.md, phase 2).
-notes-core = { git = "ssh://git@github.com/ByteApps/prime-graffito.git", rev = "1abf76746a2e46bd13a456b54e7e78472d5bbfa1" }
+# notes-core: the FROZEN PNTE protocol (envelope, sealing, ECDH, taproot
+# tx build/sign). Lives in this workspace since 2026-09-02 (moved from
+# ByteApps/prime-graffito when the Prime app was shelved); the Prime app
+# pins it as a git dependency of this repo, so both apps' txs stay
+# byte-identical by construction. Its device-only RNG contract tests
+# (vendored-TRNG wiring) live in prime-graffito/tests/.
+notes-core = { path = "../notes-core" }
 # Shared UI-free POLICY (compose Security copy — `graffito_core::seclabel`,
 # re-exported through `passphrase`), rendered identically by this app and
 # the Prime app. notes-core + serde only; nothing new enters the graph.
-graffito-core = { git = "ssh://git@github.com/ByteApps/prime-graffito.git", rev = "1abf76746a2e46bd13a456b54e7e78472d5bbfa1" }
+graffito-core = { path = "../graffito-core" }
 # base64 feature = PSBT <-> base64 string (`.psbt` file / clipboard export).
 bitcoin = { version = "0.32", features = ["base64"] }
 # Output-descriptor parsing + address derivation for external funding wallets

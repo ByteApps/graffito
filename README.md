@@ -30,7 +30,7 @@ Graffito writes personal notes into real bitcoin transactions — public ones an
 
 ## Compatible by construction
 
-The app reuses the Prime app's `notes-core` as a pinned dependency — envelope, encryption, and transaction signing are the same code, so notes from either app are interchangeable on-chain. The [web viewer](https://byteapps.com/graffito/companion/) renders both.
+The app and the Passport Prime app share one `notes-core` crate (it lives in this repo; the Prime app pins it) — envelope, encryption, and transaction signing are the same code, so notes from either app are interchangeable on-chain. The [web viewer](https://byteapps.com/graffito/companion/) renders both.
 
 ## Get it running
 

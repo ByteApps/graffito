@@ -6,8 +6,8 @@ Direct dependencies of this app and its `app-core` library. The complete transit
 
 | Library | Version | License | Used for |
 |---|---|---|---|
-| [notes-core](https://github.com/ByteApps/prime-graffito) | pinned git rev | MIT OR Apache-2.0 | The PNTE protocol: envelope, sealing, ECDH, taproot tx build/sign — shared with the Passport Prime app |
-| [graffito-core](https://github.com/ByteApps/prime-graffito) | same pinned git rev | MIT OR Apache-2.0 | Shared UI-free policy (compose Security copy, `seclabel`) rendered identically by both apps |
+| [notes-core](notes-core/) | workspace member | MIT OR Apache-2.0 | The PNTE protocol: envelope, sealing, ECDH, taproot tx build/sign — shared with the Passport Prime app |
+| [graffito-core](graffito-core/) | workspace member | MIT OR Apache-2.0 | Shared UI-free policy (compose Security copy, `seclabel`) rendered identically by both apps |
 | [bitcoin](https://crates.io/crates/bitcoin) (rust-bitcoin) | 0.32 | CC0-1.0 | BIP-32/86 derivation, WIF/xprv parsing, PSBT |
 | [miniscript](https://crates.io/crates/miniscript) | 12 | CC0-1.0 | Output-descriptor parsing for watch-only identities |
 | [bip39](https://crates.io/crates/bip39) | 2 | CC0-1.0 | BIP-39 mnemonic handling |
@@ -22,6 +22,32 @@ Direct dependencies of this app and its `app-core` library. The complete transit
 | [getrandom](https://crates.io/crates/getrandom) | 0.2 | MIT OR Apache-2.0 | OS entropy |
 | [serde](https://crates.io/crates/serde) / [serde_json](https://crates.io/crates/serde_json) | 1 | MIT OR Apache-2.0 | Store/config persistence, esplora JSON |
 | [reqwest](https://crates.io/crates/reqwest) | 0.12 | MIT OR Apache-2.0 | HTTPS chain sync + broadcast (rustls) |
+
+## notes-core & graffito-core (workspace members, MIT OR Apache-2.0)
+
+Both crates moved here from the Passport Prime app repo on 2026-09-02; the Prime app pins them as git dependencies of this repo. Pure-Rust by rule (C does not cross-compile to the Prime's `armv7a-unknown-xous-elf`). `graffito-core` adds nothing beyond `notes-core` + `serde`.
+
+| Library | Version | License | Used for |
+|---|---|---|---|
+| [k256](https://crates.io/crates/k256) | 0.13 | Apache-2.0 OR MIT | secp256k1 math: BIP341 taproot tweak, BIP340 Schnorr signing, ECDH, and (`ecdsa` feature) RFC6979 deterministic ECDSA for BIP143 P2WPKH spending-wallet signing |
+| [sha2](https://crates.io/crates/sha2) | 0.10 | MIT OR Apache-2.0 | SHA-256 (sighashes, tagged hashes) |
+| [hkdf](https://crates.io/crates/hkdf) / [hmac](https://crates.io/crates/hmac) | 0.12 | MIT OR Apache-2.0 | Key derivation (identity, encryption, directed-note keys) |
+| [pbkdf2](https://crates.io/crates/pbkdf2) | 0.12 | MIT OR Apache-2.0 | BIP-39 mnemonic → seed (recovery seeds) |
+| [ripemd](https://crates.io/crates/ripemd) | 0.1 | MIT OR Apache-2.0 | BIP-32 key fingerprints (recovery seeds) |
+| [chacha20poly1305](https://crates.io/crates/chacha20poly1305) | 0.10 | Apache-2.0 OR MIT | XChaCha20-Poly1305 sealing of private notes |
+| [ml-kem](https://crates.io/crates/ml-kem) | 0.2 | Apache-2.0 OR MIT | FIPS 203 ML-KEM (512/768/1024) — the optional post-quantum hybrid layer on private notes (`pq.rs`; deterministic APIs only, entropy via `getrandom`) |
+| [argon2](https://crates.io/crates/argon2) | 0.5 | MIT OR Apache-2.0 | Argon2id passphrase stretching for the optional password layer on private notes |
+| [base64](https://crates.io/crates/base64) | 0.22 | MIT OR Apache-2.0 | Armored ML-KEM key import/export |
+| [bech32](https://crates.io/crates/bech32) | 0.11 | MIT | Taproot addresses (BIP350) |
+| [bs58](https://crates.io/crates/bs58) | 0.5 | MIT/Apache-2.0 | Base58check for WIF / xprv / xpub key export |
+| [getrandom](https://crates.io/crates/getrandom) | 0.2 | MIT OR Apache-2.0 | Entropy source — on a Prime, the version line its TRNG override patches (`notes-core/tests/rng_backend.rs` guards it) |
+| [miniz_oxide](https://crates.io/crates/miniz_oxide) | 0.8 | MIT OR Zlib OR Apache-2.0 | Deflate decompression of scanned bundle payloads |
+| [serde](https://crates.io/crates/serde) / [serde_json](https://crates.io/crates/serde_json) | 1 | MIT OR Apache-2.0 | Sync-bundle JSON |
+| [zeroize](https://crates.io/crates/zeroize) | 1 | Apache-2.0 OR MIT | Wiping secrets from memory |
+| [hex](https://crates.io/crates/hex) | 0.4 | MIT OR Apache-2.0 | Hex encoding (txids, exports) |
+| [bitcoin](https://crates.io/crates/bitcoin) (dev) | 0.32 | CC0-1.0 | Host-test cross-check of tx serialization/sighashes/signatures against libsecp256k1 — never a device dependency |
+| [foundation-ur](https://crates.io/crates/foundation-ur) (dev) | 0.4 | MIT | Verifies the companion's UR encoder against the exact decoder the KeyOS scanner runs |
+| [bip39](https://crates.io/crates/bip39) (dev) | 2 | CC0-1.0 | Host-test cross-check of the ported BIP-39 against an independent implementation |
 
 ## UI & QR
 

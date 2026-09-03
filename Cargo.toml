@@ -6,7 +6,10 @@ license = "Apache-2.0"
 description = "Native Mac/iOS/Android peer for Graffito (PNTE protocol)"
 
 [workspace]
-members = ["app-core"]
+# notes-core (FROZEN PNTE protocol) and graffito-core (shared UI-free policy)
+# moved here from ByteApps/prime-graffito on 2026-09-02 when the Prime app
+# was shelved; that app now pins them as git dependencies of THIS repo.
+members = ["app-core", "notes-core", "graffito-core"]
 
 # The code lives in a lib so BOTH the desktop/iOS bin (fn main) and the
 # Android cdylib (android_main, loaded by NativeActivity) can share it.
