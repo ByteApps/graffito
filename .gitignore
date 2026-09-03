@@ -67,7 +67,7 @@
 /play
 /playstore
 
-# Companion test output + Python bytecode (companion/ is the canonical
-# source of the Pages tree in docs/companion/ — scripts/publish-companion.sh)
-/companion/tests/screenshots/
+# Companion test output + Python bytecode (docs/companion/ is BOTH the
+# source and the Pages tree — editing it is publishing)
+/docs/companion/tests/screenshots/
 __pycache__/

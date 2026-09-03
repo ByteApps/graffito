@@ -102,9 +102,9 @@ cannot use it and is GPL-3.0-or-later instead.
 | [jni](https://crates.io/crates/jni) | 0.21 | MIT OR Apache-2.0 | Keystore, clipboard, intents via JNI |
 | [ndk-context](https://crates.io/crates/ndk-context) | 0.1 | MIT OR Apache-2.0 | JavaVM/Activity handles from the NativeActivity |
 
-## Companion web pages (JavaScript, vendored in `companion/`)
+## Companion web pages (JavaScript, vendored in `docs/companion/`)
 
-The companion (`companion/`, published to `docs/companion/` → [byteapps.com/graffito/companion](https://byteapps.com/graffito/companion/)) moved here from the Passport Prime app repo on 2026-09-02.
+The companion (`docs/companion/`, served by GitHub Pages at [byteapps.com/graffito/companion](https://byteapps.com/graffito/companion/)) moved here from the Passport Prime app repo on 2026-09-02.
 
 | Library | License | Used for |
 |---|---|---|

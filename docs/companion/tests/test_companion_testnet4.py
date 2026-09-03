@@ -25,7 +25,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 NOTES_CLI = REPO / "target/debug/examples/notes_cli"
 SHOTS = Path(__file__).resolve().parent / "screenshots"
 SHOTS.mkdir(exist_ok=True)

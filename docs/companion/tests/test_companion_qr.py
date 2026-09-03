@@ -14,7 +14,7 @@ Prereqs: companion/server.py serving :8091, pointed at the ONE shared
 node — the Pi's persistent regtest or testnet4 chain, never a local
 throwaway one (PLAN-one-regtest-node.md):
 
-    ../../../ui-automation/node-env.sh <regtest|testnet4> python3 companion/server.py 8091
+    ../../../../ui-automation/node-env.sh <regtest|testnet4> python3 docs/companion/server.py 8091
 
 and cargo examples built. This leg never faucets or mines — it only
 builds a bundle and round-trips it through the QR encoder/decoder — so
@@ -35,7 +35,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 BASE = "http://localhost:8091"
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 NOTES_CLI = REPO / "target/debug/examples/notes_cli"
 UR_DECODE = REPO / "target/debug/examples/ur_decode"
 SHOTS = Path(__file__).resolve().parent / "screenshots"
