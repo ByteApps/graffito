@@ -291,3 +291,47 @@ pub(crate) fn update_activity(&self, w: &AppWindow) {
     w.global::<Ui>().set_activity(VecModel::from_slice(&list));
 }
 }
+
+impl State {
+#[allow(unused_variables)]
+pub(crate) fn on_act_bump_open(&mut self, w: &AppWindow, ref_id: SharedString, is_note: bool) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        // The bump dialog prices off `st.fees.fastest` — lazily (re)fetch
+        // before either branch below reads it (network-efficiency,
+        // 2026-07-23). `watch_bump_open` also calls this — the 60s cache
+        // makes the second call here-or-there free either way.
+        s.refresh_fees_price(w);
+        if s.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
+            s.watch_bump_open(w, ref_id.to_string(), is_note);
+            return;
+        }
+        let Some(store) = &s.store else { return };
+        // CHANGE 2 defense-in-depth: the UI already hides Speed-up for a
+        // mixed record (`ActivityItem.bumpable`), but refuse here too
+        // rather than trust the tap origin.
+        if !is_note && store.txs.iter().any(|t| t.txids.iter().any(|x| x == ref_id.as_str()) && t.mixed_inputs) {
+            w.global::<Ui>().set_status("this sweep mixed notebook + spending coins — it can't be sped up (rebroadcast still works)".into());
+            return;
+        }
+        let Some((old_rate, fee, vsize)) = tx_rate(store, ref_id.as_str(), is_note) else {
+            w.global::<Ui>().set_status("can't determine current fee rate".into());
+            return;
+        };
+        // BIP-125: the replacement must add at least 1 sat/vB (incremental
+        // relay) over the original, and pay a strictly higher total fee.
+        let min_rate = old_rate + 1.0;
+        let fast = s.fees.as_ref().map(|f| f.fastest).unwrap_or(min_rate);
+        let recommended = fast.max(min_rate);
+        println!("cb: bump-open ref={ref_id} old={old_rate:.1} min={min_rate:.1}");
+        w.global::<Ui>().set_bump_ref(ref_id.clone());
+        w.global::<Ui>().set_bump_is_note(is_note);
+        w.global::<Modals>().set_bump_kind(if is_note { "Note transaction" } else { "Sweep / consolidate" }.into());
+        w.global::<Modals>().set_bump_current(format!("Currently {old_rate:.1} sat/vB · {fee} sats fee").into());
+        w.global::<Modals>().set_bump_min(format!("Minimum {min_rate:.1} sat/vB — RBF must add ≥1 sat/vB.").into());
+        w.global::<Modals>().set_bump_error("".into());
+        w.global::<Modals>().set_bump_rate(format!("{recommended:.1}").into());
+        w.global::<Modals>().set_bump_new_fee(new_fee_line(recommended, vsize, fee).into());
+        w.global::<Ui>().set_show_bump_dialog(true);
+    }
+}

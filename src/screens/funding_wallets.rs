@@ -216,3 +216,75 @@ pub(crate) fn save_funding_descriptors(&mut self, w: &AppWindow, descriptors: &[
     added
 }
 }
+
+impl State {
+#[allow(unused_variables)]
+pub(crate) fn on_add_funding_wallet(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = &mut s;
+        w.global::<Ui>().set_status("".into());
+        w.global::<FundingWalletScreen>().set_funding_descriptor("".into());
+        w.global::<FundingWalletScreen>().set_funding_feedback("".into());
+        w.global::<FundingWalletScreen>().set_funding_valid(false);
+        w.global::<Ui>().set_screen(Screen::FundingWallet);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_use_funding_wallet(&mut self, w: &AppWindow, id: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        s.activate_funding_wallet(w, id.as_str());
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_remove_funding_wallet(&mut self, w: &AppWindow, id: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        println!("cb: remove-funding-wallet");
+        s.funding_wallets.retain(|fw| fw.id != id.as_str());
+        if s.active_funding_id.as_deref() == Some(id.as_str()) {
+            s.active_funding_id = None;
+            s.funding = None;
+            s.funding_coins.clear();
+        }
+        s.save_funding_wallets();
+        s.refresh_funding_list(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_refresh_funding_wallet(&mut self, w: &AppWindow, id: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let net = s.network;
+        let Some(idx) = s.funding_wallets.iter().position(|fw| fw.id == id.as_str()) else { return };
+        let descriptor = s.funding_wallets[idx].descriptor.clone();
+        let Some(base) = s.base_url() else {
+            w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
+            return;
+        };
+        let Ok(src) = FundingSource::parse(&descriptor, net) else { return };
+        w.global::<Ui>().set_status("scanning…".into());
+        let creds = s.core_rpc_creds_for(&base, net);
+        if let Ok(client) = open_client(&base, net, creds) {
+            if let Ok(scan) = client.scan_funding(&src, 20) {
+                s.funding_wallets[idx].balance = scan.utxos.iter().map(|c| c.value).sum();
+                s.funding_wallets[idx].coins = scan.utxos.len();
+                s.funding_wallets[idx].scanned = true;
+                s.funding_wallets[idx].next_change_index = scan.next_change_index;
+                s.save_funding_wallets();
+            }
+        }
+        w.global::<Ui>().set_status("".into());
+        s.refresh_funding_list(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_fund_rename_start(&mut self, w: &AppWindow, id: SharedString, label: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = &mut s;
+        w.global::<Modals>().set_fund_rename_input(label);
+        w.global::<Ui>().set_fund_rename_id(id);
+    }
+}

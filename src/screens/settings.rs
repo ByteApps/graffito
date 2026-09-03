@@ -816,3 +816,609 @@ pub(crate) fn flush_core_rpc_migration(&mut self) {
     }
 }
 }
+
+impl State {
+#[allow(unused_variables)]
+pub(crate) fn on_set_spending_enabled(&mut self, w: &AppWindow, on: bool) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        println!("cb: set-spending enabled={on}");
+        if let Some(store) = s.store.as_mut() {
+            store.spending_set_enabled(on);
+        }
+        s.save_spending();
+        s.update_spending_ui(w);
+        if on && !s.spending_scanned {
+            s.spending_refresh_async(w);
+        }
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_spending_refresh(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        s.spending_refresh_async(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_open_coins(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        println!("cb: open-coins");
+        s.update_home(w);
+        s.update_spending_ui(w);
+        if w.global::<Ui>().get_coins_segment() == "spending" && s.spending_capable && !s.spending_scanned {
+            s.spending_refresh_async(w);
+        }
+        w.global::<Ui>().set_status("".into());
+        w.global::<Ui>().set_screen(Screen::Coins);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_open_source(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = (&w, &mut s);
+        println!("cb: open-source");
+        let _ = platform::open_url(SOURCE_URL);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_sweep_open(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        println!("cb: sweep-open");
+        // The send-to picker's sweep entry lands on screen 16 (fee tiers
+        // shown) once a destination is picked — lazily (re)fetch here so
+        // it's ready by then (network-efficiency, 2026-07-23).
+        s.refresh_fees_price(w);
+        s.pending_spending_sweep_index = None; // a fresh manual pick, not the spending-wallet shortcut
+        // A wallet sweep's inputs include spending-wallet coins — ALWAYS kick
+        // a fresh scan here (not just when never-scanned). A prior scan can be
+        // stale: coins may have arrived since, or gap-discovery may not have
+        // reached the funded index yet, which showed ONLY notebook coins in
+        // the sweep preview until the user backed out and re-entered. The scan
+        // runs while the user is on the picker; apply_spending_refresh_results
+        // repaints screen 16 with the spending coins when it lands.
+        if s.spending_capable
+            && s.store.as_ref().map(|st| st.spending.enabled).unwrap_or(false)
+        {
+            s.spending_refresh_async(w);
+        }
+        w.global::<Ui>().set_sweep_kind("sweep".into());
+        w.global::<Ui>().set_pick_mode("sweep".into());
+        s.pull_icloud_contacts_on_open(w);
+        w.global::<Ui>().set_contact_input("".into());
+        w.global::<Ui>().set_status("".into());
+        w.global::<Ui>().set_screen(Screen::Contacts);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_spending_sweep_here(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        s.ensure_spending_source();
+        let Some(src) = s.spending_source.clone() else {
+            w.global::<Ui>().set_status("spending wallet unavailable for this identity".into());
+            return;
+        };
+        let Some(idx) = s.store.as_ref().map(|st| st.spending.next_receive) else { return };
+        let Ok(d) = src.derive(0, idx) else { return };
+        s.pending_spending_sweep_index = Some(idx);
+        w.global::<Ui>().set_sweep_kind("sweep".into());
+        w.global::<Ui>().set_pick_mode("sweep".into());
+        s.set_sweep_dest(w, d.address);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_open_info(&mut self, w: &AppWindow, kind: slint::SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = &mut s;
+        let (title, body): (&str, String) = match kind.as_str() {
+            "about" => ("About", about_body()),
+            "privacy" => ("Privacy", PRIVACY.to_string()),
+            "help" => ("Help", HELP.to_string()),
+            "faq" => ("Q & A", FAQ.to_string()),
+            // Terms & disclaimer re-views through the SAME info screen (25) as
+            // the others, so Settings sub-screens share one scroll-top UX. The
+            // centered screen 24 is now purely the first-run accept gate.
+            "terms" => ("Terms & disclaimer", DISCLAIMER.to_string()),
+            _ => return,
+        };
+        w.global::<Info>().set_info_title(title.into());
+        w.global::<Info>().set_info_body(body.as_str().into());
+        // The Slint attribution rides the About entry only. Section 2 of the
+        // Slint Royalty-free license makes it a condition of the grant, so
+        // this flag is load-bearing, not cosmetic — see THIRD-PARTY.md.
+        w.global::<Info>().set_info_show_slint(kind.as_str() == "about");
+        w.global::<Ui>().set_screen(Screen::Info);
+        println!("cb: open-info {kind}");
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_open_account_picker(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let Some(material) = s.material.as_ref().map(|z| String::from(z.as_str())) else { return };
+        println!("cb: account-picker open");
+        let page = s.account / 5;
+        w.global::<AccountPicker>().set_account_pick_mode("switch".into());
+        show_account_picker(w, &material, s.network, page, Some(s.account));
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_set_network(&mut self, w: &AppWindow, net: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let Some(n) = Network::from_str_opt(net.as_str()) else { return };
+        if n == s.network {
+            return;
+        }
+        s.network = n;
+        println!("cb: set-network {}", s.network.as_str());
+        s.save_config();
+        // Notebooks are PER-NETWORK (`notebooks-<net>-<fp8>.json`), so a
+        // network is a wallet context exactly like an account is — reset to
+        // notebook 0 the same way the Settings account switch does, or the
+        // active index would carry over to a chain that may not list it.
+        s.nb_index = 0;
+        // Same key material, new network: re-derive + reload store.
+        let material = std::env::var("APP_KEY")
+            .ok()
+            .or_else(|| s.material.as_ref().map(|z| String::from(z.as_str())));
+        if let Some(m) = material {
+            match s.activate(&m, false) {
+                Ok(()) => {
+                    // A network this key has never touched starts with an
+                    // EMPTY index, so the switch used to land on an empty
+                    // notebook list (Sal 2026-08-01). Auto-create its first
+                    // notebook, same guard and same wording as the account
+                    // switch above. Safe w.r.t. gap discovery: activate()
+                    // already decided `discovery_pending` from whether the
+                    // index FILE existed, so writing an entry now cannot
+                    // suppress the probe that recovers a used seed's other
+                    // notebooks — it just means index 0 is listed first.
+                    let empty = s
+                        .notebooks
+                        .as_ref()
+                        .map(|ix| ix.active(s.account).count() == 0)
+                        .unwrap_or(true);
+                    if empty {
+                        s.ensure_first_onboarded_notebook();
+                    }
+                    s.update_home(w);
+                    s.update_notebook_list(w);
+                    s.refresh_async(w);
+                    s.spending_refresh_async(w); // CHANGE 5
+                }
+                Err(e) => w.global::<Ui>().set_status(format!("network switch: {e}").into()),
+            }
+        }
+        w.global::<Settings>().set_settings_network(s.network.as_str().into());
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_set_chunk(&mut self, w: &AppWindow, t: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        match t.trim().parse::<usize>() {
+            Ok(n) if (20..=100_000).contains(&n) => {
+                if let Some(store) = &mut s.store {
+                    store.chunk_size = n;
+                }
+                s.save_store();
+                s.chunk = Some(n); // device-level: every notebook, on activate
+                s.save_config();
+                println!("cb: set-chunk-size {n} ok");
+                w.global::<Settings>().set_chunk_text(n.to_string().into());
+                if n == 100_000 || n == 80 {
+                    w.global::<Settings>().set_chunk_custom(false);
+                }
+                w.global::<Ui>().set_status("".into());
+            }
+            _ => {
+                println!("cb: set-chunk-size err=range");
+                w.global::<Ui>().set_status("chunk bytes must be 20..=100000".into());
+            }
+        }
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_set_locktime(&mut self, w: &AppWindow, mode: SharedString, height: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let policy = parse_locktime_mode(mode.as_str(), height.as_str());
+        let Some(policy) = policy else {
+            println!("cb: set-locktime err=range");
+            w.global::<Ui>().set_status("locktime must be a block height below 500000000".into());
+            return;
+        };
+        s.lock_time_policy = policy;
+        if let Some(store) = &mut s.store {
+            store.lock_time = policy; // device-level: every notebook, on activate
+        }
+        s.save_store();
+        s.save_config();
+        let effective = s.lock_time();
+        println!("cb: set-locktime {} effective={effective} ok", policy.as_str());
+        w.global::<Settings>().set_locktime_mode(policy.as_str().into());
+        w.global::<Settings>().set_locktime_text(effective.to_string().into());
+        w.global::<Settings>().set_locktime_effective(locktime_caption(policy, s.store.as_ref().map(|st| st.tip_height)).into());
+        w.global::<Ui>().set_status("".into());
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_set_node_preset(&mut self, w: &AppWindow, i: i32) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let net = s.network.as_str().to_string();
+        let presets = node_presets(s.network);
+        let i = i as usize;
+        if i < presets.len() {
+            match presets[i].1 {
+                Some(url) => { s.node_urls.insert(net, url.to_string()); }
+                None => { s.node_urls.remove(&net); }
+            }
+            s.save_config();
+            println!("cb: set-node-preset {}", presets[i].0);
+        } else if i == presets.len() {
+            println!("cb: set-node-preset core");
+        } else {
+            println!("cb: set-node-preset custom");
+        }
+        w.global::<Ui>().set_status("".into());
+        // Every preset is Esplora — this both clears a previously-active
+        // Core node's credential fields/health line and is a no-op (no
+        // network call) whenever the picker was already on Esplora.
+        s.refresh_node_health(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_set_node_address(&mut self, w: &AppWindow, t: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let net = s.network.as_str().to_string();
+        match compose_core_url(t.trim(), s.network) {
+            Ok((v, inline_creds)) => {
+                s.node_urls.insert(net.clone(), v.clone());
+                s.save_config();
+                println!("cb: set-node-address {v}");
+                if let Some((user, pass)) = &inline_creds {
+                    let persist = s.core_rpc_should_persist(s.network);
+                    let result = route_core_rpc_creds(
+                        persist,
+                        &net,
+                        user,
+                        pass,
+                        &mut s.core_rpc_session_creds,
+                        |u, p| keychain::store_rpc_creds(&net, u, p),
+                        || keychain::delete_rpc_creds(&net),
+                    );
+                    match result {
+                        Ok(()) => println!(
+                            "cb: set-node-address inline-creds redacted stored=ok persist={persist}"
+                        ),
+                        Err(e) => {
+                            println!("cb: set-node-address inline-creds redacted stored=err ({e})")
+                        }
+                    }
+                }
+                w.global::<Ui>().set_node_address_text(display_core_url(&v).into());
+                w.global::<Ui>().set_status("".into());
+            }
+            Err(msg) => {
+                println!("cb: set-node-address err={msg}");
+                w.global::<Ui>().set_status(format!("Bitcoin node address: {msg}").into());
+            }
+        }
+        s.refresh_node_health(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_set_node_custom(&mut self, w: &AppWindow, t: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let net = s.network.as_str().to_string();
+        // Strip any inline `user:pass@` userinfo BEFORE it ever reaches
+        // config.json or this `cb:` log line (plan §2.4 — "the stored node
+        // URL must contain NO credentials"). A pasted
+        // `bitcoind+http://user:pass@host:8332` is routed exactly like the
+        // credential fields below (`route_core_rpc_creds` — Keychain when
+        // the "Save credentials" switch is on, the session-only slot when
+        // it's off, so a pasted credential can't become a persisted one
+        // behind the user's back); the value that gets
+        // stored/logged/displayed is always the creds-free form.
+        let (v, inline_creds) = split_url_userinfo(t.trim());
+        if v.is_empty() {
+            s.node_urls.remove(&net);
+        } else {
+            s.node_urls.insert(net.clone(), v.clone());
+        }
+        s.save_config();
+        println!("cb: set-node-custom {}", if v.is_empty() { "default" } else { &v });
+        if let Some((user, pass)) = &inline_creds {
+            let persist = s.core_rpc_should_persist(s.network);
+            let result = route_core_rpc_creds(
+                persist,
+                &net,
+                user,
+                pass,
+                &mut s.core_rpc_session_creds,
+                |u, p| keychain::store_rpc_creds(&net, u, p),
+                || keychain::delete_rpc_creds(&net),
+            );
+            match result {
+                Ok(()) => println!(
+                    "cb: set-node-custom inline-creds redacted stored=ok persist={persist}"
+                ),
+                Err(e) => println!("cb: set-node-custom inline-creds redacted stored=err ({e})"),
+            }
+        }
+        w.global::<Ui>().set_status("".into());
+        s.refresh_node_health(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_set_node_core_creds(&mut self, w: &AppWindow, user: SharedString, pass: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let net = s.network.as_str().to_string();
+        let user = user.trim().to_string();
+        let pass = pass.to_string();
+        let persist = s.core_rpc_should_persist(s.network);
+        let result = route_core_rpc_creds(
+            persist,
+            &net,
+            &user,
+            &pass,
+            &mut s.core_rpc_session_creds,
+            |u, p| keychain::store_rpc_creds(&net, u, p),
+            || keychain::delete_rpc_creds(&net),
+        );
+        match &result {
+            Ok(()) => println!(
+                "cb: set-node-core-creds ok user_len={} pass_len={} persist={persist}",
+                user.len(),
+                pass.len()
+            ),
+            Err(e) => println!("cb: set-node-core-creds err={e}"),
+        }
+        w.global::<Ui>().set_status(if result.is_ok() { "".into() } else { "couldn't save RPC credentials".into() });
+        s.refresh_node_health(w);
+        if result.is_err() {
+            // A FAILED save stored nothing, so the refresh above resolves
+            // this network's credentials as absent and empties the fields —
+            // destroying what the user typed on top of not saving it. Put
+            // it back so they can fix the cause and press Save again
+            // (reproducible on any unsigned dev build, where SecItemAdd
+            // returns -34018).
+            w.global::<Settings>().set_node_core_user(user.as_str().into());
+            w.global::<Settings>().set_node_core_pass(pass.as_str().into());
+        }
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_set_node_core_save_creds(&mut self, w: &AppWindow, enabled: bool) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let net = s.network.as_str().to_string();
+        let net_key = net.clone();
+        let user = w.global::<Settings>().get_node_core_user().to_string();
+        let pass = w.global::<Settings>().get_node_core_pass().to_string();
+        let result = apply_core_rpc_persist_toggle(
+            enabled,
+            &user,
+            &pass,
+            || keychain::delete_rpc_creds(&net),
+            |u, p| keychain::store_rpc_creds(&net, u, p),
+        );
+        match result {
+            Ok(session) => {
+                s.core_rpc_save_creds.insert(net_key.clone(), enabled);
+                match session {
+                    Some(entry) => {
+                        s.core_rpc_session_creds.insert(net_key, entry);
+                    }
+                    None => {
+                        s.core_rpc_session_creds.remove(&net_key);
+                    }
+                }
+                s.save_config();
+                println!("cb: set-node-core-save-creds {enabled} ok");
+            }
+            Err(e) => {
+                w.global::<Settings>().set_node_core_save_creds(!enabled);
+                println!("cb: set-node-core-save-creds {enabled} err={e}");
+            }
+        }
+        s.update_node_backend_ui(w);
+        s.refresh_node_health(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_set_explorer_preset(&mut self, w: &AppWindow, i: i32) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let net = s.network.as_str().to_string();
+        let presets = explorer_presets(s.network);
+        let i = i as usize;
+        if i < presets.len() {
+            match presets[i].1 {
+                Some(url) => { s.explorers.insert(net, url.to_string()); }
+                None => { s.explorers.remove(&net); }
+            }
+            s.save_config();
+            s.update_activity(w); // refresh live Explorer links
+            println!("cb: set-explorer-preset {}", presets[i].0);
+        } else {
+            println!("cb: set-explorer-preset custom");
+        }
+        w.global::<Ui>().set_status("".into());
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_set_explorer_custom(&mut self, w: &AppWindow, t: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let net = s.network.as_str().to_string();
+        let v = t.trim().to_string();
+        if v.is_empty() {
+            s.explorers.remove(&net);
+        } else {
+            s.explorers.insert(net, v.clone());
+        }
+        s.save_config();
+        s.update_activity(w); // refresh live Explorer links
+        println!("cb: set-explorer-custom {}", if v.is_empty() { "default" } else { &v });
+        w.global::<Ui>().set_status("".into());
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_reveal_public(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let material = std::env::var("APP_KEY")
+            .ok()
+            .or_else(|| s.material.as_ref().map(|z| String::from(z.as_str())));
+        let Some(material) = material else {
+            w.global::<PublicKeys>().set_reveal_public_rows(VecModel::from_slice(&Vec::<RevealRow>::new()));
+            w.global::<Ui>().set_reveal_fingerprint("".into());
+            w.global::<Ui>().set_reveal_public_hint(
+                "No key material cached this session — open Private keys once (it re-authenticates), or restart the app."
+                    .into(),
+            );
+            w.global::<Ui>().set_screen(Screen::PublicKeys);
+            println!("cb: reveal-public no-material");
+            return;
+        };
+        match app_core::keyexport::export_formats(&material, s.network, s.account, s.nb_index) {
+            Ok(f) => {
+                let mut rows: Vec<RevealRow> = Vec::new();
+                if let Some(v) = f.account_xpub.as_deref() {
+                    rows.push(RevealRow {
+                        label: "Account xpub".into(),
+                        value: v.into(),
+                        qr: qr::qr_image(v).unwrap_or_default(),
+                        expanded: false,
+                    });
+                }
+                if let Some(v) = f.descriptor.as_deref() {
+                    rows.push(RevealRow {
+                        label: "Descriptor (tr)".into(),
+                        value: v.into(),
+                        qr: qr::qr_image(v).unwrap_or_default(),
+                        expanded: false,
+                    });
+                }
+                let fp_line = match f.fingerprint.as_deref() {
+                    Some(fp) => format!("{fp} · account {}", s.account),
+                    None => format!("account {}", s.account),
+                };
+                println!("cb: reveal-public ok rows={}", rows.len());
+                w.global::<Ui>().set_reveal_fingerprint(fp_line.into());
+                w.global::<PublicKeys>().set_reveal_public_rows(VecModel::from_slice(&rows));
+                // A single hex/WIF key import has a leaf key but no account
+                // node — legitimately nothing public to export. Explain the
+                // empty screen instead of leaving it blank.
+                w.global::<Ui>().set_reveal_public_hint(if rows.is_empty() {
+                    "This key has no account-level public material — a single hex/WIF import can't yield a watch-only xpub or descriptor.".into()
+                } else {
+                    "".into()
+                });
+            }
+            Err(e) => {
+                w.global::<PublicKeys>().set_reveal_public_rows(VecModel::from_slice(&Vec::<RevealRow>::new()));
+                w.global::<Ui>().set_reveal_public_hint(format!("Couldn't derive public keys: {e}").into());
+                println!("cb: reveal-public err");
+            }
+        }
+        w.global::<Ui>().set_screen(Screen::PublicKeys);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_reveal_private(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        match keychain::reveal_secret(KEYCHAIN_ACCOUNT, "reveal your keys") {
+            Ok(Some(secret)) => {
+                match app_core::keyexport::export_formats(&secret, s.network, s.account, s.nb_index)
+                {
+                    Ok(f) => {
+                        let fp_line = match f.fingerprint.as_deref() {
+                            Some(fp) => format!("{fp} · account {}", s.account),
+                            None => format!("account {}", s.account),
+                        };
+                        w.global::<Ui>().set_reveal_fingerprint(fp_line.into());
+                        w.global::<PrivateKeys>().set_reveal_has_recovery(f.mnemonic.is_some());
+                        w.global::<PrivateKeys>().set_reveal_has_xprv(f.account_xprv.is_some());
+                        w.global::<PrivateKeys>().set_reveal_has_hex(f.leaf_hex.is_some());
+                        w.global::<PrivateKeys>().set_reveal_has_wif(f.leaf_wif.is_some());
+                        // Nothing selected yet — the screen shows only the
+                        // pills until one is tapped.
+                        w.global::<Ui>().set_reveal_private_format("".into());
+                        w.global::<PrivateKeys>().set_reveal_private_value("".into());
+                        w.global::<PrivateKeys>().set_reveal_private_qr(slint::Image::default());
+                        w.global::<PrivateKeys>().set_reveal_words_col1("".into());
+                        w.global::<PrivateKeys>().set_reveal_words_col2("".into());
+                        w.global::<PrivateKeys>().set_reveal_show_seedqr(false);
+                        w.global::<PrivateKeys>().set_reveal_seedqr_image(slint::Image::default());
+                        // Hex/WIF picker: the active account's notebooks,
+                        // defaulting to the active notebook. Hidden in the UI
+                        // for recovery/xprv, but harmless to populate always.
+                        w.global::<PrivateKeys>().set_reveal_nb_rows(VecModel::from_slice(&s.private_nb_rows()));
+                        w.global::<PrivateKeys>().set_reveal_nb_index(s.nb_index as i32);
+                        println!("cb: reveal-private ok");
+                        s.reveal_formats = Some(f);
+                        w.global::<Ui>().set_status("".into());
+                        w.global::<Ui>().set_screen(Screen::PrivateKeys);
+                    }
+                    Err(e) => {
+                        println!("cb: reveal-private err");
+                        w.global::<Ui>().set_status(format!("export: {e}").into());
+                    }
+                }
+            }
+            Ok(None) => {
+                println!("cb: reveal-private no-key");
+                w.global::<Ui>().set_status("(no key in keychain — APP_KEY env session?)".into());
+            }
+            Err(e) if e == "cancelled" => {
+                println!("cb: reveal-private cancelled");
+                w.global::<Ui>().set_status("authentication cancelled".into());
+            }
+            Err(e) => {
+                println!("cb: reveal-private err");
+                w.global::<Ui>().set_status(format!("keychain: {e}").into());
+            }
+        }
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_open_pq_keys(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        // User-initiated — the LAUNCH-PATH rule's other sanctioned door for
+        // loading an imported ML-KEM secret from the Keychain this session
+        // (a no-op once already cached).
+        s.ensure_pq_imported_loaded();
+        w.global::<QuantumKeys>().set_pq_import_text("".into());
+        w.global::<QuantumKeys>().set_pq_import_error("".into());
+        w.global::<Ui>().set_pq_import_source("".into());
+        w.global::<Ui>().set_pq_show_backup_confirm(false);
+        w.global::<QuantumKeys>().set_pq_gen_level("768".into());
+        w.global::<QuantumKeys>().set_pq_gen_extra("".into());
+        w.global::<Ui>().set_pq_show_replace_confirm(false);
+        w.global::<Ui>().set_pq_show_export_private_confirm(false);
+        w.global::<Modals>().set_pq_imported_private_value("".into());
+        w.global::<Modals>().set_pq_imported_private_qr(slint::Image::default());
+        s.pq_pending_replace = None;
+        s.update_pq_keys_screen(w);
+        w.global::<Ui>().set_screen(Screen::QuantumKeys);
+        // Log-contract landing signal (graffito-app-selfpq.sh) — emitted
+        // LAST, after ensure_pq_imported_loaded (which blocks on a
+        // SecurityAgent keychain prompt on a freshly-resigned debug build)
+        // and set_screen, so it fires only once the screen is truly shown.
+        println!("cb: pq-keys open");
+    }
+}

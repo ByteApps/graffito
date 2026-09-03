@@ -683,3 +683,393 @@ pub(crate) fn set_confirm_from_psbt(&mut self, w: &AppWindow, psbt: bitcoin::Psb
     st.show_confirm(w, pending, confirm_ctx);
 }
 }
+
+impl State {
+#[allow(unused_variables)]
+pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        if s.wallet_tx_busy {
+            return;
+        }
+        let Some(pending) = s.pending_broadcast.clone() else { return };
+        println!("cb: confirm broadcast kind={} txid={}", pending.kind, pending.txid);
+        match pending.payload {
+            PendingPayload::Psbt => {
+                // Self-managed: reads State.signed_psbt directly, sets its
+                // own wallet_tx_busy, pushes PSBT_BROADCAST_RESULTS. Leaving
+                // `pending_broadcast` in place lets a failed POST be retried
+                // by tapping Broadcast again (re-invokes this same path).
+                // U4: `on_psbt_broadcast` is a method now (not a fresh
+                // `st.borrow_mut()`), so a direct call replaces the old
+                // `drop(s); w.global::<Ui>().invoke_psbt_broadcast();` —
+                // sequential method calls on the same `&mut self` need no
+                // drop; that dance was only ever for the shared RefCell.
+                s.on_psbt_broadcast(w);
+            }
+            PendingPayload::Compose { composed, text, private, change_to, created_at, to } => {
+                let Some(base) = s.base_url() else {
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                // Record-before-POST, moved here from stage A: exactly what
+                // `compose_and_record` used to do before its own broadcast
+                // call. Recording is one-shot, so drop `pending_broadcast`
+                // now — a failed POST is retried from Activity's
+                // Rebroadcast (existing `apply_notebook_compose_result`
+                // behavior, unchanged), never by re-tapping this button.
+                if let Some(store) = s.store.as_mut() {
+                    app_core::compose::record_composed_note(
+                        store,
+                        &text,
+                        private,
+                        change_to.as_deref(),
+                        created_at,
+                        &composed,
+                    );
+                }
+                s.save_store();
+                // Device-level contacts (iCloud-contacts feature): touch
+                // every recipient here too — `record_composed_note` still
+                // touches the per-notebook `Store.contacts` internally (kept
+                // for serde back-compat; no longer read anywhere), but the
+                // recents list the picker actually shows now lives on
+                // `State.contacts`.
+                if composed.recipients.is_empty() {
+                    if let Some(addr) = &to {
+                        s.touch_contact(addr);
+                    }
+                } else {
+                    for addr in &composed.recipients {
+                        s.touch_contact(addr);
+                    }
+                }
+                s.save_contacts();
+                s.pending_broadcast = None;
+                s.wallet_tx_busy = true;
+                w.global::<Confirm>().set_wallet_tx_busy(true);
+                let note_id = composed.note_id.clone();
+                let fee = composed.tx.fee;
+                let vsize = composed.tx.vsize;
+                let pq_flags = composed.pq_flags;
+                let raw = pending.raw_hex.clone();
+                let creds = s.core_rpc_creds_for(&base, net);
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
+                    NOTEBOOK_COMPOSE_RESULTS.lock().expect("notebook compose results mutex").push(
+                        NotebookComposeResult { note_id, fee, vsize, to, private, pq_flags, result },
+                    );
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_compose());
+                });
+            }
+            PendingPayload::ComposeSpending {
+                text,
+                private,
+                to,
+                recipients,
+                gift,
+                built_fee,
+                built_change,
+                spent_outpoints,
+                change_index,
+                change_raw,
+                source,
+            } => {
+                let Some(base) = s.base_url() else {
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                s.wallet_tx_busy = true;
+                w.global::<Confirm>().set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let txid = pending.txid.clone();
+                let vsize = pending.vsize;
+                let creds = s.core_rpc_creds_for(&base, net);
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
+                    SPENDING_COMPOSE_RESULTS.lock().expect("spending compose results mutex").push(
+                        SpendingComposeResult {
+                            text,
+                            private,
+                            to,
+                            recipients,
+                            gift,
+                            raw,
+                            txid,
+                            vsize,
+                            built_fee,
+                            built_change,
+                            spent_outpoints,
+                            change_index,
+                            change_raw,
+                            source,
+                            result,
+                        },
+                    );
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_compose());
+                });
+            }
+            PendingPayload::ComposeMixed {
+                text,
+                private,
+                to,
+                recipients,
+                gift,
+                built_fee,
+                built_change,
+                change_default,
+                notebook_spent,
+                spent_spending,
+                change_spent,
+                payloads_len,
+                recipient_count,
+                change_index,
+                spending_source,
+            } => {
+                let Some(base) = s.base_url() else {
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                s.wallet_tx_busy = true;
+                w.global::<Confirm>().set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let txid = pending.txid.clone();
+                let vsize = pending.vsize;
+                let creds = s.core_rpc_creds_for(&base, net);
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
+                    MIXED_COMPOSE_RESULTS.lock().expect("mixed compose results mutex").push(
+                        MixedComposeResult {
+                            text,
+                            private,
+                            to,
+                            recipients,
+                            gift,
+                            raw,
+                            txid,
+                            vsize,
+                            built_fee,
+                            built_change,
+                            change_default,
+                            notebook_spent,
+                            spent_spending,
+                            change_spent,
+                            payloads_len,
+                            recipient_count,
+                            change_index,
+                            spending_source,
+                            result,
+                        },
+                    );
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_compose());
+                });
+            }
+            // ---- sweep / consolidate / wconsol / spending-consolidate:
+            // stage A already built + signed (see `build_sweep_confirm`
+            // et al.); stage B synchronously returns to the ORIGIN screen
+            // (`pending.return_screen`) — mirroring the removed confirm
+            // modals, which closed in place while the broadcast ran in the
+            // background — then spawns the pre-existing thread-spawn
+            // verbatim, pushing into the SAME result queue their (UNTOUCHED)
+            // `apply_*_broadcast_result` already drains via the shared
+            // `apply-pending-wallet-tx` trampoline.
+            PendingPayload::Sweep { snap } => {
+                let Some(base) = s.base_url() else {
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                w.global::<Ui>().set_screen(pending.return_screen);
+                s.wallet_tx_busy = true;
+                w.global::<Confirm>().set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let creds = s.core_rpc_creds_for(&base, net);
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
+                    SWEEP_BROADCAST_RESULTS
+                        .lock()
+                        .expect("sweep broadcast results mutex")
+                        .push(SweepBroadcastResult { snap, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
+                });
+            }
+            PendingPayload::Consolidate { snap } => {
+                let Some(base) = s.base_url() else {
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                w.global::<Ui>().set_screen(pending.return_screen);
+                s.wallet_tx_busy = true;
+                w.global::<Confirm>().set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let creds = s.core_rpc_creds_for(&base, net);
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
+                    CONSOLIDATE_BROADCAST_RESULTS
+                        .lock()
+                        .expect("consolidate broadcast results mutex")
+                        .push(ConsolidateBroadcastResult { snap, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
+                });
+            }
+            PendingPayload::WConsol { snap } => {
+                let Some(base) = s.base_url() else {
+                    w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
+                    return;
+                };
+                let net = snap.network;
+                s.pending_broadcast = None;
+                w.global::<Ui>().set_screen(pending.return_screen);
+                s.wallet_tx_busy = true;
+                w.global::<Confirm>().set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let creds = s.core_rpc_creds_for(&base, net);
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
+                    WCONSOL_BROADCAST_RESULTS
+                        .lock()
+                        .expect("wconsol broadcast results mutex")
+                        .push(WConsolBroadcastResult { snap, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
+                });
+            }
+            PendingPayload::SpendingConsolidate { snap } => {
+                let Some(base) = s.base_url() else {
+                    w.global::<Ui>().set_status("no Bitcoin node for this network — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                w.global::<Ui>().set_screen(pending.return_screen);
+                s.wallet_tx_busy = true;
+                w.global::<Confirm>().set_wallet_tx_busy(true);
+                let raw = pending.raw_hex.clone();
+                let creds = s.core_rpc_creds_for(&base, net);
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
+                    SPENDING_CONSOLIDATE_RESULTS
+                        .lock()
+                        .expect("spending consolidate results mutex")
+                        .push(SpendingConsolidateResult { snap, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_wallet_tx());
+                });
+            }
+            // ---- bump / rebroadcast: stage B re-arms `act_pending_ref`
+            // (the Activity row's own busy guard — screen 26 briefly, then
+            // back on the Activity screen while the POST runs) and spawns
+            // the SAME broadcast worker their (UNTOUCHED) apply_act_*
+            // functions already drain.
+            PendingPayload::Bump { ref_id, fee, new_rate, bumped } => {
+                let Some(base) = s.base_url() else {
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                // Record-before-POST, moved here from stage A (zero-trace
+                // cancel fix): apply the exact mutation the one-shot
+                // bump_* functions used to make — replacement txid append,
+                // fee/vsize/raw_hex update, and (notes) the ledger change
+                // swap — then save, exactly like the Compose arm. A failed
+                // POST leaves a retryable record with the replacement hex
+                // in hand (`apply_act_bump_results` behavior, unchanged).
+                // PLAN-pnte-redesign.md: a note bump RENAMES the record's
+                // id to the replacement's txid (the note id IS the txid),
+                // so the busy-row marker below must follow the rename — a
+                // sweep/consolidate bump keeps using `ref_id` (its identity
+                // is the whole `txids` history, never renamed).
+                let mut renamed_note_id: Option<String> = None;
+                if let Some(store) = s.store.as_mut() {
+                    match &bumped {
+                        BumpedBuild::Note(c) => {
+                            renamed_note_id = app_core::compose::record_bumped_note(store, &ref_id, c);
+                        }
+                        BumpedBuild::Tx(tx) => {
+                            app_core::compose::record_bumped_tx(store, &ref_id, tx)
+                        }
+                    }
+                }
+                s.save_store();
+                s.pending_broadcast = None;
+                w.global::<Ui>().set_screen(pending.return_screen);
+                s.act_pending_ref = Some(renamed_note_id.clone().unwrap_or_else(|| ref_id.clone()));
+                s.update_activity(w);
+                let raw = pending.raw_hex.clone();
+                let txid = pending.txid.clone();
+                let creds = s.core_rpc_creds_for(&base, net);
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
+                    ACT_BUMP_RESULTS
+                        .lock()
+                        .expect("act-bump results mutex")
+                        .push(ActBumpResult { ref_id, txid, fee, new_rate, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_act_bump());
+                });
+            }
+            PendingPayload::Rebroadcast { ref_id } => {
+                let Some(base) = s.base_url() else {
+                    w.global::<Ui>().set_status("no Bitcoin node — set one in Settings".into());
+                    return;
+                };
+                let net = s.network;
+                s.pending_broadcast = None;
+                w.global::<Ui>().set_screen(pending.return_screen);
+                s.act_pending_ref = Some(ref_id.clone());
+                s.update_activity(w);
+                let raw = pending.raw_hex.clone();
+                let creds = s.core_rpc_creds_for(&base, net);
+                let weak = w.as_weak();
+                std::thread::spawn(move || {
+                    let _net_guard = NetOpGuard::new(weak.clone());
+                    let result = open_client(&base, net, creds)
+                        .map_err(|e| e.to_string())
+                        .and_then(|client| client.broadcast(&raw).map_err(|e| format!("{e}")));
+                    ACT_RETRY_RESULTS
+                        .lock()
+                        .expect("act-retry results mutex")
+                        .push(ActRetryResult { ref_id, result });
+                    let _ = weak.upgrade_in_event_loop(|w| w.global::<Ui>().invoke_apply_pending_act_retry());
+                });
+            }
+        }
+    }
+}
