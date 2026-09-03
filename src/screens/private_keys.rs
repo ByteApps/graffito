@@ -73,3 +73,82 @@ pub(crate) fn private_nb_rows(&self) -> Vec<NbPickRow> {
         .collect()
 }
 }
+
+impl State {
+#[allow(unused_variables)]
+pub(crate) fn on_private_select(&mut self, w: &AppWindow, fmt: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let fmt = fmt.as_str();
+        if fmt == "hex" || fmt == "wif" {
+            let Some(v) = s.derive_leaf_value(w, fmt) else { return };
+            w.global::<PrivateKeys>().set_reveal_show_seedqr(false);
+            w.global::<PrivateKeys>().set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
+            w.global::<PrivateKeys>().set_reveal_private_value(v.into());
+            w.global::<Ui>().set_reveal_private_format(fmt.into());
+            println!("cb: private-select fmt={fmt}");
+            return;
+        }
+        let Some(f) = s.reveal_formats.as_ref() else { return };
+        w.global::<PrivateKeys>().set_reveal_show_seedqr(false);
+        match fmt {
+            "recovery" => {
+                let Some(words) = f.mnemonic.as_ref().map(|z| z.as_str().to_string()) else {
+                    return;
+                };
+                let list: Vec<&str> = words.split_whitespace().collect();
+                let half = list.len() / 2;
+                let col = |range: std::ops::Range<usize>| -> String {
+                    range
+                        .map(|i| format!("{:2}. {}", i + 1, list[i]))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                w.global::<PrivateKeys>().set_reveal_words_col1(col(0..half).into());
+                w.global::<PrivateKeys>().set_reveal_words_col2(col(half..list.len()).into());
+                if let Ok(m) = bip39::Mnemonic::parse(&words) {
+                    let digits = app_core::seedqr::encode_standard(&m);
+                    w.global::<PrivateKeys>().set_reveal_seedqr_image(qr::qr_image(&digits).unwrap_or_default());
+                }
+                w.global::<PrivateKeys>().set_reveal_private_value(words.into());
+                w.global::<PrivateKeys>().set_reveal_private_qr(slint::Image::default());
+            }
+            "xprv" => {
+                let Some(v) = f.account_xprv.as_ref().map(|z| z.as_str().to_string()) else {
+                    return;
+                };
+                w.global::<PrivateKeys>().set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
+                w.global::<PrivateKeys>().set_reveal_private_value(v.into());
+            }
+            // hex/wif are handled above (picker-aware, returns early).
+            _ => return,
+        }
+        w.global::<Ui>().set_reveal_private_format(fmt.into());
+        println!("cb: private-select fmt={fmt}");
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_private_pick_notebook(&mut self, w: &AppWindow, index: i32) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        w.global::<PrivateKeys>().set_reveal_nb_index(index);
+        println!("cb: private-pick-notebook index={index}");
+        let fmt = w.global::<Ui>().get_reveal_private_format().to_string();
+        if fmt != "hex" && fmt != "wif" {
+            return;
+        }
+        let Some(v) = s.derive_leaf_value(w, &fmt) else { return };
+        w.global::<PrivateKeys>().set_reveal_private_qr(qr::qr_image(&v).unwrap_or_default());
+        w.global::<PrivateKeys>().set_reveal_private_value(v.into());
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_copy_secret(&mut self, w: &AppWindow, value: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = &mut s;
+        let ok = platform::set_clipboard_secret(value.as_str());
+        println!("cb: copy-secret len={}", value.len());
+        show_toast(w, if ok { "Copied" } else { "Copy failed" });
+    }
+}

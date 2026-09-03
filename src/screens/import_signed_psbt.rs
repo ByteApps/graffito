@@ -34,3 +34,17 @@ pub(crate) fn load_signed_psbt(&mut self, w: &AppWindow, data: &[u8]) {
     }
 }
 }
+
+impl State {
+#[allow(unused_variables)]
+pub(crate) fn on_psbt_import_file(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        if let Some(path) = platform::pick_file(&[("PSBT", &["psbt", "txt"])]) {
+            match std::fs::read(&path) {
+                Ok(bytes) => s.load_signed_psbt(w, &bytes),
+                Err(e) => w.global::<Ui>().set_status(format!("read failed: {e}").into()),
+            }
+        }
+    }
+}

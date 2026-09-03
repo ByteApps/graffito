@@ -223,3 +223,120 @@ pub(crate) fn ensure_pq_imported_loaded(&mut self) {
     }
 }
 }
+
+impl State {
+#[allow(unused_variables)]
+pub(crate) fn on_pq_set_level(&mut self, w: &AppWindow, level: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let Some(level) = pq_level_from_str(level.as_str()) else { return };
+        s.pq_level = level;
+        s.save_config();
+        println!("cb: pq-key level={}", pq_level_str(level));
+        s.update_pq_keys_screen(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_pq_copy_public(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = &mut s;
+        let Some(ls) = s.ident.as_ref().and_then(|i| i.leaf_secret()) else { return };
+        let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(s.pq_level));
+        let armor = app_core::pqkeys::export_public_armor(&kp);
+        let ok = platform::set_clipboard_text(&armor);
+        println!("cb: pq-key-export public len={}", armor.len());
+        show_toast(w, if ok { "Copied" } else { "Copy failed" });
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_pq_save_public(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = &mut s;
+        let Some(ls) = s.ident.as_ref().and_then(|i| i.leaf_secret()) else { return };
+        let kp = app_core::pqkeys::derive_keypair(ls, app_core::pqkeys::pq_alg(s.pq_level));
+        let armor = app_core::pqkeys::export_public_armor(&kp);
+        if let Some(path) = platform::save_file("quantum-public-key.asc") {
+            match std::fs::write(&path, armor.as_bytes()) {
+                Ok(()) => {
+                    println!("cb: pq-key-export public len={}", armor.len());
+                    w.global::<Ui>().set_status("saved public key".into());
+                }
+                Err(e) => w.global::<Ui>().set_status(format!("save failed: {e}").into()),
+            }
+        }
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_pq_import_paste(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = &mut s;
+        match platform::clipboard_text() {
+            Some(text) => w.global::<QuantumKeys>().set_pq_import_text(text.into()),
+            None => w.global::<QuantumKeys>().set_pq_import_error("clipboard empty".into()),
+        }
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_pq_import_file(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = &mut s;
+        if let Some(path) = platform::pick_file(&[("Key", &["asc", "txt", "pgp", "gpg"])]) {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => w.global::<QuantumKeys>().set_pq_import_text(text.trim().into()),
+                Err(e) => w.global::<QuantumKeys>().set_pq_import_error(format!("file: {e}").into()),
+            }
+        }
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_pq_generate(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        if s.pq_imported.is_some() {
+            s.pq_pending_replace = Some(PqReplaceKind::Generate);
+            w.global::<Ui>().set_pq_show_replace_confirm(true);
+            return;
+        }
+        s.do_pq_generate(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_pq_import_submit(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        if s.pq_imported.is_some() {
+            s.pq_pending_replace = Some(PqReplaceKind::Import);
+            w.global::<Ui>().set_pq_show_replace_confirm(true);
+            return;
+        }
+        s.do_pq_import(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_pq_import_remove(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = keychain::delete_secret(PQ_IMPORTED_ACCOUNT);
+        s.pq_imported = None;
+        w.global::<Ui>().set_pq_import_source("".into());
+        w.global::<QuantumKeys>().set_pq_import_error("".into());
+        println!("cb: pq-key-remove");
+        s.update_pq_keys_screen(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_pq_imported_copy_public(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = &mut s;
+        let Some(kp) = s.pq_imported.as_ref() else { return };
+        let armor = app_core::notes_core::pq::export_public(kp.alg(), kp.ek());
+        let ok = platform::set_clipboard_text(&armor);
+        println!("cb: pq-key-export public len={}", armor.len());
+        show_toast(w, if ok { "Copied" } else { "Copy failed" });
+    }
+}

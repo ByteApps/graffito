@@ -337,3 +337,61 @@ pub(crate) fn pick_contact_core(&mut self, w: &AppWindow, addr: &str) {
     st.refresh_compose(w);
 }
 }
+
+impl State {
+#[allow(unused_variables)]
+pub(crate) fn on_sync_contacts_now(&mut self, w: &AppWindow) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        s.sync_contacts_now(w);
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_pick_contact(&mut self, w: &AppWindow, addr: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        // Sweep mode: the picker chooses the sweep DESTINATION, then opens
+        // the compose-like sweep screen (16) instead of compose.
+        if w.global::<Ui>().get_pick_mode().as_str() == "sweep" {
+            let mut a = normalize_addr(addr.as_str());
+            if a == "self" || a.is_empty() {
+                w.global::<Ui>().set_status("pick a destination address".into());
+                return;
+            }
+            if Recipient::parse(s.network, &a).is_err() {
+                let lower = a.to_lowercase();
+                if Recipient::parse(s.network, &lower).is_ok() {
+                    a = lower;
+                } else {
+                    println!("cb: sweep-pick err=bad-address");
+                    w.global::<Ui>().set_status(format!("not a valid {} address", s.network.as_str()).into());
+                    return;
+                }
+            }
+            // A manual pick here always replaces whatever destination was
+            // set before (including the spending-wallet shortcut) — don't
+            // mark a stale index used for an address the user didn't pick.
+            s.pending_spending_sweep_index = None;
+            s.set_sweep_dest(w, a);
+            return;
+        }
+        // Multi-select: the picker was reopened via compose's "+ Add
+        // recipient" — append instead of replacing the primary recipient.
+        if s.picking_extra {
+            s.add_recipient_chip(w, addr.as_str());
+            return;
+        }
+        w.global::<Ui>().set_compose_return(Screen::Contacts);
+        s.pick_contact_core(w, addr.as_str());
+    }
+
+#[allow(unused_variables)]
+pub(crate) fn on_confirm_remove(&mut self, w: &AppWindow, addr: SharedString, name: SharedString) {
+    #[allow(unused_mut)]
+    let mut s = self;
+        let _ = &mut s;
+        println!("cb: confirm-remove addr={addr}");
+        w.global::<Modals>().set_confirm_remove_name(name);
+        w.global::<Ui>().set_confirm_remove_address(addr);
+    }
+}

@@ -6,25 +6,32 @@
 
 mod account_picker;
 mod activity;
+mod backup_words;
 mod change;
 mod coins;
 mod compose;
 mod confirm;
 mod contacts;
 mod dice;
+mod entropy_source;
 mod export_psbt;
 mod funding_wallet;
 mod funding_wallets;
 mod home;
+mod import_key;
 mod import_signed_psbt;
 mod info;
+mod modals;
 mod note;
 mod notebooks;
 mod onboarding;
+mod pay_from;
 mod private_keys;
 mod quantum_keys;
+mod quiz;
 mod settings;
 mod sweep;
+mod terms;
 mod ui;
 
 pub(crate) use account_picker::*;
