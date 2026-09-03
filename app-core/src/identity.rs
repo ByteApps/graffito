@@ -22,6 +22,10 @@ use crate::Error;
 /// Parsed, validated key material. The original user string should be
 /// kept (Zeroizing) by the caller for the SecretStore — reveal shows
 /// exactly what the user once had.
+// Boxing `Xpub`'s FundingSource would ripple `KeyMaterial::Xpub(_)`
+// through every match/construction site in this crate — out of scope for
+// a hygiene-only pass.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum KeyMaterial {
     Mnemonic(bip39::Mnemonic),
@@ -101,6 +105,10 @@ pub fn index_fp8(material: &KeyMaterial, network: Network) -> Result<String, Err
 /// go through [`AppIdentity::full`] and decide what watch-only means.
 /// Watch keeps its FundingSource so spend PSBTs (sweep/consolidate/bump,
 /// signed by an external wallet) carry key origins.
+// Boxing `Watch`'s FundingSource would ripple `IdentityKeys::Watch { .. }`
+// through every match/construction site in this crate — out of scope for
+// a hygiene-only pass.
+#[allow(clippy::large_enum_variant)]
 pub enum IdentityKeys {
     Full { leaf_secret: Zeroizing<[u8; 32]>, identity: Identity },
     Watch { output_x: [u8; 32], source: FundingSource },

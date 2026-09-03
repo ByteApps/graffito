@@ -59,7 +59,7 @@ pub struct EsploraUtxo {
 /// callers don't have to reach through two levels for the fields they
 /// need. All fields `#[serde(default)]`-tolerant like every other esplora
 /// shape in this file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub(super) struct EsploraAddrStatsGroup {
     #[serde(default)]
     pub(super) tx_count: u64,
@@ -77,11 +77,6 @@ pub(super) struct EsploraAddrStats {
     pub(super) mempool_stats: EsploraAddrStatsGroup,
 }
 
-impl Default for EsploraAddrStatsGroup {
-    fn default() -> Self {
-        EsploraAddrStatsGroup { tx_count: 0, funded_txo_sum: 0, spent_txo_sum: 0 }
-    }
-}
 
 /// Flat "did anything change since last scan" fingerprint for one address —
 /// esplora's `GET /address/:a` chain + mempool stats, flattened. A later

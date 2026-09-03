@@ -99,16 +99,20 @@ pub struct WatchCoin {
 /// lengths — what the watch bump dialog prices old/new rates against.
 pub fn predict_keyspend_vsize(n_inputs: usize, out_lens: impl Iterator<Item = usize>) -> u64 {
     predict_weight(
-        std::iter::repeat(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH).take(n_inputs),
+        std::iter::repeat_n(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH, n_inputs),
         out_lens,
     )
     .to_vbytes_ceil()
 }
 
+/// [`taproot_keyspend_inputs`]'s return: PSBT inputs, their prevouts, and
+/// the per-input weight predictions `predict_weight` needs.
+type TaprootKeyspendInputs = (Vec<TxIn>, Vec<TxOut>, Vec<InputWeightPrediction>);
+
 fn taproot_keyspend_inputs(
     source: &FundingSource,
     coins: &[WatchCoin],
-) -> Result<(Vec<TxIn>, Vec<TxOut>, Vec<InputWeightPrediction>), Error> {
+) -> Result<TaprootKeyspendInputs, Error> {
     let mut inputs = Vec::with_capacity(coins.len());
     let mut prevouts = Vec::with_capacity(coins.len());
     let mut weights = Vec::with_capacity(coins.len());
@@ -274,6 +278,7 @@ fn public_multi_payloads(
 /// Output order matches the on-device compose (OP_RETURNs, recipient,
 /// change), keeping the ledger's change-vout convention. PUBLIC only:
 /// sealing needs the enc/DM keys, which a watch device doesn't hold.
+#[allow(clippy::too_many_arguments)]
 pub fn build_watch_note_psbt(
     source: &FundingSource,
     coins: &[WatchCoin],
@@ -375,7 +380,6 @@ pub fn build_watch_note_psbt_multi(
     }
     let (fee, change, with_change) =
         selected.ok_or_else(|| Error::Funding("selected coins don't cover the note + fee".into()))?;
-    let mut outputs = outputs;
     if with_change {
         outputs.push(TxOut { value: Amount::from_sat(change), script_pubkey: self_spk });
     }

@@ -177,7 +177,7 @@ pub(crate) fn commas(n: u64) -> String {
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in b.iter().enumerate() {
-        if i > 0 && (b.len() - i) % 3 == 0 {
+        if i > 0 && (b.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*c as char);
@@ -235,7 +235,7 @@ pub fn estimate_funded_fee_multi(
         lens.push(34); // our own P2TR notebook address, when present
     }
     lens.push(change_spk_len);
-    let vsize = predict_weight(input_weights.iter().copied(), lens.into_iter()).to_vbytes_ceil();
+    let vsize = predict_weight(input_weights.iter().copied(), lens).to_vbytes_ceil();
     (vsize as f64 * fee_rate).ceil().max(0.0) as u64
 }
 
@@ -273,7 +273,7 @@ pub fn estimate_funded_fee_no_change_multi(
     if dust_to_self {
         lens.push(34); // present with or without change, unless anchored
     }
-    let vsize = predict_weight(input_weights.iter().copied(), lens.into_iter()).to_vbytes_ceil();
+    let vsize = predict_weight(input_weights.iter().copied(), lens).to_vbytes_ceil();
     (vsize as f64 * fee_rate).ceil().max(0.0) as u64
 }
 
@@ -374,6 +374,7 @@ pub fn notebook_vsize_no_change(vsize_with_change: usize, change_len: usize) -> 
 /// `dust_to_self`: forwarded to both estimators — `false` when the
 /// selection includes a `CoinSource::Notebook` coin, `true` otherwise (see
 /// [`estimate_funded_fee`]'s doc).
+#[allow(clippy::too_many_arguments)]
 pub fn predict_funded_fold(
     input_weights: &[InputWeightPrediction],
     payloads: &[Vec<u8>],

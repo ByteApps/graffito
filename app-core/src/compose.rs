@@ -680,7 +680,7 @@ pub fn bump_raw_tx_build(
 
 /// Apply EXACTLY the store mutation the one-shot [`bump_raw_tx`] /
 /// [`bump_raw_tx_multi`] make after building: append the replacement txid
-/// + update raw_hex/fee/vsize/value on the tx record — nothing more or
+/// and update raw_hex/fee/vsize/value on the tx record — nothing more or
 /// less. `txid` is the SAME reference the build step looked the record up
 /// by (any txid in its chain). A vanished record is a quiet no-op; the
 /// one-shot paths can never hit that.
