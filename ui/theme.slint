@@ -1,0 +1,33 @@
+// Palette and per-platform metrics globals — split out of app.slint (U1,
+// PLAN-graffito-app-arch.md) as a pure file move: no value changes.
+
+// Per-platform optical calibration, set from Rust at startup. The header
+// title Text sits differently inside its line box per platform font (macOS/
+// iOS system font vs Roboto), so the back chevron's vertical nudge is
+// calibrated by measuring rendered ink centers on each platform:
+// macOS -1.25px · iOS -1.25px (default) · Android +1.5px.
+export global Metrics {
+    in-out property <length> back-dy: -1.25px;
+}
+
+// ---- palette ----
+export global Pal {
+    out property <color> bg: #0B0F14;
+    out property <color> card: #151B23;
+    out property <color> card-hover: #1B232E;
+    out property <color> line: #26303C;
+    out property <color> text: #E6EDF3;
+    out property <color> muted: #8B98A5;
+    out property <color> faint: #5A6572;
+    out property <color> accent: #F7931A;
+    out property <color> accent-hover: #FFA53C;
+    out property <color> on-accent: #1A1005;
+    out property <color> good: #3FB950;
+    out property <color> warn: #D29922;
+    out property <color> bad: #F85149;
+    // text-field looks (shared by EditField/EditArea)
+    out property <color> field: #10151C;
+    out property <color> field-focus-line: #4CC2FF;
+    out property <color> sel-bg: #4CC2FF;
+    out property <color> sel-fg: #0B0F14;
+}

@@ -1,0 +1,818 @@
+// The design-system component library: typography (H1/Body/Caption/Mono),
+// buttons, Header/Badge, QR widgets, and the compose/confirm panels
+// (CoinListPanel, TxConfirmView). Split out of app.slint (U1,
+// PLAN-graffito-app-arch.md) as a pure file move: no value changes.
+// Also fixes the Slint 1.17.1 deprecation warnings in SyncButton and
+// QrSpinner (3 properties each): rotation-angle/rotation-origin-x/
+// rotation-origin-y → transform-rotation/transform-origin (a Point
+// literal), the exact replacements the compiler names (visual result
+// identical — render-all.sh proves it byte-for-byte).
+import { Pal, Metrics } from "theme.slint";
+import { SpendCoin, PsbtRow } from "types.slint";
+
+export component H1 inherits Text {
+    font-size: 21px;
+    font-weight: 700;
+    color: Pal.text;
+}
+export component Body inherits Text {
+    font-size: 13px;
+    color: Pal.text;
+    wrap: word-wrap;
+}
+export component Caption inherits Text {
+    font-size: 11px;
+    color: Pal.muted;
+    wrap: word-wrap;
+}
+export component Mono inherits Text {
+    font-family: "Menlo";
+    font-size: 12px;
+    color: Pal.text;
+    wrap: char-wrap;
+}
+
+export component Card inherits Rectangle {
+    background: Pal.card;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Pal.line;
+}
+
+export component PrimaryButton inherits Rectangle {
+    in property <string> text;
+    in property <color> tint: Pal.accent;
+    in property <color> tint-hover: Pal.accent-hover;
+    callback clicked;
+    height: 46px;
+    border-radius: 10px;
+    background: ta.has-hover ? root.tint-hover : root.tint;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        color: Pal.on-accent;
+        font-size: 14px;
+        font-weight: 700;
+    }
+}
+
+export component GhostButton inherits Rectangle {
+    in property <string> text;
+    callback clicked;
+    height: 40px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Pal.line;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    // Accessibility (VoiceOver/TalkBack) AND in-process UI-test findability
+    // (i-slint-backend-testing ElementHandle::find_by_accessible_label) —
+    // one edit here covers every GhostButton instance.
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        color: Pal.text;
+        font-size: 13px;
+    }
+}
+
+export component IconButton inherits Rectangle {
+    in property <string> glyph;
+    in property <length> glyph-size: 17px;
+    in property <color> glyph-color: Pal.muted;
+    callback clicked;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.glyph;
+        color: root.glyph-color;
+        font-size: root.glyph-size;
+    }
+}
+
+export component SvgIconButton inherits Rectangle {
+    in property <string> icon;
+    in property <length> size: 19px;
+    in property <color> tint: Pal.muted;
+    callback clicked;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Image {
+        source: root.icon == "activity" ? @image-url("icons/activity.svg")
+              : root.icon == "refresh" ? @image-url("icons/refresh.svg")
+              : root.icon == "archive" ? @image-url("icons/archive.svg")
+              : @image-url("icons/copy.svg");
+        colorize: root.tint;
+        width: root.size;
+        height: root.size;
+        x: (parent.width - root.size) / 2;
+        y: (parent.height - root.size) / 2;
+    }
+}
+
+// Header network-sync control (2026-07-22, supersedes the pulsing NetDot):
+// a ↻ button that SPINS continuously while `net-busy` is true — a Timer
+// bumping rotation-angle, same femtovg-safe pattern as QrSpinner below
+// (Slint's `animate` has no infinite-iteration mode) — and gates its own
+// tap: idle → `sync()` (the screen's normal refresh callback), busy →
+// `busy-tapped()` instead of firing another refresh (wired by callers to
+// the shared "Syncing…" toast). The SCAN_LANE already coalesces duplicate
+// scans on the Rust side; this is the UI-level "don't spam" affordance.
+// Same footprint as SvgIconButton (40×40, 10px radius, same hover tint) so
+// it drops into a header's trailing-icon slot without shifting layout —
+// UI e2e suites tap fixed header coordinates.
+export component SyncButton inherits Rectangle {
+    in property <length> size: 19px;
+    in property <color> tint: Pal.muted;
+    in property <bool> net-busy: false;
+    callback sync;         // fired on an IDLE tap
+    callback busy-tapped;  // fired on a tap WHILE net-busy
+    property <angle> spin-angle: 0deg;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    Timer {
+        interval: 16ms;
+        running: root.net-busy;
+        triggered => { root.spin-angle += 8deg; }
+    }
+    // Reset to upright when idle so it never freezes mid-spin.
+    changed net-busy => { if (!root.net-busy) { root.spin-angle = 0deg; } }
+    ta := TouchArea {
+        clicked => {
+            if (root.net-busy) { root.busy-tapped(); } else { root.sync(); }
+        }
+    }
+    Image {
+        source: @image-url("icons/refresh.svg");
+        colorize: root.tint;
+        width: root.size;
+        height: root.size;
+        x: (parent.width - root.size) / 2;
+        y: (parent.height - root.size) / 2;
+        transform-rotation: root.spin-angle;
+        transform-origin: { x: self.width / 2, y: self.height / 2 };
+    }
+}
+
+// Back chevron, shifted off the button's geometric center onto the title's
+// visual center by the per-platform Metrics.back-dy (see the global above).
+export component BackButton inherits Rectangle {
+    callback clicked;
+    width: 44px;
+    height: 40px;
+    border-radius: 10px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Image {
+        source: @image-url("icons/chevron-left.svg");
+        colorize: Pal.text;
+        width: 22px;
+        height: 22px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2 + Metrics.back-dy;
+    }
+}
+
+export component Header inherits HorizontalLayout {
+    in property <string> title;
+    in property <bool> show-back: true;
+    // Opt-in network-sync button (2026-07-22, supersedes the old pulsing
+    // NetDot): a screen that wants the spinning ↻ passes `show-sync: true`
+    // + `net-busy: root.net-busy` and wires `sync`/`busy-tapped`; every
+    // other Header{} instantiation is unaffected — no button, no reserved
+    // space, matching the pre-existing per-screen opt-in.
+    in property <bool> show-sync: false;
+    in property <bool> net-busy: false;
+    callback back;
+    callback sync;         // forwarded from the header's own SyncButton
+    callback busy-tapped;  // forwarded from the header's own SyncButton
+    spacing: 8px;
+    height: 40px;
+    if root.show-back: BackButton {
+        clicked => { root.back(); }
+    }
+    Text {
+        text: root.title;
+        font-size: 19px;
+        font-weight: 700;
+        color: Pal.text;
+        vertical-alignment: center;
+    }
+    Rectangle { }
+    if root.show-sync: SyncButton {
+        net-busy: root.net-busy;
+        sync => { root.sync(); }
+        busy-tapped => { root.busy-tapped(); }
+    }
+    @children
+}
+
+export component Badge inherits Rectangle {
+    in property <string> label;
+    in property <color> tint: Pal.muted;
+    height: 20px;
+    width: t.preferred-width + 16px;
+    border-radius: 10px;
+    background: root.tint.with-alpha(0.16);
+    t := Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.label;
+        color: root.tint;
+        font-size: 10px;
+        font-weight: 600;
+    }
+}
+
+export component CopyButton inherits Rectangle {
+    callback clicked;
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Image {
+        source: @image-url("icons/copy.svg");
+        colorize: Pal.muted;
+        width: 13px;
+        height: 13px;
+        x: (parent.width - 13px) / 2;
+        y: (parent.height - 13px) / 2;
+    }
+}
+
+// Continuously-rotating loading indicator for QR cards (Sal 2026-07-16): QR
+// generation can lag behind an async refresh (e.g. the spending wallet's
+// receive-address QR is cleared to the default image while its worker-
+// thread scan runs) — without this, that gap rendered as a plain white
+// square that looked stuck. A Timer bumps the rotation angle continuously
+// (Slint's `animate` has no infinite-iteration mode, so a timer step gives
+// the same continuous-spin effect — femtovg-safe, no GPU shader needed);
+// the icon is the plain arc SVG (`icons/spinner.svg`) per the tofu rule —
+// no glyph spinners.
+export component QrSpinner inherits Rectangle {
+    property <angle> spin-angle: 0deg;
+    Timer {
+        interval: 16ms;
+        running: true;
+        triggered => { spin-angle += 8deg; }
+    }
+    Image {
+        source: @image-url("icons/spinner.svg");
+        colorize: Pal.faint;
+        width: min(parent.width, parent.height) * 0.4;
+        height: self.width;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        transform-rotation: spin-angle;
+        transform-origin: { x: self.width / 2, y: self.height / 2 };
+    }
+}
+
+// A QR image with an automatic loading spinner: whenever `img` is the
+// default/unset image (width == 0 — Rust hasn't produced/refreshed it yet),
+// shows QrSpinner instead of a blank white square. `qr-size` is the square
+// side; callers keep their own tap-to-zoom TouchArea layered on top.
+export component QrArea inherits Rectangle {
+    in property <image> img;
+    in property <length> qr-size: 100px;
+    width: root.qr-size;
+    height: root.qr-size;
+    if root.img.width > 0: Image {
+        source: root.img;
+        width: 100%;
+        height: 100%;
+        image-rendering: pixelated;
+    }
+    if root.img.width <= 0: QrSpinner {
+        width: 100%;
+        height: 100%;
+    }
+}
+
+export component PencilButton inherits Rectangle {
+    callback clicked;
+    width: 32px;
+    height: 32px;
+    border-radius: 10px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Image {
+        source: @image-url("icons/pencil.svg");
+        colorize: Pal.muted;
+        width: 16px;
+        height: 16px;
+        x: (parent.width - 16px) / 2;
+        y: (parent.height - 16px) / 2;
+    }
+}
+
+export component WebViewButton inherits Rectangle {
+    callback clicked;
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Image {
+        source: @image-url("icons/external.svg");
+        colorize: Pal.muted;
+        width: 15px;
+        height: 15px;
+        x: (parent.width - 15px) / 2;
+        y: (parent.height - 15px) / 2;
+    }
+}
+
+export component ScanButton inherits Rectangle {
+    callback clicked;
+    width: 44px;
+    height: 40px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Pal.line;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Rectangle {
+        width: 20px;
+        height: 20px;
+        x: (parent.width - 20px) / 2;
+        y: (parent.height - 20px) / 2;
+        Rectangle { x: 0; y: 0; width: 8px; height: 8px; border-width: 2px; border-color: Pal.accent; }
+        Rectangle { x: 12px; y: 0; width: 8px; height: 8px; border-width: 2px; border-color: Pal.accent; }
+        Rectangle { x: 0; y: 12px; width: 8px; height: 8px; border-width: 2px; border-color: Pal.accent; }
+        Rectangle { x: 12px; y: 12px; width: 8px; height: 8px; background: Pal.accent; }
+    }
+}
+
+export component SelectPill inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+    height: 32px;
+    border-radius: 16px;
+    border-width: 1px;
+    border-color: root.active ? Pal.accent : Pal.line;
+    background: root.active ? Pal.accent : (ta.has-hover ? Pal.card-hover : transparent);
+    width: t.preferred-width + 24px;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.active;
+    accessible-action-default => { root.clicked(); }
+    ta := TouchArea { clicked => { root.clicked(); } }
+    t := Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        font-size: 12px;
+        font-weight: 600;
+        color: root.active ? Pal.on-accent : Pal.text;
+    }
+}
+
+// A dark-themed dropdown: a button showing the current option, a popup list on
+// click. `options` is the label model (caller appends a trailing "Custom…"),
+// `current-index` the selected row; `selected(i)` fires on pick.
+export component Dropdown inherits Rectangle {
+    in property <[string]> options;
+    in property <int> current-index;
+    callback selected(int);
+    height: 40px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Pal.line;
+    background: ta.has-hover ? Pal.card-hover : Pal.bg;
+    ta := TouchArea { clicked => { popup.show(); } }
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 8px;
+        Text {
+            text: (root.current-index >= 0 && root.current-index < root.options.length)
+                ? root.options[root.current-index] : "";
+            vertical-alignment: center;
+            horizontal-alignment: left;
+            color: Pal.text;
+            font-size: 13px;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Image {
+            source: @image-url("icons/caret-down.svg");
+            colorize: Pal.muted;
+            width: 14px;
+            height: 14px;
+            y: (parent.height - 14px) / 2;
+        }
+    }
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: root.width;
+        Rectangle {
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Pal.line;
+            background: Pal.card;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000088;
+            VerticalLayout {
+                padding: 4px;
+                for opt[i] in root.options: Rectangle {
+                    height: 36px;
+                    border-radius: 8px;
+                    background: ota.has-hover ? Pal.card-hover
+                        : (i == root.current-index ? Pal.accent.with-alpha(0.18) : transparent);
+                    ota := TouchArea { clicked => { root.selected(i); popup.close(); } }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: opt;
+                            vertical-alignment: center;
+                            color: i == root.current-index ? Pal.accent : Pal.text;
+                            font-size: 13px;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component SettingsCard inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Pal.line;
+    background: Pal.card;
+    height: l.preferred-height;
+    l := VerticalLayout {
+        padding: 16px;
+        spacing: 8px;
+        Text {
+            text: root.title;
+            font-size: 14px;
+            font-weight: 700;
+            color: Pal.text;
+        }
+        Caption { text: root.subtitle; }
+        @children
+    }
+}
+
+// One key:value line of a breakdown card — label muted-left, value
+// bold-right (the Pay-from summary card's row idiom, extracted for the
+// compose cost card; Sal's build-17 follow-up 2026-07-18: "use sections
+// key: value so it's more clear" instead of one long wrapped string).
+export component KvRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <color> value-color: Pal.text;
+    spacing: 6px;
+    Text { text: root.label; font-size: 11px; color: Pal.muted; vertical-alignment: center; }
+    Text {
+        text: root.value;
+        font-size: 13px;
+        font-weight: 600;
+        color: root.value-color;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+        horizontal-alignment: right;
+        overflow: elide;
+    }
+}
+
+export component DoorCard inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <bool> highlight: false;
+    callback clicked;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: root.highlight ? Pal.accent.with-alpha(0.55) : Pal.line;
+    background: ta.has-hover ? Pal.card-hover : Pal.card;
+    height: l.preferred-height;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    l := VerticalLayout {
+        padding: 16px;
+        spacing: 5px;
+        Text {
+            text: root.title;
+            font-size: 14px;
+            font-weight: 700;
+            color: root.highlight ? Pal.accent : Pal.text;
+        }
+        Caption { text: root.subtitle; }
+    }
+}
+
+// Nested coin-control list under a wallet row on the Pay-from screen
+// (funding-unification UI rework, 2026-07-16): checkbox-style coin rows,
+// content driven entirely by `in` properties so the SAME AppWindow-level
+// `spend-coins`/`spend-title` state (recomputed in Rust for whichever
+// source is expanded) renders under whichever wallet row is currently
+// expanded — the "Coins" section is no longer a page-level block.
+// Deliberately NEUTRAL always (Sal's iPhone bug cluster, 2026-07-18,
+// defect #3): a panel with 0 selected coins is a normal state, not an
+// error, and the insufficiency verdict is now a WHOLE-SCREEN concern shown
+// once under the summary card — so this component no longer takes an
+// `enough` input or renders its own copy of the warning.
+export component CoinListPanel inherits VerticalLayout {
+    in property <[SpendCoin]> coins;
+    in property <string> title;
+    in property <int> strategy;
+    callback pick-strategy(int);
+    callback toggle(string);
+    callback refresh();
+    callback explorer(string);
+    padding: 10px;
+    spacing: 8px;
+    HorizontalLayout {
+        Text {
+            text: root.title;
+            font-size: 12px;
+            color: Pal.muted;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        SvgIconButton {
+            icon: "refresh";
+            size: 14px;
+            width: 28px;
+            height: 22px;
+            clicked => { root.refresh(); }
+        }
+    }
+    Caption { text: "Tap coins to include or exclude. The note spends exactly what's selected."; }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        SelectPill { text: "fewest coins"; active: root.strategy == 0; clicked => { root.pick-strategy(0); } }
+        SelectPill { text: "consolidate"; active: root.strategy == 1; clicked => { root.pick-strategy(1); } }
+    }
+    for c in root.coins: Rectangle {
+        height: 42px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: c.selected ? Pal.accent : Pal.line;
+        background: c.selected ? Pal.accent.with-alpha(0.10) : transparent;
+        TouchArea { clicked => { root.toggle(c.outpoint); } }
+        HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            spacing: 10px;
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                y: (parent.height - 18px) / 2;
+                border-radius: 4px;
+                border-width: 2px;
+                border-color: c.selected ? Pal.accent : Pal.muted;
+                background: c.selected ? Pal.accent : transparent;
+                if c.selected: Rectangle {
+                    width: 8px; height: 8px;
+                    x: (parent.width - 8px) / 2;
+                    y: (parent.height - 8px) / 2;
+                    background: Pal.on-accent;
+                    border-radius: 2px;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Text { text: c.value + " sats"; font-size: 12px; color: Pal.text; }
+            }
+            Rectangle { }
+            if c.tag != "": VerticalLayout {
+                alignment: center;
+                Badge { label: c.tag; tint: Pal.accent; }
+            }
+            VerticalLayout {
+                alignment: center;
+                Badge { label: c.confirmed ? "confirmed" : "unconfirmed"; tint: c.confirmed ? Pal.good : Pal.warn; }
+            }
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    height: 22px;
+                    width: cplpill.preferred-width + 14px;
+                    border-radius: 11px;
+                    border-width: 1px;
+                    border-color: Pal.line;
+                    background: cplta.has-hover && c.explorer != "" ? Pal.card-hover : transparent;
+                    cplta := TouchArea { clicked => { if (c.explorer != "") { root.explorer(c.explorer); } } }
+                    cplpill := HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 7px;
+                        spacing: 4px;
+                        Text {
+                            text: c.txid-short;
+                            font-family: "Menlo";
+                            font-size: 10px;
+                            color: Pal.muted;
+                            vertical-alignment: center;
+                        }
+                        if c.explorer != "": Image {
+                            source: @image-url("icons/external.svg");
+                            colorize: Pal.accent;
+                            width: 11px;
+                            height: 11px;
+                            y: (parent.height - 11px) / 2;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The universal "Confirm & broadcast" screen's decoded-tx view (extracted
+// out of the old screen 14 inline confirm block, funding-unification
+// follow-up 2026-07-17): a paranoid-bitcoiner readout of the SIGNED tx
+// about to hit the wire — every fact here comes from `app_core::confirm::
+// summarize_signed_tx` decoding the actual raw bytes, never from the app's
+// own intent. Screen 26 is the only user of this; screen 14 now stops at
+// loading + validating the signed PSBT.
+export component TxConfirmView inherits Flickable {
+    in property <string> note;
+    in property <[PsbtRow]> inputs;
+    in property <[PsbtRow]> outputs;
+    in property <string> fee-line;
+    in property <string> lock-time-line;
+    in property <string> warn;
+    in property <string> txid;
+    viewport-height: conf-col.preferred-height;
+    conf-col := VerticalLayout {
+        spacing: 10px;
+        alignment: start;
+        if root.warn != "": Rectangle {
+            border-radius: 10px;
+            background: Pal.warn.with-alpha(0.12);
+            border-width: 1px;
+            border-color: Pal.warn.with-alpha(0.4);
+            height: warn-t.preferred-height + 20px;
+            warn-t := Caption {
+                x: 12px;
+                y: 10px;
+                width: parent.width - 24px;
+                color: Pal.warn;
+                text: root.warn;
+            }
+        }
+        if root.txid != "": Mono {
+            text: "txid " + root.txid;
+            font-size: 10px;
+            color: Pal.muted;
+            overflow: elide;
+            wrap: no-wrap;
+        }
+        if root.note != "": Rectangle {
+            border-radius: 10px;
+            background: Pal.accent.with-alpha(0.08);
+            border-width: 1px;
+            border-color: Pal.accent.with-alpha(0.35);
+            height: ncard.preferred-height;
+            ncard := VerticalLayout {
+                padding: 14px;
+                spacing: 6px;
+                Caption { text: "NOTE"; color: Pal.accent; }
+                Body { text: root.note; }
+            }
+        }
+        Caption { text: "INPUTS"; }
+        for i in root.inputs: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: irow.preferred-height;
+            irow := HorizontalLayout {
+                padding: 12px;
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 3px;
+                    horizontal-stretch: 1;
+                    Mono { text: i.title; font-size: 11px; overflow: elide; wrap: no-wrap; }
+                    Caption { text: i.subtitle; font-size: 10px; overflow: elide; }
+                }
+                Mono {
+                    text: i.amount + " sats";
+                    color: Pal.text;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Caption { text: "OUTPUTS"; }
+        for o in root.outputs: Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: o.kind == "self" ? Pal.good.with-alpha(0.4)
+                : (o.kind == "recipient" ? Pal.accent.with-alpha(0.4)
+                : (o.kind == "other" ? Pal.bad.with-alpha(0.4) : Pal.line));
+            height: orow.preferred-height;
+            orow := HorizontalLayout {
+                padding: 12px;
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 3px;
+                    horizontal-stretch: 1;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Badge {
+                            label: o.kind;
+                            tint: o.kind == "self" ? Pal.good
+                                : (o.kind == "recipient" ? Pal.accent
+                                : (o.kind == "change" ? Pal.faint
+                                : (o.kind == "note" ? Pal.accent
+                                : (o.kind == "other" ? Pal.bad : Pal.muted))));
+                        }
+                    }
+                    if o.title != "": Mono { text: o.title; font-size: 11px; overflow: elide; wrap: no-wrap; }
+                    if o.subtitle != "": Caption { text: o.subtitle; font-size: 10px; overflow: elide; }
+                }
+                Mono {
+                    // A 0-value OP_RETURN row has an empty amount — no
+                    // orphaned "sats" suffix (Sal, testnet4 build-14 review).
+                    text: o.amount == "" ? "" : o.amount + " sats";
+                    color: o.kind == "self" ? Pal.good : Pal.text;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: frow.preferred-height;
+            frow := HorizontalLayout {
+                padding: 14px;
+                Text {
+                    text: "Network fee";
+                    font-size: 13px;
+                    color: Pal.muted;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Mono { text: root.fee-line; color: Pal.text; }
+            }
+        }
+        if root.lock-time-line != "": Rectangle {
+            border-radius: 10px;
+            background: Pal.card;
+            border-width: 1px;
+            border-color: Pal.line;
+            height: ltrow.preferred-height;
+            ltrow := HorizontalLayout {
+                padding: 14px;
+                Text {
+                    text: "Locktime";
+                    font-size: 13px;
+                    color: Pal.muted;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Mono { text: root.lock-time-line; color: Pal.text; }
+            }
+        }
+    }
+}
+

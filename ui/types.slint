@@ -1,0 +1,79 @@
+// Shared data-model structs, rendered by AppWindow's list views and the
+// SDK bridge in src/lib.rs. Split out of app.slint (U1,
+// PLAN-graffito-app-arch.md) as a pure file move: no value changes.
+
+// `locked`: a post-quantum note this device hasn't decrypted yet
+// (NoteRecord.locked.is_some() — text stays None until Store::unlock_note
+// succeeds). Distinct from `private`, which just means "encrypted" —
+// every private note (pq or not) already shows the padlock glyph next to
+// its title; `locked` additionally means "and we can't currently read it".
+export struct NoteItem { id: string, title: string, meta: string, badge: string, web-url: string, private: bool, locked: bool }
+// One notebook row: `unread` is a preformatted badge label ("3 new"), empty =
+// no badge; `meta` is "addr-short · balance · note count".
+export struct NotebookItem { index: int, name: string, snippet: string, meta: string, unread: string, active: bool }
+// One sender-filter row: `key` is the raw sender address (the exclusion-set
+// entry), `label` the resolved display name, `sub` the note count line.
+export struct SenderItem { key: string, label: string, sub: string, excluded: bool }
+// sync-status: 0 = not opted into iCloud sync (no icon), 1 = opted in but
+// the outcome of the last push is still unknown (plain cloud), 2 = opted
+// in and the last push reached iCloud (cloud-check), 3 = opted in but
+// iCloud is unavailable / the last push failed (cloud-alert). Only
+// meaningful when `synced` is true — see `refresh_contacts` in lib.rs.
+export struct ContactItem { address: string, name: string, synced: bool, sync-status: int, pq: bool }
+// One revealed key-export format (Public keys screen — the ONLY reveal
+// surface that shows several rows at once; Private keys is progressive-
+// disclosure, one format at a time, via scalar reveal-private-* props).
+export struct RevealRow { label: string, value: string, qr: image, expanded: bool }
+// A notebook picker row for the hex/WIF single-key reveal (Private keys
+// screen 19 only — Recovery phrase/Account xprv are seed/account-level and
+// don't need one). `addr` is the short address; `name` falls back to the
+// same short address when the notebook is unnamed.
+export struct NbPickRow { index: int, name: string, addr: string }
+// `pill`/`balance` are set only by the notebook-create picker ("new" /
+// "used" / "notebook" + a sats line); the import/switch picker leaves them
+// empty and the row renders as before.
+export struct AccountItem { index: int, address: string, active: bool, pill: string, balance: string }
+// `notebook` = owning notebook's display name (the coins viewer is
+// wallet-wide since 2026-07-11).
+export struct CoinItem { outpoint: string, value: string, status: string, notebook: string }
+// A spending-wallet UTXO (funding-unification M3, Coins screen "Spending"
+// segment) — address instead of `notebook` since these coins live on the
+// BIP-84 fresh-address chain, not any one notebook.
+export struct SpendingCoinItem { address: string, value: string, status: string }
+// `tag`: "" for an ordinary coin, "change" for a taproot CHANGE-chain coin
+// (m/86'/…/1/{index}, taproot-change unit 5) folded into the Pay-from
+// "Notebook" panel — CoinListPanel shows a small badge when non-empty,
+// mirroring the Coins screen's CoinItem.notebook == "change" convention.
+export struct SpendCoin { outpoint: string, value: string, confirmed: bool, selected: bool, txid-short: string, explorer: string, tag: string }
+// One input/output row in the Sparrow-style PSBT confirmation. `kind` drives
+// the accent: note · self · recipient · change · input · other.
+export struct PsbtRow { title: string, subtitle: string, amount: string, kind: string }
+// A saved funding wallet in the manager list.
+// `coins`/`coin-title` + `expanded` (independent-expand rework, 2026-07-18):
+// each row carries its OWN Pay-from screen (20) coin panel data — external
+// wallets stay an accordion among themselves (`expanded` is true for at
+// most one row at a time), but that no longer affects Notebook/Spending.
+export struct FundingWalletRow {
+    id: string, label: string, meta: string, active: bool, change-addr: string,
+    coins: [SpendCoin], coin-title: string, expanded: bool,
+}
+// `notebook` = owning notebook's display name (Activity is wallet-wide);
+// `pending` also gates the action buttons — only the ACTIVE notebook's
+// rows are actionable (bump/rebroadcast sign with its key).
+export struct ActivityItem {
+    ref-id: string, is-note: bool, kind: string, title: string,
+    txid: string, fee-line: string, status: string, explorer: string,
+    pending: bool, replaced: string, notebook: string,
+    // Funding-unification M3: "spending" | "wallet:<label>" | "" (notebook-funded).
+    funded: string,
+    // Async rebroadcast/speed-up (2026-07-16): true only for the ONE row
+    // whose Rebroadcast/Speed-up is in flight on a worker thread — that
+    // row's buttons show a busy caption and disable; other rows stay
+    // tappable.
+    busy: bool,
+    // CHANGE 2 (2026-07-17): false for a mixed notebook+spending-wallet
+    // sweep record (`TxRecord.mixed_inputs`) — no per-input owner scheme
+    // covers both input kinds, so Speed-up (RBF) is unavailable; gates
+    // ONLY the Speed-up button — `pending` alone still shows Rebroadcast.
+    // true for every other record (unaffected, matches today).
+    bumpable: bool }
