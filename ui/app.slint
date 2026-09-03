@@ -42,6 +42,7 @@ import { TermsScreen } from "screens/terms.slint";
 import { InfoScreen } from "screens/info.slint";
 import { ConfirmScreen } from "screens/confirm.slint";
 import { EntropySourceScreen } from "screens/entropy-source.slint";
+import { DiceScreen } from "screens/dice.slint";
 // Rust (src/lib.rs, via slint::include_modules!()) needs these re-exported
 // from the entry-point file.
 export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem, Ui, Modals, Info, Terms, Settings, BackupWords, ImportKey, Quiz, Home, Note, Compose, Change, PayFrom, Sweep, FundingWalletScreen, ExportPsbt, Confirm, Coins, AccountPicker, PublicKeys, PrivateKeys, QuantumKeys, Activity, Onboarding, Dice, EntropySource, Contacts, FundingWallets, ImportSignedPsbt, Notebooks }
@@ -461,125 +462,7 @@ export component AppWindow inherits Window {
 
     if Ui.screen == Screen.entropy-source: EntropySourceScreen { }
 
-    // ---------- 28 · dice entry ----------
-    // The roll counter and the LIVE hash are the point of this screen: the
-    // same two things a hardware signer shows while you roll, for the same
-    // reason — at any moment you can check the number on screen against
-    // `echo -n <rolls> | shasum -a 256` and see the device isn't inventing
-    // anything.
-    if Ui.screen == Screen.dice: VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
-        padding: 20px;
-        spacing: 10px;
-        alignment: start;
-        Header {
-            title: "Roll the dice";
-            back => { root.nav-back(); }
-        }
-        HorizontalLayout {
-            alignment: center;
-            spacing: 8px;
-            Text {
-                text: Ui.dice-count;
-                font-size: 40px;
-                font-weight: 700;
-                color: Dice.dice-ready ? Pal.accent : Pal.text;
-                vertical-alignment: center;
-            }
-            Text {
-                text: Ui.dice-count == 1 ? "roll" : "rolls";
-                font-size: 15px;
-                color: Pal.muted;
-                vertical-alignment: center;
-            }
-        }
-        Caption {
-            horizontal-alignment: center;
-            color: Dice.dice-ready ? Pal.muted : Pal.warn;
-            text: Dice.dice-ready
-                ? "Enough for " + Ui.new-word-count + " words. Keep going if you like — more rolls never hurt."
-                : (Dice.dice-needed - Ui.dice-count) + " more needed for " + Ui.new-word-count + " words";
-        }
-        if Dice.dice-warning != "": Caption {
-            horizontal-alignment: center;
-            color: Pal.warn;
-            text: Dice.dice-warning;
-        }
-        // Live entropy. Two lines of 32 hex chars, exactly how a hardware
-        // signer renders it, so a side-by-side comparison is easy.
-        Rectangle {
-            border-radius: 10px;
-            background: Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            height: hl.preferred-height;
-            hl := VerticalLayout {
-                padding: 12px;
-                spacing: 2px;
-                Text {
-                    text: "SHA-256 of your rolls so far";
-                    font-size: 11px;
-                    color: Pal.muted;
-                }
-                Text { text: Ui.dice-hash; font-size: 12px; color: Pal.text; }
-                Text { text: Dice.dice-hash2; font-size: 12px; color: Pal.text; }
-            }
-        }
-        // Keypad of actual die faces (icons/die-N.svg). These are the ONE
-        // place we deliberately don't `colorize`: a die reads as a die
-        // because the face is light and the pips are dark, and tinting it
-        // flat would just give six indistinguishable blobs. Row height is
-        // unchanged from the digits version so the calibrated e2e taps in
-        // ui-automation still land.
-        for row in [[1, 2, 3], [4, 5, 6]]: HorizontalLayout {
-            spacing: 8px;
-            for n in row: Rectangle {
-                height: 54px;
-                border-radius: 10px;
-                border-width: 1px;
-                border-color: Pal.line;
-                background: dta.pressed ? Pal.accent.with-alpha(0.25)
-                          : (dta.has-hover ? Pal.card-hover : Pal.card);
-                dta := TouchArea { clicked => { Ui.dice-roll(n); } }
-                Image {
-                    width: 34px;
-                    height: 34px;
-                    image-fit: contain;
-                    source: n == 1 ? @image-url("icons/die-1.svg")
-                          : n == 2 ? @image-url("icons/die-2.svg")
-                          : n == 3 ? @image-url("icons/die-3.svg")
-                          : n == 4 ? @image-url("icons/die-4.svg")
-                          : n == 5 ? @image-url("icons/die-5.svg")
-                          :          @image-url("icons/die-6.svg");
-                }
-            }
-        }
-        HorizontalLayout {
-            spacing: 8px;
-            GhostButton {
-                text: "Undo";
-                clicked => { Dice.dice-undo(); }
-            }
-            GhostButton {
-                text: "Start over";
-                clicked => {
-                    if (Ui.dice-count > 5) { Ui.show-dice-clear-confirm = true; }
-                    else { Ui.dice-clear(); }
-                }
-            }
-        }
-        // Gated the same way compose gates Sign: faint tint + an inert
-        // handler, rather than a disabled property PrimaryButton doesn't have.
-        PrimaryButton {
-            text: "Create seed from these rolls";
-            tint: Dice.dice-ready ? Pal.accent : Pal.faint;
-            tint-hover: Dice.dice-ready ? Pal.accent-hover : Pal.faint;
-            clicked => { if (Dice.dice-ready) { Dice.dice-continue(); } }
-        }
-        Caption {
-            color: Pal.muted;
-            text: "Check it yourself: put the same digits through any SHA-256 tool — the result is the number above, and that number is your seed.";
-        }
-    }
+    if Ui.screen == Screen.dice: DiceScreen { }
 
     if Ui.screen == Screen.confirm: ConfirmScreen { }
 
