@@ -89,3 +89,13 @@ mod ui_flow_quantum_key;
 mod ui_flow_selfpq_passphrase;
 mod ui_flow_selfpq_kem;
 mod ui_flow_locked_note_unlock;
+
+/// U12 (PLAN-graffito-app-arch.md): in-process ports of the network-free legs
+/// of the coordinate Mac suite
+/// (ui-automation/tests/graffito-app-multi-recipient.sh) — multi-select
+/// picker chips, the universal confirm screen's byte-true multi-recipient
+/// decode, and Reply-all prefill on an own multi-recipient note. The
+/// broadcast leg itself needs a real chain and stays on the Mac suite.
+mod ui_flow_multi_select;
+mod ui_flow_multi_confirm;
+mod ui_flow_multi_reply_all;
