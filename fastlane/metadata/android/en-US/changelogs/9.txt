@@ -1,0 +1,1 @@
+Under-the-hood restructuring of the app (every screen is now its own module) with no change to how notes, keys, or funds work. Fixed: the security label for a personal note protected by both a password and a quantum key now describes exactly that; reopening a password-locked note after a permanent unlock no longer crashes.
