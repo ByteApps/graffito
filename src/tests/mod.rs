@@ -99,3 +99,18 @@ mod ui_flow_locked_note_unlock;
 mod ui_flow_multi_select;
 mod ui_flow_multi_confirm;
 mod ui_flow_multi_reply_all;
+/// U10 (PLAN-graffito-app-arch.md): in-process ports of the NETWORK-FREE
+/// legs of the coordinate Mac suite (ui-automation/tests/graffito-app.sh) —
+/// notebooks create/name/open/archive, the universal-confirm cancel
+/// regression, the spending-wallet enable toggle + its M4 empty-wallet
+/// default rule, the cross-wallet payfrom verdict, the dispatch-follows-
+/// the-verdict poison sequence, and the sub-dust change fold. Everything
+/// else in that suite (funded scans, sweeps, broadcasts) needs a real node
+/// and stays there — see each file's own header for exactly what it skips
+/// and why. Same real State/AppWindow flow as `ui_flow_quantum_key`.
+mod ui_flow_app_notebooks;
+mod ui_flow_app_cancel_regression;
+mod ui_flow_app_spending_wallet;
+mod ui_flow_app_payfrom_state;
+mod ui_flow_app_dispatch;
+mod ui_flow_app_subdust_fold;
