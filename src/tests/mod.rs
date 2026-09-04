@@ -114,3 +114,17 @@ mod ui_flow_app_spending_wallet;
 mod ui_flow_app_payfrom_state;
 mod ui_flow_app_dispatch;
 mod ui_flow_app_subdust_fold;
+/// U11 (PLAN-graffito-app-arch.md): in-process ports of the NETWORK-FREE
+/// legs of the coordinate Mac suite
+/// (ui-automation/tests/graffito-app-matrix.sh) — S1 hex import/copy/
+/// reset, S2 WIF import, S3 mnemonic import + account switch + the
+/// disabled-spending gate, S4's create-seed onboarding + contacts +
+/// settings pills, and S6 dice-roll entropy. The node-set/funded/
+/// directed-note/activity/recipient-decrypt/coins/consolidate legs of S4,
+/// and all of S5 (notebook gap discovery), need a real regtest node and
+/// stay in the Mac suite.
+mod ui_flow_matrix_s1_hex_import;
+mod ui_flow_matrix_s2_wif_import;
+mod ui_flow_matrix_s3_mnemonic_accounts;
+mod ui_flow_matrix_s4_onboarding_contacts_settings;
+mod ui_flow_matrix_s6_dice;
