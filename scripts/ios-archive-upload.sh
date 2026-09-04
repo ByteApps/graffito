@@ -13,7 +13,7 @@
 # Usage (from the repo root):
 #   source signing.env                 # DEVELOPMENT_TEAM
 #   source appstore/config.local.env   # TEAM_ID / ASC_KEY_* / ASC_ISSUER_ID
-#   scripts/ios-archive-upload.sh [--archive-only]
+#   scripts/ios-archive-upload.sh [--archive-only | --export-only]
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
@@ -38,7 +38,12 @@ EXPORT_OPTS="$BUILD_DIR/ExportOptions.plist"
 LOG="$BUILD_DIR/archive.log"
 UPLOG="$BUILD_DIR/upload.log"
 mkdir -p "$BUILD_DIR"
-rm -rf "$ARCHIVE" "$EXPORT_DIR"
+if [ "${1:-}" = "--export-only" ]; then
+  [ -d "$ARCHIVE" ] || { echo "!! --export-only but no archive at $ARCHIVE" >&2; exit 1; }
+  rm -rf "$EXPORT_DIR"
+else
+  rm -rf "$ARCHIVE" "$EXPORT_DIR"
+fi
 
 # Signing uses the Xcode signed-in session by default (the paid account is added
 # in Xcode > Settings > Accounts). The ASC API key can create DEVELOPMENT
@@ -52,10 +57,16 @@ if [ "${USE_ASC_KEY_SIGNING:-0}" = "1" ]; then
          -authenticationKeyIssuerID "$ASC_ISSUER_ID" )
 fi
 
+sed "s/__TEAM_ID__/${TEAM_ID}/" "$REPO/scripts/ExportOptions.plist.template" > "$EXPORT_OPTS"
+
+# --export-only (2026-09-03): reuse the archive already on disk — the export
+# step is the one that needs the Xcode Apple-ID session, and when that session
+# has expired (2FA re-sign-in in Xcode > Settings > Accounts) re-archiving
+# for ten minutes buys nothing.
+if [ "${1:-}" != "--export-only" ]; then
 echo "==> xcodegen generate (DEVELOPMENT_TEAM=$TEAM_ID)"
 DEVELOPMENT_TEAM="$TEAM_ID" xcodegen generate --spec "$REPO/project.yml"
 
-sed "s/__TEAM_ID__/${TEAM_ID}/" "$REPO/scripts/ExportOptions.plist.template" > "$EXPORT_OPTS"
 
 archive() {
   echo "==> xcodebuild archive (team $TEAM_ID)"
@@ -98,6 +109,7 @@ rm -rf "$ORG_ARCHIVE"
 cp -R "$ARCHIVE" "$ORG_ARCHIVE"
 echo "==> archive filed for Organizer at $ORG_ARCHIVE"
 
+fi
 if [ "${1:-}" = "--archive-only" ]; then
   echo "✅ Archived at $ARCHIVE (upload skipped: --archive-only)"; exit 0
 fi
