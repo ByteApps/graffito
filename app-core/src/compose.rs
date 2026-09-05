@@ -14,7 +14,7 @@ use notes_core::bundle::{
     compose_note_pq_with_change, compose_note_with_change, Identity,
 };
 use notes_core::keys::generate_aux_rand;
-use notes_core::pq::{LockedBody, SealLayers};
+use notes_core::pq::{LockedBody, PwLayer, SealLayers};
 use notes_core::tx::{op_return_payload, outpoint_bytes, NoteTx};
 use notes_core::Network;
 use zeroize::Zeroize;
@@ -114,6 +114,10 @@ pub struct ComposeRequest<'a> {
     /// `None` = no passphrase layer (the ordinary v1 path, byte-identical
     /// to before this field existed).
     pub pq_password: Option<String>,
+    /// The Argon2id cost preset used when `pq_password` is `Some`
+    /// (`notes_core::pq::PwCost`) — ignored otherwise. The UI's per-note
+    /// choice; default [`notes_core::pq::PwCost::DEFAULT`].
+    pub pq_pw_cost: notes_core::pq::PwCost,
     /// Post-quantum: an ML-KEM hybrid layer. For a DIRECTED note, sealed to
     /// the recipient's encapsulation key — `(alg, ek_bytes)`; the caller
     /// resolves `ek` (from a `Contact::mlkem_ek` or a freshly imported key)
@@ -245,7 +249,10 @@ pub fn compose_note(
         }
         let layers = SealLayers {
             mlkem_ek: req.pq_mlkem.as_ref().map(|(alg, ek)| (*alg, ek.as_slice())),
-            password: req.pq_password.as_deref(),
+            password: req
+                .pq_password
+                .as_deref()
+                .map(|password| PwLayer { password, cost: req.pq_pw_cost }),
         };
         let pq_flags = layers.flags();
         if let Some((recipient, gift)) = recipients.first() {
@@ -985,7 +992,7 @@ mod bump_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1072,7 +1079,7 @@ mod multi_recipient_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1130,7 +1137,7 @@ mod multi_recipient_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1170,7 +1177,7 @@ mod multi_recipient_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 42,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1224,7 +1231,7 @@ mod multi_recipient_tests {
                 gift_amount: Some(5_000),
                 lock_time: None,
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1262,7 +1269,7 @@ mod multi_recipient_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1296,7 +1303,7 @@ mod multi_recipient_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1363,7 +1370,7 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: Some(777_777),
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1395,7 +1402,7 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1427,7 +1434,7 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: Some(123_456),
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1459,7 +1466,7 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: Some(444_444),
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1523,7 +1530,7 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: None,
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )
@@ -1561,7 +1568,7 @@ mod lock_time_tests {
                 gift_amount: None,
                 lock_time: Some(999_999),
                 now: 1,
-                pq_password: None,
+                pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
                 pq_mlkem: None,
             },
         )

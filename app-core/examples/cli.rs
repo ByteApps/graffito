@@ -613,7 +613,7 @@ fn main() {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
-                    pq_password: None, pq_mlkem: None,
+                    pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
                 },
             )
             .expect("compose");

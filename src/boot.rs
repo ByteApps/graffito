@@ -140,6 +140,8 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
         to_addresses_extra: Vec::new(),
         picking_extra: false,
         pq_passphrase_verified: false,
+        pq_pw_cost: app_core::notes_core::pq::PwCost::DEFAULT,
+        pq_mlkem_user_off: false,
         pq_passphrase_generated: None,
         pq_recipient_cache: None,
         pq_level,

@@ -562,39 +562,90 @@ pub fn mlkem_keypair_from_leaf(leaf_secret: &[u8; 32], alg: MlKemAlg) -> MlKemKe
 // Argon2id password layer
 // ---------------------------------------------------------------------
 
-/// Production Argon2id parameters: t=3 iterations, m=2^15 KiB (32 MiB),
-/// p=1 lane.
+/// Argon2id cost presets for the password layer. Chosen per note by the
+/// sender; the wire prefix records (t, m_log2, p) so unlock never needs
+/// this enum. Memory is what makes each guess expensive for an attacker.
 ///
-/// `m` was 2^16 (64 MiB, Sal's original brief) until the 2026-08-22 crypto
-/// audit (F2, `private/SECURITY-AUDIT-CRYPTO-2026-08-22.md`): a Passport
-/// Prime has ~59-60 MB of free heap, so a single 64 MiB Argon2 allocation
-/// plausibly fails on hardware — and both apps must EMIT one value the
-/// weakest platform can also UNLOCK, or Mac-sealed FLAG_PW notes become
-/// unreadable on device. 32 MiB at t=3 still clears RFC 9106's and OWASP's
-/// recommended Argon2id floors. Notes already sealed at m=2^16 remain
-/// decodable everywhere the memory exists ([`validate_pw_params`] accepts
-/// up to 16) — the wire prefix self-describes its params, so this constant
-/// only shapes NEW notes and is safe to lower again (never raise past the
-/// decode cap without bumping the cap a release earlier).
-pub const PW_PROD_T: u32 = 3;
-pub const PW_PROD_M_LOG2: u8 = 15;
-pub const PW_PROD_P: u32 = 1;
+/// There is no more single "production" constant — the product offers a
+/// cost choice at compose time (there is no shipped installed base to keep
+/// byte-compatible with, so this replaced the old fixed
+/// `PW_PROD_T`/`PW_PROD_M_LOG2`/`PW_PROD_P` outright rather than adding
+/// alongside them). The wire format already self-describes `(t, m_log2,
+/// p)` per note, so decoding an old or new note is identical either way —
+/// only the decode CAPS (below) needed raising to admit the largest
+/// preset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PwCost {
+    Standard,
+    Strong,
+    Maximum,
+}
+
+impl PwCost {
+    /// The default a compose UI should pre-select.
+    pub const DEFAULT: PwCost = PwCost::Strong;
+
+    /// All presets, in ascending cost order — for a UI picker.
+    pub const ALL: [PwCost; 3] = [PwCost::Standard, PwCost::Strong, PwCost::Maximum];
+
+    /// `(t iterations, m_log2 where m = 2^m_log2 KiB, p lanes)`.
+    pub const fn params(self) -> (u32, u8, u32) {
+        match self {
+            PwCost::Standard => (3, 16, 1), // 64 MiB
+            PwCost::Strong => (4, 17, 1),   // 128 MiB
+            PwCost::Maximum => (6, 18, 1),  // 256 MiB
+        }
+    }
+
+    /// The memory cost in MiB — for display ("Strong · 128 MiB").
+    pub const fn mib(self) -> u32 {
+        1 << (self.params().1 - 10)
+    }
+
+    /// Stable lowercase name, for config/UI persistence.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PwCost::Standard => "standard",
+            PwCost::Strong => "strong",
+            PwCost::Maximum => "maximum",
+        }
+    }
+
+    /// Case-insensitive inverse of [`Self::as_str`].
+    pub fn parse(s: &str) -> Option<PwCost> {
+        match s.to_ascii_lowercase().as_str() {
+            "standard" => Some(PwCost::Standard),
+            "strong" => Some(PwCost::Strong),
+            "maximum" => Some(PwCost::Maximum),
+            _ => None,
+        }
+    }
+}
+
+/// A password layer request: the passphrase plus the cost preset the
+/// sender chose. Replaces a bare `&str` in [`SealLayers::password`] so the
+/// seal path always knows which params to write into the wire prefix.
+#[derive(Clone, Copy, Debug)]
+pub struct PwLayer<'a> {
+    pub password: &'a str,
+    pub cost: PwCost,
+}
 
 /// Decode-side cap on a received note's `m_log2`. These params are
 /// ATTACKER-CONTROLLED on-chain bytes, and Argon2 allocates `2^m_log2` KiB
 /// up front — before the 2026-08-22 audit (F1) this cap was 24, letting a
 /// hostile note demand a 16 GiB allocation at unlock time (an instant
-/// process abort on a 128 MB device, an OOM grind elsewhere). 16 is the
-/// largest value any honest emitter has EVER written ([`PW_PROD_M_LOG2`]
-/// was 16 from the feature's ship date until the same audit lowered it to
-/// 15), so capping here rejects nothing legitimate. If production params
-/// are ever raised past 16, ship the cap bump one release BEFORE the
-/// emitter bump, or old builds will reject the new notes.
-pub const PW_MAX_M_LOG2: u8 = 16;
-/// Decode-side cap on a received note's `t` (pass count). Honest emitters
-/// have only ever written [`PW_PROD_T`] = 3; 16 leaves generous headroom
-/// while bounding the CPU an attacker can demand (255 passes over a
-/// 64 MiB arena ≈ minutes of compute per unlock attempt). Same
+/// process abort on a 128 MB device, an OOM grind elsewhere). Sized to the
+/// largest [`PwCost`] preset ([`PwCost::Maximum`]'s `m_log2` = 18, 256 MiB)
+/// — the threat model is unchanged: a note may demand at most 256 MiB of
+/// Argon2 memory at unlock. If a future preset is ever added above
+/// Maximum, ship the cap bump one release BEFORE any emitter uses it, or
+/// old builds will reject the new notes.
+pub const PW_MAX_M_LOG2: u8 = 18;
+/// Decode-side cap on a received note's `t` (pass count). Every
+/// [`PwCost`] preset's `t` is <= 6; 16 leaves generous headroom while
+/// bounding the CPU an attacker can demand (16 passes over a 256 MiB
+/// arena is still bounded compute per unlock attempt). Same
 /// raise-the-cap-first rule as [`PW_MAX_M_LOG2`].
 pub const PW_MAX_T: u32 = 16;
 
@@ -621,8 +672,8 @@ fn validate_pw_params(t: u32, m_log2: u8, p: u32) -> Result<(), Error> {
 
 /// Argon2id(v0x13) key derivation: `m = 2^m_log2` KiB, `t` iterations, `p`
 /// lanes, 32-byte output. `(t, m_log2, p)` must already be valid Argon2
-/// parameters (production callers use [`PW_PROD_T`] / [`PW_PROD_M_LOG2`] /
-/// [`PW_PROD_P`], which always are; callers parsing `(t, m_log2, p)` off
+/// parameters (production callers use one of [`PwCost::params`], which
+/// always are; callers parsing `(t, m_log2, p)` off
 /// the chain MUST run [`validate_pw_params`] first —
 /// `unlock_received`/`unlock_sent` do this before ever calling `pw_key`).
 /// Invalid params return `Error::Decode` (never reachable from this
@@ -807,14 +858,15 @@ pub fn seal_self_pq(
     }
 
     let mut pw_key_bytes: Option<[u8; 32]> = None;
-    if let Some(password) = layers.password {
+    if let Some(PwLayer { password, cost }) = layers.password {
+        let (t, m_log2, p) = cost.params();
         let mut salt = [0u8; 16];
         getrandom::getrandom(&mut salt).map_err(|_| Error::Entropy)?;
-        let key = pw_key(password, &salt, PW_PROD_T, PW_PROD_M_LOG2, PW_PROD_P)?;
+        let key = pw_key(password, &salt, t, m_log2, p)?;
         prefix.extend_from_slice(&salt);
-        prefix.push(PW_PROD_T as u8);
-        prefix.push(PW_PROD_M_LOG2);
-        prefix.push(PW_PROD_P as u8);
+        prefix.push(t as u8);
+        prefix.push(m_log2);
+        prefix.push(p as u8);
         pw_key_bytes = Some(key);
     }
 
@@ -878,7 +930,9 @@ pub fn unlock_self(
 #[derive(Clone, Copy)]
 pub struct SealLayers<'a> {
     pub mlkem_ek: Option<(MlKemAlg, &'a [u8])>,
-    pub password: Option<&'a str>,
+    /// The passphrase plus the Argon2id cost preset it should be sealed
+    /// under (see [`PwLayer`]/[`PwCost`]) — `None` = no password layer.
+    pub password: Option<PwLayer<'a>>,
 }
 
 impl<'a> SealLayers<'a> {
@@ -938,14 +992,15 @@ pub fn seal_directed_pq(
     }
 
     let mut pw_key_bytes: Option<[u8; 32]> = None;
-    if let Some(password) = layers.password {
+    if let Some(PwLayer { password, cost }) = layers.password {
+        let (t, m_log2, p) = cost.params();
         let mut salt = [0u8; 16];
         getrandom::getrandom(&mut salt).map_err(|_| Error::Entropy)?;
-        let key = pw_key(password, &salt, PW_PROD_T, PW_PROD_M_LOG2, PW_PROD_P)?;
+        let key = pw_key(password, &salt, t, m_log2, p)?;
         prefix.extend_from_slice(&salt);
-        prefix.push(PW_PROD_T as u8);
-        prefix.push(PW_PROD_M_LOG2);
-        prefix.push(PW_PROD_P as u8);
+        prefix.push(t as u8);
+        prefix.push(m_log2);
+        prefix.push(p as u8);
         pw_key_bytes = Some(key);
     }
 
@@ -1150,6 +1205,33 @@ pub fn unlock_sent(
 mod tests {
     use super::*;
 
+    /// Every [`PwCost`] preset must itself be a valid, decodable Argon2
+    /// parameter triple — otherwise a note sealed under that preset could
+    /// never be unlocked by anyone, sender included.
+    #[test]
+    fn every_pw_cost_preset_passes_validation() {
+        for cost in PwCost::ALL {
+            let (t, m_log2, p) = cost.params();
+            assert!(
+                validate_pw_params(t, m_log2, p).is_ok(),
+                "{cost:?} params ({t}, {m_log2}, {p}) failed validate_pw_params"
+            );
+            assert!(m_log2 <= PW_MAX_M_LOG2, "{cost:?} m_log2 exceeds the decode cap");
+            assert!(t <= PW_MAX_T, "{cost:?} t exceeds the decode cap");
+        }
+    }
+
+    /// [`PwCost::parse`] must invert [`PwCost::as_str`] for every preset.
+    #[test]
+    fn pw_cost_str_round_trips() {
+        for cost in PwCost::ALL {
+            assert_eq!(PwCost::parse(cost.as_str()), Some(cost));
+            // Case-insensitive.
+            assert_eq!(PwCost::parse(&cost.as_str().to_ascii_uppercase()), Some(cost));
+        }
+        assert_eq!(PwCost::parse("bogus"), None);
+    }
+
     /// FROZEN-domain pin for the self-pq sealing key
     /// (PLAN-graffito-self-pw.md): fixed inputs -> pinned output for every
     /// layer combination, plus domain separation from the directed
@@ -1182,11 +1264,11 @@ mod tests {
         assert_ne!(kem_only, kem_1024);
     }
 
-    /// A FLAG_PW note sealed under the ORIGINAL production params
-    /// (t=3, m_log2=16, p=1 — what every PW note carried before the
-    /// 2026-08-22 audit lowered [`PW_PROD_M_LOG2`] to 15) must still
-    /// unlock: the decode cap ([`PW_MAX_M_LOG2`] = 16) deliberately
-    /// admits the old value, and `pw_key`'s fallible-allocation refactor
+    /// A FLAG_PW note sealed under the historical pre-`PwCost` production
+    /// params (t=3, m_log2=16, p=1 — what every PW note carried before the
+    /// 2026-08-22 audit, and coincidentally identical to [`PwCost::Standard`]
+    /// today) must still unlock: the decode cap ([`PW_MAX_M_LOG2`] = 18)
+    /// admits it comfortably, and `pw_key`'s fallible-allocation refactor
     /// is byte-preserving (also pinned by `pw_key_vectors_are_pinned` in
     /// tests/pq.rs). Uses the private `derive_pq_key` to reconstruct the
     /// exact sealing the old emitter performed, since the public seal

@@ -632,6 +632,11 @@ export global Compose {
     callback pq-generate-passphrase();
     callback pq-passphrase-changed(string);
     callback pq-mlkem-toggled(bool);
+    // Argon2id cost preset for the passphrase layer, chosen per note:
+    // "standard" (64 MiB) / "strong" (128 MiB, default) / "maximum" (256 MiB).
+    in-out property <string> pq-pw-cost: "strong";
+    in property <string> pq-pw-cost-caption;
+    callback pq-pw-cost-changed(string);
     // Fired whenever the Security panel's header is tapped, with the NEW
     // expanded state — the sanctioned user-initiated door (LAUNCH-PATH
     // rule) for lazily loading a self-note's imported quantum key from the
