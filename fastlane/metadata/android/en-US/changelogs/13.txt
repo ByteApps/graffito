@@ -1,0 +1,1 @@
+Text follows your phone's font-size setting and is larger by default. Seed words show as an aligned numbered grid. The back gesture navigates instead of closing the app, revealing keys no longer freezes the app, the layout no longer shifts under the status bar after a font-size change, and screens showing keys block screenshots. No change to notes, keys, or funds.
