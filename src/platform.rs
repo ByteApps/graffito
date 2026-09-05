@@ -270,12 +270,33 @@ pub fn safe_area_insets(scale: f32) -> (f32, f32) {
     let Some(app) = crate::android_app() else {
         return (0.0, 0.0);
     };
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    // Edge-to-edge (2026-09-04): from Android 15 with targetSdk >= 35 the
+    // window is drawn under the system bars and the NativeActivity content
+    // rect is the FULL window — the rect-based path below reads (0, 0), the
+    // Terms button sat under the gesture bar and every header under the
+    // status bar (Pixel 11 Pro XL / Android 17; the API 34 emulator never
+    // shows it). The authoritative source is the root view's WindowInsets
+    // (system bars + display cutout); the content rect stays as the fallback
+    // for the window not being attached yet.
+    match android_jni::window_insets() {
+        Ok((top, bottom)) if top > 0 || bottom > 0 => {
+            return (top as f32 / scale, bottom as f32 / scale);
+        }
+        other => {
+            // Logged once: which path the device took matters when a new OS
+            // moves the insets again (debug builds + this diagnostic only).
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                println!("cb: window-insets {other:?}");
+            }
+        }
+    }
     let rect = app.content_rect();
     // An all-zero / inverted rect means the content rect isn't known yet.
     if rect.bottom <= rect.top {
         return (0.0, 0.0);
     }
-    let scale = if scale > 0.0 { scale } else { 1.0 };
     let top = (rect.top.max(0) as f32) / scale;
     let bottom = app
         .native_window()
@@ -547,11 +568,83 @@ mod android_jni {
             Ok(v) => Ok(v),
             Err(e) => {
                 if env.exception_check().unwrap_or(false) {
+                    // Stack trace to logcat (W/System.err) — the only way to
+                    // see WHICH call threw from a shipped build.
+                    let _ = env.exception_describe();
                     let _ = env.exception_clear();
                 }
                 Err(format!("{e}"))
             }
         }
+    }
+
+    /// activity.getWindow().getDecorView().getRootWindowInsets()
+    ///     .getInsets(WindowInsets.Type.systemBars() | Type.displayCutout())
+    /// → (top, bottom) in PHYSICAL pixels. API 30+ path first; on API 26-29
+    /// the deprecated getSystemWindowInsetTop/Bottom() (same numbers, minus
+    /// the cutout). Err when the decor view has no insets yet (not attached
+    /// on the very first ticks) — the caller re-polls.
+    pub fn window_insets() -> Result<(i32, i32), String> {
+        // NOT the ndk_context context object (an Application-ish context is
+        // what the other shims get — which is why open_url needs
+        // FLAG_ACTIVITY_NEW_TASK); getWindow() lives on the NativeActivity,
+        // reachable through android-activity's raw activity handle.
+        let app = crate::android_app().ok_or_else(|| "no android app".to_string())?;
+        let activity_ptr = app.activity_as_ptr();
+        with_env_ctx(|env, _ctx| {
+            let activity = unsafe { JObject::from_raw(activity_ptr as jni::sys::jobject) };
+            let window = env.call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])?.l()?;
+            let decor = env.call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?.l()?;
+            let insets = env
+                .call_method(&decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", &[])?
+                .l()?;
+            if insets.is_null() {
+                return Err(jni::errors::Error::NullPtr("getRootWindowInsets"));
+            }
+            let sdk = env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i()?;
+            if sdk >= 30 {
+                let ty = |env: &mut JNIEnv, name: &str| -> jni::errors::Result<i32> {
+                    env.call_static_method("android/view/WindowInsets$Type", name, "()I", &[])?.i()
+                };
+                let read = |env: &mut JNIEnv, method: &str, mask: i32| -> jni::errors::Result<(i32, i32)> {
+                    let ins = env
+                        .call_method(&insets, method, "(I)Landroid/graphics/Insets;", &[JValue::Int(mask)])?
+                        .l()?;
+                    Ok((env.get_field(&ins, "top", "I")?.i()?, env.get_field(&ins, "bottom", "I")?.i()?))
+                };
+                let status = ty(env, "statusBars")?;
+                let nav = ty(env, "navigationBars")?;
+                let cutout = ty(env, "displayCutout")?;
+                let gest = ty(env, "systemGestures")?;
+                let mand = ty(env, "mandatorySystemGestures")?;
+                let tap = ty(env, "tappableElement")?;
+                let vis = read(env, "getInsets", status | nav | cutout)?;
+                let ign = read(env, "getInsetsIgnoringVisibility", status | nav | cutout)?;
+                // One-time survey of every inset type: which one carries the
+                // gesture bar differs by device/OS, and this is the only way
+                // to learn it from a shipped build.
+                static SURVEYED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SURVEYED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let n = read(env, "getInsets", nav)?;
+                    let s_ = read(env, "getInsets", status)?;
+                    let c = read(env, "getInsets", cutout)?;
+                    let g = read(env, "getInsets", gest)?;
+                    let m = read(env, "getInsets", mand)?;
+                    let t = read(env, "getInsets", tap)?;
+                    println!(
+                        "cb: insets-survey status={s_:?} nav={n:?} cutout={c:?} gestures={g:?} mandatory={m:?} tappable={t:?} ignoring-vis={ign:?}"
+                    );
+                }
+                // Layout against the larger of visible and ignoring-visibility
+                // system-bar insets: a transient/hidden gesture bar still
+                // reserves its strip.
+                Ok((vis.0.max(ign.0), vis.1.max(ign.1)))
+            } else {
+                let top = env.call_method(&insets, "getSystemWindowInsetTop", "()I", &[])?.i()?;
+                let bottom = env.call_method(&insets, "getSystemWindowInsetBottom", "()I", &[])?.i()?;
+                Ok((top, bottom))
+            }
+        })
     }
 
     /// context.getSystemService("clipboard").setPrimaryClip(
