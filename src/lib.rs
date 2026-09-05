@@ -2165,9 +2165,25 @@ pub fn run() {
     // Quantum keys (screen 29) level-picker captions — pinned copy from
     // `passphrase::MlKemLevel::describe()`, set once (never changes at
     // runtime, so no need to re-derive it on every screen open).
-    window.global::<QuantumKeys>().set_pq_desc_512(app_core::passphrase::MlKemLevel::MlKem512.describe().into());
-    window.global::<QuantumKeys>().set_pq_desc_768(app_core::passphrase::MlKemLevel::MlKem768.describe().into());
-    window.global::<QuantumKeys>().set_pq_desc_1024(app_core::passphrase::MlKemLevel::MlKem1024.describe().into());
+    // Each card's caption = the pinned security description + what the level
+    // COSTS on-chain (Sal, 2026-09-05): the ML-KEM ciphertext rides in every
+    // note sealed to the key, so the level is a fee choice as much as a
+    // security one. Relative to 768 so it reads at any fee rate; the compose
+    // preview shows the exact sats once the layer is on.
+    {
+        use app_core::notes_core::pq::MlKemAlg;
+        use app_core::passphrase::MlKemLevel;
+        let base = MlKemAlg::MlKem768.ct_len() + 1;
+        let card = |level: MlKemLevel, alg: MlKemAlg| -> String {
+            let bytes = alg.ct_len() + 1;
+            let ratio = bytes as f64 / base as f64;
+            let rel = if (ratio - 1.0).abs() < 0.01 { "the baseline".to_string() } else { format!("{ratio:.2}× the 768 size") };
+            format!("{} On-chain: +{bytes} bytes in every note sealed to this key ({rel}).", level.describe())
+        };
+        window.global::<QuantumKeys>().set_pq_desc_512(card(MlKemLevel::MlKem512, MlKemAlg::MlKem512).into());
+        window.global::<QuantumKeys>().set_pq_desc_768(card(MlKemLevel::MlKem768, MlKemAlg::MlKem768).into());
+        window.global::<QuantumKeys>().set_pq_desc_1024(card(MlKemLevel::MlKem1024, MlKemAlg::MlKem1024).into());
+    }
 
     // EditOps global wiring — src/editops.rs (U4, PLAN-graffito-app-arch.md).
     editops::wire(&window);
