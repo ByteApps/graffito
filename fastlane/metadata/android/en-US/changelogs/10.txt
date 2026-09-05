@@ -1,0 +1,1 @@
+Fixes the app failing to open when installed from Google Play (the Play-served build could not start). No change to notes, keys, or funds. Also carries the under-the-hood restructuring and the two fixes from 0.1.6.
