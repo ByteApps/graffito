@@ -14,13 +14,7 @@ pub(crate) fn on_regenerate_words(&mut self, w: &AppWindow) {
         match generate_mnemonic_with_salt(count, &salt) {
             Ok(m) => {
                 let phrase = m.to_string();
-                let grid: String = phrase
-                    .split(' ')
-                    .enumerate()
-                    .map(|(i, wd)| {
-                        format!("{:>2}. {:<9}{}", i + 1, wd, if i % 3 == 2 { "\n" } else { " " })
-                    })
-                    .collect();
+                let grid = word_grid(&phrase);
                 if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
                     println!("cb-test: words={phrase}");
                 }
@@ -68,4 +62,22 @@ pub(crate) fn on_backup_continue(&mut self, w: &AppWindow) {
         w.global::<Quiz>().set_quiz_answer("".into());
         w.global::<Ui>().set_screen(Screen::Quiz);
     }
+}
+
+/// The numbered backup-word grid shown on the write-it-down screen. Three
+/// columns on desktop; TWO on phones (`platform::type_scale() > 1.0`): a
+/// 3-column row of 13px Menlo is ~44 chars, which the `Mono` char-wrap
+/// splits mid-word on a 411dp phone even before the type scale. The one
+/// formatter for both create paths (device RNG + dice) and the preview mock.
+pub(crate) fn word_grid(phrase: &str) -> String {
+    let cols = if crate::platform::type_scale() > 1.0 { 2 } else { 3 };
+    // Longest BIP-39 word is 8 chars; the wider pad is the desktop look.
+    let pad = if cols == 2 { 8 } else { 9 };
+    phrase
+        .split(' ')
+        .enumerate()
+        .map(|(i, wd)| {
+            format!("{:>2}. {:<pad$}{}", i + 1, wd, if i % cols == cols - 1 { "\n" } else { " " }, pad = pad)
+        })
+        .collect()
 }

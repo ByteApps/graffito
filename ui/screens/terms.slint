@@ -5,7 +5,7 @@
 
 import { Ui, Terms, Settings } from "../globals.slint";
 import { H1, Body, PrimaryButton, Header } from "../components.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component TermsScreen inherits VerticalLayout { padding-top: Ui.safe-top + 20px; padding-bottom: Ui.safe-bottom + 10px;
         padding: 24px;
@@ -32,7 +32,7 @@ export component TermsScreen inherits VerticalLayout { padding-top: Ui.safe-top 
         }
         Body {
             text: Terms.disclaimer-body;
-            font-size: 17px;
+            font-size: 17px * Metrics.type-scale;
         }
         Rectangle { }  // stretch
         if Ui.terms-accept-mode: PrimaryButton {

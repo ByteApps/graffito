@@ -116,11 +116,7 @@ pub(crate) fn activate_restored(&mut self, window: &AppWindow, material: String,
 /// the two paths can never drift on the iCloud default or the grid format.
 pub(crate) fn stage_new_mnemonic(&mut self, w: &AppWindow, phrase: String) {
     let s = self;
-    let grid: String = phrase
-        .split(' ')
-        .enumerate()
-        .map(|(i, wd)| format!("{:>2}. {:<9}{}", i + 1, wd, if i % 3 == 2 { "\n" } else { " " }))
-        .collect();
+    let grid = word_grid(&phrase);
     if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
         // TEST ONLY (env-gated): lets the UI e2e complete the backup quiz.
         // Never set outside automation.

@@ -8,6 +8,13 @@
 // macOS -1.25px · iOS -1.25px (default) · Android +1.5px.
 export global Metrics {
     in-out property <length> back-dy: -1.25px;
+    // Type scale (2026-09-05): EVERY `font-size` in the UI is written as
+    // `N px * Metrics.type-scale`. Desktop stays 1.0 (render-all.sh must be
+    // byte-identical to prove that); phones get a BASE bump (the design's
+    // 11-13px body copy reads too small at 1 dp = 1 px on a phone) times the
+    // OS accessibility font scale, capped — see `platform::type_scale`.
+    // A layout with a fixed-height row must survive the cap, never lower it.
+    in-out property <float> type-scale: 1.0;
 }
 
 // ---- palette ----

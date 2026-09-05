@@ -6,7 +6,7 @@
 import { Ui, Modals, Note } from "globals.slint";
 import { Body, Caption, Mono, PrimaryButton, GhostButton, IconButton, QrArea } from "components.slint";
 import { EditField } from "edit.slint";
-import { Pal } from "theme.slint";
+import { Pal, Metrics } from "theme.slint";
 import { Switch } from "std-widgets.slint";
 
 // ScanningModal -- extracted verbatim from app.slint on 2026-09-03
@@ -28,7 +28,7 @@ export component ScanningModal inherits Rectangle {
                 Text {
                     text: Modals.scan-hint;
                     color: Pal.text;
-                    font-size: 15px;
+                    font-size: 15px * Metrics.type-scale;
                     font-weight: 600;
                     horizontal-alignment: center;
                     wrap: word-wrap;
@@ -117,7 +117,7 @@ export component FundRenameModal inherits Rectangle {
                 spacing: 12px;
                 Text {
                     text: "Name this wallet";
-                    font-size: 16px;
+                    font-size: 16px * Metrics.type-scale;
                     font-weight: 700;
                     color: Pal.text;
                 }
@@ -164,13 +164,13 @@ export component RenameAddressModal inherits Rectangle {
                 spacing: 12px;
                 Text {
                     text: "Name this contact";
-                    font-size: 16px;
+                    font-size: 16px * Metrics.type-scale;
                     font-weight: 700;
                     color: Pal.text;
                 }
                 Mono {
                     text: Ui.rename-address;
-                    font-size: 10px;
+                    font-size: 10px * Metrics.type-scale;
                     color: Pal.muted;
                     wrap: no-wrap;
                     overflow: elide;
@@ -185,7 +185,7 @@ export component RenameAddressModal inherits Rectangle {
                     }
                 }
                 if Ui.apple-platform: Rectangle {
-                    height: 30px;
+                    height: 30px * Metrics.type-scale;
                     cbta := TouchArea { clicked => { Modals.rename-synced = !Modals.rename-synced; } }
                     HorizontalLayout {
                         spacing: 10px;
@@ -207,14 +207,14 @@ export component RenameAddressModal inherits Rectangle {
                         }
                         Text {
                             text: "Save to iCloud";
-                            font-size: 13px;
+                            font-size: 13px * Metrics.type-scale;
                             color: Pal.text;
                             vertical-alignment: center;
                         }
                     }
                 }
                 Rectangle { height: 1px; background: Pal.line; }
-                Text { text: "Quantum key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                Text { text: "Quantum key"; font-size: 13px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
                 if Ui.rename-pq-display != "": HorizontalLayout {
                     spacing: 8px;
                     Caption { text: Ui.rename-pq-display; horizontal-stretch: 1; wrap: word-wrap; }
@@ -235,7 +235,7 @@ export component RenameAddressModal inherits Rectangle {
                         placeholder-text: "paste their quantum public key";
                         accepted(t) => { Ui.contact-pq-set(t); }
                     }
-                    GhostButton { text: "Set"; width: 64px; clicked => { Ui.contact-pq-set(Modals.rename-pq-input); } }
+                    GhostButton { text: "Set"; width: 64px * Metrics.type-scale; clicked => { Ui.contact-pq-set(Modals.rename-pq-input); } }
                 }
                 if Ui.desktop-platform && Ui.rename-pq-display == "": GhostButton {
                     text: "From file…";
@@ -276,7 +276,7 @@ export component NbRenameModal inherits Rectangle {
                 spacing: 12px;
                 Text {
                     text: "Name this notebook";
-                    font-size: 16px;
+                    font-size: 16px * Metrics.type-scale;
                     font-weight: 700;
                     color: Pal.text;
                 }
@@ -323,14 +323,14 @@ export component ConfirmRemoveAddressModal inherits Rectangle {
                 spacing: 12px;
                 Text {
                     text: "Remove this contact?";
-                    font-size: 16px;
+                    font-size: 16px * Metrics.type-scale;
                     font-weight: 700;
                     color: Pal.text;
                 }
                 if Modals.confirm-remove-name != "": Body { text: Modals.confirm-remove-name; }
                 Mono {
                     text: Ui.confirm-remove-address;
-                    font-size: 10px;
+                    font-size: 10px * Metrics.type-scale;
                     color: Pal.muted;
                     wrap: no-wrap;
                     overflow: elide;
@@ -378,13 +378,13 @@ export component DiceClearConfirmModal inherits Rectangle {
                 spacing: 12px;
                 Text {
                     text: "Discard " + Ui.dice-count + " rolls?";
-                    font-size: 16px;
+                    font-size: 16px * Metrics.type-scale;
                     font-weight: 700;
                     color: Pal.text;
                 }
                 Body {
                     text: "You'll start again from zero and have to re-roll them.";
-                    font-size: 12px;
+                    font-size: 12px * Metrics.type-scale;
                 }
                 HorizontalLayout {
                     spacing: 10px;
@@ -429,7 +429,7 @@ export component PqBackupConfirmModal inherits Rectangle {
                 spacing: 12px;
                 Text {
                     text: "Back up your quantum private key?";
-                    font-size: 16px;
+                    font-size: 16px * Metrics.type-scale;
                     font-weight: 700;
                     color: Pal.text;
                 }
@@ -472,7 +472,7 @@ export component PqReplaceConfirmModal inherits Rectangle {
                 spacing: 12px;
                 Text {
                     text: "Replace your quantum key?";
-                    font-size: 16px;
+                    font-size: 16px * Metrics.type-scale;
                     font-weight: 700;
                     color: Pal.text;
                 }
@@ -523,7 +523,7 @@ export component PqExportPrivateConfirmModal inherits Rectangle {
                     spacing: 12px;
                     Text {
                         text: "Export your quantum private key?";
-                        font-size: 16px;
+                        font-size: 16px * Metrics.type-scale;
                         font-weight: 700;
                         color: Pal.text;
                     }
@@ -541,7 +541,7 @@ export component PqExportPrivateConfirmModal inherits Rectangle {
                     spacing: 12px;
                     Text {
                         text: "Your quantum private key";
-                        font-size: 16px;
+                        font-size: 16px * Metrics.type-scale;
                         font-weight: 700;
                         color: Pal.text;
                     }
@@ -600,13 +600,13 @@ export component ResetConfirmModal inherits Rectangle {
                 spacing: 12px;
                 Text {
                     text: "Switch identity?";
-                    font-size: 16px;
+                    font-size: 16px * Metrics.type-scale;
                     font-weight: 700;
                     color: Pal.text;
                 }
                 Body {
                     text: "This removes the current key from this device and returns to onboarding, where you can create a new seed or import a different key (and pick its account).";
-                    font-size: 12px;
+                    font-size: 12px * Metrics.type-scale;
                 }
                 Caption {
                     text: "Your notes and funds stay on-chain. Re-import the same key + account and everything comes back. Make sure the backup is written down — without it, this identity is gone.";
@@ -654,13 +654,13 @@ export component OversizeModal inherits Rectangle {
                 spacing: 12px;
                 Text {
                     text: "Note too large";
-                    font-size: 16px;
+                    font-size: 16px * Metrics.type-scale;
                     font-weight: 700;
                     color: Pal.text;
                 }
                 Body {
                     text: Modals.oversize-message;
-                    font-size: 12px;
+                    font-size: 12px * Metrics.type-scale;
                 }
                 HorizontalLayout {
                     spacing: 10px;
@@ -702,22 +702,22 @@ export component BumpDialogModal inherits Rectangle {
                 spacing: 12px;
                 Text {
                     text: "Speed up transaction";
-                    font-size: 16px;
+                    font-size: 16px * Metrics.type-scale;
                     font-weight: 700;
                     color: Pal.text;
                 }
-                Body { text: Modals.bump-kind; font-size: 12px; }
+                Body { text: Modals.bump-kind; font-size: 12px * Metrics.type-scale; }
                 Caption { text: Modals.bump-current; }
                 HorizontalLayout {
                     spacing: 8px;
                     EditField {
-                        width: 96px;
+                        width: 96px * Metrics.type-scale;
                         text <=> Modals.bump-rate;
                         edited => { Modals.act-bump-rate-changed(self.text); }
                     }
                     Caption { text: "sat/vB"; vertical-alignment: center; }
                 }
-                Body { text: Modals.bump-new-fee; font-size: 13px; font-weight: 600; color: Pal.accent; }
+                Body { text: Modals.bump-new-fee; font-size: 13px * Metrics.type-scale; font-weight: 600; color: Pal.accent; }
                 Caption { text: Modals.bump-min; color: Pal.warn; }
                 if Modals.bump-error != "": Caption { text: Modals.bump-error; color: Pal.bad; }
                 HorizontalLayout {
@@ -759,7 +759,7 @@ export component QrZoomModal inherits Rectangle {
             x: (parent.width - self.width) / 2;
             y: qr-zoom-card.y + qr-zoom-card.height + 18px;
             color: white;
-            font-size: 14px;
+            font-size: 14px * Metrics.type-scale;
         }
         // Dismiss layer on TOP so a tap anywhere — including on the enlarged
         // QR — closes it (non-TouchArea siblings above would otherwise swallow
@@ -776,7 +776,7 @@ export component ToastModal inherits Rectangle {
             x: (parent.width - self.width) / 2;
             y: parent.height - self.height - 64px;
             width: toast-label.preferred-width + 32px;
-            height: 36px;
+            height: 36px * Metrics.type-scale;
             border-radius: 18px;
             background: Pal.card.with-alpha(0.96);
             border-width: 1px;
@@ -788,7 +788,7 @@ export component ToastModal inherits Rectangle {
                 vertical-alignment: center;
                 text: Ui.toast-text;
                 color: Pal.text;
-                font-size: 13px;
+                font-size: 13px * Metrics.type-scale;
                 font-weight: 600;
             }
         }

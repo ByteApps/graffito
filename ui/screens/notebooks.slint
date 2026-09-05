@@ -5,7 +5,7 @@
 
 import { Ui, Notebooks } from "../globals.slint";
 import { Caption, PrimaryButton, GhostButton, IconButton, SvgIconButton, SyncButton, Badge, PencilButton } from "../components.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component NotebooksScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -15,7 +15,7 @@ export component NotebooksScreen inherits VerticalLayout { padding-top: Ui.safe-
             height: 40px;
             Text {
                 text: "Graffito";
-                font-size: 19px;
+                font-size: 19px * Metrics.type-scale;
                 font-weight: 700;
                 color: Pal.text;
                 vertical-alignment: center;
@@ -46,7 +46,7 @@ export component NotebooksScreen inherits VerticalLayout { padding-top: Ui.safe-
                 alignment: start;
                 spacing: 6px;
                 for nb in Ui.notebooks: Rectangle {
-                    height: 86px;
+                    height: 86px * Metrics.type-scale;
                     nb-ta := TouchArea { clicked => { Notebooks.open-notebook(nb.index); } }
                     Rectangle {
                         y: 2px;
@@ -67,7 +67,7 @@ export component NotebooksScreen inherits VerticalLayout { padding-top: Ui.safe-
                                     alignment: start;
                                     Text {
                                         text: nb.name;
-                                        font-size: 14px;
+                                        font-size: 14px * Metrics.type-scale;
                                         font-weight: 700;
                                         color: Pal.text;
                                         overflow: elide;
@@ -95,7 +95,7 @@ export component NotebooksScreen inherits VerticalLayout { padding-top: Ui.safe-
                     }
                 }
                 if Notebooks.archived-toggle-label != "": Rectangle {
-                    height: 34px;
+                    height: 34px * Metrics.type-scale;
                     arch-ta := TouchArea { clicked => { Notebooks.show-archived = !Notebooks.show-archived; } }
                     HorizontalLayout {
                         spacing: 6px;
@@ -117,7 +117,7 @@ export component NotebooksScreen inherits VerticalLayout { padding-top: Ui.safe-
                 if Notebooks.show-archived: VerticalLayout {
                     spacing: 6px;
                     for nb in Notebooks.archived-notebooks: Rectangle {
-                        height: 56px;
+                        height: 56px * Metrics.type-scale;
                         anb-ta := TouchArea { clicked => { Notebooks.open-notebook(nb.index); } }
                         Rectangle {
                             y: 2px;
@@ -135,7 +135,7 @@ export component NotebooksScreen inherits VerticalLayout { padding-top: Ui.safe-
                                     spacing: 4px;
                                     Text {
                                         text: nb.name;
-                                        font-size: 13px;
+                                        font-size: 13px * Metrics.type-scale;
                                         color: Pal.muted;
                                         overflow: elide;
                                     }

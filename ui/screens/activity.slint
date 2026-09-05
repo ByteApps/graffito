@@ -5,7 +5,7 @@
 
 import { Ui, Activity } from "../globals.slint";
 import { Body, Caption, Mono, GhostButton, Header, Badge } from "../components.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component ActivityScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -37,7 +37,7 @@ export component ActivityScreen inherits VerticalLayout { padding-top: Ui.safe-t
                             spacing: 6px;
                             Text {
                                 text: a.kind;
-                                font-size: 12px;
+                                font-size: 12px * Metrics.type-scale;
                                 font-weight: 700;
                                 color: Pal.text;
                             }
@@ -54,14 +54,14 @@ export component ActivityScreen inherits VerticalLayout { padding-top: Ui.safe-t
                                     : ((a.status == "pending" || a.status == "dropped") ? Pal.warn : Pal.bad);
                             }
                         }
-                        Body { text: a.title; font-size: 12px; overflow: elide; }
+                        Body { text: a.title; font-size: 12px * Metrics.type-scale; overflow: elide; }
                         if a.status == "dropped": Caption { text: "dropped — bump fee to retry"; color: Pal.warn; }
                         Caption { text: a.fee-line; }
                         HorizontalLayout {
                             spacing: 6px;
                             Mono {
                                 text: a.txid;
-                                font-size: 10px;
+                                font-size: 10px * Metrics.type-scale;
                                 color: Pal.muted;
                                 wrap: no-wrap;
                                 overflow: elide;
@@ -73,22 +73,22 @@ export component ActivityScreen inherits VerticalLayout { padding-top: Ui.safe-t
                             spacing: 8px;
                             alignment: start;
                             if a.pending && a.bumpable: GhostButton {
-                                width: 96px;
-                                height: 30px;
+                                width: 96px * Metrics.type-scale;
+                                height: 30px * Metrics.type-scale;
                                 opacity: a.busy ? 0.5 : 1.0;
                                 text: a.busy ? "…" : "Speed up";
                                 clicked => { if (!a.busy) { Activity.act-bump-open(a.ref-id, a.is-note); } }
                             }
                             if a.pending: GhostButton {
-                                width: 108px;
-                                height: 30px;
+                                width: 108px * Metrics.type-scale;
+                                height: 30px * Metrics.type-scale;
                                 opacity: a.busy ? 0.5 : 1.0;
                                 text: a.busy ? "Sending…" : "Rebroadcast";
                                 clicked => { if (!a.busy) { Ui.act-retry(a.ref-id, a.is-note); } }
                             }
                             if a.explorer != "": GhostButton {
-                                width: 92px;
-                                height: 30px;
+                                width: 92px * Metrics.type-scale;
+                                height: 30px * Metrics.type-scale;
                                 text: "Explorer";
                                 clicked => { Ui.act-explorer(a.explorer); }
                             }

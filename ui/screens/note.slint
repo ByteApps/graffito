@@ -6,7 +6,7 @@
 import { Ui, Note, Activity } from "../globals.slint";
 import { Caption, Mono, Card, PrimaryButton, GhostButton, Header } from "../components.slint";
 import { EditField } from "../edit.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component NoteScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -27,7 +27,7 @@ export component NoteScreen inherits VerticalLayout { padding-top: Ui.safe-top +
                 y: 16px;
                 width: parent.width - 32px;
                 text: Note.note-detail;
-                font-size: 12px;
+                font-size: 12px * Metrics.type-scale;
             }
         }
         // ---- locked-note unlock (post-quantum) ----
@@ -61,7 +61,7 @@ export component NoteScreen inherits VerticalLayout { padding-top: Ui.safe-top +
                         accepted => { Note.unlock-note(); }
                     }
                     PrimaryButton {
-                        width: 100px;
+                        width: 100px * Metrics.type-scale;
                         text: Note.note-unlock-busy ? "…" : "Unlock";
                         clicked => { Note.unlock-note(); }
                     }
@@ -92,7 +92,7 @@ export component NoteScreen inherits VerticalLayout { padding-top: Ui.safe-top +
                 // renders, the author can still retry against an
                 // already-imported quantum key with no password to type.
                 if Ui.note-unlock-show-button: PrimaryButton {
-                    width: 100px;
+                    width: 100px * Metrics.type-scale;
                     text: Note.note-unlock-busy ? "…" : "Unlock";
                     clicked => { Note.unlock-note(); }
                 }

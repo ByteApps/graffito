@@ -6,7 +6,7 @@
 import { Ui, FundingWalletScreen } from "../globals.slint";
 import { Body, Caption, PrimaryButton, GhostButton, Header, ScanButton } from "../components.slint";
 import { EditField } from "../edit.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component FundingWalletDetailScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -31,7 +31,7 @@ export component FundingWalletDetailScreen inherits VerticalLayout { padding-top
         if Ui.desktop-platform: HorizontalLayout {
             alignment: start;
             GhostButton {
-                width: 140px;
+                width: 140px * Metrics.type-scale;
                 text: "Load from file…";
                 clicked => { FundingWalletScreen.funding-file(); }
             }

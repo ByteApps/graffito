@@ -6,6 +6,7 @@
 import { Ui, Info } from "../globals.slint";
 import { Body, Header } from "../components.slint";
 import { AboutSlint } from "std-widgets.slint";
+import { Metrics } from "../theme.slint";
 
 export component InfoScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -20,7 +21,7 @@ export component InfoScreen inherits VerticalLayout { padding-top: Ui.safe-top +
             info-body-t := Body {
                 width: parent.width;
                 text: Info.info-body;
-                font-size: 17px;
+                font-size: 17px * Metrics.type-scale;
             }
         }
         if Info.info-show-slint: AboutSlint {
