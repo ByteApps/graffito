@@ -265,10 +265,10 @@ struct State {
     /// like `pq_level`; the note itself still records the parameters it was
     /// sealed with, so this is only the default for the NEXT note.
     pq_pw_cost: app_core::notes_core::pq::PwCost,
-    /// The user switched the ML-KEM hybrid OFF by hand this session. The
-    /// hybrid defaults ON whenever a quantum key is available (2026-09-05);
-    /// this keeps a deliberate opt-out from being re-enabled on the next
-    /// recipient change.
+    /// The user switched the ML-KEM hybrid OFF by hand. The hybrid defaults
+    /// ON whenever a quantum key is available (2026-09-05); this keeps a
+    /// deliberate opt-out from being re-enabled on the next recipient change
+    /// or the next run (persisted in config.json as `pq_mlkem_off`).
     pq_mlkem_user_off: bool,
     /// The last text `passphrase::generate()` produced this session, so
     /// `on_pq_passphrase_changed` can tell "still exactly the generated
@@ -1174,6 +1174,7 @@ impl State {
             "locktime": self.lock_time_policy,
             "pq_level": self.pq_level,
             "pq_pw_cost": self.pq_pw_cost.as_str(),
+            "pq_mlkem_off": self.pq_mlkem_user_off,
         })
     }
 

@@ -79,6 +79,9 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
         .and_then(|v| v.as_str())
         .and_then(app_core::notes_core::pq::PwCost::parse)
         .unwrap_or(app_core::notes_core::pq::PwCost::DEFAULT);
+    // The user switched the ML-KEM hybrid off by hand (persisted, Sal
+    // 2026-09-05); absent => false, i.e. hybrid ON whenever a key exists.
+    let pq_mlkem_user_off = config.get("pq_mlkem_off").and_then(|v| v.as_bool()).unwrap_or(false);
     // Device-level per-network Settings (Bitcoin node / block explorer URLs).
     let str_map = |key: &str| -> HashMap<String, String> {
         config
@@ -148,7 +151,7 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
         picking_extra: false,
         pq_passphrase_verified: false,
         pq_pw_cost,
-        pq_mlkem_user_off: false,
+        pq_mlkem_user_off,
         pq_passphrase_generated: None,
         pq_recipient_cache: None,
         pq_level,
