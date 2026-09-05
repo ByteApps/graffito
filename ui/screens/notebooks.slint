@@ -27,7 +27,9 @@ export component NotebooksScreen inherits VerticalLayout { padding-top: Ui.safe-
                 busy-tapped => { Ui.sync-busy-toast(); }
             }
             SvgIconButton { icon: "activity"; clicked => { Ui.open-activity(); } }
-            IconButton { glyph: "⚙"; clicked => { Notebooks.settings-open(); } }
+            // SVG, not a "⚙" text glyph: the glyph renders from the platform font
+            // at a different optical size than the SVG icons beside it.
+            SvgIconButton { icon: "settings"; clicked => { Notebooks.settings-open(); } }
         }
         if Notebooks.can-create-notebook: PrimaryButton { text: "+  New notebook"; clicked => { Notebooks.create-notebook(); } }
         Caption { text: Ui.status; }

@@ -50,6 +50,12 @@ import { ScanningModal, FundRenameModal, RenameAddressModal, NbRenameModal, Conf
 export { Metrics, EditOps, Screen, NoteItem, NotebookItem, SenderItem, ContactItem, RevealRow, NbPickRow, AccountItem, CoinItem, SpendingCoinItem, SpendCoin, PsbtRow, FundingWalletRow, ActivityItem, Ui, Modals, Info, Terms, Settings, BackupWords, ImportKey, Quiz, Home, Note, Compose, Change, PayFrom, Sweep, FundingWalletScreen, ExportPsbt, Confirm, Coins, AccountPicker, PublicKeys, PrivateKeys, QuantumKeys, Activity, Onboarding, Dice, EntropySource, Contacts, FundingWallets, ImportSignedPsbt, Notebooks }
 
 export component AppWindow inherits Window {
+    // Screens that show key material: the window is capture-proof while one
+    // is up (see Ui.secure-screen-changed). Add new secret surfaces HERE.
+    property <bool> secure-screen: Ui.screen == Screen.private-keys
+        || Ui.screen == Screen.backup-words
+        || Modals.pq-imported-private-value != "";
+    changed secure-screen => { Ui.secure-screen-changed(self.secure-screen); }
     preferred-width: 480px;
     preferred-height: 780px;
     min-width: 440px;

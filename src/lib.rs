@@ -2157,6 +2157,16 @@ pub fn run() {
 
     // EditOps global wiring — src/editops.rs (U4, PLAN-graffito-app-arch.md).
     editops::wire(&window);
+    // Capture-proof window while a secret is on screen (app.slint decides
+    // which screens; this just applies it to the platform window).
+    {
+        let w = window.as_weak();
+        window.global::<Ui>().on_secure_screen_changed(move |on| {
+            if let Some(win) = w.upgrade() {
+                platform::set_secure_screen(win.window(), on);
+            }
+        });
+    }
 
     // Boot identity: APP_KEY env (dev/tests) or the keychain.
     //
