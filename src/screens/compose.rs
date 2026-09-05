@@ -2345,6 +2345,7 @@ pub(crate) fn on_pq_mlkem_toggled(&mut self, w: &AppWindow, on: bool) {
         use app_core::notes_core::pq::PwCost;
         if let Some(c) = PwCost::parse(&cost) {
             self.pq_pw_cost = c;
+            self.save_config();
             println!("cb: pq-pw-cost {}", c.as_str());
         }
         w.global::<Compose>().set_pq_pw_cost(self.pq_pw_cost.as_str().into());

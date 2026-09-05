@@ -72,6 +72,13 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
         .get("pq_level")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or(app_core::passphrase::MlKemLevel::DEFAULT);
+    // Compose "Unlock cost" preset for the passphrase layer — persisted like
+    // the ML-KEM level; absent (every earlier config) => PwCost::DEFAULT.
+    let pq_pw_cost = config
+        .get("pq_pw_cost")
+        .and_then(|v| v.as_str())
+        .and_then(app_core::notes_core::pq::PwCost::parse)
+        .unwrap_or(app_core::notes_core::pq::PwCost::DEFAULT);
     // Device-level per-network Settings (Bitcoin node / block explorer URLs).
     let str_map = |key: &str| -> HashMap<String, String> {
         config
@@ -140,7 +147,7 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
         to_addresses_extra: Vec::new(),
         picking_extra: false,
         pq_passphrase_verified: false,
-        pq_pw_cost: app_core::notes_core::pq::PwCost::DEFAULT,
+        pq_pw_cost,
         pq_mlkem_user_off: false,
         pq_passphrase_generated: None,
         pq_recipient_cache: None,
