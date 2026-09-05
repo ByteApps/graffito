@@ -71,6 +71,7 @@ fn locked_note_stub() -> (State, AppWindow, String, std::path::PathBuf, std::syn
             gift_amount: None,
             lock_time: None,
             now: 1_700_000_000,
+            pq_pw_cost: app_core::notes_core::pq::PwCost::DEFAULT,
             pq_password: Some(PASSPHRASE.to_string()),
             pq_mlkem: None,
         },

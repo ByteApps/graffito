@@ -46,20 +46,24 @@ export component OnboardingScreen inherits VerticalLayout { padding-top: Ui.safe
             subtitle: "Any mnemonic, xprv, WIF, or 32-byte hex key — e.g. a BIP-85 child from your hardware wallet. An account xpub imports as watch-only. Type, scan, or open a file.";
             clicked => { Onboarding.door-import(); }
         }
+        // 24 words FIRST (2026-09-05): every key in the app derives from the
+        // seed, so the phrase length is the ceiling on all of it — 24 words
+        // is 256 bits of entropy, 12 is 128. The shorter phrases stay as
+        // doors for people who want less to write down.
+        DoorCard {
+            title: "Create a new 24-word seed";
+            subtitle: "Recommended — fresh identity with the strongest phrase (256-bit), backed up on paper. For everyone without a hardware wallet.";
+            clicked => { Onboarding.door-create(24); }
+        }
         DoorCard {
             title: "Create a new 12-word seed";
-            subtitle: "Fresh identity, backed up on paper. For everyone without a hardware wallet.";
+            subtitle: "Shorter phrase (128-bit) — less to write down.";
             clicked => { Onboarding.door-create(12); }
         }
         DoorCard {
             title: "Create a new 18-word seed";
-            subtitle: "Same, with a longer phrase.";
+            subtitle: "In between (192-bit).";
             clicked => { Onboarding.door-create(18); }
-        }
-        DoorCard {
-            title: "Create a new 24-word seed";
-            subtitle: "Same, with the longest phrase.";
-            clicked => { Onboarding.door-create(24); }
         }
         // NO separate "Restore from iCloud" door (removed 2026-07-26): an
         // iCloud-synced key IS a saved key on this device — `identity_exists`

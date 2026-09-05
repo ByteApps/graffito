@@ -260,6 +260,15 @@ struct State {
     /// doesn't match) — see `passphrase::SecurityChoice::passphrase_verified`'s
     /// doc for why an unverified estimate must never count.
     pq_passphrase_verified: bool,
+    /// Argon2id preset for the passphrase layer of the note being composed
+    /// (the compose panel's "Unlock cost" pills). Session-sticky, never
+    /// persisted: the note itself records the parameters it was sealed with.
+    pq_pw_cost: app_core::notes_core::pq::PwCost,
+    /// The user switched the ML-KEM hybrid OFF by hand this session. The
+    /// hybrid defaults ON whenever a quantum key is available (2026-09-05);
+    /// this keeps a deliberate opt-out from being re-enabled on the next
+    /// recipient change.
+    pq_mlkem_user_off: bool,
     /// The last text `passphrase::generate()` produced this session, so
     /// `on_pq_passphrase_changed` can tell "still exactly the generated
     /// phrase" (stays verified) from "the user touched it" (reverts to
@@ -1211,6 +1220,8 @@ impl State {
             to_addresses_extra: Vec::new(),
             picking_extra: false,
             pq_passphrase_verified: false,
+            pq_pw_cost: app_core::notes_core::pq::PwCost::DEFAULT,
+            pq_mlkem_user_off: false,
             pq_passphrase_generated: None,
             pq_recipient_cache: None,
             pq_level: app_core::passphrase::MlKemLevel::DEFAULT,
@@ -2789,6 +2800,7 @@ pub fn run() {
     cb!(Compose, on_pq_passphrase_changed, |w, s, text: SharedString| { s.on_pq_passphrase_changed(&w, text) });
 
     cb!(Compose, on_pq_mlkem_toggled, |w, s, _on: bool| { s.on_pq_mlkem_toggled(&w, _on) });
+    cb!(Compose, on_pq_pw_cost_changed, |w, s, cost: SharedString| { s.on_pq_pw_cost_changed(&w, cost) });
 
     // Security panel opened (Sal 2026-08-22, PLAN-graffito-self-pw.md): the
     // sanctioned user-initiated door for lazily loading a SELF-note's

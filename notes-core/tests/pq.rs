@@ -12,7 +12,7 @@ use notes_core::envelope::{self, FLAG_DIRECTED, FLAG_MLKEM, FLAG_MULTI, FLAG_PRI
 use notes_core::pq::{
     self, export_private, export_public, fingerprint, import_private, import_public,
     mlkem_keypair_from_leaf, mlkem_seed_from_leaf, pw_key, seal_directed_pq, unlock_received,
-    unlock_sent, LockedBody, MlKemAlg, MlKemKeypair, SealLayers,
+    unlock_sent, LockedBody, MlKemAlg, MlKemKeypair, PwCost, PwLayer, SealLayers,
 };
 use notes_core::tx::{op_return_payload, Utxo};
 use notes_core::{Error, Network, DUST_LIMIT};
@@ -277,7 +277,7 @@ fn seal_unlock_round_trip_all_layer_combinations() {
         let kp = combo.alg.map(MlKemKeypair::generate).transpose().unwrap();
         let layers = SealLayers {
             mlkem_ek: kp.as_ref().map(|k| (k.alg(), k.ek())),
-            password: combo.password,
+            password: combo.password.map(|password| PwLayer { password, cost: PwCost::DEFAULT }),
         };
         let expect_flags = (if combo.alg.is_some() { FLAG_MLKEM } else { 0 })
             | (if combo.password.is_some() { FLAG_PW } else { 0 });
@@ -336,7 +336,7 @@ fn unlock_sent_pw_only_succeeds_kem_always_fails() {
     let outpoint = [0x66u8; 36];
 
     // pw-only: sender CAN re-open their own sent note.
-    let layers = SealLayers { mlkem_ek: None, password: Some("wipe recovery phrase") };
+    let layers = SealLayers { mlkem_ek: None, password: Some(PwLayer { password: "wipe recovery phrase", cost: PwCost::DEFAULT }) };
     let (pq_flags, body) = seal_directed_pq(
         &sender.tweaked_seckey, &sender.output_x, &recipient.output_x, &outpoint,
         b"sender re-read", layers,
@@ -355,7 +355,10 @@ fn unlock_sent_pw_only_succeeds_kem_always_fails() {
     // regardless of whether they also supply the correct password.
     for password in [None, Some("hybrid layer")] {
         let kp = MlKemKeypair::generate(MlKemAlg::MlKem768).unwrap();
-        let layers = SealLayers { mlkem_ek: Some((kp.alg(), kp.ek())), password };
+        let layers = SealLayers {
+            mlkem_ek: Some((kp.alg(), kp.ek())),
+            password: password.map(|password| PwLayer { password, cost: PwCost::DEFAULT }),
+        };
         let (pq_flags, body) = seal_directed_pq(
             &sender.tweaked_seckey, &sender.output_x, &recipient.output_x, &outpoint,
             b"never reopenable by sender", layers,
@@ -385,7 +388,7 @@ fn wrong_and_missing_secrets_are_reported_precisely() {
     let outpoint = [0x77u8; 36];
 
     // --- password layer ---
-    let layers = SealLayers { mlkem_ek: None, password: Some("the real password") };
+    let layers = SealLayers { mlkem_ek: None, password: Some(PwLayer { password: "the real password", cost: PwCost::DEFAULT }) };
     let (pq_flags, body) = seal_directed_pq(
         &sender.tweaked_seckey, &sender.output_x, &recipient.output_x, &outpoint,
         b"pw secrets", layers,
@@ -445,7 +448,7 @@ fn tampering_any_section_breaks_the_open() {
     let outpoint = [0x88u8; 36];
     let kp = MlKemKeypair::generate(MlKemAlg::MlKem768).unwrap();
     let layers =
-        SealLayers { mlkem_ek: Some((kp.alg(), kp.ek())), password: Some("tamper test pw") };
+        SealLayers { mlkem_ek: Some((kp.alg(), kp.ek())), password: Some(PwLayer { password: "tamper test pw", cost: PwCost::DEFAULT }) };
     let (pq_flags, body) = seal_directed_pq(
         &sender.tweaked_seckey, &sender.output_x, &recipient.output_x, &outpoint,
         b"tamper me not", layers,
@@ -589,7 +592,7 @@ fn compose_pq_note_extracts_locked_then_unlocks() {
     let b = identity(21); // recipient
     let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
     let kp = MlKemKeypair::generate(MlKemAlg::MlKem768).unwrap();
-    let layers = SealLayers { mlkem_ek: Some((kp.alg(), kp.ek())), password: Some("compose e2e") };
+    let layers = SealLayers { mlkem_ek: Some((kp.alg(), kp.ek())), password: Some(PwLayer { password: "compose e2e", cost: PwCost::DEFAULT }) };
 
     let note = compose_directed_note_pq_with_change_amount(
         &a, &utxos(), "pq note for bob", &to_b, DUST_LIMIT, layers, None, 80, 1.0, 0, || Ok(AUX),
@@ -702,7 +705,7 @@ fn compose_directed_note_pq_exact_amount_coin_control() {
     let b = identity(27);
     let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
     let inputs = utxos();
-    let layers = SealLayers { mlkem_ek: None, password: Some("exact amount pw") };
+    let layers = SealLayers { mlkem_ek: None, password: Some(PwLayer { password: "exact amount pw", cost: PwCost::DEFAULT }) };
     let note = compose_directed_note_pq_exact_amount(
         &a, &inputs, "exact inputs pq", &to_b, DUST_LIMIT, layers, None, 80, 1.0, 0, || Ok(AUX),
     )
@@ -729,19 +732,22 @@ fn compose_directed_note_pq_exact_amount_coin_control() {
 #[test]
 fn argon2_production_params_direct() {
     let salt = [0x5au8; 16];
-    let out = pw_key("production parameter check", &salt, pq::PW_PROD_T, pq::PW_PROD_M_LOG2, pq::PW_PROD_P).unwrap();
-    assert_eq!(out.len(), 32);
-    // Deterministic for the same inputs.
-    let out2 = pw_key("production parameter check", &salt, pq::PW_PROD_T, pq::PW_PROD_M_LOG2, pq::PW_PROD_P).unwrap();
-    assert_eq!(out, out2);
-    // Different password -> different key.
-    let out3 = pw_key("different password", &salt, pq::PW_PROD_T, pq::PW_PROD_M_LOG2, pq::PW_PROD_P).unwrap();
-    assert_ne!(out, out3);
-    // Production params must always sit within the decode caps — a prod
-    // bump past the caps would emit notes every peer rejects (the
-    // raise-the-cap-first rule on PW_MAX_M_LOG2/PW_MAX_T).
-    const { assert!(pq::PW_PROD_M_LOG2 <= pq::PW_MAX_M_LOG2) };
-    const { assert!(pq::PW_PROD_T <= pq::PW_MAX_T) };
+    for cost in PwCost::ALL {
+        let (t, m_log2, p) = cost.params();
+        let out = pw_key("production parameter check", &salt, t, m_log2, p).unwrap();
+        assert_eq!(out.len(), 32, "{cost:?}");
+        // Deterministic for the same inputs.
+        let out2 = pw_key("production parameter check", &salt, t, m_log2, p).unwrap();
+        assert_eq!(out, out2, "{cost:?}");
+        // Different password -> different key.
+        let out3 = pw_key("different password", &salt, t, m_log2, p).unwrap();
+        assert_ne!(out, out3, "{cost:?}");
+        // Every preset must always sit within the decode caps — a preset
+        // past the caps would emit notes every peer rejects (the
+        // raise-the-cap-first rule on PW_MAX_M_LOG2/PW_MAX_T).
+        assert!(m_log2 <= pq::PW_MAX_M_LOG2, "{cost:?}");
+        assert!(t <= pq::PW_MAX_T, "{cost:?}");
+    }
 }
 
 /// Guards the 2026-08-22 fallible-allocation refactor (audit F2) and any
@@ -793,20 +799,22 @@ fn hostile_argon2_params_are_rejected_at_decode() {
     let unlock =
         |t, m, p| unlock_received(&locked(t, m, p), &b.tweaked_seckey, None, Some("pw"));
 
-    // The pre-audit cap admitted up to 24 (a 16 GiB arena). Now: > 16 is
-    // undecodable, as are Argon2's own out-of-range minimums.
+    // The pre-audit cap admitted up to 24 (a 16 GiB arena), and a later cap
+    // admitted only up to 16 (32 MiB). The cap is now sized to the largest
+    // [`PwCost`] preset (Maximum: m_log2=18, 256 MiB) — anything above that
+    // is still undecodable, as are Argon2's own out-of-range minimums.
     assert!(matches!(unlock(3, 24, 1).unwrap_err(), Error::Decode(_)), "m_log2=24 (16 GiB)");
-    assert!(matches!(unlock(3, 17, 1).unwrap_err(), Error::Decode(_)), "m_log2=17");
+    assert!(matches!(unlock(3, 19, 1).unwrap_err(), Error::Decode(_)), "m_log2=19");
     assert!(matches!(unlock(17, 15, 1).unwrap_err(), Error::Decode(_)), "t=17");
     assert!(matches!(unlock(0, 15, 1).unwrap_err(), Error::Decode(_)), "t=0");
     assert!(matches!(unlock(3, 15, 0).unwrap_err(), Error::Decode(_)), "p=0");
 
-    // Boundary acceptance: m_log2=16 (the original prod value — every
-    // pre-audit FLAG_PW note) and t=16 pass validation and fail only at
-    // the AEAD tag (the blob here is garbage).
+    // Boundary acceptance: m_log2=18 (PwCost::Maximum's memory cost) and
+    // t=16 pass validation and fail only at the AEAD tag (the blob here is
+    // garbage).
     assert!(
-        matches!(unlock(3, 16, 1).unwrap_err(), Error::DecryptFailed),
-        "m_log2=16 must stay decodable"
+        matches!(unlock(3, 18, 1).unwrap_err(), Error::DecryptFailed),
+        "m_log2=18 must stay decodable (PwCost::Maximum)"
     );
     assert!(matches!(unlock(16, 15, 1).unwrap_err(), Error::DecryptFailed), "t=16");
 }
@@ -968,7 +976,7 @@ fn self_pq_overhead_matches_actual_body_growth() {
     let plaintext = b"self overhead check";
     for alg in ALL_ALGS {
         let kp = MlKemKeypair::generate(alg).unwrap();
-        let layers = SealLayers { mlkem_ek: Some((alg, kp.ek())), password: Some("pw") };
+        let layers = SealLayers { mlkem_ek: Some((alg, kp.ek())), password: Some(PwLayer { password: "pw", cost: PwCost::DEFAULT }) };
         let (pq_flags, body) =
             pq::seal_self_pq(&me.enc_key, &outpoint, plaintext, layers).unwrap();
         assert_eq!(pq_flags, FLAG_MLKEM | FLAG_PW);
@@ -984,7 +992,7 @@ fn self_pq_overhead_matches_actual_body_growth() {
 #[test]
 fn self_pw_note_round_trip() {
     let me = identity(41);
-    let layers = SealLayers { mlkem_ek: None, password: Some("self note pw") };
+    let layers = SealLayers { mlkem_ek: None, password: Some(PwLayer { password: "self note pw", cost: PwCost::DEFAULT }) };
     let note = notes_core::bundle::compose_note_pq_with_change(
         &me, &utxos(), "personal secret", layers, None, 80, 2.0, 0, || Ok(AUX),
     )
@@ -1069,7 +1077,7 @@ fn self_kem_note_round_trip() {
     // Both layers combined.
     let layers = SealLayers {
         mlkem_ek: Some((MlKemAlg::MlKem768, kp.ek())),
-        password: Some("belt and braces"),
+        password: Some(PwLayer { password: "belt and braces", cost: PwCost::DEFAULT }),
     };
     let note2 = notes_core::bundle::compose_note_pq_with_change(
         &me, &utxos(), "double locked", layers, None, 80, 2.0, 0, || Ok(AUX),
@@ -1099,7 +1107,7 @@ fn self_kem_note_round_trip() {
 fn foreign_and_watch_self_pq_notes_have_no_locked_body() {
     let author = identity(43);
     let me = identity(44);
-    let layers = SealLayers { mlkem_ek: None, password: Some("their pw") };
+    let layers = SealLayers { mlkem_ek: None, password: Some(PwLayer { password: "their pw", cost: PwCost::DEFAULT }) };
     let note = notes_core::bundle::compose_note_pq_with_change(
         &author, &utxos(), "not ours", layers, None, 80, 2.0, 0, || Ok(AUX),
     )
@@ -1134,7 +1142,7 @@ fn pq_cost_estimator_is_exact() {
     // Self-pw shape (no recipient output).
     for (text_len, max_or) in [(5usize, 80usize), (200, 80), (600, 10_000)] {
         let text = "x".repeat(text_len);
-        let layers = SealLayers { mlkem_ek: None, password: Some("estimate pw") };
+        let layers = SealLayers { mlkem_ek: None, password: Some(PwLayer { password: "estimate pw", cost: PwCost::DEFAULT }) };
         let note = notes_core::bundle::compose_note_pq_with_change(
             &me, &utxos(), &text, layers, None, max_or, 2.0, 0, || Ok(AUX),
         )
@@ -1156,7 +1164,7 @@ fn pq_cost_estimator_is_exact() {
     // Directed-pw shape (dust recipient output modeled byte-exactly).
     let recipient = Recipient::parse(NET, &b.address(NET)).unwrap();
     let text = "y".repeat(120);
-    let layers = SealLayers { mlkem_ek: None, password: Some("estimate pw") };
+    let layers = SealLayers { mlkem_ek: None, password: Some(PwLayer { password: "estimate pw", cost: PwCost::DEFAULT }) };
     let note = compose_directed_note_pq_with_change_amount(
         &me, &utxos(), &text, &recipient, DUST_LIMIT, layers, None, 80, 2.0, 0, || Ok(AUX),
     )
@@ -1211,4 +1219,71 @@ fn generate_mlkem_seed_output_is_not_degenerate() {
     assert_ne!(*s, [0u8; 64]);
     let zeros = s.iter().filter(|b| **b == 0).count();
     assert!(zeros < 24, "implausible zero density for a mixed 64-byte seed: {zeros}");
+}
+
+// ---------------------------------------------------------------------
+// PwCost presets: seal -> unlock round trip for every preset, on both a
+// directed note and a self note; plus the as_str/parse round trip.
+// ---------------------------------------------------------------------
+
+#[test]
+fn pw_cost_all_presets_round_trip_directed_note() {
+    let sender = identity(50);
+    let recipient = identity(51);
+    let outpoint = [0xa1u8; 36];
+    for cost in PwCost::ALL {
+        let password = "preset round trip password";
+        let layers = SealLayers { mlkem_ek: None, password: Some(PwLayer { password, cost }) };
+        let (pq_flags, body) = seal_directed_pq(
+            &sender.tweaked_seckey,
+            &sender.output_x,
+            &recipient.output_x,
+            &outpoint,
+            b"preset directed note",
+            layers,
+        )
+        .unwrap();
+        assert_eq!(pq_flags, FLAG_PW, "{cost:?}");
+        let locked = LockedBody {
+            pq_flags,
+            body,
+            sender_x: sender.output_x,
+            recipient_x: recipient.output_x,
+            outpoint,
+        };
+        let pt = unlock_received(&locked, &recipient.tweaked_seckey, None, Some(password)).unwrap();
+        assert_eq!(pt, b"preset directed note", "{cost:?}");
+        // Sender re-read (pw-only is always sender-reopenable) also works.
+        let pt2 =
+            unlock_sent(&locked, &sender.tweaked_seckey, &sender.output_x, Some(password)).unwrap();
+        assert_eq!(pt2, b"preset directed note", "{cost:?}");
+    }
+}
+
+#[test]
+fn pw_cost_all_presets_round_trip_self_note() {
+    let me = identity(52);
+    for cost in PwCost::ALL {
+        let password = "preset self note password";
+        let layers = SealLayers { mlkem_ek: None, password: Some(PwLayer { password, cost }) };
+        let note = notes_core::bundle::compose_note_pq_with_change(
+            &me, &utxos(), "preset self note", layers, None, 80, 2.0, 0, || Ok(AUX),
+        )
+        .unwrap();
+        let bundle = bundle_from_txs(&[(&note, true, Some(600))]);
+        let notes = extract_notes(&bundle, &me, NET);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].pq_flags, FLAG_PW, "{cost:?}");
+        let locked = notes[0].locked.clone().expect("keyed self scan populates locked");
+        let pt = pq::unlock_self(&locked, &me.enc_key, None, Some(password)).unwrap();
+        assert_eq!(pt, b"preset self note", "{cost:?}");
+    }
+}
+
+#[test]
+fn pw_cost_str_round_trips() {
+    for cost in PwCost::ALL {
+        assert_eq!(PwCost::parse(cost.as_str()), Some(cost));
+    }
+    assert_eq!(PwCost::parse("nonsense"), None);
 }

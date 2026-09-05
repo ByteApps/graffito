@@ -440,6 +440,22 @@ export component ComposeScreen inherits Rectangle {
                     color: Compose.pq-passphrase-verified ? Pal.good
                         : (Compose.pq-passphrase-weak ? Pal.bad : Pal.warn);
                 }
+                // Per-note Argon2id cost (2026-09-05): how much memory and
+                // time EVERY unlock attempt costs — the reader's and an
+                // attacker's alike. Recorded in the note, so unlock never
+                // needs the setting.
+                if Compose.pq-expanded && Compose.pq-passphrase-enabled: HorizontalLayout {
+                    spacing: 8px;
+                    Caption { text: "Unlock cost"; vertical-alignment: center; }
+                    SelectPill { text: "Standard"; active: Compose.pq-pw-cost == "standard"; clicked => { Compose.pq-pw-cost-changed("standard"); } }
+                    SelectPill { text: "Strong"; active: Compose.pq-pw-cost == "strong"; clicked => { Compose.pq-pw-cost-changed("strong"); } }
+                    SelectPill { text: "Maximum"; active: Compose.pq-pw-cost == "maximum"; clicked => { Compose.pq-pw-cost-changed("maximum"); } }
+                    Rectangle { }
+                }
+                if Compose.pq-expanded && Compose.pq-passphrase-enabled: Caption {
+                    text: Compose.pq-pw-cost-caption;
+                    color: Pal.muted;
+                }
                 // ---- ML-KEM hybrid layer ----
                 if Compose.pq-expanded: HorizontalLayout {
                     Switch {

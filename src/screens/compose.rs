@@ -602,6 +602,15 @@ pub(crate) fn refresh_compose_pq(&mut self, w: &AppWindow) -> (u8, Option<app_co
     if !mlkem_available && w.global::<Compose>().get_pq_mlkem_enabled() {
         w.global::<Compose>().set_pq_mlkem_enabled(false);
     }
+    // Hybrid by DEFAULT (2026-09-05): whenever a quantum key is available
+    // for this note — the recipient published one, or this is a self-note
+    // and the notebook has one — the ML-KEM layer starts ON. The classical
+    // ECDH/seed key is the only quantum-weak primitive in a private note,
+    // and having the key but not using it was the worst of both. A manual
+    // switch-off sticks for the session (`pq_mlkem_user_off`).
+    if mlkem_available && !st.pq_mlkem_user_off && !w.global::<Compose>().get_pq_mlkem_enabled() {
+        w.global::<Compose>().set_pq_mlkem_enabled(true);
+    }
     let mlkem_on = mlkem_available && w.global::<Compose>().get_pq_mlkem_enabled();
 
     // ---- passphrase layer ----
@@ -642,6 +651,8 @@ pub(crate) fn refresh_compose_pq(&mut self, w: &AppWindow) -> (u8, Option<app_co
     };
     w.global::<Compose>().set_pq_passphrase_verified(passphrase_on && st.pq_passphrase_verified);
     w.global::<Compose>().set_pq_passphrase_strength_line(strength_line.into());
+    w.global::<Compose>().set_pq_pw_cost(st.pq_pw_cost.as_str().into());
+    w.global::<Compose>().set_pq_pw_cost_caption(pw_cost_caption(st.pq_pw_cost).into());
 
     // ---- combined label (Rust-computed, never reimplemented in slint) --
     let choice = SecurityChoice {
@@ -2322,7 +2333,22 @@ pub(crate) fn on_pq_passphrase_changed(&mut self, w: &AppWindow, text: SharedStr
         self.refresh_compose(w);
     }
 
-pub(crate) fn on_pq_mlkem_toggled(&mut self, w: &AppWindow, _on: bool) {
+pub(crate) fn on_pq_mlkem_toggled(&mut self, w: &AppWindow, on: bool) {
+        self.pq_mlkem_user_off = !on;
+        self.refresh_compose(w);
+    }
+
+    /// "Unlock cost" pills: which Argon2id preset seals the passphrase layer
+    /// of the note being composed. The caption spells out what the reader
+    /// (and an attacker, per guess) pays.
+    pub(crate) fn on_pq_pw_cost_changed(&mut self, w: &AppWindow, cost: SharedString) {
+        use app_core::notes_core::pq::PwCost;
+        if let Some(c) = PwCost::parse(&cost) {
+            self.pq_pw_cost = c;
+            println!("cb: pq-pw-cost {}", c.as_str());
+        }
+        w.global::<Compose>().set_pq_pw_cost(self.pq_pw_cost.as_str().into());
+        w.global::<Compose>().set_pq_pw_cost_caption(pw_cost_caption(self.pq_pw_cost).into());
         self.refresh_compose(w);
     }
 
@@ -2753,6 +2779,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
             lock_time: self.lock_time_override_value(),
             now: created_at,
             pq_password,
+            pq_pw_cost: self.pq_pw_cost,
             pq_mlkem,
         };
         let Some(store) = self.store.as_ref() else {
@@ -3526,5 +3553,18 @@ pub(crate) fn on_set_compose_locktime(&mut self, w: &AppWindow, mode: SharedStri
         println!("cb: compose-locktime {} effective={effective} ok", policy.as_str());
         self.refresh_compose_locktime_panel(w);
         w.global::<Ui>().set_status("".into());
+    }
+}
+
+/// Caption under the "Unlock cost" pills — the Argon2id parameters in plain
+/// words. Memory is the attacker-facing number: every guess has to fill it.
+pub(crate) fn pw_cost_caption(cost: app_core::notes_core::pq::PwCost) -> String {
+    use app_core::notes_core::pq::PwCost;
+    let (t, _, _) = cost.params();
+    let mib = cost.mib();
+    match cost {
+        PwCost::Standard => format!("Argon2id, {mib} MiB × {t} passes — quick to unlock; each guess an attacker makes costs the same memory and time."),
+        PwCost::Strong => format!("Argon2id, {mib} MiB × {t} passes — about a second to unlock on a phone. Recommended."),
+        PwCost::Maximum => format!("Argon2id, {mib} MiB × {t} passes — a few seconds to unlock, and the most any guess can cost an attacker."),
     }
 }

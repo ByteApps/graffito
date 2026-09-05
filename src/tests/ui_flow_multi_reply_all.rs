@@ -63,6 +63,7 @@ fn multi_note_stub(r1: &str, r2: &str) -> (State, AppWindow, String) {
             gift_amount: None,
             lock_time: None,
             now: 1_700_000_000,
+            pq_pw_cost: app_core::notes_core::pq::PwCost::DEFAULT,
             pq_password: None,
             pq_mlkem: None,
         },

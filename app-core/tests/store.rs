@@ -116,7 +116,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1000, pq_password: None, pq_mlkem: None },
+        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1000, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None },
     )
     .unwrap();
     assert_eq!(store.notes.len(), 1);
@@ -127,7 +127,7 @@ fn compose_confirm_recover_lifecycle() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 2000, pq_password: None, pq_mlkem: None },
+        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 2000, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None },
     )
     .unwrap();
     assert_eq!(
@@ -185,7 +185,7 @@ fn directed_private_note_both_sides() {
             change_to: None,
             coins: None,
             fee_rate: 1.0,
-            gift_amount: None, lock_time: None, now: 3000, pq_password: None, pq_mlkem: None,
+            gift_amount: None, lock_time: None, now: 3000, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -287,7 +287,7 @@ fn multi_recipient_note_recovers_recipients_on_rescan() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 1, pq_password: None, pq_mlkem: None,
+            now: 1, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -322,7 +322,7 @@ fn unconfirmed_scanned_utxo_is_spendable() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "spend unconfirmed", private: false, recipient: None, extra_recipients: &[],
-            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None,
+            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -349,7 +349,7 @@ fn coin_control_spends_exactly_selected() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "coin control", private: false, recipient: None, extra_recipients: &[],
-            change_to: None, coins: Some(&picks), fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None,
+            change_to: None, coins: Some(&picks), fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -375,7 +375,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
         &mut store, &a, NET,
         &ComposeRequest {
             text: "change goes to bob", private: false, recipient: None, extra_recipients: &[],
-            change_to: Some(&bob_addr), coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None,
+            change_to: Some(&bob_addr), coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -392,7 +392,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
         &mut store2, &a, NET,
         &ComposeRequest {
             text: "change to self", private: false, recipient: None, extra_recipients: &[],
-            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None,
+            change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -412,7 +412,7 @@ fn bump_fee_renames_note_id_to_replacement_txid_same_inputs_higher_fee() {
     let mut store = funded_store(&a);
     let n1 = compose_and_record(
         &mut store, &a, NET,
-        &ComposeRequest { text: "bump me", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None },
+        &ComposeRequest { text: "bump me", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None },
     )
     .unwrap();
     assert!(store.notes[0].raw_hex.is_some(), "raw kept for rebroadcast");
@@ -453,7 +453,7 @@ fn orphaned_when_inputs_spent_elsewhere() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "never broadcast", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_mlkem: None },
+        &ComposeRequest { text: "never broadcast", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None },
     )
     .unwrap();
 
@@ -569,7 +569,7 @@ fn directed_gift_amount_plumbs_through() {
             fee_rate: 1.0,
             gift_amount: Some(gift),
             lock_time: None,
-            now: 1, pq_password: None, pq_mlkem: None,
+            now: 1, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -597,7 +597,7 @@ fn directed_gift_amount_plumbs_through() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 1, pq_password: None, pq_mlkem: None,
+            now: 1, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -616,14 +616,14 @@ fn watch_store_recovers_notebook_without_keys() {
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1000, pq_password: None, pq_mlkem: None },
+        &ComposeRequest { text: "first, public", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1000, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None },
     )
     .unwrap();
     let n2 = compose_and_record(
         &mut store,
         &a,
         NET,
-        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 2000, pq_password: None, pq_mlkem: None },
+        &ComposeRequest { text: "second, private", private: true, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 2000, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None },
     )
     .unwrap();
     let b = bundle(
@@ -771,7 +771,7 @@ fn display_owner_dedup_keeps_note_only_in_first_notebook_input_scan() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 4000, pq_password: None, pq_mlkem: None,
+            now: 4000, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -821,7 +821,7 @@ fn display_owner_dedup_archived_notebook_input_never_anchors() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 4100, pq_password: None, pq_mlkem: None,
+            now: 4100, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -938,7 +938,7 @@ fn spending_window_spk_makes_funded_note_own() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 9000, pq_password: None, pq_mlkem: None,
+            now: 9000, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -996,7 +996,7 @@ fn stale_received_twin_pruned_on_full_scan() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 9100, pq_password: None, pq_mlkem: None,
+            now: 9100, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -1049,7 +1049,7 @@ fn third_party_received_note_never_pruned() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 9200, pq_password: None, pq_mlkem: None,
+            now: 9200, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -1108,7 +1108,7 @@ fn stale_received_twin_not_pruned_on_incremental_bundle() {
             fee_rate: 1.0,
             gift_amount: None,
             lock_time: None,
-            now: 9300, pq_password: None, pq_mlkem: None,
+            now: 9300, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
         },
     )
     .unwrap();
@@ -1212,7 +1212,7 @@ fn pq_layers_require_single_recipient_directed_private_or_self() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: Some("hunter2hunter2hunter2".into()),
+            pq_password: Some("hunter2hunter2hunter2".into()), pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
             pq_mlkem: None,
         },
     )
@@ -1236,7 +1236,7 @@ fn pq_layers_require_single_recipient_directed_private_or_self() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: Some("hunter2hunter2hunter2".into()),
+            pq_password: Some("hunter2hunter2hunter2".into()), pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
             pq_mlkem: None,
         },
     )
@@ -1261,7 +1261,7 @@ fn pq_layers_require_single_recipient_directed_private_or_self() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: Some("hunter2hunter2hunter2".into()),
+            pq_password: Some("hunter2hunter2hunter2".into()), pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
             pq_mlkem: None,
         },
     )
@@ -1295,7 +1295,7 @@ fn pq_self_note_with_mlkem_layer_composes() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: None,
+            pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
             pq_mlkem: Some((MlKemAlg::MlKem768, kp.ek().to_vec())),
         },
     )
@@ -1334,7 +1334,7 @@ fn pq_password_only_note_round_trips_both_sides_and_survives_rescan() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: Some(password.into()),
+            pq_password: Some(password.into()), pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
             pq_mlkem: None,
         },
     )
@@ -1419,7 +1419,7 @@ fn pq_kem_only_note_auto_unlocks_for_recipient_with_derived_secret() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: None,
+            pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
             pq_mlkem: Some((MlKemAlg::MlKem768, bob_kp.ek().to_vec())),
         },
     )
@@ -1510,7 +1510,7 @@ fn pq_hybrid_note_needs_both_layers_together() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: Some(password.into()),
+            pq_password: Some(password.into()), pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
             pq_mlkem: Some((MlKemAlg::MlKem768, bob_kp.ek().to_vec())),
         },
     )
@@ -1565,7 +1565,7 @@ fn pq_note_refuses_fee_bump() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: Some("some reasonably long password".into()),
+            pq_password: Some("some reasonably long password".into()), pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
             pq_mlkem: None,
         },
     )
@@ -1616,7 +1616,7 @@ fn pq_self_note_with_password_is_stored_locked_and_never_cached() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: Some(password.into()),
+            pq_password: Some(password.into()), pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
             pq_mlkem: None,
         },
     )
@@ -1675,7 +1675,7 @@ fn pq_self_note_unlock_is_view_only_and_never_persists() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: Some(password.into()),
+            pq_password: Some(password.into()), pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
             pq_mlkem: None,
         },
     )
