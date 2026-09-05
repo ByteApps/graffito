@@ -8,8 +8,8 @@
 
   Structural NativeActivity attributes (activity name, exported,
   configChanges, the android.app.lib_name meta-data, the MAIN/LAUNCHER
-  intent-filter, application hasCode=false) are copied VERBATIM from that
-  dump — those are what cargo-apk's manifest template always sets for a
+  intent-filter) are copied VERBATIM from that dump (hasCode=false was
+  dropped 2026-09-04 — see the comment on <application>) — those are what cargo-apk's manifest template always sets for a
   NativeActivity app and are not app-specific.
 
   App-identity values (label, icon, theme, permissions, uses-feature) instead
@@ -48,11 +48,16 @@
         android:name="android.hardware.camera.any"
         android:required="false" />
 
+    <!-- android:name + NO hasCode="false" (2026-09-04): Play's Automatic
+         protection injects a dex and wraps the declared Application class;
+         with hasCode=false ART loads no dex and the Play-served build crashed
+         on launch (ClassNotFoundException com.pairip.application.Application).
+         GraffitoApplication is an empty subclass that exists to be wrapped. -->
     <application
+        android:name="com.byteapps.graffito.GraffitoApplication"
         android:label="Graffito"
         android:icon="@mipmap/ic_launcher"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
-        android:hasCode="false">
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
         <activity
             android:name="android.app.NativeActivity"

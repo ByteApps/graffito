@@ -49,15 +49,17 @@ android {
         // exercise the full upload — aab + native symbols in one edit —
         // without committing anything. The hardcoded default stays the source
         // of truth for real releases.
-        versionCode = (project.findProperty("playVersionCode") as String?)?.toInt() ?: 9
-        versionName = "0.1.6"
+        versionCode = (project.findProperty("playVersionCode") as String?)?.toInt() ?: 10
+        versionName = "0.1.7"
     }
 
-    // No java/kotlin sources: the BiometricPrompt bridge ships as a dex
-    // embedded in the Rust binary via include_bytes! (see
-    // ../../../src/keychain/android.rs — search BIOMETRIC_DEX) and loaded at
-    // runtime with InMemoryDexClassLoader, so this Gradle project needs no
-    // sourceSets.java entries and no assets/ dir of its own.
+    // ONE Java source, src/main/java/com/byteapps/graffito/GraffitoApplication.java
+    // (empty Application subclass — the thing Play's Automatic protection
+    // wraps; see the comment there). The BiometricPrompt bridge still ships
+    // as a dex embedded in the Rust binary via include_bytes! (see
+    // ../../../src/keychain/android.rs — search BIOMETRIC_DEX) and is loaded
+    // at runtime with InMemoryDexClassLoader; AGP's default java srcDir
+    // picks the one class up, so no sourceSets.java entry is needed.
     sourceSets {
         getByName("main") {
             manifest.srcFile("src/main/AndroidManifest.xml")
