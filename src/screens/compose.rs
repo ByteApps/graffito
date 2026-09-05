@@ -3565,8 +3565,8 @@ pub(crate) fn pw_cost_caption(cost: app_core::notes_core::pq::PwCost) -> String 
     let (t, _, _) = cost.params();
     let mib = cost.mib();
     match cost {
-        PwCost::Standard => format!("Argon2id, {mib} MiB × {t} passes — quick to unlock; each guess an attacker makes costs the same memory and time."),
-        PwCost::Strong => format!("Argon2id, {mib} MiB × {t} passes — about a second to unlock on a phone. Recommended."),
-        PwCost::Maximum => format!("Argon2id, {mib} MiB × {t} passes — a few seconds to unlock, and the most any guess can cost an attacker."),
+        PwCost::Standard => format!("Argon2id, {mib} MiB × {t} passes — quick to unlock; each guess an attacker makes costs the same memory and time. No extra on-chain bytes or fee."),
+        PwCost::Strong => format!("Argon2id, {mib} MiB × {t} passes — about a second to unlock on a phone. Recommended. No extra on-chain bytes or fee."),
+        PwCost::Maximum => format!("Argon2id, {mib} MiB × {t} passes — a few seconds to unlock, and the most any guess can cost an attacker. No extra on-chain bytes or fee."),
     }
 }
