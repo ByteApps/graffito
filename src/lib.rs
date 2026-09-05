@@ -3239,6 +3239,10 @@ fn preview_mock(w: &AppWindow) {
     w.global::<Compose>().set_gift_sats("330".into());
     // Through the real formatter so the phone column count previews too.
     set_backup_words(w, "legal winner thank year wave sausage worth useful dawn absorb pledge yellow");
+    // Mixed word lengths on purpose: the reveal grid must keep its columns
+    // aligned whatever the words are.
+    set_reveal_word_list(w, "upset around cover chalk relief live multiply pool define police crouch exile");
+    w.global::<Ui>().set_reveal_private_format("recovery".into());
     w.global::<Ui>().set_fund_external(true);
     w.global::<Ui>().set_funding_ready(true);
     w.global::<Sweep>().set_funding_summary("taproot · bcrt1p2caq…6hrewe · 2 coins · 220,000 sats".into());

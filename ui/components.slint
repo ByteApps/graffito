@@ -36,7 +36,8 @@ export component Mono inherits Text {
 // it. Real cells (right-aligned number + word) laid out by the engine, so
 // alignment never depends on a font (Android has no monospace fallback for
 // "Menlo"). `Metrics.word-columns` per row (3 desktop / 2 phone); rows
-// round up so a 15- or 21-word phrase keeps its tail.
+// round up so a 15- or 21-word phrase keeps its tail. Numbering runs DOWN
+// each column (1..rows on the left), not across.
 export component WordGrid inherits VerticalLayout {
     in property <[string]> words;
     property <int> cols: Metrics.word-columns;
@@ -45,7 +46,13 @@ export component WordGrid inherits VerticalLayout {
     for r in rows: HorizontalLayout {
         spacing: 12px;
         for c in cols: HorizontalLayout {
-            property <int> i: r * cols + c;
+            // Column-major: 1..rows down the left column, then the next
+            // column — the way a seed is read off paper (Sal, 2026-09-05).
+            property <int> i: c * rows + r;
+            // Equal cell widths, explicitly: a layout child otherwise takes
+            // its content width, so "7. multiply" on the left pushed the
+            // whole right column over (Sal's reveal screenshot, 2026-09-05).
+            width: (parent.width - 12px * (cols - 1)) / cols;
             spacing: 6px;
             Text {
                 text: i < words.length ? i + 1 + "." : "";

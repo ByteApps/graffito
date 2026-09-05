@@ -104,8 +104,7 @@ pub(crate) fn on_private_select(&mut self, w: &AppWindow, fmt: SharedString) {
                 };
                 w.global::<PrivateKeys>().set_reveal_words_col1(col(0..half).into());
                 w.global::<PrivateKeys>().set_reveal_words_col2(col(half..list.len()).into());
-                let cells: Vec<slint::SharedString> = list.iter().map(|w| (*w).into()).collect();
-                w.global::<PrivateKeys>().set_reveal_word_list(slint::ModelRc::new(slint::VecModel::from(cells)));
+                set_reveal_word_list(w, &words);
                 if let Ok(m) = bip39::Mnemonic::parse(&words) {
                     let digits = app_core::seedqr::encode_standard(&m);
                     w.global::<PrivateKeys>().set_reveal_seedqr_image(qr::qr_image(&digits).unwrap_or_default());
@@ -144,4 +143,10 @@ pub(crate) fn on_copy_secret(&mut self, w: &AppWindow, value: SharedString) {
         println!("cb: copy-secret len={}", value.len());
         show_toast(w, if ok { "Copied" } else { "Copy failed" });
     }
+}
+
+/// The reveal's word cells (WordGrid) from a space-separated phrase.
+pub(crate) fn set_reveal_word_list(w: &AppWindow, phrase: &str) {
+    let cells: Vec<slint::SharedString> = phrase.split_whitespace().map(Into::into).collect();
+    w.global::<PrivateKeys>().set_reveal_word_list(slint::ModelRc::new(slint::VecModel::from(cells)));
 }
