@@ -137,13 +137,10 @@ export component QuantumKeysScreen inherits VerticalLayout { padding-top: Ui.saf
 
                 // ---- Generate a fresh key ----
                 Text { text: "Generate a new key"; font-size: 13px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    SelectPill { text: "ML-KEM-512"; active: QuantumKeys.pq-gen-level == "512"; clicked => { QuantumKeys.pq-gen-level = "512"; } }
-                    SelectPill { text: "ML-KEM-768"; active: QuantumKeys.pq-gen-level == "768"; clicked => { QuantumKeys.pq-gen-level = "768"; } }
-                    SelectPill { text: "ML-KEM-1024"; active: QuantumKeys.pq-gen-level == "1024"; clicked => { QuantumKeys.pq-gen-level = "1024"; } }
-                }
-                Caption { text: "768 is the standard recommendation for general use."; }
+                // ONE level for both keys (Sal, 2026-09-05: two pickers for what
+                // reads as one setting): the Parameter level cards above
+                // decide this key's level too.
+                Caption { text: "Generated at the parameter level chosen above (ML-KEM-" + QuantumKeys.pq-key-level + ")."; }
                 Text { text: "Extra entropy (optional)"; font-size: 12px * Metrics.type-scale; font-weight: 600; color: Pal.text; }
                 Caption { text: "Type anything — a passphrase, dice rolls. Mixed WITH the system's randomness, it can only add strength, never replace it."; }
                 EditField {

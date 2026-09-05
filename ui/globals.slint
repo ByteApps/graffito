@@ -887,7 +887,6 @@ export global QuantumKeys {
     // Generate a fresh key: its own level picker (independent of the
     // notebook receive-key picker above) + optional extra entropy, mixed
     // WITH the device CSPRNG, never in place of it.
-    in-out property <string> pq-gen-level: "768";
     in-out property <string> pq-gen-extra;
     callback pq-generate();
     // Export: public half is a plain QR/copy (share freely); the private

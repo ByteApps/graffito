@@ -112,8 +112,9 @@ pub(crate) fn update_pq_keys_screen(&self, w: &AppWindow) {
 /// called while a key exists without that confirm having fired first.
 pub(crate) fn do_pq_generate(&mut self, w: &AppWindow) {
     let s = self;
-    let level = pq_level_from_str(w.global::<QuantumKeys>().get_pq_gen_level().as_str())
-        .unwrap_or(app_core::passphrase::MlKemLevel::DEFAULT);
+    // Same level as the notebook's derived key — the screen has ONE
+    // Parameter level picker for both keys.
+    let level = s.pq_level;
     let extra = w.global::<QuantumKeys>().get_pq_gen_extra().to_string();
     w.global::<QuantumKeys>().set_pq_import_error("".into());
     let (kp, armor) = match app_core::pqkeys::generate_native_private(level, extra.as_bytes()) {

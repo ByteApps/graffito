@@ -960,6 +960,14 @@ fn rpc_delete_account(account: &str) -> Result<(), String> {
 /// the device.
 pub fn store_rpc_creds(network: &str, user: &str, pass: &str) -> Result<(), String> {
     let account = rpc_account(network);
+    // Hermetic in-memory keychain (GRAFFITO_KEYCHAIN_MEMORY=1, the UI
+    // suites): RPC creds live in the same process-local map as the identity
+    // item — an unsigned dev build has no keychain entitlement, and the
+    // cross-device e2e points every target at Bitcoin Core (2026-09-05).
+    if mem_keychain_enabled() {
+        MEM_KEYCHAIN.lock().unwrap().insert(account, encode_rpc_creds(user, pass));
+        return Ok(());
+    }
     let staging = rpc_staging_account(network);
     let value = encode_rpc_creds(user, pass);
 
@@ -994,6 +1002,9 @@ pub fn store_rpc_creds(network: &str, user: &str, pass: &str) -> Result<(), Stri
 /// the module doc for why boot itself must still never reach this.
 pub fn load_rpc_creds(network: &str) -> Result<Option<(String, String)>, String> {
     let account = rpc_account(network);
+    if mem_keychain_enabled() {
+        return Ok(MEM_KEYCHAIN.lock().unwrap().get(&account).and_then(|v| decode_rpc_creds(v)));
+    }
     if let Some(v) = rpc_read_item(&account)? {
         return Ok(decode_rpc_creds(&v));
     }
@@ -1011,6 +1022,10 @@ pub fn load_rpc_creds(network: &str) -> Result<Option<(String, String)>, String>
 /// Remove stored RPC credentials for `network` — the live item and any
 /// staging debris. A missing item is success.
 pub fn delete_rpc_creds(network: &str) -> Result<(), String> {
+    if mem_keychain_enabled() {
+        MEM_KEYCHAIN.lock().unwrap().remove(&rpc_account(network));
+        return Ok(());
+    }
     let live = rpc_delete_account(&rpc_account(network));
     let staged = rpc_delete_account(&rpc_staging_account(network));
     live.and(staged)

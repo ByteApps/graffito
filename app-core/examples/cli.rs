@@ -122,6 +122,26 @@ fn main() {
             let net = network(&args[2]);
             println!("{}", identity(net).address);
         }
+        Some("pq-public") => {
+            // pq-public <network> <512|768|1024>
+            // The notebook's seed-derived ML-KEM PUBLIC key as the same
+            // armored text the app's "Copy public key" produces — so a
+            // harness that knows every device's seed can hand each device
+            // the others' quantum keys without moving a clipboard across
+            // devices (PLAN-graffito-cross-device-e2e.md).
+            let net = network(&args[2]);
+            let alg = match args.get(3).map(String::as_str) {
+                Some("512") => app_core::notes_core::pq::MlKemAlg::MlKem512,
+                Some("768") | None => app_core::notes_core::pq::MlKemAlg::MlKem768,
+                Some("1024") => app_core::notes_core::pq::MlKemAlg::MlKem1024,
+                Some(other) => panic!("pq-public: level must be 512|768|1024, got {other}"),
+            };
+            let id = identity(net);
+            let leaf = id.leaf_secret().expect("pq-public needs a full (non-watch-only) identity");
+            let kp = app_core::pqkeys::derive_keypair(leaf, alg);
+            eprintln!("pq-public fingerprint={}", app_core::pqkeys::fingerprint(&kp));
+            println!("{}", app_core::pqkeys::export_public_armor(&kp));
+        }
         Some("change-address") => {
             // change-address <network> [change_index]
             // Watch identity (taproot change-chain unit 6): the address of

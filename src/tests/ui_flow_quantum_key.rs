@@ -56,7 +56,6 @@ fn generate_flow_produces_a_key_and_logs_ok() {
 
     // Drive the compose the UI would: pick a level + type extra entropy,
     // exactly as the on_pq_generate callback reads them.
-    app.global::<QuantumKeys>().set_pq_gen_level("768".into());
     app.global::<QuantumKeys>().set_pq_gen_extra("dice 4 2 6 1 3 5 harness entropy".into());
     assert!(st.pq_imported.is_none());
 
@@ -158,7 +157,6 @@ fn replace_guard_decision_gates_an_existing_key() {
 
     // No key yet -> the guard would run the action directly.
     assert!(st.pq_imported.is_none());
-    app.global::<QuantumKeys>().set_pq_gen_level("768".into());
     st.do_pq_generate(&app);
     assert!(st.pq_imported.is_some());
 

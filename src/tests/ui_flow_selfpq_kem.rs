@@ -45,7 +45,6 @@ fn self_note_kem_compose_reaches_confirm_with_layered_label_then_cancels() {
 
     // Settings -> Quantum keys -> Generate (768, the Mac suite's default) —
     // the exact do_pq_generate flow ui_flow_quantum_key.rs proves.
-    app.global::<QuantumKeys>().set_pq_gen_level("768".into());
     app.global::<QuantumKeys>().set_pq_gen_extra("selfpq kem compose harness entropy".into());
     st.do_pq_generate(&app);
     let kp_alg = st.pq_imported.as_ref().expect("generate populated State.pq_imported").alg();
