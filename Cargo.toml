@@ -61,7 +61,10 @@ block2 = "0.6"
 
 # macOS desktop: femtovg default + software renderer for --render; native glue.
 [target.'cfg(target_os = "macos")'.dependencies]
-slint = { version = "=1.17.1", features = ["renderer-software"] }
+# raw-window-handle-06: platform::set_secure_screen reaches the NSWindow
+# (sharingType none while a secret is on screen).
+slint = { version = "=1.17.1", features = ["renderer-software", "raw-window-handle-06"] }
+raw-window-handle = "0.6"
 # QR in: camera frames (AVFoundation via nokhwa) → rqrr decode.
 nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 # Native file-open dialog (import-from-file door).

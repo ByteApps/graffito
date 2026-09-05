@@ -327,6 +327,58 @@ fn sdk_int(env: &mut JNIEnv) -> jni::errors::Result<i32> {
 /// android_main → CountDownLatch.await ← BiometricBridge.await). Every caller
 /// (`reveal_secret`, `load_secret_gated`) now runs on `std::thread::spawn`
 /// and posts its result back to the UI thread.
+/// Load one class out of the embedded dex (`assets/android/biometric.dex`,
+/// every `.java` under android/biometric/) with the activity's own class
+/// loader as parent so framework classes resolve.
+fn load_dex_class<'l>(env: &mut JNIEnv<'l>, activity: &JObject, name: &str) -> jni::errors::Result<JObject<'l>> {
+    let act_class = env.call_method(activity, "getClass", "()Ljava/lang/Class;", &[])?.l()?;
+    let parent = env
+        .call_method(&act_class, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+        .l()?;
+    let buf = unsafe {
+        env.new_direct_byte_buffer(BIOMETRIC_DEX.as_ptr() as *mut u8, BIOMETRIC_DEX.len())?
+    };
+    let loader = env.new_object(
+        "dalvik/system/InMemoryDexClassLoader",
+        "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+        &[JValue::Object(&buf), JValue::Object(&parent)],
+    )?;
+    let name = jstr(env, name)?;
+    env.call_method(
+        &loader,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[JValue::Object(&name)],
+    )?
+    .l()
+}
+
+/// FLAG_SECURE on/off for the activity window (see WindowSecure.java): the
+/// window is excluded from screenshots, screen recording and the recents
+/// thumbnail while a secret is on screen. Posted to the UI thread; returns
+/// as soon as it is queued.
+pub fn set_window_secure(secure: bool) -> Result<(), String> {
+    with_env(|env| {
+        let app = crate::android_app().ok_or_else(|| {
+            jni::errors::Error::JniCall(jni::errors::JniError::Other(-1))
+        })?;
+        let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
+        let class = load_dex_class(env, &activity, "xyz.foundation.graffito.WindowSecure")?;
+        let runnable = env.new_object(
+            &JClass::from(class),
+            "(Landroid/app/Activity;Z)V",
+            &[JValue::Object(&activity), JValue::Bool(u8::from(secure))],
+        )?;
+        env.call_method(
+            &activity,
+            "runOnUiThread",
+            "(Ljava/lang/Runnable;)V",
+            &[JValue::Object(&runnable)],
+        )?;
+        Ok(())
+    })
+}
+
 fn user_presence_check(reason: &str) -> Result<(), String> {
     let title = "Reveal secret";
     let negative = "Cancel";
@@ -350,28 +402,7 @@ fn user_presence_check(reason: &str) -> Result<(), String> {
         })?;
         let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
 
-        // parent loader = the activity's own, so framework classes resolve
-        let act_class = env.call_method(&activity, "getClass", "()Ljava/lang/Class;", &[])?.l()?;
-        let parent = env
-            .call_method(&act_class, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
-            .l()?;
-        let buf = unsafe {
-            env.new_direct_byte_buffer(BIOMETRIC_DEX.as_ptr() as *mut u8, BIOMETRIC_DEX.len())?
-        };
-        let loader = env.new_object(
-            "dalvik/system/InMemoryDexClassLoader",
-            "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
-            &[JValue::Object(&buf), JValue::Object(&parent)],
-        )?;
-        let name = jstr(env, "xyz.foundation.graffito.BiometricBridge")?;
-        let class = env
-            .call_method(
-                &loader,
-                "loadClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[JValue::Object(&name)],
-            )?
-            .l()?;
+        let class = load_dex_class(env, &activity, "xyz.foundation.graffito.BiometricBridge")?;
 
         let t = jstr(env, title)?;
         let s = jstr(env, reason)?;

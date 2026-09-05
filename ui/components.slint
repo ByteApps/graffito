@@ -166,6 +166,7 @@ export component SvgIconButton inherits Rectangle {
         source: root.icon == "activity" ? @image-url("icons/activity.svg")
               : root.icon == "refresh" ? @image-url("icons/refresh.svg")
               : root.icon == "archive" ? @image-url("icons/archive.svg")
+              : root.icon == "settings" ? @image-url("icons/settings.svg")
               : @image-url("icons/copy.svg");
         colorize: root.tint;
         width: root.size;

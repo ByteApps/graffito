@@ -619,13 +619,81 @@ pub fn build_number() -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-// Android build number would come from PackageInfo.versionCode over JNI —
-// not wired up yet; About shows the marketing version alone there.
-// TODO(android): PackageManager.getPackageInfo(...).versionCode.
-#[cfg(not(target_vendor = "apple"))]
+/// Android: `PackageInfo.getLongVersionCode()` — the Play versionCode.
+#[cfg(target_os = "android")]
+pub fn build_number() -> Option<String> {
+    android_jni::package_version().ok().map(|(_, code)| code.to_string())
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 pub fn build_number() -> Option<String> {
     None
 }
+
+/// The user-facing version the store shipped — `CFBundleShortVersionString`
+/// on Apple platforms, `PackageInfo.versionName` on Android — read at
+/// RUNTIME so About can never disagree with the store listing. `None` on a
+/// bare host binary (the caller falls back to the Cargo version).
+#[cfg(target_vendor = "apple")]
+pub fn app_version() -> Option<String> {
+    use objc2_foundation::{NSBundle, NSString};
+    let bundle = NSBundle::mainBundle();
+    let key = NSString::from_str("CFBundleShortVersionString");
+    let val = bundle.objectForInfoDictionaryKey(&key)?;
+    let s = val.downcast::<NSString>().ok()?.to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(target_os = "android")]
+pub fn app_version() -> Option<String> {
+    android_jni::package_version().ok().map(|(name, _)| name).filter(|s| !s.is_empty())
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
+pub fn app_version() -> Option<String> {
+    None
+}
+
+/// Make the window capture-proof (or not): screenshots, screen recording
+/// and the task-switcher thumbnail show black while a secret is on screen.
+/// Android: `FLAG_SECURE` on the activity window (via the embedded
+/// `WindowSecure` Runnable — window flags are UI-thread only). macOS:
+/// `NSWindow.sharingType = NSWindowSharingNone`, which excludes the window
+/// from screen capture. iOS has NO public API for this (the UITextField
+/// secure-layer trick is unsupported behaviour and fights the Metal view);
+/// the Private keys screen's own warning copy is the mitigation there.
+#[cfg(target_os = "android")]
+pub fn set_secure_screen(_win: &slint::Window, on: bool) {
+    match crate::keychain::set_window_secure(on) {
+        Ok(()) => println!("cb: secure-screen {}", u8::from(on)),
+        Err(e) => println!("cb: secure-screen err={e}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_secure_screen(win: &slint::Window, on: bool) {
+    use objc2::runtime::AnyObject;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = win.window_handle();
+    let Ok(h) = handle.window_handle() else {
+        return;
+    };
+    if let RawWindowHandle::AppKit(a) = h.as_raw() {
+        // NSWindowSharingNone = 0, NSWindowSharingReadOnly = 1 (the default).
+        let sharing: usize = if on { 0 } else { 1 };
+        unsafe {
+            let view = a.ns_view.as_ptr() as *mut AnyObject;
+            let nswin: *mut AnyObject = objc2::msg_send![view, window];
+            if !nswin.is_null() {
+                let _: () = objc2::msg_send![nswin, setSharingType: sharing];
+                println!("cb: secure-screen {}", u8::from(on));
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "macos")))]
+pub fn set_secure_screen(_win: &slint::Window, _on: bool) {}
 
 /// Android framework calls used by the shims above — same JNI plumbing as
 /// the Keystore backend (JavaVM + Activity context via ndk_context).
@@ -724,6 +792,38 @@ mod android_jni {
                 let bottom = env.call_method(&insets, "getSystemWindowInsetBottom", "()I", &[])?.i()?;
                 Ok((top, bottom))
             }
+        })
+    }
+
+    /// (versionName, longVersionCode) of this package —
+    /// context.getPackageManager().getPackageInfo(context.getPackageName(), 0).
+    pub fn package_version() -> Result<(String, i64), String> {
+        with_env_ctx(|env, context| {
+            let pkg = env.call_method(context, "getPackageName", "()Ljava/lang/String;", &[])?.l()?;
+            let pm = env
+                .call_method(context, "getPackageManager", "()Landroid/content/pm/PackageManager;", &[])?
+                .l()?;
+            let info = env
+                .call_method(
+                    &pm,
+                    "getPackageInfo",
+                    "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
+                    &[JValue::Object(&pkg), JValue::Int(0)],
+                )?
+                .l()?;
+            let name_obj = env.get_field(&info, "versionName", "Ljava/lang/String;")?.l()?;
+            let name = if name_obj.is_null() {
+                String::new()
+            } else {
+                env.get_string(&jni::objects::JString::from(name_obj))?.to_string_lossy().into_owned()
+            };
+            let sdk = env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i()?;
+            let code = if sdk >= 28 {
+                env.call_method(&info, "getLongVersionCode", "()J", &[])?.j()?
+            } else {
+                i64::from(env.get_field(&info, "versionCode", "I")?.i()?)
+            };
+            Ok((name, code))
         })
     }
 

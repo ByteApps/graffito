@@ -43,6 +43,11 @@ public final class BiometricBridge extends BiometricPrompt.AuthenticationCallbac
     public volatile int errorCode = -1;
 
     private final CountDownLatch latch = new CountDownLatch(1);
+    /** The prompt's cancel handle — fired on await() timeout so the system
+     *  sheet does not stay on screen after Rust has already given up
+     *  (seen on the Pixel, 2026-09-05: an orphaned BiometricPrompt window
+     *  blacked out every capture until Back dismissed it). */
+    private final CancellationSignal signal = new CancellationSignal();
     private final Activity activity;
     private final String title;
     private final String subtitle;
@@ -69,7 +74,7 @@ public final class BiometricBridge extends BiometricPrompt.AuthenticationCallbac
                     // so a lambda fails to compile here.
                     .setNegativeButton(negative, this, this)
                     .build();
-            prompt.authenticate(new CancellationSignal(), this, this);
+            prompt.authenticate(signal, this, this);
         } catch (Throwable t) {
             // Never leave the waiter hanging: a builder/permission failure is a
             // denial, not a hang.
@@ -119,10 +124,12 @@ public final class BiometricBridge extends BiometricPrompt.AuthenticationCallbac
     public int await(long timeoutMs) {
         try {
             if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                signal.cancel(); // take the sheet down with us
                 return ERROR;
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            signal.cancel();
             return ERROR;
         }
         return result;

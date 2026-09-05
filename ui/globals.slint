@@ -297,6 +297,9 @@ export global Ui {
     // rejects the key so Android's default runs, which moves the task to
     // the background instead of quitting.
     callback back-logged(bool, Screen); // Rust: `cb: sys-back` log line
+    // A secret is on screen → Rust blocks screenshots/recording of the
+    // window (Android FLAG_SECURE, macOS sharingType none); false clears it.
+    callback secure-screen-changed(bool);
 
     // U3b bridges: a screen/modal extracted into its own file can no longer
     // reach AppWindow's `back-scope` id or call its `nav-back()` function
