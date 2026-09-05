@@ -6,7 +6,7 @@
 import { Ui, Terms, Settings, Note, Change, Sweep, Coins } from "../globals.slint";
 import { Caption, Mono, GhostButton, SvgIconButton, Header, CopyButton, QrArea, SelectPill, Dropdown, SettingsCard } from "../components.slint";
 import { EditField } from "../edit.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 import { Switch } from "std-widgets.slint";
 
 export component SettingsScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
@@ -99,7 +99,7 @@ export component SettingsScreen inherits VerticalLayout { padding-top: Ui.safe-t
             if Settings.chunk-custom || (Settings.chunk-text != "100000" && Settings.chunk-text != "80"): HorizontalLayout {
                 spacing: 8px;
                 EditField {
-                    width: 130px;
+                    width: 130px * Metrics.type-scale;
                     text <=> Settings.chunk-text;
                     placeholder-text: "20 – 100000";
                     accepted(t) => { Settings.set-chunk(t); }
@@ -132,7 +132,7 @@ export component SettingsScreen inherits VerticalLayout { padding-top: Ui.safe-t
             if Settings.locktime-mode == "custom": HorizontalLayout {
                 spacing: 8px;
                 EditField {
-                    width: 130px;
+                    width: 130px * Metrics.type-scale;
                     text <=> Settings.locktime-text;
                     placeholder-text: "block height";
                     accepted(t) => { Settings.set-locktime("custom", t); }
@@ -315,7 +315,7 @@ export component SettingsScreen inherits VerticalLayout { padding-top: Ui.safe-t
                     HorizontalLayout {
                         Text {
                             text: Ui.spending-balance-line;
-                            font-size: 13px;
+                            font-size: 13px * Metrics.type-scale;
                             font-weight: 700;
                             color: Pal.text;
                             vertical-alignment: center;
@@ -351,7 +351,7 @@ export component SettingsScreen inherits VerticalLayout { padding-top: Ui.safe-t
                                 spacing: 4px;
                                 Mono {
                                     text: Settings.spending-address;
-                                    font-size: 10px;
+                                    font-size: 10px * Metrics.type-scale;
                                     color: Pal.muted;
                                     wrap: word-wrap;
                                     horizontal-stretch: 1;
@@ -436,7 +436,7 @@ export component SettingsScreen inherits VerticalLayout { padding-top: Ui.safe-t
                 text: "For bitcoiners by bitcoiners";
                 horizontal-alignment: center;
                 color: Pal.muted;
-                font-size: 12px;
+                font-size: 12px * Metrics.type-scale;
                 font-italic: true;
             }
         }

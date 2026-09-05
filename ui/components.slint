@@ -11,23 +11,23 @@ import { Pal, Metrics } from "theme.slint";
 import { SpendCoin, PsbtRow } from "types.slint";
 
 export component H1 inherits Text {
-    font-size: 21px;
+    font-size: 21px * Metrics.type-scale;
     font-weight: 700;
     color: Pal.text;
 }
 export component Body inherits Text {
-    font-size: 13px;
+    font-size: 13px * Metrics.type-scale;
     color: Pal.text;
     wrap: word-wrap;
 }
 export component Caption inherits Text {
-    font-size: 11px;
+    font-size: 11px * Metrics.type-scale;
     color: Pal.muted;
     wrap: word-wrap;
 }
 export component Mono inherits Text {
     font-family: "Menlo";
-    font-size: 12px;
+    font-size: 12px * Metrics.type-scale;
     color: Pal.text;
     wrap: char-wrap;
 }
@@ -44,7 +44,7 @@ export component PrimaryButton inherits Rectangle {
     in property <color> tint: Pal.accent;
     in property <color> tint-hover: Pal.accent-hover;
     callback clicked;
-    height: 46px;
+    height: 46px * Metrics.type-scale;
     border-radius: 10px;
     background: ta.has-hover ? root.tint-hover : root.tint;
     accessible-role: button;
@@ -58,7 +58,7 @@ export component PrimaryButton inherits Rectangle {
         vertical-alignment: center;
         text: root.text;
         color: Pal.on-accent;
-        font-size: 14px;
+        font-size: 14px * Metrics.type-scale;
         font-weight: 700;
     }
 }
@@ -66,7 +66,7 @@ export component PrimaryButton inherits Rectangle {
 export component GhostButton inherits Rectangle {
     in property <string> text;
     callback clicked;
-    height: 40px;
+    height: 40px * Metrics.type-scale;
     border-radius: 10px;
     border-width: 1px;
     border-color: Pal.line;
@@ -85,7 +85,7 @@ export component GhostButton inherits Rectangle {
         vertical-alignment: center;
         text: root.text;
         color: Pal.text;
-        font-size: 13px;
+        font-size: 13px * Metrics.type-scale;
     }
 }
 
@@ -95,7 +95,7 @@ export component IconButton inherits Rectangle {
     in property <color> glyph-color: Pal.muted;
     callback clicked;
     width: 40px;
-    height: 40px;
+    height: 40px * Metrics.type-scale;
     border-radius: 10px;
     background: ta.has-hover ? Pal.card-hover : transparent;
     ta := TouchArea { clicked => { root.clicked(); } }
@@ -106,7 +106,7 @@ export component IconButton inherits Rectangle {
         vertical-alignment: center;
         text: root.glyph;
         color: root.glyph-color;
-        font-size: root.glyph-size;
+        font-size: root.glyph-size * Metrics.type-scale;
     }
 }
 
@@ -218,7 +218,7 @@ export component Header inherits HorizontalLayout {
     }
     Text {
         text: root.title;
-        font-size: 19px;
+        font-size: 19px * Metrics.type-scale;
         font-weight: 700;
         color: Pal.text;
         vertical-alignment: center;
@@ -235,7 +235,7 @@ export component Header inherits HorizontalLayout {
 export component Badge inherits Rectangle {
     in property <string> label;
     in property <color> tint: Pal.muted;
-    height: 20px;
+    height: 20px * Metrics.type-scale;
     width: t.preferred-width + 16px;
     border-radius: 10px;
     background: root.tint.with-alpha(0.16);
@@ -246,7 +246,7 @@ export component Badge inherits Rectangle {
         vertical-alignment: center;
         text: root.label;
         color: root.tint;
-        font-size: 10px;
+        font-size: 10px * Metrics.type-scale;
         font-weight: 600;
     }
 }
@@ -376,7 +376,7 @@ export component SelectPill inherits Rectangle {
     in property <string> text;
     in property <bool> active;
     callback clicked;
-    height: 32px;
+    height: 32px * Metrics.type-scale;
     border-radius: 16px;
     border-width: 1px;
     border-color: root.active ? Pal.accent : Pal.line;
@@ -394,7 +394,7 @@ export component SelectPill inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         text: root.text;
-        font-size: 12px;
+        font-size: 12px * Metrics.type-scale;
         font-weight: 600;
         color: root.active ? Pal.on-accent : Pal.text;
     }
@@ -407,7 +407,7 @@ export component Dropdown inherits Rectangle {
     in property <[string]> options;
     in property <int> current-index;
     callback selected(int);
-    height: 40px;
+    height: 40px * Metrics.type-scale;
     border-radius: 10px;
     border-width: 1px;
     border-color: Pal.line;
@@ -423,7 +423,7 @@ export component Dropdown inherits Rectangle {
             vertical-alignment: center;
             horizontal-alignment: left;
             color: Pal.text;
-            font-size: 13px;
+            font-size: 13px * Metrics.type-scale;
             horizontal-stretch: 1;
             overflow: elide;
         }
@@ -449,7 +449,7 @@ export component Dropdown inherits Rectangle {
             VerticalLayout {
                 padding: 4px;
                 for opt[i] in root.options: Rectangle {
-                    height: 36px;
+                    height: 36px * Metrics.type-scale;
                     border-radius: 8px;
                     background: ota.has-hover ? Pal.card-hover
                         : (i == root.current-index ? Pal.accent.with-alpha(0.18) : transparent);
@@ -461,7 +461,7 @@ export component Dropdown inherits Rectangle {
                             text: opt;
                             vertical-alignment: center;
                             color: i == root.current-index ? Pal.accent : Pal.text;
-                            font-size: 13px;
+                            font-size: 13px * Metrics.type-scale;
                         }
                     }
                 }
@@ -483,7 +483,7 @@ export component SettingsCard inherits Rectangle {
         spacing: 8px;
         Text {
             text: root.title;
-            font-size: 14px;
+            font-size: 14px * Metrics.type-scale;
             font-weight: 700;
             color: Pal.text;
         }
@@ -501,10 +501,10 @@ export component KvRow inherits HorizontalLayout {
     in property <string> value;
     in property <color> value-color: Pal.text;
     spacing: 6px;
-    Text { text: root.label; font-size: 11px; color: Pal.muted; vertical-alignment: center; }
+    Text { text: root.label; font-size: 11px * Metrics.type-scale; color: Pal.muted; vertical-alignment: center; }
     Text {
         text: root.value;
-        font-size: 13px;
+        font-size: 13px * Metrics.type-scale;
         font-weight: 600;
         color: root.value-color;
         vertical-alignment: center;
@@ -530,7 +530,7 @@ export component DoorCard inherits Rectangle {
         spacing: 5px;
         Text {
             text: root.title;
-            font-size: 14px;
+            font-size: 14px * Metrics.type-scale;
             font-weight: 700;
             color: root.highlight ? Pal.accent : Pal.text;
         }
@@ -562,7 +562,7 @@ export component CoinListPanel inherits VerticalLayout {
     HorizontalLayout {
         Text {
             text: root.title;
-            font-size: 12px;
+            font-size: 12px * Metrics.type-scale;
             color: Pal.muted;
             vertical-alignment: center;
             horizontal-stretch: 1;
@@ -584,7 +584,7 @@ export component CoinListPanel inherits VerticalLayout {
         SelectPill { text: "consolidate"; active: root.strategy == 1; clicked => { root.pick-strategy(1); } }
     }
     for c in root.coins: Rectangle {
-        height: 42px;
+        height: 42px * Metrics.type-scale;
         border-radius: 8px;
         border-width: 1px;
         border-color: c.selected ? Pal.accent : Pal.line;
@@ -612,7 +612,7 @@ export component CoinListPanel inherits VerticalLayout {
             }
             VerticalLayout {
                 alignment: center;
-                Text { text: c.value + " sats"; font-size: 12px; color: Pal.text; }
+                Text { text: c.value + " sats"; font-size: 12px * Metrics.type-scale; color: Pal.text; }
             }
             Rectangle { }
             if c.tag != "": VerticalLayout {
@@ -626,7 +626,7 @@ export component CoinListPanel inherits VerticalLayout {
             VerticalLayout {
                 alignment: center;
                 Rectangle {
-                    height: 22px;
+                    height: 22px * Metrics.type-scale;
                     width: cplpill.preferred-width + 14px;
                     border-radius: 11px;
                     border-width: 1px;
@@ -640,7 +640,7 @@ export component CoinListPanel inherits VerticalLayout {
                         Text {
                             text: c.txid-short;
                             font-family: "Menlo";
-                            font-size: 10px;
+                            font-size: 10px * Metrics.type-scale;
                             color: Pal.muted;
                             vertical-alignment: center;
                         }
@@ -693,7 +693,7 @@ export component TxConfirmView inherits Flickable {
         }
         if root.txid != "": Mono {
             text: "txid " + root.txid;
-            font-size: 10px;
+            font-size: 10px * Metrics.type-scale;
             color: Pal.muted;
             overflow: elide;
             wrap: no-wrap;
@@ -725,8 +725,8 @@ export component TxConfirmView inherits Flickable {
                     alignment: center;
                     spacing: 3px;
                     horizontal-stretch: 1;
-                    Mono { text: i.title; font-size: 11px; overflow: elide; wrap: no-wrap; }
-                    Caption { text: i.subtitle; font-size: 10px; overflow: elide; }
+                    Mono { text: i.title; font-size: 11px * Metrics.type-scale; overflow: elide; wrap: no-wrap; }
+                    Caption { text: i.subtitle; font-size: 10px * Metrics.type-scale; overflow: elide; }
                 }
                 Mono {
                     text: i.amount + " sats";
@@ -764,8 +764,8 @@ export component TxConfirmView inherits Flickable {
                                 : (o.kind == "other" ? Pal.bad : Pal.muted))));
                         }
                     }
-                    if o.title != "": Mono { text: o.title; font-size: 11px; overflow: elide; wrap: no-wrap; }
-                    if o.subtitle != "": Caption { text: o.subtitle; font-size: 10px; overflow: elide; }
+                    if o.title != "": Mono { text: o.title; font-size: 11px * Metrics.type-scale; overflow: elide; wrap: no-wrap; }
+                    if o.subtitle != "": Caption { text: o.subtitle; font-size: 10px * Metrics.type-scale; overflow: elide; }
                 }
                 Mono {
                     // A 0-value OP_RETURN row has an empty amount — no
@@ -787,7 +787,7 @@ export component TxConfirmView inherits Flickable {
                 padding: 14px;
                 Text {
                     text: "Network fee";
-                    font-size: 13px;
+                    font-size: 13px * Metrics.type-scale;
                     color: Pal.muted;
                     vertical-alignment: center;
                     horizontal-stretch: 1;
@@ -805,7 +805,7 @@ export component TxConfirmView inherits Flickable {
                 padding: 14px;
                 Text {
                     text: "Locktime";
-                    font-size: 13px;
+                    font-size: 13px * Metrics.type-scale;
                     color: Pal.muted;
                     vertical-alignment: center;
                     horizontal-stretch: 1;

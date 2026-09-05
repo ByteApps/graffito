@@ -316,6 +316,79 @@ pub const fn has_insets() -> bool {
     cfg!(any(target_os = "ios", target_os = "android"))
 }
 
+/// Phone base type bump: the design's 11-13px body copy is sized for a Mac
+/// window and reads too small at 1 dp = 1 px on a phone (Sal, 2026-09-04,
+/// the onboarding copy on his Pixel). Multiplied by the OS font scale.
+pub const MOBILE_TYPE_BASE: f32 = 1.2;
+/// Bounds on the final `Metrics.type-scale`. The cap is a LAYOUT contract:
+/// every fixed-height row must survive 1.6× text — fix the row, never lower
+/// the cap. The floor keeps a "smaller text" OS setting from shrinking the
+/// phone below the desktop design.
+pub const TYPE_SCALE_MIN: f32 = 0.9;
+pub const TYPE_SCALE_MAX: f32 = 1.6;
+
+/// The OS-level accessibility font scale, 1.0 = the platform default size.
+/// Android: `Configuration.fontScale` (the Settings > Display > Font size
+/// slider; up to 2.0 on recent Pixels). iOS: Dynamic Type, read through
+/// `UIFontMetrics.defaultMetrics.scaledValue(forValue:)` so the ratio is
+/// Apple's own body-text curve (0.82 XS … 1.35 XXXL … 3.1 AX5). Desktop: 1.0.
+#[cfg(target_os = "android")]
+pub fn os_font_scale() -> f32 {
+    match android_jni::font_scale() {
+        Ok(v) if v > 0.0 => v,
+        other => {
+            println!("cb: font-scale {other:?}");
+            1.0
+        }
+    }
+}
+
+#[cfg(target_os = "ios")]
+pub fn os_font_scale() -> f32 {
+    use objc2::runtime::AnyObject;
+    // Raw messages rather than objc2-ui-kit's UIFontMetrics feature: two
+    // selectors, no extra crate surface to feature-gate.
+    unsafe {
+        let metrics: *mut AnyObject = objc2::msg_send![objc2::class!(UIFontMetrics), defaultMetrics];
+        if metrics.is_null() {
+            return 1.0;
+        }
+        const BODY: f64 = 17.0; // UIFontTextStyleBody at the Large (default) category
+        let scaled: f64 = objc2::msg_send![metrics, scaledValueForValue: BODY];
+        if scaled.is_finite() && scaled > 0.0 {
+            (scaled / BODY) as f32
+        } else {
+            1.0
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub fn os_font_scale() -> f32 {
+    1.0
+}
+
+/// The value the UI's `Metrics.type-scale` gets at boot. Desktop = exactly
+/// 1.0 (scripts/render-all.sh stays byte-identical — that is the proof the
+/// rewrite changed nothing there); phones = `MOBILE_TYPE_BASE` × the OS
+/// font scale, clamped. `APP_TYPE_SCALE=<f32>` overrides everything (dev /
+/// `--render` previews of the phone layouts at the cap on a Mac).
+pub fn type_scale() -> f32 {
+    if let Some(v) = std::env::var("APP_TYPE_SCALE").ok().and_then(|s| s.trim().parse::<f32>().ok()) {
+        if v.is_finite() && v > 0.0 {
+            return v;
+        }
+    }
+    if !has_insets() {
+        return 1.0;
+    }
+    let os = os_font_scale();
+    let raw = MOBILE_TYPE_BASE * os;
+    let scale = raw.clamp(TYPE_SCALE_MIN, TYPE_SCALE_MAX);
+    println!("cb: type-scale os={os:.3} raw={raw:.3} applied={scale:.3}");
+    scale
+}
+
 /// Read the system clipboard. Needed because Slint's iOS text fields don't
 /// surface the native paste menu — an in-app Paste button reads UIPasteboard.
 #[cfg(target_os = "ios")]
@@ -644,6 +717,23 @@ mod android_jni {
                 let bottom = env.call_method(&insets, "getSystemWindowInsetBottom", "()I", &[])?.i()?;
                 Ok((top, bottom))
             }
+        })
+    }
+
+    /// context.getResources().getConfiguration().fontScale — the user's
+    /// Display > Font size setting as a multiplier (1.0 default; 0.85 …
+    /// 2.0). A font-size change restarts the activity (`fontScale` is not
+    /// in the manifest's configChanges), so reading it once at boot is
+    /// current for the life of the surface.
+    pub fn font_scale() -> Result<f32, String> {
+        with_env_ctx(|env, context| {
+            let res = env
+                .call_method(context, "getResources", "()Landroid/content/res/Resources;", &[])?
+                .l()?;
+            let cfg = env
+                .call_method(&res, "getConfiguration", "()Landroid/content/res/Configuration;", &[])?
+                .l()?;
+            Ok(env.get_field(&cfg, "fontScale", "F")?.f()?)
         })
     }
 

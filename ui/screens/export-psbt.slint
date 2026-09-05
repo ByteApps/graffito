@@ -5,7 +5,7 @@
 
 import { Ui, ExportPsbt } from "../globals.slint";
 import { Caption, PrimaryButton, GhostButton, Header } from "../components.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component ExportPsbtScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -23,7 +23,7 @@ export component ExportPsbtScreen inherits VerticalLayout { padding-top: Ui.safe
         }
         if ExportPsbt.psbt-cost-line != "": Text {
             text: ExportPsbt.psbt-cost-line;
-            font-size: 13px;
+            font-size: 13px * Metrics.type-scale;
             font-weight: 600;
             color: Pal.accent;
             horizontal-alignment: center;

@@ -19,7 +19,7 @@
 import { Screen } from "../types.slint";
 import { Ui, PayFrom } from "../globals.slint";
 import { Caption, GhostButton, Header, CoinListPanel } from "../components.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component PayFromScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -43,10 +43,10 @@ export component PayFromScreen inherits VerticalLayout { padding-top: Ui.safe-to
                 spacing: 4px;
                 HorizontalLayout {
                     spacing: 6px;
-                    Text { text: "Required"; font-size: 11px; color: Pal.muted; vertical-alignment: center; }
+                    Text { text: "Required"; font-size: 11px * Metrics.type-scale; color: Pal.muted; vertical-alignment: center; }
                     Text {
                         text: PayFrom.payfrom-required-line;
-                        font-size: 13px;
+                        font-size: 13px * Metrics.type-scale;
                         font-weight: 600;
                         color: Ui.spend-enough ? Pal.text : Pal.warn;
                         vertical-alignment: center;
@@ -57,10 +57,10 @@ export component PayFromScreen inherits VerticalLayout { padding-top: Ui.safe-to
                 }
                 HorizontalLayout {
                     spacing: 6px;
-                    Text { text: "Selected"; font-size: 11px; color: Pal.muted; vertical-alignment: center; }
+                    Text { text: "Selected"; font-size: 11px * Metrics.type-scale; color: Pal.muted; vertical-alignment: center; }
                     Text {
                         text: Ui.payfrom-selected-line;
-                        font-size: 13px;
+                        font-size: 13px * Metrics.type-scale;
                         font-weight: 600;
                         color: Ui.spend-enough ? Pal.good : Pal.warn;
                         vertical-alignment: center;
@@ -91,7 +91,7 @@ export component PayFromScreen inherits VerticalLayout { padding-top: Ui.safe-to
                 VerticalLayout {
                     spacing: 8px;
                     Rectangle {
-                        height: 36px;
+                        height: 36px * Metrics.type-scale;
                         border-radius: 8px;
                         border-width: 1px;
                         border-color: PayFrom.nb-expanded ? Pal.accent : Pal.line;
@@ -103,7 +103,7 @@ export component PayFromScreen inherits VerticalLayout { padding-top: Ui.safe-to
                             spacing: 6px;
                             Text {
                                 text: "Notebook";
-                                font-size: 12px;
+                                font-size: 12px * Metrics.type-scale;
                                 color: PayFrom.nb-expanded ? Pal.accent : Pal.text;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
@@ -111,7 +111,7 @@ export component PayFromScreen inherits VerticalLayout { padding-top: Ui.safe-to
                             }
                             Text {
                                 text: PayFrom.funding-notebook-balance;
-                                font-size: 11px;
+                                font-size: 11px * Metrics.type-scale;
                                 color: Pal.muted;
                                 vertical-alignment: center;
                                 overflow: elide;
@@ -148,7 +148,7 @@ export component PayFromScreen inherits VerticalLayout { padding-top: Ui.safe-to
                 if Ui.spending-capable && Ui.spending-enabled: VerticalLayout {
                     spacing: 8px;
                     Rectangle {
-                        height: 36px;
+                        height: 36px * Metrics.type-scale;
                         border-radius: 8px;
                         border-width: 1px;
                         border-color: PayFrom.sp-expanded ? Pal.accent : Pal.line;
@@ -160,7 +160,7 @@ export component PayFromScreen inherits VerticalLayout { padding-top: Ui.safe-to
                             spacing: 6px;
                             Text {
                                 text: "Spending wallet";
-                                font-size: 12px;
+                                font-size: 12px * Metrics.type-scale;
                                 color: PayFrom.sp-expanded ? Pal.accent : Pal.text;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
@@ -168,7 +168,7 @@ export component PayFromScreen inherits VerticalLayout { padding-top: Ui.safe-to
                             }
                             Text {
                                 text: PayFrom.spending-summary;
-                                font-size: 11px;
+                                font-size: 11px * Metrics.type-scale;
                                 color: Pal.muted;
                                 vertical-alignment: center;
                                 overflow: elide;
@@ -220,7 +220,7 @@ export component PayFromScreen inherits VerticalLayout { padding-top: Ui.safe-to
                             spacing: 2px;
                             Text {
                                 text: fw.label;
-                                font-size: 12px;
+                                font-size: 12px * Metrics.type-scale;
                                 color: fw.expanded ? Pal.accent : Pal.text;
                                 overflow: elide;
                             }

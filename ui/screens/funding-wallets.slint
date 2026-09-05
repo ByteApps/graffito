@@ -5,7 +5,7 @@
 
 import { Ui, FundingWallets } from "../globals.slint";
 import { Caption, PrimaryButton, IconButton, SvgIconButton, Header, Badge, PencilButton } from "../components.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component FundingWalletsScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -23,7 +23,7 @@ export component FundingWalletsScreen inherits VerticalLayout { padding-top: Ui.
             background: Pal.card;
             border-width: 1px;
             border-color: Pal.line;
-            height: 60px;
+            height: 60px * Metrics.type-scale;
             Caption {
                 text: "No funding wallets yet — add one below.";
                 horizontal-alignment: center;
@@ -55,7 +55,7 @@ export component FundingWalletsScreen inherits VerticalLayout { padding-top: Ui.
                                 alignment: start;
                                 Text {
                                     text: fw.label;
-                                    font-size: 13px;
+                                    font-size: 13px * Metrics.type-scale;
                                     font-weight: 600;
                                     color: Pal.text;
                                     overflow: elide;

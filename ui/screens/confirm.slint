@@ -9,7 +9,7 @@
 
 import { Ui, Confirm } from "../globals.slint";
 import { Caption, PrimaryButton, Header, QrSpinner, TxConfirmView } from "../components.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component ConfirmScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -35,7 +35,7 @@ export component ConfirmScreen inherits VerticalLayout { padding-top: Ui.safe-to
             txid: Confirm.confirm-txid;
         }
         Rectangle {
-            height: 46px;
+            height: 46px * Metrics.type-scale;
             PrimaryButton {
                 width: 100%;
                 height: 100%;
