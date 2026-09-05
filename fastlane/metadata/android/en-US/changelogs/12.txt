@@ -1,0 +1,1 @@
+Text now follows your phone's font-size setting and is larger by default on phones — every screen, including the backup word list and buttons. No change to notes, keys, or funds.
