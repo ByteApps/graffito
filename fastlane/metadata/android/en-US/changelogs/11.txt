@@ -1,0 +1,1 @@
+Fixes the layout on Android 15 and newer: the app no longer draws under the status bar or the navigation bar (the "I understand and accept" button sat under the gesture bar). No change to notes, keys, or funds.
