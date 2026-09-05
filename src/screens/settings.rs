@@ -1354,7 +1354,11 @@ pub(crate) fn on_open_pq_keys(&mut self, w: &AppWindow) {
         w.global::<QuantumKeys>().set_pq_import_error("".into());
         w.global::<Ui>().set_pq_import_source("".into());
         w.global::<Ui>().set_pq_show_backup_confirm(false);
-        w.global::<QuantumKeys>().set_pq_gen_level("768".into());
+        // The generate-a-key pills start on the level the user already chose
+        // for this notebook's derived key (Settings → Quantum keys → Parameter
+        // level, persisted as `pq_level`), not a fixed 768 — one preference,
+        // both keys (2026-09-05).
+        w.global::<QuantumKeys>().set_pq_gen_level(pq_level_str(self.pq_level).into());
         w.global::<QuantumKeys>().set_pq_gen_extra("".into());
         w.global::<Ui>().set_pq_show_replace_confirm(false);
         w.global::<Ui>().set_pq_show_export_private_confirm(false);
