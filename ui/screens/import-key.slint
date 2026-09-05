@@ -6,7 +6,7 @@
 import { Ui, ImportKey } from "../globals.slint";
 import { Body, Caption, PrimaryButton, GhostButton, Header } from "../components.slint";
 import { EditArea } from "../edit.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 import { Switch } from "std-widgets.slint";
 
 export component ImportKeyScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
@@ -29,7 +29,7 @@ export component ImportKeyScreen inherits VerticalLayout { padding-top: Ui.safe-
         }
         if ImportKey.import-feedback != "": Body {
             text: ImportKey.import-feedback;
-            font-size: 12px;
+            font-size: 12px * Metrics.type-scale;
             // Rust sets the flag alongside the text (string-matching the
             // feedback here rotted once already).
             color: ImportKey.import-feedback-ok ? Pal.good : Pal.warn;

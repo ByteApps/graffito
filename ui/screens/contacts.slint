@@ -6,7 +6,7 @@
 import { Ui, Sweep, Contacts } from "../globals.slint";
 import { Caption, GhostButton, IconButton, Header, Badge, PencilButton, ScanButton, DoorCard } from "../components.slint";
 import { EditField } from "../edit.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 import { ListView } from "std-widgets.slint";
 
 export component ContactsScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
@@ -21,7 +21,7 @@ export component ContactsScreen inherits VerticalLayout { padding-top: Ui.safe-t
             // push right now so a row's cloud icon updates without waiting
             // for the next edit or a restart.
             if Ui.apple-platform: Rectangle {
-                height: 32px;
+                height: 32px * Metrics.type-scale;
                 width: sync-now-row.preferred-width + 16px;
                 border-radius: 8px;
                 background: sync-now-ta.has-hover ? Pal.card-hover : transparent;
@@ -40,7 +40,7 @@ export component ContactsScreen inherits VerticalLayout { padding-top: Ui.safe-t
                     }
                     Text {
                         text: "Sync now";
-                        font-size: 12px;
+                        font-size: 12px * Metrics.type-scale;
                         color: Pal.muted;
                         vertical-alignment: center;
                     }
@@ -65,7 +65,7 @@ export component ContactsScreen inherits VerticalLayout { padding-top: Ui.safe-t
                 accepted(t) => { Contacts.pick-contact(t); }
             }
             ScanButton { clicked => { Contacts.contact-scan(); } }
-            GhostButton { width: 64px; text: "Use"; clicked => { Contacts.pick-contact(Ui.contact-input); } }
+            GhostButton { width: 64px * Metrics.type-scale; text: "Use"; clicked => { Contacts.pick-contact(Ui.contact-input); } }
         }
         if Ui.status != "": Caption { text: Ui.status; color: Pal.bad; }
         // Sweep = leaving the wallet: destinations are EXTERNAL addresses
@@ -82,7 +82,7 @@ export component ContactsScreen inherits VerticalLayout { padding-top: Ui.safe-t
         recents-col := VerticalLayout {
             spacing: 6px;
             for c in Ui.contacts: Rectangle {
-                height: 52px;
+                height: 52px * Metrics.type-scale;
                     ct := TouchArea { clicked => { Contacts.pick-contact(c.address); } }
                     Rectangle {
                         y: 2px;
@@ -126,7 +126,7 @@ export component ContactsScreen inherits VerticalLayout { padding-top: Ui.safe-t
                                 alignment: center;
                                 Text {
                                     text: c.name == "" ? c.address : c.name;
-                                    font-size: 12px;
+                                    font-size: 12px * Metrics.type-scale;
                                     color: Pal.text;
                                     overflow: elide;
                                 }

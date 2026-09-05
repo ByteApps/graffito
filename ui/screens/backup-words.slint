@@ -6,7 +6,7 @@
 import { Ui, Settings, BackupWords, Change } from "../globals.slint";
 import { Caption, Mono, Card, PrimaryButton, SvgIconButton, Header, CopyButton } from "../components.slint";
 import { EditField } from "../edit.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 import { Switch } from "std-widgets.slint";
 
 export component BackupWordsScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
@@ -37,7 +37,7 @@ export component BackupWordsScreen inherits VerticalLayout { padding-top: Ui.saf
                 y: 16px;
                 width: parent.width - 32px;
                 text: Ui.backup-words;
-                font-size: 13px;
+                font-size: 13px * Metrics.type-scale;
             }
             CopyButton {
                 x: parent.width - self.width - 8px;
@@ -74,12 +74,12 @@ export component BackupWordsScreen inherits VerticalLayout { padding-top: Ui.saf
                 padding: 10px;
                 spacing: 8px;
                 Rectangle {
-                    height: 22px;
+                    height: 22px * Metrics.type-scale;
                     TouchArea { clicked => { BackupWords.advanced-expanded = !BackupWords.advanced-expanded; } }
                     HorizontalLayout {
                         Text {
                             text: "Advanced";
-                            font-size: 12px;
+                            font-size: 12px * Metrics.type-scale;
                             color: Pal.muted;
                             vertical-alignment: center;
                         }

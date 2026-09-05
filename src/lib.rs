@@ -2144,6 +2144,9 @@ pub fn run() {
     // Metrics global in app.slint; Apple platforms keep the -1.25px default).
     #[cfg(target_os = "android")]
     window.global::<Metrics>().set_back_dy(1.5);
+    // Type scale: 1.0 on desktop, base × OS font scale on phones
+    // (`platform::type_scale`; every font-size in the UI multiplies by it).
+    window.global::<Metrics>().set_type_scale(platform::type_scale());
 
     // Quantum keys (screen 29) level-picker captions — pinned copy from
     // `passphrase::MlKemLevel::describe()`, set once (never changes at
@@ -3228,9 +3231,9 @@ fn preview_mock(w: &AppWindow) {
     w.global::<Info>().set_info_show_slint(true);
     w.global::<Ui>().set_directed(true);
     w.global::<Compose>().set_gift_sats("330".into());
+    // Through the real formatter so the phone column count previews too.
     w.global::<Ui>().set_backup_words(
-        " 1. legal      2. winner    3. thank\n 4. year       5. wave      6. sausage\n 7. worth      8. useful    9. dawn\n10. absorb    11. pledge   12. yellow\n"
-            .into(),
+        word_grid("legal winner thank year wave sausage worth useful dawn absorb pledge yellow").into(),
     );
     w.global::<Ui>().set_fund_external(true);
     w.global::<Ui>().set_funding_ready(true);
@@ -3327,6 +3330,10 @@ fn render_previews(w: u32, h: u32, screens: &[Screen], out_dir: &str) {
     win.set_size(slint::PhysicalSize::new(w, h));
     // No safe-area pass runs headless — lift the splash cover directly.
     app.global::<Modals>().set_ready(true);
+    // `APP_TYPE_SCALE=1.6 scripts/render-all.sh out` previews every screen
+    // at the phone type-scale cap on a Mac (unset = 1.0, the byte-identity
+    // baseline).
+    app.global::<Metrics>().set_type_scale(platform::type_scale());
 
     for &n in screens {
         let name = screen_name(n);

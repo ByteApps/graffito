@@ -6,7 +6,7 @@
 import { Ui, AccountPicker, Notebooks } from "../globals.slint";
 import { Caption, Mono, GhostButton, Header, Badge } from "../components.slint";
 import { EditField } from "../edit.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component AccountPickerScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -59,7 +59,7 @@ export component AccountPickerScreen inherits VerticalLayout { padding-top: Ui.s
                         // account rows keep their raw account number.
                         text: (AccountPicker.account-pick-mode == "notebook" || AccountPicker.account-pick-mode == "wconsol"
                             ? "Notebook " + (a.index + 1) : "Account " + a.index);
-                        font-size: 14px;
+                        font-size: 14px * Metrics.type-scale;
                         font-weight: 700;
                         color: a.active ? Pal.accent : Pal.text;
                     }
@@ -74,7 +74,7 @@ export component AccountPickerScreen inherits VerticalLayout { padding-top: Ui.s
                 }
                 Mono {
                     text: a.address;
-                    font-size: 10px;
+                    font-size: 10px * Metrics.type-scale;
                     color: Pal.muted;
                     wrap: no-wrap;
                     overflow: elide;
@@ -84,7 +84,7 @@ export component AccountPickerScreen inherits VerticalLayout { padding-top: Ui.s
         HorizontalLayout {
             spacing: 10px;
             GhostButton {
-                width: 90px;
+                width: 90px * Metrics.type-scale;
                 text: "‹ Prev";
                 clicked => { AccountPicker.accounts-page(-1); }
             }
@@ -98,7 +98,7 @@ export component AccountPickerScreen inherits VerticalLayout { padding-top: Ui.s
                 vertical-alignment: center;
             }
             GhostButton {
-                width: 90px;
+                width: 90px * Metrics.type-scale;
                 text: "Next ›";
                 clicked => { AccountPicker.accounts-page(1); }
             }

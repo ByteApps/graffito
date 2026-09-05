@@ -5,7 +5,7 @@
 
 import { Ui, PublicKeys } from "../globals.slint";
 import { Caption, Mono, GhostButton, Header, QrArea } from "../components.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component PublicKeysScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -35,7 +35,7 @@ export component PublicKeysScreen inherits VerticalLayout { padding-top: Ui.safe
                 for row[idx] in PublicKeys.reveal-public-rows: VerticalLayout {
                     spacing: 6px;
                     Rectangle {
-                        height: 46px;
+                        height: 46px * Metrics.type-scale;
                         border-radius: 10px;
                         background: Pal.card;
                         border-width: 1px;
@@ -47,7 +47,7 @@ export component PublicKeysScreen inherits VerticalLayout { padding-top: Ui.safe
                             Text {
                                 text: row.label;
                                 color: Pal.text;
-                                font-size: 14px;
+                                font-size: 14px * Metrics.type-scale;
                                 font-weight: 600;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;

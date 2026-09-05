@@ -10,7 +10,7 @@
 
 import { Ui, Dice } from "../globals.slint";
 import { Caption, PrimaryButton, GhostButton, Header } from "../components.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component DiceScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -25,14 +25,14 @@ export component DiceScreen inherits VerticalLayout { padding-top: Ui.safe-top +
             spacing: 8px;
             Text {
                 text: Ui.dice-count;
-                font-size: 40px;
+                font-size: 40px * Metrics.type-scale;
                 font-weight: 700;
                 color: Dice.dice-ready ? Pal.accent : Pal.text;
                 vertical-alignment: center;
             }
             Text {
                 text: Ui.dice-count == 1 ? "roll" : "rolls";
-                font-size: 15px;
+                font-size: 15px * Metrics.type-scale;
                 color: Pal.muted;
                 vertical-alignment: center;
             }
@@ -62,11 +62,11 @@ export component DiceScreen inherits VerticalLayout { padding-top: Ui.safe-top +
                 spacing: 2px;
                 Text {
                     text: "SHA-256 of your rolls so far";
-                    font-size: 11px;
+                    font-size: 11px * Metrics.type-scale;
                     color: Pal.muted;
                 }
-                Text { text: Ui.dice-hash; font-size: 12px; color: Pal.text; }
-                Text { text: Dice.dice-hash2; font-size: 12px; color: Pal.text; }
+                Text { text: Ui.dice-hash; font-size: 12px * Metrics.type-scale; color: Pal.text; }
+                Text { text: Dice.dice-hash2; font-size: 12px * Metrics.type-scale; color: Pal.text; }
             }
         }
         // Keypad of actual die faces (icons/die-N.svg). These are the ONE

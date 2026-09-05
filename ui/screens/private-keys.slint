@@ -5,7 +5,7 @@
 
 import { Ui, PrivateKeys } from "../globals.slint";
 import { Caption, Mono, GhostButton, Header, QrArea, SelectPill } from "../components.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component PrivateKeysScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -71,7 +71,7 @@ export component PrivateKeysScreen inherits VerticalLayout { padding-top: Ui.saf
                     spacing: 6px;
                     Caption { text: "Notebook:"; color: Pal.muted; }
                     for nb in PrivateKeys.reveal-nb-rows: Rectangle {
-                        height: 44px;
+                        height: 44px * Metrics.type-scale;
                         nbp-ta := TouchArea { clicked => { PrivateKeys.private-pick-notebook(nb.index); } }
                         Rectangle {
                             border-radius: 10px;
@@ -86,7 +86,7 @@ export component PrivateKeysScreen inherits VerticalLayout { padding-top: Ui.saf
                                 spacing: 8px;
                                 Text {
                                     text: nb.name;
-                                    font-size: 13px;
+                                    font-size: 13px * Metrics.type-scale;
                                     font-weight: 600;
                                     color: Pal.text;
                                     overflow: elide;

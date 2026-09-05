@@ -3,7 +3,7 @@
 // (drop-in replacements for std LineEdit/TextEdit). Split out of
 // app.slint (U1, PLAN-graffito-app-arch.md) as a pure file move: no value
 // changes.
-import { Pal } from "theme.slint";
+import { Pal, Metrics } from "theme.slint";
 
 // ---- text-input layer --------------------------------------------------
 // EditField/EditArea replace std LineEdit/TextEdit so the app can reach
@@ -50,7 +50,7 @@ component ToolbarAction inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         text: root.text;
-        font-size: 12px;
+        font-size: 12px * Metrics.type-scale;
         color: Pal.text;
     }
     ta := TouchArea { clicked => { root.clicked(); } }
@@ -62,7 +62,7 @@ component ToolbarAction inherits Rectangle {
 component EditToolbar inherits Rectangle {
     callback action(string); // select-all | copy | paste | cut
     width: l.preferred-width;
-    height: 30px;
+    height: 30px * Metrics.type-scale;
     border-radius: 15px;
     background: #262E3A;
     border-width: 1px;
@@ -238,7 +238,7 @@ export component EditField inherits Rectangle {
         height: parent.height;
         vertical-alignment: center;
         text: root.text == "" ? root.placeholder-text : "";
-        font-size: 13px;
+        font-size: 13px * Metrics.type-scale;
         color: Pal.muted;
         overflow: elide;
     }
@@ -265,7 +265,7 @@ export component EditField inherits Rectangle {
                 vertical-alignment: center;
                 single-line: true;
                 wrap: no-wrap;
-                font-size: 13px;
+                font-size: 13px * Metrics.type-scale;
                 color: Pal.text;
                 selection-background-color: Pal.sel-bg;
                 selection-foreground-color: Pal.sel-fg;
@@ -483,7 +483,7 @@ export component EditArea inherits Rectangle {
         width: parent.width - 20px;
         vertical-alignment: top;
         text: root.text == "" ? root.placeholder-text : "";
-        font-size: 13px;
+        font-size: 13px * Metrics.type-scale;
         color: Pal.muted;
         overflow: elide;
     }
@@ -509,7 +509,7 @@ export component EditArea inherits Rectangle {
                 height: fli.viewport-height;
                 single-line: false;
                 wrap: word-wrap;
-                font-size: 13px;
+                font-size: 13px * Metrics.type-scale;
                 color: Pal.text;
                 selection-background-color: Pal.sel-bg;
                 selection-foreground-color: Pal.sel-fg;

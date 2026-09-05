@@ -6,7 +6,7 @@
 import { Ui, QuantumKeys } from "../globals.slint";
 import { Caption, Mono, GhostButton, Header, QrArea, SelectPill, DoorCard } from "../components.slint";
 import { EditField, EditArea } from "../edit.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component QuantumKeysScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -33,7 +33,7 @@ export component QuantumKeysScreen inherits VerticalLayout { padding-top: Ui.saf
                 Caption {
                     text: "A post-quantum receive key for this notebook, layered on top of your normal note encryption. Share the public half so others can seal directed notes to you with quantum-resistant protection — it recovers automatically from your seed phrase.";
                 }
-                Text { text: "Parameter level"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                Text { text: "Parameter level"; font-size: 13px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
                 VerticalLayout {
                     spacing: 8px;
                     DoorCard {
@@ -64,14 +64,14 @@ export component QuantumKeysScreen inherits VerticalLayout { padding-top: Ui.saf
                     pq-key-col := VerticalLayout {
                         padding: 12px;
                         spacing: 6px;
-                        Text { text: "Your notebook's quantum key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                        Text { text: "Your notebook's quantum key"; font-size: 13px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
                         Mono { text: QuantumKeys.pq-key-fingerprint; color: Pal.muted; }
                         Caption { text: "Derived from your seed — recovers with your seed phrase; backup is optional."; }
                     }
                 }
                 VerticalLayout {
                     spacing: 8px;
-                    Text { text: "Share your public key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                    Text { text: "Share your public key"; font-size: 13px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
                     HorizontalLayout {
                         spacing: 10px;
                         GhostButton { text: "Copy public key"; clicked => { QuantumKeys.pq-copy-public(); } }
@@ -80,12 +80,12 @@ export component QuantumKeysScreen inherits VerticalLayout { padding-top: Ui.saf
                 }
                 VerticalLayout {
                     spacing: 8px;
-                    Text { text: "Backup"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                    Text { text: "Backup"; font-size: 13px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
                     Caption { text: "Optional — this key already recovers from your seed phrase. Only do this if you want a separate copy outside the app."; }
                     GhostButton { text: "Backup private key…"; clicked => { Ui.pq-show-backup-confirm = true; } }
                 }
                 Rectangle { height: 1px; background: Pal.line; }
-                Text { text: "My quantum key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                Text { text: "My quantum key"; font-size: 13px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
                 Caption { text: "A personal ML-KEM key that does NOT come from your seed phrase — generate one here, or import one (a Graffito private-key export, or an OpenPGP key with an RFC 9980 ML-KEM-768+X25519 component). Self-notes sealed with quantum protection use THIS key, never the seed-derived one above."; }
 
                 // ---- Current key: fingerprint + share/export/remove ----
@@ -136,7 +136,7 @@ export component QuantumKeysScreen inherits VerticalLayout { padding-top: Ui.saf
                 }
 
                 // ---- Generate a fresh key ----
-                Text { text: "Generate a new key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                Text { text: "Generate a new key"; font-size: 13px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
                 HorizontalLayout {
                     spacing: 8px;
                     SelectPill { text: "ML-KEM-512"; active: QuantumKeys.pq-gen-level == "512"; clicked => { QuantumKeys.pq-gen-level = "512"; } }
@@ -144,7 +144,7 @@ export component QuantumKeysScreen inherits VerticalLayout { padding-top: Ui.saf
                     SelectPill { text: "ML-KEM-1024"; active: QuantumKeys.pq-gen-level == "1024"; clicked => { QuantumKeys.pq-gen-level = "1024"; } }
                 }
                 Caption { text: "768 is the standard recommendation for general use."; }
-                Text { text: "Extra entropy (optional)"; font-size: 12px; font-weight: 600; color: Pal.text; }
+                Text { text: "Extra entropy (optional)"; font-size: 12px * Metrics.type-scale; font-weight: 600; color: Pal.text; }
                 Caption { text: "Type anything — a passphrase, dice rolls. Mixed WITH the system's randomness, it can only add strength, never replace it."; }
                 EditField {
                     placeholder-text: "e.g. a passphrase or dice rolls";
@@ -155,7 +155,7 @@ export component QuantumKeysScreen inherits VerticalLayout { padding-top: Ui.saf
                 Rectangle { height: 1px; background: Pal.line; }
 
                 // ---- Import an existing key ----
-                Text { text: "Import a key"; font-size: 13px; font-weight: 700; color: Pal.text; }
+                Text { text: "Import a key"; font-size: 13px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
                 Caption { text: "Import someone else's — or your own already-exported — ML-KEM SECRET key so this device can use it: a Graffito private-key export, or an OpenPGP key with an RFC 9980 ML-KEM-768+X25519 component."; }
                 EditArea {
                     height: 90px;

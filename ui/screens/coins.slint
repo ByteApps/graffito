@@ -5,7 +5,7 @@
 
 import { Ui, Settings, Coins } from "../globals.slint";
 import { Body, Caption, Mono, GhostButton, Header, Badge, SelectPill } from "../components.slint";
-import { Pal } from "../theme.slint";
+import { Pal, Metrics } from "../theme.slint";
 
 export component CoinsScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
         padding: 20px;
@@ -52,8 +52,8 @@ export component CoinsScreen inherits VerticalLayout { padding-top: Ui.safe-top 
             text: "Scan for existing funds…";
             clicked => { Coins.spending-scan-deep(); }
         }
-        if Ui.coins-segment == "notebook": Body { text: Ui.coins-summary; font-size: 12px; }
-        if Ui.coins-segment == "spending": Body { text: Ui.spending-balance-line; font-size: 12px; }
+        if Ui.coins-segment == "notebook": Body { text: Ui.coins-summary; font-size: 12px * Metrics.type-scale; }
+        if Ui.coins-segment == "spending": Body { text: Ui.spending-balance-line; font-size: 12px * Metrics.type-scale; }
         if Ui.coins-segment == "notebook": Flickable {
             viewport-height: coins-col.preferred-height;
             coins-col := VerticalLayout {
@@ -72,7 +72,7 @@ export component CoinsScreen inherits VerticalLayout { padding-top: Ui.safe-top 
                             spacing: 8px;
                             Text {
                                 text: c.value + " sats";
-                                font-size: 13px;
+                                font-size: 13px * Metrics.type-scale;
                                 font-weight: 700;
                                 color: Pal.text;
                             }
@@ -91,7 +91,7 @@ export component CoinsScreen inherits VerticalLayout { padding-top: Ui.safe-top 
                         }
                         Mono {
                             text: c.outpoint;
-                            font-size: 10px;
+                            font-size: 10px * Metrics.type-scale;
                             color: Pal.muted;
                             wrap: no-wrap;
                             overflow: elide;
@@ -118,7 +118,7 @@ export component CoinsScreen inherits VerticalLayout { padding-top: Ui.safe-top 
                             spacing: 8px;
                             Text {
                                 text: c.value + " sats";
-                                font-size: 13px;
+                                font-size: 13px * Metrics.type-scale;
                                 font-weight: 700;
                                 color: Pal.text;
                             }
@@ -130,7 +130,7 @@ export component CoinsScreen inherits VerticalLayout { padding-top: Ui.safe-top 
                         }
                         Mono {
                             text: c.address;
-                            font-size: 10px;
+                            font-size: 10px * Metrics.type-scale;
                             color: Pal.muted;
                             wrap: no-wrap;
                             overflow: elide;
