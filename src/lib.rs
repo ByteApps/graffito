@@ -261,8 +261,9 @@ struct State {
     /// doc for why an unverified estimate must never count.
     pq_passphrase_verified: bool,
     /// Argon2id preset for the passphrase layer of the note being composed
-    /// (the compose panel's "Unlock cost" pills). Session-sticky, never
-    /// persisted: the note itself records the parameters it was sealed with.
+    /// (the compose panel's "Unlock cost" pills). Persisted in config.json
+    /// like `pq_level`; the note itself still records the parameters it was
+    /// sealed with, so this is only the default for the NEXT note.
     pq_pw_cost: app_core::notes_core::pq::PwCost,
     /// The user switched the ML-KEM hybrid OFF by hand this session. The
     /// hybrid defaults ON whenever a quantum key is available (2026-09-05);
@@ -1172,6 +1173,7 @@ impl State {
             "auto_unlock": self.auto_unlock,
             "locktime": self.lock_time_policy,
             "pq_level": self.pq_level,
+            "pq_pw_cost": self.pq_pw_cost.as_str(),
         })
     }
 
