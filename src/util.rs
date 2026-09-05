@@ -537,12 +537,37 @@ pub(crate) fn decode_txid_vsize(raw_hex: &str) -> Option<(String, usize)> {
     Some((tx.compute_txid().to_string(), tx.vsize()))
 }
 
+/// Push the platform type scale into the UI when it CHANGES — at boot, and
+/// from the slow poll after a font-size change: the Android manifest keeps
+/// `fontScale` in `configChanges` so the activity is NOT recreated (a
+/// recreation re-runs `android_main` inside the same process, which is how
+/// the safe-area insets were lost on 2026-09-05), so the new value has to be
+/// noticed here instead. Desktop is a no-op (always 1.0).
+pub(crate) fn apply_type_scale(win: &AppWindow) {
+    let scale = platform::type_scale();
+    let m = win.global::<Metrics>();
+    if (m.get_type_scale() - scale).abs() > 0.001 {
+        println!("cb: type-scale os={:.3} applied={scale:.3}", platform::os_font_scale());
+        m.set_type_scale(scale);
+        m.set_word_columns(platform::word_columns());
+    }
+}
+
 /// Read the platform safe-area insets (converting with the window's scale
 /// factor) and push them into the UI. Cheap; called on a few startup ticks
 /// and a slow rotation poll. No-op on desktop (insets are 0).
 pub(crate) fn apply_safe_area(win: &AppWindow) {
+    apply_type_scale(win);
     let scale = win.window().scale_factor();
     let (top, bottom) = platform::safe_area_insets(scale);
+    // A phone in portrait always has a status bar, so a (0, 0) reading after
+    // a real inset was known is the platform not knowing YET (window detached
+    // across a background/foreground or activity recreation), never a real
+    // layout — keep the last good value rather than sliding the header under
+    // the status bar until the next poll succeeds.
+    if platform::has_insets() && top <= 0.0 && win.global::<Ui>().get_safe_top() > 0.0 {
+        return;
+    }
     if (win.global::<Ui>().get_safe_top() - top).abs() > 0.5 || (win.global::<Ui>().get_safe_bottom() - bottom).abs() > 0.5 {
         println!("cb: safe-area top={top:.1} bottom={bottom:.1} scale={scale:.2}");
     }

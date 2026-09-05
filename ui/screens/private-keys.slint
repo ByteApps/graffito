@@ -4,7 +4,7 @@
 // ---------- 19 · private keys (fresh Touch ID before entry) ----------
 
 import { Ui, PrivateKeys } from "../globals.slint";
-import { Caption, Mono, GhostButton, Header, QrArea, SelectPill } from "../components.slint";
+import { Caption, Mono, GhostButton, Header, QrArea, SelectPill, WordGrid } from "../components.slint";
 import { Pal, Metrics } from "../theme.slint";
 
 export component PrivateKeysScreen inherits VerticalLayout { padding-top: Ui.safe-top + 14px; padding-bottom: Ui.safe-bottom;
@@ -109,11 +109,7 @@ export component PrivateKeysScreen inherits VerticalLayout { padding-top: Ui.saf
                 // ---- Recovery phrase: word grid + SeedQR toggle ----
                 if Ui.reveal-private-format == "recovery": VerticalLayout {
                     spacing: 10px;
-                    if !PrivateKeys.reveal-show-seedqr: HorizontalLayout {
-                        spacing: 16px;
-                        Mono { text: PrivateKeys.reveal-words-col1; horizontal-stretch: 1; }
-                        Mono { text: PrivateKeys.reveal-words-col2; horizontal-stretch: 1; }
-                    }
+                    if !PrivateKeys.reveal-show-seedqr: WordGrid { words: PrivateKeys.reveal-word-list; }
                     if PrivateKeys.reveal-show-seedqr: HorizontalLayout {
                         alignment: center;
                         Rectangle {

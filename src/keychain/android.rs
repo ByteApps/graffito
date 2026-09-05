@@ -318,9 +318,15 @@ fn sdk_int(env: &mut JNIEnv) -> jni::errors::Result<i32> {
 /// is the same guarantee iOS gives on an unentitled build via its LAContext
 /// fallback.
 ///
-/// Blocking is safe here: `android_main` runs on its own native thread, NOT the
-/// Java main thread, so the ANR watchdog is unaffected and the prompt stays
-/// responsive while this waits.
+/// **Call this from a WORKER thread, never from the slint/android_main
+/// thread.** That thread is not the Java main thread, but it IS the thread
+/// that drains the NativeActivity input queue, and Android's input watchdog
+/// raises "isn't responding" when a touch sits unconsumed for 5 s — which is
+/// exactly what happened the first time a finger touched the screen while
+/// this was parked in `await` (Sal's Pixel, 2026-09-05; ANR trace:
+/// android_main → CountDownLatch.await ← BiometricBridge.await). Every caller
+/// (`reveal_secret`, `load_secret_gated`) now runs on `std::thread::spawn`
+/// and posts its result back to the UI thread.
 fn user_presence_check(reason: &str) -> Result<(), String> {
     let title = "Reveal secret";
     let negative = "Cancel";

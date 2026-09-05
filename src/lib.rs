@@ -2146,7 +2146,7 @@ pub fn run() {
     window.global::<Metrics>().set_back_dy(1.5);
     // Type scale: 1.0 on desktop, base × OS font scale on phones
     // (`platform::type_scale`; every font-size in the UI multiplies by it).
-    window.global::<Metrics>().set_type_scale(platform::type_scale());
+    apply_type_scale(&window);
 
     // Quantum keys (screen 29) level-picker captions — pinned copy from
     // `passphrase::MlKemLevel::describe()`, set once (never changes at
@@ -2330,18 +2330,24 @@ pub fn run() {
     // meets the Face ID prompt for the stored key on a cold start, and it is
     // reached by a tap — so it can block for as long as it likes.
     // Written out rather than via cb!: that macro takes a State borrow for the
-    // whole body, and this body sits on a Face ID prompt that can last as long
-    // as the user does. Borrow only AFTER the prompt returns.
+    // whole body, and this body sits on a biometric prompt that can last as
+    // long as the user does. The prompt waits on a WORKER thread — on Android
+    // the native thread is also the input-draining thread, and blocking it
+    // trips the 5 s input watchdog (2026-09-05) — and the State borrow happens
+    // only in the posted continuation.
     {
-        let st_restore = st.clone();
         let weak = window.as_weak();
         window.global::<Onboarding>().on_restore_saved_key(move || {
-            let w = weak.unwrap();
             println!("cb: restore-saved-key");
-            if let Some(m) = read_saved_material(&w) {
-                let mut s = st_restore.borrow_mut();
-                s.activate_restored(&w, m, true); // onboarding exit
-            }
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let r = keychain::load_secret_gated(KEYCHAIN_ACCOUNT, "unlock your Graffito identity");
+                post(&weak, move |w, st| {
+                    if let Some(m) = apply_restore_result(w, r) {
+                        st.activate_restored(w, m, true); // onboarding exit
+                    }
+                });
+            });
         });
     }
 
@@ -3232,9 +3238,7 @@ fn preview_mock(w: &AppWindow) {
     w.global::<Ui>().set_directed(true);
     w.global::<Compose>().set_gift_sats("330".into());
     // Through the real formatter so the phone column count previews too.
-    w.global::<Ui>().set_backup_words(
-        word_grid("legal winner thank year wave sausage worth useful dawn absorb pledge yellow").into(),
-    );
+    set_backup_words(w, "legal winner thank year wave sausage worth useful dawn absorb pledge yellow");
     w.global::<Ui>().set_fund_external(true);
     w.global::<Ui>().set_funding_ready(true);
     w.global::<Sweep>().set_funding_summary("taproot · bcrt1p2caq…6hrewe · 2 coins · 220,000 sats".into());
@@ -3334,6 +3338,7 @@ fn render_previews(w: u32, h: u32, screens: &[Screen], out_dir: &str) {
     // at the phone type-scale cap on a Mac (unset = 1.0, the byte-identity
     // baseline).
     app.global::<Metrics>().set_type_scale(platform::type_scale());
+    app.global::<Metrics>().set_word_columns(platform::word_columns());
 
     for &n in screens {
         let name = screen_name(n);
@@ -3375,13 +3380,20 @@ fn getrandom_fill(buf: &mut [u8]) -> Result<(), ()> {
 /// `HOME` and no CLI args on Android, so we point the store at the app's
 /// private internal storage before handing off to the shared `run()`.
 #[cfg(target_os = "android")]
-static ANDROID_APP: std::sync::OnceLock<slint::android::AndroidApp> = std::sync::OnceLock::new();
+static ANDROID_APP: std::sync::RwLock<Option<slint::android::AndroidApp>> = std::sync::RwLock::new(None);
 
-/// The `AndroidApp` handle, stashed in `android_main`, so `platform::
-/// safe_area_insets` can read the content rect (status-bar / nav-bar insets).
+/// The CURRENT `AndroidApp` handle, stashed by `android_main`, so `platform::
+/// safe_area_insets` can read the window insets / content rect (status-bar
+/// and nav-bar). A RwLock, not a OnceLock: `android_main` runs AGAIN, with a
+/// NEW `AndroidApp`, every time the NativeActivity is recreated (a font-size
+/// or other configuration change — `fontScale` is deliberately not in the
+/// manifest's `configChanges`), and the old handle's activity reference is
+/// dead after that — `getRootWindowInsets` on it is null forever and its
+/// content rect reads (0, 0), which is how the header ended up under the
+/// status bar after a font-size change (Sal's Pixel, 2026-09-05).
 #[cfg(target_os = "android")]
-pub(crate) fn android_app() -> Option<&'static slint::android::AndroidApp> {
-    ANDROID_APP.get()
+pub(crate) fn android_app() -> Option<slint::android::AndroidApp> {
+    ANDROID_APP.read().ok().and_then(|g| g.clone())
 }
 
 #[cfg(target_os = "android")]
@@ -3390,9 +3402,9 @@ fn android_main(app: slint::android::AndroidApp) {
     if let Some(path) = app.internal_data_path() {
         std::env::set_var("APP_DATA_DIR", path);
     }
-    // Keep a handle for safe-area insets (content_rect); AndroidApp is a
-    // cheap clonable handle.
-    let _ = ANDROID_APP.set(app.clone());
+    // Keep the CURRENT handle for safe-area insets (see `android_app`);
+    // AndroidApp is a cheap clonable handle.
+    *ANDROID_APP.write().expect("android app lock") = Some(app.clone());
     // Stash the JavaVM + Activity so the keystore/camera JNI backends can
     // reach them (ndk-context is populated by android-activity at startup;
     // this is a belt-and-suspenders no-op if already set).

@@ -30,6 +30,7 @@ pub(crate) fn clear_reveal(&mut self, w: &AppWindow) {
     w.global::<PrivateKeys>().set_reveal_private_value("".into());
     w.global::<PrivateKeys>().set_reveal_private_qr(slint::Image::default());
     w.global::<PrivateKeys>().set_reveal_words_col1("".into());
+    w.global::<PrivateKeys>().set_reveal_word_list(slint::ModelRc::new(slint::VecModel::<slint::SharedString>::default()));
     w.global::<PrivateKeys>().set_reveal_words_col2("".into());
     w.global::<PrivateKeys>().set_reveal_show_seedqr(false);
     w.global::<PrivateKeys>().set_reveal_seedqr_image(slint::Image::default());
@@ -103,6 +104,8 @@ pub(crate) fn on_private_select(&mut self, w: &AppWindow, fmt: SharedString) {
                 };
                 w.global::<PrivateKeys>().set_reveal_words_col1(col(0..half).into());
                 w.global::<PrivateKeys>().set_reveal_words_col2(col(half..list.len()).into());
+                let cells: Vec<slint::SharedString> = list.iter().map(|w| (*w).into()).collect();
+                w.global::<PrivateKeys>().set_reveal_word_list(slint::ModelRc::new(slint::VecModel::from(cells)));
                 if let Ok(m) = bip39::Mnemonic::parse(&words) {
                     let digits = app_core::seedqr::encode_standard(&m);
                     w.global::<PrivateKeys>().set_reveal_seedqr_image(qr::qr_image(&digits).unwrap_or_default());

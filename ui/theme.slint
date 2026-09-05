@@ -15,6 +15,9 @@ export global Metrics {
     // OS accessibility font scale, capped — see `platform::type_scale`.
     // A layout with a fixed-height row must survive the cap, never lower it.
     in-out property <float> type-scale: 1.0;
+    // Backup word grid columns: 3 on desktop, 2 on phones (set with the type
+    // scale from Rust). 12/18/24 words all divide by both.
+    in-out property <int> word-columns: 3;
 }
 
 // ---- palette ----

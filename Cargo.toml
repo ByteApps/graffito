@@ -112,6 +112,14 @@ icon = "@mipmap/ic_launcher"
 # pushing every screen's header way down (found on the Pixel 6 emulator).
 theme = "@android:style/Theme.DeviceDefault.NoActionBar"
 
+# Mirror of the Play manifest's configChanges (android/play/.../AndroidManifest.xml):
+# fontScale must not recreate the activity — the app re-reads the font scale
+# itself (util::apply_type_scale) — and predictive back is off so KEYCODE_BACK
+# reaches app.slint's back-scope (the Play build targets SDK 36, where the
+# system otherwise defaults to a callback the app never registers).
+[package.metadata.android.application.activity]
+config_changes = "orientation|keyboardHidden|screenSize|fontScale|uiMode|locale|layoutDirection"
+
 # Dev/emulator release signing uses the standard Android debug keystore
 # (a real Play release would swap in a private upload key). cargo-apk
 # does not expand `$HOME`/`~` in a manifest `path` (confirmed from its

@@ -104,7 +104,7 @@ pub(crate) fn apply_node_health_result(&mut self, w: &AppWindow, r: NodeHealthRe
 }
 
 /// The UI-thread half of the deferred auto-unlock — mirrors
-/// `read_saved_material`'s error handling, but with the result already in
+/// `apply_restore_result`'s error handling, but with the result already in
 /// hand. Moved out of `on_apply_pending_unlock` (U5) — same body, applied
 /// to the worker's result directly (no `Mutex<Option<..>>` wrapper needed
 /// now that [`post`] only ever schedules a job when there IS a result).
