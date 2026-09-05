@@ -36,6 +36,7 @@ mod ui;
 
 pub(crate) use account_picker::*;
 pub(crate) use backup_words::*;
+pub(crate) use private_keys::*;
 pub(crate) use compose::*;
 pub(crate) use confirm::*;
 pub(crate) use contacts::*;
