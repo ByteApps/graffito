@@ -2335,6 +2335,7 @@ pub(crate) fn on_pq_passphrase_changed(&mut self, w: &AppWindow, text: SharedStr
 
 pub(crate) fn on_pq_mlkem_toggled(&mut self, w: &AppWindow, on: bool) {
         self.pq_mlkem_user_off = !on;
+        self.save_config();
         self.refresh_compose(w);
     }
 
