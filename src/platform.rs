@@ -284,11 +284,16 @@ pub fn safe_area_insets(scale: f32) -> (f32, f32) {
             return (top as f32 / scale, bottom as f32 / scale);
         }
         other => {
-            // Logged once: which path the device took matters when a new OS
-            // moves the insets again (debug builds + this diagnostic only).
-            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                println!("cb: window-insets {other:?}");
+            // Logged on every CHANGE of the outcome (not once): which path
+            // the device takes, and when it flips, is the only way to see a
+            // resume/recreation losing the insets from a shipped build.
+            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+            let now = format!("{other:?}");
+            if let Ok(mut last) = LAST.lock() {
+                if *last != now {
+                    println!("cb: window-insets {now}");
+                    *last = now;
+                }
             }
         }
     }
@@ -373,6 +378,12 @@ pub fn os_font_scale() -> f32 {
 /// rewrite changed nothing there); phones = `MOBILE_TYPE_BASE` × the OS
 /// font scale, clamped. `APP_TYPE_SCALE=<f32>` overrides everything (dev /
 /// `--render` previews of the phone layouts at the cap on a Mac).
+/// Backup word grid columns: 3 on desktop, 2 on phones — a 3-column row
+/// does not fit a 411dp phone at the phone type scale.
+pub fn word_columns() -> i32 {
+    if type_scale() > 1.0 { 2 } else { 3 }
+}
+
 pub fn type_scale() -> f32 {
     if let Some(v) = std::env::var("APP_TYPE_SCALE").ok().and_then(|s| s.trim().parse::<f32>().ok()) {
         if v.is_finite() && v > 0.0 {
@@ -382,11 +393,7 @@ pub fn type_scale() -> f32 {
     if !has_insets() {
         return 1.0;
     }
-    let os = os_font_scale();
-    let raw = MOBILE_TYPE_BASE * os;
-    let scale = raw.clamp(TYPE_SCALE_MIN, TYPE_SCALE_MAX);
-    println!("cb: type-scale os={os:.3} raw={raw:.3} applied={scale:.3}");
-    scale
+    (MOBILE_TYPE_BASE * os_font_scale()).clamp(TYPE_SCALE_MIN, TYPE_SCALE_MAX)
 }
 
 /// Read the system clipboard. Needed because Slint's iOS text fields don't
@@ -722,9 +729,9 @@ mod android_jni {
 
     /// context.getResources().getConfiguration().fontScale — the user's
     /// Display > Font size setting as a multiplier (1.0 default; 0.85 …
-    /// 2.0). A font-size change restarts the activity (`fontScale` is not
-    /// in the manifest's configChanges), so reading it once at boot is
-    /// current for the life of the surface.
+    /// 2.0). `fontScale` IS in the manifest's configChanges (no activity
+    /// recreation), so `apply_type_scale` re-reads this from the slow poll
+    /// and the UI follows a font-size change live.
     pub fn font_scale() -> Result<f32, String> {
         with_env_ctx(|env, context| {
             let res = env

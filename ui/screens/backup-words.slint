@@ -4,7 +4,7 @@
 // ---------- 2 · backup ----------
 
 import { Ui, Settings, BackupWords, Change } from "../globals.slint";
-import { Caption, Mono, Card, PrimaryButton, SvgIconButton, Header, CopyButton } from "../components.slint";
+import { Caption, Card, PrimaryButton, SvgIconButton, Header, CopyButton, WordGrid } from "../components.slint";
 import { EditField } from "../edit.slint";
 import { Pal, Metrics } from "../theme.slint";
 import { Switch } from "std-widgets.slint";
@@ -30,19 +30,21 @@ export component BackupWordsScreen inherits VerticalLayout { padding-top: Ui.saf
                 text: "Anyone with these words can spend your funds and read every private note. Write them on paper — never a screenshot.";
             }
         }
+        // The words as real cells (WordGrid, shared with the Private keys
+        // reveal) — never a preformatted monospace string.
         Card {
-            height: words-t.preferred-height + 32px;
-            words-t := Mono {
-                x: 16px;
-                y: 16px;
-                width: parent.width - 32px;
-                text: Ui.backup-words;
-                font-size: 13px * Metrics.type-scale;
-            }
-            CopyButton {
-                x: parent.width - self.width - 8px;
-                y: parent.height - self.height - 8px;
-                clicked => { Ui.copy-text("backup-words", Ui.backup-words); }
+            height: words-col.preferred-height;
+            words-col := VerticalLayout {
+                padding: 14px;
+                padding-bottom: 6px;
+                spacing: 4px;
+                WordGrid { words: Ui.backup-word-list; }
+                HorizontalLayout {
+                    alignment: end;
+                    CopyButton {
+                        clicked => { Ui.copy-text("backup-words", Ui.backup-words); }
+                    }
+                }
             }
         }
         // Honest about provenance: the standard caption says the device

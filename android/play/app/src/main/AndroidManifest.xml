@@ -53,16 +53,30 @@
          with hasCode=false ART loads no dex and the Play-served build crashed
          on launch (ClassNotFoundException com.pairip.application.Application).
          GraffitoApplication is an empty subclass that exists to be wrapped. -->
+    <!-- enableOnBackInvokedCallback=false (2026-09-05): from targetSdk 36
+         the system defaults to predictive back, which delivers back ONLY to a
+         registered OnBackInvokedCallback — the app registers none (logcat:
+         "Setting back callback null"), so a back gesture/button finished the
+         activity from any screen instead of navigating. The legacy path
+         delivers KEYCODE_BACK as a key event, which app.slint's root
+         back-scope turns into nav-back(). The cargo-apk sideload manifest
+         targets SDK 34 and never had this, which is why the emulator pass
+         (API 34) could not see it. -->
     <application
         android:name="com.byteapps.graffito.GraffitoApplication"
         android:label="Graffito"
         android:icon="@mipmap/ic_launcher"
+        android:enableOnBackInvokedCallback="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
         <activity
             android:name="android.app.NativeActivity"
             android:exported="true"
-            android:configChanges="orientation|keyboardHidden|screenSize">
+            android:configChanges="orientation|keyboardHidden|screenSize|fontScale|uiMode|locale|layoutDirection">
+            <!-- fontScale here (2026-09-05): a font-size change must NOT
+                 recreate the activity — that re-runs android_main in the same
+                 process and left the safe-area insets at 0; the app re-reads
+                 Configuration.fontScale itself (util::apply_type_scale). -->
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="graffito" />

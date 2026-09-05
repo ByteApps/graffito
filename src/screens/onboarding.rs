@@ -7,18 +7,19 @@ use crate::*;
 /// [`activate_restored`] so the caller isn't holding a `State` borrow across a
 /// Face ID prompt that can sit there for as long as the user takes.
 ///
-/// **Never call this on the launch path.** Both callers are safe by
-/// construction: the onboarding "Restore saved key" tap (user-initiated) and
-/// the deferred auto-unlock timer (after the first frame).
-pub(crate) fn read_saved_material(window: &AppWindow) -> Option<String> {
-    // `load_secret_gated`, NOT `load_secret_protected`: a synced item has no
-    // ACL to prompt on, so the restore door read the seed silently — most
-    // visibly on a fresh install, where tapping Restore on an unlocked phone
-    // was the whole authentication story (Sal, 2026-07-26). The gated variant
-    // adds an LAContext check for exactly that shape; the local-ACL shape is
-    // unchanged, the OS already prompts. Only the TAP path uses it — the
-    // deferred auto-unlock reads directly, off-thread.
-    match keychain::load_secret_gated(KEYCHAIN_ACCOUNT, "unlock your Graffito identity") {
+/// Outcome handling for the "Restore saved key" door. The gated keychain
+/// read itself runs on a WORKER thread (see the door wiring in `run()`):
+/// it waits for a human at a biometric prompt, and on Android the native
+/// thread it would otherwise block is the one that drains touch input.
+pub(crate) fn apply_restore_result(window: &AppWindow, r: Result<Option<String>, String>) -> Option<String> {
+    // The caller used `load_secret_gated`, NOT `load_secret_protected`: a
+    // synced item has no ACL to prompt on, so the restore door read the seed
+    // silently — most visibly on a fresh install, where tapping Restore on an
+    // unlocked phone was the whole authentication story (Sal, 2026-07-26).
+    // The gated variant adds an LAContext check for exactly that shape; the
+    // local-ACL shape is unchanged, the OS already prompts. Only the TAP path
+    // uses it — the deferred auto-unlock reads directly, off-thread.
+    match r {
         Ok(Some(m)) => Some(m),
         Ok(None) => {
             // Probed present but gone by the time we read it (deleted from
@@ -116,13 +117,12 @@ pub(crate) fn activate_restored(&mut self, window: &AppWindow, material: String,
 /// the two paths can never drift on the iCloud default or the grid format.
 pub(crate) fn stage_new_mnemonic(&mut self, w: &AppWindow, phrase: String) {
     let s = self;
-    let grid = word_grid(&phrase);
     if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
         // TEST ONLY (env-gated): lets the UI e2e complete the backup quiz.
         // Never set outside automation.
         println!("cb-test: words={phrase}");
     }
-    w.global::<Ui>().set_backup_words(grid.into());
+    set_backup_words(w, &phrase);
     s.pending_mnemonic = Some(phrase);
     // New key on an online device → default the iCloud backup ON when iCloud
     // is available (the user can still turn it off).

@@ -1272,8 +1272,25 @@ pub(crate) fn on_reveal_public(&mut self, w: &AppWindow) {
         w.global::<Ui>().set_screen(Screen::PublicKeys);
     }
 
-pub(crate) fn on_reveal_private(&mut self, w: &AppWindow) {
-        match keychain::reveal_secret(KEYCHAIN_ACCOUNT, "reveal your keys") {
+/// Settings → Private keys. The biometric/keychain gate waits for a HUMAN,
+    /// so it runs on a worker thread and the result comes back through `post`
+    /// (the same trampoline as the deferred auto-unlock). On Android the app's
+    /// native thread is ALSO the thread that drains touch input, so blocking
+    /// it on the prompt tripped the 5 s input watchdog ("Graffito isn't
+    /// responding") the moment anything was touched while the prompt was up
+    /// (Sal's Pixel, 2026-09-05). On Apple the system prompt is modal, so this
+    /// only matters for the watchdog — but one shape for all platforms.
+    pub(crate) fn on_reveal_private(&mut self, w: &AppWindow) {
+        w.global::<Ui>().set_status("".into());
+        let weak = w.as_weak();
+        std::thread::spawn(move || {
+            let r = keychain::reveal_secret(KEYCHAIN_ACCOUNT, "reveal your keys");
+            post(&weak, move |w, st| st.apply_reveal_private(w, r));
+        });
+    }
+
+    pub(crate) fn apply_reveal_private(&mut self, w: &AppWindow, r: Result<Option<String>, String>) {
+        match r {
             Ok(Some(secret)) => {
                 match app_core::keyexport::export_formats(&secret, self.network, self.account, self.nb_index)
                 {
@@ -1293,6 +1310,7 @@ pub(crate) fn on_reveal_private(&mut self, w: &AppWindow) {
                         w.global::<PrivateKeys>().set_reveal_private_value("".into());
                         w.global::<PrivateKeys>().set_reveal_private_qr(slint::Image::default());
                         w.global::<PrivateKeys>().set_reveal_words_col1("".into());
+                        w.global::<PrivateKeys>().set_reveal_word_list(slint::ModelRc::new(slint::VecModel::<slint::SharedString>::default()));
                         w.global::<PrivateKeys>().set_reveal_words_col2("".into());
                         w.global::<PrivateKeys>().set_reveal_show_seedqr(false);
                         w.global::<PrivateKeys>().set_reveal_seedqr_image(slint::Image::default());

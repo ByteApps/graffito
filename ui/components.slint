@@ -32,6 +32,41 @@ export component Mono inherits Text {
     wrap: char-wrap;
 }
 
+// Numbered word grid — the backup screen and the Private keys reveal share
+// it. Real cells (right-aligned number + word) laid out by the engine, so
+// alignment never depends on a font (Android has no monospace fallback for
+// "Menlo"). `Metrics.word-columns` per row (3 desktop / 2 phone); rows
+// round up so a 15- or 21-word phrase keeps its tail.
+export component WordGrid inherits VerticalLayout {
+    in property <[string]> words;
+    property <int> cols: Metrics.word-columns;
+    property <int> rows: (words.length + cols - 1) / cols;
+    spacing: 4px * Metrics.type-scale;
+    for r in rows: HorizontalLayout {
+        spacing: 12px;
+        for c in cols: HorizontalLayout {
+            property <int> i: r * cols + c;
+            spacing: 6px;
+            Text {
+                text: i < words.length ? i + 1 + "." : "";
+                width: 26px * Metrics.type-scale;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                color: Pal.muted;
+                font-size: 13px * Metrics.type-scale;
+            }
+            Text {
+                text: i < words.length ? words[i] : "";
+                vertical-alignment: center;
+                color: Pal.text;
+                font-size: 14px * Metrics.type-scale;
+                font-weight: 600;
+                overflow: elide;
+            }
+        }
+    }
+}
+
 export component Card inherits Rectangle {
     background: Pal.card;
     border-radius: 12px;

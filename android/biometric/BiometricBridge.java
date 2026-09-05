@@ -23,9 +23,10 @@ import java.util.concurrent.TimeUnit;
  *
  * The result comes back through a CountDownLatch, so there is no RegisterNatives
  * plumbing: Rust constructs an instance, posts it with runOnUiThread, then
- * blocks in await() on the native thread android_main runs on. Blocking there
- * is safe — it is NOT the Java main thread, so the ANR watchdog is unaffected
- * and the prompt stays responsive.
+ * blocks in await() on a Rust WORKER thread. Never the android_main thread:
+ * that one drains the NativeActivity input queue, and a touch left unconsumed
+ * for 5 s while it sat in await() raised "Graffito isn't responding"
+ * (2026-09-05).
  *
  * DEFAULT IS DENIAL: `result` starts at ERROR, so every path that fails to
  * complete — timeout, an exception before authenticate(), a cancelled signal —

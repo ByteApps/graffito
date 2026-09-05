@@ -62,6 +62,10 @@ export global Ui {
     // "Face ID" / "biometrics") — copy only, the gating is in keychain.rs.
     in property <string> biometric-name: "Touch ID";
     in property <string> backup-words;
+    // The same words as a list — the backup screen lays them out as its own
+    // numbered cells (Metrics.word-columns per row) instead of trusting a
+    // monospace font to align a preformatted string (Android has no Menlo).
+    in property <[string]> backup-word-list;
     in property <string> address;
     in property <[NoteItem]> notes;
     in-out property <string> note-view-id;
@@ -829,6 +833,7 @@ export global PrivateKeys {
     in property <image> reveal-private-qr;        // xprv/hex/wif QR
     in property <string> reveal-words-col1;       // recovery phrase, first half
     in property <string> reveal-words-col2;       // recovery phrase, second half
+    in property <[string]> reveal-word-list;       // the same words as cells (WordGrid)
     in-out property <bool> reveal-show-seedqr;    // recovery: words vs SeedQR toggle
     in property <image> reveal-seedqr-image;
     // Notebook picker for the hex/WIF single-key views only (Recovery

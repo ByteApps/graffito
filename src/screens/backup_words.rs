@@ -14,12 +14,11 @@ pub(crate) fn on_regenerate_words(&mut self, w: &AppWindow) {
         match generate_mnemonic_with_salt(count, &salt) {
             Ok(m) => {
                 let phrase = m.to_string();
-                let grid = word_grid(&phrase);
                 if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
                     println!("cb-test: words={phrase}");
                 }
                 println!("cb: regenerate-words count={count}");
-                w.global::<Ui>().set_backup_words(grid.into());
+                set_backup_words(w, &phrase);
                 self.pending_mnemonic = Some(phrase);
             }
             Err(e) => w.global::<Ui>().set_status(format!("{e}").into()),
@@ -69,8 +68,17 @@ pub(crate) fn on_backup_continue(&mut self, w: &AppWindow) {
 /// 3-column row of 13px Menlo is ~44 chars, which the `Mono` char-wrap
 /// splits mid-word on a 411dp phone even before the type scale. The one
 /// formatter for both create paths (device RNG + dice) and the preview mock.
+/// Push a phrase to the backup screen: the numbered grid string (what Copy
+/// puts on the clipboard, and what the UI suites read) AND the word list the
+/// screen lays out as cells.
+pub(crate) fn set_backup_words(w: &AppWindow, phrase: &str) {
+    w.global::<Ui>().set_backup_words(word_grid(phrase).into());
+    let words: Vec<slint::SharedString> = phrase.split(' ').filter(|s| !s.is_empty()).map(Into::into).collect();
+    w.global::<Ui>().set_backup_word_list(slint::ModelRc::new(slint::VecModel::from(words)));
+}
+
 pub(crate) fn word_grid(phrase: &str) -> String {
-    let cols = if crate::platform::type_scale() > 1.0 { 2 } else { 3 };
+    let cols = crate::platform::word_columns() as usize;
     // Longest BIP-39 word is 8 chars; the wider pad is the desktop look.
     let pad = if cols == 2 { 8 } else { 9 };
     phrase
