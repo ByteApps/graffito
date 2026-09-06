@@ -767,6 +767,20 @@ impl CoreRpcTransport {
     /// on this ONE number rather than needing two.
     fn import_descriptors(&self, requests: serde_json::Value) -> Result<serde_json::Value, Error> {
         IMPORT_DESCRIPTORS_CALLS.fetch_add(1, Ordering::Relaxed);
+        // Diagnostic (stderr, like every `cb:` line): a real rescan is the
+        // most expensive thing this transport ever asks a node for, so
+        // every request names what it imports and from when.
+        if let Some(reqs) = requests.as_array() {
+            for r in reqs {
+                let desc = r.get("desc").and_then(|d| d.as_str()).unwrap_or("?");
+                let head: String = desc.chars().take(40).collect();
+                eprintln!(
+                    "cb: core importdescriptors desc={head}… timestamp={} range={}",
+                    r.get("timestamp").map(|t| t.to_string()).unwrap_or_default(),
+                    r.get("range").map(|t| t.to_string()).unwrap_or_else(|| "-".into())
+                );
+            }
+        }
         match self.call_timeout(
             Some(&Self::watch_wallet()),
             "importdescriptors",
