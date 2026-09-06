@@ -2092,6 +2092,26 @@ const SPENDING_WINDOW_BUFFER: u32 = 50;
 /// Shared entry point. The desktop/iOS bin calls this from `fn main`;
 /// the Android cdylib calls it from `android_main` after Slint's
 /// android backend is initialized.
+/// `APP_NODE` accepts only a loopback host: `127.0.0.1`, `localhost`, or
+/// the IPv6 loopback (`[::1]` / `::1`), after any `scheme+scheme://` and
+/// `user:pass@` prefix, before the optional `:port`. Everything else —
+/// a LAN or tailnet address, a hostname, a malformed URL — is refused.
+pub(crate) fn app_node_is_loopback(url: &str) -> bool {
+    let rest = url.rsplit_once("://").map(|(_, r)| r).unwrap_or(url);
+    let rest = rest.trim_end_matches('/');
+    let authority = match rest.find('@') {
+        Some(at) if !rest[..at].contains('/') => &rest[at + 1..],
+        _ => rest,
+    };
+    let authority = authority.split('/').next().unwrap_or("");
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+    };
+    matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
+}
+
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--spike") {
@@ -2191,15 +2211,25 @@ pub fn run() {
     // Bitcoin node at boot exactly as if typed into Settings — a `bitcoind+
     // http://user:pass@host:port` URL carries the Core RPC creds inline
     // (stored in the session/keychain per the persist switch, never in the
-    // URL). The cross-device e2e relaunches the Mac and the simulator with
-    // an in-memory keychain, so the creds are gone on every start; this
-    // puts them back without driving the Settings screen.
+    // URL), `electrum+tcp://host:port` an Electrum server. The cross-device
+    // e2e relaunches the Mac and the simulator with an in-memory keychain,
+    // so the creds are gone on every start; this puts them back without
+    // driving the Settings screen. **LOOPBACK ONLY** (Sal, 2026-09-06): the
+    // knob can never point a build at a remote host — every harness reaches
+    // the node through an SSH tunnel on 127.0.0.1 anyway, and an
+    // environment variable must not be a way to redirect the app's chain
+    // source elsewhere. Anything else is logged and ignored.
     if let Ok(url) = std::env::var("APP_NODE") {
-        if !url.trim().is_empty() {
-            if url.trim().starts_with("electrum+") {
-                st.borrow_mut().on_set_node_electrum_address(&window, url.trim().into());
+        let url = url.trim();
+        if !url.is_empty() {
+            if app_node_is_loopback(url) {
+                if url.starts_with("electrum+") {
+                    st.borrow_mut().on_set_node_electrum_address(&window, url.into());
+                } else {
+                    st.borrow_mut().on_set_node_address(&window, url.into());
+                }
             } else {
-                st.borrow_mut().on_set_node_address(&window, url.trim().into());
+                println!("cb: app-node refused (not loopback)");
             }
         }
     }

@@ -797,3 +797,31 @@ fn format_electrum_status_warns_on_a_chain_mismatch_and_reports_the_tip() {
     assert!(warn, "{text}");
     assert!(text.contains("different chain") && text.contains("testnet4"), "{text}");
 }
+
+// ---- APP_NODE boot knob is loopback-only (Sal, 2026-09-06) ----
+
+#[test]
+fn app_node_knob_accepts_only_loopback_hosts() {
+    for ok in [
+        "bitcoind+http://user:pass@127.0.0.1:48332",
+        "bitcoind+http://127.0.0.1:18443",
+        "bitcoind+https://localhost:8332",
+        "electrum+tcp://127.0.0.1:40001",
+        "electrum+tcp://[::1]:50001",
+        "http://127.0.0.1:18797/regtest/api",
+        "http://LOCALHOST:8091/node/api/",
+    ] {
+        assert!(app_node_is_loopback(ok), "{ok} must be accepted");
+    }
+    for bad in [
+        "bitcoind+http://user:pass@192.168.1.10:48332",
+        "electrum+tcp://umbrel.local:50001",
+        "https://mempool.space/api",
+        "bitcoind+http://user:pass@100.64.0.1:48332",
+        "http://127.0.0.1.evil.example/api",
+        "electrum+tcp://[fe80::1]:50001",
+        "",
+    ] {
+        assert!(!app_node_is_loopback(bad), "{bad} must be refused");
+    }
+}
