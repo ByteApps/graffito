@@ -183,6 +183,8 @@ export global Ui {
     // Bitcoin Core RPC base — drives the "Bitcoin node · Bitcoin Core" title
     // suffix via `node-backend-label` below.
     in property <bool> node-is-core;
+    // The ACTIVE backend is an Electrum server (`electrum+tcp://…` stored).
+    in property <bool> node-is-electrum;
     // "Bitcoin Core" / "Esplora" — small label next to the picker.
     in property <string> node-backend-label;
     in property <bool> node-health-warn;
@@ -419,7 +421,9 @@ export global Settings {
     // switch/health-caption rows below; NOT the same thing as
     // `node-is-core` (the ACTUALLY ACTIVE backend, which only updates once
     // an address is submitted — see `update_node_backend_ui` in lib.rs).
-    out property <bool> node-core-row-selected: Ui.node-index == Ui.node-options.length - 2;
+    // Row order (fill_node): <presets…>, "Bitcoin Core", "Electrum server", "Custom…".
+    out property <bool> node-core-row-selected: Ui.node-index == Ui.node-options.length - 3;
+    out property <bool> node-electrum-row-selected: Ui.node-index == Ui.node-options.length - 2;
     // The three URL fields below (Core address, custom Esplora URL, custom
     // explorer URL) used to submit ONLY on `accepted` — Return, or Done on
     // the mobile keyboard. Typing an address and then tapping somewhere
@@ -485,6 +489,8 @@ export global Settings {
     // URL, normalized+stored as `bitcoind+http(s)://host:port` in Rust —
     // the prefix never appears here.
     callback set-node-address(string);
+    // "Electrum server" row: host[:port] → electrum+tcp://host:port (PLAN-graffito-electrum.md).
+    callback set-node-electrum-address(string);
     // Save Bitcoin Core RPC creds (user, pass) to the Keychain for the
     // active network's configured node — never written to config.json.
     callback set-node-core-creds(string, string);

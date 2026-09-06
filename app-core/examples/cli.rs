@@ -1327,8 +1327,16 @@ fn main() {
             .expect("<base-url> parse");
             let status = match transport {
                 app_core::chain::AnyTransport::Core(t) => t.preflight().expect("preflight"),
+                app_core::chain::AnyTransport::Electrum(t) => {
+                    let st = t.server_status().expect("server_status");
+                    println!(
+                        "cli: electrum server={} protocol={} tip={} genesis={}",
+                        st.server_version, st.protocol, st.tip_height, st.genesis_hash
+                    );
+                    return;
+                }
                 app_core::chain::AnyTransport::Esplora(_) => {
-                    panic!("preflight only supported for bitcoind+http(s):// bases")
+                    panic!("preflight only supported for bitcoind+http(s):// and electrum+tcp:// bases")
                 }
             };
             let _ = net;

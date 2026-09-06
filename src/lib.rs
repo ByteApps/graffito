@@ -2196,7 +2196,11 @@ pub fn run() {
     // puts them back without driving the Settings screen.
     if let Ok(url) = std::env::var("APP_NODE") {
         if !url.trim().is_empty() {
-            st.borrow_mut().on_set_node_address(&window, url.trim().into());
+            if url.trim().starts_with("electrum+") {
+                st.borrow_mut().on_set_node_electrum_address(&window, url.trim().into());
+            } else {
+                st.borrow_mut().on_set_node_address(&window, url.trim().into());
+            }
         }
     }
 
@@ -3054,6 +3058,7 @@ pub fn run() {
     // screen always matches what got stored; on a malformed input nothing
     // is written and the field is left as typed so the user can fix it.
     cb!(Settings, on_set_node_address, |w, s, t: SharedString| { s.on_set_node_address(&w, t) });
+    cb!(Settings, on_set_node_electrum_address, |w, s, t: SharedString| { s.on_set_node_electrum_address(&w, t) });
 
     cb!(Settings, on_set_node_custom, |w, s, t: SharedString| { s.on_set_node_custom(&w, t) });
 

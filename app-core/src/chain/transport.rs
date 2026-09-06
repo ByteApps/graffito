@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use crate::Error;
 
 use super::core_rpc::CoreRpcTransport;
+use super::electrum::ElectrumTransport;
 
 pub trait Transport {
     fn get_text(&self, path: &str) -> Result<String, Error>;
@@ -266,14 +267,19 @@ pub enum AnyTransport {
     Esplora(HttpTransport),
     /// `bitcoind+http(s)://host[:port]` — Bitcoin Core JSON-RPC.
     Core(CoreRpcTransport),
+    /// `electrum+tcp://host:port` — Electrum protocol
+    /// (`PLAN-graffito-electrum.md`). `electrum+ssl://` is a recognized
+    /// prefix too, but [`AnyTransport::new`] refuses it outright (a
+    /// follow-up unit) rather than ever constructing this variant for it.
+    Electrum(ElectrumTransport),
 }
 
 impl AnyTransport {
     /// Parses `base` and picks a backend. Anything that does not start
-    /// with `bitcoind+` is handed to [`HttpTransport::new`] EXACTLY as
-    /// every call site already did — this refactor must not change one
-    /// byte of the Esplora path's behavior (request paths, pacing, 429
-    /// retry, error classification all untouched).
+    /// with `bitcoind+` or `electrum+` is handed to [`HttpTransport::new`]
+    /// EXACTLY as every call site already did — this refactor must not
+    /// change one byte of the Esplora path's behavior (request paths,
+    /// pacing, 429 retry, error classification all untouched).
     ///
     /// `creds` is an explicit parameter (not read from anywhere) so
     /// `app-core` stays platform-agnostic — a later unit sources it from
@@ -282,7 +288,21 @@ impl AnyTransport {
     /// carries inline `user:pass@` userinfo (`bitcoind+http://user:pass@
     /// host:8332`, needed so the CLI can address a node with no Keychain
     /// at all), the explicit `creds` parameter wins if both are present.
+    /// `creds` is meaningless for `electrum+`/plain Esplora bases and is
+    /// simply ignored for them (Electrum needs no credentials at all —
+    /// electrs already indexes every scripthash).
     pub fn new(base: &str, creds: Option<(String, String)>) -> Result<Self, Error> {
+        if base.starts_with("electrum+ssl://") {
+            // Out of scope for this unit (TLS + cert pinning, Sparrow-
+            // style) — refused with a clear error rather than silently
+            // falling through to plain TCP or to Esplora.
+            return Err(Error::Http(
+                "electrum+ssl is not supported yet — use electrum+tcp:// or a Bitcoin Core / Esplora backend".into(),
+            ));
+        }
+        if let Some(rest) = base.strip_prefix("electrum+") {
+            return Ok(AnyTransport::Electrum(ElectrumTransport::new(rest)?));
+        }
         match base.strip_prefix("bitcoind+") {
             Some(rest) => Ok(AnyTransport::Core(CoreRpcTransport::new(rest, creds)?)),
             None => Ok(AnyTransport::Esplora(HttpTransport::new(base))),
@@ -295,21 +315,25 @@ impl Transport for AnyTransport {
         match self {
             AnyTransport::Esplora(t) => t.get_text(path),
             AnyTransport::Core(t) => t.get_text(path),
+            AnyTransport::Electrum(t) => t.get_text(path),
         }
     }
     fn post_text(&self, path: &str, body: String) -> Result<String, Error> {
         match self {
             AnyTransport::Esplora(t) => t.post_text(path, body),
             AnyTransport::Core(t) => t.post_text(path, body),
+            AnyTransport::Electrum(t) => t.post_text(path, body),
         }
     }
 }
 
-/// "Bitcoin Core" vs "Esplora" — small label for the Settings UI (a later
-/// unit) to name the active backend from its stored node URL.
+/// "Bitcoin Core" / "Electrum" / "Esplora" — small label for the Settings
+/// UI to name the active backend from its stored node URL.
 pub fn node_backend_label(base: &str) -> &'static str {
     if base.starts_with("bitcoind+") {
         "Bitcoin Core"
+    } else if base.starts_with("electrum+") {
+        "Electrum"
     } else {
         "Esplora"
     }
@@ -425,6 +449,7 @@ mod tests {
         match AnyTransport::new(base, None).unwrap() {
             AnyTransport::Esplora(t) => assert_eq!(t.base, base),
             AnyTransport::Core(_) => panic!("expected Esplora"),
+            AnyTransport::Electrum(_) => panic!("expected Esplora"),
         }
     }
 
@@ -433,5 +458,41 @@ mod tests {
         assert_eq!(node_backend_label("https://mempool.space/api"), "Esplora");
         assert_eq!(node_backend_label("http://127.0.0.1:18797/regtest/api"), "Esplora");
         assert_eq!(node_backend_label("bitcoind+http://127.0.0.1:8332"), "Bitcoin Core");
+        assert_eq!(node_backend_label("electrum+tcp://127.0.0.1:50001"), "Electrum");
+    }
+
+    // ---- AnyTransport / ElectrumTransport (PLAN-graffito-electrum.md) --
+
+    #[test]
+    fn any_transport_picks_electrum_for_electrum_tcp_scheme() {
+        let t = AnyTransport::new("electrum+tcp://127.0.0.1:50001", None).unwrap();
+        assert!(matches!(t, AnyTransport::Electrum(_)));
+    }
+
+    #[test]
+    fn any_transport_rejects_electrum_ssl_with_a_clear_error() {
+        // `AnyTransport` carries no `Debug` impl (matches `CoreRpcTransport`'s
+        // own hand-written-Debug-only stance elsewhere), so this checks the
+        // error via `if let` rather than `.unwrap_err()`/`{:?}`.
+        match AnyTransport::new("electrum+ssl://127.0.0.1:50002", None) {
+            Err(Error::Http(msg)) => assert!(
+                msg.contains("electrum+ssl") && msg.to_lowercase().contains("not supported"),
+                "expected a clear electrum+ssl-unsupported message, got {msg}"
+            ),
+            Err(_) => panic!("expected Error::Http"),
+            Ok(_) => panic!("electrum+ssl:// must be refused, not constructed"),
+        }
+    }
+
+    #[test]
+    fn any_transport_electrum_ignores_creds_and_still_constructs() {
+        // Electrum needs no credentials at all — passing some must not
+        // error or otherwise change construction.
+        let t = AnyTransport::new(
+            "electrum+tcp://127.0.0.1:50001",
+            Some(("ignored".to_string(), "ignored".to_string())),
+        )
+        .unwrap();
+        assert!(matches!(t, AnyTransport::Electrum(_)));
     }
 }

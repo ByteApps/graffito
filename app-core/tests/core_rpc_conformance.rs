@@ -1168,7 +1168,7 @@ fn core_rpc_conformance() {
             // touched it), so scanning info must be reportable, not absent.
             assert!(status.wallet_scanning.is_some(), "watch wallet exists — scanning info must be Some");
         }
-        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+        AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
 
     // `fx`'s `_sender_guard` sweeps the throwaway signing wallet back to
@@ -1222,7 +1222,7 @@ fn core_rpc_conformance_ranged_descriptors() {
                 },
             ])
             .expect("configure ranged descriptors"),
-        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+        AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
 
     let client = ChainClient::new(transport, fx.network);
@@ -1362,7 +1362,7 @@ fn core_rpc_range_widening_finds_address_beyond_initial_range() {
                 range_end: 900,
             }])
             .expect("configure ranged descriptor"),
-        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+        AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
 
     let range_before = find_receive_chain_end(&watch_wallet_descriptors(&node))
@@ -1640,7 +1640,7 @@ fn core_rpc_preflight_reports_pruned_node() {
     let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
     let status = match &transport {
         AnyTransport::Core(core) => core.preflight().expect("preflight"),
-        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+        AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport for a bitcoind+ base"),
     };
     assert!(status.pruned, "a getblockchaininfo.pruned=true response must report pruned=true");
     assert_eq!(status.prune_height, Some(550), "pruneheight must be threaded through when pruned");
@@ -1670,7 +1670,7 @@ fn core_rpc_preflight_reports_missing_txindex() {
     let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
     let status = match &transport {
         AnyTransport::Core(core) => core.preflight().expect("preflight"),
-        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+        AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport for a bitcoind+ base"),
     };
     assert!(!status.txindex, "an empty getindexinfo response (no txindex key) must report txindex=false");
     assert!(!status.pruned, "this synthetic node was never pruned");
@@ -1715,7 +1715,7 @@ fn core_rpc_ranged_import_sends_the_caller_birthday_not_zero() {
         AnyTransport::Core(core) => core
             .watch_descriptors(vec![WatchDescriptor { descriptor, network, timestamp: birthday, range_end: 2 }])
             .expect("configure ranged descriptor"),
-        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+        AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
 
     let sent = mock.calls_for("importdescriptors");
@@ -2087,7 +2087,7 @@ fn core_rpc_established_absence_caches_node_status_across_lookups() {
             1,
             "5 lookups must share ONE cached node-status probe, not re-probe per call"
         ),
-        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+        AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
 
     // `_sender_guard` sweeps `sender`'s balance back to testwallet on
@@ -2395,7 +2395,7 @@ fn core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero() {
         AnyTransport::Core(core) => core
             .watch_descriptors(vec![WatchDescriptor { descriptor, network, timestamp: birthday, range_end: 2 }])
             .expect("configure ranged descriptor"),
-        AnyTransport::Esplora(_) => panic!("expected a Core transport for a bitcoind+ base"),
+        AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport for a bitcoind+ base"),
     }
 
     let timestamps = watch_wallet_descriptor_timestamps(&node);

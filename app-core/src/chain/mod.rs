@@ -29,7 +29,9 @@
 
 mod client;
 mod core_rpc;
+mod electrum;
 mod esplora;
+mod esplora_shape;
 mod transport;
 
 pub use client::{
@@ -42,5 +44,8 @@ pub use core_rpc::{
     core_rpc_tx_json_cache_max_entries, identity_watch_descriptors, CoreRpcTransport, NodeStatus,
     WatchDescriptor,
 };
+// PLAN-graffito-electrum.md: the Electrum protocol backend, plus the pure
+// genesis-hash comparison the app supplies its own expected hash to.
+pub use electrum::{network_matches_genesis, ElectrumStatus, ElectrumTransport};
 pub use esplora::{AddrStats, EsploraOut, EsploraStatus, EsploraTx, EsploraUtxo, EsploraVin};
 pub use transport::{node_backend_label, AnyTransport, HttpTransport, Transport, TxLookupStatus};

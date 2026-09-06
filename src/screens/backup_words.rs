@@ -37,14 +37,7 @@ pub(crate) fn on_backup_continue(&mut self, w: &AppWindow) {
         if getrandom_fill(&mut idx).is_err() {
             println!("cb: backup-quiz entropy err");
         }
-        let mut picks: Vec<usize> = idx.iter().map(|b| (*b as usize) % count).collect();
-        picks.sort();
-        picks.dedup();
-        while picks.len() < 3 {
-            picks.push((picks.last().copied().unwrap_or(0) + 3) % count);
-            picks.sort();
-            picks.dedup();
-        }
+        let picks = quiz_picks(idx, count);
         if std::env::var("APP_TEST_SHOW_WORDS").is_ok() {
             println!("cb-test: quiz={} {} {}", picks[0] + 1, picks[1] + 1, picks[2] + 1);
         }
@@ -61,6 +54,32 @@ pub(crate) fn on_backup_continue(&mut self, w: &AppWindow) {
         w.global::<Quiz>().set_quiz_answer("".into());
         w.global::<Ui>().set_screen(Screen::Quiz);
     }
+}
+
+/// Three DISTINCT, ascending word positions for the backup quiz from three
+/// random bytes. Collisions are resolved by walking forward from the last
+/// pick until a free position turns up — the previous loop pushed
+/// `(last + 3) % count` unconditionally and dedup'd, which never terminates
+/// once that slot is already taken (e.g. picks `[0, 9]` on a 12-word seed
+/// keep producing 0): the app's UI thread hung in the quiz step, caught
+/// 2026-09-06 when `cargo test --lib` spun for 30 minutes in
+/// `create_seed_backup_quiz_lands_on_notebook_list_named_notebook_1`.
+/// Total function for every `count >= 3`.
+pub(crate) fn quiz_picks(idx: [u8; 3], count: usize) -> Vec<usize> {
+    let count = count.max(3);
+    let mut picks: Vec<usize> = idx.iter().map(|b| (*b as usize) % count).collect();
+    picks.sort_unstable();
+    picks.dedup();
+    while picks.len() < 3 {
+        let mut next = (picks.last().copied().unwrap_or(0) + 3) % count;
+        while picks.contains(&next) {
+            next = (next + 1) % count;
+        }
+        picks.push(next);
+        picks.sort_unstable();
+        picks.dedup();
+    }
+    picks
 }
 
 /// The numbered backup-word grid shown on the write-it-down screen. Three
@@ -88,4 +107,42 @@ pub(crate) fn word_grid(phrase: &str) -> String {
             format!("{:>2}. {:<pad$}{}", i + 1, wd, if i % cols == cols - 1 { "\n" } else { " " }, pad = pad)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod quiz_pick_tests {
+    use super::quiz_picks;
+
+    /// The exact shape that hung the old loop: two picks where `last + 3`
+    /// wraps onto an existing one.
+    #[test]
+    fn quiz_picks_terminates_on_the_wrapping_collision() {
+        assert_eq!(quiz_picks([9, 9, 9], 12), vec![0, 1, 9]);
+        assert_eq!(quiz_picks([0, 9, 9], 12), vec![0, 1, 9]);
+    }
+
+    /// Exhaustive over every residue triple for the three seed lengths:
+    /// always three distinct ascending positions inside the phrase.
+    #[test]
+    fn quiz_picks_are_three_distinct_in_range_positions_for_every_input() {
+        for count in [12usize, 18, 24] {
+            for a in 0..count {
+                for b in 0..count {
+                    for c in 0..count {
+                        let p = quiz_picks([a as u8, b as u8, c as u8], count);
+                        assert_eq!(p.len(), 3, "{count} {a} {b} {c}: {p:?}");
+                        assert!(p[0] < p[1] && p[1] < p[2], "{count} {a} {b} {c}: {p:?}");
+                        assert!(p[2] < count, "{count} {a} {b} {c}: {p:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Distinct random bytes are used as-is (the common case is untouched).
+    #[test]
+    fn quiz_picks_keeps_three_distinct_draws() {
+        assert_eq!(quiz_picks([5, 2, 11], 12), vec![2, 5, 11]);
+        assert_eq!(quiz_picks([200, 13, 77], 24), vec![5, 8, 13]);
+    }
 }

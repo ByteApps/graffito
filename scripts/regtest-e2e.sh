@@ -12,7 +12,7 @@
 # script never spawns bitcoind itself, in any mode. Two independent
 # choices, orthogonal to each other:
 #
-#   BACKEND  --esplora (default) | --core-rpc
+#   BACKEND  --esplora (default) | --core-rpc | --electrum
 #            HOW THE APP talks to the chain. Esplora goes through
 #            docs/companion/server.py, a mempool.space-
 #            shaped shim pointed at the real node (`AnyTransport::Esplora`
@@ -162,10 +162,11 @@ DRY_RUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --core-rpc) BACKEND="core-rpc"; shift ;;
+        --electrum) BACKEND="electrum"; shift ;;   # a personal electrs (PLAN-graffito-electrum.md); port from CN_ELECTRUM_PORT
         --network) NETWORK="${2:?--network requires regtest|testnet4}"; shift 2 ;;
         --network=*) NETWORK="${1#--network=}"; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
-        *) fail "unknown arg $1: usage: $0 [--core-rpc] [--network regtest|testnet4] [--dry-run]" ;;
+        *) fail "unknown arg $1: usage: $0 [--core-rpc|--electrum] [--network regtest|testnet4] [--dry-run]" ;;
     esac
 done
 case "$NETWORK" in
@@ -498,6 +499,18 @@ if [[ "$BACKEND" == esplora ]]; then
     python3 -c "import json,sys; d=json.load(sys.stdin); assert d.get('network')=='$NETWORK', d" <<<"$HEALTH" \
         || fail "server health reports an unexpected network: $HEALTH"
     BASE="http://127.0.0.1:$PORT/node/api"
+elif [[ "$BACKEND" == electrum ]]; then
+    # Electrum backend: the app speaks the Electrum protocol to an electrs
+    # indexing this network — through the same tunnel host as the node (the
+    # Pi's testnet4 electrs listens on 40001, regtest on 60401 by electrs's
+    # defaults; override with CN_ELECTRUM_PORT). Funding/settle/confirm still
+    # use the node's RPC contract; only the APP's chain source changes.
+    case "$NETWORK" in testnet4) _eport=40001 ;; *) _eport=60401 ;; esac
+    ELECTRUM_PORT="${CN_ELECTRUM_PORT:-$_eport}"
+    echo "== Electrum backend: app talks to electrs at $CN_NODE_HOST:$ELECTRUM_PORT, no shim =="
+    nc -z -G 3 -w 3 "$CN_NODE_HOST" "$ELECTRUM_PORT" >/dev/null 2>&1 \
+        || fail "no Electrum server at $CN_NODE_HOST:$ELECTRUM_PORT (tunnel forwarding that port up? electrs-$NETWORK running?)"
+    BASE="electrum+tcp://$CN_NODE_HOST:$ELECTRUM_PORT"
 else
     echo "== Core RPC backend: app talks directly to the $NETWORK node, no shim =="
     BASE="bitcoind+http://$CN_NODE_HOST:$CN_NODE_PORT"
@@ -509,7 +522,7 @@ fi
 # reported as a warning and never gating — mirrors testnet4-live.sh's
 # preflight step. Also the app-level confirmation that the wallet this
 # script is about to touch isn't ALREADY mid-rescan from another consumer.
-if [[ "$BACKEND" == core-rpc ]]; then
+if [[ "$BACKEND" == core-rpc || "$BACKEND" == electrum ]]; then
     PREFLIGHT_OUT="$("$APP" preflight "$BASE" "$NETWORK" 2>&1)" || echo "preflight call failed (non-fatal): $PREFLIGHT_OUT" >&2
     echo "$PREFLIGHT_OUT"
 fi

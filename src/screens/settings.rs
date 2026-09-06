@@ -20,13 +20,21 @@ pub(crate) fn fill_node(
 ) -> (Vec<SharedString>, i32, SharedString, SharedString) {
     let mut opts: Vec<SharedString> = presets.iter().map(|(l, _)| (*l).into()).collect();
     let core_row = presets.len();
-    let custom_row = presets.len() + 1;
+    let electrum_row = presets.len() + 1;
+    let custom_row = presets.len() + 2;
     opts.push("Bitcoin Core".into());
+    // "Electrum server" (2026-09-06, PLAN-graffito-electrum.md): a personal
+    // electrs, the server Sparrow uses — no credentials, no watch wallet.
+    // Shares the address field with the Core row (only one is visible).
+    opts.push("Electrum server".into());
     opts.push("Custom…".into());
 
     if let Some(u) = cur {
         if u.starts_with("bitcoind+") {
             return (opts, core_row as i32, "".into(), display_core_url(u).into());
+        }
+        if u.starts_with("electrum+") {
+            return (opts, electrum_row as i32, "".into(), display_electrum_url(u).into());
         }
     }
     let idx = presets.iter().position(|(_, u)| match (u, cur) {
@@ -50,6 +58,108 @@ pub(crate) fn core_rpc_default_port(network: Network) -> u16 {
         Network::Testnet4 => 48332,
         Network::Signet => 38332,
         Network::Regtest => 18443,
+    }
+}
+
+/// Default Electrum TCP port per network — electrs's own defaults
+/// (`--network` → `electrum_rpc_addr`): mainnet 50001, testnet4 40001,
+/// signet 60601, regtest 60401.
+pub(crate) fn electrum_default_port(network: Network) -> u16 {
+    match network {
+        Network::Mainnet => 50001,
+        Network::Testnet4 => 40001,
+        Network::Signet => 60601,
+        Network::Regtest => 60401,
+    }
+}
+
+/// Genesis block hash per network — what an Electrum server's
+/// `server.features.genesis_hash` must equal for it to be indexing the
+/// chain this identity lives on (a mainnet electrs under a testnet4
+/// identity would otherwise scan an empty history and look "synced").
+pub(crate) fn expected_genesis_hex(network: Network) -> &'static str {
+    match network {
+        Network::Mainnet => "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        Network::Testnet4 => "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
+        Network::Signet => "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
+        Network::Regtest => "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+    }
+}
+
+/// Normalize what a person types into the Settings "Electrum server"
+/// field into the stored `electrum+tcp://host:port` form
+/// (PLAN-graffito-electrum.md — the prefix is a STORAGE format like
+/// `bitcoind+`, never shown). Accepted: `host`, `host:port`,
+/// `tcp://host[:port]`, a pasted `electrum+tcp://…`; `ssl://` and
+/// `electrum+ssl://` are refused with a clear message until certificate
+/// pinning ships. No userinfo: Electrum servers have no credentials.
+pub(crate) fn compose_electrum_url(input: &str, network: Network) -> Result<String, String> {
+    let raw = input.trim();
+    let raw = raw.strip_prefix("electrum+").unwrap_or(raw);
+    if raw.is_empty() {
+        return Err("enter a host, e.g. 192.168.1.10 or umbrel.local:50001".to_string());
+    }
+    let rest = if let Some(r) = raw.strip_prefix("tcp://") {
+        r
+    } else if raw.starts_with("ssl://") || raw.starts_with("tls://") {
+        return Err("SSL Electrum servers aren't supported yet — use the plain TCP port (50001)".to_string());
+    } else if let Some((sch, _)) = raw.split_once("://") {
+        return Err(format!("unsupported scheme {sch:?} — enter host:port"));
+    } else {
+        raw
+    };
+    let authority = rest.trim_end_matches('/');
+    if authority.contains('@') {
+        return Err("an Electrum server takes no username or password".to_string());
+    }
+    let (host, port) = parse_host_port(authority, "enter a host, e.g. 192.168.1.10 or umbrel.local:50001")?;
+    let port = port.unwrap_or_else(|| electrum_default_port(network));
+    Ok(format!("electrum+tcp://{host}:{port}"))
+}
+
+/// The inverse of [`compose_electrum_url`] for display: bare `host:port`.
+pub(crate) fn display_electrum_url(base: &str) -> String {
+    let rest = base.strip_prefix("electrum+").unwrap_or(base);
+    rest.strip_prefix("tcp://").unwrap_or(rest).trim_end_matches('/').to_string()
+}
+
+/// `host[:port]` with a bracketed-IPv6 literal allowed — the authority
+/// grammar `compose_core_url` and `compose_electrum_url` share.
+fn parse_host_port(authority: &str, empty_msg: &str) -> Result<(String, Option<u16>), String> {
+    if authority.is_empty() {
+        return Err(empty_msg.to_string());
+    }
+    if authority.contains('/') {
+        return Err("node address must be host[:port] only, no path".to_string());
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return Err("unterminated IPv6 literal — missing ']'".to_string());
+        };
+        let (h, after) = rest.split_at(end);
+        if h.is_empty() {
+            return Err(empty_msg.to_string());
+        }
+        let after = &after[1..];
+        let port = if after.is_empty() {
+            None
+        } else if let Some(p) = after.strip_prefix(':') {
+            if p.is_empty() {
+                return Err("empty port after ':'".to_string());
+            }
+            Some(p.parse::<u16>().map_err(|_| format!("invalid port {p:?}"))?)
+        } else {
+            return Err(format!("unexpected text after IPv6 literal: {after:?}"));
+        };
+        return Ok((format!("[{h}]"), port));
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() => {
+            let port = p.parse::<u16>().map_err(|_| format!("invalid port {p:?}"))?;
+            Ok((h.to_string(), Some(port)))
+        }
+        Some(("", _)) => Err(empty_msg.to_string()),
+        _ => Ok((authority.to_string(), None)),
     }
 }
 
@@ -175,6 +285,29 @@ pub(crate) fn display_core_url(base: &str) -> String {
     } else {
         rest.to_string()
     }
+}
+
+/// Render an Electrum server's `server.version`/`server.features`/tip as
+/// the node-health line — a chain mismatch is a WARNING that names both
+/// sides, since a mainnet server under a testnet4 identity would otherwise
+/// look synced with nothing in it.
+pub(crate) fn format_electrum_status(
+    status: &app_core::chain::ElectrumStatus,
+    network: Network,
+    expected_genesis: &str,
+) -> (String, bool) {
+    if !app_core::chain::network_matches_genesis(&status.genesis_hash, expected_genesis) {
+        return (
+            format!(
+                "{} indexes a different chain (genesis {}…) — this identity is on {}",
+                status.server_version,
+                &status.genesis_hash[..8.min(status.genesis_hash.len())],
+                network.as_str()
+            ),
+            true,
+        );
+    }
+    (format!("{} · protocol {} · tip {}", status.server_version, status.protocol, commas(status.tip_height)), false)
 }
 
 /// Render one [`app_core::chain::NodeStatus`] preflight (plan §2.2/§2.3) as
@@ -528,6 +661,7 @@ pub(crate) fn update_node_backend_ui(&self, w: &AppWindow) {
     let base = st.base_url();
     let is_core = base.as_deref().is_some_and(|b| b.starts_with("bitcoind+"));
     w.global::<Ui>().set_node_is_core(is_core);
+    w.global::<Ui>().set_node_is_electrum(base.as_deref().is_some_and(|b| b.starts_with("electrum+")));
     w.global::<Ui>().set_node_backend_label(base.as_deref().map(node_backend_label).unwrap_or("Esplora").into());
     // "Save credentials" switch (plan §2.4 / U10): a device-level per-network
     // preference, so it's meaningful even for an Esplora base (set it before
@@ -607,10 +741,34 @@ pub(crate) fn refresh_node_health(&mut self, w: &AppWindow) {
     st.flush_core_rpc_migration();
     st.update_node_backend_ui(w);
     let Some(base) = st.base_url() else { return };
+    let network = st.network;
+    if base.starts_with("electrum+") {
+        // No credentials to wait for: dial the server, read its version and
+        // tip, and refuse a server indexing another chain (genesis check).
+        w.global::<Settings>().set_node_health_text("checking server…".into());
+        w.global::<Ui>().set_node_health_warn(false);
+        let weak = w.as_weak();
+        let expected = expected_genesis_hex(network);
+        std::thread::spawn(move || {
+            let _net_guard = NetOpGuard::new(weak.clone());
+            let (text, warn) = match open_client(&base, network, None) {
+                Ok(client) => match &client.transport {
+                    AnyTransport::Electrum(t) => match t.server_status() {
+                        Ok(status) => format_electrum_status(&status, network, expected),
+                        Err(e) => (format!("couldn't reach the server — {e}"), true),
+                    },
+                    _ => (String::new(), false),
+                },
+                Err(e) => (format!("couldn't reach the server — {e}"), true),
+            };
+            let r = NodeHealthResult { network, base: base.clone(), text: text.into(), warn };
+            post(&weak, move |w, st| st.apply_node_health_result(w, r));
+        });
+        return;
+    }
     if !base.starts_with("bitcoind+") {
         return;
     }
-    let network = st.network;
     // Honest UI when credentials are missing (plan §2.4 / U10 design point
     // 5): with nothing to authenticate with, don't dial the node and let it
     // 401 into a generic "couldn't reach the node" line — say so directly.
@@ -635,7 +793,7 @@ pub(crate) fn refresh_node_health(&mut self, w: &AppWindow) {
                 },
                 // Unreachable: `base` was checked above to start with
                 // "bitcoind+", which `AnyTransport::new` always maps to Core.
-                AnyTransport::Esplora(_) => (String::new(), false),
+                AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => (String::new(), false),
             },
             Err(e) => (format!("couldn't reach the node — {e}"), true),
         };
@@ -1021,6 +1179,8 @@ pub(crate) fn on_set_node_preset(&mut self, w: &AppWindow, i: i32) {
             println!("cb: set-node-preset {}", presets[i].0);
         } else if i == presets.len() {
             println!("cb: set-node-preset core");
+        } else if i == presets.len() + 1 {
+            println!("cb: set-node-preset electrum");
         } else {
             println!("cb: set-node-preset custom");
         }
@@ -1064,6 +1224,27 @@ pub(crate) fn on_set_node_address(&mut self, w: &AppWindow, t: SharedString) {
             Err(msg) => {
                 println!("cb: set-node-address err={msg}");
                 w.global::<Ui>().set_status(format!("Bitcoin node address: {msg}").into());
+            }
+        }
+        self.refresh_node_health(w);
+    }
+
+/// The "Electrum server" row's field (PLAN-graffito-electrum.md): store
+/// `electrum+tcp://host:port`, redisplay it canonically, then check the
+/// server (version, tip, and that it indexes THIS network's chain).
+pub(crate) fn on_set_node_electrum_address(&mut self, w: &AppWindow, t: SharedString) {
+        let net = self.network.as_str().to_string();
+        match compose_electrum_url(t.trim(), self.network) {
+            Ok(v) => {
+                self.node_urls.insert(net, v.clone());
+                self.save_config();
+                println!("cb: set-node-address {v}");
+                w.global::<Ui>().set_node_address_text(display_electrum_url(&v).into());
+                w.global::<Ui>().set_status("".into());
+            }
+            Err(msg) => {
+                println!("cb: set-node-address err={msg}");
+                w.global::<Ui>().set_status(format!("Electrum server: {msg}").into());
             }
         }
         self.refresh_node_health(w);

@@ -248,7 +248,48 @@ pub(crate) fn open_client(
     network: Network,
     creds: Option<(String, String)>,
 ) -> Result<ChainClient<AnyTransport>, app_core::Error> {
-    Ok(ChainClient::new(AnyTransport::new(base, creds)?, network))
+    let transport = AnyTransport::new(base, creds)?;
+    if let AnyTransport::Electrum(t) = &transport {
+        verify_electrum_chain(t, base, network)?;
+    }
+    Ok(ChainClient::new(transport, network))
+}
+
+/// An Electrum server indexing ANOTHER chain must never serve a scan
+/// (PLAN-graffito-electrum.md, found live 2026-09-06): a testnet4
+/// address hashes to a scripthash the mainnet server simply has no history
+/// for, so the wallet reads as empty AND the mainnet tip gets stamped into
+/// every new transaction's locktime (non-final on testnet4 for years).
+/// Core RPC has no such hazard — a wrong-network address is an RPC error
+/// there. Verified ONCE per (base, network) per process via
+/// `server.features.genesis_hash` (three small calls), then cached; a
+/// transport failure during the check is surfaced as-is (retryable),
+/// never cached as a verdict.
+fn verify_electrum_chain(
+    t: &app_core::chain::ElectrumTransport,
+    base: &str,
+    network: Network,
+) -> Result<(), app_core::Error> {
+    static VERIFIED: std::sync::Mutex<Option<std::collections::HashMap<(String, String), bool>>> =
+        std::sync::Mutex::new(None);
+    let key = (base.to_string(), network.as_str().to_string());
+    if let Some(ok) = VERIFIED.lock().expect("electrum-verify mutex").get_or_insert_with(Default::default).get(&key) {
+        return if *ok { Ok(()) } else { Err(wrong_chain_err(network)) };
+    }
+    let status = t.server_status()?;
+    let ok = app_core::chain::network_matches_genesis(
+        &status.genesis_hash,
+        expected_genesis_hex(network),
+    );
+    VERIFIED.lock().expect("electrum-verify mutex").get_or_insert_with(Default::default).insert(key, ok);
+    if ok { Ok(()) } else { Err(wrong_chain_err(network)) }
+}
+
+fn wrong_chain_err(network: Network) -> app_core::Error {
+    app_core::Error::Http(format!(
+        "Electrum server indexes a different chain — this identity is on {}",
+        network.as_str()
+    ))
 }
 
 /// [`open_client`] plus Bitcoin Core ranged-watch configuration (U7 —

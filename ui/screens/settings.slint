@@ -142,8 +142,8 @@ export component SettingsScreen inherits VerticalLayout { padding-top: Ui.safe-t
             Caption { text: Settings.locktime-effective; }
         }
         SettingsCard {
-            title: "Bitcoin node" + (Ui.node-is-core ? " · " + Ui.node-backend-label : "");
-            subtitle: "Scans and broadcasts go through this server — it learns your address and IP. Pick a provider, point at your own Esplora/mempool-compatible node, or choose Bitcoin Core and enter your node's address (RPC credentials below, never stored in this URL).";
+            title: "Bitcoin node" + ((Ui.node-is-core || Ui.node-is-electrum) ? " · " + Ui.node-backend-label : "");
+            subtitle: "Scans and broadcasts go through this server — it learns your address and IP. Pick a provider, point at your own Esplora/mempool-compatible node, choose Electrum server for a personal electrs (the one Sparrow uses), or choose Bitcoin Core and enter your node's address (RPC credentials below, never stored in this URL).";
             Dropdown {
                 options: Ui.node-options;
                 current-index: Ui.node-index;
@@ -168,6 +168,24 @@ export component SettingsScreen inherits VerticalLayout { padding-top: Ui.safe-t
                         Settings.set-node-address(self.text);
                     }
                 }
+            }
+            // "Electrum server" row: host[:port] of a personal electrs — no
+            // credentials, no watch wallet, nothing imported on the server.
+            if Settings.node-electrum-row-selected: EditField {
+                text <=> Ui.node-address-text;
+                placeholder-text: "192.168.1.10:50001  or  umbrel.local";
+                edited(t) => { Settings.node-address-dirty = true; }
+                accepted(t) => { Settings.node-address-dirty = false; Settings.set-node-electrum-address(t); }
+                changed has-focus => {
+                    if (!self.has-focus && Settings.node-address-dirty && self.text != "") {
+                        Settings.node-address-dirty = false;
+                        Settings.set-node-electrum-address(self.text);
+                    }
+                }
+            }
+            if Settings.node-electrum-row-selected: Caption {
+                text: "Plain TCP to your electrs (the server Sparrow connects to) — use Tailscale, Tor, or an SSH tunnel unless it's on localhost. Your server has no price oracle — USD estimates stay hidden while it's active.";
+                wrap: word-wrap;
             }
             if Ui.node-index == Ui.node-options.length - 1: EditField {
                 text <=> Settings.node-custom-text;
@@ -254,7 +272,7 @@ export component SettingsScreen inherits VerticalLayout { padding-top: Ui.safe-t
                 text: "Save credentials";
                 clicked => { Settings.set-node-core-creds(Settings.node-core-user, Settings.node-core-pass); }
             }
-            if Settings.node-core-row-selected && Settings.node-health-text != "": Caption {
+            if (Settings.node-core-row-selected || Settings.node-electrum-row-selected) && Settings.node-health-text != "": Caption {
                 text: Settings.node-health-text;
                 color: Ui.node-health-warn ? Pal.warn : Pal.muted;
                 wrap: word-wrap;

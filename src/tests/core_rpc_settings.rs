@@ -649,9 +649,10 @@ fn fill_node_round_trip_core_base_selects_core_row_no_prefix_no_creds() {
     let presets = node_presets(net);
     let (opts, idx, esplora_text, core_text) =
         fill_node(presets.clone(), Some("bitcoind+http://192.168.1.10:8332"));
-    // Row order: <presets…>, "Bitcoin Core", "Custom…" — Core is
-    // second-to-last regardless of how many presets a network has.
-    assert_eq!(opts[opts.len() - 2], "Bitcoin Core");
+    // Row order: <presets…>, "Bitcoin Core", "Electrum server", "Custom…" —
+    // Core is third-to-last regardless of how many presets a network has.
+    assert_eq!(opts[opts.len() - 3], "Bitcoin Core");
+    assert_eq!(opts[opts.len() - 2], "Electrum server");
     assert_eq!(opts[opts.len() - 1], "Custom…");
     assert_eq!(idx as usize, presets.len()); // the "Bitcoin Core" row
     assert_eq!(esplora_text, "");
@@ -678,13 +679,13 @@ fn fill_node_round_trip_custom_esplora_base_selects_custom_row() {
     let (opts, idx, esplora_text, core_text) =
         fill_node(presets.clone(), Some("https://my-own-node.example/api"));
     assert_eq!(opts[idx as usize], "Custom…");
-    assert_eq!(idx as usize, presets.len() + 1);
+    assert_eq!(idx as usize, presets.len() + 2);
     assert_eq!(esplora_text, "https://my-own-node.example/api");
     assert_eq!(core_text, "");
 }
 
 #[test]
-fn fill_node_regtest_has_exactly_core_then_custom() {
+fn fill_node_regtest_has_exactly_core_electrum_then_custom() {
     // node_presets(Regtest) is empty — the dropdown must still resolve
     // to exactly "Bitcoin Core", "Custom…" with correct index math.
     let net = Network::Regtest;
@@ -692,17 +693,18 @@ fn fill_node_regtest_has_exactly_core_then_custom() {
     assert!(presets.is_empty());
     let (opts, idx, _, core_text) =
         fill_node(presets.clone(), Some("bitcoind+http://127.0.0.1:18443"));
-    assert_eq!(opts.len(), 2);
+    assert_eq!(opts.len(), 3);
     assert_eq!(opts[0], "Bitcoin Core");
-    assert_eq!(opts[1], "Custom…");
+    assert_eq!(opts[1], "Electrum server");
+    assert_eq!(opts[2], "Custom…");
     assert_eq!(idx, 0);
     assert_eq!(core_text, "127.0.0.1:18443");
 
     // No configured value at all (default network base, None) selects
     // Custom on regtest — there is no Esplora preset for it to match.
     let (opts2, idx2, esplora_text2, core_text2) = fill_node(presets, None);
-    assert_eq!(opts2.len(), 2);
-    assert_eq!(idx2, 1); // "Custom…"
+    assert_eq!(opts2.len(), 3);
+    assert_eq!(idx2, 2); // "Custom…"
     assert_eq!(esplora_text2, "");
     assert_eq!(core_text2, "");
 }
@@ -730,4 +732,68 @@ fn credentials_typed_into_node_address_field_never_reach_the_stored_url() {
         // creds from anywhere, but prove it never echoes the input).
         assert!(!display_core_url(&url).contains("s3cr3t"));
     }
+}
+
+// ---- Electrum server row (PLAN-graffito-electrum.md, 2026-09-06) ----
+
+#[test]
+fn fill_node_electrum_base_selects_the_electrum_row_and_shows_host_port() {
+    let net = Network::Mainnet;
+    let presets = node_presets(net);
+    let (opts, idx, esplora_text, addr_text) =
+        fill_node(presets.clone(), Some("electrum+tcp://umbrel.local:50001"));
+    assert_eq!(opts[idx as usize], "Electrum server");
+    assert_eq!(idx as usize, presets.len() + 1);
+    assert_eq!(esplora_text, "");
+    assert_eq!(addr_text, "umbrel.local:50001");
+}
+
+#[test]
+fn compose_electrum_url_accepts_host_forms_and_fills_the_network_port() {
+    assert_eq!(compose_electrum_url("umbrel.local", Network::Mainnet).unwrap(), "electrum+tcp://umbrel.local:50001");
+    assert_eq!(compose_electrum_url("127.0.0.1", Network::Testnet4).unwrap(), "electrum+tcp://127.0.0.1:40001");
+    assert_eq!(compose_electrum_url("127.0.0.1", Network::Signet).unwrap(), "electrum+tcp://127.0.0.1:60601");
+    assert_eq!(compose_electrum_url("127.0.0.1", Network::Regtest).unwrap(), "electrum+tcp://127.0.0.1:60401");
+    assert_eq!(compose_electrum_url(" 192.168.1.10:50002 ", Network::Mainnet).unwrap(), "electrum+tcp://192.168.1.10:50002");
+    assert_eq!(compose_electrum_url("tcp://host:1", Network::Mainnet).unwrap(), "electrum+tcp://host:1");
+    assert_eq!(compose_electrum_url("electrum+tcp://host:1/", Network::Mainnet).unwrap(), "electrum+tcp://host:1");
+    assert_eq!(compose_electrum_url("[::1]:50001", Network::Mainnet).unwrap(), "electrum+tcp://[::1]:50001");
+}
+
+#[test]
+fn compose_electrum_url_rejects_ssl_userinfo_paths_and_garbage() {
+    assert!(compose_electrum_url("", Network::Mainnet).is_err());
+    assert!(compose_electrum_url("ssl://host:50002", Network::Mainnet).unwrap_err().contains("SSL"));
+    assert!(compose_electrum_url("electrum+ssl://host:50002", Network::Mainnet).unwrap_err().contains("SSL"));
+    assert!(compose_electrum_url("http://host:50001", Network::Mainnet).is_err());
+    assert!(compose_electrum_url("user:pw@host:50001", Network::Mainnet).unwrap_err().contains("username"));
+    assert!(compose_electrum_url("host:50001/path", Network::Mainnet).is_err());
+    assert!(compose_electrum_url("host:notaport", Network::Mainnet).is_err());
+}
+
+#[test]
+fn display_electrum_url_round_trips_through_compose() {
+    for typed in ["umbrel.local:50001", "127.0.0.1:40001", "[::1]:50001"] {
+        let stored = compose_electrum_url(typed, Network::Testnet4).unwrap();
+        let shown = display_electrum_url(&stored);
+        assert_eq!(shown, typed);
+        assert_eq!(compose_electrum_url(&shown, Network::Testnet4).unwrap(), stored);
+    }
+}
+
+#[test]
+fn format_electrum_status_warns_on_a_chain_mismatch_and_reports_the_tip() {
+    let ok = app_core::chain::ElectrumStatus {
+        server_version: "electrs/0.10.10".into(),
+        protocol: "1.4".into(),
+        tip_height: 151_262,
+        genesis_hash: expected_genesis_hex(Network::Testnet4).to_string(),
+    };
+    let (text, warn) = format_electrum_status(&ok, Network::Testnet4, expected_genesis_hex(Network::Testnet4));
+    assert!(!warn, "{text}");
+    assert!(text.contains("electrs/0.10.10") && text.contains("151,262"), "{text}");
+    let mainnet = app_core::chain::ElectrumStatus { genesis_hash: expected_genesis_hex(Network::Mainnet).to_string(), ..ok };
+    let (text, warn) = format_electrum_status(&mainnet, Network::Testnet4, expected_genesis_hex(Network::Testnet4));
+    assert!(warn, "{text}");
+    assert!(text.contains("different chain") && text.contains("testnet4"), "{text}");
 }

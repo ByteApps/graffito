@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 use crate::funding::FundingSource;
 use crate::Error;
 
+use super::esplora_shape;
 use super::transport::Transport;
 
 /// U6 (`../../PLAN-chain-notes-app-core-rpc.md`, "unusable against a real
@@ -63,68 +64,18 @@ pub fn core_rpc_import_descriptors_call_count() -> u32 {
 /// 2090 `getrawtransaction` round trips (~418 each), with NO decrease
 /// across repetition.
 ///
-/// See [`CoreRpcTransport::esplora_tx_json`] for the one place this is
-/// populated: **only a CONFIRMED transaction's fully-built JSON is ever
-/// inserted.** This is the load-bearing safety rule, not a stylistic
-/// choice — an UNCONFIRMED (mempool) transaction's status can change on
-/// the very next call (mined, dropped, replaced by a fee bump), so caching
-/// it would risk exactly the failure mode this project treats as worst:
-/// telling the user a live transaction was dropped, or hiding a fresh
-/// confirmation (`TxLookupStatus::NotFound`'s own doc comment). A
-/// CONFIRMED transaction's content — including the `status` object's
-/// `block_height`/`block_time`, computed once from an ABSOLUTE block
-/// height (`tip - confirmations + 1`), not a relative "N confirmations
-/// ago" — cannot change short of a deep reorg, a risk this crate already
-/// accepts elsewhere with no special handling (`tx_lookup_status`, the
-/// dropped-tx detector, ...). Keyed by node identity exactly like
-/// [`GLOBAL_WATCH_CACHE`], so a Settings node-URL change or network switch
-/// can never serve a stale hit from a different chain's history.
-static TX_JSON_CACHE: std::sync::LazyLock<Mutex<HashMap<(String, String), serde_json::Value>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Hard cap on [`TX_JSON_CACHE`]'s entry count, enforced at insert time
-/// (see [`CoreRpcTransport::esplora_tx_json`]). Left unbounded, the cache
-/// would trade an O(wallet-history) NETWORK cost for an O(wallet-history)
-/// MEMORY cost — the same "nothing may be O(chain length)/O(wallet
-/// history)" rule `PLAN-one-regtest-node.md` states for the node side
-/// ("Two things now grow without bound"), just moved into this process
-/// instead, on a platform (a phone) that can least afford it.
-///
-/// Arithmetic: one cache entry is a confirmed transaction's fully-built
-/// esplora-shaped JSON. A typical Graffito tx (1-2 inputs, a recipient
-/// output, an OP_RETURN chunk or two, maybe a taproot change output)
-/// serializes to roughly 0.5-1 KB; an outlier — a wallet sweep/consolidate
-/// pulling in many inputs — runs a few KB. At [`TX_JSON_CACHE_MAX_ENTRIES`]
-/// = 5,000, that is ~2.5-5 MB in the ordinary case and comfortably under
-/// 20 MB even if EVERY entry were an outlier — trivial next to a mobile
-/// app's normal memory budget (a handful of decoded images), and it
-/// already covers a wallet used HEAVILY (10+ notes/day) for several
-/// YEARS, since this is one entry per distinct historical txid ever
-/// resolved, not per operation.
-///
-/// The policy on reaching the cap is deliberately the crudest one that is
-/// still correct: **stop inserting.** Existing entries are never evicted
-/// (so there is no thrashing, and everything already cached keeps serving
-/// hits) — the cache just stops growing. A fixed ceiling with a dumb
-/// policy beats an eviction scheme clever enough to need its own tests;
-/// the cost of understating the cap is a few more `getrawtransaction`
-/// calls once a node's shared history is already enormous, a regime this
-/// crate already tolerates elsewhere (`PLAN-one-regtest-node.md`'s
-/// accepted unbounded chain/wallet growth).
-const TX_JSON_CACHE_MAX_ENTRIES: usize = 5_000;
-
-/// Test visibility only — see [`TX_JSON_CACHE_MAX_ENTRIES`]'s doc comment
-/// for the reasoning behind the exact number, so a test can assert against
-/// it by name instead of a hardcoded duplicate.
+/// **Moved into [`esplora_shape`] (`PLAN-graffito-electrum.md`)** so the
+/// Electrum backend shares the exact same cache (and the exact same
+/// only-cache-a-CONFIRMED-result safety rule) rather than duplicating it —
+/// these two thin wrappers exist only to keep this module's existing
+/// public function names/paths (re-exported via `mod.rs`) unchanged.
 pub fn core_rpc_tx_json_cache_max_entries() -> usize {
-    TX_JSON_CACHE_MAX_ENTRIES
+    esplora_shape::TX_JSON_CACHE_MAX_ENTRIES
 }
 
-/// Current entry count of [`TX_JSON_CACHE`] — test visibility only, proves
-/// the cap in [`CoreRpcTransport::esplora_tx_json`] is genuinely enforced
-/// rather than merely documented.
+/// See [`core_rpc_tx_json_cache_max_entries`]'s doc comment.
 pub fn core_rpc_tx_json_cache_len() -> usize {
-    TX_JSON_CACHE.lock().expect("tx-json cache mutex poisoned").len()
+    esplora_shape::tx_json_cache_len()
 }
 
 /// Bitcoin Core JSON-RPC backend (`../../PLAN-chain-notes-app-core-rpc.md`
@@ -420,34 +371,9 @@ enum RpcOutcome {
     BadResponse(String),
 }
 
-/// `10^8` scale, rounded — bitcoind reports amounts in BTC (f64); every
-/// esplora shape in this crate is sats (u64).
-fn btc_to_sats(btc: f64) -> u64 {
-    (btc * 1e8).round() as u64
-}
-
-/// Does `tx` (an esplora-shaped JSON value, as built by
-/// [`CoreRpcTransport::esplora_tx_json`]) touch `address` — an input
-/// prevout OR an output? The watch wallet is SHARED across every address
-/// ever queried (one `graffito-watch` wallet holds every imported
-/// `addr()` descriptor), so `listtransactions` returns other addresses'
-/// txs too; this filter is load-bearing exactly as the plan's §1.3 table
-/// notes — without it a gap-limit scan never finds an unused address and
-/// walks forever.
-fn tx_touches(tx: &serde_json::Value, address: &str) -> bool {
-    let touches_vin = tx.get("vin").and_then(|v| v.as_array()).is_some_and(|a| {
-        a.iter().any(|i| {
-            i.get("prevout").and_then(|p| p.get("scriptpubkey_address")).and_then(|x| x.as_str())
-                == Some(address)
-        })
-    });
-    if touches_vin {
-        return true;
-    }
-    tx.get("vout").and_then(|v| v.as_array()).is_some_and(|a| {
-        a.iter().any(|o| o.get("scriptpubkey_address").and_then(|x| x.as_str()) == Some(address))
-    })
-}
+// `btc_to_sats` and `tx_touches` moved to [`esplora_shape`]
+// (`PLAN-graffito-electrum.md`) so the Electrum backend shares them —
+// called below as `esplora_shape::btc_to_sats`/`esplora_shape::tx_touches`.
 
 impl CoreRpcTransport {
     /// Watch-only wallet this transport creates/loads on the node, holding
@@ -945,115 +871,42 @@ impl CoreRpcTransport {
         let Ok(parent) = self.getrawtransaction(parent_txid, 1) else {
             return (None, 0);
         };
-        let out = parent.get("vout").and_then(|v| v.as_array()).and_then(|a| a.get(vout as usize));
-        let address = out
-            .and_then(|o| o.get("scriptPubKey"))
-            .and_then(|s| s.get("address"))
-            .and_then(|a| a.as_str())
-            .map(str::to_string);
-        let value = out.and_then(|o| o.get("value")).and_then(|v| v.as_f64()).map(btc_to_sats).unwrap_or(0);
-        (address, value)
+        esplora_shape::prevout_from_verbose_parent(&parent, vout)
     }
 
     /// `getrawtransaction txid 2` mapped onto the esplora tx shape
-    /// [`EsploraTx`] deserializes — mirrors `server.py`'s `esplora_tx`
-    /// (module doc, §1.3 of the plan) field-for-field: `confirmed` from
-    /// `confirmations > 0`, `block_height` derived from `tip`, `nulldata`
-    /// → `"op_return"` (esplora's own type name, load-bearing —
-    /// `classify_tx_inner` matches it literally), vin prevouts via
-    /// [`Self::resolve_prevout`] when Core didn't inline one.
+    /// [`EsploraTx`] deserializes, via the shared
+    /// [`esplora_shape::verbose_tx_to_esplora_json`] (`PLAN-graffito-
+    /// electrum.md` — the Electrum backend's `blockchain.transaction.get
+    /// [txid, true]` answers the identical Core-shaped verbose tx, so both
+    /// backends call the same conversion) — mirrors `server.py`'s
+    /// `esplora_tx` field-for-field: `confirmed` from `confirmations > 0`,
+    /// `block_height` derived from `tip`, `nulldata` → `"op_return"`
+    /// (esplora's own type name, load-bearing — `classify_tx_inner`
+    /// matches it literally), vin prevouts via [`Self::resolve_prevout`]
+    /// when Core didn't inline one.
     ///
-    /// Checks [`TX_JSON_CACHE`] first and, when this call ends up building
-    /// a CONFIRMED result, populates it before returning — see that
-    /// static's doc comment for the exact safety rule (unconfirmed results
-    /// are never cached, never read from cache). A cache hit skips the
-    /// `getrawtransaction` round trip (and any [`Self::resolve_prevout`]
-    /// follow-ups) entirely; `tip` is only used to (re)compute
-    /// `status.block_height` on a miss, since a confirmed tx's own block
-    /// height is fixed the moment it's first resolved and does not need
-    /// recomputing against a later, higher tip.
+    /// Checks the shared cache first ([`esplora_shape::tx_json_cache_get`])
+    /// and, when this call ends up building a CONFIRMED result, populates
+    /// it before returning ([`esplora_shape::tx_json_cache_maybe_insert`]
+    /// — see that module's doc comment for the exact safety rule:
+    /// unconfirmed results are never cached, never read from cache). A
+    /// cache hit skips the `getrawtransaction` round trip (and any
+    /// [`Self::resolve_prevout`] follow-ups) entirely; `tip` is only used
+    /// to (re)compute `status.block_height` on a miss, since a confirmed
+    /// tx's own block height is fixed the moment it's first resolved and
+    /// does not need recomputing against a later, higher tip.
     fn esplora_tx_json(&self, txid: &str, tip: u64) -> Result<serde_json::Value, Error> {
         let cache_key = (self.node_key(), txid.to_string());
-        if let Some(cached) = TX_JSON_CACHE.lock().expect("tx-json cache mutex poisoned").get(&cache_key) {
-            return Ok(cached.clone());
+        if let Some(cached) = esplora_shape::tx_json_cache_get(&cache_key) {
+            return Ok(cached);
         }
         let raw = self.getrawtransaction(txid, 2)?;
-        let confirmations = raw.get("confirmations").and_then(|c| c.as_u64()).unwrap_or(0);
-        let confirmed = confirmations > 0;
-        let mut status = serde_json::json!({"confirmed": confirmed});
-        if confirmed {
-            status["block_height"] = serde_json::json!(tip.saturating_sub(confirmations).saturating_add(1));
-            if let Some(bt) = raw.get("blocktime") {
-                status["block_time"] = bt.clone();
-            }
-        }
-        let vin: Vec<serde_json::Value> = raw
-            .get("vin")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|i| {
-                let txid_v = i.get("txid").cloned().unwrap_or(serde_json::Value::Null);
-                let vout_v = i.get("vout").cloned().unwrap_or(serde_json::Value::Null);
-                let (address, value) = match i.get("prevout").filter(|p| !p.is_null()) {
-                    Some(p) => {
-                        let addr = p
-                            .get("scriptPubKey")
-                            .and_then(|s| s.get("address"))
-                            .and_then(|a| a.as_str())
-                            .map(str::to_string);
-                        let v = p.get("value").and_then(|v| v.as_f64()).map(btc_to_sats).unwrap_or(0);
-                        (addr, v)
-                    }
-                    None => match (txid_v.as_str(), vout_v.as_u64()) {
-                        // Coinbase inputs carry neither — nothing to resolve.
-                        (Some(pt), Some(pv)) => self.resolve_prevout(pt, pv),
-                        _ => (None, 0),
-                    },
-                };
-                serde_json::json!({
-                    "txid": txid_v,
-                    "vout": vout_v,
-                    "prevout": {"scriptpubkey_address": address, "value": value},
-                })
-            })
-            .collect();
-        let vout: Vec<serde_json::Value> = raw
-            .get("vout")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|o| {
-                let spk = o.get("scriptPubKey");
-                let core_type = spk.and_then(|s| s.get("type")).and_then(|t| t.as_str());
-                let esplora_type = if core_type == Some("nulldata") { Some("op_return") } else { core_type };
-                let address = spk.and_then(|s| s.get("address")).and_then(|a| a.as_str());
-                let hex = spk.and_then(|s| s.get("hex")).and_then(|h| h.as_str());
-                let value = o.get("value").and_then(|v| v.as_f64()).map(btc_to_sats).unwrap_or(0);
-                serde_json::json!({
-                    "scriptpubkey": hex,
-                    "scriptpubkey_type": esplora_type,
-                    "scriptpubkey_address": address,
-                    "value": value,
-                })
-            })
-            .collect();
-        let result = serde_json::json!({"txid": txid, "status": status, "vin": vin, "vout": vout});
-        if confirmed {
-            // See `TX_JSON_CACHE`'s doc comment: ONLY a confirmed result is
-            // ever inserted. An unconfirmed one is returned as-is, every
-            // time, with no cache write — its status can still change.
-            // See `TX_JSON_CACHE_MAX_ENTRIES`'s doc comment for the bound
-            // enforced here: once full, stop inserting rather than evict —
-            // existing entries keep serving hits, the cache just stops
-            // growing.
-            let mut cache = TX_JSON_CACHE.lock().expect("tx-json cache mutex poisoned");
-            if cache.len() < TX_JSON_CACHE_MAX_ENTRIES {
-                cache.insert(cache_key, result.clone());
-            }
-        }
+        let result =
+            esplora_shape::verbose_tx_to_esplora_json(txid, &raw, tip, |pt, pv| self.resolve_prevout(pt, pv));
+        let confirmed =
+            result.get("status").and_then(|s| s.get("confirmed")).and_then(|c| c.as_bool()).unwrap_or(false);
+        esplora_shape::tx_json_cache_maybe_insert(cache_key, confirmed, &result);
         Ok(result)
     }
 
@@ -1559,7 +1412,7 @@ impl CoreRpcTransport {
         let mut out = Vec::with_capacity(txids.len());
         for txid in txids {
             let tx = self.esplora_tx_json(&txid, tip)?;
-            if tx_touches(&tx, address) {
+            if esplora_shape::tx_touches(&tx, address) {
                 out.push(tx);
             }
         }
@@ -1567,44 +1420,18 @@ impl CoreRpcTransport {
     }
 
     /// `GET /address/:a` — folds full history into chain/mempool buckets
-    /// exactly like `server.py`'s `/address` handler (plan §1.3, :220).
+    /// via the shared [`esplora_shape::fold_address_stats`], exactly like
+    /// `server.py`'s `/address` handler (plan §1.3, :220).
     fn address_stats_route(&self, address: &str) -> Result<String, Error> {
         let txs = self.address_history_json(address)?;
-        let (mut chain_n, mut chain_f, mut chain_s) = (0u64, 0u64, 0u64);
-        let (mut mem_n, mut mem_f, mut mem_s) = (0u64, 0u64, 0u64);
-        for tx in &txs {
-            let confirmed = tx.get("status").and_then(|s| s.get("confirmed")).and_then(|c| c.as_bool()).unwrap_or(false);
-            let mut funded = 0u64;
-            let mut spent = 0u64;
-            for o in tx.get("vout").and_then(|v| v.as_array()).into_iter().flatten() {
-                if o.get("scriptpubkey_address").and_then(|a| a.as_str()) == Some(address) {
-                    funded += o.get("value").and_then(|v| v.as_u64()).unwrap_or(0);
-                }
-            }
-            for i in tx.get("vin").and_then(|v| v.as_array()).into_iter().flatten() {
-                if i.get("prevout").and_then(|p| p.get("scriptpubkey_address")).and_then(|a| a.as_str()) == Some(address) {
-                    spent += i.get("prevout").and_then(|p| p.get("value")).and_then(|v| v.as_u64()).unwrap_or(0);
-                }
-            }
-            if confirmed {
-                chain_n += 1;
-                chain_f += funded;
-                chain_s += spent;
-            } else {
-                mem_n += 1;
-                mem_f += funded;
-                mem_s += spent;
-            }
-        }
-        Ok(serde_json::json!({
-            "chain_stats": {"tx_count": chain_n, "funded_txo_sum": chain_f, "spent_txo_sum": chain_s},
-            "mempool_stats": {"tx_count": mem_n, "funded_txo_sum": mem_f, "spent_txo_sum": mem_s},
-        })
-        .to_string())
+        Ok(esplora_shape::fold_address_stats(&txs, address).to_string())
     }
 
     /// `GET /address/:a/utxo` → `listunspent 0 9999999 [address]` (plan
-    /// §1.3, `server.py`:263).
+    /// §1.3, `server.py`:263). The `status` shaping is shared with the
+    /// Electrum backend via [`esplora_shape::confirmed_status`] — Core has
+    /// no cheap way to resolve a `block_time` here, so it always passes
+    /// `None` (unchanged behavior).
     fn utxo_route(&self, address: &str) -> Result<String, Error> {
         let tip = self.tip_height_rpc()?;
         let result =
@@ -1616,15 +1443,13 @@ impl CoreRpcTransport {
             .into_iter()
             .map(|u| {
                 let confirmations = u.get("confirmations").and_then(|c| c.as_i64()).unwrap_or(0);
-                let value = u.get("amount").and_then(|a| a.as_f64()).map(btc_to_sats).unwrap_or(0);
-                let status = if confirmations > 0 {
-                    serde_json::json!({
-                        "confirmed": true,
-                        "block_height": tip.saturating_sub(confirmations as u64).saturating_add(1),
-                    })
+                let value = u.get("amount").and_then(|a| a.as_f64()).map(esplora_shape::btc_to_sats).unwrap_or(0);
+                let confirmed_height = if confirmations > 0 {
+                    Some(tip.saturating_sub(confirmations as u64).saturating_add(1))
                 } else {
-                    serde_json::json!({"confirmed": false})
+                    None
                 };
+                let status = esplora_shape::confirmed_status(confirmed_height, None);
                 serde_json::json!({
                     "txid": u.get("txid").cloned().unwrap_or(serde_json::Value::Null),
                     "vout": u.get("vout").cloned().unwrap_or(serde_json::Value::Null),
@@ -1638,27 +1463,18 @@ impl CoreRpcTransport {
 
     /// `GET /address/:a/txs[/chain/:after]` — `listtransactions "*" …`
     /// filtered to txs touching `address` (plan §1.3, `server.py`:188,
-    /// :283). `chain_only` (the `/txs/chain/:after` form) drops mempool
-    /// entries and paginates 25-at-a-time by PATH-embedded cursor, exactly
-    /// what `ChainClient::full_history` sends and real esplora expects —
-    /// see the `EsploraFake` reference in `tests/common/mod.rs`; the
-    /// regtest `server.py` shim instead reads a query-string cursor it
-    /// never actually receives from this app (a pre-existing, out-of-scope
-    /// shim gap noted in `chain.rs`'s own doc comment), so it does not
-    /// double as a second worked example for this form.
+    /// :283), paginated via the shared [`esplora_shape::paginate_txs`].
+    /// `chain_only` (the `/txs/chain/:after` form) drops mempool entries
+    /// and paginates 25-at-a-time by PATH-embedded cursor, exactly what
+    /// `ChainClient::full_history` sends and real esplora expects — see
+    /// the `EsploraFake` reference in `tests/common/mod.rs`; the regtest
+    /// `server.py` shim instead reads a query-string cursor it never
+    /// actually receives from this app (a pre-existing, out-of-scope shim
+    /// gap noted in `chain.rs`'s own doc comment), so it does not double
+    /// as a second worked example for this form.
     fn txs_route(&self, address: &str, after: Option<&str>, chain_only: bool) -> Result<String, Error> {
-        let mut items = self.address_history_json(address)?;
-        if chain_only {
-            items.retain(|t| t.get("status").and_then(|s| s.get("confirmed")).and_then(|c| c.as_bool()).unwrap_or(false));
-        }
-        if let Some(after_txid) = after {
-            let idx = items.iter().position(|t| t.get("txid").and_then(|v| v.as_str()) == Some(after_txid));
-            items = match idx {
-                Some(i) => items.split_off(i + 1),
-                None => Vec::new(),
-            };
-        }
-        items.truncate(if chain_only { 25 } else { 50 });
+        let items = self.address_history_json(address)?;
+        let items = esplora_shape::paginate_txs(items, after, chain_only);
         Ok(serde_json::to_string(&items).unwrap())
     }
 
@@ -1712,7 +1528,7 @@ impl CoreRpcTransport {
         let sat_vb = |blocks: u64| -> Option<u64> {
             let v = self.rpc(None, "estimatesmartfee", serde_json::json!([blocks])).ok()?;
             let btc_per_kvb = v.get("feerate")?.as_f64()?;
-            Some(btc_per_kvb_to_sat_vb(btc_per_kvb))
+            Some(esplora_shape::btc_per_kvb_to_sat_vb(btc_per_kvb))
         };
         // The node's own relay floor — `mempoolminfee` is documented as the
         // HIGHER of the static `-minrelaytxfee` and any dynamic
@@ -1725,7 +1541,7 @@ impl CoreRpcTransport {
         let relay_min = mempool_info
             .as_ref()
             .and_then(|v| v.get("mempoolminfee").and_then(|f| f.as_f64()))
-            .map(btc_per_kvb_to_sat_vb)
+            .map(esplora_shape::btc_per_kvb_to_sat_vb)
             .unwrap_or(1);
         // `bytes` is the mempool's total VIRTUAL size (Core's field name
         // predates segwit); `loaded` says mempool.dat has been read at start.
@@ -1734,13 +1550,18 @@ impl CoreRpcTransport {
             .as_ref()
             .and_then(|v| v.get("loaded").and_then(|b| b.as_bool()))
             .unwrap_or(false);
-        let fastest = sat_vb(1).unwrap_or(FASTEST_FALLBACK_SAT_VB);
-        let half_hour = sat_vb(3).unwrap_or(HALF_HOUR_FALLBACK_SAT_VB);
-        let hour = sat_vb(6).unwrap_or(HOUR_FALLBACK_SAT_VB);
-        let economy = sat_vb(144).unwrap_or(ECONOMY_FALLBACK_SAT_VB);
-        let (fastest, half_hour, hour, economy) = clamp_fee_tiers(fastest, half_hour, hour, economy, relay_min);
+        let fastest = sat_vb(1).unwrap_or(esplora_shape::FASTEST_FALLBACK_SAT_VB);
+        let half_hour = sat_vb(3).unwrap_or(esplora_shape::HALF_HOUR_FALLBACK_SAT_VB);
+        let hour = sat_vb(6).unwrap_or(esplora_shape::HOUR_FALLBACK_SAT_VB);
+        let economy = sat_vb(144).unwrap_or(esplora_shape::ECONOMY_FALLBACK_SAT_VB);
         let (fastest, half_hour, hour, economy) =
-            quiet_mempool_tiers((fastest, half_hour, hour, economy), mempool_vbytes, mempool_loaded, relay_min);
+            esplora_shape::clamp_fee_tiers(fastest, half_hour, hour, economy, relay_min);
+        let (fastest, half_hour, hour, economy) = esplora_shape::quiet_mempool_tiers(
+            (fastest, half_hour, hour, economy),
+            mempool_vbytes,
+            mempool_loaded,
+            relay_min,
+        );
         Ok(serde_json::json!({
             "fastestFee": fastest,
             "halfHourFee": half_hour,
@@ -1752,96 +1573,12 @@ impl CoreRpcTransport {
     }
 }
 
-/// `10^8` sat/BTC ÷ `10^3` vB/kvB — see [`btc_per_kvb_to_sat_vb`]'s doc
-/// comment for why this exact constant is the entire ballgame.
-const SAT_VB_PER_BTC_PER_KVB: f64 = 100_000.0;
-
-/// BTC/kvB (`estimatesmartfee`'s and `getmempoolinfo`'s native unit) →
-/// sat/vB (every `FeeRates` field in this crate). Rounds UP
-/// (`.ceil()`) — rounding DOWN a genuine 1.4 sat/vB estimate to 1 could
-/// compose a tx that pays less than the rate it was estimated at, risking
-/// a slow confirmation or, at the relay-floor boundary, outright
-/// rejection; overpaying by a fraction of a sat/vB is the safe direction
-/// to round. `.max(1)` is a belt-and-braces floor for a degenerate `0.0`
-/// input (a node that answered but reported no real fee) — the
-/// AUTHORITATIVE relay-minimum floor is applied separately, from the live
-/// node, in [`clamp_fee_tiers`]; this local floor exists only so this
-/// function alone never returns a nonsensical 0.
-fn btc_per_kvb_to_sat_vb(btc_per_kvb: f64) -> u64 {
-    ((btc_per_kvb * SAT_VB_PER_BTC_PER_KVB).ceil() as u64).max(1)
-}
-
-/// Fallback sat/vB for the ~1-block tier when `estimatesmartfee` has
-/// nothing to estimate from. Deliberately just above the relay floor and
-/// the highest of the four fallbacks (never absurd — nowhere near a real
-/// mainnet fee spike — but visibly "the urgent one" so the fallback shape
-/// alone doesn't read as a flat, broken line).
-const FASTEST_FALLBACK_SAT_VB: u64 = 3;
-/// Fallback sat/vB for the ~3-block tier — see [`FASTEST_FALLBACK_SAT_VB`].
-const HALF_HOUR_FALLBACK_SAT_VB: u64 = 2;
-/// Fallback sat/vB for the ~6-block tier — the network's de-facto default
-/// relay rate. See [`FASTEST_FALLBACK_SAT_VB`].
-const HOUR_FALLBACK_SAT_VB: u64 = 1;
-/// Fallback sat/vB for the ~144-block (economy) tier — never below 1
-/// (never zero; a zero-fee tx does not relay at all). See
-/// [`FASTEST_FALLBACK_SAT_VB`].
-const ECONOMY_FALLBACK_SAT_VB: u64 = 1;
-
-/// Forces `fastest >= half_hour >= hour >= economy >= floor` — see
-/// [`CoreRpcTransport::fee_estimates_route`]'s doc comment for why this is
-/// necessary even though `estimatesmartfee` itself is monotonic per
-/// confirmation target: each tier passed in here was chosen independently
-/// (real estimate OR fallback), so a real, volatile value in one tier and
-/// a stale fallback in an adjacent one can otherwise cross.
-///
-/// Order of operations matters and is deliberate: the descending clamp
-/// (`half_hour.min(fastest)`, etc.) runs FIRST, then `floor` is applied via
-/// `.max(floor)` to every already-ordered value. `max` is a monotonic
-/// function of its first argument, so applying it independently to an
-/// already-descending sequence cannot un-sort it — doing the floor first
-/// (or interleaved) could let a tier that needed raising up to the floor
-/// end up ABOVE a neighbor that didn't.
-fn clamp_fee_tiers(fastest: u64, half_hour: u64, hour: u64, economy: u64, floor: u64) -> (u64, u64, u64, u64) {
-    let half_hour = half_hour.min(fastest);
-    let hour = hour.min(half_hour);
-    let economy = economy.min(hour);
-    (fastest.max(floor), half_hour.max(floor), hour.max(floor), economy.max(floor))
-}
-
-/// One block's worth of virtual bytes — the threshold below which a
-/// mempool cannot fill the next block, so nothing in it competes for
-/// space and next-block inclusion costs the relay floor.
-const BLOCK_VBYTES: u64 = 1_000_000;
-
-/// Quiet-mempool sanity for `estimatesmartfee` (2026-09-06): the estimator
-/// answers from CONFIRMED-block fee history, not from what is waiting now,
-/// and on a chain like testnet4 that history is dominated by spam paid at
-/// hundreds of sat/vB while the mempool holds a handful of 1 sat/vB
-/// transactions — the Pi node answered 376 sat/vB for every target with 6
-/// transactions pending (live, 2026-09-05), and the app's tiers repeated
-/// it. mempool.space's tiers come from projecting the mempool into blocks
-/// instead, which is why the same chain shows 1–2 sat/vB there: when the
-/// whole mempool fits in one block, nothing outbids anything and every
-/// tier is the relay floor. This applies that one rule — every tier
-/// becomes `floor` when the node reports a LOADED mempool (mempool.dat
-/// read — a node that just started with an empty pool is not evidence of a
-/// quiet network) smaller than [`BLOCK_VBYTES`]. Anything else (a busy
-/// mempool, an unknown size, an unloaded pool) leaves the estimator's tiers
-/// as they are. Never raises a tier.
-fn quiet_mempool_tiers(
-    tiers: (u64, u64, u64, u64),
-    mempool_vbytes: Option<u64>,
-    mempool_loaded: bool,
-    floor: u64,
-) -> (u64, u64, u64, u64) {
-    match mempool_vbytes {
-        Some(vb) if mempool_loaded && vb < BLOCK_VBYTES => {
-            let floor = floor.max(1);
-            (tiers.0.min(floor), tiers.1.min(floor), tiers.2.min(floor), tiers.3.min(floor))
-        }
-        _ => tiers,
-    }
-}
+// `SAT_VB_PER_BTC_PER_KVB`/`btc_per_kvb_to_sat_vb`, the four fallback
+// constants, `clamp_fee_tiers`, `BLOCK_VBYTES`, and `quiet_mempool_tiers`
+// all moved to [`esplora_shape`] (`PLAN-graffito-electrum.md`) so the
+// Electrum backend's fee route shares them byte-for-byte — called above
+// as `esplora_shape::*`. This module's own tests for them (below) now
+// call through that path too.
 
 impl Transport for CoreRpcTransport {
     fn get_text(&self, path: &str) -> Result<String, Error> {
@@ -2004,6 +1741,7 @@ mod tests {
                 assert_eq!(creds_as_str(&c), Some(("user", "pass")));
             }
             AnyTransport::Esplora(_) => panic!("expected Core"),
+            AnyTransport::Electrum(_) => panic!("expected Core"),
         }
     }
 
@@ -2215,7 +1953,7 @@ mod tests {
         ];
         for &(btc_per_kvb, expected_sat_vb) in cases {
             assert_eq!(
-                btc_per_kvb_to_sat_vb(btc_per_kvb),
+                esplora_shape::btc_per_kvb_to_sat_vb(btc_per_kvb),
                 expected_sat_vb,
                 "btc_per_kvb_to_sat_vb({btc_per_kvb}) should be {expected_sat_vb} sat/vB \
                  (a 1000x unit error would give {} or {})",
@@ -2233,42 +1971,42 @@ mod tests {
     /// unambiguous.
     #[test]
     fn sat_vb_conversion_constant_is_exactly_100_000() {
-        assert_eq!(SAT_VB_PER_BTC_PER_KVB, 100_000.0);
+        assert_eq!(esplora_shape::SAT_VB_PER_BTC_PER_KVB, 100_000.0);
     }
 
     /// The live 2026-09-05 testnet4 shape: 376 sat/vB from every target,
     /// six transactions in a loaded mempool → every tier is the relay floor.
     #[test]
     fn quiet_mempool_collapses_stale_estimator_tiers_to_the_relay_floor() {
-        assert_eq!(quiet_mempool_tiers((376, 376, 376, 376), Some(6172), true, 1), (1, 1, 1, 1));
+        assert_eq!(esplora_shape::quiet_mempool_tiers((376, 376, 376, 376), Some(6172), true, 1), (1, 1, 1, 1));
         // A raised dynamic floor is honoured, never undercut.
-        assert_eq!(quiet_mempool_tiers((376, 376, 376, 376), Some(6172), true, 3), (3, 3, 3, 3));
+        assert_eq!(esplora_shape::quiet_mempool_tiers((376, 376, 376, 376), Some(6172), true, 3), (3, 3, 3, 3));
     }
 
     #[test]
     fn quiet_mempool_rule_never_raises_a_tier() {
-        assert_eq!(quiet_mempool_tiers((1, 1, 1, 1), Some(0), true, 5), (1, 1, 1, 1));
+        assert_eq!(esplora_shape::quiet_mempool_tiers((1, 1, 1, 1), Some(0), true, 5), (1, 1, 1, 1));
     }
 
     #[test]
     fn busy_unknown_or_unloaded_mempool_leaves_the_estimator_alone() {
         let t = (40, 30, 20, 10);
-        assert_eq!(quiet_mempool_tiers(t, Some(BLOCK_VBYTES), true, 1), t, "a full block competes");
-        assert_eq!(quiet_mempool_tiers(t, Some(5_000_000), true, 1), t);
-        assert_eq!(quiet_mempool_tiers(t, None, true, 1), t, "no size, no opinion");
-        assert_eq!(quiet_mempool_tiers(t, Some(100), false, 1), t, "a fresh node's empty pool is not a quiet network");
+        assert_eq!(esplora_shape::quiet_mempool_tiers(t, Some(esplora_shape::BLOCK_VBYTES), true, 1), t, "a full block competes");
+        assert_eq!(esplora_shape::quiet_mempool_tiers(t, Some(5_000_000), true, 1), t);
+        assert_eq!(esplora_shape::quiet_mempool_tiers(t, None, true, 1), t, "no size, no opinion");
+        assert_eq!(esplora_shape::quiet_mempool_tiers(t, Some(100), false, 1), t, "a fresh node's empty pool is not a quiet network");
     }
 
     #[test]
     fn clamp_fee_tiers_leaves_an_already_sorted_above_floor_input_untouched() {
-        assert_eq!(clamp_fee_tiers(20, 15, 10, 5, 1), (20, 15, 10, 5));
+        assert_eq!(esplora_shape::clamp_fee_tiers(20, 15, 10, 5, 1), (20, 15, 10, 5));
     }
 
     #[test]
     fn clamp_fee_tiers_floors_every_tier_to_the_relay_minimum() {
         // Every raw tier below the floor -> every tier becomes the floor,
         // and the result is trivially still "sorted" (all equal).
-        assert_eq!(clamp_fee_tiers(3, 2, 1, 1, 20), (20, 20, 20, 20));
+        assert_eq!(esplora_shape::clamp_fee_tiers(3, 2, 1, 1, 20), (20, 20, 20, 20));
     }
 
     #[test]
@@ -2278,7 +2016,7 @@ mod tests {
         // a fallback constant that happens to read HIGHER than the real
         // fastest estimate. Without the clamp this would answer
         // fastest < half_hour — backwards.
-        let (fastest, half_hour, hour, economy) = clamp_fee_tiers(2, 5, 5, 5, 1);
+        let (fastest, half_hour, hour, economy) = esplora_shape::clamp_fee_tiers(2, 5, 5, 5, 1);
         assert!(fastest >= half_hour, "fastest {fastest} must be >= half_hour {half_hour}");
         assert!(half_hour >= hour, "half_hour {half_hour} must be >= hour {hour}");
         assert!(hour >= economy, "hour {hour} must be >= economy {economy}");
@@ -2294,7 +2032,7 @@ mod tests {
         // floor-AFTER-clamp (the real implementation) instead clamps
         // economy = min(1, hour=4) = 1 first, THEN floors every already-
         // ordered value to 5, landing on hour=5, economy=5 — still sorted.
-        let (fastest, half_hour, hour, economy) = clamp_fee_tiers(10, 8, 4, 1, 5);
+        let (fastest, half_hour, hour, economy) = esplora_shape::clamp_fee_tiers(10, 8, 4, 1, 5);
         assert!(fastest >= half_hour && half_hour >= hour && hour >= economy);
         assert_eq!((fastest, half_hour, hour, economy), (10, 8, 5, 5));
     }
