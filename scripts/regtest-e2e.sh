@@ -918,6 +918,7 @@ echo "run identity: NOTES_APP_SEED=$RUN_PRIME_SEED (throwaway, logged so an abor
 
 # App identity: a BIP-39 mnemonic exercises the flagship import format.
 export APP_KEY="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+MAIN_KEY="$APP_KEY"   # the app identity's OWN key — the cleanup below must sweep $STORE with THIS, not the ambient APP_KEY
 A_ADDR="$("$APP" address "$NETWORK")"
 [[ "$A_ADDR" == "$TAP_HRP"* ]] || fail "app address not taproot: $A_ADDR"
 pre_watch_fresh "$A_ADDR"
@@ -1295,7 +1296,14 @@ pass "multi leg: all three recipients independently scan + read the multi-recipi
 if [[ "$NETWORK" == testnet4 ]]; then
     echo
     echo "== testnet4 cleanup: sweep leftovers back to the gift wallet ($FUND_ADDR) =="
-    SWEEP_OUT="$("$APP" sweep "$STORE" "$BASE" "$FUND_ADDR" 1.0 2>&1 || true)"
+    # Each store is swept with ITS OWN key. The fu/multi legs above `export
+    # APP_KEY` to their identities and never restore it, so the ambient key
+    # here is the multi funder's: sweeping $STORE and $FU_STORE with it
+    # signed their taproot coins with the WRONG key — bitcoind rejected both
+    # as "Invalid Schnorr signature" (the Pi's electrs journal, 2026-09-06
+    # 14:07:18/19), `|| true` swallowed it as a quiet "skipped", and 20,571
+    # sats sat stranded until swept by hand from the work dir's account number.
+    SWEEP_OUT="$(APP_KEY="$MAIN_KEY" "$APP" sweep "$STORE" "$BASE" "$FUND_ADDR" 1.0 2>&1 || true)"
     if echo "$SWEEP_OUT" | grep -q "^cli: sweep txid="; then
         pass "swept app identity ($A_ADDR) leftovers back to the gift wallet"
     else
@@ -1319,9 +1327,9 @@ if [[ "$NETWORK" == testnet4 ]]; then
         fi
     fi
 
-    for pair in "spending-wallet notebook ($FU_ADDR):$FU_STORE" "multi-recipient funder:$MFU_STORE"; do
-        label="${pair%%:*}"; s_store="${pair#*:}"
-        SW_OUT="$("$APP" sweep "$s_store" "$BASE" "$FUND_ADDR" 1.0 2>&1 || true)"
+    for triple in "spending-wallet notebook ($FU_ADDR):$FU_STORE:$FU_KEY" "multi-recipient funder:$MFU_STORE:$MFU_KEY"; do
+        label="${triple%%:*}"; rest="${triple#*:}"; s_store="${rest%%:*}"; s_key="${rest#*:}"
+        SW_OUT="$(APP_KEY="$s_key" "$APP" sweep "$s_store" "$BASE" "$FUND_ADDR" 1.0 2>&1 || true)"
         if echo "$SW_OUT" | grep -q "^cli: sweep txid="; then
             pass "swept $label leftovers back to the gift wallet"
         else

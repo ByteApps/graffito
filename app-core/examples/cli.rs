@@ -611,6 +611,16 @@ fn main() {
             let mut store = load(&args[2]);
             let net = network(&store.network.clone());
             let ident = identity(net);
+            // Refuse to sign another identity's coins: a store whose address
+            // is not the one APP_KEY/APP_ACCOUNT/APP_INDEX derive would get
+            // its taproot inputs signed with the wrong key — bitcoind rejects
+            // that as "Invalid Schnorr signature", which the e2e's `|| true`
+            // cleanup once swallowed as a quiet "skipped" (2026-09-06).
+            assert_eq!(
+                store.address, ident.address,
+                "cli: {} belongs to {} but the env derives {} — wrong APP_KEY/APP_ACCOUNT/APP_INDEX for this store",
+                args[2], store.address, ident.address
+            );
             let private = match args[4].as_str() {
                 "private" => true,
                 "public" => false,
@@ -656,6 +666,16 @@ fn main() {
             let mut store = load(&args[2]);
             let net = network(&store.network.clone());
             let ident = identity(net);
+            // Refuse to sign another identity's coins: a store whose address
+            // is not the one APP_KEY/APP_ACCOUNT/APP_INDEX derive would get
+            // its taproot inputs signed with the wrong key — bitcoind rejects
+            // that as "Invalid Schnorr signature", which the e2e's `|| true`
+            // cleanup once swallowed as a quiet "skipped" (2026-09-06).
+            assert_eq!(
+                store.address, ident.address,
+                "cli: {} belongs to {} but the env derives {} — wrong APP_KEY/APP_ACCOUNT/APP_INDEX for this store",
+                args[2], store.address, ident.address
+            );
             let dest = app_core::notes_core::address::Recipient::parse(net, &args[4])
                 .expect("dest address");
             let rate: f64 = args[5].parse().expect("fee rate");
