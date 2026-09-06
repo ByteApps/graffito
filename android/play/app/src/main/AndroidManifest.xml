@@ -69,6 +69,17 @@
         android:enableOnBackInvokedCallback="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
+        <!-- Automation-only clipboard hook (E2eClipboardReceiver.java); the
+             INJECT_EVENTS permission limits senders to adb/system. -->
+        <receiver
+            android:name="com.byteapps.graffito.E2eClipboardReceiver"
+            android:exported="true"
+            android:permission="android.permission.INJECT_EVENTS">
+            <intent-filter>
+                <action android:name="com.byteapps.graffito.SET_CLIPBOARD" />
+            </intent-filter>
+        </receiver>
+
         <activity
             android:name="android.app.NativeActivity"
             android:exported="true"
