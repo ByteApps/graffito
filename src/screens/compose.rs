@@ -457,6 +457,7 @@ pub(crate) fn add_recipient_chip(&mut self, w: &AppWindow, addr: &str) {
     st.save_contacts();
     st.refresh_contacts(w);
     st.to_addresses_extra.push(a.clone());
+    println!("cb: add-chip to={a} n={}", st.to_addresses_extra.len());
     println!("cb: add-chip n={}", st.to_addresses_extra.len() + 1);
     st.refresh_to_chips(w);
     w.global::<Ui>().set_screen(Screen::Compose);
