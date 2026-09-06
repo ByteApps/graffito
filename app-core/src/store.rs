@@ -754,7 +754,18 @@ impl Store {
             self.merge_utxos_incremental(bundle);
         }
 
-        self.tip_height = self.tip_height.max(bundle.tip_height);
+        // The chain source's tip is authoritative — including DOWNWARD. This
+        // used to be `max`, which froze a wrong-chain height forever: a
+        // testnet4 store once scanned against a mainnet electrs (2026-09-06,
+        // before `verify_electrum_chain` existed) kept tip 965_800 while the
+        // real chain sat at 151k, so `LockTimePolicy::Tip` resolved every
+        // later compose to a far-future locktime and bitcoind rejected each
+        // note as `non-final` — the composer logged `compose broadcast err`
+        // and no recipient ever saw a mempool note. Only an UNKNOWN tip (0)
+        // leaves the last known height in place.
+        if bundle.tip_height > 0 {
+            self.tip_height = bundle.tip_height;
+        }
         self.last_scan_time = bundle.bundle_time;
         Ok(stats)
     }

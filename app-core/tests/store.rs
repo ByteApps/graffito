@@ -1736,3 +1736,27 @@ fn pq_self_note_unlock_is_view_only_and_never_persists() {
 fn classify_version_bumped_for_self_pw_notes() {
     assert_eq!(app_core::store::CLASSIFY_VERSION, 5);
 }
+
+/// A store whose tip was stamped by a scan against the WRONG chain must take
+/// the next scan's tip verbatim, even when it is LOWER. Found live
+/// 2026-09-06: a testnet4 identity pointed at a mainnet electrs took tip
+/// 965_800 (testnet4 was at ~151k); the old `max` rule kept it there for good,
+/// every later compose resolved `LockTimePolicy::Tip` to that far-future
+/// height, and bitcoind rejected each note as `non-final` — which is what
+/// "the Electrum recipient never sees the note" actually was.
+#[test]
+fn scan_tip_corrects_downward_after_a_wrong_chain_scan() {
+    let a = alice();
+    let mut store = Store::new(&a.output_x, NET);
+    store.apply_bundle(&bundle(vec![], vec![], 965_800), &a, NET, &[], &[], &[]).unwrap();
+    assert_eq!(store.tip_height, 965_800);
+    assert_eq!(store.lock_time(), 965_800, "policy `tip` puts the last scanned height on the wire");
+
+    store.apply_bundle(&bundle(vec![], vec![], 151_298), &a, NET, &[], &[], &[]).unwrap();
+    assert_eq!(store.tip_height, 151_298, "the chain source's tip is authoritative, downward too");
+    assert_eq!(store.lock_time(), 151_298, "so the next compose is final again");
+
+    // An UNKNOWN tip (0) never clobbers a known height.
+    store.apply_bundle(&bundle(vec![], vec![], 0), &a, NET, &[], &[], &[]).unwrap();
+    assert_eq!(store.tip_height, 151_298);
+}
