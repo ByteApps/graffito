@@ -2330,12 +2330,14 @@ pub(crate) fn on_pq_generate_passphrase(&mut self, w: &AppWindow) {
 pub(crate) fn on_pq_passphrase_changed(&mut self, w: &AppWindow, text: SharedString) {
         let text = text.to_string();
         self.pq_passphrase_verified = self.pq_passphrase_generated.as_deref() == Some(text.as_str());
+        println!("cb: pq-passphrase len={} verified={}", text.chars().count(), self.pq_passphrase_verified);
         self.refresh_compose(w);
     }
 
 pub(crate) fn on_pq_mlkem_toggled(&mut self, w: &AppWindow, on: bool) {
         self.pq_mlkem_user_off = !on;
         self.save_config();
+        println!("cb: pq-mlkem {}", if on { "on" } else { "off" });
         self.refresh_compose(w);
     }
 
@@ -2355,6 +2357,7 @@ pub(crate) fn on_pq_mlkem_toggled(&mut self, w: &AppWindow, on: bool) {
     }
 
 pub(crate) fn on_pq_panel_toggled(&mut self, w: &AppWindow, opened: bool) {
+        println!("cb: pq-panel {}", if opened { "open" } else { "closed" });
         if opened {
             self.ensure_pq_imported_loaded();
             self.refresh_compose(w);
@@ -2784,6 +2787,18 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
             pq_pw_cost: self.pq_pw_cost,
             pq_mlkem,
         };
+        // The security shape of what is about to be sealed — the e2e
+        // suites assert on it (private/public, directed/multi, pw layer +
+        // its cost, ML-KEM level) instead of reading the form.
+        println!(
+            "cb: compose-request private={} directed={} recipients={} pw={} cost={} mlkem={}",
+            req.private,
+            req.recipient.is_some(),
+            req.recipient.is_some() as usize + req.extra_recipients.len(),
+            req.pq_password.is_some(),
+            req.pq_pw_cost.as_str(),
+            req.pq_mlkem.as_ref().map(|(alg, _)| format!("{alg:?}")).unwrap_or_else(|| "none".into()),
+        );
         let Some(store) = self.store.as_ref() else {
             w.global::<Ui>().set_status("no store".into());
             return;

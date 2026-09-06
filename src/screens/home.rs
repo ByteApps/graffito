@@ -119,7 +119,7 @@ impl State {
 pub(crate) fn on_open_note(&mut self, w: &AppWindow, id: SharedString) {
         let Some(store) = &self.store else { return };
         if let Some(n) = store.notes.iter().find(|n| n.note_id.as_str() == id.as_str()) {
-            println!("cb: open-note id={} status={:?}", n.note_id, n.status);
+            println!("cb: open-note id={} status={:?} decrypted={}", n.note_id, n.status, n.text.is_some());
             let watch = self.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
             // PLAN-pnte-redesign.md: the note id IS the txid now (64 hex
             // chars, not the old synthetic hex8) — the inline "id:" quick-
