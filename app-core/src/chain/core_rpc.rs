@@ -1721,17 +1721,26 @@ impl CoreRpcTransport {
         // here (RPC error, missing field) falls back to the network's
         // universal default of 1 sat/vB — never 0, which would make the
         // floor a no-op and let a degenerate real estimate of 0.0 through.
-        let relay_min = self
-            .rpc(None, "getmempoolinfo", serde_json::json!([]))
-            .ok()
+        let mempool_info = self.rpc(None, "getmempoolinfo", serde_json::json!([])).ok();
+        let relay_min = mempool_info
+            .as_ref()
             .and_then(|v| v.get("mempoolminfee").and_then(|f| f.as_f64()))
             .map(btc_per_kvb_to_sat_vb)
             .unwrap_or(1);
+        // `bytes` is the mempool's total VIRTUAL size (Core's field name
+        // predates segwit); `loaded` says mempool.dat has been read at start.
+        let mempool_vbytes = mempool_info.as_ref().and_then(|v| v.get("bytes").and_then(|b| b.as_u64()));
+        let mempool_loaded = mempool_info
+            .as_ref()
+            .and_then(|v| v.get("loaded").and_then(|b| b.as_bool()))
+            .unwrap_or(false);
         let fastest = sat_vb(1).unwrap_or(FASTEST_FALLBACK_SAT_VB);
         let half_hour = sat_vb(3).unwrap_or(HALF_HOUR_FALLBACK_SAT_VB);
         let hour = sat_vb(6).unwrap_or(HOUR_FALLBACK_SAT_VB);
         let economy = sat_vb(144).unwrap_or(ECONOMY_FALLBACK_SAT_VB);
         let (fastest, half_hour, hour, economy) = clamp_fee_tiers(fastest, half_hour, hour, economy, relay_min);
+        let (fastest, half_hour, hour, economy) =
+            quiet_mempool_tiers((fastest, half_hour, hour, economy), mempool_vbytes, mempool_loaded, relay_min);
         Ok(serde_json::json!({
             "fastestFee": fastest,
             "halfHourFee": half_hour,
@@ -1797,6 +1806,41 @@ fn clamp_fee_tiers(fastest: u64, half_hour: u64, hour: u64, economy: u64, floor:
     let hour = hour.min(half_hour);
     let economy = economy.min(hour);
     (fastest.max(floor), half_hour.max(floor), hour.max(floor), economy.max(floor))
+}
+
+/// One block's worth of virtual bytes — the threshold below which a
+/// mempool cannot fill the next block, so nothing in it competes for
+/// space and next-block inclusion costs the relay floor.
+const BLOCK_VBYTES: u64 = 1_000_000;
+
+/// Quiet-mempool sanity for `estimatesmartfee` (2026-09-06): the estimator
+/// answers from CONFIRMED-block fee history, not from what is waiting now,
+/// and on a chain like testnet4 that history is dominated by spam paid at
+/// hundreds of sat/vB while the mempool holds a handful of 1 sat/vB
+/// transactions — the Pi node answered 376 sat/vB for every target with 6
+/// transactions pending (live, 2026-09-05), and the app's tiers repeated
+/// it. mempool.space's tiers come from projecting the mempool into blocks
+/// instead, which is why the same chain shows 1–2 sat/vB there: when the
+/// whole mempool fits in one block, nothing outbids anything and every
+/// tier is the relay floor. This applies that one rule — every tier
+/// becomes `floor` when the node reports a LOADED mempool (mempool.dat
+/// read — a node that just started with an empty pool is not evidence of a
+/// quiet network) smaller than [`BLOCK_VBYTES`]. Anything else (a busy
+/// mempool, an unknown size, an unloaded pool) leaves the estimator's tiers
+/// as they are. Never raises a tier.
+fn quiet_mempool_tiers(
+    tiers: (u64, u64, u64, u64),
+    mempool_vbytes: Option<u64>,
+    mempool_loaded: bool,
+    floor: u64,
+) -> (u64, u64, u64, u64) {
+    match mempool_vbytes {
+        Some(vb) if mempool_loaded && vb < BLOCK_VBYTES => {
+            let floor = floor.max(1);
+            (tiers.0.min(floor), tiers.1.min(floor), tiers.2.min(floor), tiers.3.min(floor))
+        }
+        _ => tiers,
+    }
 }
 
 impl Transport for CoreRpcTransport {
@@ -2190,6 +2234,29 @@ mod tests {
     #[test]
     fn sat_vb_conversion_constant_is_exactly_100_000() {
         assert_eq!(SAT_VB_PER_BTC_PER_KVB, 100_000.0);
+    }
+
+    /// The live 2026-09-05 testnet4 shape: 376 sat/vB from every target,
+    /// six transactions in a loaded mempool → every tier is the relay floor.
+    #[test]
+    fn quiet_mempool_collapses_stale_estimator_tiers_to_the_relay_floor() {
+        assert_eq!(quiet_mempool_tiers((376, 376, 376, 376), Some(6172), true, 1), (1, 1, 1, 1));
+        // A raised dynamic floor is honoured, never undercut.
+        assert_eq!(quiet_mempool_tiers((376, 376, 376, 376), Some(6172), true, 3), (3, 3, 3, 3));
+    }
+
+    #[test]
+    fn quiet_mempool_rule_never_raises_a_tier() {
+        assert_eq!(quiet_mempool_tiers((1, 1, 1, 1), Some(0), true, 5), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn busy_unknown_or_unloaded_mempool_leaves_the_estimator_alone() {
+        let t = (40, 30, 20, 10);
+        assert_eq!(quiet_mempool_tiers(t, Some(BLOCK_VBYTES), true, 1), t, "a full block competes");
+        assert_eq!(quiet_mempool_tiers(t, Some(5_000_000), true, 1), t);
+        assert_eq!(quiet_mempool_tiers(t, None, true, 1), t, "no size, no opinion");
+        assert_eq!(quiet_mempool_tiers(t, Some(100), false, 1), t, "a fresh node's empty pool is not a quiet network");
     }
 
     #[test]
