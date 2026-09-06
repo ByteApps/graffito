@@ -1173,6 +1173,25 @@ impl CoreRpcTransport {
             self.watched.lock().expect("watched-address mutex poisoned").insert(address.to_string());
             return Ok(true);
         }
+        // Ask the NODE first (one cheap `getaddressinfo` on the shared watch
+        // wallet): the address may already be covered by a descriptor some
+        // OTHER identity/device imported, or by a range this process widened
+        // in an earlier run. Widening our own ranged families (below)
+        // re-runs `importdescriptors` with the seed birthday, and for an
+        // imported seed (birthday 0) every chunk is a full-chain rescan —
+        // on the 2026-09-05 cross-device e2e a directed compose to a
+        // foreign address turned into minutes of node rescans that blocked
+        // every device's scan, all for an address the node already knew.
+        self.ensure_watch_wallet()?;
+        if let RpcOutcome::Ok(info) =
+            self.call(Some(&Self::watch_wallet()), "getaddressinfo", serde_json::json!([address]))
+        {
+            if info.get("ismine").and_then(|v| v.as_bool()).unwrap_or(false) {
+                self.watched.lock().expect("watched-address mutex poisoned").insert(address.to_string());
+                GLOBAL_WATCH_CACHE.lock().expect("global watch-cache mutex poisoned").insert(cache_key);
+                return Ok(true);
+            }
+        }
         if self.ranged_lookup_or_widen(address)? {
             // Already imported (at configure time or just now, widened) —
             // cache the hit in `watched`/`GLOBAL_WATCH_CACHE` too so the
@@ -1182,7 +1201,6 @@ impl CoreRpcTransport {
             GLOBAL_WATCH_CACHE.lock().expect("global watch-cache mutex poisoned").insert(cache_key);
             return Ok(true);
         }
-        self.ensure_watch_wallet()?;
 
         // U6: idempotence AGAINST THE NODE, not process memory.
         // `getaddressinfo` is a stateless, authoritative answer to "did

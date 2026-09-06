@@ -2187,6 +2187,19 @@ pub fn run() {
 
     // EditOps global wiring — src/editops.rs (U4, PLAN-graffito-app-arch.md).
     editops::wire(&window);
+    // APP_NODE=<url> (dev/tests only, like APP_KEY/APP_NETWORK): apply a
+    // Bitcoin node at boot exactly as if typed into Settings — a `bitcoind+
+    // http://user:pass@host:port` URL carries the Core RPC creds inline
+    // (stored in the session/keychain per the persist switch, never in the
+    // URL). The cross-device e2e relaunches the Mac and the simulator with
+    // an in-memory keychain, so the creds are gone on every start; this
+    // puts them back without driving the Settings screen.
+    if let Ok(url) = std::env::var("APP_NODE") {
+        if !url.trim().is_empty() {
+            st.borrow_mut().on_set_node_address(&window, url.trim().into());
+        }
+    }
+
     // Capture-proof window while a secret is on screen (app.slint decides
     // which screens; this just applies it to the platform window).
     {
