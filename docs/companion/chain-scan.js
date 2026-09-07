@@ -40,10 +40,12 @@ const FLAG_CONT = 0x08;
 // flags bits 4-5: post-quantum sealing layers (notes-core/src/pq.rs) — an
 // Argon2id password layer (FLAG_PW) and/or an ML-KEM layer (FLAG_MLKEM),
 // on a PRIVATE note, directed or (since 2026-08-22, the self-pq
-// extension) not. The browser can never decrypt any private body, so a
-// pq note renders the same encrypted placeholder as any other private
-// note — these bits only need to be DECODABLE here, or the viewer would
-// drop pq notes as foreign data instead of showing the placeholder.
+// extension) not — and since 2026-09-06 (PLAN-graffito-multi-pq.md) ALSO
+// on a FLAG_MULTI note (the prior MULTI-vs-pq exclusion is lifted). The
+// browser can never decrypt any private body, so a pq note (multi or not)
+// renders the same encrypted placeholder as any other private note —
+// these bits only need to be DECODABLE here, or the viewer would drop pq
+// notes as foreign data instead of showing the placeholder.
 const FLAG_PW = 0x10;
 const FLAG_MLKEM = 0x20;
 // Every flag bit this decoder understands — any other set bit (6-7, or
@@ -136,11 +138,15 @@ function parseHeader(payload) {
   if (flags & ~KNOWN_FLAGS) return null; // unassigned bits
   const multi = (flags & FLAG_MULTI) !== 0;
   if (multi && (flags & FLAG_DIRECTED) === 0) return null;
-  // pq bits require FLAG_PRIVATE and exclude FLAG_MULTI (envelope.rs
-  // validate_pq — DIRECTED is optional since the self-pq extension).
+  // pq bits require FLAG_PRIVATE (envelope.rs validate_pq — DIRECTED is
+  // optional since the self-pq extension). Since 2026-09-06
+  // (PLAN-graffito-multi-pq.md) pq bits are ALSO valid together with
+  // FLAG_MULTI — the prior exclusion here is LIFTED to match. The browser
+  // still never decrypts any private body (multi or not), so this only
+  // needs to keep the combination DECODABLE, not render it any
+  // differently — see the FLAG_PW/FLAG_MLKEM doc comment above.
   if (flags & (FLAG_PW | FLAG_MLKEM)) {
     if ((flags & FLAG_PRIVATE) === 0) return null;
-    if (multi) return null;
   }
   let idx = 7;
   let multiCount = null;

@@ -667,6 +667,7 @@ fn reply_set_unit() {
         text: Some("hi".into()),
         pq_flags: 0,
         locked: None,
+        locked_multi: None,
     };
     // I'm B: sender A plus the OTHER recipient C, not myself.
     let set = reply_set(&note, &b.address(NET));

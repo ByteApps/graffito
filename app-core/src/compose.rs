@@ -8,13 +8,14 @@
 use notes_core::address::Recipient;
 use notes_core::address::address_to_script_pubkey;
 use notes_core::bundle::{
-    compose_directed_note_multi_exact, compose_directed_note_multi_with_change,
+    compose_directed_note_multi_exact, compose_directed_note_multi_pq_exact,
+    compose_directed_note_multi_pq_with_change, compose_directed_note_multi_with_change,
     compose_directed_note_pq_exact_amount, compose_directed_note_pq_with_change_amount,
     compose_directed_note_with_change_amount, compose_note_exact, compose_note_pq_exact,
     compose_note_pq_with_change, compose_note_with_change, Identity,
 };
 use notes_core::keys::generate_aux_rand;
-use notes_core::pq::{LockedBody, PwLayer, SealLayers};
+use notes_core::pq::{LockedBody, MlKemAlg, MultiSealLayers, PwLayer, SealLayers};
 use notes_core::tx::{op_return_payload, outpoint_bytes, NoteTx};
 use notes_core::Network;
 use zeroize::Zeroize;
@@ -118,20 +119,27 @@ pub struct ComposeRequest<'a> {
     /// (`notes_core::pq::PwCost`) — ignored otherwise. The UI's per-note
     /// choice; default [`notes_core::pq::PwCost::DEFAULT`].
     pub pq_pw_cost: notes_core::pq::PwCost,
-    /// Post-quantum: an ML-KEM hybrid layer. For a DIRECTED note, sealed to
-    /// the recipient's encapsulation key — `(alg, ek_bytes)`; the caller
-    /// resolves `ek` (from a `Contact::mlkem_ek` or a freshly imported key)
-    /// before calling. For a SELF-note, the caller MUST pass an imported/
-    /// randomly-generated quantum key living outside the seed tree — NEVER
-    /// the notebook's own seed-derived receive key
-    /// (`pqkeys::derive_keypair`/`mlkem_keypair_from_leaf`), which shares
-    /// the same leaf secret as the enc key it would be layered over and so
-    /// buys nothing (notes-core's `pq.rs` "Self-note pq layers" doc calls
-    /// this out explicitly — this module cannot enforce it, since it never
-    /// sees which key the caller resolved). Same single-recipient-directed-
-    /// or-self requirement as `pq_password`, and the two compose together
-    /// (hybrid, never exclusive). `None` = no ML-KEM layer.
-    pub pq_mlkem: Option<(notes_core::pq::MlKemAlg, Vec<u8>)>,
+    /// Post-quantum: an ML-KEM hybrid layer, PER RECIPIENT (2026-09-06,
+    /// PLAN-graffito-multi-pq.md — was a single `(alg, ek)` before multi-
+    /// recipient pq notes existed). `None` = no ML-KEM layer at all.
+    /// `Some(v)` must carry EXACTLY one `(alg, ek_bytes)` per directed
+    /// recipient (`req.recipient` + `req.extra_recipients`, in that same
+    /// order — one entry for a single-recipient note, `1 + extras.len()`
+    /// for a multi-recipient one) — mixed levels across recipients are
+    /// allowed. On a SELF-note (no recipient) `v` must hold exactly ONE
+    /// entry: the caller MUST pass an imported/randomly-generated quantum
+    /// key living outside the seed tree — NEVER the notebook's own
+    /// seed-derived receive key (`pqkeys::derive_keypair`/
+    /// `mlkem_keypair_from_leaf`), which shares the same leaf secret as the
+    /// enc key it would be layered over and so buys nothing (notes-core's
+    /// `pq.rs` "Self-note pq layers" doc calls this out explicitly — this
+    /// module cannot enforce it, since it never sees which key the caller
+    /// resolved). The caller resolves each `ek` (from a `Contact::
+    /// mlkem_ek` or a freshly imported key) before calling. Composes with
+    /// `pq_password` (hybrid, never exclusive) on a private note of ANY
+    /// recipient count — `compose_note` errors on a length mismatch or a
+    /// non-private note rather than silently dropping a layer.
+    pub pq_mlkem: Option<Vec<(notes_core::pq::MlKemAlg, Vec<u8>)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -236,23 +244,58 @@ pub fn compose_note(
     // pq.rs): additive over the ordinary compose path, so this branches out
     // BEFORE the existing self/multi dispatch below rather than threading
     // pq state through it. Structural requirement mirrors notes-core's own
-    // `SealLayers`/envelope validity rule: a pq note is always private, and
-    // either single-recipient directed OR a self-note (no recipient) — no
-    // public/multi-recipient pq notes exist. `req.private` false, or a
-    // multi-recipient pick (`recipients.len() > 1`) with a pq layer set is
-    // refused loudly rather than silently dropping the layer.
+    // `SealLayers`/`MultiSealLayers`/envelope validity rule: a pq note is
+    // always private. Since 2026-09-06 (PLAN-graffito-multi-pq.md) a
+    // multi-recipient directed note may carry pq layers too — `pq_mlkem`,
+    // when set, must supply exactly one `(alg, ek)` per recipient (1 for a
+    // self-note or single-recipient directed note, `recipients.len()`
+    // otherwise); a length mismatch or a non-private note is refused
+    // loudly rather than silently dropping a layer.
     if req.pq_password.is_some() || req.pq_mlkem.is_some() {
-        if !req.private || recipients.len() > 1 {
-            return Err(Error::Store(
-                "post-quantum layers require a single-recipient directed or self private note".into(),
-            ));
+        if !req.private {
+            return Err(Error::Store("post-quantum layers require a private note".into()));
         }
+        let expected_eks = recipients.len().max(1);
+        if let Some(eks) = &req.pq_mlkem {
+            if eks.len() != expected_eks {
+                return Err(Error::Store(
+                    "pq_mlkem must supply exactly one key per recipient".into(),
+                ));
+            }
+        }
+        let pw_layer =
+            req.pq_password.as_deref().map(|password| PwLayer { password, cost: req.pq_pw_cost });
+
+        if recipients.len() >= 2 {
+            let eks_owned: Option<Vec<(MlKemAlg, &[u8])>> =
+                req.pq_mlkem.as_ref().map(|v| v.iter().map(|(a, ek)| (*a, ek.as_slice())).collect());
+            let pq_flags = MultiSealLayers { mlkem_eks: eks_owned.as_deref(), password: pw_layer }.flags();
+            let mut content_key = fresh_content_key()?;
+            let result = match &selected {
+                Some(ins) => compose_directed_note_multi_pq_exact(
+                    identity, ins, req.text, &recipients, eks_owned.as_deref(), pw_layer, content_key,
+                    change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
+                ),
+                None => compose_directed_note_multi_pq_with_change(
+                    identity, &utxos, req.text, &recipients, eks_owned.as_deref(), pw_layer, content_key,
+                    change_spk, store.chunk_size, req.fee_rate, lock_time, generate_aux_rand,
+                ),
+            };
+            content_key.zeroize();
+            let tx = result?;
+            return Ok(ComposedNote {
+                note_id: tx.txid_hex.clone(),
+                recipient_address,
+                recipients: recipient_addresses,
+                change_is_self: change_spk.is_none(),
+                pq_flags,
+                tx,
+            });
+        }
+
         let layers = SealLayers {
-            mlkem_ek: req.pq_mlkem.as_ref().map(|(alg, ek)| (*alg, ek.as_slice())),
-            password: req
-                .pq_password
-                .as_deref()
-                .map(|password| PwLayer { password, cost: req.pq_pw_cost }),
+            mlkem_ek: req.pq_mlkem.as_ref().and_then(|v| v.first()).map(|(alg, ek)| (*alg, ek.as_slice())),
+            password: pw_layer,
         };
         let pq_flags = layers.flags();
         if let Some((recipient, gift)) = recipients.first() {
@@ -437,8 +480,11 @@ pub fn record_composed_note(
         // later (see above); a self-pq note is locked from the start.
         // `locked` is otherwise only ever populated for a RECEIVED pq note
         // the scanner couldn't decrypt yet (see `Store::apply_bundle`/
-        // `unlock_note`).
+        // `unlock_note`). Multi-recipient pq notes we compose ourselves are
+        // in the exact same "we hold the plaintext already" boat as a
+        // directed one — `locked_multi` is likewise never populated here.
         locked,
+        locked_multi: None,
     };
     store.record_signed(record, change_utxo);
 

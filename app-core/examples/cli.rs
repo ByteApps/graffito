@@ -86,6 +86,15 @@ fn open_client_watched(base: &str, network: Network, material: &str, account: u3
     client
 }
 
+/// A trailing-args flag token for the `compose`/`note-spend-funded-multi`
+/// pq option parsing below — an EXACT match, never a `--`-prefix check: an
+/// armored ML-KEM public key itself starts with `-----BEGIN ...` (5
+/// dashes), which a generic prefix check would misread as a flag the
+/// instant the FIRST armor value was reached.
+fn is_flag(s: &str) -> bool {
+    s == "--mlkem" || s == "--password"
+}
+
 fn load(path: &str) -> Store {
     Store::load(std::path::Path::new(path)).expect("store load")
 }
@@ -250,9 +259,21 @@ fn main() {
             }
             let client = open_client_watched(&args[3], net, &key, account);
             let bundle = client.build_bundle(&store.address, None).expect("build bundle");
+            // ML-KEM auto-unlock (single- and multi-recipient pq notes,
+            // PLAN-graffito-multi-pq.md): this identity's own notebook-leaf-
+            // derived secret set at all three levels — the same union
+            // `app-core/src/pqkeys.rs::derive_secrets`'s doc describes,
+            // mirroring what `State::mlkem_secrets_for` hands the app's own
+            // scan. Password-flagged notes are never auto-unlocked here
+            // (passwords are never stored) — those stay `locked` for a
+            // separate explicit `Store::unlock_note` call.
+            let mlkem_secrets: Vec<notes_core::pq::MlKemSecret> = ident
+                .leaf_secret()
+                .map(app_core::pqkeys::derive_secrets)
+                .unwrap_or_default();
             let stats = match ident.full() {
                 Some(id) => store
-                    .apply_bundle(&bundle, id, net, &notebook_spks, &spending_window, &[])
+                    .apply_bundle(&bundle, id, net, &notebook_spks, &spending_window, &mlkem_secrets)
                     .expect("apply"),
                 None => store
                     .apply_bundle_watch(&bundle, &ident.output_x(), net, &notebook_spks, &spending_window)
@@ -606,8 +627,42 @@ fn main() {
                 );
             }
         }
+        Some("note-unlock") => {
+            // note-unlock <store.json> <txid> [password]
+            // Explicit unlock of a pq-locked note (PLAN-graffito-multi-pq.md):
+            // `scan`'s auto-unlock only ever tries ML-KEM alone (never a
+            // password, which is never stored — see `apply_bundle`'s doc);
+            // this is the CLI's `Store::unlock_note` door for everything
+            // else (password-only, or password+ML-KEM together, single- or
+            // multi-recipient) — this identity's OWN derived ML-KEM secret
+            // set is tried automatically alongside whatever password is
+            // given, exactly like `scan`'s auto-unlock set.
+            let mut store = load(&args[2]);
+            let net = network(&store.network.clone());
+            let ident = identity(net);
+            let id = ident.expect_full();
+            let txid = &args[3];
+            let password = args.get(4).map(String::as_str);
+            let secrets: Vec<notes_core::pq::MlKemSecret> = ident
+                .leaf_secret()
+                .map(app_core::pqkeys::derive_secrets)
+                .unwrap_or_default();
+            let text = store.unlock_note(txid, id, &secrets, password).expect("unlock");
+            save(&store, &args[2]);
+            println!("cli: unlock-note id={txid} text={text}");
+        }
         Some("compose") => {
-            // compose <store.json> <base-url> <public|private> <fee_rate> <text> [to_addr]
+            // compose <store.json> <base-url> <public|private> <fee_rate> <text> [to_addr] [extra2] [extra3...]
+            //   [--mlkem <armor1> <armor2> ...] [--password <pw> [cost]]
+            // Notebook-funded (identity's OWN taproot coin) — unlike
+            // `note-spend-funded-multi`, this always leaves a taproot first
+            // input, so a received-side pq scan's single-candidate sender_x
+            // resolution (LockedBody/MultiLockedBody's documented
+            // "candidate, not proven" convention) always succeeds. 2+
+            // recipient addresses route through the SAME multi-recipient
+            // dispatch `compose_note` already has; pq flags follow
+            // `ComposeRequest::pq_mlkem`'s per-recipient shape
+            // (PLAN-graffito-multi-pq.md, 2026-09-06).
             let mut store = load(&args[2]);
             let net = network(&store.network.clone());
             let ident = identity(net);
@@ -627,7 +682,51 @@ fn main() {
                 other => panic!("visibility must be public|private, got {other}"),
             };
             let fee_rate: f64 = args[5].parse().expect("fee rate");
-            let to = args.get(7).map(String::as_str);
+
+            let mut i = 7;
+            let mut recip_addrs: Vec<&str> = Vec::new();
+            while i < args.len() && !is_flag(&args[i]) {
+                recip_addrs.push(args[i].as_str());
+                i += 1;
+            }
+            let to = recip_addrs.first().copied();
+            let extra_recipients: Vec<&str> = recip_addrs.get(1..).map(<[&str]>::to_vec).unwrap_or_default();
+
+            let mut mlkem_armors: Vec<&str> = Vec::new();
+            let mut password: Option<&str> = None;
+            let mut pw_cost = app_core::notes_core::pq::PwCost::DEFAULT;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--mlkem" => {
+                        i += 1;
+                        while i < args.len() && !is_flag(&args[i]) {
+                            mlkem_armors.push(args[i].as_str());
+                            i += 1;
+                        }
+                    }
+                    "--password" => {
+                        i += 1;
+                        password = Some(args.get(i).expect("--password needs a value").as_str());
+                        i += 1;
+                        if i < args.len() && !is_flag(&args[i]) {
+                            pw_cost = app_core::notes_core::pq::PwCost::parse(&args[i])
+                                .unwrap_or_else(|| panic!("unknown pw cost {}", args[i]));
+                            i += 1;
+                        }
+                    }
+                    other => panic!("compose: unknown flag {other}"),
+                }
+            }
+            let expected_eks = recip_addrs.len().max(1);
+            if !mlkem_armors.is_empty() {
+                assert_eq!(mlkem_armors.len(), expected_eks, "--mlkem needs exactly one armor per recipient");
+            }
+            let mlkem_pairs: Vec<(app_core::notes_core::pq::MlKemAlg, Vec<u8>)> = mlkem_armors
+                .iter()
+                .map(|a| app_core::notes_core::pq::import_public(a).expect("--mlkem: bad armor"))
+                .collect();
+            let pq_mlkem = (!mlkem_pairs.is_empty()).then_some(mlkem_pairs);
+
             let composed = compose_and_record(
                 &mut store,
                 ident.expect_full(),
@@ -635,7 +734,7 @@ fn main() {
                 &ComposeRequest {
                     text: &args[6],
                     private,
-                    recipient: to, extra_recipients: &[],
+                    recipient: to, extra_recipients: &extra_recipients,
                     change_to: None,
                     coins: None,
                     fee_rate,
@@ -643,7 +742,7 @@ fn main() {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
-                    pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None,
+                    pq_password: password.map(String::from), pq_pw_cost: pw_cost, pq_mlkem,
                 },
             )
             .expect("compose");
@@ -652,12 +751,13 @@ fn main() {
             let txid = client.broadcast(&composed.tx.raw_hex).expect("broadcast");
             assert_eq!(txid, composed.tx.txid_hex, "endpoint echoed a different txid");
             println!(
-                "cli: compose id={} txid={} fee={} vsize={} to={} private={} broadcast=ok",
+                "cli: compose id={} txid={} fee={} vsize={} to={} recipients={} private={} broadcast=ok",
                 composed.note_id,
                 composed.tx.txid_hex,
                 composed.tx.fee,
                 composed.tx.vsize,
                 to.unwrap_or("self"),
+                recip_addrs.len(),
                 private,
             );
         }
@@ -966,6 +1066,7 @@ fn main() {
         }
         Some("note-spend-funded-multi") => {
             // note-spend-funded-multi <store.json> <base-url> <public|private> <rate> <gift> <text> <to1> <to2> [to3...]
+            //   [--mlkem <armor1> <armor2> ...] [--password <pw> [cost]]
             // Multi-all-paths e2e substitute (2026-07-19): the same fully
             // in-app spending-wallet-funded shape as `note-spend-funded`,
             // but to 2+ recipients via `build_funding_psbt_multi` — proves
@@ -976,6 +1077,15 @@ fn main() {
             // recipe — enable spending in Settings, faucet-fund the derived
             // spending address, drive the compose screen — is much heavier
             // than the notebook-funded leg it already covers).
+            //
+            // Post-quantum layers (PLAN-graffito-multi-pq.md, 2026-09-06):
+            // `--mlkem <armor1> <armor2> ...` supplies one recipient's
+            // exported public armor (`pq-public`'s stdout) per recipient,
+            // IN THE SAME ORDER as the recipient addresses — mixed levels
+            // allowed. `--password <pw> [standard|strong|maximum]` seals a
+            // shared Argon2id block (default: strong). Either or both may
+            // be given; recipients-only remains byte-identical to before
+            // these flags existed.
             let store = load(&args[2]);
             let net = network(&store.network.clone());
             let ident = identity(net);
@@ -991,11 +1101,59 @@ fn main() {
             let fee_rate: f64 = args[5].parse().expect("fee rate");
             let gift: u64 = args[6].parse().expect("gift sats");
             let text = args[7].clone();
-            let to_addrs: Vec<&str> = args[8..].iter().map(String::as_str).collect();
+
+            // Recipient addresses run until the first known flag token
+            // (`is_flag` — never a generic `--` prefix check, see its doc).
+            let mut i = 8;
+            let mut to_addrs: Vec<&str> = Vec::new();
+            while i < args.len() && !is_flag(&args[i]) {
+                to_addrs.push(args[i].as_str());
+                i += 1;
+            }
             assert!(to_addrs.len() >= 2, "note-spend-funded-multi needs at least 2 recipient addresses");
+
+            let mut mlkem_armors: Vec<&str> = Vec::new();
+            let mut password: Option<&str> = None;
+            let mut pw_cost = app_core::notes_core::pq::PwCost::DEFAULT;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--mlkem" => {
+                        i += 1;
+                        while i < args.len() && !is_flag(&args[i]) {
+                            mlkem_armors.push(args[i].as_str());
+                            i += 1;
+                        }
+                    }
+                    "--password" => {
+                        i += 1;
+                        password = Some(args.get(i).expect("--password needs a value").as_str());
+                        i += 1;
+                        if i < args.len() && !is_flag(&args[i]) {
+                            pw_cost = app_core::notes_core::pq::PwCost::parse(&args[i])
+                                .unwrap_or_else(|| panic!("unknown pw cost {}", args[i]));
+                            i += 1;
+                        }
+                    }
+                    other => panic!("note-spend-funded-multi: unknown flag {other}"),
+                }
+            }
+
             let recipients = app_core::compose::parse_dedupe_recipients(net, to_addrs.first().copied(), &to_addrs[1..])
                 .expect("recipients parse");
             assert!(recipients.len() >= 2, "recipient addresses must be distinct to exercise the multi path");
+            if !mlkem_armors.is_empty() {
+                assert_eq!(
+                    mlkem_armors.len(), recipients.len(),
+                    "--mlkem needs exactly one armor per (deduped) recipient"
+                );
+            }
+            let mlkem_pairs: Vec<(app_core::notes_core::pq::MlKemAlg, Vec<u8>)> = mlkem_armors
+                .iter()
+                .map(|a| app_core::notes_core::pq::import_public(a).expect("--mlkem: bad armor"))
+                .collect();
+            let mlkem_eks: Option<Vec<(app_core::notes_core::pq::MlKemAlg, &[u8])>> =
+                (!mlkem_pairs.is_empty()).then(|| mlkem_pairs.iter().map(|(a, ek)| (*a, ek.as_slice())).collect());
+            let pw_layer = password.map(|password| app_core::notes_core::pq::PwLayer { password, cost: pw_cost });
 
             let source = app_core::spending::funding_source(&material, net, account)
                 .expect("spending wallet needs a BIP-39/master-xprv APP_KEY");
@@ -1026,9 +1184,16 @@ fn main() {
                 max_op_return_bytes: store.chunk_size,
                 network: net,
             };
-            let built = app_core::psbt_build::build_funding_psbt_multi(&plan, &np, &recipients, gift, 0)
-                .expect("build multi-recipient funded note psbt");
+            let built = app_core::psbt_build::build_funding_psbt_multi_pq(
+                &plan, &np, &recipients, mlkem_eks.as_deref(), pw_layer, gift, 0,
+            )
+            .expect("build multi-recipient funded note psbt");
             assert_eq!(built.sent_to_recipient, gift * recipients.len() as u64, "uniform gift x N recipients");
+            eprintln!(
+                "cli: note-spend-funded-multi pq mlkem={} password={}",
+                !mlkem_pairs.is_empty(),
+                password.is_some(),
+            );
             let mut psbt = built.psbt.clone();
             let signed = app_core::psbt_build::sign_own_wpkh_inputs(
                 &mut psbt, &material, net, account, &scan.utxos,

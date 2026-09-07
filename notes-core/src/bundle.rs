@@ -346,6 +346,11 @@ pub struct RecoveredNote {
     /// [`extract_notes_pq`] for a convenience wrapper that also attempts
     /// auto-unlock.
     pub locked: Option<crate::pq::LockedBody>,
+    /// Multi-recipient analog of `locked` (PLAN-graffito-multi-pq.md,
+    /// 2026-09-06) — present instead of `locked` (never both) when
+    /// `decoded.multi_count` was `Some` on a pq-flagged note. See
+    /// [`crate::pq::MultiLockedBody`].
+    pub locked_multi: Option<crate::pq::MultiLockedBody>,
 }
 
 /// `{sender} ∪ recipients` minus `my_address`, deduped, sender first then
@@ -486,14 +491,32 @@ pub fn extract_notes_pq(
         if note.pq_flags != envelope::FLAG_MLKEM || !note.received {
             continue;
         }
-        let Some(locked) = note.locked.clone() else { continue };
-        for secret in mlkem_secrets {
-            if let Ok(pt) =
-                pq::unlock_received(&locked, &identity.tweaked_seckey, Some(secret), None)
-            {
-                if let Ok(s) = String::from_utf8(pt) {
-                    note.text = Some(s);
-                    break;
+        if let Some(locked) = note.locked.clone() {
+            for secret in mlkem_secrets {
+                if let Ok(pt) =
+                    pq::unlock_received(&locked, &identity.tweaked_seckey, Some(secret), None)
+                {
+                    if let Ok(s) = String::from_utf8(pt) {
+                        note.text = Some(s);
+                        break;
+                    }
+                }
+            }
+        } else if let Some(locked) = note.locked_multi.clone() {
+            // Multi-recipient analog: same "try every derived level" loop,
+            // via `pq::unlock_received_multi` (PLAN-graffito-multi-pq.md).
+            for secret in mlkem_secrets {
+                if let Ok(pt) = pq::unlock_received_multi(
+                    &locked,
+                    &identity.tweaked_seckey,
+                    &identity.output_x,
+                    Some(secret),
+                    None,
+                ) {
+                    if let Ok(s) = String::from_utf8(pt) {
+                        note.text = Some(s);
+                        break;
+                    }
                 }
             }
         }
@@ -637,15 +660,59 @@ fn extract_notes_inner(
         let outpoint = tx.first_input_outpoint.as_deref().and_then(parse_outpoint);
 
         // Post-quantum layer(s) (envelope::FLAG_PW/FLAG_MLKEM — pq.rs).
-        // Header validity (envelope.rs) guarantees these bits never appear
-        // together with FLAG_MULTI, and only on FLAG_PRIVATE|FLAG_DIRECTED
-        // notes — so `decoded.multi_count` is always `None` here and
-        // `directed`/`private` are always true. Extraction never attempts
-        // v1-style decryption on a pq note: it packages everything needed
-        // to unlock later (`pq::LockedBody`) instead. See
+        // Header validity (envelope.rs) guarantees these bits only appear
+        // on FLAG_PRIVATE notes; since 2026-09-06 (PLAN-graffito-multi-pq.md)
+        // they may ALSO combine with FLAG_MULTI, so `decoded.multi_count`
+        // can be `Some` here now. Extraction never attempts v1-style
+        // decryption on a pq note: it packages everything needed to unlock
+        // later (`pq::LockedBody`/`pq::MultiLockedBody`) instead. See
         // `RecoveredNote::locked`'s doc for the watch-only/keyed scope.
         let pq_body_flags = flags & (envelope::FLAG_PW | envelope::FLAG_MLKEM);
         if pq_body_flags != 0 {
+            if let Some(count) = decoded.multi_count {
+                // Multi-recipient pq note. `recipients` was populated above
+                // from the header count regardless of pq — reuse it.
+                let count = count as usize;
+                let locked_multi = keys.and_then(|identity| {
+                    let outpoint = outpoint?;
+                    let recipients_x: Vec<[u8; 32]> =
+                        recipients.iter().filter_map(|a| p2tr_x_of_address(network, a)).collect();
+                    if recipients_x.len() != count {
+                        return None; // malformed: not every output address parsed as taproot
+                    }
+                    // `sender_x` is a best-effort CANDIDATE, same convention
+                    // as the single-recipient case below — a wrong guess
+                    // simply fails to unlock later, never a crash.
+                    let sender_x = if received {
+                        sender.as_deref().and_then(|a| p2tr_x_of_address(network, a))?
+                    } else {
+                        identity.output_x
+                    };
+                    Some(crate::pq::MultiLockedBody {
+                        pq_flags: pq_body_flags,
+                        body: body.clone(),
+                        sender_x,
+                        recipients_x,
+                        outpoint,
+                    })
+                });
+                notes.push(RecoveredNote {
+                    id: tx.txid.clone(),
+                    height: tx.height,
+                    blocktime: tx.blocktime,
+                    private,
+                    directed,
+                    received,
+                    sender,
+                    recipient: if received { None } else { recipients.first().cloned() },
+                    recipients,
+                    text: None,
+                    pq_flags: pq_body_flags,
+                    locked: None,
+                    locked_multi,
+                });
+                continue;
+            }
             let locked = keys.and_then(|identity| {
                 let outpoint = outpoint?;
                 if !directed {
@@ -691,6 +758,7 @@ fn extract_notes_inner(
                 text: None,
                 pq_flags: pq_body_flags,
                 locked,
+                locked_multi: None,
             });
             continue;
         }
@@ -906,6 +974,7 @@ fn extract_notes_inner(
             text,
             pq_flags: 0,
             locked: None,
+            locked_multi: None,
         });
     }
     // Confirmed first, oldest first; unconfirmed last.
@@ -1679,6 +1748,219 @@ pub fn compose_directed_note_pq_exact_amount(
     build_note_tx_exact(
         inputs, &identity.output_x, &payloads, Some(&recipient.spk), recipient_amount,
         change_spk, fee_rate, lock_time, &identity.tweaked_seckey, aux,
+    )
+}
+
+// ---------------------------------------------------------------------
+// Post-quantum MULTI-recipient directed compose (PLAN-graffito-multi-pq.md,
+// 2026-09-06) — the pq analog of `compose_directed_note_multi_*` above,
+// hybrid over the same per-recipient dm.rs wraps (pq.rs `seal_multi_pq`).
+// Additive: none of the compose functions above are touched. PRIVATE-only
+// by construction, same as the single-recipient pq path.
+// ---------------------------------------------------------------------
+
+/// Build the FLAG_MULTI pq body: `pq::seal_multi_pq`'s framing (shared PW
+/// block, per-recipient `[kem_prefix?] || wrap`, sealed body) — the pq
+/// analog of [`multi_body`]. `mlkem_eks`, when `Some`, must have exactly
+/// `deduped.len()` entries, in the SAME order as `deduped`.
+#[allow(clippy::too_many_arguments)]
+fn multi_body_pq(
+    identity: &Identity,
+    text: &str,
+    outpoint: &[u8; 36],
+    deduped: &[&Recipient],
+    content_key: [u8; 32],
+    mlkem_eks: Option<&[(pq::MlKemAlg, &[u8])]>,
+    password: Option<pq::PwLayer>,
+) -> Result<(u8, Vec<u8>), Error> {
+    let recipients_x: Vec<[u8; 32]> =
+        deduped.iter().map(|r| r.p2tr_x.ok_or(Error::RecipientNotTaproot)).collect::<Result<_, _>>()?;
+    let layers = pq::MultiSealLayers { mlkem_eks, password };
+    pq::seal_multi_pq(
+        &identity.tweaked_seckey,
+        &identity.output_x,
+        &recipients_x,
+        outpoint,
+        &content_key,
+        text.as_bytes(),
+        layers,
+    )
+}
+
+/// Multi-recipient pq analog of [`sealed_note_payloads_multi`] — the
+/// payload-side primitive for externally-assembled (PSBT / mixed-source)
+/// multi-recipient pq notes (the spending-wallet-funded CLI/app path,
+/// `note-spend-funded-multi`). `recipients` are deduped by address (first
+/// occurrence wins); private + pq requires 2..=255 UNIQUE taproot
+/// recipients — a note this thin on recipients has no single-recipient pq
+/// delegation the way the plain multi path does, since a genuinely
+/// single-recipient pq note goes through [`compose_directed_note_pq_with_change_amount`]
+/// instead, which this function's callers are expected to route to
+/// themselves when `recipients` collapses to one unique address.
+#[allow(clippy::too_many_arguments)]
+pub fn sealed_note_payloads_multi_pq(
+    identity: &Identity,
+    text: &str,
+    recipients: &[Recipient],
+    mlkem_eks: Option<&[(pq::MlKemAlg, &[u8])]>,
+    password: Option<pq::PwLayer>,
+    outpoint: [u8; 36],
+    content_key: [u8; 32],
+    max_op_return_bytes: usize,
+) -> Result<(u8, SealedNotePayloadsMulti), Error> {
+    let mut deduped: Vec<&Recipient> = Vec::new();
+    for r in recipients {
+        if !deduped.iter().any(|existing| existing.address == r.address) {
+            deduped.push(r);
+        }
+    }
+    if deduped.len() < 2 {
+        return Err(Error::Envelope("pq multi requires 2..=255 unique recipients"));
+    }
+    if deduped.len() > 255 {
+        return Err(Error::Envelope("recipients: 1..=255"));
+    }
+    if let Some(eks) = mlkem_eks {
+        if eks.len() != deduped.len() {
+            return Err(Error::Envelope("pq: mlkem key count must match recipient count"));
+        }
+    }
+    let count = deduped.len() as u8;
+    let (pq_flags, body) =
+        multi_body_pq(identity, text, &outpoint, &deduped, content_key, mlkem_eks, password)?;
+    let flags = FLAG_DIRECTED | FLAG_MULTI | FLAG_PRIVATE | pq_flags;
+    let payloads = envelope::encode_outputs(flags, Some(count), &body, max_op_return_bytes)?;
+    Ok((pq_flags, (payloads, deduped.iter().map(|r| r.spk.clone()).collect())))
+}
+
+/// Multi-recipient pq analog of [`compose_directed_note_multi_with_change`]:
+/// like that function, but the shared private body is additionally sealed
+/// under one or both of `layers`' post-quantum extensions
+/// (`mlkem_eks`/`password`) — hybrid over the ordinary per-recipient dm.rs
+/// wraps, never replacing them. Two-phase, same reasoning as the
+/// single-recipient pq composer: selects inputs by LENGTH first
+/// (`pq::multi_pq_overhead` extends the usual per-recipient wrap
+/// accounting), then seals with the real first-input outpoint. Requires
+/// 2+ unique recipients (a collapsed single-recipient pq note goes through
+/// [`compose_directed_note_pq_with_change_amount`] instead — callers with
+/// exactly one address should call that directly; this function returns
+/// `Error::Envelope` rather than silently delegating, since the pq layers'
+/// shapes differ enough between the two paths — a single ML-KEM ek vs a
+/// per-recipient slice — that a silent delegation would need its own
+/// caller-facing type anyway).
+#[allow(clippy::too_many_arguments)]
+pub fn compose_directed_note_multi_pq_with_change(
+    identity: &Identity,
+    utxos: &[Utxo],
+    text: &str,
+    recipients: &[(Recipient, u64)],
+    mlkem_eks: Option<&[(pq::MlKemAlg, &[u8])]>,
+    password: Option<pq::PwLayer>,
+    content_key: [u8; 32],
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    lock_time: u32,
+    mut aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let deduped = dedupe_recipients(recipients)?;
+    if deduped.len() < 2 {
+        return Err(Error::Envelope(
+            "pq multi requires 2+ unique recipients — use compose_directed_note_pq_with_change_amount for one",
+        ));
+    }
+    if let Some(eks) = mlkem_eks {
+        if eks.len() != deduped.len() {
+            return Err(Error::Envelope("pq: mlkem key count must match recipient count"));
+        }
+    }
+    let layers_flags = (if mlkem_eks.is_some() { crate::envelope::FLAG_MLKEM } else { 0 })
+        | (if password.is_some() { crate::envelope::FLAG_PW } else { 0 });
+    if layers_flags == 0 {
+        return Err(Error::Envelope("pq compose requires at least one seal layer"));
+    }
+    let count = deduped.len() as u8;
+    let recips: Vec<&Recipient> = deduped.iter().map(|(r, _)| r).collect();
+    let recipient_pairs: Vec<(Vec<u8>, u64)> =
+        deduped.iter().map(|(r, amount)| (r.spk.clone(), *amount)).collect();
+    let algs: Option<Vec<pq::MlKemAlg>> = mlkem_eks.map(|e| e.iter().map(|(a, _)| *a).collect());
+    let flags_guess = FLAG_DIRECTED | FLAG_MULTI | FLAG_PRIVATE | layers_flags;
+    let recipient_lens: Vec<usize> = recipient_pairs.iter().map(|(spk, _)| spk.len()).collect();
+    let sent: u64 = recipient_pairs.iter().map(|(_, a)| a).sum();
+    let overhead = pq::multi_pq_overhead(layers_flags, algs.as_deref());
+    let body_len = deduped.len() * dm::WRAP_LEN + text.len() + crypt::SEAL_OVERHEAD + overhead;
+    let payload_lens = envelope::payload_lens_for(flags_guess, Some(count), body_len, max_op_return_bytes)?;
+    let selected = select_note_inputs_multi(utxos, &payload_lens, &recipient_lens, sent, fee_rate)?;
+    let outpoint = outpoint_bytes(selected.first().ok_or(Error::InsufficientFunds)?);
+    let (pq_flags, body) =
+        multi_body_pq(identity, text, &outpoint, &recips, content_key, mlkem_eks, password)?;
+    let flags = FLAG_DIRECTED | FLAG_MULTI | FLAG_PRIVATE | pq_flags;
+    let payloads = envelope::encode_outputs(flags, Some(count), &body, max_op_return_bytes)?;
+    build_note_tx_multi_exact(
+        &selected,
+        &identity.output_x,
+        &payloads,
+        &recipient_pairs,
+        change_spk,
+        fee_rate,
+        lock_time,
+        &identity.tweaked_seckey,
+        &mut aux,
+    )
+}
+
+/// Coin-control (`_exact`) analog of
+/// [`compose_directed_note_multi_pq_with_change`]: spend EXACTLY `inputs`.
+/// `inputs[0]` is the tx's first input immediately — no two-phase
+/// selection needed, mirroring [`compose_directed_note_pq_exact_amount`].
+#[allow(clippy::too_many_arguments)]
+pub fn compose_directed_note_multi_pq_exact(
+    identity: &Identity,
+    inputs: &[Utxo],
+    text: &str,
+    recipients: &[(Recipient, u64)],
+    mlkem_eks: Option<&[(pq::MlKemAlg, &[u8])]>,
+    password: Option<pq::PwLayer>,
+    content_key: [u8; 32],
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    lock_time: u32,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let deduped = dedupe_recipients(recipients)?;
+    if deduped.len() < 2 {
+        return Err(Error::Envelope(
+            "pq multi requires 2+ unique recipients — use compose_directed_note_pq_exact_amount for one",
+        ));
+    }
+    if let Some(eks) = mlkem_eks {
+        if eks.len() != deduped.len() {
+            return Err(Error::Envelope("pq: mlkem key count must match recipient count"));
+        }
+    }
+    if inputs.is_empty() {
+        return Err(Error::InsufficientFunds);
+    }
+    let count = deduped.len() as u8;
+    let recips: Vec<&Recipient> = deduped.iter().map(|(r, _)| r).collect();
+    let recipient_pairs: Vec<(Vec<u8>, u64)> =
+        deduped.iter().map(|(r, amount)| (r.spk.clone(), *amount)).collect();
+    let outpoint = outpoint_bytes(inputs.first().expect("checked non-empty above"));
+    let (pq_flags, body) =
+        multi_body_pq(identity, text, &outpoint, &recips, content_key, mlkem_eks, password)?;
+    let flags = FLAG_DIRECTED | FLAG_MULTI | FLAG_PRIVATE | pq_flags;
+    let payloads = envelope::encode_outputs(flags, Some(count), &body, max_op_return_bytes)?;
+    build_note_tx_multi_exact(
+        inputs,
+        &identity.output_x,
+        &payloads,
+        &recipient_pairs,
+        change_spk,
+        fee_rate,
+        lock_time,
+        &identity.tweaked_seckey,
+        aux,
     )
 }
 

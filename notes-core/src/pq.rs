@@ -21,8 +21,13 @@
 //! since 2026-08-22 (PLAN-graffito-self-pw.md, the additive extension) — on
 //! a PRIVATE SELF-note too (see the "Self-note pq layers" section below for
 //! that variant's own domain, threat model, and the seed-derived-ek
-//! warning). FLAG_MULTI stays incompatible with both; the layers can be
-//! combined. The doc above this line describes the DIRECTED form.
+//! warning); the layers can be combined. Since 2026-09-06
+//! (PLAN-graffito-multi-pq.md) both layers are ALSO valid on a PRIVATE
+//! MULTI-recipient DIRECTED note — see the "Multi-recipient pq layers"
+//! section near the bottom of this file for that variant's own wire
+//! framing and key derivation (a NEW domain, distinct from both the
+//! single-recipient and self-note ones described here). The doc above
+//! this line describes the single-recipient DIRECTED form.
 //!
 //! ## Wire format
 //!
@@ -1201,6 +1206,419 @@ pub fn unlock_sent(
     crypt::open_aad(&key, &aad, rest)
 }
 
+// ---------------------------------------------------------------------
+// Multi-recipient pq layers (PLAN-graffito-multi-pq.md, 2026-09-06) — a
+// NEW domain, distinct from both `derive_pq_key` (single-recipient
+// directed) and `derive_self_pq_key` (self-note) above. FROZEN once
+// shipped, same rule as every domain in this file.
+// ---------------------------------------------------------------------
+//
+// A PRIVATE MULTI-recipient DIRECTED note (`FLAG_MULTI`, dm.rs) can carry
+// the same two optional, composable pq layers a single-recipient note can
+// — hybrid ON TOP of the existing per-recipient pairwise ECDH wrap
+// (dm.rs's `seal_multi`/`open_received_multi`), never a replacement:
+//
+// ```text
+// [salt(16) || t(1) || m_log2(1) || p(1)]                iff FLAG_PW  (ONE block,
+//                                                          shared by every recipient)
+// count × { [alg_id(1) || mlkem_ct_i(ct_len(alg_id))] iff FLAG_MLKEM || wrap_i(72) }
+// nonce(24) || ciphertext || tag(16)               (sealed body under content key K —
+//                                                    UNCHANGED, dm::multi_body_aad)
+// ```
+//
+// `FLAG_MLKEM`: each recipient gets their OWN ciphertext, addressed to
+// THEIR OWN contact key — mixed levels across recipients are allowed, the
+// `alg_id` byte is per-wrap, so a decoder walking the block always knows
+// each ct's length before parsing the next. `FLAG_PW`: ONE shared Argon2id
+// block (same params/salt shape as the single-recipient layer above); the
+// derived `pw_key` mixes into EVERY recipient's wrap key.
+//
+// ```text
+// wrap_key_i = HKDF-SHA256(
+//     salt = "prime-graffito/dm-multi-pq/v1",
+//     ikm  = ecdh_shared_x_i(32) || [mlkem_ss_i(32) iff FLAG_MLKEM] || [pw_key(32) iff FLAG_PW],
+// ).expand(info = "dm-wrap-pq/v1" || pq_flags_byte || [alg_id_i iff FLAG_MLKEM], 32)
+// wrap_i     = crypt::seal_aad(wrap_key_i, dm_aad(sender_x, recipient_x_i, outpoint), K)  // 72 bytes
+// ```
+//
+// `ecdh_shared_x_i` is the SAME `dm::ecdh_shared_x` v1 secret, per
+// recipient — this module never reimplements or alters dm.rs. A tampered
+// `ct_i` decapsulates (implicit rejection) to a wrong `ss_i` -> wrong wrap
+// key -> AEAD failure on THAT wrap only, exactly like the single-recipient
+// case; the other recipients' wraps are unaffected.
+//
+// Behaviour: the sender holds no recipient's decapsulation key, so
+// `FLAG_MLKEM` set makes a sender re-read ([`unlock_sent_multi`]) return
+// [`Error::SenderCannotReopen`], identical to the single-recipient rule.
+// `FLAG_PW` alone lets the sender reopen through their own pairwise ECDH
+// with ANY recipient (mirrors `dm::open_sent_multi`). A recipient tries
+// their own wrap (by output index) first, then falls back to every other
+// wrap — robustness only, not a protocol requirement, same as
+// `dm::open_received_multi`.
+
+const DM_MULTI_PQ_SALT: &[u8] = b"prime-graffito/dm-multi-pq/v1";
+const DM_MULTI_PQ_INFO_PREFIX: &[u8] = b"dm-wrap-pq/v1";
+
+/// FROZEN: one recipient's wrap-key derivation. Mirrors [`derive_pq_key`]
+/// exactly, with a NEW salt/info domain (`DM_MULTI_PQ_SALT`/
+/// `DM_MULTI_PQ_INFO_PREFIX`) so a multi-recipient wrap key can never
+/// collide with a single-recipient directed pq sealing key even given the
+/// same ECDH secret and pq inputs.
+fn derive_multi_wrap_key(
+    pq_flags: u8,
+    alg: Option<MlKemAlg>,
+    shared_x: &[u8; 32],
+    mlkem_ss: Option<&[u8; 32]>,
+    pw_key_bytes: Option<&[u8; 32]>,
+) -> [u8; 32] {
+    let mut ikm = Vec::with_capacity(96);
+    ikm.extend_from_slice(shared_x);
+    if let Some(ss) = mlkem_ss {
+        ikm.extend_from_slice(ss);
+    }
+    if let Some(pw) = pw_key_bytes {
+        ikm.extend_from_slice(pw);
+    }
+    let mut info = Vec::with_capacity(DM_MULTI_PQ_INFO_PREFIX.len() + 2);
+    info.extend_from_slice(DM_MULTI_PQ_INFO_PREFIX);
+    info.push(pq_flags & (FLAG_PW | FLAG_MLKEM));
+    if let Some(a) = alg {
+        info.push(a.id());
+    }
+    let hk = Hkdf::<Sha256>::new(Some(DM_MULTI_PQ_SALT), &ikm);
+    let mut okm = [0u8; 32];
+    hk.expand(&info, &mut okm).expect("32 bytes is a valid HKDF length");
+    okm
+}
+
+/// Which extra layer(s) to seal a MULTI-recipient directed note under. At
+/// least one field must be `Some` — a plain multi note with neither uses
+/// `dm::seal_multi` directly instead (see `bundle::multi_body`).
+#[derive(Clone, Copy)]
+pub struct MultiSealLayers<'a> {
+    /// One `(alg, ek)` per recipient, in the SAME order as the
+    /// `recipients_x` passed to [`seal_multi_pq`] — all-or-nothing: `Some`
+    /// means EVERY recipient gets an ML-KEM wrap (mixed levels allowed),
+    /// `None` means no ML-KEM layer on this note at all. A length mismatch
+    /// against the recipient count is a caller bug ([`Error::Envelope`]).
+    pub mlkem_eks: Option<&'a [(MlKemAlg, &'a [u8])]>,
+    /// The ONE shared passphrase layer — same value/cost for every
+    /// recipient (the password is shared by construction).
+    pub password: Option<PwLayer<'a>>,
+}
+
+impl<'a> MultiSealLayers<'a> {
+    /// The envelope pq flag bits this set of layers would produce —
+    /// usable by callers (e.g. the compose cost estimator) before any
+    /// crypto runs.
+    pub fn flags(&self) -> u8 {
+        (if self.mlkem_eks.is_some() { FLAG_MLKEM } else { 0 })
+            | (if self.password.is_some() { FLAG_PW } else { 0 })
+    }
+}
+
+/// Prefix-byte overhead [`seal_multi_pq`] adds ON TOP OF the plain
+/// `count * dm::WRAP_LEN` multi-body framing, for the given pq flags —
+/// pure arithmetic, for the compose cost estimator (mirrors
+/// [`pq_overhead`]'s no-crypto-needed contract). `algs`, when
+/// `FLAG_MLKEM` is set, must carry one alg PER RECIPIENT (mixed levels
+/// each cost their own `ct_len`); `None` there yields 0 for the ML-KEM
+/// term (the caller doesn't know the algs yet).
+pub fn multi_pq_overhead(pq_flags: u8, algs: Option<&[MlKemAlg]>) -> usize {
+    let mut n = 0;
+    if pq_flags & FLAG_MLKEM != 0 {
+        n += algs.map_or(0, |algs| algs.iter().map(|a| 1 + a.ct_len()).sum());
+    }
+    if pq_flags & FLAG_PW != 0 {
+        n += 19; // salt(16) || t(1) || m_log2(1) || p(1) — ONE shared block
+    }
+    n
+}
+
+/// Sender side: seal a multi-recipient private body under one or both pq
+/// layers, hybrid over the same per-recipient pairwise ECDH wraps
+/// `dm::seal_multi` uses (never replacing them). `content_key` is
+/// caller-supplied exactly as `dm::seal_multi` requires (never generated,
+/// stored, or returned by this module). Returns `(pq_flags, full_body)` —
+/// `full_body` is `[pw_prefix?] || count x ([kem_prefix_i?] || wrap_i) ||
+/// sealed_body` (see the section doc above); the caller envelopes it
+/// exactly like a plain multi body (`FLAG_PRIVATE | FLAG_DIRECTED |
+/// FLAG_MULTI | pq_flags`).
+pub fn seal_multi_pq(
+    my_tweaked_seckey: &[u8; 32],
+    my_output_x: &[u8; 32],
+    recipients_x: &[[u8; 32]],
+    outpoint: &[u8; 36],
+    content_key: &[u8; 32],
+    plaintext: &[u8],
+    layers: MultiSealLayers,
+) -> Result<(u8, Vec<u8>), Error> {
+    let pq_flags = layers.flags();
+    if pq_flags == 0 {
+        return Err(Error::Envelope("pq: at least one seal layer required"));
+    }
+    if let Some(eks) = layers.mlkem_eks {
+        if eks.len() != recipients_x.len() {
+            return Err(Error::Envelope("pq: mlkem key count must match recipient count"));
+        }
+    }
+
+    let mut full_body = Vec::new();
+
+    // Shared PW block FIRST — mixed into every recipient's wrap key below.
+    let mut pw_key_bytes: Option<[u8; 32]> = None;
+    if let Some(PwLayer { password, cost }) = layers.password {
+        let (t, m_log2, p) = cost.params();
+        let mut salt = [0u8; 16];
+        getrandom::getrandom(&mut salt).map_err(|_| Error::Entropy)?;
+        let key = pw_key(password, &salt, t, m_log2, p)?;
+        full_body.extend_from_slice(&salt);
+        full_body.push(t as u8);
+        full_body.push(m_log2);
+        full_body.push(p as u8);
+        pw_key_bytes = Some(key);
+    }
+
+    // Per-recipient: [kem_prefix_i?] || wrap_i(72).
+    for (i, r) in recipients_x.iter().enumerate() {
+        let shared_x = dm::ecdh_shared_x(my_tweaked_seckey, r)?;
+        let mut mlkem_ss: Option<[u8; 32]> = None;
+        let mut alg_used: Option<MlKemAlg> = None;
+        if let Some(eks) = layers.mlkem_eks {
+            let (alg, ek) = eks[i];
+            let (ct, ss) = encapsulate(alg, ek)?;
+            full_body.push(alg.id());
+            full_body.extend_from_slice(&ct);
+            mlkem_ss = Some(ss);
+            alg_used = Some(alg);
+        }
+        let wrap_key =
+            derive_multi_wrap_key(pq_flags, alg_used, &shared_x, mlkem_ss.as_ref(), pw_key_bytes.as_ref());
+        let aad = dm::dm_aad(my_output_x, r, outpoint);
+        let wrap = crypt::seal_aad(&wrap_key, &aad, content_key)?;
+        full_body.extend_from_slice(&wrap);
+    }
+
+    let sealed_body = crypt::seal_aad(content_key, &dm::multi_body_aad(my_output_x, outpoint), plaintext)?;
+    full_body.extend_from_slice(&sealed_body);
+    Ok((pq_flags, full_body))
+}
+
+/// A multi-recipient note recovered from chain data whose pq layer(s) have
+/// NOT been unlocked yet — the multi-recipient analog of [`LockedBody`].
+/// `sender_x` is a best-effort candidate at extraction time (the tx's
+/// first-input address for a RECEIVED note, or this identity's own output
+/// key for an OWN sent one) — same "candidate, not proven" convention
+/// [`LockedBody::sender_x`] already uses; a wrong candidate simply fails
+/// to unlock (`Error::DecryptFailed`), same as tampering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiLockedBody {
+    pub pq_flags: u8,
+    pub body: Vec<u8>,
+    pub sender_x: [u8; 32],
+    /// Recipient output keys, in OUTPUT order (== wrap order) — length is
+    /// the note's `FLAG_MULTI` header count.
+    pub recipients_x: Vec<[u8; 32]>,
+    pub outpoint: [u8; 36],
+}
+
+mod multi_locked_body_serde {
+    use super::MultiLockedBody;
+    use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct Wire {
+        pq_flags: u8,
+        body: String,
+        sender_x: String,
+        recipients_x: Vec<String>,
+        outpoint: String,
+    }
+
+    fn hex_arr<const N: usize>(s: &str) -> Result<[u8; N], String> {
+        let bytes = hex::decode(s).map_err(|e| e.to_string())?;
+        <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| format!("expected {N} bytes"))
+    }
+
+    impl Serialize for MultiLockedBody {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            Wire {
+                pq_flags: self.pq_flags,
+                body: hex::encode(&self.body),
+                sender_x: hex::encode(self.sender_x),
+                recipients_x: self.recipients_x.iter().map(hex::encode).collect(),
+                outpoint: hex::encode(self.outpoint),
+            }
+            .serialize(s)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for MultiLockedBody {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            let w = Wire::deserialize(d)?;
+            let recipients_x = w
+                .recipients_x
+                .iter()
+                .map(|s| hex_arr(s))
+                .collect::<Result<Vec<[u8; 32]>, String>>()
+                .map_err(D::Error::custom)?;
+            Ok(MultiLockedBody {
+                pq_flags: w.pq_flags,
+                body: hex::decode(&w.body).map_err(D::Error::custom)?,
+                sender_x: hex_arr(&w.sender_x).map_err(D::Error::custom)?,
+                recipients_x,
+                outpoint: hex_arr(&w.outpoint).map_err(D::Error::custom)?,
+            })
+        }
+    }
+}
+
+/// Parse a multi-pq body into its shared PW prefix (if any), the
+/// per-recipient `(kem_prefix?, wrap)` blocks (exactly `count` of them, in
+/// output order), and the trailing sealed body — pure framing, no crypto.
+#[allow(clippy::type_complexity)]
+fn parse_multi_pq_body(
+    body: &[u8],
+    pq_flags: u8,
+    count: usize,
+) -> Result<(Option<PwPrefix>, Vec<(Option<MlKemPrefix<'_>>, &[u8])>, &[u8]), Error> {
+    let mut rest = body;
+    let mut pw_prefix = None;
+    if pq_flags & FLAG_PW != 0 {
+        let (params, r) = parse_pw_prefix(rest)?;
+        pw_prefix = Some(params);
+        rest = r;
+    }
+    let mut per_recipient = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mlkem_prefix = if pq_flags & FLAG_MLKEM != 0 {
+            let (prefix, r) = parse_mlkem_prefix(rest)?;
+            rest = r;
+            Some(prefix)
+        } else {
+            None
+        };
+        if rest.len() < dm::WRAP_LEN {
+            return Err(Error::Decode("pq: truncated multi wrap"));
+        }
+        let (wrap, r) = rest.split_at(dm::WRAP_LEN);
+        rest = r;
+        per_recipient.push((mlkem_prefix, wrap));
+    }
+    Ok((pw_prefix, per_recipient, rest))
+}
+
+/// Recipient side: open a multi-recipient pq-layered body sent to me by
+/// `locked.sender_x` (a candidate — see [`MultiLockedBody`]'s doc).
+/// `mlkem_secret`/`password` are required exactly when `locked.pq_flags`
+/// carries the corresponding bit ([`Error::NeedsMlKemKey`] /
+/// [`Error::NeedsPassword`] otherwise); a supplied-but-wrong secret is
+/// indistinguishable from tampering (both [`Error::DecryptFailed`]). Tries
+/// my own recipient-output index first (matched by `my_output_x` against
+/// `locked.recipients_x`), then every other wrap — robustness only,
+/// mirroring `dm::open_received_multi`.
+pub fn unlock_received_multi(
+    locked: &MultiLockedBody,
+    my_tweaked_seckey: &[u8; 32],
+    my_output_x: &[u8; 32],
+    mlkem_secret: Option<&MlKemSecret>,
+    password: Option<&str>,
+) -> Result<Vec<u8>, Error> {
+    if locked.pq_flags & FLAG_MLKEM != 0 && mlkem_secret.is_none() {
+        return Err(Error::NeedsMlKemKey);
+    }
+    if locked.pq_flags & FLAG_PW != 0 && password.is_none() {
+        return Err(Error::NeedsPassword);
+    }
+
+    let count = locked.recipients_x.len();
+    let (pw_prefix, per_recipient, sealed_body) =
+        parse_multi_pq_body(&locked.body, locked.pq_flags, count)?;
+
+    let pw_key_bytes = match (pw_prefix, password) {
+        (Some(params), Some(pw)) => Some(pw_key(pw, &params.salt, params.t, params.m_log2, params.p)?),
+        _ => None,
+    };
+
+    let Ok(shared_x) = dm::ecdh_shared_x(my_tweaked_seckey, &locked.sender_x) else {
+        return Err(Error::DecryptFailed);
+    };
+
+    let my_index = locked.recipients_x.iter().position(|x| x == my_output_x);
+    let mut order: Vec<usize> = Vec::with_capacity(count);
+    if let Some(i) = my_index {
+        order.push(i);
+    }
+    order.extend((0..count).filter(|i| Some(*i) != my_index));
+
+    for i in order {
+        let (mlkem_prefix, wrap) = &per_recipient[i];
+        let (alg_used, mlkem_ss) = if locked.pq_flags & FLAG_MLKEM != 0 {
+            let Some(prefix) = mlkem_prefix else { continue };
+            let Ok(ss) = decapsulate(prefix.alg, mlkem_secret.expect("checked above"), prefix.ct)
+            else {
+                continue;
+            };
+            (Some(prefix.alg), Some(ss))
+        } else {
+            (None, None)
+        };
+        let wrap_key =
+            derive_multi_wrap_key(locked.pq_flags, alg_used, &shared_x, mlkem_ss.as_ref(), pw_key_bytes.as_ref());
+        let aad = dm::dm_aad(&locked.sender_x, my_output_x, &locked.outpoint);
+        let Ok(k_bytes) = crypt::open_aad(&wrap_key, &aad, wrap) else { continue };
+        let Ok(content_key) = <[u8; 32]>::try_from(k_bytes.as_slice()) else { continue };
+        if let Ok(pt) =
+            crypt::open_aad(&content_key, &dm::multi_body_aad(&locked.sender_x, &locked.outpoint), sealed_body)
+        {
+            return Ok(pt);
+        }
+    }
+    Err(Error::DecryptFailed)
+}
+
+/// Sender re-reading their own sent multi-recipient pq note (wipe
+/// recovery — the `dm::open_sent_multi` analog). Possible ONLY when
+/// `locked.pq_flags == FLAG_PW` alone: a KEM-layered note was encapsulated
+/// to each RECIPIENT's key, which the sender never held, so
+/// [`Error::SenderCannotReopen`] is returned whenever `FLAG_MLKEM` is set
+/// (with or without `FLAG_PW` alongside it) — see the section doc.
+pub fn unlock_sent_multi(
+    locked: &MultiLockedBody,
+    my_tweaked_seckey: &[u8; 32],
+    my_output_x: &[u8; 32],
+    password: Option<&str>,
+) -> Result<Vec<u8>, Error> {
+    if locked.pq_flags & FLAG_MLKEM != 0 {
+        return Err(Error::SenderCannotReopen);
+    }
+    if locked.pq_flags & FLAG_PW == 0 {
+        return Err(Error::Envelope("pq: locked body carries no reopenable layer"));
+    }
+
+    let count = locked.recipients_x.len();
+    let (pw_prefix, per_recipient, sealed_body) =
+        parse_multi_pq_body(&locked.body, locked.pq_flags, count)?;
+    let params = pw_prefix.ok_or(Error::Decode("pq: missing pw prefix"))?;
+    let pw = password.ok_or(Error::NeedsPassword)?;
+    let pw_key_bytes = pw_key(pw, &params.salt, params.t, params.m_log2, params.p)?;
+
+    for (i, r) in locked.recipients_x.iter().enumerate() {
+        let Ok(shared_x) = dm::ecdh_shared_x(my_tweaked_seckey, r) else { continue };
+        let wrap_key = derive_multi_wrap_key(locked.pq_flags, None, &shared_x, None, Some(&pw_key_bytes));
+        let aad = dm::dm_aad(my_output_x, r, &locked.outpoint);
+        let (_, wrap) = &per_recipient[i];
+        let Ok(k_bytes) = crypt::open_aad(&wrap_key, &aad, wrap) else { continue };
+        let Ok(content_key) = <[u8; 32]>::try_from(k_bytes.as_slice()) else { continue };
+        if let Ok(pt) =
+            crypt::open_aad(&content_key, &dm::multi_body_aad(my_output_x, &locked.outpoint), sealed_body)
+        {
+            return Ok(pt);
+        }
+    }
+    Err(Error::DecryptFailed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1309,5 +1727,398 @@ mod tests {
             unlock_sent(&locked, &a.tweaked_seckey, &a.output_x, Some("legacy m16 password"))
                 .unwrap();
         assert_eq!(pt2, b"pre-audit note");
+    }
+
+    // -------------------------------------------------------------
+    // Multi-recipient pq layers (PLAN-graffito-multi-pq.md)
+    // -------------------------------------------------------------
+
+    fn ident(seed_byte: u8) -> crate::bundle::Identity {
+        crate::bundle::Identity::from_app_seed(&[seed_byte; 32]).unwrap()
+    }
+
+    /// Seal `plaintext` from `sender` to `recipients` (mixed-alg ML-KEM per
+    /// recipient when `algs` is `Some`), returning `(pq_flags, body,
+    /// recipients_x, outpoint)` ready to build a [`MultiLockedBody`] from.
+    #[allow(clippy::type_complexity)]
+    fn seal_multi_pq_fixture(
+        sender: &crate::bundle::Identity,
+        recipients: &[crate::bundle::Identity],
+        algs: Option<&[MlKemAlg]>,
+        password: Option<PwLayer>,
+        plaintext: &[u8],
+    ) -> (u8, Vec<u8>, Vec<[u8; 32]>, [u8; 36], Vec<MlKemKeypair>) {
+        let recipients_x: Vec<[u8; 32]> = recipients.iter().map(|r| r.output_x).collect();
+        let outpoint = [0x77u8; 36];
+        let mut kps = Vec::new();
+        let mlkem_eks: Option<Vec<(MlKemAlg, &[u8])>> = algs.map(|algs| {
+            kps = algs.iter().map(|a| MlKemKeypair::generate(*a).unwrap()).collect();
+            algs.iter().zip(kps.iter()).map(|(a, kp)| (*a, kp.ek())).collect()
+        });
+        let layers = MultiSealLayers { mlkem_eks: mlkem_eks.as_deref(), password };
+        let (pq_flags, body) = seal_multi_pq(
+            &sender.tweaked_seckey,
+            &sender.output_x,
+            &recipients_x,
+            &outpoint,
+            &[0x55u8; 32],
+            plaintext,
+            layers,
+        )
+        .unwrap();
+        (pq_flags, body, recipients_x, outpoint, kps)
+    }
+
+    #[test]
+    fn multi_pq_kem_only_mixed_levels_round_trips() {
+        let sender = ident(1);
+        let recipients = [ident(2), ident(3), ident(4)];
+        let algs = [MlKemAlg::MlKem512, MlKemAlg::MlKem768, MlKemAlg::MlKem1024];
+        let (pq_flags, body, recipients_x, outpoint, kps) =
+            seal_multi_pq_fixture(&sender, &recipients, Some(&algs), None, b"three levels, one note");
+        assert_eq!(pq_flags, FLAG_MLKEM);
+
+        for (i, r) in recipients.iter().enumerate() {
+            let locked = MultiLockedBody {
+                pq_flags,
+                body: body.clone(),
+                sender_x: sender.output_x,
+                recipients_x: recipients_x.clone(),
+                outpoint,
+            };
+            let secret = kps[i].secret();
+            let pt = unlock_received_multi(&locked, &r.tweaked_seckey, &r.output_x, Some(&secret), None)
+                .unwrap();
+            assert_eq!(pt, b"three levels, one note");
+        }
+    }
+
+    #[test]
+    fn multi_pq_two_recipients_pw_only_round_trips() {
+        let sender = ident(10);
+        let recipients = [ident(11), ident(12)];
+        let (pq_flags, body, recipients_x, outpoint, _) = seal_multi_pq_fixture(
+            &sender,
+            &recipients,
+            None,
+            Some(PwLayer { password: "hunter2", cost: PwCost::Standard }),
+            b"pw only, two recipients",
+        );
+        assert_eq!(pq_flags, FLAG_PW);
+
+        for r in &recipients {
+            let locked = MultiLockedBody {
+                pq_flags,
+                body: body.clone(),
+                sender_x: sender.output_x,
+                recipients_x: recipients_x.clone(),
+                outpoint,
+            };
+            let pt =
+                unlock_received_multi(&locked, &r.tweaked_seckey, &r.output_x, None, Some("hunter2"))
+                    .unwrap();
+            assert_eq!(pt, b"pw only, two recipients");
+        }
+    }
+
+    #[test]
+    fn multi_pq_both_layers_round_trip() {
+        let sender = ident(20);
+        let recipients = [ident(21), ident(22), ident(23)];
+        let algs = [MlKemAlg::MlKem768, MlKemAlg::MlKem768, MlKemAlg::MlKem1024];
+        let (pq_flags, body, recipients_x, outpoint, kps) = seal_multi_pq_fixture(
+            &sender,
+            &recipients,
+            Some(&algs),
+            Some(PwLayer { password: "belt-and-suspenders", cost: PwCost::Strong }),
+            b"both layers",
+        );
+        assert_eq!(pq_flags, FLAG_PW | FLAG_MLKEM);
+
+        for (i, r) in recipients.iter().enumerate() {
+            let locked = MultiLockedBody {
+                pq_flags,
+                body: body.clone(),
+                sender_x: sender.output_x,
+                recipients_x: recipients_x.clone(),
+                outpoint,
+            };
+            let secret = kps[i].secret();
+            let pt = unlock_received_multi(
+                &locked, &r.tweaked_seckey, &r.output_x, Some(&secret), Some("belt-and-suspenders"),
+            )
+            .unwrap();
+            assert_eq!(pt, b"both layers");
+
+            // Missing either required secret is a distinct error, not a
+            // silent DecryptFailed.
+            assert_eq!(
+                unlock_received_multi(&locked, &r.tweaked_seckey, &r.output_x, None, Some("belt-and-suspenders")),
+                Err(Error::NeedsMlKemKey)
+            );
+            assert_eq!(
+                unlock_received_multi(&locked, &r.tweaked_seckey, &r.output_x, Some(&secret), None),
+                Err(Error::NeedsPassword)
+            );
+        }
+    }
+
+    #[test]
+    fn multi_pq_wrong_recipient_key_fails() {
+        let sender = ident(30);
+        let recipients = [ident(31), ident(32)];
+        let algs = [MlKemAlg::MlKem768, MlKemAlg::MlKem768];
+        let (pq_flags, body, recipients_x, outpoint, kps) =
+            seal_multi_pq_fixture(&sender, &recipients, Some(&algs), None, b"secret");
+
+        // Recipient 0 tries recipient 1's decapsulation secret against
+        // their OWN wrap slot — structurally decapsulates (implicit
+        // rejection), but the resulting wrap key is wrong -> AEAD failure,
+        // never a silent wrong-plaintext.
+        let locked = MultiLockedBody {
+            pq_flags,
+            body: body.clone(),
+            sender_x: sender.output_x,
+            recipients_x: recipients_x.clone(),
+            outpoint,
+        };
+        let wrong_secret = kps[1].secret();
+        assert_eq!(
+            unlock_received_multi(
+                &locked, &recipients[0].tweaked_seckey, &recipients[0].output_x, Some(&wrong_secret), None,
+            ),
+            Err(Error::DecryptFailed)
+        );
+
+        // A totally unrelated identity (not in recipients_x at all) also
+        // fails — no `my_index` match, falls through every wrap.
+        let stranger = ident(99);
+        let stranger_secret = MlKemKeypair::generate(MlKemAlg::MlKem768).unwrap().secret();
+        assert_eq!(
+            unlock_received_multi(
+                &locked, &stranger.tweaked_seckey, &stranger.output_x, Some(&stranger_secret), None,
+            ),
+            Err(Error::DecryptFailed)
+        );
+    }
+
+    #[test]
+    fn multi_pq_tampered_ciphertext_fails_only_that_wrap() {
+        let sender = ident(40);
+        let recipients = [ident(41), ident(42)];
+        let algs = [MlKemAlg::MlKem768, MlKemAlg::MlKem768];
+        let (pq_flags, body, recipients_x, outpoint, kps) =
+            seal_multi_pq_fixture(&sender, &recipients, Some(&algs), None, b"tamper test");
+
+        // Flip a byte inside recipient 0's ML-KEM ciphertext (the block
+        // right after the 1-byte alg id) — recipient 1's wrap is BYTE FOR
+        // BYTE downstream, untouched.
+        let mut tampered = body.clone();
+        tampered[1] ^= 0xff;
+
+        let locked0 = MultiLockedBody {
+            pq_flags,
+            body: tampered.clone(),
+            sender_x: sender.output_x,
+            recipients_x: recipients_x.clone(),
+            outpoint,
+        };
+        let secret0 = kps[0].secret();
+        assert_eq!(
+            unlock_received_multi(
+                &locked0, &recipients[0].tweaked_seckey, &recipients[0].output_x, Some(&secret0), None,
+            ),
+            Err(Error::DecryptFailed)
+        );
+
+        // Recipient 1's own wrap is unaffected by the tamper to recipient 0's block.
+        let locked1 = MultiLockedBody {
+            pq_flags,
+            body: tampered,
+            sender_x: sender.output_x,
+            recipients_x: recipients_x.clone(),
+            outpoint,
+        };
+        let secret1 = kps[1].secret();
+        let pt = unlock_received_multi(
+            &locked1, &recipients[1].tweaked_seckey, &recipients[1].output_x, Some(&secret1), None,
+        )
+        .unwrap();
+        assert_eq!(pt, b"tamper test");
+    }
+
+    #[test]
+    fn multi_pq_sender_cannot_reopen_kem_but_can_reopen_pw() {
+        let sender = ident(50);
+        let recipients = [ident(51), ident(52)];
+
+        // KEM alone (and KEM+PW): SenderCannotReopen.
+        let algs = [MlKemAlg::MlKem768, MlKemAlg::MlKem1024];
+        let (pq_flags, body, recipients_x, outpoint, _) =
+            seal_multi_pq_fixture(&sender, &recipients, Some(&algs), None, b"kem note");
+        let locked = MultiLockedBody {
+            pq_flags,
+            body,
+            sender_x: sender.output_x,
+            recipients_x: recipients_x.clone(),
+            outpoint,
+        };
+        assert_eq!(
+            unlock_sent_multi(&locked, &sender.tweaked_seckey, &sender.output_x, None),
+            Err(Error::SenderCannotReopen)
+        );
+
+        let (pq_flags2, body2, recipients_x2, outpoint2, _) = seal_multi_pq_fixture(
+            &sender,
+            &recipients,
+            Some(&algs),
+            Some(PwLayer { password: "wipe-recovery", cost: PwCost::Standard }),
+            b"both, sender view",
+        );
+        let locked2 = MultiLockedBody {
+            pq_flags: pq_flags2,
+            body: body2,
+            sender_x: sender.output_x,
+            recipients_x: recipients_x2,
+            outpoint: outpoint2,
+        };
+        assert_eq!(
+            unlock_sent_multi(&locked2, &sender.tweaked_seckey, &sender.output_x, Some("wipe-recovery")),
+            Err(Error::SenderCannotReopen)
+        );
+
+        // PW alone: the sender CAN reopen via any recipient's pairwise key.
+        let (pq_flags3, body3, recipients_x3, outpoint3, _) = seal_multi_pq_fixture(
+            &sender,
+            &recipients,
+            None,
+            Some(PwLayer { password: "wipe-recovery", cost: PwCost::Standard }),
+            b"pw only, sender view",
+        );
+        let locked3 = MultiLockedBody {
+            pq_flags: pq_flags3,
+            body: body3,
+            sender_x: sender.output_x,
+            recipients_x: recipients_x3,
+            outpoint: outpoint3,
+        };
+        let pt = unlock_sent_multi(&locked3, &sender.tweaked_seckey, &sender.output_x, Some("wipe-recovery"))
+            .unwrap();
+        assert_eq!(pt, b"pw only, sender view");
+    }
+
+    /// Framing round-trips exactly through [`parse_multi_pq_body`]: PW
+    /// block, then `count` (kem?, wrap) blocks, then the sealed body — no
+    /// bytes lost or misaligned, for every layer combination.
+    #[test]
+    fn multi_pq_framing_parses_back_to_the_same_blocks() {
+        let sender = ident(60);
+        let recipients = [ident(61), ident(62), ident(63)];
+        let algs = [MlKemAlg::MlKem512, MlKemAlg::MlKem768, MlKemAlg::MlKem1024];
+        let (pq_flags, body, _, _, _) = seal_multi_pq_fixture(
+            &sender,
+            &recipients,
+            Some(&algs),
+            Some(PwLayer { password: "framing", cost: PwCost::Standard }),
+            b"framing check",
+        );
+        let (pw, per_recipient, sealed_body) = parse_multi_pq_body(&body, pq_flags, 3).unwrap();
+        assert!(pw.is_some());
+        assert_eq!(per_recipient.len(), 3);
+        for (i, (mlkem, wrap)) in per_recipient.iter().enumerate() {
+            assert_eq!(mlkem.as_ref().unwrap().alg, algs[i]);
+            assert_eq!(wrap.len(), dm::WRAP_LEN);
+        }
+        // Reassembling the parsed pieces exactly reproduces `body`.
+        let params = pw.unwrap();
+        let mut rebuilt = Vec::new();
+        rebuilt.extend_from_slice(&params.salt);
+        rebuilt.push(params.t as u8);
+        rebuilt.push(params.m_log2);
+        rebuilt.push(params.p as u8);
+        for (mlkem, wrap) in &per_recipient {
+            let m = mlkem.as_ref().unwrap();
+            rebuilt.push(m.alg.id());
+            rebuilt.extend_from_slice(m.ct);
+            rebuilt.extend_from_slice(wrap);
+        }
+        rebuilt.extend_from_slice(sealed_body);
+        assert_eq!(rebuilt, body);
+    }
+
+    /// Mutation-testing note (not a real bug — this pins the domain
+    /// separation the HKDF `info` byte provides): two different pq_flags
+    /// byte values with otherwise-identical inputs MUST derive different
+    /// wrap keys. A change that dropped `pq_flags` from `info` (see
+    /// `derive_multi_wrap_key`) would collapse this to equality and this
+    /// test would fail — verified by hand during implementation (temporarily
+    /// removed the `info.push(pq_flags & ...)` line, re-ran `cargo test -p
+    /// notes-core derive_multi_wrap_key_domain_separates_on_pq_flags`, saw
+    /// it fail, then reverted).
+    /// FROZEN-domain pin for the multi-recipient wrap-key derivation
+    /// (PLAN-graffito-multi-pq.md): fixed inputs -> pinned output for
+    /// every layer combination, mirroring `self_pq_kdf_vectors_are_pinned`
+    /// above. `derive_multi_wrap_key` (like `derive_pq_key`/
+    /// `derive_self_pq_key`) never draws randomness itself — the only
+    /// non-deterministic ingredient in a real `seal_multi_pq` call is
+    /// ML-KEM's internal `m` draw inside `encapsulate`, which this vector
+    /// deliberately bypasses by supplying `ss`/`pwk` directly, exactly the
+    /// convention the self-pq vector above already uses. A mismatch means
+    /// shipped multi-pq wraps stop unlocking — SHIP-BLOCKING, never "fix
+    /// the hex".
+    #[test]
+    fn multi_pq_wrap_key_vectors_are_pinned() {
+        let shared_x = [0x44u8; 32];
+        let ss = [0x55u8; 32];
+        let pwk = [0x66u8; 32];
+        let pw_only = derive_multi_wrap_key(FLAG_PW, None, &shared_x, None, Some(&pwk));
+        let kem_only =
+            derive_multi_wrap_key(FLAG_MLKEM, Some(MlKemAlg::MlKem768), &shared_x, Some(&ss), None);
+        let both = derive_multi_wrap_key(
+            FLAG_PW | FLAG_MLKEM, Some(MlKemAlg::MlKem768), &shared_x, Some(&ss), Some(&pwk),
+        );
+        assert_eq!(hex::encode(pw_only), "332180deab8bad56bc28891306a3795e274612bc4267ace1b79097913844604b");
+        assert_eq!(hex::encode(kem_only), "46f61b1a17993ad99fcb9f222afdf08038369938eb627185a775c9f64589d35f");
+        assert_eq!(hex::encode(both), "51c780854ccba8b28f4e1f595ac4959fae7b126fd7277a32ead9326eb9adecb5");
+        // Domain-separated from the single-recipient/self derivations given
+        // the exact same raw inputs (different salt AND info prefix).
+        let directed = derive_pq_key(FLAG_PW, None, &shared_x, None, Some(&pwk));
+        assert_ne!(pw_only, directed);
+        let self_note = derive_self_pq_key(FLAG_PW, None, &shared_x, None, Some(&pwk));
+        assert_ne!(pw_only, self_note);
+        // Alg id folds into info: 768 vs 1024 differ even with equal ss.
+        let kem_1024 =
+            derive_multi_wrap_key(FLAG_MLKEM, Some(MlKemAlg::MlKem1024), &shared_x, Some(&ss), None);
+        assert_ne!(kem_only, kem_1024);
+    }
+
+    #[test]
+    fn derive_multi_wrap_key_domain_separates_on_pq_flags() {
+        // Isolate the `pq_flags` byte's contribution to `info` by holding
+        // EVERY OTHER input (ikm's shared_x/ss/pw, and alg) fixed and
+        // varying only the `pq_flags` argument itself (real callers never
+        // decouple `pq_flags` from what's actually present in ikm — this
+        // synthetic mismatch is exactly what makes the test isolate the one
+        // byte in question rather than being dominated by an ikm-length
+        // difference). If `derive_multi_wrap_key` stopped folding
+        // `pq_flags` into `info`, these two calls would produce IDENTICAL
+        // output despite naming different flag combinations.
+        let shared_x = [0x9au8; 32];
+        let ss = [0x9bu8; 32];
+        let pwk = [0x9cu8; 32];
+        let a = derive_multi_wrap_key(
+            FLAG_MLKEM | FLAG_PW, Some(MlKemAlg::MlKem768), &shared_x, Some(&ss), Some(&pwk),
+        );
+        let b = derive_multi_wrap_key(
+            FLAG_MLKEM, Some(MlKemAlg::MlKem768), &shared_x, Some(&ss), Some(&pwk),
+        );
+        assert_ne!(a, b, "pq_flags byte must be folded into info, not just ikm shape");
+
+        // And domain-separated from the single-recipient/self derivations
+        // given the exact same raw inputs.
+        let single = derive_pq_key(FLAG_MLKEM, Some(MlKemAlg::MlKem768), &shared_x, Some(&ss), None);
+        let multi_kem_only =
+            derive_multi_wrap_key(FLAG_MLKEM, Some(MlKemAlg::MlKem768), &shared_x, Some(&ss), None);
+        assert_ne!(multi_kem_only, single, "multi wrap-key domain must differ from the single-recipient one");
     }
 }

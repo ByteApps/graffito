@@ -766,6 +766,48 @@ pub fn build_funding_psbt_multi(
     assemble_funded_note_psbt(plan, &payloads, &out_recipients, self_spk, lock_time)
 }
 
+/// [`build_funding_psbt_multi`] with optional post-quantum layers
+/// (PLAN-graffito-multi-pq.md, 2026-09-06) — `mlkem_eks`, when `Some`, must
+/// carry exactly one `(alg, ek)` per recipient (mixed levels allowed);
+/// `password`, when `Some`, seals ONE shared Argon2id block mixed into
+/// every recipient's wrap. Requires 2+ recipients (a single-recipient pq
+/// note has no funded-PSBT analog today — `note-spend-funded`'s single-
+/// recipient path never carries pq layers). With neither layer set, this
+/// is byte-identical to [`build_funding_psbt_multi`] (delegates to the
+/// SAME `sealed_note_payloads_multi`, not a duplicate call).
+#[allow(clippy::too_many_arguments)]
+pub fn build_funding_psbt_multi_pq(
+    plan: &FundingPlan,
+    note: &NoteParams,
+    recipients: &[Recipient],
+    mlkem_eks: Option<&[(notes_core::pq::MlKemAlg, &[u8])]>,
+    password: Option<notes_core::pq::PwLayer>,
+    gift_amount: u64,
+    lock_time: u32,
+) -> Result<BuiltPsbt, Error> {
+    if mlkem_eks.is_none() && password.is_none() {
+        return build_funding_psbt_multi(plan, note, recipients, gift_amount, lock_time);
+    }
+    let gift = gift_amount.max(DUST_LIMIT);
+    let outpoint = first_funding_outpoint(plan.coins)?;
+    let mut content_key = crate::compose::fresh_content_key()?;
+    let result = notes_core::bundle::sealed_note_payloads_multi_pq(
+        note.identity,
+        note.text,
+        recipients,
+        mlkem_eks,
+        password,
+        outpoint,
+        content_key,
+        note.max_op_return_bytes,
+    );
+    content_key.zeroize();
+    let (_pq_flags, (payloads, spks)) = result?;
+    let self_spk = notes_core::address::p2tr_script_pubkey(&note.identity.output_x);
+    let out_recipients: Vec<(Vec<u8>, u64)> = spks.into_iter().map(|spk| (spk, gift)).collect();
+    assemble_funded_note_psbt(plan, &payloads, &out_recipients, self_spk, lock_time)
+}
+
 /// A WATCH identity's externally funded PUBLIC note: the funding wallet's
 /// coins pay for OP_RETURN chunks + an optional directed-recipient output
 /// (the gift) + the dust-to-self that keeps the note discoverable, change
@@ -1897,6 +1939,101 @@ mod tests {
             Err(e) => assert!(format!("{e}").to_lowercase().contains("taproot"), "got: {e}"),
             Ok(_) => panic!("expected a taproot-required error"),
         }
+    }
+
+    /// `build_funding_psbt_multi_pq` (PLAN-graffito-multi-pq.md, 2026-09-06):
+    /// the spending-wallet/external-funding multi-recipient note builder,
+    /// with a shared password AND per-recipient mixed-level ML-KEM — the
+    /// exact shape `note-spend-funded-multi`'s new pq flags reach. Proves
+    /// the built OP_RETURN body actually decodes with `FLAG_MULTI |
+    /// FLAG_PRIVATE | FLAG_PW | FLAG_MLKEM` and that each recipient's
+    /// `pq::unlock_received_multi` opens it with THEIR OWN level's secret.
+    #[test]
+    fn funding_psbt_multi_pq_mixed_levels_and_password_decodes() {
+        use notes_core::envelope;
+        use notes_core::pq::{unlock_received_multi, MlKemAlg, MlKemKeypair, PwLayer};
+
+        let src = source();
+        let coins = one_coin(&src);
+        let alice = Identity::from_app_seed(&[70u8; 32]).unwrap();
+        let bob = Identity::from_app_seed(&[71u8; 32]).unwrap();
+        let carol = Identity::from_app_seed(&[72u8; 32]).unwrap();
+        let recipients = vec![
+            Recipient::parse(NET, &bob.address(NET)).unwrap(),
+            Recipient::parse(NET, &carol.address(NET)).unwrap(),
+        ];
+        let bob_kp = MlKemKeypair::generate(MlKemAlg::MlKem512).unwrap();
+        let carol_kp = MlKemKeypair::generate(MlKemAlg::MlKem1024).unwrap();
+        let eks: Vec<(MlKemAlg, &[u8])> = vec![(bob_kp.alg(), bob_kp.ek()), (carol_kp.alg(), carol_kp.ek())];
+
+        let plan = FundingPlan { source: &src, coins: &coins, change_index: 0, fee_rate: 2.0, change_override: None };
+        let np = NoteParams {
+            identity: &alice,
+            text: "funded multi pq note",
+            private: true,
+            recipient: None,
+            max_op_return_bytes: 200,
+            network: NET,
+        };
+        let built = build_funding_psbt_multi_pq(
+            &plan,
+            &np,
+            &recipients,
+            Some(&eks),
+            Some(PwLayer { password: "funded multi pw", cost: notes_core::pq::PwCost::Standard }),
+            DUST_LIMIT,
+            0,
+        )
+        .unwrap();
+        assert_eq!(built.sent_to_recipient, DUST_LIMIT * 2);
+
+        // Decode the header off the ACTUAL unsigned tx's OP_RETURN outputs.
+        let tx = &built.psbt.unsigned_tx;
+        let payloads: Vec<Vec<u8>> = tx
+            .output
+            .iter()
+            .filter_map(|o| notes_core::tx::op_return_payload(o.script_pubkey.as_bytes()).map(<[u8]>::to_vec))
+            .collect();
+        let decoded = envelope::decode_note(&payloads).expect("valid PNTE header");
+        assert_eq!(decoded.multi_count, Some(2));
+        assert_eq!(
+            decoded.flags,
+            envelope::FLAG_DIRECTED | envelope::FLAG_MULTI | envelope::FLAG_PRIVATE
+                | envelope::FLAG_PW | envelope::FLAG_MLKEM
+        );
+
+        // Every input's prevout is this tx's first input outpoint (the AAD).
+        let first_in = &tx.input[0].previous_output;
+        let mut outpoint = [0u8; 36];
+        outpoint[..32].copy_from_slice(&first_in.txid.to_byte_array());
+        outpoint[32..].copy_from_slice(&first_in.vout.to_le_bytes());
+
+        let locked_for = |recipients_x: [[u8; 32]; 2]| notes_core::pq::MultiLockedBody {
+            pq_flags: decoded.flags & (envelope::FLAG_PW | envelope::FLAG_MLKEM),
+            body: decoded.body.clone(),
+            sender_x: alice.output_x,
+            recipients_x: recipients_x.to_vec(),
+            outpoint,
+        };
+        let recipients_x = [bob.output_x, carol.output_x];
+
+        let bob_pt = unlock_received_multi(
+            &locked_for(recipients_x), &bob.tweaked_seckey, &bob.output_x, Some(&bob_kp.secret()), Some("funded multi pw"),
+        )
+        .unwrap();
+        assert_eq!(bob_pt, b"funded multi pq note");
+
+        let carol_pt = unlock_received_multi(
+            &locked_for(recipients_x), &carol.tweaked_seckey, &carol.output_x, Some(&carol_kp.secret()), Some("funded multi pw"),
+        )
+        .unwrap();
+        assert_eq!(carol_pt, b"funded multi pq note");
+
+        // Bob's key does not open Carol's wrap under a wrong password.
+        assert!(unlock_received_multi(
+            &locked_for(recipients_x), &bob.tweaked_seckey, &bob.output_x, Some(&bob_kp.secret()), Some("wrong"),
+        )
+        .is_err());
     }
 
     /// CHANGE-CHAIN sweep signing (taproot-change unit 6, see

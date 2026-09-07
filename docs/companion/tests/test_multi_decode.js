@@ -38,6 +38,8 @@ const src = fs.readFileSync(path.join(__dirname, "..", "chain-scan.js"), "utf8")
 const FLAG_PRIVATE = 0x01;
 const FLAG_DIRECTED = 0x02;
 const FLAG_MULTI = 0x04;
+const FLAG_PW = 0x10;
+const FLAG_MLKEM = 0x20;
 
 const ADDR = "bcrt1ptestscannedaddr";  // the scanned address (also B, a recipient)
 const SENDER = "bcrt1palicesender";    // the note's author (not `mine`)
@@ -144,6 +146,17 @@ const HISTORIES = {
        "aa".repeat(72) + "aa".repeat(72) + "bb".repeat(24)), 104,
        { voutAddrs: [ADDR, CAROL] }),
   ],
+  // === G: multi + BOTH pq layers (PLAN-graffito-multi-pq.md, 2026-09-06) ===
+  // The prior MULTI-vs-pq exclusion is lifted — this header must now
+  // DECODE (never foreign data), and since the browser holds no key at
+  // all, it renders exactly like scenario E: sealed placeholder text,
+  // recipients still resolved from the header count alone. The body bytes
+  // here are arbitrary (no real crypto needed to prove decodability/no-crash).
+  multiPq: [
+    tx("tx_g", noteSpk(FLAG_DIRECTED | FLAG_MULTI | FLAG_PRIVATE | FLAG_PW | FLAG_MLKEM, 2,
+       "cc".repeat(19) + "dd".repeat(40)), 106,
+       { voutAddrs: [ADDR, CAROL] }),
+  ],
   // === F: single-recipient regression — FLAG_MULTI CLEAR ===
   // Plain directed note, own side (ADDR spends from itself to CAROL +
   // change to self) — must decode exactly as before this feature existed:
@@ -215,6 +228,16 @@ vm.runInContext(`
   assert(JSON.stringify(ne.recipients) === JSON.stringify([${JSON.stringify(ADDR)}, ${JSON.stringify(CAROL)}]),
          "privateTwo: recipients must resolve even though the body is sealed: " + JSON.stringify(ne.recipients));
   console.log("PASS E: private 2-recipient note (72B wraps + sealed body) — placeholder text, recipients resolve");
+
+  // --- G: multi + both pq layers, now decodable (PLAN-graffito-multi-pq.md) ---
+  const g = await scanAddress("stub:multiPq", ${JSON.stringify(ADDR)});
+  assert(g.notes.length === 1, "multiPq: expected 1 note (header must decode), got " + g.notes.length);
+  const ng = g.notes[0];
+  assert(ng.private === true && ng.multi === true, "multiPq: private+multi flags");
+  assert(ng.text === null, "multiPq: private body must render as the placeholder (text:null)");
+  assert(JSON.stringify(ng.recipients) === JSON.stringify([${JSON.stringify(ADDR)}, ${JSON.stringify(CAROL)}]),
+         "multiPq: recipients must resolve from the header count alone: " + JSON.stringify(ng.recipients));
+  console.log("PASS G: multi note with FLAG_PW|FLAG_MLKEM decodes (exclusion lifted) — placeholder text, recipients resolve");
 
   // --- F: single-recipient regression, FLAG_MULTI clear ---
   const f = await scanAddress("stub:singleRegression", ${JSON.stringify(ADDR)});

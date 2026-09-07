@@ -1576,6 +1576,7 @@ pub(crate) fn apply_spending_compose_result(&mut self, w: &AppWindow, r: Spendin
                         // see the compose-send glue notes).
                         pq_flags: 0,
                         locked: None,
+                        locked_multi: None,
                     },
                     None,
                 );
@@ -1681,6 +1682,7 @@ pub(crate) fn apply_mixed_compose_result(&mut self, w: &AppWindow, r: MixedCompo
                         // no pq layer here yet.
                         pq_flags: 0,
                         locked: None,
+                        locked_multi: None,
                     },
                     change_utxo,
                 );

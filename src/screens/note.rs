@@ -30,7 +30,14 @@ use crate::*;
 pub(crate) fn refresh_note_unlock_ui(w: &AppWindow, n: &app_core::store::NoteRecord) {
     use app_core::notes_core::envelope::{FLAG_MLKEM, FLAG_PW};
 
-    let locked = n.locked.is_some();
+    // Multi-recipient pq notes (PLAN-graffito-multi-pq.md) populate
+    // `locked_multi` instead of `locked` (never both) — this block treats
+    // them identically to a single-recipient directed pq note in every way
+    // that matters here: never self (FLAG_MULTI always implies
+    // FLAG_DIRECTED), and the same password/ML-KEM/SenderCannotReopen
+    // captions apply verbatim (`pq_flags`/`received` drive all of that,
+    // not the locked-body shape).
+    let locked = n.locked.is_some() || n.locked_multi.is_some();
     w.global::<Ui>().set_note_locked(locked);
     w.global::<Note>().set_note_unlock_busy(false);
     w.global::<Ui>().set_note_unlock_show_button(false);
@@ -93,7 +100,7 @@ pub(crate) fn format_note_detail(n: &app_core::store::NoteRecord, watch: bool, t
     let short_id = &n.note_id[..8.min(n.note_id.len())];
     format!(
         "{}\n\nid: {}…\nkind: {}{}{}\ntxids: {}\nheight: {}\n{}{}",
-        text_override.or(n.text.as_deref()).unwrap_or(if n.locked.is_some() {
+        text_override.or(n.text.as_deref()).unwrap_or(if n.locked.is_some() || n.locked_multi.is_some() {
             "(locked — see below to unlock)"
         } else if watch && n.private {
             "(private — the key that reads this note isn't on this device)"

@@ -1290,6 +1290,108 @@ done
 pass "multi leg: all three recipients independently scan + read the multi-recipient public note"
 
 # ---------------------------------------------------------------------------
+# PLAN-graffito-multi-pq.md (2026-09-06): ML-KEM + password layers on a
+# MULTI-recipient note — the exclusion the plain multi leg above never
+# needed to test is now lifted. Three recipients at mixed ML-KEM levels
+# (512/768/1024), each ek exported via `pq-public` under the recipient's
+# OWN key (mirrors the single-recipient pq legs' convention), plus ONE
+# shared password mixed into every wrap. A dedicated identity + store, same
+# never-perturb-earlier-assertions rule as the "fu"/"multi" legs above.
+#
+# Funded via the identity's OWN NOTEBOOK (keyed `compose`, not
+# `note-spend-funded-multi`'s spending wallet): a received-pq note's
+# sender_x resolution tries only the tx's first-input address as a
+# candidate (LockedBody/MultiLockedBody's documented "candidate, not
+# proven" convention, unchanged by this plan), which is a TAPROOT address
+# only when the funding input is the sender's own notebook coin — a
+# spending-wallet (P2WPKH) input can never resolve there. This is a
+# pre-existing property of the single-recipient pq path too, not something
+# this leg works around.
+echo "== multi+pq leg: 3 recipients, mixed ML-KEM levels + shared password =="
+MPQ_KEY="letter advice cage absurd amount doctor acoustic avoid letter advice cage above"
+MPQ_STORE="$WORK/mpq-store.json"
+export APP_KEY="$MPQ_KEY"
+"$APP" init "$MPQ_STORE" "$NETWORK" | grep -q "kind=mnemonic" || fail "multi-pq: init"
+MPQ_ADDR="$("$APP" address "$NETWORK")"
+[[ "$MPQ_ADDR" == "$TAP_HRP"* ]] || fail "multi-pq: notebook address not taproot: $MPQ_ADDR"
+pre_watch_fresh "$MPQ_ADDR"
+MPQ_FUND_TXID="$(faucet "$MPQ_ADDR" 0.0008)"
+settle "$MPQ_FUND_TXID"
+"$APP" scan "$MPQ_STORE" "$BASE" >/dev/null
+
+MPQ_R1=4444444444444444444444444444444444444444444444444444444444444444
+MPQ_R2=5555555555555555555555555555555555555555555555555555555555555555
+MPQ_R3=6666666666666666666666666666666666666666666666666666666666666666
+MPQ_R1_ADDR="$(APP_KEY="$MPQ_R1" "$APP" address "$NETWORK")"
+MPQ_R2_ADDR="$(APP_KEY="$MPQ_R2" "$APP" address "$NETWORK")"
+MPQ_R3_ADDR="$(APP_KEY="$MPQ_R3" "$APP" address "$NETWORK")"
+pre_watch_fresh "$MPQ_R1_ADDR" "$MPQ_R2_ADDR" "$MPQ_R3_ADDR"
+
+# Each recipient's seed-derived ML-KEM receive key, at their OWN chosen
+# level — exactly `cli pq-public` under its own key, same convention the
+# single-recipient pq legs use (mixed levels, per PLAN-graffito-multi-pq.md).
+MPQ_R1_EK="$(APP_KEY="$MPQ_R1" "$APP" pq-public "$NETWORK" 512 2>"$WORK/mpq-r1-pq.err")"
+MPQ_R2_EK="$(APP_KEY="$MPQ_R2" "$APP" pq-public "$NETWORK" 768 2>"$WORK/mpq-r2-pq.err")"
+MPQ_R3_EK="$(APP_KEY="$MPQ_R3" "$APP" pq-public "$NETWORK" 1024 2>"$WORK/mpq-r3-pq.err")"
+[[ -n "$MPQ_R1_EK" && -n "$MPQ_R2_EK" && -n "$MPQ_R3_EK" ]] || fail "multi-pq: pq-public produced an empty armor"
+
+export APP_KEY="$MPQ_KEY"
+MPQ_TEXT="multi pq note: mixed ML-KEM levels + shared password"
+MPQ_PASSWORD="multi pq e2e password"
+MPQ_OUT="$("$APP" compose "$MPQ_STORE" "$BASE" private 2.0 "$MPQ_TEXT" \
+    "$MPQ_R1_ADDR" "$MPQ_R2_ADDR" "$MPQ_R3_ADDR" \
+    --mlkem "$MPQ_R1_EK" "$MPQ_R2_EK" "$MPQ_R3_EK" \
+    --password "$MPQ_PASSWORD" standard)"
+echo "$MPQ_OUT" | tee "$WORK/multi-pq-leg.log" | grep -q "recipients=3 private=true broadcast=ok" \
+    || fail "multi+pq leg: compose: $MPQ_OUT"
+MPQ_TXID="$(echo "$MPQ_OUT" | grep -oE 'txid=[0-9a-f]+' | head -1 | cut -d= -f2)"
+[[ "$NEEDS_EXPLICIT_SETTLE" == 1 ]] && settle "$MPQ_TXID"
+pass "multi+pq leg: 3-recipient private note (ML-KEM 512/768/1024 + shared password) composed + signed + broadcast entirely in-app, notebook-funded"
+
+# note-spend-funded-multi ALSO accepts the same --mlkem/--password flags
+# (PLAN-graffito-multi-pq.md's explicit ask) — proven separately here for
+# the build+sign+broadcast path alone: a spending-wallet-funded tx's first
+# input is P2WPKH, so the received-side sender_x candidate never resolves
+# (the pre-existing single-candidate limitation above) and this leg
+# deliberately does not attempt recipient-side decryption for it.
+MPQF_SPEND_ADDR="$("$APP" spending-address "$MPQ_STORE" "$NETWORK" | tail -1)"
+pre_watch_fresh "$MPQF_SPEND_ADDR"
+MPQF_FUND_TXID="$(faucet "$MPQF_SPEND_ADDR" 0.0008)"
+E2E_SPENDING_FUNDED+=("$MPQ_STORE|$MPQ_KEY|${APP_ACCOUNT:-0}")
+settle "$MPQF_FUND_TXID"
+MPQF_OUT="$("$APP" note-spend-funded-multi "$MPQ_STORE" "$BASE" private 2.0 500 "spending-funded multi pq" \
+    "$MPQ_R1_ADDR" "$MPQ_R2_ADDR" "$MPQ_R3_ADDR" \
+    --mlkem "$MPQ_R1_EK" "$MPQ_R2_EK" "$MPQ_R3_EK" \
+    --password "$MPQ_PASSWORD" standard)"
+echo "$MPQF_OUT" | tee "$WORK/multi-pq-funded-leg.log" | grep -q "recipients=3 sent_to_recipient=1500 .*broadcast=ok" \
+    || fail "multi+pq leg: note-spend-funded-multi: $MPQF_OUT"
+MPQF_TXID="$(echo "$MPQF_OUT" | grep -oE 'txid=[0-9a-f]+' | head -1 | cut -d= -f2)"
+[[ "$NEEDS_EXPLICIT_SETTLE" == 1 ]] && settle "$MPQF_TXID"
+pass "multi+pq leg: note-spend-funded-multi also accepts --mlkem/--password and broadcasts (spending-wallet-funded)"
+
+# Each recipient: a bare `scan` must NOT reveal the text (both pq bits are
+# set, and a password is never auto-tried — `apply_bundle`'s doc); an
+# explicit `note-unlock` with the shared password (their own derived
+# ML-KEM secret set is tried automatically) must.
+for pair in "$MPQ_R1:512" "$MPQ_R2:768" "$MPQ_R3:1024"; do
+    rk="${pair%%:*}"
+    lvl="${pair##*:}"
+    R_STORE="$WORK/multi-pq-recip-$rk.json"
+    APP_KEY="$rk" "$APP" init "$R_STORE" "$NETWORK" >/dev/null
+    APP_KEY="$rk" "$APP" scan "$R_STORE" "$BASE" >/dev/null
+    APP_KEY="$rk" "$APP" notes "$R_STORE" | tee "$WORK/multi-pq-scan-$rk" \
+        | grep -qE "received=true .*text=-\$" \
+        || fail "multi+pq leg (level $lvl): must stay locked after a bare scan: $(cat "$WORK/multi-pq-scan-$rk")"
+    APP_KEY="$rk" "$APP" note-unlock "$R_STORE" "$MPQ_TXID" "$MPQ_PASSWORD" \
+        | tee "$WORK/multi-pq-unlock-$rk" | grep -qF "text=$MPQ_TEXT" \
+        || fail "multi+pq leg (level $lvl): note-unlock failed: $(cat "$WORK/multi-pq-unlock-$rk")"
+    APP_KEY="$rk" "$APP" notes "$R_STORE" | tee "$WORK/multi-pq-notes-$rk" \
+        | grep -qF "text=$MPQ_TEXT" \
+        || fail "multi+pq leg (level $lvl): decrypted text did not persist to the store: $(cat "$WORK/multi-pq-notes-$rk")"
+done
+pass "multi+pq leg: all three recipients (mixed ML-KEM levels 512/768/1024) independently unlock with their own key + the shared password"
+
+# ---------------------------------------------------------------------------
 # testnet4 cleanup: sweep leftovers back to the gift-wallet address. This is
 # real money — best-effort (a store at/near zero balance is expected to
 # "fail" harmlessly here, e.g. FU_STORE after leg5b's consolidate).

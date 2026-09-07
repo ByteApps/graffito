@@ -117,9 +117,15 @@ console.log("PASS all roundtrip.rs::envelope_rejects_bad_shapes negative vectors
     const d = ctx.decodeNote_(`PNTE1${hex} hi`);
     assert(d !== null && d.flags === flags, `${why} (0x${hex}) must decode`);
   }
-  const bad = ctx.decodeNote_("PNTE11702 hi"); // PW|MULTI|DIRECTED|PRIVATE
-  assert(bad === null, "pq with FLAG_MULTI must stay undecodable");
-  console.log("PASS pq flag validity matches envelope.rs (self + directed forms, MULTI excluded)");
+  // PLAN-graffito-multi-pq.md (2026-09-06): the prior MULTI-vs-pq exclusion
+  // is LIFTED — a multi-recipient note may now carry pq bits too. The
+  // browser never decrypts a private body regardless, so this only proves
+  // the header stays DECODABLE (not that it renders any differently).
+  const nowOk = ctx.decodeNote_("PNTE11702 hi"); // PW|MULTI|DIRECTED|PRIVATE, count=2
+  assert(nowOk !== null && nowOk.flags === 0x17 && nowOk.multiCount === 2, "pq with FLAG_MULTI is now decodable");
+  const nowOkKem = ctx.decodeNote_("PNTE12702 hi"); // MLKEM|MULTI|DIRECTED|PRIVATE
+  assert(nowOkKem !== null && nowOkKem.flags === 0x27, "MLKEM with FLAG_MULTI is now decodable");
+  console.log("PASS pq flag validity matches envelope.rs (self + directed forms, MULTI now compatible)");
 }
 
 // Empty payload list.

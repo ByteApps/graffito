@@ -83,16 +83,39 @@ pub(crate) fn compose_est(
     }
 }
 
-/// `compose_est`, pq-aware: when `pq` carries nonzero flags, prices the
-/// note through notes-core's `estimate_note_cost_pq` (which bakes in
-/// `pq::pq_overhead`) instead of the ordinary `estimate_note_cost` — so
-/// the compose screen's live cost card shows the extra prefix bytes a pq
-/// layer adds seamlessly, without a separate line. pq notes are always
-/// single-recipient directed-private by construction (mirrors
-/// `compose::compose_note`'s own structural requirement), so this only
-/// ever takes the single-recipient path; `pq = (0, _)` (nothing on, or the
-/// section doesn't apply) delegates to `compose_est` unchanged — every
-/// non-pq compose stays byte-identical to before this function existed.
+/// Multi-recipient pq analog of [`multi_note_est`]: same framing
+/// arithmetic, but through `pq::multi_pq_overhead` (PLAN-graffito-multi-pq.md)
+/// so the extra prefix bytes (shared PW block + per-recipient ML-KEM
+/// ciphertexts, mixed levels included) show up in the live cost preview
+/// exactly like the single-recipient pq estimator does.
+pub(crate) fn multi_note_est_pq(
+    text_len: usize,
+    chunk_size: usize,
+    n_inputs: usize,
+    recipient_spk_lens: &[usize],
+    change_spk_len: Option<usize>,
+    pq_flags: u8,
+    algs: &[app_core::notes_core::pq::MlKemAlg],
+) -> Result<(usize, usize), app_core::notes_core::Error> {
+    use app_core::notes_core::{crypt, dm, envelope, pq, tx};
+    let n = recipient_spk_lens.len();
+    let overhead = pq::multi_pq_overhead(pq_flags, Some(algs));
+    let body_len = n * dm::WRAP_LEN + crypt::SEAL_OVERHEAD + text_len + overhead;
+    let flags = envelope::FLAG_DIRECTED | envelope::FLAG_MULTI | envelope::FLAG_PRIVATE | pq_flags;
+    let payload_lens = envelope::payload_lens_for(flags, Some(n as u8), body_len, chunk_size)?;
+    let vsize = tx::estimate_vsize_multi(n_inputs.max(1), &payload_lens, recipient_spk_lens, true);
+    let vsize = change_spk_len.map_or(vsize, |l| (vsize as i64 + l as i64 - 34).max(0) as usize);
+    Ok((payload_lens.len(), vsize))
+}
+
+/// `compose_est`, pq-aware: when `pq.0` carries nonzero flags, prices the
+/// note through notes-core's pq-aware estimators (`estimate_note_cost_pq`
+/// for a self-note/single recipient, [`multi_note_est_pq`] for 2+) instead
+/// of the ordinary non-pq ones — so the compose screen's live cost card
+/// shows the extra prefix bytes a pq layer adds seamlessly, without a
+/// separate line. `pq = (0, _, _)` (nothing on, or the section doesn't
+/// apply) delegates to `compose_est` unchanged — every non-pq compose
+/// stays byte-identical to before this function existed.
 pub(crate) fn compose_est_pq(
     store: &Store,
     text_len: usize,
@@ -100,11 +123,16 @@ pub(crate) fn compose_est_pq(
     n_inputs: usize,
     recipient_spk_lens: &[usize],
     change_spk_len: Option<usize>,
-    pq: (u8, Option<app_core::notes_core::pq::MlKemAlg>),
+    pq: (u8, Option<app_core::notes_core::pq::MlKemAlg>, Vec<app_core::notes_core::pq::MlKemAlg>),
 ) -> Result<(usize, usize), app_core::notes_core::Error> {
-    let (pq_flags, alg) = pq;
+    let (pq_flags, alg, multi_algs) = pq;
     if pq_flags == 0 {
         return compose_est(store, text_len, private, n_inputs, recipient_spk_lens, change_spk_len);
+    }
+    if recipient_spk_lens.len() >= 2 {
+        return multi_note_est_pq(
+            text_len, store.chunk_size, n_inputs, recipient_spk_lens, change_spk_len, pq_flags, &multi_algs,
+        );
     }
     let (chunks, vsize) = app_core::notes_core::bundle::estimate_note_cost_pq(
         text_len,
@@ -516,9 +544,58 @@ pub(crate) fn refresh_compose_locktime_panel(&self, w: &AppWindow) {
 pub(crate) fn pq_compose_eligible(&self, w: &AppWindow) -> bool {
     let st = self;
     w.global::<Compose>().get_compose_private()
-        && st.to_addresses_extra.is_empty()
         && st.ident.as_ref().map(|i| !i.is_watch()).unwrap_or(false)
         && st.payfrom_active_source == "notebook"
+}
+
+/// Every directed recipient address for the current compose (primary `to`
+/// plus `to_addresses_extra`, in that order) — empty for a self-note.
+/// Shared by the pq gating below and by [`on_compose_send`]'s Sign-time ek
+/// resolution so both use the exact same recipient order.
+pub(crate) fn compose_pq_recipient_addrs(&self) -> Vec<String> {
+    match &self.to_address {
+        Some(addr) => {
+            let mut v = vec![addr.clone()];
+            v.extend(self.to_addresses_extra.iter().cloned());
+            v
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Resolve every one of `addrs`' stored ML-KEM contact key (PLAN-graffito-
+/// multi-pq.md) — in the SAME order as `addrs`. ALL-OR-NOTHING: `Ok` only
+/// when every address carries a valid, parseable key; otherwise `Err`
+/// names how many are missing/unreadable (a note that is pq for one
+/// recipient and not another would be a false promise — see the plan's
+/// "Behaviour" section). Self-notes never call this (they resolve
+/// `State.pq_imported` instead, unchanged).
+pub(crate) fn resolve_pq_mlkem_eks(
+    &self,
+    addrs: &[String],
+) -> Result<Vec<(app_core::notes_core::pq::MlKemAlg, Vec<u8>)>, String> {
+    let net = self.network.as_str();
+    let mut out = Vec::with_capacity(addrs.len());
+    let mut missing = 0usize;
+    for addr in addrs {
+        let armor = self
+            .contacts
+            .iter()
+            .find(|c| &c.address == addr && (c.network == net || c.network.is_empty()))
+            .and_then(|c| c.mlkem_ek.clone());
+        match armor.as_deref().map(app_core::notes_core::pq::import_public) {
+            Some(Ok(pair)) => out.push(pair),
+            _ => missing += 1,
+        }
+    }
+    if missing > 0 {
+        return Err(if addrs.len() == 1 {
+            "recipient has no quantum key — add one in Contacts".to_string()
+        } else {
+            format!("{missing} of {} recipients lack a quantum key", addrs.len())
+        });
+    }
+    Ok(out)
 }
 
 /// Repaint the compose screen's "Security" section from current UI toggle
@@ -528,7 +605,19 @@ pub(crate) fn pq_compose_eligible(&self, w: &AppWindow) -> bool {
 /// every non-pq compose stays byte-identical to before this feature.
 /// Called from `refresh_compose` on every relevant compose change (mirrors
 /// `refresh_compose_locktime_panel`'s pattern).
-pub(crate) fn refresh_compose_pq(&mut self, w: &AppWindow) -> (u8, Option<app_core::notes_core::pq::MlKemAlg>) {
+/// Return: `(pq_flags, single_alg, multi_algs)` — `single_alg` is the
+/// resolved level for a self-note or ORDINARY (one-recipient) directed
+/// note, `Some` only when the ML-KEM layer is actually ON; `multi_algs` is
+/// non-empty ONLY for a 2+-recipient directed note with ML-KEM on, one alg
+/// per recipient in recipient order (PLAN-graffito-multi-pq.md — mixed
+/// levels across recipients are allowed). `(0, None, vec![])` when the
+/// section doesn't apply or neither layer is on, so every non-pq compose
+/// stays byte-identical to before this feature. Called from
+/// `refresh_compose` on every relevant compose change (mirrors
+/// `refresh_compose_locktime_panel`'s pattern).
+pub(crate) fn refresh_compose_pq(
+    &mut self, w: &AppWindow,
+) -> (u8, Option<app_core::notes_core::pq::MlKemAlg>, Vec<app_core::notes_core::pq::MlKemAlg>) {
     let st = self;
     use app_core::notes_core::envelope::{FLAG_MLKEM, FLAG_PW};
     use app_core::passphrase::{self, SecurityChoice};
@@ -542,14 +631,39 @@ pub(crate) fn refresh_compose_pq(&mut self, w: &AppWindow) -> (u8, Option<app_co
         w.global::<Compose>().set_pq_security_label("".into());
         w.global::<Compose>().set_pq_mlkem_available(false);
         w.global::<Compose>().set_pq_mlkem_caption("".into());
-        return (0, None);
+        return (0, None, Vec::new());
     }
 
     let private = true; // pq_compose_eligible already required this
     let directed = st.to_address.is_some();
+    let recipient_addrs = st.compose_pq_recipient_addrs();
+    let is_multi = recipient_addrs.len() >= 2;
 
     // ---- ML-KEM availability ----
-    let (mlkem_available, mlkem_level, mlkem_caption) = if directed {
+    let (mlkem_available, mlkem_level, mlkem_caption, multi_algs) = if directed && is_multi {
+        // Multi-recipient (2026-09-06, PLAN-graffito-multi-pq.md):
+        // ALL-OR-NOTHING across every recipient — recomputed each refresh
+        // (a handful of linear contact lookups, cheap enough to skip the
+        // single-recipient cache's optimization).
+        match st.resolve_pq_mlkem_eks(&recipient_addrs) {
+            Ok(eks) => {
+                let algs: Vec<app_core::notes_core::pq::MlKemAlg> =
+                    eks.iter().map(|(alg, _)| *alg).collect();
+                let caption = algs
+                    .iter()
+                    .map(|a| app_core::pqkeys::from_pq_alg(*a).name())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                // The combined-label call below only takes ONE level (it
+                // names the mechanism, not every recipient's choice) — the
+                // first recipient's is representative; `mlkem_caption`
+                // above is what the user actually reads.
+                let first_level = app_core::pqkeys::from_pq_alg(algs[0]);
+                (true, Some(first_level), caption, algs)
+            }
+            Err(msg) => (false, None, msg, Vec::new()),
+        }
+    } else if directed {
         // Directed note: cached per resolved recipient address (unchanged).
         let addr = st.to_address.clone().unwrap_or_default();
         let recompute = st.pq_recipient_cache.as_ref().map(|(a, _)| a.as_str()) != Some(addr.as_str());
@@ -564,11 +678,12 @@ pub(crate) fn refresh_compose_pq(&mut self, w: &AppWindow) -> (u8, Option<app_co
             st.pq_recipient_cache = Some((addr.clone(), display));
         }
         let resolved = st.pq_recipient_cache.as_ref().and_then(|(_, d)| d.as_ref());
-        match resolved {
+        let (available, level, caption) = match resolved {
             Some(Ok((level, line))) => (true, Some(*level), line.clone()),
             Some(Err(e)) => (false, None, format!("couldn't read this contact's quantum key: {e}")),
             None => (false, None, "recipient has no quantum key — add one in Contacts".to_string()),
-        }
+        };
+        (available, level, caption, Vec::new())
     } else {
         // Self-note (PLAN-graffito-self-pw.md): the ONLY eligible key is an
         // imported/randomly-generated quantum key living outside the seed
@@ -578,7 +693,7 @@ pub(crate) fn refresh_compose_pq(&mut self, w: &AppWindow) -> (u8, Option<app_co
         // "Self-note pq layers" doc calls this out explicitly). No
         // recipient-keyed cache applies here.
         st.pq_recipient_cache = None;
-        match st.pq_imported.as_ref() {
+        let (available, level, caption) = match st.pq_imported.as_ref() {
             Some(kp) => (
                 true,
                 Some(app_core::pqkeys::from_pq_alg(kp.alg())),
@@ -593,7 +708,8 @@ pub(crate) fn refresh_compose_pq(&mut self, w: &AppWindow) -> (u8, Option<app_co
                 None,
                 "add a quantum key first (Settings → Quantum keys) to add this layer".to_string(),
             ),
-        }
+        };
+        (available, level, caption, Vec::new())
     };
     w.global::<Compose>().set_pq_mlkem_available(mlkem_available);
     w.global::<Compose>().set_pq_mlkem_caption(mlkem_caption.into());
@@ -673,7 +789,8 @@ pub(crate) fn refresh_compose_pq(&mut self, w: &AppWindow) -> (u8, Option<app_co
 
     let flags = (if passphrase_on { FLAG_PW } else { 0 }) | (if mlkem_on { FLAG_MLKEM } else { 0 });
     let alg = if mlkem_on { mlkem_level.map(app_core::pqkeys::pq_alg) } else { None };
-    (flags, alg)
+    let multi_algs = if mlkem_on { multi_algs } else { Vec::new() };
+    (flags, alg, multi_algs)
 }
 
 /// Recompute the whole compose screen from state: coin list + selection,
@@ -2734,20 +2851,19 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
         } else {
             None
         };
+        // Per-recipient ML-KEM (2026-09-06, PLAN-graffito-multi-pq.md):
+        // one `(alg, ek)` per directed recipient, in recipient order (to,
+        // then extras) — or the single self-note imported key wrapped in a
+        // length-1 Vec (see `ComposeRequest::pq_mlkem`'s doc).
         let pq_mlkem = if pq_eligible && w.global::<Compose>().get_pq_mlkem_enabled() {
             match to.as_deref() {
-                Some(addr) => {
-                    let net_str = self.network.as_str();
-                    let armor = self
-                        .contacts
-                        .iter()
-                        .find(|c| c.address == addr && (c.network == net_str || c.network.is_empty()))
-                        .and_then(|c| c.mlkem_ek.clone());
-                    match armor.as_deref().map(app_core::notes_core::pq::import_public) {
-                        Some(Ok(pair)) => Some(pair),
-                        _ => {
+                Some(_) => {
+                    let addrs = self.compose_pq_recipient_addrs();
+                    match self.resolve_pq_mlkem_eks(&addrs) {
+                        Ok(eks) => Some(eks),
+                        Err(_) => {
                             w.global::<Ui>().set_status(
-                                "couldn't read this contact's quantum key — try again, or turn off quantum encryption".into(),
+                                "couldn't read a recipient's quantum key — try again, or turn off quantum encryption".into(),
                             );
                             return;
                         }
@@ -2761,7 +2877,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
                 // race the key being removed since, so re-check here rather
                 // than trusting the toggle blindly.
                 None => match self.pq_imported.as_ref() {
-                    Some(kp) => Some((kp.alg(), kp.ek().to_vec())),
+                    Some(kp) => Some(vec![(kp.alg(), kp.ek().to_vec())]),
                     None => {
                         w.global::<Ui>().set_status(
                             "no quantum key — add one in Settings, or turn off quantum encryption".into(),
@@ -2790,7 +2906,15 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
         };
         // The security shape of what is about to be sealed — the e2e
         // suites assert on it (private/public, directed/multi, pw layer +
-        // its cost, ML-KEM level) instead of reading the form.
+        // its cost, ML-KEM level(s)) instead of reading the form. `mlkem=`
+        // is `none`, `MlKem<level>` for exactly one recipient (unchanged
+        // format), or a comma-separated per-recipient list in recipient
+        // order for 2+ (PLAN-graffito-multi-pq.md's log contract).
+        let mlkem_log = match req.pq_mlkem.as_ref() {
+            None => "none".to_string(),
+            Some(eks) if eks.len() == 1 => format!("{:?}", eks[0].0),
+            Some(eks) => eks.iter().map(|(alg, _)| format!("{alg:?}")).collect::<Vec<_>>().join(","),
+        };
         println!(
             "cb: compose-request private={} directed={} recipients={} pw={} cost={} mlkem={}",
             req.private,
@@ -2798,7 +2922,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
             req.recipient.is_some() as usize + req.extra_recipients.len(),
             req.pq_password.is_some(),
             req.pq_pw_cost.as_str(),
-            req.pq_mlkem.as_ref().map(|(alg, _)| format!("{alg:?}")).unwrap_or_else(|| "none".into()),
+            mlkem_log,
         );
         let Some(store) = self.store.as_ref() else {
             w.global::<Ui>().set_status("no store".into());

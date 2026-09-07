@@ -113,6 +113,7 @@ pub(crate) fn record_watch_note(&mut self, wn: &WatchNote, txid: &str, raw: &str
             // at compose time, which a watch identity never has.
             pq_flags: 0,
             locked: None,
+            locked_multi: None,
         },
         change,
     );

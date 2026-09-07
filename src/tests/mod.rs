@@ -99,6 +99,12 @@ mod ui_flow_locked_note_unlock;
 mod ui_flow_multi_select;
 mod ui_flow_multi_confirm;
 mod ui_flow_multi_reply_all;
+
+/// PLAN-graffito-multi-pq.md (2026-09-06): multi-recipient directed notes
+/// with pq layers — the all-or-nothing ML-KEM gate, the mixed-level
+/// caption, and the recipient-ordered `pq_mlkem`/log-line resolution the
+/// cross-device suite's `mlkem=MlKem768,MlKem1024` assertion depends on.
+mod ui_flow_multi_pq;
 /// U10 (PLAN-graffito-app-arch.md): in-process ports of the NETWORK-FREE
 /// legs of the coordinate Mac suite (ui-automation/tests/graffito-app.sh) —
 /// notebooks create/name/open/archive, the universal-confirm cancel

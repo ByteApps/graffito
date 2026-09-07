@@ -910,6 +910,7 @@ fn stale_received_twin(note_id: &str, txid: &str, height: u64) -> NoteRecord {
         dropped: false,
         pq_flags: 0,
         locked: None,
+        locked_multi: None,
     }
 }
 
@@ -1190,7 +1191,7 @@ fn alice_own_view(tx: &NoteTx, bob_addr: &str, height: u64) -> SyncBundle {
 /// — see `pq_self_note_with_password_is_stored_locked_and_never_cached`
 /// and the ML-KEM case in `pq_self_note_with_mlkem_layer_composes`.
 #[test]
-fn pq_layers_require_single_recipient_directed_private_or_self() {
+fn pq_layers_require_a_private_note() {
     let a = alice();
     let b = bob();
     let bob_addr = b.address(NET);
@@ -1243,9 +1244,11 @@ fn pq_layers_require_single_recipient_directed_private_or_self() {
     .unwrap_err();
     assert!(matches!(err, Error::Store(_)));
 
-    // Multi-recipient (extra_recipients adds a distinct address) + a
-    // password layer.
+    // A private note but the wrong `pq_mlkem` key COUNT (2 recipients, only
+    // 1 key supplied) — PLAN-graffito-multi-pq.md's per-recipient shape
+    // must be enforced, not silently truncated/padded.
     let carol_addr = carol().address(NET);
+    let kp = bob_pq_keypair();
     let err = compose_note(
         &store,
         &a,
@@ -1261,12 +1264,81 @@ fn pq_layers_require_single_recipient_directed_private_or_self() {
             gift_amount: None,
             lock_time: None,
             now: 1,
-            pq_password: Some("hunter2hunter2hunter2".into()), pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
-            pq_mlkem: None,
+            pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
+            pq_mlkem: Some(vec![(MlKemAlg::MlKem768, kp.ek().to_vec())]),
         },
     )
     .unwrap_err();
     assert!(matches!(err, Error::Store(_)));
+}
+
+/// Multi-recipient pq compose (PLAN-graffito-multi-pq.md, 2026-09-06): a
+/// private note to 2+ recipients with EITHER a password layer, an
+/// ML-KEM layer (one key per recipient, mixed levels allowed), or both is
+/// now ACCEPTED — the exclusion the previous test's old name asserted was
+/// lifted. `pq_flags`/`recipients` come back exactly as a plain multi note
+/// would, plus the pq bits.
+#[test]
+fn pq_multi_recipient_note_composes_with_password_and_mixed_mlkem_levels() {
+    let a = alice();
+    let bob_addr = bob().address(NET);
+    let carol_addr = carol().address(NET);
+    let store = funded_store(&a);
+
+    // Password only.
+    let composed = compose_note(
+        &store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "multi + password",
+            private: true,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[&carol_addr],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: Some("correct horse battery staple".into()),
+            pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
+            pq_mlkem: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(composed.pq_flags, FLAG_PW);
+    assert_eq!(composed.recipients.len(), 2);
+
+    // ML-KEM only, mixed levels (Bob 768, Carol 1024).
+    let bob_kp = bob_pq_keypair();
+    let carol_kp = notes_core::pq::MlKemKeypair::generate(MlKemAlg::MlKem1024).unwrap();
+    let composed = compose_note(
+        &store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "multi + mixed mlkem",
+            private: true,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[&carol_addr],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: None,
+            pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
+            pq_mlkem: Some(vec![
+                (bob_kp.alg(), bob_kp.ek().to_vec()),
+                (carol_kp.alg(), carol_kp.ek().to_vec()),
+            ]),
+        },
+    )
+    .unwrap();
+    assert_eq!(composed.pq_flags, FLAG_MLKEM);
+    assert_eq!(composed.recipients.len(), 2);
 }
 
 /// Self-note pq compose routing (PLAN-graffito-self-pw.md): a private
@@ -1296,7 +1368,7 @@ fn pq_self_note_with_mlkem_layer_composes() {
             lock_time: None,
             now: 1,
             pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
-            pq_mlkem: Some((MlKemAlg::MlKem768, kp.ek().to_vec())),
+            pq_mlkem: Some(vec![(MlKemAlg::MlKem768, kp.ek().to_vec())]),
         },
     )
     .unwrap();
@@ -1420,7 +1492,7 @@ fn pq_kem_only_note_auto_unlocks_for_recipient_with_derived_secret() {
             lock_time: None,
             now: 1,
             pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
-            pq_mlkem: Some((MlKemAlg::MlKem768, bob_kp.ek().to_vec())),
+            pq_mlkem: Some(vec![(MlKemAlg::MlKem768, bob_kp.ek().to_vec())]),
         },
     )
     .unwrap();
@@ -1511,7 +1583,7 @@ fn pq_hybrid_note_needs_both_layers_together() {
             lock_time: None,
             now: 1,
             pq_password: Some(password.into()), pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
-            pq_mlkem: Some((MlKemAlg::MlKem768, bob_kp.ek().to_vec())),
+            pq_mlkem: Some(vec![(MlKemAlg::MlKem768, bob_kp.ek().to_vec())]),
         },
     )
     .unwrap();
@@ -1801,4 +1873,180 @@ fn pending_note_change_spent_elsewhere_is_not_resurrected() {
     );
     assert_eq!(store.balance(), 0);
     assert_eq!(store.notes[0].status, NoteStatus::Pending, "the note itself is still pending in the mempool");
+}
+
+// ---------------------------------------------------------------------
+// Multi-recipient pq layers (PLAN-graffito-multi-pq.md, 2026-09-06) — full
+// app-core round trip: ComposeRequest -> compose_and_record -> apply_bundle
+// -> Store::unlock_note, mirroring the single-recipient pq tests above.
+// ---------------------------------------------------------------------
+
+const CAROL_LEAF: [u8; 32] = [0x55u8; 32];
+
+/// A RECEIVED multi-recipient `OnchainTx`: paid to every address in
+/// `output_addrs` (recipient dust outputs precede change by construction),
+/// authored by `sender_addr` — the received-side analog of
+/// `onchain_own_multi` above (that one is the SENDER's own view).
+fn onchain_received_multi(tx: &NoteTx, height: u64, sender_addr: &str, output_addrs: Vec<String>) -> OnchainTx {
+    OnchainTx {
+        txid: tx.txid_hex.clone(),
+        height: Some(height),
+        blocktime: Some(1_700_000_000 + height),
+        spends_from_self: false,
+        payloads: tx
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey).map(hex::encode))
+            .collect(),
+        pays_self: true,
+        sender: Some(sender_addr.to_string()),
+        author_candidates: vec![sender_addr.to_string()],
+        recipient: None,
+        input_prevout_spks: Vec::new(),
+        output_addrs,
+        first_input_outpoint: first_input_outpoint_of(tx),
+    }
+}
+
+#[test]
+fn pq_multi_recipient_kem_and_password_round_trip_through_store() {
+    let a = alice();
+    let b = bob();
+    let c = identity_from_leaf(&CAROL_LEAF).unwrap();
+    let bob_addr = b.address(NET);
+    let carol_addr = c.address(NET);
+    let alice_addr = a.address(NET);
+    let bob_kp = bob_pq_keypair(); // MlKem768, leaf BOB_LEAF
+    let carol_kp = pqkeys::derive_keypair(&CAROL_LEAF, MlKemAlg::MlKem1024);
+
+    let mut store = funded_store(&a);
+    let sent = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "multi kem+pw",
+            private: true,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[&carol_addr],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: Some("multi round trip password".into()),
+            pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
+            pq_mlkem: Some(vec![
+                (bob_kp.alg(), bob_kp.ek().to_vec()),
+                (carol_kp.alg(), carol_kp.ek().to_vec()),
+            ]),
+        },
+    )
+    .unwrap();
+    assert_eq!(sent.pq_flags, FLAG_MLKEM | FLAG_PW);
+    assert_eq!(sent.recipients, vec![bob_addr.clone(), carol_addr.clone()]);
+
+    let output_addrs = vec![bob_addr.clone(), carol_addr.clone()];
+    let received_tx = onchain_received_multi(&sent.tx, 200, &alice_addr, output_addrs);
+    let received_bundle = bundle(vec![received_tx], vec![], 200);
+
+    // Bob: locked until he supplies both his ML-KEM secret and the password.
+    let mut bob_store = Store::new(&b.output_x, NET);
+    bob_store.apply_bundle(&received_bundle, &b, NET, &[], &[], &[]).unwrap();
+    assert!(bob_store.notes[0].text.is_none());
+    assert!(bob_store.notes[0].locked.is_none(), "multi-pq must populate locked_multi, not locked");
+    assert!(bob_store.notes[0].locked_multi.is_some());
+    let bob_note_id = bob_store.notes[0].note_id.clone();
+    let bob_secret = bob_kp.secret();
+    let pt = bob_store
+        .unlock_note(&bob_note_id, &b, std::slice::from_ref(&bob_secret), Some("multi round trip password"))
+        .unwrap();
+    assert_eq!(pt, "multi kem+pw");
+    assert!(bob_store.notes[0].locked_multi.is_none(), "unlocking clears locked_multi");
+
+    // Carol: her OWN level (1024, distinct from Bob's 768 — mixed levels).
+    let mut carol_store = Store::new(&c.output_x, NET);
+    carol_store.apply_bundle(&received_bundle, &c, NET, &[], &[], &[]).unwrap();
+    let carol_note_id = carol_store.notes[0].note_id.clone();
+    let carol_secret = carol_kp.secret();
+    let pt2 = carol_store
+        .unlock_note(&carol_note_id, &c, std::slice::from_ref(&carol_secret), Some("multi round trip password"))
+        .unwrap();
+    assert_eq!(pt2, "multi kem+pw");
+
+    // Wrong password fails cleanly (never a crash, never wrong plaintext).
+    let mut carol_store2 = Store::new(&c.output_x, NET);
+    carol_store2.apply_bundle(&received_bundle, &c, NET, &[], &[], &[]).unwrap();
+    let carol_note_id2 = carol_store2.notes[0].note_id.clone();
+    let err = carol_store2
+        .unlock_note(&carol_note_id2, &c, std::slice::from_ref(&carol_secret), Some("wrong password"))
+        .unwrap_err();
+    assert!(matches!(err, Error::Notes(_)));
+
+    // Bob's WRONG secret (Carol's 1024 key) also fails cleanly.
+    let mut bob_store2 = Store::new(&b.output_x, NET);
+    bob_store2.apply_bundle(&received_bundle, &b, NET, &[], &[], &[]).unwrap();
+    let bob_note_id2 = bob_store2.notes[0].note_id.clone();
+    let err2 = bob_store2
+        .unlock_note(&bob_note_id2, &b, std::slice::from_ref(&carol_secret), Some("multi round trip password"))
+        .unwrap_err();
+    assert!(matches!(err2, Error::Notes(_)));
+}
+
+#[test]
+fn pq_multi_recipient_kem_only_auto_unlocks_via_apply_bundle() {
+    let a = alice();
+    let b = bob();
+    let c = identity_from_leaf(&CAROL_LEAF).unwrap();
+    let bob_addr = b.address(NET);
+    let carol_addr = c.address(NET);
+    let alice_addr = a.address(NET);
+    let bob_kp = bob_pq_keypair();
+    let carol_kp = pqkeys::derive_keypair(&CAROL_LEAF, MlKemAlg::MlKem512);
+
+    let mut store = funded_store(&a);
+    let sent = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "multi kem only",
+            private: true,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[&carol_addr],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: None,
+            pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
+            pq_mlkem: Some(vec![
+                (bob_kp.alg(), bob_kp.ek().to_vec()),
+                (carol_kp.alg(), carol_kp.ek().to_vec()),
+            ]),
+        },
+    )
+    .unwrap();
+    assert_eq!(sent.pq_flags, FLAG_MLKEM);
+
+    let output_addrs = vec![bob_addr.clone(), carol_addr.clone()];
+    let received_tx = onchain_received_multi(&sent.tx, 200, &alice_addr, output_addrs);
+    let received_bundle = bundle(vec![received_tx], vec![], 200);
+
+    // Bob auto-unlocks on scan with his own full derived secret set.
+    let mut bob_store = Store::new(&b.output_x, NET);
+    let bob_secrets = pqkeys::derive_secrets(&BOB_LEAF);
+    bob_store.apply_bundle(&received_bundle, &b, NET, &[], &[], &bob_secrets).unwrap();
+    assert_eq!(bob_store.notes[0].text.as_deref(), Some("multi kem only"));
+    assert!(bob_store.notes[0].locked_multi.is_none());
+
+    // Carol likewise, with HER level (512).
+    let mut carol_store = Store::new(&c.output_x, NET);
+    let carol_secrets = pqkeys::derive_secrets(&CAROL_LEAF);
+    carol_store.apply_bundle(&received_bundle, &c, NET, &[], &[], &carol_secrets).unwrap();
+    assert_eq!(carol_store.notes[0].text.as_deref(), Some("multi kem only"));
 }

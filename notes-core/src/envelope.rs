@@ -34,7 +34,16 @@
 //! never a replacement for it. Header ENCODING is unchanged (flags already
 //! occupy a full byte); only the body FRAMING is new (extra prefix blocks
 //! ahead of the sealed blob — see pq.rs). A header carrying either bit
-//! without FLAG_PRIVATE, or together with FLAG_MULTI, is undecodable.
+//! without FLAG_PRIVATE is undecodable.
+//!
+//! Additive (2026-09-06, PLAN-graffito-multi-pq.md): `FLAG_PW`/`FLAG_MLKEM`
+//! are ALSO valid together with `FLAG_MULTI` — a multi-recipient directed
+//! note may carry either or both pq layers, per-recipient ML-KEM wraps and
+//! a single shared password block (see pq.rs's `seal_multi_pq`/
+//! `MultiSealLayers` for the wire framing). This lifted the prior
+//! MULTI-vs-pq exclusion; nothing already on chain changes meaning (no
+//! confirmed note has ever combined these bits, since the old decoder
+//! rejected the combination outright).
 
 use crate::Error;
 
@@ -56,6 +65,10 @@ pub const FLAG_DIRECTED: u8 = 0x02;
 /// the multi-recipient crypto that fills it in):
 ///   public  (FLAG_PRIVATE clear): the UTF-8 text, verbatim (no count byte)
 ///   private (FLAG_PRIVATE set):   `count × wrap(72B each) || sealed_body`
+///   private + pq (FLAG_PW/FLAG_MLKEM set, 2026-09-06): see pq.rs's
+///     `seal_multi_pq` module doc for the extra prefix blocks ahead of the
+///     wraps — additive, the plain-multi framing above is the pq_flags=0
+///     case of that same shape.
 /// `count` is the number of recipients (the tx's recipient outputs,
 /// `output_addrs[0..count]`, precede change by construction).
 pub const FLAG_MULTI: u8 = 0x04;
@@ -69,16 +82,21 @@ pub const FLAG_CONT: u8 = 0x08;
 /// Argon2id-stretched password, hybrid ON TOP of the note's base key
 /// (dm.rs ECDH when DIRECTED; the notebook enc key on a SELF-note —
 /// PLAN-graffito-self-pw.md), never a replacement for it. Requires
-/// `FLAG_PRIVATE` (DIRECTED optional since 2026-08-22) and is INVALID
-/// with `FLAG_MULTI` — a violating header is undecodable (`None`). May
-/// combine with `FLAG_MLKEM`.
+/// `FLAG_PRIVATE` (DIRECTED optional since 2026-08-22) — a violating
+/// header is undecodable (`None`). May combine with `FLAG_MLKEM`, and
+/// (2026-09-06, PLAN-graffito-multi-pq.md) with `FLAG_MULTI` — on a
+/// multi-recipient note the password is ONE shared block, mixed into
+/// every recipient's wrap key (pq.rs `seal_multi_pq`).
 pub const FLAG_PW: u8 = 0x10;
 /// flags bit 5: post-quantum ML-KEM layer (notes-core/src/pq.rs) — a
 /// FIPS-203 key-encapsulation ciphertext, hybrid ON TOP of the note's
 /// base key: addressed to the RECIPIENT's ek when DIRECTED, or (self-pq
 /// extension) to a keypair of the AUTHOR's choosing on a SELF-note —
 /// meaningful there only for a NON-seed-derived keypair, see pq.rs. Same
-/// validity rule as `FLAG_PW`; may combine with it.
+/// validity rule as `FLAG_PW`; may combine with it. Combines with
+/// `FLAG_MULTI` too (2026-09-06): each recipient gets their OWN ciphertext
+/// addressed to their own ek, possibly at a different ML-KEM level per
+/// recipient (mixed levels are allowed — pq.rs `seal_multi_pq`).
 pub const FLAG_MLKEM: u8 = 0x20;
 
 /// Every flag bit this decoder understands. Any OTHER set bit (6-7, or
@@ -152,28 +170,28 @@ fn validate_multi(flags: u8, multi_count: Option<u8>) -> Result<(), Error> {
     }
 }
 
-/// `flags`'s pq bits (`FLAG_PW`/`FLAG_MLKEM`) validity, and both are
-/// invalid together with `FLAG_MULTI` (no multi-recipient pq support —
-/// notes-core/src/pq.rs):
+/// `flags`'s pq bits (`FLAG_PW`/`FLAG_MLKEM`) validity — both require
+/// `FLAG_PRIVATE`, with OR without `FLAG_DIRECTED` (2026-08-22,
+/// PLAN-graffito-self-pw.md — the ADDITIVE extension the frozen format
+/// permits): the directed forms are the original pq layers; `PW|PRIVATE` /
+/// `MLKEM|PRIVATE` without DIRECTED are pq-layered SELF-notes (pq.rs
+/// `seal_self_pq`/`unlock_self` — including the seed-derived-ek warning
+/// that makes a self-KEM meaningful ONLY for a non-seed-derived keypair).
+/// Decoders older than this rule treat the self combinations as
+/// undecodable and skip them silently — graceful, by design.
 ///
-/// Both bits require `FLAG_PRIVATE`, with OR without `FLAG_DIRECTED`
-/// (2026-08-22, PLAN-graffito-self-pw.md — the ADDITIVE extension the
-/// frozen format permits): the directed forms are the original pq
-/// layers; `PW|PRIVATE` / `MLKEM|PRIVATE` without DIRECTED are
-/// pq-layered SELF-notes (pq.rs `seal_self_pq`/`unlock_self` — including
-/// the seed-derived-ek warning that makes a self-KEM meaningful ONLY for
-/// a non-seed-derived keypair). Decoders older than this rule treat the
-/// self combinations as undecodable and skip them silently — graceful,
-/// by design.
+/// Since 2026-09-06 (PLAN-graffito-multi-pq.md) both bits are ALSO valid
+/// together with `FLAG_MULTI` — a multi-recipient directed note may carry
+/// either or both pq layers (pq.rs `seal_multi_pq`/`unlock_received_multi`).
+/// This lifted the prior MULTI-vs-pq exclusion; a decoder older than this
+/// rule treats the combination as undecodable and skips it silently, same
+/// graceful-degradation story as the self-note extension above.
 fn validate_pq(flags: u8) -> Result<(), Error> {
     if flags & (FLAG_PW | FLAG_MLKEM) == 0 {
         return Ok(());
     }
     if flags & FLAG_PRIVATE == 0 {
         return Err(Error::Envelope("FLAG_PW/FLAG_MLKEM require FLAG_PRIVATE"));
-    }
-    if flags & FLAG_MULTI != 0 {
-        return Err(Error::Envelope("FLAG_PW/FLAG_MLKEM are incompatible with FLAG_MULTI"));
     }
     Ok(())
 }

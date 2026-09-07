@@ -160,6 +160,12 @@ pub struct NoteRecord {
     /// pre-pq store file loads with `None`.
     #[serde(default)]
     pub locked: Option<notes_core::pq::LockedBody>,
+    /// Multi-recipient analog of `locked` (PLAN-graffito-multi-pq.md,
+    /// 2026-09-06) — present instead of `locked` (never both) for a
+    /// multi-recipient pq note. `#[serde(default)]` so every pre-multi-pq
+    /// store file loads with `None`.
+    #[serde(default)]
+    pub locked_multi: Option<notes_core::pq::MultiLockedBody>,
 }
 
 impl NoteRecord {
@@ -990,6 +996,7 @@ impl Store {
                 if note.text.is_some() && n.text != note.text {
                     n.text = note.text.clone();
                     n.locked = None;
+                    n.locked_multi = None;
                 }
                 if n.recipient.is_none() {
                     n.recipient = note.recipient.clone();
@@ -1013,6 +1020,11 @@ impl Store {
                     if let Some(locked) = &note.locked {
                         n.locked = Some(locked.clone());
                     }
+                    if let Some(locked_multi) = &note.locked_multi {
+                        n.locked_multi = Some(locked_multi.clone());
+                    }
+                } else {
+                    n.locked_multi = None;
                 }
                 false
             }
@@ -1054,6 +1066,7 @@ impl Store {
                     // `existing`-record branch's `n.text.is_none()` guard
                     // just above).
                     locked: if note.text.is_none() { note.locked.clone() } else { None },
+                    locked_multi: if note.text.is_none() { note.locked_multi.clone() } else { None },
                 });
                 true
             }
@@ -1402,37 +1415,66 @@ impl Store {
         password: Option<&str>,
     ) -> Result<String, Error> {
         use notes_core::envelope::FLAG_MLKEM;
-        use notes_core::pq::{unlock_received, unlock_sent};
+        use notes_core::pq::{unlock_received, unlock_received_multi, unlock_sent, unlock_sent_multi};
 
         let rec = self
             .notes
             .iter()
             .find(|n| n.note_id == note_id)
             .ok_or_else(|| Error::Store("no such note".into()))?;
-        let locked = rec
-            .locked
-            .clone()
-            .ok_or_else(|| Error::Store("note has no locked post-quantum body".into()))?;
         let received = rec.received;
 
-        let plaintext = if !received {
-            unlock_sent(&locked, &identity.tweaked_seckey, &identity.output_x, password)
-                .map_err(Error::Notes)?
-        } else if locked.pq_flags & FLAG_MLKEM != 0 {
-            let mut last_err = Error::Notes(notes_core::Error::NeedsMlKemKey);
-            let mut ok = None;
-            for secret in secrets {
-                match unlock_received(&locked, &identity.tweaked_seckey, Some(secret), password) {
-                    Ok(pt) => {
-                        ok = Some(pt);
-                        break;
+        // Multi-recipient pq note (PLAN-graffito-multi-pq.md, 2026-09-06):
+        // same dispatch shape as the single-recipient path below, through
+        // `pq::unlock_received_multi`/`unlock_sent_multi` instead.
+        let plaintext = if let Some(locked) = rec.locked_multi.clone() {
+            if !received {
+                unlock_sent_multi(&locked, &identity.tweaked_seckey, &identity.output_x, password)
+                    .map_err(Error::Notes)?
+            } else if locked.pq_flags & FLAG_MLKEM != 0 {
+                let mut last_err = Error::Notes(notes_core::Error::NeedsMlKemKey);
+                let mut ok = None;
+                for secret in secrets {
+                    match unlock_received_multi(
+                        &locked, &identity.tweaked_seckey, &identity.output_x, Some(secret), password,
+                    ) {
+                        Ok(pt) => {
+                            ok = Some(pt);
+                            break;
+                        }
+                        Err(e) => last_err = Error::Notes(e),
                     }
-                    Err(e) => last_err = Error::Notes(e),
                 }
+                ok.ok_or(last_err)?
+            } else {
+                unlock_received_multi(&locked, &identity.tweaked_seckey, &identity.output_x, None, password)
+                    .map_err(Error::Notes)?
             }
-            ok.ok_or(last_err)?
         } else {
-            unlock_received(&locked, &identity.tweaked_seckey, None, password).map_err(Error::Notes)?
+            let locked = rec
+                .locked
+                .clone()
+                .ok_or_else(|| Error::Store("note has no locked post-quantum body".into()))?;
+
+            if !received {
+                unlock_sent(&locked, &identity.tweaked_seckey, &identity.output_x, password)
+                    .map_err(Error::Notes)?
+            } else if locked.pq_flags & FLAG_MLKEM != 0 {
+                let mut last_err = Error::Notes(notes_core::Error::NeedsMlKemKey);
+                let mut ok = None;
+                for secret in secrets {
+                    match unlock_received(&locked, &identity.tweaked_seckey, Some(secret), password) {
+                        Ok(pt) => {
+                            ok = Some(pt);
+                            break;
+                        }
+                        Err(e) => last_err = Error::Notes(e),
+                    }
+                }
+                ok.ok_or(last_err)?
+            } else {
+                unlock_received(&locked, &identity.tweaked_seckey, None, password).map_err(Error::Notes)?
+            }
         };
 
         let text = String::from_utf8(plaintext)
@@ -1445,6 +1487,7 @@ impl Store {
             .expect("checked present above");
         rec.text = Some(text.clone());
         rec.locked = None;
+        rec.locked_multi = None;
         Ok(text)
     }
 
@@ -1543,6 +1586,7 @@ mod tests {
             dropped: false,
             pq_flags: 0,
             locked: None,
+            locked_multi: None,
         }
     }
 
@@ -1922,6 +1966,7 @@ mod tests {
             text: Some("public note to many".into()),
             pq_flags: 0,
             locked: None,
+            locked_multi: None,
         };
         // Fresh scan decodes correctly -> cache corrected.
         store.upsert_note(&rec);

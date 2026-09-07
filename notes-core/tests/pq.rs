@@ -552,18 +552,34 @@ fn envelope_pq_flag_without_private_is_undecodable() {
 }
 
 #[test]
-fn envelope_pq_flags_incompatible_with_multi() {
+fn envelope_pq_flags_now_compatible_with_multi() {
+    // PLAN-graffito-multi-pq.md (2026-09-06): the prior MULTI-vs-pq
+    // exclusion is LIFTED — a multi-recipient directed note may carry
+    // either or both pq bits (pq.rs `seal_multi_pq` supplies the body
+    // framing; this test only proves the HEADER accepts the combination).
     let flags = FLAG_PRIVATE | FLAG_DIRECTED | FLAG_MULTI | FLAG_PW;
     assert_eq!(flags, 0x17);
-    assert!(envelope::encode_outputs(flags, Some(2), b"xx", 80).is_err());
+    assert!(envelope::encode_outputs(flags, Some(2), b"xx", 80).is_ok());
     // Header hand-built: "PNTE" + '1' (version) + flags hex("17") + count
     // hex("02") + ' '.
-    assert!(envelope::decode_note(&[b"PNTE11702 hi".to_vec()]).is_none());
+    let decoded = envelope::decode_note(&[b"PNTE11702 hi".to_vec()]).expect("multi+pw decodes");
+    assert_eq!(decoded.flags, flags);
+    assert_eq!(decoded.multi_count, Some(2));
 
     let flags2 = FLAG_PRIVATE | FLAG_DIRECTED | FLAG_MULTI | FLAG_MLKEM;
     assert_eq!(flags2, 0x27);
-    assert!(envelope::encode_outputs(flags2, Some(2), b"xx", 80).is_err());
-    assert!(envelope::decode_note(&[b"PNTE12702 hi".to_vec()]).is_none());
+    assert!(envelope::encode_outputs(flags2, Some(2), b"xx", 80).is_ok());
+    let decoded2 = envelope::decode_note(&[b"PNTE12702 hi".to_vec()]).expect("multi+kem decodes");
+    assert_eq!(decoded2.flags, flags2);
+
+    let flags3 = FLAG_PRIVATE | FLAG_DIRECTED | FLAG_MULTI | FLAG_PW | FLAG_MLKEM;
+    assert_eq!(flags3, 0x37);
+    assert!(envelope::encode_outputs(flags3, Some(3), b"xxx", 80).is_ok());
+    let decoded3 = envelope::decode_note(&[b"PNTE13703 hi".to_vec()]).expect("multi+both decodes");
+    assert_eq!(decoded3.flags, flags3);
+
+    // Still rejected: MULTI without DIRECTED, and pq bits without PRIVATE.
+    assert!(envelope::decode_note(&[b"PNTE13403 hi".to_vec()]).is_none());
 }
 
 #[test]
@@ -954,17 +970,18 @@ fn self_pq_envelope_validity_matrix() {
     assert!(!ok(FLAG_MLKEM), "MLKEM without PRIVATE");
     assert!(!ok(FLAG_DIRECTED | FLAG_PW), "PW public directed");
     assert!(!ok(FLAG_MLKEM | FLAG_PW), "both without PRIVATE");
-    // MULTI exclusion (count supplied so the multi check itself passes).
+    // MULTI+pq is now VALID (PLAN-graffito-multi-pq.md, 2026-09-06) — the
+    // exclusion lifted. `payload_lens_for`/`validate_multi` never checked
+    // MULTI-requires-DIRECTED to begin with (that guard is decode-side,
+    // `parse_header`'s `multi && flags & FLAG_DIRECTED == 0` check —
+    // exercised by `envelope_pq_flags_now_compatible_with_multi` above via
+    // `decode_note`), so this layer accepts MULTI+PW with or without
+    // DIRECTED; only the pq-requires-PRIVATE rule applies here.
     assert!(
         envelope::payload_lens_for(
             FLAG_PRIVATE | FLAG_DIRECTED | FLAG_MULTI | FLAG_PW, Some(2), 64, 80
-        ).is_err(),
-        "PW with MULTI"
-    );
-    assert!(
-        envelope::payload_lens_for(FLAG_PRIVATE | FLAG_MULTI | FLAG_PW, Some(2), 64, 80)
-            .is_err(),
-        "self PW with MULTI"
+        ).is_ok(),
+        "PW with MULTI+DIRECTED is now valid"
     );
 }
 
@@ -1286,4 +1303,126 @@ fn pw_cost_str_round_trips() {
         assert_eq!(PwCost::parse(cost.as_str()), Some(cost));
     }
     assert_eq!(PwCost::parse("nonsense"), None);
+}
+
+// ---------------------------------------------------------------------
+// 10. Multi-recipient pq layers, end-to-end through bundle::
+//     compose_directed_note_multi_pq_* + extraction (PLAN-graffito-multi-pq.md).
+// ---------------------------------------------------------------------
+
+#[test]
+fn multi_pq_compose_extract_unlock_end_to_end() {
+    use notes_core::bundle::compose_directed_note_multi_pq_with_change;
+
+    let sender = identity(70);
+    let recip_ids = [identity(71), identity(72), identity(73)];
+    let recipients: Vec<(Recipient, u64)> = recip_ids
+        .iter()
+        .map(|r| (Recipient::parse(NET, &r.address(NET)).unwrap(), DUST_LIMIT))
+        .collect();
+    let algs = [MlKemAlg::MlKem512, MlKemAlg::MlKem768, MlKemAlg::MlKem1024];
+    let kps: Vec<MlKemKeypair> = algs.iter().map(|a| MlKemKeypair::generate(*a).unwrap()).collect();
+    let eks: Vec<(MlKemAlg, &[u8])> = algs.iter().zip(kps.iter()).map(|(a, kp)| (*a, kp.ek())).collect();
+
+    let note = compose_directed_note_multi_pq_with_change(
+        &sender,
+        &utxos(),
+        "multi pq end to end",
+        &recipients,
+        Some(&eks),
+        Some(PwLayer { password: "multi e2e", cost: PwCost::Standard }),
+        [0x99u8; 32],
+        None,
+        200,
+        1.0,
+        0,
+        || Ok(AUX),
+    )
+    .unwrap();
+
+    // Recipient-side bundle, as the companion would build it: the tx pays
+    // every recipient address (header count == 3), author = sender.
+    let mut recv_bundle = bundle_from_txs(&[(&note, false, Some(300))]);
+    recv_bundle.notes_onchain[0].pays_self = true;
+    recv_bundle.notes_onchain[0].sender = Some(sender.address(NET));
+    recv_bundle.notes_onchain[0].output_addrs =
+        recip_ids.iter().map(|r| r.address(NET)).collect();
+
+    for (i, r) in recip_ids.iter().enumerate() {
+        let notes = extract_notes(&recv_bundle, r, NET);
+        assert_eq!(notes.len(), 1);
+        let recovered = &notes[0];
+        assert!(recovered.private && recovered.directed && recovered.received);
+        assert_eq!(recovered.pq_flags, FLAG_MLKEM | FLAG_PW);
+        assert_eq!(recovered.recipients.len(), 3);
+        assert!(recovered.text.is_none(), "multi-pq notes never auto-decrypt via extract_notes");
+        let locked = recovered.locked_multi.clone().expect("keyed multi scan must populate MultiLockedBody");
+        assert_eq!(locked.recipients_x.len(), 3);
+        assert_eq!(locked.sender_x, sender.output_x);
+
+        let pt = pq::unlock_received_multi(
+            &locked, &r.tweaked_seckey, &r.output_x, Some(&kps[i].secret()), Some("multi e2e"),
+        )
+        .unwrap();
+        assert_eq!(pt, b"multi pq end to end");
+
+        // Wrong recipient's secret fails cleanly.
+        let wrong = kps[(i + 1) % 3].secret();
+        assert_eq!(
+            pq::unlock_received_multi(&locked, &r.tweaked_seckey, &r.output_x, Some(&wrong), Some("multi e2e")),
+            Err(Error::DecryptFailed)
+        );
+    }
+
+    // Sender side: re-scanning their own sent tx. FLAG_MLKEM is set, so
+    // SenderCannotReopen even with the correct password.
+    let mut sent_bundle = bundle_from_txs(&[(&note, true, Some(300))]);
+    sent_bundle.notes_onchain[0].output_addrs =
+        recip_ids.iter().map(|r| r.address(NET)).collect();
+    let sent_notes = extract_notes(&sent_bundle, &sender, NET);
+    assert_eq!(sent_notes.len(), 1);
+    let sent_locked = sent_notes[0].locked_multi.clone().expect("own scan must populate MultiLockedBody");
+    assert_eq!(
+        pq::unlock_sent_multi(&sent_locked, &sender.tweaked_seckey, &sender.output_x, Some("multi e2e")),
+        Err(Error::SenderCannotReopen)
+    );
+}
+
+#[test]
+fn multi_pq_kem_only_auto_unlocks_via_extract_notes_pq() {
+    use notes_core::bundle::compose_directed_note_multi_pq_with_change;
+
+    let sender = identity(80);
+    let recip_ids = [identity(81), identity(82)];
+    let recipients: Vec<(Recipient, u64)> = recip_ids
+        .iter()
+        .map(|r| (Recipient::parse(NET, &r.address(NET)).unwrap(), DUST_LIMIT))
+        .collect();
+    let kps: Vec<MlKemKeypair> =
+        (0..2).map(|_| MlKemKeypair::generate(MlKemAlg::MlKem768).unwrap()).collect();
+    let eks: Vec<(MlKemAlg, &[u8])> = kps.iter().map(|kp| (kp.alg(), kp.ek())).collect();
+
+    let note = compose_directed_note_multi_pq_with_change(
+        &sender, &utxos(), "auto-unlock multi", &recipients, Some(&eks), None, [0x11u8; 32],
+        None, 200, 1.0, 0, || Ok(AUX),
+    )
+    .unwrap();
+
+    let mut bundle = bundle_from_txs(&[(&note, false, Some(400))]);
+    bundle.notes_onchain[0].pays_self = true;
+    bundle.notes_onchain[0].sender = Some(sender.address(NET));
+    bundle.notes_onchain[0].output_addrs = recip_ids.iter().map(|r| r.address(NET)).collect();
+
+    // Recipient 1 auto-unlocks with their own derived secret set.
+    let self_spk = notes_core::address::p2tr_script_pubkey(&recip_ids[1].output_x);
+    let unlocked = extract_notes_pq(&bundle, &recip_ids[1], NET, &[self_spk], &[], &[kps[1].secret()]);
+    assert_eq!(unlocked.len(), 1);
+    assert_eq!(unlocked[0].text.as_deref(), Some("auto-unlock multi"));
+    assert_eq!(unlocked[0].pq_flags, FLAG_MLKEM);
+
+    // Recipient 0 with the WRONG (recipient 1's) secret stays locked.
+    let self_spk0 = notes_core::address::p2tr_script_pubkey(&recip_ids[0].output_x);
+    let still_locked =
+        extract_notes_pq(&bundle, &recip_ids[0], NET, &[self_spk0], &[], &[kps[1].secret()]);
+    assert_eq!(still_locked[0].text, None);
 }
