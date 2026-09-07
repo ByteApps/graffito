@@ -540,3 +540,80 @@ fn override_then_revert_to_default_clears_tint_and_reset_row() {
     assert!(!app.global::<Compose>().get_ov_visibility(), "private is the default — no tint");
     assert!(!app.global::<Compose>().get_has_overrides());
 }
+
+// ---------------------------------------------------------------------------
+// 10. "Make this my default" checkbox (2026-09-07 round 3): checking it and
+//     tapping Done on a per-note sheet ALSO writes the Settings default
+//     (through the same `on_set_compose_default_*` handler/log line the
+//     Settings row itself uses), then drops the note's own override key
+//     since its value now equals what the default just became.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fee_promoted_via_checkbox_updates_default_and_next_compose_starts_untinted() {
+    let (mut st, app) = funded_stub("promote-fee");
+    st.pick_contact_core(&app, "self");
+    assert_eq!(st.compose_defaults.fee_tier, 1, "starts at the plain default (normal)");
+
+    // Override this note to "fast" — same as any per-note fee-sheet edit.
+    st.on_set_fee_tier(&app, 2);
+    assert!(app.global::<Compose>().get_ov_fee());
+
+    // Open the fee sheet and check "Make this my default" (unchecked by
+    // default on every sheet open — `on_compose_card_row` resets it).
+    st.on_compose_card_row(&app, "fee".into());
+    assert!(!app.global::<Compose>().get_promote_default(), "unchecked every time a sheet opens");
+    app.global::<Compose>().set_promote_default(true);
+
+    st.on_compose_sheet_done(&app);
+
+    // The SAME handler/log line the Settings row uses ran: config.json (the
+    // in-memory mirror of it) now shows "fast" as the default.
+    assert_eq!(st.compose_defaults.fee_tier, 2, "config.json's compose default must show the promoted tier");
+    let payload = st.config_payload();
+    assert_eq!(payload["compose"]["fee_tier"], serde_json::json!(2));
+
+    // The sheet closed normally (promotion succeeds, unlike the gift gate).
+    assert_eq!(app.global::<Compose>().get_sheet_kind().as_str(), "");
+    assert!(!app.global::<Compose>().get_promote_default(), "cleared after Done");
+
+    // Because the note's value now EQUALS the (freshly promoted) default,
+    // Round D's is-default path must have dropped the override.
+    assert!(!app.global::<Compose>().get_ov_fee(), "no tint — the note is exactly at its (new) default");
+    assert!(!app.global::<Compose>().get_has_overrides());
+
+    // A fresh compose session must start with the promoted default, untinted.
+    st.pick_contact_core(&app, "self");
+    assert_eq!(app.global::<Compose>().get_fee_tier(), 2, "the next note starts from the newly promoted default");
+    assert!(!app.global::<Compose>().get_ov_fee());
+    assert!(!app.global::<Compose>().get_has_overrides());
+}
+
+#[test]
+fn gift_promotion_below_dust_is_refused_and_default_unchanged() {
+    let (mut st, app) = funded_stub("promote-gift");
+    st.pick_contact_core(&app, "self");
+    let r = app_core::notes_core::bundle::Identity::from_app_seed(&[22u8; 32]).unwrap().address(Network::Regtest);
+    st.on_pick_contact(&app, r.into());
+    assert_eq!(st.compose_defaults.gift_sats, 330);
+
+    // Type a below-dust value directly into the (two-way-bound) field, as a
+    // real TextInput edit would leave it sitting there without ever having
+    // gone through `on_set_compose_gift`'s validation.
+    app.global::<Compose>().set_gift_sats("329".into());
+
+    st.on_compose_card_row(&app, "gift".into());
+    assert!(!app.global::<Compose>().get_promote_default());
+    app.global::<Compose>().set_promote_default(true);
+
+    st.on_compose_sheet_done(&app);
+
+    // Refused: the Settings default must not move, the sheet stays open
+    // (never closes on refusal), and the compose-side error is populated.
+    assert_eq!(st.compose_defaults.gift_sats, 330, "a below-dust promotion must never reach the default");
+    let payload = st.config_payload();
+    assert_eq!(payload["compose"]["gift_sats"], serde_json::json!(330));
+    assert_eq!(app.global::<Compose>().get_sheet_kind().as_str(), "gift", "refusal keeps the sheet open");
+    assert!(!app.global::<Compose>().get_gift_error().is_empty());
+    assert!(!app.global::<Compose>().get_gift_valid());
+}

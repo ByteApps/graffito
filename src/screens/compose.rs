@@ -623,6 +623,10 @@ pub(crate) fn on_compose_card_row(&mut self, w: &AppWindow, key: SharedString) {
     println!("cb: compose-card row={key}");
     w.global::<Compose>().set_card_open(false);
     w.global::<Compose>().set_sheet_kind(key.clone());
+    // "Make this my default" is unchecked every time a sheet opens — this
+    // is the ONE choke point every sheet-opening tap (pill or gear-card
+    // row) runs through.
+    w.global::<Compose>().set_promote_default(false);
     // The old "Security" collapsible (now split into the passphrase and
     // quantum sheets) fired this on open — preserved for the lazy
     // self-note imported-key load (`ensure_pq_imported_loaded`) and the
@@ -630,6 +634,89 @@ pub(crate) fn on_compose_card_row(&mut self, w: &AppWindow, key: SharedString) {
     if key.as_str() == "passphrase" || key.as_str() == "quantum" {
         self.on_pq_panel_toggled(w, true);
     }
+}
+
+/// A per-note sheet's Done button (2026-09-07 round 3). When
+/// `Compose.promote-default` is checked, this ALSO writes the Settings
+/// default — through the SAME handler/log line the Settings row itself
+/// uses (`on_set_compose_default_*`) — before closing, then drops this
+/// note's override key (the value now equals the default it just became,
+/// so `set_compose_override`'s `is_default = true` path removes it and
+/// logs `cb: compose-override <key>=default` if one was set). Never on
+/// "change" (no Settings default exists for it) and, on "passphrase",
+/// only for the cost pills — the enable switch/text have no default to
+/// promote to.
+pub(crate) fn on_compose_sheet_done(&mut self, w: &AppWindow) {
+    let kind = w.global::<Compose>().get_sheet_kind().to_string();
+    let promote = w.global::<Compose>().get_promote_default();
+    if promote {
+        match kind.as_str() {
+            "visibility" => {
+                let private = w.global::<Compose>().get_compose_private();
+                let v = if private { "private" } else { "public" };
+                self.on_set_compose_default_visibility(w, v.into());
+                self.set_compose_override(w, "visibility", v, true);
+            }
+            "fee" => {
+                let tier = w.global::<Compose>().get_fee_tier();
+                let tier_name = fee_tier_name(tier);
+                let rate = w.global::<Compose>().get_rate_text().to_string();
+                self.on_set_compose_default_fee(w, tier_name.into(), rate.into());
+                self.set_compose_override(w, "fee", tier_name, true);
+            }
+            "gift" => {
+                // Same dust-gate refusal as the Settings row and the
+                // sheet's own field — but surfaced on the COMPOSE sheet's
+                // error (`Compose.gift-error`), and the sheet stays open
+                // (never closed) on refusal. The raw field text is
+                // re-validated here rather than trusting `gift-valid`,
+                // since the field's two-way binding can hold an untyped
+                // value the user never committed via Return/blur.
+                let t = w.global::<Compose>().get_gift_sats().to_string();
+                match t.trim().parse::<u64>() {
+                    Ok(n) if n >= DUST_SATS => {
+                        self.on_set_compose_default_gift(w, t.clone().into());
+                        w.global::<Compose>().set_gift_error("".into());
+                        w.global::<Compose>().set_gift_valid(true);
+                        self.set_compose_override(w, "gift", &n.to_string(), true);
+                    }
+                    _ => {
+                        println!("cb: compose-override gift=err below-dust");
+                        w.global::<Compose>().set_gift_error(
+                            format!("below dust ({DUST_SATS} sats) — the network would reject the note").into(),
+                        );
+                        w.global::<Compose>().set_gift_valid(false);
+                        return; // keep the sheet open — do not close on refusal
+                    }
+                }
+            }
+            "payfrom" => {
+                let src = w.global::<Ui>().get_pay_from().to_string();
+                self.on_set_compose_default_payfrom(w, src.clone().into());
+                self.set_compose_override(w, "payfrom", &src, true);
+            }
+            "quantum" => {
+                let on = w.global::<Compose>().get_pq_mlkem_enabled();
+                let v = if on { "on" } else { "off" };
+                self.on_set_compose_default_pq_mlkem(w, v.into());
+                self.set_compose_override(w, "quantum", v, true);
+            }
+            "passphrase" => {
+                // ONLY the cost pill promotes; it already persists + logs
+                // (`cb: pq-pw-cost <cost>`) on every tap, so this just
+                // re-runs the SAME handler over the current value — no new
+                // log-contract line, matching the Settings row's own
+                // "existing cb: pq-pw-cost" contract. The enable switch and
+                // the typed text are never promoted (no Settings default
+                // exists for either).
+                let cost = self.pq_pw_cost.as_str().to_string();
+                self.on_pq_pw_cost_changed(w, cost.into());
+            }
+            _ => {}
+        }
+    }
+    w.global::<Compose>().set_promote_default(false);
+    w.global::<Compose>().set_sheet_kind("".into());
 }
 
 pub(crate) fn on_compose_reset_overrides(&mut self, w: &AppWindow) {
@@ -938,10 +1025,15 @@ pub(crate) fn refresh_compose_pq(
                 "weak (~{:.0} bits) — easily brute-forced; use Generate or add more words",
                 strength.bits
             )
+        } else if passphrase_text.trim().is_empty() {
+            // Empty (or whitespace-only) field — zxcvbn's estimate isn't
+            // meaningful yet, so there's no number to show at all.
+            format!("Can't rate a typed phrase — Generate makes ~{:.0} bits", passphrase::GENERATED_BITS)
         } else {
             format!(
-                "~{:.0} bits — strength can't be verified; use Generate for a certified phrase",
-                strength.bits
+                "~{:.0} bits, estimated — Generate makes ~{:.0} bits",
+                strength.bits,
+                passphrase::GENERATED_BITS,
             )
         };
         (Some(strength.bits), line)
@@ -2957,6 +3049,22 @@ pub(crate) fn on_pq_generate_passphrase(&mut self, w: &AppWindow) {
                 w.global::<Ui>().set_status(format!("couldn't generate a passphrase: {e}").into());
             }
         }
+    }
+
+    /// Passphrase sheet's Copy button — routes through the CONCEALED/
+    /// expiring clipboard path (the same one the security audit added for
+    /// spending material, `platform::set_clipboard_secret`), never the
+    /// plain `copy-value` path: this text unlocks the note exactly like a
+    /// private key would. The sheet disables the button while the field is
+    /// empty; this guards it too rather than trusting the UI gate alone.
+    pub(crate) fn on_pq_passphrase_copy(&mut self, w: &AppWindow) {
+        let text = w.global::<Compose>().get_pq_passphrase_text().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let ok = platform::set_clipboard_secret(&text);
+        println!("cb: pq-passphrase copied");
+        show_toast(w, if ok { "Copied" } else { "Copy failed" });
     }
 
 pub(crate) fn on_pq_passphrase_changed(&mut self, w: &AppWindow, text: SharedString) {

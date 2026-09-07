@@ -11,7 +11,7 @@
 // ---------- 6 · compose ----------
 
 import { Ui, Note, Compose, Change } from "../globals.slint";
-import { Caption, PrimaryButton, GhostButton, IconButton, SvgIconButton, Header, Badge, SelectPill, KvRow, StatusPill, MenuValueRow } from "../components.slint";
+import { Caption, PrimaryButton, GhostButton, IconButton, SvgIconButton, Header, Badge, SelectPill, KvRow, StatusPill, MenuValueRow, CheckboxRow } from "../components.slint";
 import { EditField, EditArea } from "../edit.slint";
 import { Pal, Metrics } from "../theme.slint";
 import { Switch } from "std-widgets.slint";
@@ -545,11 +545,24 @@ export component ComposeScreen inherits Rectangle {
                             width: 96px * Metrics.type-scale;
                             clicked => { Compose.pq-generate-passphrase(); }
                         }
+                        GhostButton {
+                            text: "Copy";
+                            width: 72px * Metrics.type-scale;
+                            enabled: Compose.pq-passphrase-text != "";
+                            clicked => { Compose.pq-passphrase-copy(); }
+                        }
                     }
                     if Compose.sheet-kind == "passphrase" && Compose.pq-passphrase-enabled: Caption {
                         text: Compose.pq-passphrase-strength-line;
                         color: Compose.pq-passphrase-verified ? Pal.good
                             : (Compose.pq-passphrase-weak ? Pal.bad : Pal.warn);
+                    }
+                    // Always visible while the layer is on — the app holds
+                    // NO copy of this text anywhere (unlike the seed, it is
+                    // never persisted or recoverable from the notebook).
+                    if Compose.sheet-kind == "passphrase" && Compose.pq-passphrase-enabled: Caption {
+                        text: "Graffito never stores this passphrase. Share it with the recipient out of band and keep your own copy — without it, nobody (including you) can read this note again.";
+                        color: Pal.warn;
                     }
                     if Compose.sheet-kind == "passphrase" && Compose.pq-passphrase-enabled: HorizontalLayout {
                         spacing: 8px;
@@ -580,9 +593,47 @@ export component ComposeScreen inherits Rectangle {
                     }
                     if Compose.sheet-kind == "quantum": Caption { text: Compose.pq-security-label; }
 
+                    // ---- "Make this my default" (2026-09-07 round 3) ----
+                    // Unchecked every time a sheet opens (`on_compose_card_row`
+                    // resets it); checking it + Done ALSO writes the Settings
+                    // default (the same handler/log line the Settings row
+                    // uses) and drops this note's override, since its value
+                    // now equals the default. Never on Change; on Passphrase
+                    // only for the cost pills, never the text/enable switch.
+                    if Compose.sheet-kind == "visibility": CheckboxRow {
+                        text: "Make this my default";
+                        checked: Compose.promote-default;
+                        toggled(v) => { Compose.promote-default = v; }
+                    }
+                    if Compose.sheet-kind == "fee": CheckboxRow {
+                        text: "Make this my default";
+                        checked: Compose.promote-default;
+                        toggled(v) => { Compose.promote-default = v; }
+                    }
+                    if Compose.sheet-kind == "gift": CheckboxRow {
+                        text: "Make this my default";
+                        checked: Compose.promote-default;
+                        toggled(v) => { Compose.promote-default = v; }
+                    }
+                    if Compose.sheet-kind == "payfrom": CheckboxRow {
+                        text: "Make this my default";
+                        checked: Compose.promote-default;
+                        toggled(v) => { Compose.promote-default = v; }
+                    }
+                    if Compose.sheet-kind == "quantum": CheckboxRow {
+                        text: "Make this my default";
+                        checked: Compose.promote-default;
+                        toggled(v) => { Compose.promote-default = v; }
+                    }
+                    if Compose.sheet-kind == "passphrase" && Compose.pq-passphrase-enabled: CheckboxRow {
+                        text: "Make this cost my default";
+                        checked: Compose.promote-default;
+                        toggled(v) => { Compose.promote-default = v; }
+                    }
+
                     GhostButton {
                         text: "Done";
-                        clicked => { Compose.sheet-kind = ""; }
+                        clicked => { Compose.sheet-done(); }
                     }
                 }
             }

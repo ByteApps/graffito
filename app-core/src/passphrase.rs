@@ -73,7 +73,9 @@ pub use graffito_core::seclabel::{
 /// Number of words in a generated passphrase. Deliberately NOT 12 or 24 —
 /// those word counts read as "this is a BIP-39 seed phrase", and a
 /// generated passphrase must never be mistaken for one (see [`generate`]).
-const WORD_COUNT: usize = 12;
+/// `pub` so UI call sites can name it in copy (e.g. the compose passphrase
+/// sheet's strength hint) instead of hardcoding the number.
+pub const WORD_COUNT: usize = 12;
 
 /// Converts zxcvbn's `guesses_log10` (the decimal log of its estimated
 /// guess count) to bits (the binary log of the same number):

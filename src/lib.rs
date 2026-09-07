@@ -2647,6 +2647,7 @@ pub fn run() {
     cb!(Compose, on_card_row, |w, s, key: SharedString| { s.on_compose_card_row(&w, key) });
     cb!(Compose, on_compose_reset_overrides, |w, s| { s.on_compose_reset_overrides(&w) });
     cb!(Compose, on_compose_edit_defaults, |w, s| { s.on_compose_edit_defaults(&w) });
+    cb!(Compose, on_sheet_done, |w, s| { s.on_compose_sheet_done(&w) });
     cb!(Compose, on_compose_defaults_return, |w, s| { s.on_compose_defaults_return(&w) });
     cb!(Compose, on_set_compose_visibility, |w, s, private: bool| { s.on_set_compose_visibility(&w, private) });
     cb!(Compose, on_set_fee_rate, |w, s, t: SharedString| { s.on_set_fee_rate(&w, t) });
@@ -2937,6 +2938,8 @@ pub fn run() {
     // passphrase — see passphrase::generate's doc and the
     // SecurityChoice::passphrase_verified rule it exists to satisfy.
     cb!(Compose, on_pq_generate_passphrase, |w, s| { s.on_pq_generate_passphrase(&w) });
+
+    cb!(Compose, on_pq_passphrase_copy, |w, s| { s.on_pq_passphrase_copy(&w) });
 
     // Any edit — typed, pasted, or a generated phrase touched afterward —
     // is verified only when it EXACTLY matches the last generated text;

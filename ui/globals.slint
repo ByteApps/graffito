@@ -662,6 +662,10 @@ export global Compose {
     // reimplemented here.
     in property <string> pq-security-label;
     callback pq-generate-passphrase();
+    // Passphrase sheet's Copy button — the CONCEALED/expiring clipboard
+    // path, never the plain one (this text unlocks the note). Disabled in
+    // the sheet while the field is empty.
+    callback pq-passphrase-copy();
     callback pq-passphrase-changed(string);
     callback pq-mlkem-toggled(bool);
     // Argon2id cost preset for the passphrase layer, chosen per note:
@@ -706,6 +710,17 @@ export global Compose {
     in-out property <string> sheet-kind: "";
     // The gear card (anchored dropdown, Format C rows) — open/closed.
     in-out property <bool> card-open: false;
+    // "Make this my default" checkbox (2026-09-07 round 3) — unchecked every
+    // time a sheet opens (`on_compose_card_row` resets it); on "New notes"
+    // (visibility), "Fee", "Gift", "Pay from", and "Quantum" only, plus the
+    // Passphrase sheet's cost pills alone ("Make this COST my default" —
+    // never the passphrase text/enable switch, never on Change). Read by
+    // `sheet-done` when the user taps Done.
+    in-out property <bool> promote-default: false;
+    // The sheet's Done button — routes through Rust so a checked
+    // `promote-default` can ALSO write the Settings default (same handler/
+    // log line as the Settings row) before the override-drop and close.
+    callback sheet-done();
     // Quiet per-field override markers (accent tint on a pill/card-row
     // value) — true while THIS compose session has changed that setting
     // away from the Settings default. `has-overrides` is the OR of all of
