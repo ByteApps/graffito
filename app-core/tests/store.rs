@@ -1760,3 +1760,45 @@ fn scan_tip_corrects_downward_after_a_wrong_chain_scan() {
     store.apply_bundle(&bundle(vec![], vec![], 0), &a, NET, &[], &[], &[]).unwrap();
     assert_eq!(store.tip_height, 151_298);
 }
+
+/// A pending note's change is carried across full scans only while the
+/// chain source has never seen the note (unbroadcast). Once the note is in
+/// the mempool, a change coin the bundle no longer lists was SPENT elsewhere
+/// (another wallet on the same seed, a harness sweep) and must not come
+/// back — found live 2026-09-06: a resurrected coin made the next compose a
+/// double-spend, rejected by bitcoind as "insufficient fee, rejecting
+/// replacement".
+#[test]
+fn pending_note_change_spent_elsewhere_is_not_resurrected() {
+    let a = alice();
+    let mut store = funded_store(&a);
+    let n1 = compose_and_record(
+        &mut store,
+        &a,
+        NET,
+        &ComposeRequest { text: "spent elsewhere", private: false, recipient: None, extra_recipients: &[], change_to: None, coins: None, fee_rate: 1.0, gift_amount: None, lock_time: None, now: 1000, pq_password: None, pq_pw_cost: notes_core::pq::PwCost::DEFAULT, pq_mlkem: None },
+    )
+    .unwrap();
+    assert_eq!(store.balance(), n1.tx.change, "the change is spendable right after compose");
+
+    // Unbroadcast: the chain still lists the funding coin and knows nothing
+    // of the note — its change is carried over (existing behaviour).
+    let funding = BundleUtxo { txid: "aa".repeat(32), vout: 0, value: 100_000, height: Some(100), owner_address: None };
+    store.apply_bundle(&bundle(vec![], vec![funding], 100), &a, NET, &[], &[], &[]).unwrap();
+    assert_eq!(store.balance(), n1.tx.change, "unbroadcast change is carried across a full scan");
+    assert_eq!(store.notes[0].status, NoteStatus::Pending);
+
+    // In the mempool, and its change already spent by another wallet: the
+    // bundle lists the note tx but NOT its change output.
+    let mut in_mempool = onchain(&n1.tx, 0, true, None, None);
+    in_mempool.height = None;
+    in_mempool.blocktime = None;
+    store.apply_bundle(&bundle(vec![in_mempool], vec![], 100), &a, NET, &[], &[], &[]).unwrap();
+    assert!(
+        store.utxos.iter().all(|u| u.txid != n1.tx.txid_hex),
+        "a change coin the chain no longer lists must not be resurrected: {:?}",
+        store.utxos
+    );
+    assert_eq!(store.balance(), 0);
+    assert_eq!(store.notes[0].status, NoteStatus::Pending, "the note itself is still pending in the mempool");
+}

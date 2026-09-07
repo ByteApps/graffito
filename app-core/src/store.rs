@@ -1094,10 +1094,18 @@ impl Store {
             })
             .collect();
 
-        // Unconfirmed change of still-pending (unbroadcast) notes isn't on
-        // chain yet — carry it over.
+        // Unconfirmed change of still-pending UNBROADCAST notes isn't on
+        // chain yet — carry it over. Only while the chain source has never
+        // seen the note's tx: once it is in the mempool/chain (`known_txids`),
+        // the bundle's utxo set is authoritative for its outputs, and a
+        // change coin missing from it was SPENT — by another wallet on the
+        // same seed, or a harness sweep (2026-09-06: a CLI exit-sweep spent
+        // a pending note's change; the next full scan resurrected the coin,
+        // the next compose double-spent it, and bitcoind answered
+        // "insufficient fee, rejecting replacement").
         for l in &self.utxos {
             let carried = pending_txids.contains(&l.txid)
+                && !known_txids.contains(l.txid.as_str())
                 && !next.iter().any(|n| n.txid == l.txid && n.vout == l.vout);
             if carried {
                 next.push(l.clone());
