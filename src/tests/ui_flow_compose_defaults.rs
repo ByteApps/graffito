@@ -228,11 +228,14 @@ fn compose_gift_sheet_refuses_below_dust_and_disables_sign_accepts_dust() {
     st.on_set_compose_gift(&app, "330".into());
     assert!(app.global::<Compose>().get_gift_valid());
     assert!(app.global::<Compose>().get_gift_error().is_empty());
-    assert!(app.global::<Compose>().get_ov_gift());
+    // 330 is the Settings default (compose_defaults.gift_sats) — landing
+    // back on it must NOT count as an override (2026-09-07 follow-up).
+    assert!(!app.global::<Compose>().get_ov_gift());
 
     st.on_set_compose_gift(&app, "888".into());
     assert_eq!(app.global::<Compose>().get_gift_sats().as_str(), "888");
     assert!(app.global::<Compose>().get_gift_valid());
+    assert!(app.global::<Compose>().get_ov_gift(), "888 differs from the 330-sat default — this IS an override");
 }
 
 // ---------------------------------------------------------------------------
@@ -351,15 +354,15 @@ fn quantum_pill_states_multi_recipient_partial_then_full_keying() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Gear-card row text, Format C exactly (2026-09-07 follow-up 2): on/off
-//    rows render just the state name plus the ✓ (checked = true, the SVG
-//    check mark, never baked into the string) when on, and the bare "None"/
-//    other-state name when off — the row's OWN label ("Passphrase",
-//    "Quantum encryption") already says what the value is, so the value
-//    must not repeat it (2026-09-07 follow-up). `Compose.card-*-checked`
-//    is what actually drives the check-mark icon in compose.slint; the
-//    value strings are asserted verbatim since the wording itself is
-//    exactly what the plan/Sal pinned.
+// 6. Gear-card row text, Format C exactly (2026-09-07, refined twice the
+//    same day): on states render just the state name ("Private", "Strong",
+//    "768"/"768+1024"), off states render the bare "None" (or the other
+//    named state, "Public") — no ✓ (removed as redundant once the value
+//    speaks for itself; `MenuValueRow` keeps its chevron + tap-to-sheet
+//    behavior). The row's OWN label ("Passphrase", "Quantum encryption")
+//    already says what the value is, so the value must not repeat it
+//    either. Value strings are asserted verbatim since the wording itself
+//    is exactly what the plan/Sal pinned.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -368,11 +371,9 @@ fn card_visibility_row_on_vs_off_text() {
     st.pick_contact_core(&app, "self");
 
     assert_eq!(app.global::<Compose>().get_card_visibility_value().as_str(), "Private");
-    assert!(app.global::<Compose>().get_card_visibility_checked());
 
     st.on_set_compose_visibility(&app, false);
     assert_eq!(app.global::<Compose>().get_card_visibility_value().as_str(), "Public");
-    assert!(!app.global::<Compose>().get_card_visibility_checked());
 }
 
 #[test]
@@ -381,21 +382,18 @@ fn card_passphrase_row_on_vs_off_text() {
     st.pick_contact_core(&app, "self");
 
     assert_eq!(app.global::<Compose>().get_card_passphrase_value().as_str(), "None");
-    assert!(!app.global::<Compose>().get_card_passphrase_checked());
 
     app.global::<Compose>().set_pq_passphrase_enabled(true); // mirrors the sheet's Switch
     st.on_set_passphrase_enabled(&app, true);
     assert_eq!(
         app.global::<Compose>().get_card_passphrase_value().as_str(),
         "Strong",
-        "default cost is Strong; the row's own label already says \"Passphrase\", and the ✓ is its own icon"
+        "default cost is Strong; the row's own label already says \"Passphrase\" — no ✓, the value speaks for itself"
     );
-    assert!(app.global::<Compose>().get_card_passphrase_checked());
 
     app.global::<Compose>().set_pq_passphrase_enabled(false);
     st.on_set_passphrase_enabled(&app, false);
     assert_eq!(app.global::<Compose>().get_card_passphrase_value().as_str(), "None");
-    assert!(!app.global::<Compose>().get_card_passphrase_checked());
 }
 
 #[test]
@@ -407,19 +405,17 @@ fn card_quantum_row_on_off_and_no_key_text() {
     st.refresh_compose_pq(&app);
     st.refresh_compose_pills(&app); // card-quantum-* is set here, not by refresh_compose_pq
 
-    // No key on file: grey "no PQ key", not checked.
-    let (val, checked, muted) = (
+    // No key on file: grey "no PQ key".
+    let (val, muted) = (
         app.global::<Compose>().get_card_quantum_value().to_string(),
-        app.global::<Compose>().get_card_quantum_checked(),
         app.global::<Compose>().get_card_quantum_muted(),
     );
     assert_eq!(val, "no PQ key");
-    assert!(!checked);
     assert!(muted);
 
-    // Key present: defaults ON -> "768" checked, not muted (the row's own
-    // label already reads "Quantum encryption" — the value is just the
-    // level, no "PQ " prefix).
+    // Key present: defaults ON -> "768", not muted (the row's own label
+    // already reads "Quantum encryption" — the value is just the level, no
+    // "PQ " prefix and no ✓).
     let kp = app_core::notes_core::pq::MlKemKeypair::generate(app_core::notes_core::pq::MlKemAlg::MlKem768).unwrap();
     let armor = app_core::pqkeys::export_public_armor(&kp);
     let contact = st.contacts.iter_mut().find(|c| c.address == r).unwrap();
@@ -427,25 +423,21 @@ fn card_quantum_row_on_off_and_no_key_text() {
     st.pq_recipient_cache = None; // see the sibling tests' comment on this cache
     st.refresh_compose_pq(&app);
     st.refresh_compose_pills(&app);
-    let (val, checked, muted) = (
+    let (val, muted) = (
         app.global::<Compose>().get_card_quantum_value().to_string(),
-        app.global::<Compose>().get_card_quantum_checked(),
         app.global::<Compose>().get_card_quantum_muted(),
     );
     assert_eq!(val, "768");
-    assert!(checked);
     assert!(!muted);
 
-    // Turned off for this note: "None", not checked, not muted.
+    // Turned off for this note: "None", not muted.
     app.global::<Compose>().set_pq_mlkem_enabled(false);
     st.on_pq_mlkem_toggled(&app, false);
-    let (val, checked, muted) = (
+    let (val, muted) = (
         app.global::<Compose>().get_card_quantum_value().to_string(),
-        app.global::<Compose>().get_card_quantum_checked(),
         app.global::<Compose>().get_card_quantum_muted(),
     );
     assert_eq!(val, "None");
-    assert!(!checked);
     assert!(!muted);
 }
 
@@ -500,4 +492,51 @@ fn usd_suffix_hides_on_no_price_and_never_shows_zero_or_negative() {
     assert_eq!(usd_suffix(Some(-65_000.0), 239), "", "a negative price must never render a negative dollar figure");
     assert_eq!(usd_suffix(Some(65_000.0), 0), "", "a zero fee must never render \"$0.00\"");
     assert_eq!(usd_suffix(Some(65_000.0), 239), " (~$0.16)");
+}
+
+// ---------------------------------------------------------------------------
+// 9. An override that lands back on the DEFAULT value must not count as an
+//    override (2026-09-07 follow-up). Repro: passphrase switch on, then off
+//    again — the pill/card must not stay tinted and the "Reset this note to
+//    defaults" row (gated on `Compose.has-overrides`) must not stay visible,
+//    even though `compose_overrides` briefly held the key. Also covers fee
+//    tier and visibility landing back on their Settings defaults.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn override_then_revert_to_default_clears_tint_and_reset_row() {
+    let (mut st, app) = funded_stub("revert");
+    st.pick_contact_core(&app, "self");
+    assert!(!app.global::<Compose>().get_has_overrides());
+
+    // Passphrase: the exact repro from the coordinator's report.
+    app.global::<Compose>().set_pq_passphrase_enabled(true);
+    st.on_set_passphrase_enabled(&app, true);
+    assert!(app.global::<Compose>().get_ov_passphrase(), "on IS an override — off is the only default");
+    assert!(app.global::<Compose>().get_has_overrides(), "the reset row must show while an override exists");
+
+    app.global::<Compose>().set_pq_passphrase_enabled(false);
+    st.on_set_passphrase_enabled(&app, false);
+    assert!(!app.global::<Compose>().get_ov_passphrase(), "back at the default (off) — no tint");
+    assert!(!app.global::<Compose>().get_has_overrides(), "no override left — the reset row must not show");
+
+    // Fee tier: override to "fast", then explicitly back to "normal" (the
+    // Settings default) — not via reset, via the SAME picker tap a real
+    // change of mind would use.
+    st.on_set_fee_tier(&app, 2);
+    assert!(app.global::<Compose>().get_ov_fee());
+    assert!(app.global::<Compose>().get_has_overrides());
+
+    st.on_set_fee_tier(&app, 1);
+    assert!(!app.global::<Compose>().get_ov_fee(), "tier 1 (normal) is the default — no tint");
+    assert!(!app.global::<Compose>().get_has_overrides());
+
+    // Visibility: Public, then back to Private (the default).
+    st.on_set_compose_visibility(&app, false);
+    assert!(app.global::<Compose>().get_ov_visibility());
+    assert!(app.global::<Compose>().get_has_overrides());
+
+    st.on_set_compose_visibility(&app, true);
+    assert!(!app.global::<Compose>().get_ov_visibility(), "private is the default — no tint");
+    assert!(!app.global::<Compose>().get_has_overrides());
 }

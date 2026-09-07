@@ -339,7 +339,8 @@ pub(crate) fn on_set_pay_from(&mut self, w: &AppWindow, kind: SharedString) {
         println!("cb: pay-from {kind}");
         self.payfrom_manual = true; // explicit pick — CHANGE 5 stops re-defaulting it
         self.apply_pay_from(w, kind.as_str());
-        self.mark_compose_override(w, "payfrom", kind.as_str());
+        let is_default = kind.as_str() == self.compose_defaults.pay_from;
+        self.set_compose_override(w, "payfrom", kind.as_str(), is_default);
         self.refresh_compose(w);
     }
 

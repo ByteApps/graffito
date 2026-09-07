@@ -1815,38 +1815,34 @@ pub(crate) fn refresh_compose_pills(&self, w: &AppWindow) {
     c.set_pill_quantum_tappable(q_tappable);
     let _ = ui; // reserved for future pill states that read Ui directly
 
-    // ---- gear-card row values (Format C exactly, 2026-09-07 follow-up) —
-    // distinct wording from the pills above: on/off rows are "Label ✓" (an
-    // SVG check mark, `MenuValueRow.checked`, never this glyph) when on,
-    // "key: value" when off.
+    // ---- gear-card row values (Format C exactly, 2026-09-07 follow-up,
+    // refined the same day: the values speak for themselves — "Private"/
+    // "Public", "None"/"Strong", "None"/"768+1024"/"no PQ key" — so the
+    // redundant ✓ was removed; the row's own label plus the value text is
+    // enough, and MenuValueRow keeps its chevron + tap-to-sheet behavior). ----
     c.set_card_visibility_value(if c.get_compose_private() { "Private".into() } else { "Public".into() });
-    c.set_card_visibility_checked(c.get_compose_private());
 
     // The row's own label ("Passphrase") already says what this is — the
-    // value is just the cost name (2026-09-07 follow-up: rows must not
-    // repeat their own label).
+    // value is just the cost name.
     c.set_card_passphrase_value(if pw_on { pw_label.to_string().into() } else { "None".into() });
-    c.set_card_passphrase_checked(pw_on);
 
-    let (cq_value, cq_checked, cq_muted) = st.pq_card_row_value(w);
+    let (cq_value, cq_muted) = st.pq_card_row_value(w);
     c.set_card_quantum_value(cq_value.into());
-    c.set_card_quantum_checked(cq_checked);
     c.set_card_quantum_muted(cq_muted);
 }
 
-/// The gear card's Quantum row value (Format C): `(value, checked, muted)`.
-/// Distinct from [`pq_pill_state`]'s pill wording: the row's own label
-/// ("Quantum encryption") already says what this is, so the value is bare
-/// "None" instead of "PQ off", and the level(s) alone instead of a leading
-/// "PQ " on every state (the ✓ is the row's own SVG icon, never baked into
-/// the string).
-pub(crate) fn pq_card_row_value(&self, w: &AppWindow) -> (String, bool, bool) {
+/// The gear card's Quantum row value (Format C): `(value, muted)`. Distinct
+/// from [`pq_pill_state`]'s pill wording: the row's own label ("Quantum
+/// encryption") already says what this is, so the value is bare "None"
+/// instead of "PQ off", and the level(s) alone instead of a leading "PQ "
+/// on every state.
+pub(crate) fn pq_card_row_value(&self, w: &AppWindow) -> (String, bool) {
     let st = self;
     let (label, muted, _eligible) = st.pq_pill_state(w);
     if muted {
         // "no PQ key" / "no PQ key · X of Y" — identical wording to the
         // pill; there is no "off" state to distinguish here.
-        return (label, false, true);
+        return (label, true);
     }
     let available = w.global::<Compose>().get_pq_mlkem_available();
     let enabled = w.global::<Compose>().get_pq_mlkem_enabled();
@@ -1854,10 +1850,10 @@ pub(crate) fn pq_card_row_value(&self, w: &AppWindow) -> (String, bool, bool) {
         // The row's own label ("Quantum encryption") already says what
         // this is — the value is just the level(s), e.g. "768" / "768+1024"
         // (`label` is "PQ <levels>" from `pq_pill_state`; strip the
-        // redundant "PQ " prefix). The ✓ rides as `MenuValueRow`'s own icon.
-        (label.trim_start_matches("PQ ").to_string(), true, false)
+        // redundant "PQ " prefix).
+        (label.trim_start_matches("PQ ").to_string(), false)
     } else {
-        ("None".to_string(), false, false)
+        ("None".to_string(), false)
     }
 }
 
@@ -2776,16 +2772,33 @@ pub(crate) fn fee_tier_index(name: &str) -> i32 {
 }
 
 impl State {
-/// Mark `key` as overridden away from the Settings default for THIS
-/// compose session (PLAN-graffito-compose-simplify.md's Format-C "quiet
-/// marker" — an accent tint on the pill/card-row value) and log the
-/// suite-facing `cb: compose-override <key>=<value>` line every per-note
-/// sheet emits on top of whatever `cb:` line it already logged today.
-/// `key` is one of "visibility" | "fee" | "gift" | "payfrom" | "change" |
-/// "passphrase" | "quantum" — see `State::compose_overrides`'s doc.
-pub(crate) fn mark_compose_override(&mut self, w: &AppWindow, key: &'static str, value: &str) {
-    self.compose_overrides.insert(key);
-    println!("cb: compose-override {key}={value}");
+/// Set or clear the override marker for `key` for THIS compose session
+/// (PLAN-graffito-compose-simplify.md's Format-C "quiet marker" — an
+/// accent tint on the pill/card-row value, and what gates the gear card's
+/// "Reset this note to defaults" row). `is_default` is the caller's OWN
+/// equality check against that setting's default (each compares
+/// differently — numeric for gift, a bool for visibility/quantum, the
+/// app's own computed default for change — so this stays one choke point
+/// for the bookkeeping + logging rather than owning every comparison
+/// itself): an override that lands back on the default must not count as
+/// an override (2026-09-07 follow-up — the repro was the passphrase
+/// switch on then off again, which left the pill tinted and the reset row
+/// showing on a note that was exactly at its defaults). Logs
+/// `cb: compose-override <key>=<value>` when marking an override, and
+/// `cb: compose-override <key>=default` only when a PREVIOUSLY-set
+/// override is dropped this way (never for a value that was already at
+/// its default — there's nothing to "drop"). `key` is one of "visibility"
+/// | "fee" | "gift" | "payfrom" | "change" | "passphrase" | "quantum" —
+/// see `State::compose_overrides`'s doc.
+pub(crate) fn set_compose_override(&mut self, w: &AppWindow, key: &'static str, value: &str, is_default: bool) {
+    if is_default {
+        if self.compose_overrides.remove(key) {
+            println!("cb: compose-override {key}=default");
+        }
+    } else {
+        self.compose_overrides.insert(key);
+        println!("cb: compose-override {key}={value}");
+    }
     self.refresh_compose_override_flags(w);
 }
 
@@ -2823,7 +2836,14 @@ pub(crate) fn on_set_fee_tier(&mut self, w: &AppWindow, tier: i32) {
             w.global::<Compose>().set_rate_text(format!("{rate}").into());
         }
         println!("cb: fee-tier {tier} rate={rate}");
-        self.mark_compose_override(w, "fee", fee_tier_name(tier));
+        // Back-to-default check: tier alone decides it for economy/normal/
+        // fast (the rate is always the live network figure for those); a
+        // pill tap landing on tier 3 (custom) also needs the rate to match
+        // the default's — `on_set_fee_rate` is the only other place tier 3
+        // is reached, and it does the analogous check for its own edits.
+        let is_default = tier == self.compose_defaults.fee_tier
+            && (tier != 3 || w.global::<Compose>().get_rate_text().as_str() == self.compose_defaults.fee_rate);
+        self.set_compose_override(w, "fee", fee_tier_name(tier), is_default);
         self.refresh_compose(w);
     }
 
@@ -2835,7 +2855,11 @@ pub(crate) fn on_set_fee_tier(&mut self, w: &AppWindow, tier: i32) {
         w.global::<Compose>().set_fee_tier(3);
         w.global::<Compose>().set_rate_text(t.clone());
         println!("cb: fee-tier 3 rate={t}");
-        self.mark_compose_override(w, "fee", &format!("custom rate={t}"));
+        // Same rule as the tier pill: default only if tier 3 IS the
+        // default AND this rate matches the default's.
+        let is_default =
+            self.compose_defaults.fee_tier == 3 && t.trim() == self.compose_defaults.fee_rate.trim();
+        self.set_compose_override(w, "fee", &format!("custom rate={t}"), is_default);
         self.refresh_compose(w);
     }
 
@@ -2847,7 +2871,8 @@ pub(crate) fn on_set_fee_tier(&mut self, w: &AppWindow, tier: i32) {
         let private = private && !watch;
         w.global::<Compose>().set_compose_private(private);
         println!("cb: compose-visibility {}", if private { "private" } else { "public" });
-        self.mark_compose_override(w, "visibility", if private { "private" } else { "public" });
+        let is_default = private == self.compose_defaults.visibility_private;
+        self.set_compose_override(w, "visibility", if private { "private" } else { "public" }, is_default);
         self.refresh_compose(w);
     }
 
@@ -2861,7 +2886,8 @@ pub(crate) fn on_set_fee_tier(&mut self, w: &AppWindow, tier: i32) {
                 w.global::<Compose>().set_gift_error("".into());
                 w.global::<Compose>().set_gift_valid(true);
                 println!("cb: compose-gift {n}");
-                self.mark_compose_override(w, "gift", &n.to_string());
+                let is_default = n == self.compose_defaults.gift_sats;
+                self.set_compose_override(w, "gift", &n.to_string(), is_default);
             }
             _ => {
                 println!("cb: compose-override gift=err below-dust");
@@ -2882,7 +2908,10 @@ pub(crate) fn on_set_fee_tier(&mut self, w: &AppWindow, tier: i32) {
     pub(crate) fn on_set_passphrase_enabled(&mut self, w: &AppWindow, on: bool) {
         w.global::<Compose>().set_pq_passphrase_enabled(on);
         println!("cb: pq-passphrase enabled={on}");
-        self.mark_compose_override(w, "passphrase", if on { "on" } else { "off" });
+        // No Settings default exists for this layer — every fresh compose
+        // starts with it off (`apply_compose_defaults`), so "off" IS the
+        // default, always.
+        self.set_compose_override(w, "passphrase", if on { "on" } else { "off" }, !on);
         self.refresh_compose(w);
     }
 
@@ -2948,7 +2977,8 @@ pub(crate) fn on_pq_mlkem_toggled(&mut self, w: &AppWindow, on: bool) {
         // outlive the note.
         self.pq_mlkem_user_off = !on;
         println!("cb: pq-mlkem {}", if on { "on" } else { "off" });
-        self.mark_compose_override(w, "quantum", if on { "on" } else { "off" });
+        let is_default = self.pq_mlkem_user_off == self.compose_defaults.pq_mlkem_off;
+        self.set_compose_override(w, "quantum", if on { "on" } else { "off" }, is_default);
         self.refresh_compose(w);
     }
 

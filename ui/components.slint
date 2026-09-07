@@ -561,15 +561,14 @@ export component StatusPill inherits Rectangle {
 // overridden) on the right, a trailing chevron. No icon (icon rule).
 export component MenuValueRow inherits Rectangle {
     in property <string> label;
+    // Format C's on/off rows (visibility/passphrase/quantum): `value` is
+    // JUST the state name ("Private", "768+1024", "Strong") — no ✓ here
+    // (removed 2026-09-07 as redundant: the value already says whether the
+    // setting is on). Off states render a plain name ("Public") or the
+    // bare "None" — the caller composes that string; this component has no
+    // opinion on wording.
     in property <string> value;
     in property <bool> overridden: false;
-    // Format C's on/off rows (visibility/passphrase/quantum): `value` is
-    // JUST the state name ("Private", "PQ 768", "Passphrase · Strong") —
-    // this appends the SVG check mark (never a glyph, per the icon rule)
-    // when the setting is ON. Off states render `value` alone (a plain
-    // name like "Public", or "<Label>: None" — the caller composes that
-    // string; this component has no opinion on wording).
-    in property <bool> checked: false;
     // Inert/grey state (e.g. "no PQ key" — the row is still tappable, the
     // sheet it opens explains why) — takes precedence over `overridden`.
     in property <bool> muted: false;
@@ -603,13 +602,6 @@ export component MenuValueRow inherits Rectangle {
             color: root.muted ? Pal.muted : (root.overridden ? Pal.accent : Pal.muted);
             vertical-alignment: center;
             overflow: elide;
-        }
-        if root.checked: Image {
-            source: @image-url("icons/check.svg");
-            colorize: root.overridden ? Pal.accent : Pal.good;
-            width: 12px;
-            height: 12px;
-            y: (parent.height - 12px) / 2;
         }
         Text { text: "›"; font-size: 16px * Metrics.type-scale; color: Pal.muted; vertical-alignment: center; }
     }

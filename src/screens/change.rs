@@ -111,8 +111,14 @@ pub(crate) fn on_change_pick(&mut self, w: &AppWindow, choice: SharedString) {
             w.global::<Ui>().set_change_address("".into());
             w.global::<Change>().set_change_error("".into());
         }
-        self.mark_compose_override(w, "change", choice.as_str());
+        // Change has no Settings default — `update_change_label` computes
+        // the app's own resolved default (spending/notebook/wallet:<id>)
+        // fresh for the CURRENT selection, so it must run before this
+        // comparison; "custom" never matches (an explicit address is
+        // always a deviation from any resolved default).
         self.update_change_label(w);
+        let is_default = choice.as_str() == w.global::<Change>().get_change_default_choice().as_str();
+        self.set_compose_override(w, "change", choice.as_str(), is_default);
         self.refresh_compose(w);
         if choice.as_str() != "custom" {
             w.global::<Ui>().set_screen(Screen::Compose);

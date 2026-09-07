@@ -740,18 +740,17 @@ export global Compose {
     // row entirely rather than showing one with nothing behind it.
     in property <bool> pill-quantum-tappable: true;
     // ---- gear-card row values, Format C exactly (2026-09-07 follow-up,
-    // refined the same day): the row already carries its own label
+    // refined twice the same day): the row already carries its own label
     // ("Passphrase", "Quantum encryption") on the left, so the value must
-    // NOT repeat it — on states render just the state name + the row's own
-    // SVG check mark (never baked into the string, never a glyph), off
-    // states render the bare "None" — distinct from the short pill texts
-    // above, which DO carry their own name ("Passphrase", "PQ off"). ----
+    // NOT repeat it — on states render just the state name ("Private",
+    // "Strong", "768+1024"), off states render the bare "None". No ✓ here
+    // (removed as redundant once the value speaks for itself — the row
+    // keeps its chevron + tap-to-sheet behavior); distinct from the short
+    // pill texts above, which DO carry their own name ("Passphrase", "PQ
+    // off"). ----
     in property <string> card-visibility-value: "Private";
-    in property <bool> card-visibility-checked: true;
     in property <string> card-passphrase-value: "None";
-    in property <bool> card-passphrase-checked: false;
     in property <string> card-quantum-value: "None";
-    in property <bool> card-quantum-checked: false;
     in property <bool> card-quantum-muted: false;
     // Fee card row keeps the fuller "normal · 1 sat/vB · ~239 sats" form
     // (tier · effective rate · cost) — distinct from the pill, which shows

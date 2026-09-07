@@ -288,7 +288,6 @@ export component ComposeScreen inherits Rectangle {
                 if !Ui.watch-only: MenuValueRow {
                     label: "New notes";
                     value: Compose.card-visibility-value;
-                    checked: Compose.card-visibility-checked;
                     overridden: Compose.ov-visibility;
                     clicked => { Compose.card-row("visibility"); }
                 }
@@ -319,14 +318,12 @@ export component ComposeScreen inherits Rectangle {
                 if !Ui.watch-only && Ui.pay-from == "notebook": MenuValueRow {
                     label: "Passphrase";
                     value: Compose.card-passphrase-value;
-                    checked: Compose.card-passphrase-checked;
                     overridden: Compose.ov-passphrase;
                     clicked => { Compose.card-row("passphrase"); }
                 }
                 if Ui.directed && Compose.pill-quantum-tappable: MenuValueRow {
                     label: "Quantum encryption";
                     value: Compose.card-quantum-value;
-                    checked: Compose.card-quantum-checked;
                     muted: Compose.card-quantum-muted;
                     overridden: Compose.ov-quantum;
                     clicked => { Compose.card-row("quantum"); }
