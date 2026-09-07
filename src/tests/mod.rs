@@ -134,3 +134,12 @@ mod ui_flow_matrix_s2_wif_import;
 mod ui_flow_matrix_s3_mnemonic_accounts;
 mod ui_flow_matrix_s4_onboarding_contacts_settings;
 mod ui_flow_matrix_s6_dice;
+
+/// PLAN-graffito-compose-simplify.md (2026-09-07): Settings "Compose
+/// defaults" config round-trip + the `pq_mlkem_off` migration, a per-note
+/// override applying then dying on the next compose (fee tier, the ML-KEM
+/// sticky-opt-out bug the plan calls out by name), the 330-sat gift dust
+/// gate in both Settings and the sheet, the gear card's override flags +
+/// reset, and the quantum status-pill states for keyed/unkeyed/partially-
+/// keyed recipients.
+mod ui_flow_compose_defaults;

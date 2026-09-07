@@ -1,10 +1,17 @@
 // Screen.compose -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (PLAN-graffito-app-arch.md U3b); rebuilt 2026-09-07 per
+// PLAN-graffito-compose-simplify.md: the nine-controls-deep form (Private,
+// four fee chips + rate, Gift, Pay from, Change, Locktime, Security with
+// passphrase + cost + ML-KEM, "+ Add recipient", Sign) collapses into a
+// status strip of pills + a gear card, each opening a per-note override
+// sheet. Policy defaults now live in Settings → "Compose defaults"; an
+// override made here dies with the note (`Compose.compose-overrides`,
+// reset by `apply_compose_defaults` on every fresh compose session).
 //
 // ---------- 6 · compose ----------
 
 import { Ui, Note, Compose, Change } from "../globals.slint";
-import { Caption, PrimaryButton, GhostButton, IconButton, Header, Badge, SelectPill, KvRow } from "../components.slint";
+import { Caption, PrimaryButton, GhostButton, IconButton, SvgIconButton, Header, Badge, SelectPill, KvRow, StatusPill, MenuValueRow } from "../components.slint";
 import { EditField, EditArea } from "../edit.slint";
 import { Pal, Metrics } from "../theme.slint";
 import { Switch } from "std-widgets.slint";
@@ -26,6 +33,11 @@ export component ComposeScreen inherits Rectangle {
             back => { Ui.nav-back-nonce += 1; }
             sync => { Ui.refresh(); }
             busy-tapped => { Ui.sync-busy-toast(); }
+            SvgIconButton {
+                icon: "settings";
+                a11y-label: "Compose settings";
+                clicked => { Compose.card-toggle(); }
+            }
         }
         Flickable {
             viewport-height: compose-col.preferred-height;
@@ -115,44 +127,59 @@ export component ComposeScreen inherits Rectangle {
             text <=> Compose.compose-text;
             edited => { Ui.compose-changed(); }
         }
-        if !Ui.watch-only: HorizontalLayout {
-            spacing: 12px;
-            Switch {
-                text: "Private";
-                checked <=> Compose.compose-private;
-                toggled => { Ui.compose-changed(); }
-            }
-            Rectangle { }
-        }
         if Ui.watch-only: Caption {
             text: "Watch-only: public notes only — sealing needs the encryption key, which stays on your other device.";
         }
-        HorizontalLayout {
-            spacing: 8px;
-            alignment: start;
-            SelectPill { text: "economy"; active: Compose.fee-tier == 0; clicked => { Compose.set-fee-tier(0); } }
-            SelectPill { text: "normal"; active: Compose.fee-tier == 1; clicked => { Compose.set-fee-tier(1); } }
-            SelectPill { text: "fast"; active: Compose.fee-tier == 2; clicked => { Compose.set-fee-tier(2); } }
-            SelectPill { text: "custom"; active: Compose.fee-tier == 3; clicked => { Compose.set-fee-tier(3); } }
-        }
-        // Sat/vB rate box — ALWAYS visible (fee-tier redesign, 2026-07-16):
-        // shows the active tier's effective rate and updates live when the
-        // pills change; editing it auto-selects the Custom pill instead of
-        // requiring a tap there first. Rust's on-set-fee-tier never
-        // overwrites rate-text while fee-tier == 3, so this can't fight
-        // the user's typing.
-        HorizontalLayout {
-            spacing: 8px;
-            alignment: start;
-            EditField {
-                width: 84px * Metrics.type-scale;
-                text <=> Compose.rate-text;
-                edited => {
-                    Compose.fee-tier = 3;
-                    Ui.compose-changed();
+        // ---- status strip (PLAN-graffito-compose-simplify.md, Format C) ----
+        // ALWAYS one pill per setting that applies; Gift and PQ only on
+        // directed notes. A pill never changes state itself — tapping one
+        // only opens its per-note sheet. Horizontally scrollable rather
+        // than wrapping (Slint has no flex-wrap layout) — narrow phones
+        // scroll the strip instead of stacking a second row.
+        Flickable {
+            height: 30px * Metrics.type-scale;
+            viewport-width: pill-row.preferred-width;
+            pill-row := HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                if !Ui.watch-only: StatusPill {
+                    text: Compose.pill-visibility;
+                    overridden: Compose.ov-visibility;
+                    clicked => { Compose.card-row("visibility"); }
+                }
+                // `pill-quantum-tappable` doubles as "PQ applies to this
+                // note at all" (`pq_compose_eligible`) — hidden entirely
+                // rather than shown inert when it doesn't (public/watch-
+                // only/non-notebook notes). Once shown it's ALWAYS tappable,
+                // including the "no PQ key on file" state — the sheet's own
+                // caption explains why and points at Contacts.
+                if Ui.directed && Compose.pill-quantum-tappable: StatusPill {
+                    text: Compose.pill-quantum;
+                    overridden: Compose.ov-quantum;
+                    muted: Compose.pill-quantum-muted;
+                    clicked => { Compose.card-row("quantum"); }
+                }
+                if !Ui.watch-only && Ui.pay-from == "notebook": StatusPill {
+                    text: Compose.pill-passphrase;
+                    overridden: Compose.ov-passphrase;
+                    clicked => { Compose.card-row("passphrase"); }
+                }
+                StatusPill {
+                    text: Compose.pill-fee;
+                    overridden: Compose.ov-fee;
+                    clicked => { Compose.card-row("fee"); }
+                }
+                if Ui.directed: StatusPill {
+                    text: Compose.pill-gift;
+                    overridden: Compose.ov-gift;
+                    clicked => { Compose.card-row("gift"); }
+                }
+                if !Ui.fund-external: StatusPill {
+                    text: Compose.pill-payfrom;
+                    overridden: Compose.ov-payfrom;
+                    clicked => { Compose.card-row("payfrom"); }
                 }
             }
-            Caption { text: "sat/vB"; vertical-alignment: center; }
         }
         // Structured cost breakdown (Sal's build-17 follow-up, 2026-07-18:
         // the wrapped one-line string "doesn't look organized, use sections
@@ -191,292 +218,6 @@ export component ComposeScreen inherits Rectangle {
             preferred-width: 0;
             horizontal-stretch: 1;
         }
-        // ---- gift amount (directed notes only), collapsible ----
-        if Ui.directed: Rectangle {
-            border-radius: 10px;
-            background: Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            height: gift-col.preferred-height;
-            gift-col := VerticalLayout {
-                padding: 10px;
-                spacing: 8px;
-                Rectangle {
-                    height: 22px * Metrics.type-scale;
-                    TouchArea { clicked => { Compose.gift-expanded = !Compose.gift-expanded; } }
-                    HorizontalLayout {
-                        Text {
-                            text: "Gift · \{Compose.gift-sats} sats";
-                            font-size: 12px * Metrics.type-scale;
-                            color: Pal.muted;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { }
-                        Image {
-                            source: Compose.gift-expanded
-                                ? @image-url("../icons/caret-up.svg")
-                                : @image-url("../icons/caret-down.svg");
-                            colorize: Pal.muted;
-                            width: 16px;
-                            height: 16px;
-                        }
-                    }
-                }
-                if Compose.gift-expanded: Caption {
-                    text: "Sats sent to the recipient along with your note. Minimum 330 (dust).";
-                }
-                if Compose.gift-expanded: EditField {
-                    text <=> Compose.gift-sats;
-                    input-type: number;
-                    edited => { Ui.compose-changed(); }
-                }
-            }
-        }
-        // ---- pay from: ONE compact navigation row → screen 20 ----
-        // Picker, coin control, and custom change all live on the "Pay from"
-        // screen now (Sal 2026-07-16 iPhone-build-8 review — the old inline
-        // rows widened past the right edge on iPhone). Every text elides so
-        // this row can never do that again. Label + amount come from
-        // `payfrom-source-label`/`payfrom-selected-line` (Sal's iPhone bug
-        // cluster, 2026-07-18) — the TRUE cross-wallet selection, not the
-        // last-tapped `pay-from`/`pay-from-label`, which could disagree with
-        // what's actually selected (defect #4: the row used to lie).
-        Rectangle {
-            border-radius: 10px;
-            background: pftap.has-hover ? Pal.card-hover : Pal.card;
-            border-width: 1px;
-            border-color: Ui.spend-enough ? Pal.line : Pal.bad;
-            height: 44px * Metrics.type-scale;
-            pftap := TouchArea { clicked => { Compose.open-funding-screen(); } }
-            HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 12px;
-                spacing: 6px;
-                Text {
-                    text: "Pay from · " + Compose.payfrom-source-label;
-                    font-size: 12px * Metrics.type-scale;
-                    color: Ui.spend-enough ? Pal.text : Pal.bad;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    horizontal-stretch: 1;
-                }
-                Text {
-                    text: Ui.payfrom-selected-line;
-                    font-size: 12px * Metrics.type-scale;
-                    color: Pal.muted;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    horizontal-stretch: 0;
-                }
-                Text { text: "›"; font-size: 20px * Metrics.type-scale; color: Pal.muted; vertical-alignment: center; }
-            }
-        }
-        // ---- change: ONE compact navigation row → screen 21, directly
-        // below Pay-from (funding-unification UI rework, 2026-07-16). ----
-        Rectangle {
-            border-radius: 10px;
-            background: chtap.has-hover ? Pal.card-hover : Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            height: 44px * Metrics.type-scale;
-            chtap := TouchArea { clicked => { Compose.change-open(); } }
-            HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 12px;
-                spacing: 6px;
-                Text {
-                    text: "Change · " + Ui.change-dest-label;
-                    font-size: 12px * Metrics.type-scale;
-                    color: Pal.text;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    horizontal-stretch: 1;
-                }
-                Text { text: "›"; font-size: 20px * Metrics.type-scale; color: Pal.muted; vertical-alignment: center; }
-            }
-        }
-        // ---- locktime override (collapsible), right before Sign ----
-        Rectangle {
-            border-radius: 10px;
-            background: Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            height: cl-col.preferred-height;
-            cl-col := VerticalLayout {
-                padding: 10px;
-                spacing: 8px;
-                Rectangle {
-                    height: 22px * Metrics.type-scale;
-                    TouchArea { clicked => { Compose.compose-locktime-expanded = !Compose.compose-locktime-expanded; } }
-                    HorizontalLayout {
-                        Text {
-                            text: "Locktime · " + (Compose.compose-locktime-mode == "tip" ? "chain height"
-                                : Compose.compose-locktime-mode == "zero" ? "zero"
-                                : "custom " + Compose.compose-locktime-height);
-                            font-size: 12px * Metrics.type-scale;
-                            color: Pal.muted;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { }
-                        Image {
-                            source: Compose.compose-locktime-expanded
-                                ? @image-url("../icons/caret-up.svg")
-                                : @image-url("../icons/caret-down.svg");
-                            colorize: Pal.muted;
-                            width: 16px;
-                            height: 16px;
-                        }
-                    }
-                }
-                if Compose.compose-locktime-expanded: HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-                    SelectPill {
-                        text: "Chain height";
-                        active: Compose.compose-locktime-mode == "tip";
-                        clicked => { Compose.set-compose-locktime("tip", Compose.compose-locktime-height); }
-                    }
-                    SelectPill {
-                        text: "Zero";
-                        active: Compose.compose-locktime-mode == "zero";
-                        clicked => { Compose.set-compose-locktime("zero", Compose.compose-locktime-height); }
-                    }
-                    SelectPill {
-                        text: "Custom";
-                        active: Compose.compose-locktime-mode == "custom";
-                        clicked => { Compose.set-compose-locktime("custom", Compose.compose-locktime-height); }
-                    }
-                }
-                if Compose.compose-locktime-expanded && Compose.compose-locktime-mode == "custom": HorizontalLayout {
-                    spacing: 8px;
-                    EditField {
-                        width: 130px * Metrics.type-scale;
-                        text <=> Compose.compose-locktime-height;
-                        placeholder-text: "block height";
-                        accepted(t) => { Compose.set-compose-locktime("custom", t); }
-                    }
-                    Caption { text: "height · press Return to apply"; vertical-alignment: center; }
-                }
-                if Compose.compose-locktime-expanded: Caption { text: Compose.compose-locktime-effective; }
-                if Compose.compose-locktime-warn != "": Caption { text: Compose.compose-locktime-warn; color: Pal.warn; }
-            }
-        }
-        // ---- post-quantum layers (private + single-recipient-or-self,
-        // notebook-funded, keyed only — mirrors `pq_compose_eligible` in
-        // src/lib.rs exactly) — the LAST collapsible on this screen,
-        // deliberately: it only pushes the Sign/cost area below it, so
-        // that's the one area an e2e recalibration needs to touch. Imitates
-        // the Gift/Locktime panels exactly (same card/caret/caption shape).
-        // Multi-recipient notes carry the pq layers too since 2026-09-06
-        // (PLAN-graffito-multi-pq.md) — the former `to-chips.length == 0`
-        // term hid this card for 2+ recipients while the ML-KEM default
-        // still engaged underneath, so the passphrase layer was unreachable.
-        if Compose.compose-private && !Ui.watch-only && Ui.pay-from == "notebook": Rectangle {
-            border-radius: 10px;
-            background: Pal.card;
-            border-width: 1px;
-            border-color: Pal.line;
-            height: pq-col.preferred-height;
-            pq-col := VerticalLayout {
-                padding: 10px;
-                spacing: 8px;
-                Rectangle {
-                    height: 22px * Metrics.type-scale;
-                    TouchArea {
-                        clicked => {
-                            Compose.pq-expanded = !Compose.pq-expanded;
-                            Compose.pq-panel-toggled(Compose.pq-expanded);
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: 6px;
-                        Text {
-                            text: "Security";
-                            font-size: 12px * Metrics.type-scale;
-                            color: Pal.muted;
-                            vertical-alignment: center;
-                        }
-                        Badge {
-                            label: Compose.pq-status-chip;
-                            tint: Ui.pq-quantum-resistant ? Pal.good : Pal.faint;
-                        }
-                        Rectangle { }
-                        Image {
-                            source: Compose.pq-expanded
-                                ? @image-url("../icons/caret-up.svg")
-                                : @image-url("../icons/caret-down.svg");
-                            colorize: Pal.muted;
-                            width: 16px;
-                            height: 16px;
-                        }
-                    }
-                }
-                // ---- passphrase layer ----
-                if Compose.pq-expanded: HorizontalLayout {
-                    Switch {
-                        text: "Passphrase";
-                        checked <=> Compose.pq-passphrase-enabled;
-                        toggled => { Compose.pq-passphrase-changed(Compose.pq-passphrase-text); }
-                    }
-                    Rectangle { }
-                }
-                if Compose.pq-expanded && Compose.pq-passphrase-enabled: HorizontalLayout {
-                    spacing: 8px;
-                    // Deliberately PLAIN text, not `input-type: password`:
-                    // the whole point of Generate is a phrase the user can
-                    // read and copy down (the same reasoning screen 19's
-                    // "Private keys" reveal already follows — a secret
-                    // meant to be recorded is shown, not masked).
-                    EditField {
-                        horizontal-stretch: 1;
-                        text <=> Compose.pq-passphrase-text;
-                        placeholder-text: "type, paste, or generate a passphrase";
-                        edited(t) => { Compose.pq-passphrase-changed(t); }
-                    }
-                    GhostButton {
-                        text: "Generate";
-                        width: 96px * Metrics.type-scale;
-                        clicked => { Compose.pq-generate-passphrase(); }
-                    }
-                }
-                if Compose.pq-expanded && Compose.pq-passphrase-enabled: Caption {
-                    text: Compose.pq-passphrase-strength-line;
-                    color: Compose.pq-passphrase-verified ? Pal.good
-                        : (Compose.pq-passphrase-weak ? Pal.bad : Pal.warn);
-                }
-                // Per-note Argon2id cost (2026-09-05): how much memory and
-                // time EVERY unlock attempt costs — the reader's and an
-                // attacker's alike. Recorded in the note, so unlock never
-                // needs the setting.
-                if Compose.pq-expanded && Compose.pq-passphrase-enabled: HorizontalLayout {
-                    spacing: 8px;
-                    Caption { text: "Unlock cost"; vertical-alignment: center; }
-                    SelectPill { text: "Standard"; active: Compose.pq-pw-cost == "standard"; clicked => { Compose.pq-pw-cost-changed("standard"); } }
-                    SelectPill { text: "Strong"; active: Compose.pq-pw-cost == "strong"; clicked => { Compose.pq-pw-cost-changed("strong"); } }
-                    SelectPill { text: "Maximum"; active: Compose.pq-pw-cost == "maximum"; clicked => { Compose.pq-pw-cost-changed("maximum"); } }
-                    Rectangle { }
-                }
-                if Compose.pq-expanded && Compose.pq-passphrase-enabled: Caption {
-                    text: Compose.pq-pw-cost-caption;
-                    color: Pal.muted;
-                }
-                // ---- ML-KEM hybrid layer ----
-                if Compose.pq-expanded: HorizontalLayout {
-                    Switch {
-                        text: "Quantum encryption (ML-KEM)";
-                        enabled: Compose.pq-mlkem-available;
-                        checked <=> Compose.pq-mlkem-enabled;
-                        toggled => { Compose.pq-mlkem-toggled(self.checked); }
-                    }
-                    Rectangle { }
-                }
-                if Compose.pq-expanded && Compose.pq-mlkem-caption != "": Caption {
-                    text: Compose.pq-mlkem-caption;
-                    color: Compose.pq-mlkem-available ? Pal.muted : Pal.warn;
-                }
-                if Compose.pq-expanded: Caption { text: Compose.pq-security-label; }
-            }
-        }
         if Ui.mixed-linkage-hint: Caption {
             text: "This note spends coins from more than one wallet — their addresses become publicly linked on-chain.";
             color: Pal.warn;
@@ -489,32 +230,32 @@ export component ComposeScreen inherits Rectangle {
         if Ui.mixed-linkage-hint: PrimaryButton {
             text: Compose.compose-sending ? Compose.compose-progress-label
                 : Ui.wallet-scan-busy ? "Syncing…" : "Sign + review…";
-            tint: (Ui.spend-enough && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent : Pal.faint;
-            tint-hover: (Ui.spend-enough && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent-hover : Pal.faint;
-            clicked => { if (Ui.spend-enough && !Compose.compose-sending && !Ui.wallet-scan-busy) { Compose.compose-send-mixed(); } }
+            tint: (Ui.spend-enough && Compose.gift-valid && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent : Pal.faint;
+            tint-hover: (Ui.spend-enough && Compose.gift-valid && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent-hover : Pal.faint;
+            clicked => { if (Ui.spend-enough && Compose.gift-valid && !Compose.compose-sending && !Ui.wallet-scan-busy) { Compose.compose-send-mixed(); } }
         }
         if !Ui.mixed-linkage-hint && Ui.pay-from == "notebook": PrimaryButton {
             text: Compose.compose-sending ? Compose.compose-progress-label
                 : Ui.wallet-scan-busy ? "Syncing…" : (Ui.watch-only ? "Build transaction to sign" : "Sign + review…");
-            tint: (Ui.spend-enough && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent : Pal.faint;
-            tint-hover: (Ui.spend-enough && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent-hover : Pal.faint;
-            clicked => { if (Ui.spend-enough && !Compose.compose-sending && !Ui.wallet-scan-busy) { Compose.compose-send(); } }
+            tint: (Ui.spend-enough && Compose.gift-valid && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent : Pal.faint;
+            tint-hover: (Ui.spend-enough && Compose.gift-valid && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent-hover : Pal.faint;
+            clicked => { if (Ui.spend-enough && Compose.gift-valid && !Compose.compose-sending && !Ui.wallet-scan-busy) { Compose.compose-send(); } }
         }
         if !Ui.mixed-linkage-hint && Ui.pay-from == "spending": PrimaryButton {
             text: Compose.compose-sending ? Compose.compose-progress-label
                 : Ui.wallet-scan-busy ? "Syncing…" : "Sign + review…";
-            tint: (Ui.spend-enough && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent : Pal.faint;
-            tint-hover: (Ui.spend-enough && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent-hover : Pal.faint;
-            clicked => { if (Ui.spend-enough && !Compose.compose-sending && !Ui.wallet-scan-busy) { Compose.spending-compose-send(); } }
+            tint: (Ui.spend-enough && Compose.gift-valid && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent : Pal.faint;
+            tint-hover: (Ui.spend-enough && Compose.gift-valid && !Compose.compose-sending && !Ui.wallet-scan-busy) ? Pal.accent-hover : Pal.faint;
+            clicked => { if (Ui.spend-enough && Compose.gift-valid && !Compose.compose-sending && !Ui.wallet-scan-busy) { Compose.spending-compose-send(); } }
         }
         if !Ui.mixed-linkage-hint && Ui.fund-external: PrimaryButton {
             text: Ui.funding-ready ? "Build transaction to sign" : "Set a funding wallet first";
-            tint: (Ui.funding-ready && Ui.spend-enough) ? Pal.accent : Pal.faint;
-            tint-hover: (Ui.funding-ready && Ui.spend-enough) ? Pal.accent-hover : Pal.faint;
+            tint: (Ui.funding-ready && Ui.spend-enough && Compose.gift-valid) ? Pal.accent : Pal.faint;
+            tint-hover: (Ui.funding-ready && Ui.spend-enough && Compose.gift-valid) ? Pal.accent-hover : Pal.faint;
             clicked => {
                 if (!Ui.funding-ready) {
                     Ui.open-funding();
-                } else if (Ui.spend-enough) {
+                } else if (Ui.spend-enough && Compose.gift-valid) {
                     Compose.fund-build();
                 }
             }
@@ -522,5 +263,331 @@ export component ComposeScreen inherits Rectangle {
         Caption { text: Ui.status; color: Pal.bad; }
             }
         }
+        }
+
+        // ---- gear card (Format C, anchored under the header's gear icon) ----
+        // A tap-outside dismiss layer sits behind the card itself, both
+        // added as the LAST children of the screen so they render above
+        // everything above (later sibling wins z-order in Slint).
+        if Compose.card-open: TouchArea { clicked => { Compose.card-toggle(); } }
+        if Compose.card-open: Rectangle {
+            x: parent.width - self.width - 20px;
+            y: Ui.safe-top + 14px + 44px;
+            width: 260px;
+            height: card-col.preferred-height;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Pal.line;
+            background: Pal.card;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000088;
+            TouchArea { } // swallow taps so they don't fall through to the dismiss layer
+            card-col := VerticalLayout {
+                padding: 6px;
+                spacing: 2px;
+                if !Ui.watch-only: MenuValueRow {
+                    label: "New notes";
+                    value: Compose.card-visibility-value;
+                    checked: Compose.card-visibility-checked;
+                    overridden: Compose.ov-visibility;
+                    clicked => { Compose.card-row("visibility"); }
+                }
+                MenuValueRow {
+                    label: "Fee";
+                    value: Compose.card-fee-value;
+                    overridden: Compose.ov-fee;
+                    clicked => { Compose.card-row("fee"); }
+                }
+                if Ui.directed: MenuValueRow {
+                    label: "Gift to recipients";
+                    value: Compose.pill-gift;
+                    overridden: Compose.ov-gift;
+                    clicked => { Compose.card-row("gift"); }
+                }
+                if !Ui.fund-external: MenuValueRow {
+                    label: "Pay from";
+                    value: Compose.pill-payfrom;
+                    overridden: Compose.ov-payfrom;
+                    clicked => { Compose.card-row("payfrom"); }
+                }
+                MenuValueRow {
+                    label: "Change";
+                    value: Ui.change-dest-label;
+                    overridden: Compose.ov-change;
+                    clicked => { Compose.card-row("change"); }
+                }
+                if !Ui.watch-only && Ui.pay-from == "notebook": MenuValueRow {
+                    label: "Passphrase";
+                    value: Compose.card-passphrase-value;
+                    checked: Compose.card-passphrase-checked;
+                    overridden: Compose.ov-passphrase;
+                    clicked => { Compose.card-row("passphrase"); }
+                }
+                if Ui.directed && Compose.pill-quantum-tappable: MenuValueRow {
+                    label: "Quantum encryption";
+                    value: Compose.card-quantum-value;
+                    checked: Compose.card-quantum-checked;
+                    muted: Compose.card-quantum-muted;
+                    overridden: Compose.ov-quantum;
+                    clicked => { Compose.card-row("quantum"); }
+                }
+                Rectangle { height: 1px; background: Pal.line; }
+                if Compose.has-overrides: MenuValueRow {
+                    label: "Reset this note to defaults";
+                    value: "";
+                    clicked => { Compose.compose-reset-overrides(); }
+                }
+                MenuValueRow {
+                    label: "Edit compose defaults…";
+                    value: "";
+                    clicked => { Compose.compose-edit-defaults(); }
+                }
+            }
+        }
+
+        // ---- per-note override sheets ----
+        // One shared modal shape switched by `Compose.sheet-kind`; each
+        // kind's content mirrors what used to be the equivalent collapsible/
+        // nav-row and logs the SAME `cb:` line it always did, plus
+        // `cb: compose-override <key>=<value>` (see the individual `on_set_*`
+        // handlers in src/screens/compose.rs).
+        if Compose.sheet-kind != "": Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #000000.with-alpha(0.55);
+            TouchArea { clicked => { Compose.sheet-kind = ""; } }
+            Rectangle {
+                width: min(420px, parent.width - 40px);
+                height: sheet-col.preferred-height;
+                x: (parent.width - self.width) / 2;
+                y: 140px;
+                border-radius: 14px;
+                background: Pal.card;
+                border-width: 1px;
+                border-color: Pal.line;
+                TouchArea { }
+                sheet-col := VerticalLayout {
+                    padding: 20px;
+                    spacing: 12px;
+
+                    // ---- visibility ----
+                    if Compose.sheet-kind == "visibility": Text { text: "New note"; font-size: 16px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
+                    if Compose.sheet-kind == "visibility" && !Ui.watch-only: Rectangle {
+                        height: vrow1.preferred-height;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Compose.compose-private ? Pal.accent : Pal.line;
+                        background: Compose.compose-private ? Pal.accent.with-alpha(0.10) : transparent;
+                        TouchArea { clicked => { Compose.set-compose-visibility(true); } }
+                        vrow1 := VerticalLayout {
+                            padding: 10px;
+                            Text { text: "Private" + (Compose.compose-private ? " ✓" : ""); font-size: 13px * Metrics.type-scale; font-weight: 600; color: Compose.compose-private ? Pal.accent : Pal.text; }
+                            Caption { text: "Encrypted on-chain — only your key (and a directed recipient) can read it."; }
+                        }
+                    }
+                    if Compose.sheet-kind == "visibility": Rectangle {
+                        height: vrow2.preferred-height;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: !Compose.compose-private ? Pal.accent : Pal.line;
+                        background: !Compose.compose-private ? Pal.accent.with-alpha(0.10) : transparent;
+                        TouchArea { clicked => { Compose.set-compose-visibility(false); } }
+                        vrow2 := VerticalLayout {
+                            padding: 10px;
+                            Text { text: "Public" + (!Compose.compose-private ? " ✓" : ""); font-size: 13px * Metrics.type-scale; font-weight: 600; color: !Compose.compose-private ? Pal.accent : Pal.text; }
+                            Caption { text: "World-readable, forever."; }
+                        }
+                    }
+
+                    // ---- fee ----
+                    if Compose.sheet-kind == "fee": Text { text: "Fee"; font-size: 16px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
+                    if Compose.sheet-kind == "fee": HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        SelectPill { text: "economy"; active: Compose.fee-tier == 0; clicked => { Compose.set-fee-tier(0); } }
+                        SelectPill { text: "normal"; active: Compose.fee-tier == 1; clicked => { Compose.set-fee-tier(1); } }
+                        SelectPill { text: "fast"; active: Compose.fee-tier == 2; clicked => { Compose.set-fee-tier(2); } }
+                        SelectPill { text: "custom"; active: Compose.fee-tier == 3; clicked => { Compose.set-fee-tier(3); } }
+                    }
+                    if Compose.sheet-kind == "fee": HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        EditField {
+                            width: 84px * Metrics.type-scale;
+                            text <=> Compose.rate-text;
+                            input-type: number;
+                            accepted(t) => { Compose.set-fee-rate(t); }
+                            changed has-focus => { if (!self.has-focus) { Compose.set-fee-rate(self.text); } }
+                        }
+                        Caption { text: "sat/vB"; vertical-alignment: center; }
+                    }
+
+                    // ---- gift ----
+                    if Compose.sheet-kind == "gift": Text { text: "Gift to recipients"; font-size: 16px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
+                    if Compose.sheet-kind == "gift": Caption { text: "Sats sent to each recipient along with your note. Minimum 330 (dust) — the network rejects anything less."; }
+                    if Compose.sheet-kind == "gift": HorizontalLayout {
+                        spacing: 8px;
+                        EditField {
+                            text <=> Compose.gift-sats;
+                            input-type: number;
+                            accepted(t) => { Compose.set-compose-gift(t); }
+                            changed has-focus => { if (!self.has-focus) { Compose.set-compose-gift(self.text); } }
+                        }
+                        Caption { text: "sats"; vertical-alignment: center; }
+                    }
+                    if Compose.sheet-kind == "gift" && Compose.gift-error != "": Caption { text: Compose.gift-error; color: Pal.bad; }
+
+                    // ---- pay from ----
+                    if Compose.sheet-kind == "payfrom": Text { text: "Pay from"; font-size: 16px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
+                    if Compose.sheet-kind == "payfrom": Rectangle {
+                        height: pfrow1.preferred-height;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Ui.pay-from == "notebook" ? Pal.accent : Pal.line;
+                        background: Ui.pay-from == "notebook" ? Pal.accent.with-alpha(0.10) : transparent;
+                        TouchArea { clicked => { Ui.set-pay-from("notebook"); } }
+                        pfrow1 := VerticalLayout {
+                            padding: 10px;
+                            Text { text: "Notebook"; font-size: 13px * Metrics.type-scale; font-weight: 600; color: Ui.pay-from == "notebook" ? Pal.accent : Pal.text; }
+                        }
+                    }
+                    if Compose.sheet-kind == "payfrom" && Ui.spending-capable: Rectangle {
+                        height: pfrow2.preferred-height;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Ui.pay-from == "spending" ? Pal.accent : Pal.line;
+                        background: Ui.pay-from == "spending" ? Pal.accent.with-alpha(0.10) : transparent;
+                        TouchArea { clicked => { Ui.set-pay-from("spending"); } }
+                        pfrow2 := VerticalLayout {
+                            padding: 10px;
+                            Text { text: "Spending wallet"; font-size: 13px * Metrics.type-scale; font-weight: 600; color: Ui.pay-from == "spending" ? Pal.accent : Pal.text; }
+                        }
+                    }
+                    if Compose.sheet-kind == "payfrom": GhostButton {
+                        text: "Manage coins & sources…";
+                        clicked => { Compose.sheet-kind = ""; Compose.open-funding-screen(); }
+                    }
+
+                    // ---- change ----
+                    if Compose.sheet-kind == "change": Text { text: "Change"; font-size: 16px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
+                    if Compose.sheet-kind == "change" && Ui.spending-capable && Ui.spending-enabled: Rectangle {
+                        height: chrow1.preferred-height;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Ui.change-choice == "spending" ? Pal.accent : Pal.line;
+                        background: Ui.change-choice == "spending" ? Pal.accent.with-alpha(0.10) : transparent;
+                        TouchArea { clicked => { Change.change-pick("spending"); } }
+                        chrow1 := VerticalLayout {
+                            padding: 10px;
+                            Text { text: "Spending wallet · fresh change"; font-size: 12px * Metrics.type-scale; font-weight: 600; color: Ui.change-choice == "spending" ? Pal.accent : Pal.text; }
+                        }
+                    }
+                    if Compose.sheet-kind == "change": Rectangle {
+                        height: chrow2.preferred-height;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Ui.change-choice == "notebook" ? Pal.accent : Pal.line;
+                        background: Ui.change-choice == "notebook" ? Pal.accent.with-alpha(0.10) : transparent;
+                        TouchArea { clicked => { Change.change-pick("notebook"); } }
+                        chrow2 := VerticalLayout {
+                            padding: 10px;
+                            Text { text: "Notebook"; font-size: 12px * Metrics.type-scale; font-weight: 600; color: Ui.change-choice == "notebook" ? Pal.accent : Pal.text; }
+                        }
+                    }
+                    if Compose.sheet-kind == "change": Rectangle {
+                        height: chrow3.preferred-height;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Ui.change-choice == "custom" ? Pal.accent : Pal.line;
+                        background: Ui.change-choice == "custom" ? Pal.accent.with-alpha(0.10) : transparent;
+                        TouchArea { clicked => { Change.change-pick("custom"); } }
+                        chrow3 := VerticalLayout {
+                            padding: 10px;
+                            Text { text: "Custom address…"; font-size: 12px * Metrics.type-scale; font-weight: 600; color: Ui.change-choice == "custom" ? Pal.accent : Pal.text; }
+                        }
+                    }
+                    if Compose.sheet-kind == "change" && Ui.change-choice == "custom": HorizontalLayout {
+                        spacing: 8px;
+                        EditField {
+                            text <=> Ui.change-address;
+                            placeholder-text: "change address";
+                            edited => { Ui.compose-changed(); }
+                        }
+                    }
+                    if Compose.sheet-kind == "change" && Change.change-error != "": Caption { text: Change.change-error; color: Pal.bad; }
+                    if Compose.sheet-kind == "change": Caption { text: "Current: " + Ui.change-dest-label; }
+                    // A funding wallet's own change chain isn't offered by
+                    // this compact sheet (rare path) — "More options…" opens
+                    // the full picker (screen 21), which lists every saved
+                    // funding wallet too.
+                    if Compose.sheet-kind == "change" && Ui.funding-wallets.length > 0: GhostButton {
+                        text: "More options…";
+                        clicked => { Compose.sheet-kind = ""; Compose.change-open(); }
+                    }
+
+                    // ---- passphrase ----
+                    if Compose.sheet-kind == "passphrase": Text { text: "Passphrase"; font-size: 16px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
+                    if Compose.sheet-kind == "passphrase": HorizontalLayout {
+                        Switch {
+                            text: "Passphrase";
+                            checked: Compose.pq-passphrase-enabled;
+                            toggled => { Compose.set-passphrase-enabled(self.checked); }
+                        }
+                        Rectangle { }
+                    }
+                    if Compose.sheet-kind == "passphrase" && Compose.pq-passphrase-enabled: HorizontalLayout {
+                        spacing: 8px;
+                        EditField {
+                            horizontal-stretch: 1;
+                            text <=> Compose.pq-passphrase-text;
+                            placeholder-text: "type, paste, or generate a passphrase";
+                            edited(t) => { Compose.pq-passphrase-changed(t); }
+                        }
+                        GhostButton {
+                            text: "Generate";
+                            width: 96px * Metrics.type-scale;
+                            clicked => { Compose.pq-generate-passphrase(); }
+                        }
+                    }
+                    if Compose.sheet-kind == "passphrase" && Compose.pq-passphrase-enabled: Caption {
+                        text: Compose.pq-passphrase-strength-line;
+                        color: Compose.pq-passphrase-verified ? Pal.good
+                            : (Compose.pq-passphrase-weak ? Pal.bad : Pal.warn);
+                    }
+                    if Compose.sheet-kind == "passphrase" && Compose.pq-passphrase-enabled: HorizontalLayout {
+                        spacing: 8px;
+                        Caption { text: "Unlock cost"; vertical-alignment: center; }
+                        SelectPill { text: "Standard"; active: Compose.pq-pw-cost == "standard"; clicked => { Compose.pq-pw-cost-changed("standard"); } }
+                        SelectPill { text: "Strong"; active: Compose.pq-pw-cost == "strong"; clicked => { Compose.pq-pw-cost-changed("strong"); } }
+                        SelectPill { text: "Maximum"; active: Compose.pq-pw-cost == "maximum"; clicked => { Compose.pq-pw-cost-changed("maximum"); } }
+                    }
+                    if Compose.sheet-kind == "passphrase" && Compose.pq-passphrase-enabled: Caption {
+                        text: Compose.pq-pw-cost-caption;
+                        color: Pal.muted;
+                    }
+
+                    // ---- quantum ----
+                    if Compose.sheet-kind == "quantum": Text { text: "Quantum encryption"; font-size: 16px * Metrics.type-scale; font-weight: 700; color: Pal.text; }
+                    if Compose.sheet-kind == "quantum": HorizontalLayout {
+                        Switch {
+                            text: "Quantum encryption (ML-KEM)";
+                            enabled: Compose.pq-mlkem-available;
+                            checked <=> Compose.pq-mlkem-enabled;
+                            toggled => { Compose.pq-mlkem-toggled(self.checked); }
+                        }
+                        Rectangle { }
+                    }
+                    if Compose.sheet-kind == "quantum" && Compose.pq-mlkem-caption != "": Caption {
+                        text: Compose.pq-mlkem-caption;
+                        color: Compose.pq-mlkem-available ? Pal.muted : Pal.warn;
+                    }
+                    if Compose.sheet-kind == "quantum": Caption { text: Compose.pq-security-label; }
+
+                    GhostButton {
+                        text: "Done";
+                        clicked => { Compose.sheet-kind = ""; }
+                    }
+                }
+            }
         }
     }

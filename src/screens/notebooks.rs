@@ -170,8 +170,29 @@ pub(crate) fn update_notebook_list(&self, w: &AppWindow) {
 
 impl State {
 pub(crate) fn on_settings_open(&mut self, w: &AppWindow) {
+        self.open_settings_screen(w, false);
+    }
+
+/// Shared by the normal Settings entry (`on_settings_open`, the notebook
+/// list's gear) and Compose's "Edit compose defaults…" row
+/// (`on_compose_edit_defaults`, PLAN-graffito-compose-simplify.md), which
+/// wants the SAME screen filtered down to just the "Compose defaults" card
+/// — `subset_compose` drives `Settings.settings-compose-only` (read by
+/// settings.slint to hide every other card) and picks the log line: plain
+/// `cb: settings-open` stays byte-identical for the normal entry,
+/// `cb: settings-open subset=compose` for the filtered one, so a suite can
+/// tell them apart. Back always lands on `return-screen` — Compose for the
+/// filtered entry (wired by `on_compose_edit_defaults` after this call, so
+/// the round trip re-runs the estimate via `Compose.compose-defaults-return`),
+/// Notebooks/Home for the normal one, exactly as before.
+pub(crate) fn open_settings_screen(&mut self, w: &AppWindow, subset_compose: bool) {
         w.global::<Ui>().set_return_screen(if w.global::<Ui>().get_screen() == Screen::Notebooks { Screen::Notebooks } else { Screen::Home });
-        println!("cb: settings-open");
+        w.global::<Settings>().set_settings_compose_only(subset_compose);
+        if subset_compose {
+            println!("cb: settings-open subset=compose");
+        } else {
+            println!("cb: settings-open");
+        }
         self.clear_reveal(w);
         w.global::<Ui>().set_status("".into());
         w.global::<Settings>().set_chunk_custom(false);

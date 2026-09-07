@@ -111,6 +111,7 @@ pub(crate) fn on_change_pick(&mut self, w: &AppWindow, choice: SharedString) {
             w.global::<Ui>().set_change_address("".into());
             w.global::<Change>().set_change_error("".into());
         }
+        self.mark_compose_override(w, "change", choice.as_str());
         self.update_change_label(w);
         self.refresh_compose(w);
         if choice.as_str() != "custom" {

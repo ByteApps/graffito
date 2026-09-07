@@ -114,6 +114,100 @@ const SOURCE_URL: &str = "https://github.com/ByteApps/graffito";
 /// Minimum (and default) sats sent to a directed-note recipient.
 const DUST_SATS: u64 = app_core::notes_core::DUST_LIMIT;
 
+/// Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md): the
+/// policy every fresh compose session starts from — set once in Settings,
+/// shown on Compose as small indicators, and never itself changed by a
+/// per-note sheet (a sheet only OVERRIDES the current note; see
+/// `State::compose_overrides` and `State::apply_compose_defaults`).
+/// Persisted under the `"compose"` key in config.json. No serde derive here
+/// (this crate has no direct `serde` dependency, only `serde_json` — every
+/// other config.json field in this file is hand-parsed the same way, see
+/// `boot.rs`): [`ComposeDefaults::from_json`]/[`ComposeDefaults::to_json`]
+/// read/write each field individually, missing-key-per-field so an old
+/// config (or the whole "compose" section missing, pre-2026-09-07) loads
+/// every field at its documented default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ComposeDefaults {
+    /// New notes default to Private (true) or Public (false).
+    pub(crate) visibility_private: bool,
+    /// 0=economy, 1=normal, 2=fast, 3=custom (see `fee_rate` below).
+    pub(crate) fee_tier: i32,
+    /// Only consulted when `fee_tier == 3`; a live network rate is used for
+    /// tiers 0-2 (same as today), so this stays whatever the user last
+    /// typed into a Custom rate box.
+    pub(crate) fee_rate: String,
+    /// Sats gifted to each directed-note recipient. Hard-gated at the
+    /// 330-sat taproot dust limit — never persisted below it (see
+    /// `on_set_compose_default_gift`).
+    pub(crate) gift_sats: u64,
+    /// "notebook" | "spending" | "ask" (ask = resolve today's balance-based
+    /// heuristic, then open the Pay-from sheet so the choice is conscious).
+    pub(crate) pay_from: String,
+    /// "fewest" | "consolidate" — mirrors `PayFrom.coin-strategy`'s 0/1.
+    pub(crate) coins: String,
+    /// Quantum encryption (ML-KEM hybrid) default: `false` = on whenever a
+    /// key is available (today's default), `true` = off. Replaces the old
+    /// top-level `pq_mlkem_off` config key one-for-one — see
+    /// `boot::compose_defaults_from_config`'s migration.
+    pub(crate) pq_mlkem_off: bool,
+}
+
+impl Default for ComposeDefaults {
+    fn default() -> Self {
+        ComposeDefaults {
+            visibility_private: true,
+            fee_tier: 1,
+            fee_rate: String::new(),
+            gift_sats: DUST_SATS,
+            pay_from: "notebook".to_string(),
+            coins: "fewest".to_string(),
+            pq_mlkem_off: false,
+        }
+    }
+}
+
+impl ComposeDefaults {
+    /// Parse the `"compose"` object from a loaded config.json — every field
+    /// missing or the wrong type falls back to [`ComposeDefaults::default`]'s
+    /// value for that field alone (never the whole struct), so a config from
+    /// an older or newer build round-trips whatever it DOES recognize.
+    fn from_json(v: &serde_json::Value) -> Self {
+        let d = ComposeDefaults::default();
+        ComposeDefaults {
+            visibility_private: v
+                .get("visibility_private")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(d.visibility_private),
+            fee_tier: v.get("fee_tier").and_then(|x| x.as_i64()).map(|n| n as i32).unwrap_or(d.fee_tier),
+            fee_rate: v
+                .get("fee_rate")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+                .unwrap_or(d.fee_rate),
+            gift_sats: v.get("gift_sats").and_then(|x| x.as_u64()).unwrap_or(d.gift_sats),
+            pay_from: v
+                .get("pay_from")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+                .unwrap_or(d.pay_from),
+            coins: v.get("coins").and_then(|x| x.as_str()).map(str::to_string).unwrap_or(d.coins),
+            pq_mlkem_off: v.get("pq_mlkem_off").and_then(|x| x.as_bool()).unwrap_or(d.pq_mlkem_off),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "visibility_private": self.visibility_private,
+            "fee_tier": self.fee_tier,
+            "fee_rate": self.fee_rate,
+            "gift_sats": self.gift_sats,
+            "pay_from": self.pay_from,
+            "coins": self.coins,
+            "pq_mlkem_off": self.pq_mlkem_off,
+        })
+    }
+}
+
 // ---- About / Help / Privacy / Q&A / disclaimer copy (info screens 24/25) ----
 
 const DISCLAIMER: &str = "Graffito is free software provided \"as is\", without warranty of any kind. You alone control your keys and funds. The authors accept no liability for any loss of funds or data — from lost or leaked keys, fees, failed or malformed transactions, or bugs. Bitcoin transactions are irreversible and on-chain data is public and permanent. This is a hot wallet: keep only small, note-fee amounts here and use it at your own risk.";
@@ -270,6 +364,21 @@ struct State {
     /// deliberate opt-out from being re-enabled on the next recipient change
     /// or the next run (persisted in config.json as `pq_mlkem_off`).
     pq_mlkem_user_off: bool,
+    /// Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md):
+    /// the policy a fresh compose session starts from. `apply_compose_defaults`
+    /// stamps every field below onto the live Compose globals; nothing here
+    /// is itself mutated by a per-note sheet.
+    compose_defaults: ComposeDefaults,
+    /// Which per-note settings the CURRENT compose session has overridden
+    /// away from `compose_defaults` (compose-simplify plan's Format-C
+    /// "quiet marker" — an accent tint on the pill/card row, and what gates
+    /// the gear card's "Reset this note to defaults" row). Keys: "visibility",
+    /// "fee", "gift", "payfrom", "change", "passphrase", "quantum". Cleared
+    /// by `apply_compose_defaults` (every fresh compose session) and by
+    /// `on_compose_reset_overrides` (the gear card's reset row) — an
+    /// override otherwise NEVER survives past the note it was made for, by
+    /// construction, not by discipline.
+    compose_overrides: std::collections::HashSet<&'static str>,
     /// The last text `passphrase::generate()` produced this session, so
     /// `on_pq_passphrase_changed` can tell "still exactly the generated
     /// phrase" (stays verified) from "the user touched it" (reverts to
@@ -1174,7 +1283,11 @@ impl State {
             "locktime": self.lock_time_policy,
             "pq_level": self.pq_level,
             "pq_pw_cost": self.pq_pw_cost.as_str(),
-            "pq_mlkem_off": self.pq_mlkem_user_off,
+            // "pq_mlkem_off" (top-level) is GONE — superseded by
+            // "compose.pq_mlkem_off" below (PLAN-graffito-compose-simplify.md).
+            // `boot::compose_defaults_from_config` migrates a legacy value on
+            // load; once resaved through this function it never comes back.
+            "compose": self.compose_defaults.to_json(),
         })
     }
 
@@ -1225,6 +1338,8 @@ impl State {
             pq_passphrase_verified: false,
             pq_pw_cost: app_core::notes_core::pq::PwCost::DEFAULT,
             pq_mlkem_user_off: false,
+            compose_defaults: ComposeDefaults::default(),
+            compose_overrides: std::collections::HashSet::new(),
             pq_passphrase_generated: None,
             pq_recipient_cache: None,
             pq_level: app_core::passphrase::MlKemLevel::DEFAULT,
@@ -2526,6 +2641,18 @@ pub fn run() {
 
     cb!(Compose, on_set_fee_tier, |w, s, tier: i32| { s.on_set_fee_tier(&w, tier) });
 
+    // ---- compose-simplify (PLAN-graffito-compose-simplify.md): status
+    // strip pills, gear card, per-note override sheets. ----
+    cb!(Compose, on_card_toggle, |w, s| { s.on_compose_card_toggle(&w) });
+    cb!(Compose, on_card_row, |w, s, key: SharedString| { s.on_compose_card_row(&w, key) });
+    cb!(Compose, on_compose_reset_overrides, |w, s| { s.on_compose_reset_overrides(&w) });
+    cb!(Compose, on_compose_edit_defaults, |w, s| { s.on_compose_edit_defaults(&w) });
+    cb!(Compose, on_compose_defaults_return, |w, s| { s.on_compose_defaults_return(&w) });
+    cb!(Compose, on_set_compose_visibility, |w, s, private: bool| { s.on_set_compose_visibility(&w, private) });
+    cb!(Compose, on_set_fee_rate, |w, s, t: SharedString| { s.on_set_fee_rate(&w, t) });
+    cb!(Compose, on_set_compose_gift, |w, s, t: SharedString| { s.on_set_compose_gift(&w, t) });
+    cb!(Compose, on_set_passphrase_enabled, |w, s, on: bool| { s.on_set_passphrase_enabled(&w, on) });
+
     cb!(Settings, on_open_coins, |w, s| { s.on_open_coins(&w) });
 
     // Coins screen "spending" segment: scan on first view (data otherwise
@@ -3003,6 +3130,14 @@ pub fn run() {
     cb!(Settings, on_set_network, |w, s, net: SharedString| { s.on_set_network(&w, net) });
 
     cb!(Settings, on_set_chunk, |w, s, t: SharedString| { s.on_set_chunk(&w, t) });
+
+    // ---- Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md) ----
+    cb!(Settings, on_set_compose_default_visibility, |w, s, v: SharedString| { s.on_set_compose_default_visibility(&w, v) });
+    cb!(Settings, on_set_compose_default_fee, |w, s, tier: SharedString, rate: SharedString| { s.on_set_compose_default_fee(&w, tier, rate) });
+    cb!(Settings, on_set_compose_default_gift, |w, s, t: SharedString| { s.on_set_compose_default_gift(&w, t) });
+    cb!(Settings, on_set_compose_default_payfrom, |w, s, kind: SharedString| { s.on_set_compose_default_payfrom(&w, kind) });
+    cb!(Settings, on_set_compose_default_coins, |w, s, kind: SharedString| { s.on_set_compose_default_coins(&w, kind) });
+    cb!(Settings, on_set_compose_default_pq_mlkem, |w, s, v: SharedString| { s.on_set_compose_default_pq_mlkem(&w, v) });
 
     cb!(Settings, on_set_locktime, |w, s, mode: SharedString, height: SharedString| { s.on_set_locktime(&w, mode, height) });
 

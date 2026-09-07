@@ -514,6 +514,187 @@ pub(crate) fn resolve_payfrom_default(&mut self, w: &AppWindow) {
     st.apply_pay_from(w, default_source);
 }
 
+/// Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md): stamp
+/// `st.compose_defaults` onto every per-note Compose/session field and
+/// clear the override set — the ONE place a fresh compose session (via
+/// `pick_contact_core`) and the gear card's "Reset this note to defaults"
+/// row (`on_compose_reset_overrides`) both go through, so the two can never
+/// disagree about what "the defaults" means. Deliberately does NOT touch
+/// recipient/screen/text/coin-selection scratch — callers that need a
+/// genuinely fresh compose session reset those themselves around this call.
+/// Pay-from is handled separately by `apply_compose_default_payfrom` (it
+/// needs the live spending-balance heuristic for "ask", which this
+/// function has no async/scan side effects to trigger).
+pub(crate) fn apply_compose_defaults(&mut self, w: &AppWindow) {
+    let st = self;
+    let d = st.compose_defaults.clone();
+    let watch = st.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
+    w.global::<Compose>().set_compose_private(d.visibility_private && !watch);
+    let f = st.fees.clone().unwrap_or_default();
+    let rate = match d.fee_tier {
+        0 => f.economy,
+        2 => f.fastest,
+        3 => d.fee_rate.trim().parse::<f64>().unwrap_or(1.0),
+        _ => f.hour,
+    }
+    .max(1.0);
+    w.global::<Compose>().set_fee_tier(d.fee_tier);
+    w.global::<Compose>().set_rate_text(format!("{rate}").into());
+    w.global::<Compose>().set_gift_sats(d.gift_sats.to_string().into());
+    w.global::<Compose>().set_gift_error("".into());
+    w.global::<Compose>().set_gift_valid(true);
+    st.consolidate_coins = d.coins == "consolidate";
+    st.coins_overridden = false;
+    w.global::<PayFrom>().set_coin_strategy(if st.consolidate_coins { 1 } else { 0 });
+    // The ML-KEM hybrid's per-session sticky opt-out (`pq_mlkem_user_off`,
+    // read by `refresh_compose_pq`) re-stamps from the DEFAULT every time —
+    // this is the fix for the plan's called-out bug ("the ML-KEM switch
+    // persists across composes"): a per-note toggle (`on_pq_mlkem_toggled`)
+    // can change it for THIS note, but the next note always starts here.
+    st.pq_mlkem_user_off = d.pq_mlkem_off;
+    st.compose_overrides.clear();
+    w.global::<Compose>().set_sheet_kind("".into());
+    w.global::<Compose>().set_card_open(false);
+    st.refresh_compose_override_flags(w);
+}
+
+/// The "Pay from" half of the defaults — separate from
+/// [`apply_compose_defaults`] because both non-"spending" settings defer to
+/// the existing balance-based heuristic (`resolve_payfrom_default`), which
+/// may kick an async spending-wallet scan. `"notebook"` (the Settings
+/// default) is BYTE-IDENTICAL to pre-compose-simplify behavior — every
+/// fresh compose already called `resolve_payfrom_default` unconditionally,
+/// so this setting changes nothing for anyone who never touches it.
+/// `"spending"` is the one setting that actually forces a source, skipping
+/// the heuristic. `"ask"` runs the same heuristic as "notebook" and ALSO
+/// auto-opens the Pay-from sheet once it settles, so choosing a source
+/// stays a conscious per-note action rather than a silent default (a
+/// scoped simplification of "ask each time" — see the compose-simplify
+/// plan's Settings table).
+pub(crate) fn apply_compose_default_payfrom(&mut self, w: &AppWindow) {
+    let st = self;
+    match st.compose_defaults.pay_from.as_str() {
+        "spending" if st.spending_capable && !st.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) => {
+            st.payfrom_active_source = "spending".to_string();
+            st.apply_pay_from(w, "spending");
+        }
+        "ask" => {
+            st.resolve_payfrom_default(w);
+            w.global::<Compose>().set_sheet_kind("payfrom".into());
+        }
+        _ => {
+            st.resolve_payfrom_default(w);
+        }
+    }
+}
+
+/// `cb: compose-effective …` — logged once per fresh compose session
+/// (`pick_contact_core`'s tail), after every default has settled: the
+/// exact policy this note starts from, for a suite to assert against
+/// without screenshotting pills.
+pub(crate) fn compose_effective_log(&self, w: &AppWindow) -> String {
+    let st = self;
+    let visibility = if w.global::<Compose>().get_compose_private() { "private" } else { "public" };
+    let fee = fee_tier_name(w.global::<Compose>().get_fee_tier());
+    let gift = w.global::<Compose>().get_gift_sats().to_string();
+    let pay_from = w.global::<Ui>().get_pay_from().to_string();
+    let coins = if st.consolidate_coins { "consolidate" } else { "fewest" };
+    let pq = if st.pq_mlkem_user_off { "off" } else { "on" };
+    let pw = if w.global::<Compose>().get_pq_passphrase_enabled() { st.pq_pw_cost.as_str() } else { "none" };
+    format!("visibility={visibility} fee={fee} gift={gift} pay-from={pay_from} coins={coins} pq={pq} pw={pw}")
+}
+
+/// Gear card (top-right, Format C) — open/close + row taps. `card-open`
+/// toggling is self-handled in slint for the common case; this callback
+/// exists purely so the open transition is LOGGED (`cb: compose-card open`)
+/// — a close (tap-outside or re-tap) is silent, matching the plan's log
+/// list, which names only the open transition.
+pub(crate) fn on_compose_card_toggle(&mut self, w: &AppWindow) {
+    let opening = !w.global::<Compose>().get_card_open();
+    w.global::<Compose>().set_card_open(opening);
+    if opening {
+        println!("cb: compose-card open");
+    }
+}
+
+/// A gear-card row tap (also reached directly from the matching status
+/// pill): close the card and open that row's per-note sheet.
+pub(crate) fn on_compose_card_row(&mut self, w: &AppWindow, key: SharedString) {
+    println!("cb: compose-card row={key}");
+    w.global::<Compose>().set_card_open(false);
+    w.global::<Compose>().set_sheet_kind(key.clone());
+    // The old "Security" collapsible (now split into the passphrase and
+    // quantum sheets) fired this on open — preserved for the lazy
+    // self-note imported-key load (`ensure_pq_imported_loaded`) and the
+    // `cb: pq-panel open` line a suite may still grep.
+    if key.as_str() == "passphrase" || key.as_str() == "quantum" {
+        self.on_pq_panel_toggled(w, true);
+    }
+}
+
+pub(crate) fn on_compose_reset_overrides(&mut self, w: &AppWindow) {
+    println!("cb: compose-reset-overrides");
+    self.apply_compose_defaults(w);
+    self.apply_compose_default_payfrom(w);
+    self.refresh_compose(w);
+}
+
+pub(crate) fn on_compose_edit_defaults(&mut self, w: &AppWindow) {
+    println!("cb: compose-card edit-defaults");
+    w.global::<Compose>().set_card_open(false);
+    w.global::<Compose>().set_sheet_kind("".into());
+    // Sal's explicit ask: this opens ONLY the compose-defaults subset, not
+    // the full Settings screen — `open_settings_screen(w, true)` sets
+    // `Settings.settings-compose-only` (settings.slint hides every other
+    // card) and logs `cb: settings-open subset=compose` instead of the
+    // plain line the notebook-list gear uses.
+    self.open_settings_screen(w, true);
+    // `open_settings_screen` always aims Settings' own Back at
+    // Notebooks/Home — point it at Compose instead so the round trip lands
+    // back where it started (app.slint's nav-back has a matching
+    // `Screen.compose` branch that fires `compose-defaults-return` on the
+    // way there).
+    w.global::<Ui>().set_return_screen(Screen::Compose);
+}
+
+/// Settings → Back, when it was opened from Compose's "Edit compose
+/// defaults…" row: re-apply every default the CURRENT session hasn't
+/// overridden (an override, once made, survives the round trip untouched —
+/// per-note sheets don't reset just because Settings changed the policy)
+/// and recompute the estimate, so a changed default is visible immediately
+/// without leaving Compose.
+pub(crate) fn on_compose_defaults_return(&mut self, w: &AppWindow) {
+    let st = self;
+    let d = st.compose_defaults.clone();
+    if !st.compose_overrides.contains("visibility") {
+        let watch = st.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
+        w.global::<Compose>().set_compose_private(d.visibility_private && !watch);
+    }
+    if !st.compose_overrides.contains("fee") {
+        let f = st.fees.clone().unwrap_or_default();
+        let rate = match d.fee_tier {
+            0 => f.economy,
+            2 => f.fastest,
+            3 => d.fee_rate.trim().parse::<f64>().unwrap_or(1.0),
+            _ => f.hour,
+        }
+        .max(1.0);
+        w.global::<Compose>().set_fee_tier(d.fee_tier);
+        w.global::<Compose>().set_rate_text(format!("{rate}").into());
+    }
+    if !st.compose_overrides.contains("gift") {
+        w.global::<Compose>().set_gift_sats(d.gift_sats.to_string().into());
+    }
+    if !st.compose_overrides.contains("payfrom") {
+        st.apply_compose_default_payfrom(w);
+    }
+    if !st.compose_overrides.contains("quantum") {
+        st.pq_mlkem_user_off = d.pq_mlkem_off;
+    }
+    st.consolidate_coins = if st.compose_overrides.contains("payfrom") { st.consolidate_coins } else { d.coins == "consolidate" };
+    st.refresh_compose(w);
+}
+
 /// Repaint the compose screen's locktime panel from `st`'s current
 /// effective policy (override if the panel set one this session, else the
 /// device default) — called on every fresh compose session AND after
@@ -1576,7 +1757,168 @@ pub(crate) fn sync_and_finalize_payfrom(&mut self, w: &AppWindow) {
             return;
         }
     }
+    st.refresh_compose_pills(w);
     st.update_change_label(w);
+}
+
+/// Compose's status-strip pill labels + the gear card's row values
+/// (PLAN-graffito-compose-simplify.md, Format C) — Rust-computed, never
+/// reimplemented in slint, same discipline as `pq-security-label`. Reuses
+/// the SAME text for a pill and its gear-card row (a deliberate scope
+/// simplification: the plan's mock shows slightly different wording per
+/// surface — e.g. a card row's "None" vs a pill's "PQ off" — but one
+/// Rust-computed string per setting keeps the two surfaces structurally
+/// unable to disagree, which matters more than matching the mock's exact
+/// off-state noun). Called from `sync_and_finalize_payfrom`'s tail, the
+/// ONE choke point every `refresh_compose` branch (mixed / external /
+/// spending / notebook / empty-text) already funnels through.
+pub(crate) fn refresh_compose_pills(&self, w: &AppWindow) {
+    let st = self;
+    let c = w.global::<Compose>();
+    let ui = w.global::<Ui>();
+
+    c.set_pill_visibility(if c.get_compose_private() { "Private".into() } else { "Public".into() });
+
+    let tier = fee_tier_name(c.get_fee_tier());
+    let cost_fee = c.get_cost_fee().to_string();
+    // "~151 sats (~$0.00)" -> "~151 sats" — neither surface below shows the
+    // USD aside (the structured cost card already does).
+    let fee_short = cost_fee.split(" (").next().unwrap_or("").trim().to_string();
+    // 2026-09-07 follow-up 4 (Sal): the pill shows the EFFECTIVE RATE, not
+    // the tier name — "normal" means nothing on the note itself; the
+    // number that actually applies does. Whole numbers render without a
+    // decimal ("1 sat/vB"), everything else at one decimal ("1.5 sat/vB").
+    let rate_label = format_rate_sat_vb(c.get_rate_text().as_str());
+    c.set_pill_fee(rate_label.clone().into());
+    // The gear card keeps the fuller "normal · 1 sat/vB · ~239 sats" form —
+    // tier · rate · cost — since the card has room to name the tier too.
+    c.set_card_fee_value(
+        if fee_short.is_empty() {
+            format!("{tier} · {rate_label}")
+        } else {
+            format!("{tier} · {rate_label} · {fee_short}")
+        }
+        .into(),
+    );
+
+    c.set_pill_gift(format!("Gift {}", c.get_gift_sats()).into());
+    c.set_pill_payfrom(c.get_payfrom_source_label().to_string().into());
+
+    let pw_on = c.get_pq_passphrase_enabled();
+    let pw_label = pw_cost_short(st.pq_pw_cost);
+    c.set_pill_passphrase_on(pw_on);
+    c.set_pill_passphrase(if pw_on { format!("Passphrase · {pw_label} ✓") } else { "Passphrase".to_string() }.into());
+
+    let (q_label, q_muted, q_tappable) = st.pq_pill_state(w);
+    c.set_pill_quantum(q_label.into());
+    c.set_pill_quantum_muted(q_muted);
+    c.set_pill_quantum_tappable(q_tappable);
+    let _ = ui; // reserved for future pill states that read Ui directly
+
+    // ---- gear-card row values (Format C exactly, 2026-09-07 follow-up) —
+    // distinct wording from the pills above: on/off rows are "Label ✓" (an
+    // SVG check mark, `MenuValueRow.checked`, never this glyph) when on,
+    // "key: value" when off.
+    c.set_card_visibility_value(if c.get_compose_private() { "Private".into() } else { "Public".into() });
+    c.set_card_visibility_checked(c.get_compose_private());
+
+    // The row's own label ("Passphrase") already says what this is — the
+    // value is just the cost name (2026-09-07 follow-up: rows must not
+    // repeat their own label).
+    c.set_card_passphrase_value(if pw_on { pw_label.to_string().into() } else { "None".into() });
+    c.set_card_passphrase_checked(pw_on);
+
+    let (cq_value, cq_checked, cq_muted) = st.pq_card_row_value(w);
+    c.set_card_quantum_value(cq_value.into());
+    c.set_card_quantum_checked(cq_checked);
+    c.set_card_quantum_muted(cq_muted);
+}
+
+/// The gear card's Quantum row value (Format C): `(value, checked, muted)`.
+/// Distinct from [`pq_pill_state`]'s pill wording: the row's own label
+/// ("Quantum encryption") already says what this is, so the value is bare
+/// "None" instead of "PQ off", and the level(s) alone instead of a leading
+/// "PQ " on every state (the ✓ is the row's own SVG icon, never baked into
+/// the string).
+pub(crate) fn pq_card_row_value(&self, w: &AppWindow) -> (String, bool, bool) {
+    let st = self;
+    let (label, muted, _eligible) = st.pq_pill_state(w);
+    if muted {
+        // "no PQ key" / "no PQ key · X of Y" — identical wording to the
+        // pill; there is no "off" state to distinguish here.
+        return (label, false, true);
+    }
+    let available = w.global::<Compose>().get_pq_mlkem_available();
+    let enabled = w.global::<Compose>().get_pq_mlkem_enabled();
+    if available && enabled {
+        // The row's own label ("Quantum encryption") already says what
+        // this is — the value is just the level(s), e.g. "768" / "768+1024"
+        // (`label` is "PQ <levels>" from `pq_pill_state`; strip the
+        // redundant "PQ " prefix). The ✓ rides as `MenuValueRow`'s own icon.
+        (label.trim_start_matches("PQ ").to_string(), true, false)
+    } else {
+        ("None".to_string(), false, false)
+    }
+}
+
+/// The quantum ("PQ …") status-strip pill / gear-card row value: `(label,
+/// muted, eligible)`. `eligible` is `pq_compose_eligible` verbatim — false
+/// means PQ fundamentally cannot apply to this note (public, watch-only,
+/// or not notebook-funded), and the strip/card hide the row entirely
+/// rather than show a pill with nothing useful behind it. Once eligible,
+/// EVERY state (including "no PQ key on file") stays tappable — opening
+/// the quantum sheet, whose caption explains why (points at Contacts for
+/// the missing-key case, same wording the old Security panel showed).
+pub(crate) fn pq_pill_state(&self, w: &AppWindow) -> (String, bool, bool) {
+    let st = self;
+    if !st.pq_compose_eligible(w) {
+        return ("PQ off".to_string(), true, false);
+    }
+    let addrs = st.compose_pq_recipient_addrs();
+    let available = w.global::<Compose>().get_pq_mlkem_available();
+    let enabled = w.global::<Compose>().get_pq_mlkem_enabled();
+    if addrs.len() >= 2 {
+        let have = addrs.iter().filter(|a| st.resolve_pq_mlkem_eks(std::slice::from_ref(*a)).is_ok()).count();
+        if have < addrs.len() {
+            return (format!("no PQ key · {have} of {}", addrs.len()), true, true);
+        }
+        if !enabled {
+            return ("PQ off".to_string(), false, true);
+        }
+        let mut levels: Vec<&'static str> = Vec::new();
+        for addr in &addrs {
+            if let Ok(pairs) = st.resolve_pq_mlkem_eks(std::slice::from_ref(addr)) {
+                if let Some((alg, _)) = pairs.first() {
+                    let short = pq_level_short(app_core::pqkeys::from_pq_alg(*alg));
+                    if !levels.contains(&short) {
+                        levels.push(short);
+                    }
+                }
+            }
+        }
+        return (format!("PQ {}", levels.join("+")), false, true);
+    }
+    if !addrs.is_empty() {
+        if !available {
+            return ("no PQ key".to_string(), true, true);
+        }
+        if !enabled {
+            return ("PQ off".to_string(), false, true);
+        }
+        let level = st
+            .pq_recipient_cache
+            .as_ref()
+            .and_then(|(_, d)| d.as_ref())
+            .and_then(|r| r.as_ref().ok())
+            .map(|(level, _)| pq_level_short(*level))
+            .unwrap_or("");
+        return (format!("PQ {level}"), false, true);
+    }
+    // Self-note: eligible only when a "My quantum key" is present.
+    if !available {
+        return ("no PQ key".to_string(), true, true);
+    }
+    (if enabled { "PQ on".to_string() } else { "PQ off".to_string() }, false, true)
 }
 
 /// Short "<n> sats" figure for the compose compact "Pay from" row and the
@@ -1810,10 +2152,7 @@ pub(crate) fn refresh_compose(&mut self, w: &AppWindow) {
                     (vsize, fee, sel_total.saturating_sub(fee + sent))
                 }
             };
-            let usd = st
-                .usd
-                .map(|p| format!(" (~${:.2})", fee as f64 * p / 1e8))
-                .unwrap_or_default();
+            let usd = usd_suffix(st.usd, fee);
             let fold_amount = fold.map(|(_, folded)| folded).unwrap_or(0);
             if fold_amount != st.compose_fold_shown {
                 if fold_amount > 0 {
@@ -2178,7 +2517,7 @@ pub(crate) fn spending_compose_ui(&mut self, w: &AppWindow, text: &str) {
                 st.compose_fold_shown = fold_amount;
             }
             let fee_shown = fold.map(|(nominal, _)| nominal).unwrap_or(built.fee);
-            let usd = st.usd.map(|p| format!(" (~${:.2})", fee_shown as f64 * p / 1e8)).unwrap_or_default();
+            let usd = usd_suffix(st.usd, fee_shown);
             set_cost_card(
                 w,
                 String::new(), // funded shape: no chunk/vsize estimate on this path
@@ -2360,7 +2699,7 @@ pub(crate) fn mixed_compose_ui(&mut self, w: &AppWindow, text: &str) {
                 st.mixed_est_shown = Some((built.dust_to_self, built.fee));
             }
             let fee_shown = fold.map(|(nominal, _)| nominal).unwrap_or(built.fee);
-            let usd = st.usd.map(|p| format!(" (~${:.2})", fee_shown as f64 * p / 1e8)).unwrap_or_default();
+            let usd = usd_suffix(st.usd, fee_shown);
             set_cost_card(
                 w,
                 String::new(), // funded shape: no chunk/vsize estimate on this path
@@ -2380,7 +2719,92 @@ pub(crate) fn mixed_compose_ui(&mut self, w: &AppWindow, text: &str) {
 }
 }
 
+/// The "(~$X.XX)" fee-line suffix — hidden ENTIRELY (empty string) when no
+/// price is known. `st.usd` is `None` by construction on Bitcoin Core and
+/// Electrum backends (`ChainClient::btc_usd()` errors — no price oracle —
+/// and `refresh_fees_price` now clears `st.usd` on that Err rather than
+/// leaving a stale Esplora-session price behind) and, defensively, whenever
+/// the price or the resulting figure isn't a genuine positive dollar amount
+/// — never a "$0.00" or "$-0.00" placeholder (the latter is IEEE-754
+/// negative zero rendering as "-0.00" under `{:.2}`, exactly what a stray
+/// `Some(-0.0)`/`Some(0.0)` would have produced here before this guard).
+pub(crate) fn usd_suffix(usd: Option<f64>, fee_sats: u64) -> String {
+    let Some(price) = usd else { return String::new() };
+    if !price.is_finite() || price <= 0.0 || fee_sats == 0 {
+        return String::new();
+    }
+    let dollars = fee_sats as f64 * price / 1e8;
+    if !dollars.is_finite() || dollars <= 0.0 {
+        return String::new();
+    }
+    format!(" (~${dollars:.2})")
+}
+
+/// Fee-tier index <-> name — shared by the compose fee sheet, the Settings
+/// "Compose defaults" row, and `compose-effective`/`compose-override`
+/// logging, so all three always agree on what "normal" means.
+pub(crate) fn fee_tier_name(i: i32) -> &'static str {
+    match i {
+        0 => "economy",
+        2 => "fast",
+        3 => "custom",
+        _ => "normal",
+    }
+}
+
+/// "1 sat/vB" / "1.5 sat/vB" — the fee status-strip pill's text (2026-09-07
+/// follow-up 4): whole numbers render without a decimal, everything else
+/// at exactly one. `rate_text` is `Compose.rate-text`, which every tier
+/// pick keeps in sync with the live/typed rate — parse failures (should
+/// never happen; the field is a validated number field) fall back to the
+/// literal text so the pill never goes blank.
+pub(crate) fn format_rate_sat_vb(rate_text: &str) -> String {
+    match rate_text.trim().parse::<f64>() {
+        Ok(r) if (r - r.round()).abs() < 0.001 => format!("{} sat/vB", r.round() as i64),
+        Ok(r) => format!("{r:.1} sat/vB"),
+        Err(_) => format!("{} sat/vB", rate_text.trim()),
+    }
+}
+
+pub(crate) fn fee_tier_index(name: &str) -> i32 {
+    match name {
+        "economy" => 0,
+        "fast" => 2,
+        "custom" => 3,
+        _ => 1,
+    }
+}
+
 impl State {
+/// Mark `key` as overridden away from the Settings default for THIS
+/// compose session (PLAN-graffito-compose-simplify.md's Format-C "quiet
+/// marker" — an accent tint on the pill/card-row value) and log the
+/// suite-facing `cb: compose-override <key>=<value>` line every per-note
+/// sheet emits on top of whatever `cb:` line it already logged today.
+/// `key` is one of "visibility" | "fee" | "gift" | "payfrom" | "change" |
+/// "passphrase" | "quantum" — see `State::compose_overrides`'s doc.
+pub(crate) fn mark_compose_override(&mut self, w: &AppWindow, key: &'static str, value: &str) {
+    self.compose_overrides.insert(key);
+    println!("cb: compose-override {key}={value}");
+    self.refresh_compose_override_flags(w);
+}
+
+/// Repaint every `Compose.ov-*`/`has-overrides` flag from
+/// `self.compose_overrides` — called after every mark AND after a reset,
+/// so the gear card / pills never lag the underlying set.
+pub(crate) fn refresh_compose_override_flags(&self, w: &AppWindow) {
+    let ov = &self.compose_overrides;
+    let c = w.global::<Compose>();
+    c.set_ov_visibility(ov.contains("visibility"));
+    c.set_ov_fee(ov.contains("fee"));
+    c.set_ov_gift(ov.contains("gift"));
+    c.set_ov_payfrom(ov.contains("payfrom"));
+    c.set_ov_change(ov.contains("change"));
+    c.set_ov_passphrase(ov.contains("passphrase"));
+    c.set_ov_quantum(ov.contains("quantum"));
+    c.set_has_overrides(!ov.is_empty());
+}
+
 pub(crate) fn on_set_fee_tier(&mut self, w: &AppWindow, tier: i32) {
         let f = self.fees.clone().unwrap_or_default();
         let rate = match tier {
@@ -2399,6 +2823,66 @@ pub(crate) fn on_set_fee_tier(&mut self, w: &AppWindow, tier: i32) {
             w.global::<Compose>().set_rate_text(format!("{rate}").into());
         }
         println!("cb: fee-tier {tier} rate={rate}");
+        self.mark_compose_override(w, "fee", fee_tier_name(tier));
+        self.refresh_compose(w);
+    }
+
+    /// The fee sheet's own sat/vB field — the always-editable Custom rate
+    /// (the compose.slint pill row already lets a tap set tier 3, but the
+    /// rate itself only used to fire the generic `Ui.compose-changed()`
+    /// with no override marker; the sheet routes here instead).
+    pub(crate) fn on_set_fee_rate(&mut self, w: &AppWindow, t: SharedString) {
+        w.global::<Compose>().set_fee_tier(3);
+        w.global::<Compose>().set_rate_text(t.clone());
+        println!("cb: fee-tier 3 rate={t}");
+        self.mark_compose_override(w, "fee", &format!("custom rate={t}"));
+        self.refresh_compose(w);
+    }
+
+    /// Visibility sheet: Private/Public. Watch-only identities have no
+    /// sealing key — the sheet hides the Private row for them, but this
+    /// still refuses defensively rather than trusting the UI gate alone.
+    pub(crate) fn on_set_compose_visibility(&mut self, w: &AppWindow, private: bool) {
+        let watch = self.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
+        let private = private && !watch;
+        w.global::<Compose>().set_compose_private(private);
+        println!("cb: compose-visibility {}", if private { "private" } else { "public" });
+        self.mark_compose_override(w, "visibility", if private { "private" } else { "public" });
+        self.refresh_compose(w);
+    }
+
+    /// Gift sheet: the hard dust gate (330 sats) — refuses to KEEP a lower
+    /// value rather than silently clamping it, so the user sees why (mirrors
+    /// `on_set_compose_default_gift`'s Settings-side refusal exactly).
+    pub(crate) fn on_set_compose_gift(&mut self, w: &AppWindow, t: SharedString) {
+        match t.trim().parse::<u64>() {
+            Ok(n) if n >= DUST_SATS => {
+                w.global::<Compose>().set_gift_sats(n.to_string().into());
+                w.global::<Compose>().set_gift_error("".into());
+                w.global::<Compose>().set_gift_valid(true);
+                println!("cb: compose-gift {n}");
+                self.mark_compose_override(w, "gift", &n.to_string());
+            }
+            _ => {
+                println!("cb: compose-override gift=err below-dust");
+                w.global::<Compose>().set_gift_error(
+                    format!("below dust ({DUST_SATS} sats) — the network would reject the note").into(),
+                );
+                w.global::<Compose>().set_gift_valid(false);
+            }
+        }
+        self.refresh_compose(w);
+    }
+
+    /// Passphrase sheet's enable switch — the ONLY place that toggles
+    /// `pq-passphrase-enabled` now (compose.slint used to bind it two-way
+    /// straight to the Switch, which meant the enable event and every text
+    /// keystroke both funneled through the same `pq-passphrase-changed`
+    /// line with no way to mark just the enable as an override).
+    pub(crate) fn on_set_passphrase_enabled(&mut self, w: &AppWindow, on: bool) {
+        w.global::<Compose>().set_pq_passphrase_enabled(on);
+        println!("cb: pq-passphrase enabled={on}");
+        self.mark_compose_override(w, "passphrase", if on { "on" } else { "off" });
         self.refresh_compose(w);
     }
 
@@ -2454,9 +2938,17 @@ pub(crate) fn on_pq_passphrase_changed(&mut self, w: &AppWindow, text: SharedStr
     }
 
 pub(crate) fn on_pq_mlkem_toggled(&mut self, w: &AppWindow, on: bool) {
+        // Session-only now (PLAN-graffito-compose-simplify.md): this used to
+        // persist to config.json directly, which was the very "ML-KEM
+        // switch persists across composes" bug the plan calls out — the
+        // DEFAULT lives in `compose_defaults.pq_mlkem_off` (Settings →
+        // Compose defaults → "Quantum encryption") now, and
+        // `apply_compose_defaults` re-stamps `pq_mlkem_user_off` from it on
+        // every fresh compose session, so a per-note toggle here can never
+        // outlive the note.
         self.pq_mlkem_user_off = !on;
-        self.save_config();
         println!("cb: pq-mlkem {}", if on { "on" } else { "off" });
+        self.mark_compose_override(w, "quantum", if on { "on" } else { "off" });
         self.refresh_compose(w);
     }
 
@@ -3696,6 +4188,29 @@ pub(crate) fn on_set_compose_locktime(&mut self, w: &AppWindow, mode: SharedStri
         println!("cb: compose-locktime {} effective={effective} ok", policy.as_str());
         self.refresh_compose_locktime_panel(w);
         w.global::<Ui>().set_status("".into());
+    }
+}
+
+/// "Standard" / "Strong" / "Maximum" — the passphrase status-strip pill's
+/// short label (`pq_pw_cost.as_str()` is the lowercase wire form used in
+/// `cb:` lines and config.json; this is the ONE display-cased spot).
+pub(crate) fn pw_cost_short(cost: app_core::notes_core::pq::PwCost) -> &'static str {
+    use app_core::notes_core::pq::PwCost;
+    match cost {
+        PwCost::Standard => "Standard",
+        PwCost::Strong => "Strong",
+        PwCost::Maximum => "Maximum",
+    }
+}
+
+/// "512" / "768" / "1024" — the quantum status-strip pill's short label
+/// (`MlKemLevel::name()` returns the longer "ML-KEM-768" form).
+pub(crate) fn pq_level_short(level: app_core::passphrase::MlKemLevel) -> &'static str {
+    use app_core::passphrase::MlKemLevel;
+    match level {
+        MlKemLevel::MlKem512 => "512",
+        MlKemLevel::MlKem768 => "768",
+        MlKemLevel::MlKem1024 => "1024",
     }
 }
 

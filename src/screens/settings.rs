@@ -802,8 +802,96 @@ pub(crate) fn refresh_node_health(&mut self, w: &AppWindow) {
     });
 }
 
+/// Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md):
+/// repaint every row from `st.compose_defaults` — called from
+/// `update_settings_identity` (Settings open) and after every
+/// `on_set_compose_default_*` handler so a save is reflected immediately.
+pub(crate) fn update_compose_defaults_ui(&self, w: &AppWindow) {
+    let d = &self.compose_defaults;
+    w.global::<Settings>()
+        .set_compose_default_visibility(if d.visibility_private { "private" } else { "public" }.into());
+    w.global::<Settings>().set_compose_default_fee_tier(fee_tier_name(d.fee_tier).into());
+    w.global::<Settings>().set_compose_default_fee_rate(d.fee_rate.clone().into());
+    w.global::<Settings>().set_compose_default_gift(d.gift_sats.to_string().into());
+    w.global::<Settings>().set_compose_default_payfrom(d.pay_from.clone().into());
+    w.global::<Settings>().set_compose_default_coins(d.coins.clone().into());
+    w.global::<Settings>()
+        .set_compose_default_pq_mlkem(if d.pq_mlkem_off { "off" } else { "on" }.into());
+}
+
+pub(crate) fn on_set_compose_default_visibility(&mut self, w: &AppWindow, v: SharedString) {
+    let private = v.as_str() != "public";
+    self.compose_defaults.visibility_private = private;
+    self.save_config();
+    println!("cb: set-compose-default visibility={}", if private { "private" } else { "public" });
+    self.update_compose_defaults_ui(w);
+}
+
+pub(crate) fn on_set_compose_default_fee(&mut self, w: &AppWindow, tier: SharedString, rate: SharedString) {
+    let idx = fee_tier_index(tier.as_str());
+    self.compose_defaults.fee_tier = idx;
+    if idx == 3 {
+        self.compose_defaults.fee_rate = rate.trim().to_string();
+    }
+    self.save_config();
+    if idx == 3 && !self.compose_defaults.fee_rate.is_empty() {
+        println!("cb: set-compose-default fee=custom rate={}", self.compose_defaults.fee_rate);
+    } else {
+        println!("cb: set-compose-default fee={}", fee_tier_name(idx));
+    }
+    self.update_compose_defaults_ui(w);
+}
+
+/// Settings row: refuses (never saves) a gift below the 330-sat taproot
+/// dust limit — this is the HARD gate half of the plan's dust rule (the
+/// other half is the compose sheet's own refusal, `on_set_compose_gift`).
+pub(crate) fn on_set_compose_default_gift(&mut self, w: &AppWindow, t: SharedString) {
+    match t.trim().parse::<u64>() {
+        Ok(n) if n >= DUST_SATS => {
+            self.compose_defaults.gift_sats = n;
+            self.save_config();
+            println!("cb: set-compose-default gift={n}");
+            w.global::<Settings>().set_compose_default_gift_error("".into());
+        }
+        _ => {
+            println!("cb: set-compose-default gift=err below-dust");
+            w.global::<Settings>().set_compose_default_gift_error(
+                format!("below dust ({DUST_SATS} sats) — the network would reject the note").into(),
+            );
+        }
+    }
+    // Always redisplay the STORED value (not necessarily what was just
+    // typed) — a refused entry must not silently masquerade as saved.
+    self.update_compose_defaults_ui(w);
+}
+
+pub(crate) fn on_set_compose_default_payfrom(&mut self, w: &AppWindow, kind: SharedString) {
+    let kind = kind.to_string();
+    self.compose_defaults.pay_from = kind.clone();
+    self.save_config();
+    println!("cb: set-compose-default pay-from={kind}");
+    self.update_compose_defaults_ui(w);
+}
+
+pub(crate) fn on_set_compose_default_coins(&mut self, w: &AppWindow, kind: SharedString) {
+    let kind = kind.to_string();
+    self.compose_defaults.coins = kind.clone();
+    self.save_config();
+    println!("cb: set-compose-default coins={kind}");
+    self.update_compose_defaults_ui(w);
+}
+
+pub(crate) fn on_set_compose_default_pq_mlkem(&mut self, w: &AppWindow, v: SharedString) {
+    let off = v.as_str() == "off";
+    self.compose_defaults.pq_mlkem_off = off;
+    self.save_config();
+    println!("cb: set-compose-default pq={}", if off { "off" } else { "on" });
+    self.update_compose_defaults_ui(w);
+}
+
 pub(crate) fn update_settings_identity(&self, w: &AppWindow) {
     let st = self;
+    self.update_compose_defaults_ui(w);
     let policy = st.lock_time_policy;
     w.global::<Settings>().set_locktime_mode(policy.as_str().into());
     w.global::<Settings>().set_locktime_text(st.lock_time().to_string().into());

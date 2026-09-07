@@ -79,9 +79,15 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
         .and_then(|v| v.as_str())
         .and_then(app_core::notes_core::pq::PwCost::parse)
         .unwrap_or(app_core::notes_core::pq::PwCost::DEFAULT);
-    // The user switched the ML-KEM hybrid off by hand (persisted, Sal
-    // 2026-09-05); absent => false, i.e. hybrid ON whenever a key exists.
-    let pq_mlkem_user_off = config.get("pq_mlkem_off").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md): the
+    // policy a fresh compose session starts from — see `compose_defaults_from_config`.
+    let compose_defaults_migrated = config.get("compose").is_none();
+    let compose_defaults: ComposeDefaults = compose_defaults_from_config(&config);
+    // Compose sessions start with pq_mlkem_user_off mirroring the default —
+    // `apply_compose_defaults` (called on every fresh compose) re-stamps
+    // this every time too; seeding it here just means a boot with no
+    // compose session yet already reflects the configured default.
+    let pq_mlkem_user_off = compose_defaults.pq_mlkem_off;
     // Device-level per-network Settings (Bitcoin node / block explorer URLs).
     let str_map = |key: &str| -> HashMap<String, String> {
         config
@@ -152,6 +158,8 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
         pq_passphrase_verified: false,
         pq_pw_cost,
         pq_mlkem_user_off,
+        compose_defaults,
+        compose_overrides: std::collections::HashSet::new(),
         pq_passphrase_generated: None,
         pq_recipient_cache: None,
         pq_level,
@@ -229,6 +237,14 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
     if core_rpc_migrated {
         st.borrow().save_config();
         println!("cb: core-rpc-migrate config-resaved");
+    } else if compose_defaults_migrated {
+        // No prior "compose" object (every pre-2026-09-07 config, or one
+        // whose only compose-relevant key was the legacy top-level
+        // `pq_mlkem_off`) — resave now so the next boot reads the migrated
+        // object directly rather than re-deriving it from the removed key
+        // every time (config_payload never writes "pq_mlkem_off" again).
+        st.borrow().save_config();
+        println!("cb: compose-defaults-migrate config-resaved");
     }
     // Contacts boot sequence (iCloud-contacts feature): persist a fresh
     // migration (so `contacts.json` exists from here on and the union is
@@ -277,4 +293,25 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
         s.last_sync.set(if icloud::available() { SyncStatus::Ok } else { SyncStatus::Failed });
     }
     st
+}
+
+/// Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md): parse
+/// the loaded `config.json` value into a [`ComposeDefaults`]. A config with
+/// a `"compose"` object (every build from 2026-09-07 on) parses it
+/// field-by-field via [`ComposeDefaults::from_json`]. A config predating
+/// the feature migrates the ONE overlapping legacy key — the top-level
+/// `"pq_mlkem_off"` bool (2026-09-05) — into `pq_mlkem_off` and takes every
+/// other field from [`ComposeDefaults::default`] (the exact table in the
+/// plan). Extracted to its own function (rather than inlined in `boot()`)
+/// so a test can exercise the migration directly against a hand-built
+/// `serde_json::Value`, the same reasoning `State::config_payload` already
+/// documents for why it isn't a private closure.
+pub(crate) fn compose_defaults_from_config(config: &serde_json::Value) -> ComposeDefaults {
+    match config.get("compose") {
+        Some(v) => ComposeDefaults::from_json(v),
+        None => {
+            let legacy_pq_mlkem_off = config.get("pq_mlkem_off").and_then(|v| v.as_bool()).unwrap_or(false);
+            ComposeDefaults { pq_mlkem_off: legacy_pq_mlkem_off, ..ComposeDefaults::default() }
+        }
+    }
 }

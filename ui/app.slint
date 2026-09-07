@@ -103,8 +103,14 @@ export component AppWindow inherits Window {
         if (Ui.screen == Screen.quiz) { Ui.screen = Screen.backup-words; return true; }
         if (Ui.screen == Screen.note) { Ui.go-home(); return true; }
         if (Ui.screen == Screen.settings || Ui.screen == Screen.activity) {
-            // Back to wherever settings/activity was opened from.
-            if (Ui.return-screen == Screen.notebooks) { Ui.open-notebooks(); } else { Ui.go-home(); }
+            // Back to wherever settings/activity was opened from. Compose's
+            // "Edit compose defaults…" row (compose-simplify plan) is the
+            // one caller that wants a THIRD destination: Settings itself
+            // never knows it came from Compose, so `return-screen` (set by
+            // `on_compose_edit_defaults`) carries it.
+            if (Ui.return-screen == Screen.notebooks) { Ui.open-notebooks(); }
+            else if (Ui.return-screen == Screen.compose) { Ui.screen = Screen.compose; Compose.compose-defaults-return(); }
+            else { Ui.go-home(); }
             return true;
         }
         if (Ui.screen == Screen.compose) {

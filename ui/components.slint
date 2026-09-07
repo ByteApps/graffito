@@ -156,11 +156,19 @@ export component SvgIconButton inherits Rectangle {
     in property <string> icon;
     in property <length> size: 19px;
     in property <color> tint: Pal.muted;
+    // Accessible name for VoiceOver/TalkBack AND in-process UI-test
+    // findability (i-slint-backend-testing) — the `icon` id alone isn't a
+    // human label. Empty (the pre-existing default) keeps every call site
+    // that never needed one unaffected.
+    in property <string> a11y-label: "";
     callback clicked;
     width: 40px;
     height: 40px;
     border-radius: 10px;
     background: ta.has-hover ? Pal.card-hover : transparent;
+    accessible-role: button;
+    accessible-label: root.a11y-label;
+    accessible-action-default => { root.clicked(); }
     ta := TouchArea { clicked => { root.clicked(); } }
     Image {
         source: root.icon == "activity" ? @image-url("icons/activity.svg")
@@ -513,9 +521,108 @@ export component Dropdown inherits Rectangle {
     }
 }
 
+// Compose status-strip pill (PLAN-graffito-compose-simplify.md, Format C):
+// a small rounded chip that shows what's currently in effect for a compose
+// setting. NEVER changes state itself — `clicked` only opens the setting's
+// per-note sheet, so a mis-tap can't flip privacy or the paying wallet.
+// `overridden` (accent outline) marks a per-note change away from the
+// Settings default; `muted` (grey, non-interactive-looking) marks an inert
+// state like "no PQ key" — still tappable (routes to Contacts) via the
+// SAME `clicked` callback, just visually de-emphasized.
+export component StatusPill inherits Rectangle {
+    in property <string> text;
+    in property <bool> overridden: false;
+    in property <bool> muted: false;
+    callback clicked;
+    height: 26px * Metrics.type-scale;
+    border-radius: 13px;
+    border-width: 1px;
+    border-color: root.overridden ? Pal.accent : Pal.line;
+    background: ta.has-hover ? Pal.card-hover : Pal.card;
+    width: t.preferred-width + 18px;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+    ta := TouchArea { clicked => { root.clicked(); } }
+    t := Text {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        font-size: 11px * Metrics.type-scale;
+        font-weight: 600;
+        color: root.muted ? Pal.muted : (root.overridden ? Pal.accent : Pal.text);
+    }
+}
+
+// A tappable Format-C row for the compose gear card / a per-note sheet's
+// picker rows: "Label" on the left, "value" (accent-tinted while
+// overridden) on the right, a trailing chevron. No icon (icon rule).
+export component MenuValueRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> overridden: false;
+    // Format C's on/off rows (visibility/passphrase/quantum): `value` is
+    // JUST the state name ("Private", "PQ 768", "Passphrase · Strong") —
+    // this appends the SVG check mark (never a glyph, per the icon rule)
+    // when the setting is ON. Off states render `value` alone (a plain
+    // name like "Public", or "<Label>: None" — the caller composes that
+    // string; this component has no opinion on wording).
+    in property <bool> checked: false;
+    // Inert/grey state (e.g. "no PQ key" — the row is still tappable, the
+    // sheet it opens explains why) — takes precedence over `overridden`.
+    in property <bool> muted: false;
+    callback clicked;
+    height: 40px * Metrics.type-scale;
+    border-radius: 8px;
+    background: ta.has-hover ? Pal.card-hover : transparent;
+    // Findable by its LABEL alone (the value is dynamic policy text, not
+    // part of the row's identity) — same discipline as every other
+    // interactive component here.
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.clicked(); }
+    ta := TouchArea { clicked => { root.clicked(); } }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        Text {
+            text: root.label;
+            font-size: 12px * Metrics.type-scale;
+            color: Pal.text;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Text {
+            text: root.value;
+            font-size: 12px * Metrics.type-scale;
+            font-weight: 600;
+            color: root.muted ? Pal.muted : (root.overridden ? Pal.accent : Pal.muted);
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if root.checked: Image {
+            source: @image-url("icons/check.svg");
+            colorize: root.overridden ? Pal.accent : Pal.good;
+            width: 12px;
+            height: 12px;
+            y: (parent.height - 12px) / 2;
+        }
+        Text { text: "›"; font-size: 16px * Metrics.type-scale; color: Pal.muted; vertical-alignment: center; }
+    }
+}
+
 export component SettingsCard inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
+    // Hides the title row only (subtitle caption stays) — for a caller
+    // that already names this card elsewhere, e.g. the Settings screen's
+    // "Compose defaults" subset view: the screen HEADER carries the name,
+    // so the card repeating it right underneath read as a duplicate.
+    in property <bool> hide-title: false;
     border-radius: 12px;
     border-width: 1px;
     border-color: Pal.line;
@@ -524,7 +631,7 @@ export component SettingsCard inherits Rectangle {
     l := VerticalLayout {
         padding: 16px;
         spacing: 8px;
-        Text {
+        if !root.hide-title: Text {
             text: root.title;
             font-size: 14px * Metrics.type-scale;
             font-weight: 700;

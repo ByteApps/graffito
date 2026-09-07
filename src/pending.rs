@@ -2336,9 +2336,20 @@ pub(crate) fn refresh_fees_price(&mut self, _w: &AppWindow) {
         st.fees = Some(fees);
         fetched = true;
     }
-    if let Ok(usd) = client.btc_usd() {
-        st.usd = usd;
-        fetched = true;
+    // A personal Bitcoin Core / Electrum node has no price oracle —
+    // `btc_usd()` errors by construction (`/v1/prices` never makes a
+    // network call there, see core_rpc.rs/electrum.rs). That Err must
+    // CLEAR any USD price left over from a prior Esplora session — leaving
+    // it unchanged (the old behavior here) showed a stale, and on a
+    // backend switch increasingly wrong, dollar figure on every fee line
+    // even though the active backend can no longer confirm it. `Ok(v)`
+    // (Esplora, price present or genuinely absent) sets it directly.
+    match client.btc_usd() {
+        Ok(usd) => {
+            st.usd = usd;
+            fetched = true;
+        }
+        Err(_) => st.usd = None,
     }
     // No repaint here — this is synchronous, and every call site runs it
     // BEFORE its own screen-paint call (refresh_compose/update_sweep_screen/

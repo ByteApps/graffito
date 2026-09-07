@@ -394,6 +394,14 @@ export global Terms {
 }
 
 export global Settings {
+    // Compose's "Edit compose defaults…" row opens Settings filtered down to
+    // JUST the "Compose defaults" card (Sal: "opens the settings screen, but
+    // only the subset of compose settings") — settings.slint hides every
+    // other card while this is true. Set by `open_settings_screen`'s
+    // `subset_compose` argument; false for the normal notebook-list gear
+    // entry. See `Ui.return-screen`/`Compose.compose-defaults-return` for
+    // the matching round trip back to Compose.
+    in-out property <bool> settings-compose-only: false;
     // Settings scroll position, preserved across sub-screen visits (Rust resets
     // it to 0 on a fresh open from the list; nav-back keeps it).
     in-out property <length> settings-scroll-y: 0;
@@ -502,6 +510,24 @@ export global Settings {
     callback set-explorer-custom(string);
     callback reveal-public();          // Settings entry: derive from cached material, no auth, -> screen 18
     callback reveal-private();         // Settings entry: FRESH biometric, only navigates (-> screen 19) on success
+
+    // ---- "Compose defaults" section (PLAN-graffito-compose-simplify.md) ----
+    // The policy every fresh compose session starts from; the Compose
+    // screen's pills/gear card only override a given note, never these.
+    in-out property <string> compose-default-visibility: "private";   // "private" | "public"
+    in-out property <string> compose-default-fee-tier: "normal";      // economy|normal|fast|custom
+    in-out property <string> compose-default-fee-rate: "";            // only meaningful for "custom"
+    in-out property <string> compose-default-gift: "330";
+    in property <string> compose-default-gift-error: "";              // non-empty = below-dust refusal
+    in-out property <string> compose-default-payfrom: "notebook";     // notebook|spending|ask
+    in-out property <string> compose-default-coins: "fewest";         // fewest|consolidate
+    in-out property <string> compose-default-pq-mlkem: "on";          // on|off
+    callback set-compose-default-visibility(string);
+    callback set-compose-default-fee(string, string);   // (tier, rate)
+    callback set-compose-default-gift(string);
+    callback set-compose-default-payfrom(string);
+    callback set-compose-default-coins(string);
+    callback set-compose-default-pq-mlkem(string);
 }
 
 export global BackupWords {
@@ -669,6 +695,92 @@ export global Compose {
     // Per-tx overrides of the above — compose (screen 6) and
     // sweep/consolidate (screen 16) panels, same (mode, custom-height) shape.
     callback set-compose-locktime(string, string);
+
+    // ---- compose-simplify (PLAN-graffito-compose-simplify.md): the status
+    // strip of pills + the gear card + the per-note override sheets that
+    // replace the old always-visible collapsibles. ----
+    // Non-empty = which per-note sheet is open: "visibility" | "fee" |
+    // "gift" | "payfrom" | "change" | "passphrase" | "quantum". A pill or a
+    // gear-card row NEVER changes state itself — tapping one only sets this,
+    // opening the sheet; the sheet's own controls are what apply a change.
+    in-out property <string> sheet-kind: "";
+    // The gear card (anchored dropdown, Format C rows) — open/closed.
+    in-out property <bool> card-open: false;
+    // Quiet per-field override markers (accent tint on a pill/card-row
+    // value) — true while THIS compose session has changed that setting
+    // away from the Settings default. `has-overrides` is the OR of all of
+    // them, gating the gear card's "Reset this note to defaults" row.
+    in property <bool> ov-visibility: false;
+    in property <bool> ov-fee: false;
+    in property <bool> ov-gift: false;
+    in property <bool> ov-payfrom: false;
+    in property <bool> ov-change: false;
+    in property <bool> ov-passphrase: false;
+    in property <bool> ov-quantum: false;
+    in property <bool> has-overrides: false;
+    // Precomputed pill labels (Rust-computed, never reimplemented in slint —
+    // same discipline as `pq-security-label`): status-strip text for
+    // visibility/fee/gift/payfrom/passphrase/quantum. Gift's pill is only
+    // shown while `Ui.directed`; quantum's only when `pq-compose-eligible`
+    // context applies (mirrors the Security section's old visibility rule).
+    in property <string> pill-visibility: "Private";
+    // The EFFECTIVE RATE, not the tier name ("normal" means nothing on the
+    // note itself) — 2026-09-07 follow-up 4. See `card-fee-value` below for
+    // the gear card's fuller "tier · rate · cost" form.
+    in property <string> pill-fee: "1 sat/vB";
+    in property <string> pill-gift: "Gift 330";
+    in property <string> pill-payfrom: "Notebook";
+    in property <string> pill-passphrase: "Passphrase";
+    in property <bool> pill-passphrase-on: false;
+    in property <string> pill-quantum: "PQ off";
+    // Grey/inert pill state ("no PQ key" — the sheet it opens explains why).
+    in property <bool> pill-quantum-muted: false;
+    // Whether PQ applies to this note AT ALL (`pq_compose_eligible`) — false
+    // for a public/watch-only/non-notebook note, which hides the pill/card
+    // row entirely rather than showing one with nothing behind it.
+    in property <bool> pill-quantum-tappable: true;
+    // ---- gear-card row values, Format C exactly (2026-09-07 follow-up,
+    // refined the same day): the row already carries its own label
+    // ("Passphrase", "Quantum encryption") on the left, so the value must
+    // NOT repeat it — on states render just the state name + the row's own
+    // SVG check mark (never baked into the string, never a glyph), off
+    // states render the bare "None" — distinct from the short pill texts
+    // above, which DO carry their own name ("Passphrase", "PQ off"). ----
+    in property <string> card-visibility-value: "Private";
+    in property <bool> card-visibility-checked: true;
+    in property <string> card-passphrase-value: "None";
+    in property <bool> card-passphrase-checked: false;
+    in property <string> card-quantum-value: "None";
+    in property <bool> card-quantum-checked: false;
+    in property <bool> card-quantum-muted: false;
+    // Fee card row keeps the fuller "normal · 1 sat/vB · ~239 sats" form
+    // (tier · effective rate · cost) — distinct from the pill, which shows
+    // just the rate (2026-09-07 follow-up 4: "normal" alone means nothing
+    // on the note itself, the pill needs the number that actually applies).
+    in property <string> card-fee-value: "normal · 1 sat/vB";
+    // Gift dust gate (330 sats, taproot's relay-enforced minimum): non-empty
+    // while the sheet's typed value is below it — Sign stays disabled and
+    // the sheet refuses to keep the value.
+    in property <string> gift-error: "";
+    in property <bool> gift-valid: true;
+    // Gear-card / pill taps.
+    callback card-toggle();
+    callback card-row(string);          // opens the sheet for this row's key
+    callback compose-reset-overrides();
+    callback compose-edit-defaults();   // → Settings, scrolled to Compose defaults
+    // Per-note sheet controls that don't already have a dedicated callback
+    // elsewhere in this file (fee-tier/gift/passphrase-enable/visibility —
+    // pay-from/change/pq-mlkem/pq-pw-cost reuse their EXISTING callbacks
+    // above/on `Change`/`Ui`, so a suite's `cb:` greps for those stay
+    // byte-identical).
+    callback set-compose-visibility(bool);
+    callback set-fee-rate(string);           // sheet's custom sat/vB field
+    callback set-compose-gift(string);
+    callback set-passphrase-enabled(bool);
+    // Settings → Back, when Settings was opened via "Edit compose
+    // defaults…" (`Ui.return-screen == Screen.compose`) — re-applies every
+    // NON-overridden default and recomputes the estimate.
+    callback compose-defaults-return();
 }
 
 export global Change {

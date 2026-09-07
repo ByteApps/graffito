@@ -277,20 +277,17 @@ pub(crate) fn pick_contact_core(&mut self, w: &AppWindow, addr: &str) {
         st.to_address = Some(a);
         w.global::<Ui>().set_directed(true);
     }
-    let rate = st.fees.as_ref().map(|f| f.hour).unwrap_or(1.0).max(1.0);
-    if st.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false) {
-        w.global::<Compose>().set_compose_private(false); // no sealing key on this device
-    }
-    w.global::<Compose>().set_fee_tier(1);
-    w.global::<Compose>().set_rate_text(format!("{rate}").into());
+    // Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md):
+    // stamp the policy onto this fresh session — replaces the old
+    // hardcoded fee-tier(1)/gift(dust)/coin-strategy(fewest) literals AND
+    // the sticky `pq_mlkem_user_off` (the exact bug the plan calls out —
+    // it used to persist across composes; `apply_compose_defaults`
+    // re-stamps it from the default every time). Pay-from is resolved
+    // separately below since "ask" needs the live balance heuristic.
+    st.apply_compose_defaults(w);
     w.global::<Ui>().set_change_address("".into());
     w.global::<Ui>().set_change_expanded(false);
     w.global::<Ui>().set_spend_expanded(false);
-    st.coins_overridden = false;
-    st.consolidate_coins = false;
-    w.global::<PayFrom>().set_coin_strategy(0);
-    w.global::<Compose>().set_gift_sats(format!("{DUST_SATS}").into());
-    w.global::<Compose>().set_gift_expanded(false);
     st.selected_coins.clear();
     w.global::<Ui>().set_status("".into());
     w.global::<Ui>().set_payfrom_expanded(false);
@@ -315,7 +312,7 @@ pub(crate) fn pick_contact_core(&mut self, w: &AppWindow, addr: &str) {
     st.picking_extra = false;
     w.global::<Ui>().set_picking_extra(false);
     st.refresh_to_chips(w);
-    st.resolve_payfrom_default(w);
+    st.apply_compose_default_payfrom(w);
     // A fresh compose session — the locktime override never survives past
     // the screen it was set on (see `reset_tx_lock_time_override`'s doc
     // comment).
@@ -334,6 +331,9 @@ pub(crate) fn pick_contact_core(&mut self, w: &AppWindow, addr: &str) {
     st.pq_recipient_cache = None;
     w.global::<Ui>().set_screen(Screen::Compose);
     st.refresh_compose(w);
+    // Logged once per fresh compose session, after every default has
+    // settled (PLAN-graffito-compose-simplify.md).
+    println!("cb: compose-effective {}", st.compose_effective_log(w));
 }
 }
 
