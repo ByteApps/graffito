@@ -531,8 +531,9 @@ pub(crate) fn refresh_compose_locktime_panel(&self, w: &AppWindow) {
 }
 
 /// Whether the compose screen's post-quantum "Security" section applies at
-/// all — private + single-recipient (no removable To-chips, no multi-
-/// recipient) + a KEYED identity (watch-only can't seal anything) +
+/// all — private (any recipient count since PLAN-graffito-multi-pq.md,
+/// 2026-09-06; single-recipient-only before) + a KEYED identity
+/// (watch-only can't seal anything) +
 /// NOTEBOOK-funded (mixed/spending-funded compose calls a different
 /// builder that never carries pq layers — see `ComposeRequest::
 /// pq_password`'s doc). Covers BOTH a directed note (`st.to_address` set)

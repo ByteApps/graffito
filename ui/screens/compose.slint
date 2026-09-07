@@ -367,7 +367,11 @@ export component ComposeScreen inherits Rectangle {
         // deliberately: it only pushes the Sign/cost area below it, so
         // that's the one area an e2e recalibration needs to touch. Imitates
         // the Gift/Locktime panels exactly (same card/caret/caption shape).
-        if Compose.compose-private && Compose.to-chips.length == 0 && !Ui.watch-only && Ui.pay-from == "notebook": Rectangle {
+        // Multi-recipient notes carry the pq layers too since 2026-09-06
+        // (PLAN-graffito-multi-pq.md) — the former `to-chips.length == 0`
+        // term hid this card for 2+ recipients while the ML-KEM default
+        // still engaged underneath, so the passphrase layer was unreachable.
+        if Compose.compose-private && !Ui.watch-only && Ui.pay-from == "notebook": Rectangle {
             border-radius: 10px;
             background: Pal.card;
             border-width: 1px;
