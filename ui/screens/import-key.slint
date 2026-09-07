@@ -28,18 +28,21 @@ export component ImportKeyScreen inherits VerticalLayout { padding-top: Ui.safe-
         // vanished with every keystroke — suggestions come and go per word,
         // the feedback line flips between states — and everything below
         // them (the buttons, Import) bounced (Sal, 2026-09-06).
-        Caption {
-            text: ImportKey.import-suggestions;
-            color: Pal.accent;
-            min-height: 16px * Metrics.type-scale;
-        }
-        Body {
-            text: ImportKey.import-feedback;
-            font-size: 12px * Metrics.type-scale;
-            min-height: 16px * Metrics.type-scale;
-            // Rust sets the flag alongside the text (string-matching the
-            // feedback here rotted once already).
-            color: ImportKey.import-feedback-ok ? Pal.good : Pal.warn;
+        VerticalLayout {
+            spacing: 2px;
+            Caption {
+                text: ImportKey.import-suggestions;
+                color: Pal.accent;
+                min-height: 14px * Metrics.type-scale;
+            }
+            Body {
+                text: ImportKey.import-feedback;
+                font-size: 12px * Metrics.type-scale;
+                min-height: 15px * Metrics.type-scale;
+                // Rust sets the flag alongside the text (string-matching the
+                // feedback here rotted once already).
+                color: ImportKey.import-feedback-ok ? Pal.good : Pal.warn;
+            }
         }
         HorizontalLayout {
             spacing: 10px;
