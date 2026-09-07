@@ -23,13 +23,20 @@ export component ImportKeyScreen inherits VerticalLayout { padding-top: Ui.safe-
             text <=> ImportKey.import-text;
             edited => { ImportKey.import-changed(self.text); }
         }
-        if ImportKey.import-suggestions != "": Caption {
+        // Both lines under the editor are ALWAYS laid out (empty text keeps
+        // its one-line height): as conditional elements they appeared and
+        // vanished with every keystroke — suggestions come and go per word,
+        // the feedback line flips between states — and everything below
+        // them (the buttons, Import) bounced (Sal, 2026-09-06).
+        Caption {
             text: ImportKey.import-suggestions;
             color: Pal.accent;
+            min-height: 16px * Metrics.type-scale;
         }
-        if ImportKey.import-feedback != "": Body {
+        Body {
             text: ImportKey.import-feedback;
             font-size: 12px * Metrics.type-scale;
+            min-height: 16px * Metrics.type-scale;
             // Rust sets the flag alongside the text (string-matching the
             // feedback here rotted once already).
             color: ImportKey.import-feedback-ok ? Pal.good : Pal.warn;
