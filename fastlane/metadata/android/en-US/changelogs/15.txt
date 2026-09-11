@@ -1,0 +1,10 @@
+Fixes from a device test pass:
+
+• Copying your recovery phrase now lists the words in the same order the
+  screen shows them.
+• Settings keeps Network, Bitcoin node and Block explorer together.
+• A wrong RPC username or password now says so, instead of reporting a
+  confusing "non-JSON response".
+• While your Bitcoin Core node is rescanning its wallet, the app says so
+  and keeps showing your coins, instead of briefly reading as empty and
+  greying out Sign.
