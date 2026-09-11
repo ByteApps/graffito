@@ -789,6 +789,14 @@ pub(crate) fn refresh_node_health(&mut self, w: &AppWindow) {
             Ok(client) => match &client.transport {
                 AnyTransport::Core(t) => match t.preflight() {
                     Ok(status) => format_node_status(&status),
+                    // The node ANSWERED — it just refused these credentials.
+                    // Saying "couldn't reach the node" there sends the user
+                    // hunting the address and the network instead of the one
+                    // thing that is wrong (Sal, Android pass 2026-09-10).
+                    Err(e) if e.is_auth_rejected() => (
+                        "the node rejected these RPC credentials — check the username and password".to_string(),
+                        true,
+                    ),
                     Err(e) => (format!("couldn't reach the node — {e}"), true),
                 },
                 // Unreachable: `base` was checked above to start with

@@ -2482,3 +2482,108 @@ fn core_rpc_wallet_guard_returns_funds_even_on_panic() {
 
     eprintln!("core_rpc_wallet_guard_returns_funds_even_on_panic: PASS (Drop-on-panic sweep verified live)");
 }
+
+/// Bad RPC credentials must READ as bad credentials. bitcoind answers a
+/// wrong user/password with a bare 401 and an EMPTY body, which the client
+/// used to report as "http: 401: non-JSON response from bitcoind" — the
+/// message Sal actually hit on the Android pass (2026-09-10), describing
+/// the shape of a body that was never going to exist instead of naming the
+/// one thing he could fix.
+#[test]
+fn core_rpc_bad_credentials_report_an_auth_failure_not_a_parse_failure() {
+    let mock = common::mock_rpc::MockRpcServer::start();
+    mock.set_default(common::mock_rpc::MockResponse::Status(401));
+
+    let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
+    let err = match &transport {
+        AnyTransport::Core(core) => core.preflight().expect_err("a 401 must not preflight successfully"),
+        AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport for a bitcoind+ base"),
+    };
+    let text = format!("{err}");
+    assert!(
+        text.contains("username") && text.contains("password"),
+        "a 401 must name the credentials; got {text:?}"
+    );
+    assert!(!text.contains("non-JSON"), "a 401 must not be reported as a parse failure; got {text:?}");
+    // The Settings health line branches on this, not on the message text.
+    assert!(err.is_auth_rejected(), "a 401 must classify as an auth rejection; got {text:?}");
+    assert!(!err.is_rate_limited(), "a 401 is not a rate limit; got {text:?}");
+
+    eprintln!("core_rpc_bad_credentials_report_an_auth_failure_not_a_parse_failure: PASS (synthetic — err={text:?})");
+}
+
+/// A node whose watch wallet is RESCANNING must not be allowed to report an
+/// empty wallet. `listunspent` answers `[]` mid-rescan — a successful RPC
+/// meaning "not scanned yet" — and the app applies a successful bundle as
+/// truth, so Sal's funded Android wallet read as 0 sats and Compose's
+/// "Sign + review…" greyed out with no explanation (2026-09-10). The read
+/// must fail as a retryable transport error instead, leaving the store's
+/// cached coins on screen.
+#[test]
+fn core_rpc_address_routes_refuse_a_rescanning_wallet_instead_of_reporting_empty() {
+    let mock = common::mock_rpc::MockRpcServer::start();
+    mock.set("createwallet", common::mock_rpc::MockResponse::Ok(serde_json::json!({"name": "graffito-watch"})));
+    mock.set("getaddressinfo", common::mock_rpc::MockResponse::Ok(serde_json::json!({"ismine": true})));
+    // The rescan in progress — bitcoind's real shape while scanning.
+    mock.set(
+        "getwalletinfo",
+        common::mock_rpc::MockResponse::Ok(
+            serde_json::json!({"scanning": {"duration": 256, "progress": 0.798}, "txcount": 208}),
+        ),
+    );
+    // Scripted so the test FAILS LOUDLY if the guard is removed: the route
+    // would succeed with this empty list rather than erroring.
+    mock.set("listunspent", common::mock_rpc::MockResponse::Ok(serde_json::json!([])));
+
+    let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
+    use app_core::chain::Transport as _;
+    let core = match &transport {
+        AnyTransport::Core(c) => c,
+        AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport"),
+    };
+    let err = core
+        .get_text("/address/bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080/utxo")
+        .expect_err("a rescanning wallet must not answer an address route");
+    let text = format!("{err}");
+    assert!(text.contains("rescanning"), "the error must name the rescan; got {text:?}");
+    assert!(
+        matches!(err, app_core::Error::Transport(_)),
+        "a rescan is retryable — it must be Transport, not Http; got {err:?}"
+    );
+    assert_eq!(mock.call_count("listunspent"), 0, "the guard must refuse BEFORE querying history");
+
+    eprintln!("core_rpc_address_routes_refuse_a_rescanning_wallet_instead_of_reporting_empty: PASS (synthetic — err={text:?})");
+}
+
+/// The mirror: an IDLE wallet (`scanning: false`) answers normally, and the
+/// guard costs exactly ONE `getwalletinfo` per transport — not one per
+/// route — so a scan's three address calls don't triple the RPC count.
+#[test]
+fn core_rpc_rescan_guard_is_one_probe_per_transport_and_lets_an_idle_wallet_through() {
+    let mock = common::mock_rpc::MockRpcServer::start();
+    mock.set("createwallet", common::mock_rpc::MockResponse::Ok(serde_json::json!({"name": "graffito-watch"})));
+    mock.set("getaddressinfo", common::mock_rpc::MockResponse::Ok(serde_json::json!({"ismine": true})));
+    mock.set("getwalletinfo", common::mock_rpc::MockResponse::Ok(serde_json::json!({"scanning": false, "txcount": 3})));
+    mock.set("listunspent", common::mock_rpc::MockResponse::Ok(serde_json::json!([])));
+    // The utxo route stamps confirmations against the tip.
+    mock.set("getblockcount", common::mock_rpc::MockResponse::Ok(serde_json::json!(800)));
+
+    let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
+    use app_core::chain::Transport as _;
+    let core = match &transport {
+        AnyTransport::Core(c) => c,
+        AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport"),
+    };
+    for _ in 0..3 {
+        core.get_text("/address/bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080/utxo")
+            .expect("an idle wallet must answer normally");
+    }
+    assert_eq!(mock.call_count("listunspent"), 3, "every route must still reach the node");
+    assert_eq!(
+        mock.call_count("getwalletinfo"),
+        1,
+        "the idle verdict must be remembered for this transport, not re-probed per route"
+    );
+
+    eprintln!("core_rpc_rescan_guard_is_one_probe_per_transport_and_lets_an_idle_wallet_through: PASS (synthetic)");
+}

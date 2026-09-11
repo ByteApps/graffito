@@ -35,6 +35,10 @@ use std::sync::{Arc, Mutex};
 pub enum MockResponse {
     Ok(serde_json::Value),
     Err { code: i64, message: String },
+    /// A raw HTTP status with an EMPTY body — bitcoind's bad-auth shape
+    /// (a bare 401, no JSON at all). The only case where what the client
+    /// must report comes from the STATUS rather than the envelope.
+    Status(u16),
 }
 
 #[derive(Default)]
@@ -157,11 +161,20 @@ fn handle_conn(mut stream: TcpStream, state: Arc<Mutex<MockState>>) {
             .unwrap_or(MockResponse::Err { code: -32601, message: format!("mock: no scripted response for {method}") })
     };
 
+    if let MockResponse::Status(code) = response {
+        let reason = if code == 401 { "Unauthorized" } else { "Error" };
+        let _ = stream.write_all(
+            format!("HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+        let _ = stream.flush();
+        return;
+    }
     let body_json = match response {
         MockResponse::Ok(v) => serde_json::json!({"result": v, "error": null, "id": id}),
         MockResponse::Err { code, message } => {
             serde_json::json!({"result": null, "error": {"code": code, "message": message}, "id": id})
         }
+        MockResponse::Status(_) => unreachable!("handled above"),
     };
     let body_bytes = serde_json::to_vec(&body_json).unwrap();
     let response_text = format!(

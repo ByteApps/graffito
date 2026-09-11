@@ -82,14 +82,12 @@ pub(crate) fn quiz_picks(idx: [u8; 3], count: usize) -> Vec<usize> {
     picks
 }
 
-/// The numbered backup-word grid shown on the write-it-down screen. Three
-/// columns on desktop; TWO on phones (`platform::type_scale() > 1.0`): a
-/// 3-column row of 13px Menlo is ~44 chars, which the `Mono` char-wrap
-/// splits mid-word on a 411dp phone even before the type scale. The one
-/// formatter for both create paths (device RNG + dice) and the preview mock.
-/// Push a phrase to the backup screen: the numbered grid string (what Copy
-/// puts on the clipboard, and what the UI suites read) AND the word list the
-/// screen lays out as cells.
+/// The numbered backup-word grid the Copy button puts on the clipboard.
+/// COLUMN-MAJOR, `Metrics.word-columns` wide (3 desktop / 2 phone) — it must
+/// read in the same order as the `WordGrid` cells on screen, which have run
+/// 1..rows down the left column since 2026-09-05. It was row-major until
+/// 2026-09-10, so a pasted phrase listed its words in a different order from
+/// the one the user was looking at (Sal, iOS pass).
 pub(crate) fn set_backup_words(w: &AppWindow, phrase: &str) {
     w.global::<Ui>().set_backup_words(word_grid(phrase).into());
     let words: Vec<slint::SharedString> = phrase.split(' ').filter(|s| !s.is_empty()).map(Into::into).collect();
@@ -97,16 +95,82 @@ pub(crate) fn set_backup_words(w: &AppWindow, phrase: &str) {
 }
 
 pub(crate) fn word_grid(phrase: &str) -> String {
-    let cols = crate::platform::word_columns() as usize;
+    word_grid_cols(phrase, crate::platform::word_columns() as usize)
+}
+
+fn word_grid_cols(phrase: &str, cols: usize) -> String {
     // Longest BIP-39 word is 8 chars; the wider pad is the desktop look.
     let pad = if cols == 2 { 8 } else { 9 };
-    phrase
-        .split(' ')
-        .enumerate()
-        .map(|(i, wd)| {
-            format!("{:>2}. {:<pad$}{}", i + 1, wd, if i % cols == cols - 1 { "\n" } else { " " }, pad = pad)
-        })
-        .collect()
+    let words: Vec<&str> = phrase.split(' ').filter(|s| !s.is_empty()).collect();
+    let rows = words.len().div_ceil(cols);
+    let mut out = String::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            // Same cell index the WordGrid component computes.
+            let i = c * rows + r;
+            if i >= words.len() {
+                continue;
+            }
+            let last_in_row = c == cols - 1 || i + rows >= words.len();
+            // No padding on the last cell of a row: trailing spaces are
+            // invisible here and ugly wherever the phrase is pasted.
+            if last_in_row {
+                out.push_str(&format!("{:>2}. {}\n", i + 1, words[i]));
+            } else {
+                out.push_str(&format!("{:>2}. {:<pad$} ", i + 1, words[i], pad = pad));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod word_grid_tests {
+    use super::word_grid_cols;
+
+    /// The clipboard grid reads in the SAME order as the cells on screen:
+    /// down the left column first. Row-major here is the bug Sal hit on iOS.
+    #[test]
+    fn word_grid_is_column_major() {
+        let phrase = "one two three four five six seven eight nine ten eleven twelve";
+        let three = word_grid_cols(phrase, 3);
+        assert_eq!(
+            three.lines().next().unwrap().split_whitespace().collect::<Vec<_>>(),
+            vec!["1.", "one", "5.", "five", "9.", "nine"]
+        );
+        assert_eq!(
+            three.lines().nth(3).unwrap().split_whitespace().collect::<Vec<_>>(),
+            vec!["4.", "four", "8.", "eight", "12.", "twelve"]
+        );
+        assert_eq!(three.lines().count(), 4);
+
+        let two = word_grid_cols(phrase, 2);
+        assert_eq!(
+            two.lines().next().unwrap().split_whitespace().collect::<Vec<_>>(),
+            vec!["1.", "one", "7.", "seven"]
+        );
+        assert_eq!(two.lines().count(), 6);
+    }
+
+    /// Every number appears exactly once, against its own word, for all three
+    /// seed lengths in both column counts.
+    #[test]
+    fn word_grid_keeps_every_numbered_word() {
+        for count in [12usize, 18, 24] {
+            let words: Vec<String> = (1..=count).map(|i| format!("w{i}")).collect();
+            let phrase = words.join(" ");
+            for cols in [2usize, 3] {
+                let grid = word_grid_cols(&phrase, cols);
+                let cells: Vec<&str> = grid.split_whitespace().collect();
+                assert_eq!(cells.len(), count * 2, "{count} words, {cols} cols");
+                for (n, pair) in cells.chunks(2).enumerate() {
+                    let i: usize = pair[0].trim_end_matches('.').parse().unwrap();
+                    assert_eq!(pair[1], format!("w{i}"), "cell {n} mislabelled");
+                }
+                assert_eq!(grid.lines().count(), count / cols);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

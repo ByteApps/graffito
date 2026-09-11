@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -167,6 +167,11 @@ pub struct CoreRpcTransport {
     /// than merely asserting the right final answer, which a re-probing
     /// implementation would also produce.
     probe_calls: AtomicU32,
+    /// Set once this transport has seen the watch wallet NOT rescanning —
+    /// see [`CoreRpcTransport::ensure_not_rescanning`]. One extra
+    /// `getwalletinfo` per transport instance (and `src/lib.rs` builds a
+    /// fresh one per operation), never one per address route.
+    scan_idle_seen: AtomicBool,
 }
 
 impl std::fmt::Debug for CoreRpcTransport {
@@ -545,6 +550,7 @@ impl CoreRpcTransport {
             watched: Mutex::new(HashSet::new()),
             invalid: Mutex::new(HashSet::new()),
             wallet_ready: Mutex::new(false),
+            scan_idle_seen: AtomicBool::new(false),
             ranged: Mutex::new(Vec::new()),
             next_id: Mutex::new(0),
             status_cache: Mutex::new(None),
@@ -643,6 +649,20 @@ impl CoreRpcTransport {
         // genuine RPC error surfaces its message rather than a bare status
         // number, and only fall back to the status-only shape when the
         // body isn't JSON at all.
+        // 401/403 is the ONE status a user can act on, and it is exactly the
+        // empty-bodied case below — so name it instead of reporting the shape
+        // of the (absent) body. "http: 401: non-JSON response from bitcoind"
+        // told Sal nothing about the mistyped password behind it (2026-09-10,
+        // Android test pass).
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            // Status code FIRST, same invariant `Error::is_rate_limited`
+            // relies on — `Error::is_auth_rejected` reads it to render a
+            // credential-specific line instead of "couldn't reach the node".
+            return RpcOutcome::BadResponse(format!(
+                "{}: bitcoind rejected the RPC username or password",
+                status.as_u16()
+            ));
+        }
         let v: serde_json::Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(_) => {
@@ -932,6 +952,46 @@ impl CoreRpcTransport {
         }
         *self.wallet_ready.lock().expect("wallet-ready mutex poisoned") = true;
         Ok(())
+    }
+
+    /// Refuse an address-history read while bitcoind's watch wallet is
+    /// RESCANNING. This is the `TxLookupStatus::NotFound` rule (U5) applied
+    /// to history: absence must be positively established. A rescanning
+    /// wallet answers `listunspent`/`listtransactions` with an EMPTY list —
+    /// a SUCCESSFUL RPC whose meaning is "not scanned yet", never "nothing
+    /// there" — and the app applies a successful bundle as truth, so the
+    /// wallet's coins silently vanish from Compose (Sign greys out with no
+    /// explanation) and from every balance until the next scan after the
+    /// rescan ends. Hit live on Sal's Android pass, 2026-09-10: a seed
+    /// import triggers a genesis `importdescriptors`, ~6 minutes on
+    /// testnet4, and every scan inside that window reported `balance=0` on
+    /// a wallet holding 60,000 sats.
+    ///
+    /// [`Error::Transport`] is the right class: the node is reachable and
+    /// the answer is simply not available YET, so it is safe to retry — and
+    /// a failed scan leaves the store untouched, which is exactly what
+    /// keeps the cached coins on screen.
+    fn ensure_not_rescanning(&self) -> Result<(), Error> {
+        if self.scan_idle_seen.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        // A wallet that isn't there to ask about is not a rescan verdict —
+        // leave those cases to the route itself, unchanged.
+        let Ok(info) = self.rpc(Some(&Self::watch_wallet()), "getwalletinfo", serde_json::json!([])) else {
+            return Ok(());
+        };
+        match info.get("scanning") {
+            // bitcoind answers `false` when idle and an OBJECT
+            // ({duration, progress}) while a rescan runs.
+            Some(v) if v.is_object() => {
+                let pct = v.get("progress").and_then(|p| p.as_f64()).unwrap_or(0.0) * 100.0;
+                Err(Error::Transport(format!("your node is rescanning its wallet — {pct:.0}% done, try again shortly")))
+            }
+            _ => {
+                self.scan_idle_seen.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
     }
 
     /// Per-address `addr()` descriptor import — the U3 fallback, still hit
@@ -1621,6 +1681,9 @@ impl Transport for CoreRpcTransport {
                     Some(other) => Err(Error::Http(format!("404: no route /address/.../{other}"))),
                 };
             }
+            // Every /address/* route reads wallet history — none of it is
+            // trustworthy mid-rescan (see `ensure_not_rescanning`).
+            self.ensure_not_rescanning()?;
             return match sub {
                 None => self.address_stats_route(address),
                 Some("utxo") => self.utxo_route(address),

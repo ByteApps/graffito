@@ -80,6 +80,168 @@ export component SettingsScreen inherits VerticalLayout { padding-top: Ui.safe-t
                 SelectPill { text: "regtest"; active: Settings.settings-network == "regtest"; clicked => { Settings.set-network("regtest"); } }
             }
         }
+        // The chain-connection group: which chain, the server that reads
+        // and writes it, and where its links open. These three belong
+        // together — node and explorer used to sit ~9 cards below Network
+        // (Sal, 2026-09-10 iOS pass).
+        if !Settings.settings-compose-only: SettingsCard {
+            title: "Bitcoin node" + ((Ui.node-is-core || Ui.node-is-electrum) ? " · " + Ui.node-backend-label : "");
+            subtitle: "Scans and broadcasts go through this server — it learns your address and IP. Pick a provider, point at your own Esplora/mempool-compatible node, choose Electrum server for a personal electrs (the one Sparrow uses), or choose Bitcoin Core and enter your node's address (RPC credentials below, never stored in this URL).";
+            Dropdown {
+                options: Ui.node-options;
+                current-index: Ui.node-index;
+                selected(i) => { Ui.node-index = i; Settings.set-node-preset(i); }
+            }
+            // "Bitcoin Core" row (U12, second-to-last option — see
+            // `node-core-row-selected` above): a plain address field, no
+            // storage prefix in sight. "Custom…" (last option, unchanged)
+            // stays the free-text Esplora URL field.
+            if Settings.node-core-row-selected: EditField {
+                text <=> Ui.node-address-text;
+                placeholder-text: "192.168.1.10:8332  or  umbrel.local";
+                edited(t) => { Settings.node-address-dirty = true; }
+                accepted(t) => { Settings.node-address-dirty = false; Settings.set-node-address(t); }
+                // Commit on focus loss too — see node-address-dirty above.
+                // Empty is never auto-committed: clearing the field and
+                // pressing Return stays the explicit way to unset it, so
+                // tabbing through an empty field can't wipe a stored node.
+                changed has-focus => {
+                    if (!self.has-focus && Settings.node-address-dirty && self.text != "") {
+                        Settings.node-address-dirty = false;
+                        Settings.set-node-address(self.text);
+                    }
+                }
+            }
+            // "Electrum server" row: host[:port] of a personal electrs — no
+            // credentials, no watch wallet, nothing imported on the server.
+            if Settings.node-electrum-row-selected: EditField {
+                text <=> Ui.node-address-text;
+                placeholder-text: "192.168.1.10:50001  or  umbrel.local";
+                edited(t) => { Settings.node-address-dirty = true; }
+                accepted(t) => { Settings.node-address-dirty = false; Settings.set-node-electrum-address(t); }
+                changed has-focus => {
+                    if (!self.has-focus && Settings.node-address-dirty && self.text != "") {
+                        Settings.node-address-dirty = false;
+                        Settings.set-node-electrum-address(self.text);
+                    }
+                }
+            }
+            if Settings.node-electrum-row-selected: Caption {
+                text: "Plain TCP to your electrs (the server Sparrow connects to) — use Tailscale, Tor, or an SSH tunnel unless it's on localhost. Your server has no price oracle — USD estimates stay hidden while it's active.";
+                wrap: word-wrap;
+            }
+            if Ui.node-index == Ui.node-options.length - 1: EditField {
+                text <=> Settings.node-custom-text;
+                placeholder-text: "https://mempool.example/api";
+                edited(t) => { Settings.node-custom-dirty = true; }
+                accepted(t) => { Settings.node-custom-dirty = false; Settings.set-node-custom(t); }
+                changed has-focus => {
+                    if (!self.has-focus && Settings.node-custom-dirty && self.text != "") {
+                        Settings.node-custom-dirty = false;
+                        Settings.set-node-custom(self.text);
+                    }
+                }
+            }
+            // FLATTENED (2026-07-29, U11): every row below used to live
+            // inside a single `if Ui.node-is-core: VerticalLayout { … }`
+            // — a nested layout whose OWN preferred-height didn't reliably
+            // propagate up to this SettingsCard's `height: l.preferred-
+            // height` binding when a row inside it changed size AFTER the
+            // settings screen's first layout pass (which is exactly what
+            // the node-health line does — it starts empty, then flips to
+            // a real result either synchronously from `set-node-custom`/
+            // `set-node-core-creds` or asynchronously from
+            // `refresh_node_health`'s worker thread). Symptom: a short
+            // one-line health result got ZERO visible height (fully
+            // invisible — the worst failure mode for text that tells a
+            // user their node is pruned or missing txindex), and a longer
+            // wrapped result was clipped mid-glyph, bleeding into the
+            // "Block explorer" card below. Nesting the health Caption one
+            // level deeper still (a second `if`) only made it worse — it
+            // landed on the SAME row as the "Save credentials" button
+            // instead of after it. Neither a sibling `if` at the card level
+            // NOR switching the innermost Caption to `visible:` (keeping it
+            // permanently in the tree) fixed the card's height — the bug
+            // lives in the NESTED VerticalLayout itself, not in how its
+            // last child is toggled. Removing that nested layout — making
+            // every row here a DIRECT child of the SettingsCard's own `l`
+            // layout, each individually gated by its own `if …: …`
+            // (repeating the condition, exactly the single-`if`-depth shape
+            // the iCloud-backup card's working `if !Ui.icloud-enabled:
+            // Caption` above already uses) — is what actually fixes it: `l`
+            // now sees every row as one of its own direct children, so its
+            // preferred-height always includes whichever are currently
+            // shown, at any point after the first paint. `l`'s own 8px
+            // spacing (SettingsCard) reproduces the nested layout's old
+            // `spacing: 8px` unchanged. U12 switched every gate below from
+            // `Ui.node-is-core` (the ACTUALLY ACTIVE backend) to
+            // `Settings.node-core-row-selected` (the dropdown row being
+            // browsed) — picking "Bitcoin Core" must reveal these rows
+            // immediately, before any address has been submitted, same as
+            // "Custom…" already reveals its own field on selection alone.
+            if Settings.node-core-row-selected: Caption {
+                text: "RPC username and password — stored in the device Keychain, never in app settings. Credentials cross the network in plaintext over http:// — use Tailscale, Tor, or an SSH tunnel unless this node is on localhost.";
+                wrap: word-wrap;
+            }
+            if Settings.node-core-row-selected: Caption {
+                text: "Your node has no price oracle — USD estimates stay hidden while it's active, so no third-party price lookup happens either.";
+                wrap: word-wrap;
+            }
+            if Settings.node-core-row-selected: HorizontalLayout {
+                spacing: 8px;
+                EditField {
+                    text <=> Settings.node-core-user;
+                    placeholder-text: "RPC username";
+                    accepted(t) => { Settings.set-node-core-creds(Settings.node-core-user, Settings.node-core-pass); }
+                }
+                EditField {
+                    text <=> Settings.node-core-pass;
+                    placeholder-text: "RPC password";
+                    input-type: password;
+                    accepted(t) => { Settings.set-node-core-creds(Settings.node-core-user, Settings.node-core-pass); }
+                }
+            }
+            if Settings.node-core-row-selected: Switch {
+                text: "Save credentials to Keychain";
+                checked <=> Settings.node-core-save-creds;
+                toggled => { Settings.set-node-core-save-creds(Settings.node-core-save-creds); }
+            }
+            if Settings.node-core-row-selected && !Settings.node-core-save-creds: Caption {
+                text: "Credentials stay in memory for this session only — you'll re-enter them next launch.";
+                color: Pal.muted;
+                wrap: word-wrap;
+            }
+            if Settings.node-core-row-selected: GhostButton {
+                text: "Save credentials";
+                clicked => { Settings.set-node-core-creds(Settings.node-core-user, Settings.node-core-pass); }
+            }
+            if (Settings.node-core-row-selected || Settings.node-electrum-row-selected) && Settings.node-health-text != "": Caption {
+                text: Settings.node-health-text;
+                color: Ui.node-health-warn ? Pal.warn : Pal.muted;
+                wrap: word-wrap;
+            }
+        }
+        if !Settings.settings-compose-only: SettingsCard {
+            title: "Block explorer";
+            subtitle: "Where the app's Explorer links open a transaction. Pick a site or use your own (e.g. a self-hosted mempool); the link becomes <base>/tx/<txid>.";
+            Dropdown {
+                options: Settings.explorer-options;
+                current-index: Settings.explorer-index;
+                selected(i) => { Settings.explorer-index = i; Settings.set-explorer-preset(i); }
+            }
+            if Settings.explorer-index == Settings.explorer-options.length - 1: EditField {
+                text <=> Settings.explorer-custom-text;
+                placeholder-text: "https://your-mempool-host  (no trailing /tx)";
+                edited(t) => { Settings.explorer-custom-dirty = true; }
+                accepted(t) => { Settings.explorer-custom-dirty = false; Settings.set-explorer-custom(t); }
+                changed has-focus => {
+                    if (!self.has-focus && Settings.explorer-custom-dirty && self.text != "") {
+                        Settings.explorer-custom-dirty = false;
+                        Settings.set-explorer-custom(self.text);
+                    }
+                }
+            }
+        }
         if !Settings.settings-compose-only: SettingsCard {
             title: "Note size limit";
             subtitle: "Largest OP_RETURN chunk per output. Standard suits modern relays (Core v30+). If a broadcast is rejected, switch to 80 compat and recompose.";
@@ -242,164 +404,6 @@ export component SettingsScreen inherits VerticalLayout { padding-top: Ui.safe-t
                 Caption { text: "height · press Return to apply"; vertical-alignment: center; }
             }
             Caption { text: Settings.locktime-effective; }
-        }
-        if !Settings.settings-compose-only: SettingsCard {
-            title: "Bitcoin node" + ((Ui.node-is-core || Ui.node-is-electrum) ? " · " + Ui.node-backend-label : "");
-            subtitle: "Scans and broadcasts go through this server — it learns your address and IP. Pick a provider, point at your own Esplora/mempool-compatible node, choose Electrum server for a personal electrs (the one Sparrow uses), or choose Bitcoin Core and enter your node's address (RPC credentials below, never stored in this URL).";
-            Dropdown {
-                options: Ui.node-options;
-                current-index: Ui.node-index;
-                selected(i) => { Ui.node-index = i; Settings.set-node-preset(i); }
-            }
-            // "Bitcoin Core" row (U12, second-to-last option — see
-            // `node-core-row-selected` above): a plain address field, no
-            // storage prefix in sight. "Custom…" (last option, unchanged)
-            // stays the free-text Esplora URL field.
-            if Settings.node-core-row-selected: EditField {
-                text <=> Ui.node-address-text;
-                placeholder-text: "192.168.1.10:8332  or  umbrel.local";
-                edited(t) => { Settings.node-address-dirty = true; }
-                accepted(t) => { Settings.node-address-dirty = false; Settings.set-node-address(t); }
-                // Commit on focus loss too — see node-address-dirty above.
-                // Empty is never auto-committed: clearing the field and
-                // pressing Return stays the explicit way to unset it, so
-                // tabbing through an empty field can't wipe a stored node.
-                changed has-focus => {
-                    if (!self.has-focus && Settings.node-address-dirty && self.text != "") {
-                        Settings.node-address-dirty = false;
-                        Settings.set-node-address(self.text);
-                    }
-                }
-            }
-            // "Electrum server" row: host[:port] of a personal electrs — no
-            // credentials, no watch wallet, nothing imported on the server.
-            if Settings.node-electrum-row-selected: EditField {
-                text <=> Ui.node-address-text;
-                placeholder-text: "192.168.1.10:50001  or  umbrel.local";
-                edited(t) => { Settings.node-address-dirty = true; }
-                accepted(t) => { Settings.node-address-dirty = false; Settings.set-node-electrum-address(t); }
-                changed has-focus => {
-                    if (!self.has-focus && Settings.node-address-dirty && self.text != "") {
-                        Settings.node-address-dirty = false;
-                        Settings.set-node-electrum-address(self.text);
-                    }
-                }
-            }
-            if Settings.node-electrum-row-selected: Caption {
-                text: "Plain TCP to your electrs (the server Sparrow connects to) — use Tailscale, Tor, or an SSH tunnel unless it's on localhost. Your server has no price oracle — USD estimates stay hidden while it's active.";
-                wrap: word-wrap;
-            }
-            if Ui.node-index == Ui.node-options.length - 1: EditField {
-                text <=> Settings.node-custom-text;
-                placeholder-text: "https://mempool.example/api";
-                edited(t) => { Settings.node-custom-dirty = true; }
-                accepted(t) => { Settings.node-custom-dirty = false; Settings.set-node-custom(t); }
-                changed has-focus => {
-                    if (!self.has-focus && Settings.node-custom-dirty && self.text != "") {
-                        Settings.node-custom-dirty = false;
-                        Settings.set-node-custom(self.text);
-                    }
-                }
-            }
-            // FLATTENED (2026-07-29, U11): every row below used to live
-            // inside a single `if Ui.node-is-core: VerticalLayout { … }`
-            // — a nested layout whose OWN preferred-height didn't reliably
-            // propagate up to this SettingsCard's `height: l.preferred-
-            // height` binding when a row inside it changed size AFTER the
-            // settings screen's first layout pass (which is exactly what
-            // the node-health line does — it starts empty, then flips to
-            // a real result either synchronously from `set-node-custom`/
-            // `set-node-core-creds` or asynchronously from
-            // `refresh_node_health`'s worker thread). Symptom: a short
-            // one-line health result got ZERO visible height (fully
-            // invisible — the worst failure mode for text that tells a
-            // user their node is pruned or missing txindex), and a longer
-            // wrapped result was clipped mid-glyph, bleeding into the
-            // "Block explorer" card below. Nesting the health Caption one
-            // level deeper still (a second `if`) only made it worse — it
-            // landed on the SAME row as the "Save credentials" button
-            // instead of after it. Neither a sibling `if` at the card level
-            // NOR switching the innermost Caption to `visible:` (keeping it
-            // permanently in the tree) fixed the card's height — the bug
-            // lives in the NESTED VerticalLayout itself, not in how its
-            // last child is toggled. Removing that nested layout — making
-            // every row here a DIRECT child of the SettingsCard's own `l`
-            // layout, each individually gated by its own `if …: …`
-            // (repeating the condition, exactly the single-`if`-depth shape
-            // the iCloud-backup card's working `if !Ui.icloud-enabled:
-            // Caption` above already uses) — is what actually fixes it: `l`
-            // now sees every row as one of its own direct children, so its
-            // preferred-height always includes whichever are currently
-            // shown, at any point after the first paint. `l`'s own 8px
-            // spacing (SettingsCard) reproduces the nested layout's old
-            // `spacing: 8px` unchanged. U12 switched every gate below from
-            // `Ui.node-is-core` (the ACTUALLY ACTIVE backend) to
-            // `Settings.node-core-row-selected` (the dropdown row being
-            // browsed) — picking "Bitcoin Core" must reveal these rows
-            // immediately, before any address has been submitted, same as
-            // "Custom…" already reveals its own field on selection alone.
-            if Settings.node-core-row-selected: Caption {
-                text: "RPC username and password — stored in the device Keychain, never in app settings. Credentials cross the network in plaintext over http:// — use Tailscale, Tor, or an SSH tunnel unless this node is on localhost.";
-                wrap: word-wrap;
-            }
-            if Settings.node-core-row-selected: Caption {
-                text: "Your node has no price oracle — USD estimates stay hidden while it's active, so no third-party price lookup happens either.";
-                wrap: word-wrap;
-            }
-            if Settings.node-core-row-selected: HorizontalLayout {
-                spacing: 8px;
-                EditField {
-                    text <=> Settings.node-core-user;
-                    placeholder-text: "RPC username";
-                    accepted(t) => { Settings.set-node-core-creds(Settings.node-core-user, Settings.node-core-pass); }
-                }
-                EditField {
-                    text <=> Settings.node-core-pass;
-                    placeholder-text: "RPC password";
-                    input-type: password;
-                    accepted(t) => { Settings.set-node-core-creds(Settings.node-core-user, Settings.node-core-pass); }
-                }
-            }
-            if Settings.node-core-row-selected: Switch {
-                text: "Save credentials to Keychain";
-                checked <=> Settings.node-core-save-creds;
-                toggled => { Settings.set-node-core-save-creds(Settings.node-core-save-creds); }
-            }
-            if Settings.node-core-row-selected && !Settings.node-core-save-creds: Caption {
-                text: "Credentials stay in memory for this session only — you'll re-enter them next launch.";
-                color: Pal.muted;
-                wrap: word-wrap;
-            }
-            if Settings.node-core-row-selected: GhostButton {
-                text: "Save credentials";
-                clicked => { Settings.set-node-core-creds(Settings.node-core-user, Settings.node-core-pass); }
-            }
-            if (Settings.node-core-row-selected || Settings.node-electrum-row-selected) && Settings.node-health-text != "": Caption {
-                text: Settings.node-health-text;
-                color: Ui.node-health-warn ? Pal.warn : Pal.muted;
-                wrap: word-wrap;
-            }
-        }
-        if !Settings.settings-compose-only: SettingsCard {
-            title: "Block explorer";
-            subtitle: "Where the app's Explorer links open a transaction. Pick a site or use your own (e.g. a self-hosted mempool); the link becomes <base>/tx/<txid>.";
-            Dropdown {
-                options: Settings.explorer-options;
-                current-index: Settings.explorer-index;
-                selected(i) => { Settings.explorer-index = i; Settings.set-explorer-preset(i); }
-            }
-            if Settings.explorer-index == Settings.explorer-options.length - 1: EditField {
-                text <=> Settings.explorer-custom-text;
-                placeholder-text: "https://your-mempool-host  (no trailing /tx)";
-                edited(t) => { Settings.explorer-custom-dirty = true; }
-                accepted(t) => { Settings.explorer-custom-dirty = false; Settings.set-explorer-custom(t); }
-                changed has-focus => {
-                    if (!self.has-focus && Settings.explorer-custom-dirty && self.text != "") {
-                        Settings.explorer-custom-dirty = false;
-                        Settings.set-explorer-custom(self.text);
-                    }
-                }
-            }
         }
         if !Settings.settings-compose-only: SettingsCard {
             title: "Coins";

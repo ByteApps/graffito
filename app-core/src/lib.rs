@@ -145,6 +145,16 @@ impl Error {
     pub fn is_rate_limited(&self) -> bool {
         matches!(self, Error::Http(m) if m.starts_with("429:") || m == "429")
     }
+
+    /// True iff the server refused the credentials (401/403) rather than
+    /// failing to answer — the one HTTP failure the user can fix, and the
+    /// one that must never be worded as "couldn't reach the node" (Sal's
+    /// Android pass, 2026-09-10: a bad RPC password read as
+    /// "http: 401: non-JSON response from bitcoind"). Same
+    /// status-code-prefix invariant as [`Self::is_rate_limited`].
+    pub fn is_auth_rejected(&self) -> bool {
+        matches!(self, Error::Http(m) if m.starts_with("401") || m.starts_with("403"))
+    }
 }
 
 impl From<notes_core::Error> for Error {
