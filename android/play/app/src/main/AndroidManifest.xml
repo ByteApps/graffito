@@ -62,9 +62,23 @@
          back-scope turns into nav-back(). The cargo-apk sideload manifest
          targets SDK 34 and never had this, which is why the emulator pass
          (API 34) could not see it. -->
+    <!-- allowBackup=false: no Auto Backup / D2D transfer of this app's
+         private files. `store-*.json` caches DECRYPTED note text (the iOS
+         audit of 2026-07-25 excluded exactly these from iCloud backup for
+         the same reason) and Auto Backup defaults to ON, so without this
+         Google Drive gets your notes in the clear. Nothing here is worth
+         backing up as-is either: the seed blob is sealed under an
+         AndroidKeyStore key that never leaves this device's TEE, so a
+         restored copy is undecryptable anywhere else, and the note cache
+         rebuilds itself from the chain on the next scan. When the
+         passphrase-encrypted seed backup lands (Argon2id →
+         XChaCha20-Poly1305, the notes-core FLAG_PW primitives), this
+         becomes `android:dataExtractionRules` that INCLUDE only that one
+         encrypted blob — Sal, 2026-09-10. -->
     <application
         android:name="com.byteapps.graffito.GraffitoApplication"
         android:label="Graffito"
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:enableOnBackInvokedCallback="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
