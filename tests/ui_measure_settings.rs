@@ -10,7 +10,7 @@
 //! no OS events, printing app-space logical points — the exact coordinate
 //! space `tap X Y` uses. Run:
 //!   SLINT_EMIT_DEBUG_INFO=1 cargo test --test ui_measure_settings -- --nocapture
-use graffito::{AppWindow, Screen, Ui};
+use graffito::{AppWindow, Screen, Settings, Ui};
 use i_slint_backend_testing::ElementRoot;
 use slint::ComponentHandle;
 
@@ -49,6 +49,13 @@ fn measure_settings_tap_points() {
     let n = opts.len() as i32;
     app.global::<Ui>().set_node_options(slint::ModelRc::new(slint::VecModel::from(opts)));
     app.global::<Ui>().set_node_index(n - 3);
+    // A hierarchical (mnemonic) identity adds a "Change account…" row the
+    // hex/WIF identities don't have, pushing every card below Identity down
+    // — graffito-app-android.sh imports HEX, the cross-device suite imports
+    // a MNEMONIC, so they need different numbers. MEASURE_HIER=1 for the
+    // mnemonic shape.
+    app.global::<Settings>()
+        .set_settings_hierarchical(std::env::var("MEASURE_HIER").as_deref() == Ok("1"));
     slint::platform::update_timers_and_animations();
 
     for (idx, name) in [(n - 3, "Bitcoin Core"), (n - 2, "Electrum server"), (n - 1, "Custom…")] {
