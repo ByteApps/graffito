@@ -1,0 +1,4 @@
+• The confirm screen now shows the actual OP_RETURN bytes being broadcast:
+  a public note reads back as its own text, an encrypted one shows its
+  ciphertext — so you can see that a private note really is sealed. Tap
+  the row for the full raw bytes.

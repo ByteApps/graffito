@@ -49,8 +49,8 @@ android {
         // exercise the full upload — aab + native symbols in one edit —
         // without committing anything. The hardcoded default stays the source
         // of truth for real releases.
-        versionCode = (project.findProperty("playVersionCode") as String?)?.toInt() ?: 15
-        versionName = "0.1.12"
+        versionCode = (project.findProperty("playVersionCode") as String?)?.toInt() ?: 16
+        versionName = "0.1.13"
     }
 
     // ONE Java source, src/main/java/com/byteapps/graffito/GraffitoApplication.java
