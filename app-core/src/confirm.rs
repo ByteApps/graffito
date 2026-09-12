@@ -69,6 +69,11 @@ pub struct SummaryRow {
     pub subtitle: String, // e.g. source label, "OP_RETURN · PNTE note", "change back to Spending wallet"
     pub amount: String,   // thousands-separated sats, "" for the OP_RETURN row
     pub kind: String,
+    /// Full byte truth revealed on tap — today only the OP_RETURN row sets
+    /// it (the complete payload as lowercase hex, the same bytes an
+    /// explorer shows once this is on chain). Empty elsewhere, which is how
+    /// the UI knows a row is expandable.
+    pub detail: String,
 }
 
 pub struct TxSummary {
@@ -189,7 +194,7 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
                 sum_in += info.value;
                 let title = info.address.clone().unwrap_or_else(|| outpoint.clone());
                 let subtitle = if info.source.is_empty() { "source unknown".to_string() } else { info.source.clone() };
-                inputs.push(SummaryRow { title, subtitle, amount: commas(info.value), kind: "input".into() });
+                inputs.push(SummaryRow { title, subtitle, amount: commas(info.value), kind: "input".into(), detail: String::new() });
             }
             None => {
                 any_prevout_missing = true;
@@ -198,6 +203,7 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
                     subtitle: "outpoint · amount unknown".into(),
                     amount: "?".into(),
                     kind: "input".into(),
+    detail: String::new(),
                 });
             }
         }
@@ -205,6 +211,16 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
     let total_in = if any_prevout_missing { None } else { Some(sum_in) };
 
     // --- outputs --------------------------------------------------------
+    // The tx's FIRST OP_RETURN carries the only header (PLAN-pnte-redesign:
+    // one note = one tx), so its flags decide how EVERY OP_RETURN row of
+    // this tx renders. Read off the wire, never from app state.
+    let first_header = tx
+        .output
+        .iter()
+        .find(|o| o.script_pubkey.is_op_return())
+        .and_then(|o| op_return_payload(o.script_pubkey.as_bytes()))
+        .and_then(envelope::parse_header);
+    let is_private_tx = first_header.is_some_and(|(flags, ..)| flags & envelope::FLAG_PRIVATE != 0);
     let mut outputs = Vec::with_capacity(tx.output.len());
     let mut total_out: u64 = 0;
     for txout in &tx.output {
@@ -216,11 +232,23 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
             let is_pnte = op_return_payload(spk)
                 .map(|p| p.len() >= envelope::MAGIC.len() && p[..envelope::MAGIC.len()] == envelope::MAGIC)
                 .unwrap_or(false);
+            // Byte truth, not a label: the payload itself, one glyph per
+            // byte, plus the full hex behind a tap. Same helpers notes-core
+            // uses, so this app and the Prime app render identically (Sal,
+            // 2026-09-10).
+            let payload = op_return_payload(spk).unwrap_or_default();
+            let size = format!("{} byte{}", payload.len(), if payload.len() == 1 { "" } else { "s" });
+            let subtitle = match (is_pnte, is_private_tx) {
+                (true, true) => format!("OP_RETURN · PNTE note · encrypted · {size}"),
+                (true, false) => format!("OP_RETURN · PNTE note · public · {size}"),
+                (false, _) => format!("OP_RETURN · data · {size}"),
+            };
             outputs.push(SummaryRow {
-                title: String::new(),
-                subtitle: if is_pnte { "OP_RETURN · PNTE note".to_string() } else { "OP_RETURN · data".to_string() },
+                title: notes_core::confirm::payload_glyphs(payload, !is_private_tx),
+                subtitle,
                 amount: if value == 0 { String::new() } else { commas(value) },
                 kind: "note".into(),
+                detail: notes_core::confirm::payload_hex(payload),
             });
             continue;
         }
@@ -232,6 +260,7 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
                 subtitle: "unrenderable output script".to_string(),
                 amount: commas(value),
                 kind: "other".into(),
+    detail: String::new(),
             });
             continue;
         };
@@ -253,7 +282,7 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
             ("other", "not one of your addresses".to_string())
         };
 
-        outputs.push(SummaryRow { title: addr.to_string(), subtitle, amount: commas(value), kind: kind.to_string() });
+        outputs.push(SummaryRow { title: addr.to_string(), subtitle, amount: commas(value), kind: kind.to_string(), detail: String::new() });
     }
 
     let vsize = tx.vsize() as u64;
@@ -407,9 +436,16 @@ mod tests {
 
         assert_eq!(sum.outputs.len(), 3);
         assert_eq!(sum.outputs[0].kind, "note");
-        assert_eq!(sum.outputs[0].title, "");
-        assert_eq!(sum.outputs[0].subtitle, "OP_RETURN · PNTE note");
+        // Byte truth: a PUBLIC note's body is its UTF-8 text, so the row
+        // reads it back off the wire, header included. These strings are
+        // asserted CHARACTER-FOR-CHARACTER identically in
+        // notes-core/tests/confirm.rs — the two crates render this row from
+        // the same helpers and must never drift, or Graffito and the Prime
+        // app would show a user different things about the same tx.
+        assert_eq!(sum.outputs[0].title, "PNTE100 hello world");
+        assert_eq!(sum.outputs[0].subtitle, "OP_RETURN · PNTE note · public · 19 bytes");
         assert_eq!(sum.outputs[0].amount, "");
+        assert_eq!(sum.outputs[0].detail, hex::encode(b"PNTE100 hello world"));
 
         assert_eq!(sum.outputs[1].kind, "self");
         assert_eq!(sum.outputs[1].subtitle, "your notebook (keeps the note yours)");

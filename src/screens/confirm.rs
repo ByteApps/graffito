@@ -479,6 +479,7 @@ pub(crate) fn show_confirm(&mut self, w: &AppWindow, pending: PendingBroadcast, 
                 subtitle: r.subtitle.clone().into(),
                 amount: r.amount.clone().into(),
                 kind: r.kind.clone().into(),
+                detail: r.detail.clone().into(),
             })
             .collect()
     };

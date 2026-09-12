@@ -31,6 +31,47 @@ fn op_return_payloads_in_order(outputs: &[crate::tx::TxOut]) -> Vec<&[u8]> {
     outputs.iter().filter_map(|o| op_return_payload(&o.script_pubkey)).collect()
 }
 
+/// One visible character per PAYLOAD BYTE, for the confirm screen's
+/// OP_RETURN row — the answer to "is what I'm broadcasting actually
+/// encrypted?" (Sal, 2026-09-10).
+///
+/// A public note's body is its UTF-8 text verbatim (see `envelope`), so it
+/// decodes and you READ YOUR NOTE. A private note's body is ciphertext, so
+/// there is no text to find: printable ASCII bytes show as themselves and
+/// everything else as `·`, one glyph per byte.
+///
+/// Deliberately NOT mempool.space's rendering. Their `hex2ascii` pipe
+/// decodes UTF-8 and then `.replace(/\uFFFD/g, '')` — it DELETES every
+/// undecodable byte, so ~2/3 of a ciphertext vanishes and 189 bytes
+/// collapse into a short run of arbitrary characters that reads like odd
+/// text rather than like "not text at all". One-glyph-per-byte keeps the
+/// length honest.
+///
+/// `·` is U+00B7 (Latin-1): femtovg has no font fallback in this app, so
+/// the placeholder must be a character the bundled font actually carries.
+pub fn payload_glyphs(payload: &[u8], decode_utf8: bool) -> String {
+    if decode_utf8 {
+        if let Ok(text) = core::str::from_utf8(payload) {
+            return text.replace(['\n', '\r', '\t'], " ");
+        }
+    }
+    payload
+        .iter()
+        .map(|b| match b {
+            0x20..=0x7e => *b as char,
+            _ => '·',
+        })
+        .collect()
+}
+
+/// The complete payload as lowercase hex — the row's tap-to-expand detail.
+/// Block explorers show exactly these bytes (mempool.space puts them in the
+/// ScriptPubKey/ASM row), so this is what lets a signer byte-compare the
+/// app against an explorer.
+pub fn payload_hex(payload: &[u8]) -> String {
+    payload.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// What we know about an input's previous output. `source` is a human
 /// wallet label, e.g. "Notebook · Alice", "Spending wallet", "ColdBox"
 /// (external), or "" if unknown.
@@ -79,6 +120,12 @@ pub struct SummaryRow {
     pub subtitle: String, // e.g. source label, "OP_RETURN · PNTE note", "change back to Spending wallet"
     pub amount: String,   // thousands-separated sats, "" for the OP_RETURN row
     pub kind: String,
+    /// The row's FULL byte truth, revealed on tap — today only the
+    /// OP_RETURN row sets it (the complete payload as lowercase hex, the
+    /// same bytes a block explorer will show once this is on chain).
+    /// Empty everywhere else, which is what the UI keys "is this row
+    /// expandable" off.
+    pub detail: String,
 }
 
 pub struct TxSummary {
@@ -144,7 +191,7 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
                 sum_in += info.value;
                 let title = info.address.clone().unwrap_or_else(|| outpoint.clone());
                 let subtitle = if info.source.is_empty() { "source unknown".to_string() } else { info.source.clone() };
-                inputs.push(SummaryRow { title, subtitle, amount: commas(info.value), kind: "input".into() });
+                inputs.push(SummaryRow { title, subtitle, amount: commas(info.value), kind: "input".into(), detail: String::new() });
             }
             None => {
                 any_prevout_missing = true;
@@ -153,6 +200,7 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
                     subtitle: "outpoint · amount unknown".into(),
                     amount: "?".into(),
                     kind: "input".into(),
+                    detail: String::new(),
                 });
             }
         }
@@ -164,9 +212,11 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
     // decided ONCE, since later OP_RETURN outputs of the same tx carry no
     // header of their own (they're raw continuation bytes; see
     // `op_return_payloads_in_order`'s doc comment).
-    let is_pnte_tx = op_return_payloads_in_order(&tx.outputs)
-        .first()
-        .is_some_and(|p| envelope::parse_header(p).is_some());
+    let first_header = op_return_payloads_in_order(&tx.outputs).first().and_then(|p| envelope::parse_header(p));
+    let is_pnte_tx = first_header.is_some();
+    // FLAG_PRIVATE off the wire — a public note's body IS its UTF-8 text, a
+    // private one's is ciphertext, and the row renders accordingly.
+    let is_private_tx = first_header.is_some_and(|(flags, ..)| flags & envelope::FLAG_PRIVATE != 0);
     let mut outputs = Vec::with_capacity(tx.outputs.len());
     let mut total_out: u64 = 0;
     for txout in &tx.outputs {
@@ -176,11 +226,29 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
 
         if spk.first() == Some(&0x6a) {
             let is_pnte = is_pnte_tx;
+            // The row shows the payload ITSELF, not a label for it: a public
+            // note reads back as its own text, a private one cannot, and
+            // that contrast IS the proof the note is sealed (Sal,
+            // 2026-09-10). `decode_utf8` comes from the FLAGS ON THE WIRE,
+            // never from app state — byte truth is this module's whole job.
+            let payload = op_return_payload(&txout.script_pubkey).unwrap_or_default();
+            let title = payload_glyphs(payload, !is_private_tx);
+            let size = format!(
+                "{} byte{}",
+                payload.len(),
+                if payload.len() == 1 { "" } else { "s" }
+            );
+            let subtitle = match (is_pnte, is_private_tx) {
+                (true, true) => format!("OP_RETURN · PNTE note · encrypted · {size}"),
+                (true, false) => format!("OP_RETURN · PNTE note · public · {size}"),
+                (false, _) => format!("OP_RETURN · data · {size}"),
+            };
             outputs.push(SummaryRow {
-                title: String::new(),
-                subtitle: if is_pnte { "OP_RETURN · PNTE note".to_string() } else { "OP_RETURN · data".to_string() },
+                title,
+                subtitle,
                 amount: if value == 0 { String::new() } else { commas(value) },
                 kind: "note".into(),
+                detail: payload_hex(payload),
             });
             continue;
         }
@@ -192,6 +260,7 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
                 subtitle: "unrenderable output script".to_string(),
                 amount: commas(value),
                 kind: "other".into(),
+                detail: String::new(),
             });
             continue;
         };
@@ -215,7 +284,7 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
             ("other", "not one of your addresses".to_string())
         };
 
-        outputs.push(SummaryRow { title: addr, subtitle, amount: commas(value), kind: kind.to_string() });
+        outputs.push(SummaryRow { title: addr, subtitle, amount: commas(value), kind: kind.to_string(), detail: String::new() });
     }
 
     let vsize = tx.vsize() as u64;

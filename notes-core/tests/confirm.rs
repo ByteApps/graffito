@@ -121,9 +121,15 @@ fn typical_note_tx_full_classification() {
 
     assert_eq!(sum.outputs.len(), 3);
     assert_eq!(sum.outputs[0].kind, "note");
-    assert_eq!(sum.outputs[0].title, "");
-    assert_eq!(sum.outputs[0].subtitle, "OP_RETURN · PNTE note");
+    // A PUBLIC note's body IS its UTF-8 text, so the row reads it straight
+    // back off the wire — header included, because that is what the tx
+    // actually carries.
+    assert_eq!(sum.outputs[0].title, "PNTE100 hello world");
+    assert_eq!(sum.outputs[0].subtitle, "OP_RETURN · PNTE note · public · 19 bytes");
     assert_eq!(sum.outputs[0].amount, "");
+    // The tap-to-expand detail is the WHOLE payload as hex, and it must
+    // decode back to exactly the bytes in the script.
+    assert_eq!(sum.outputs[0].detail, hex::encode(b"PNTE100 hello world"));
 
     assert_eq!(sum.outputs[1].kind, "self");
     assert_eq!(sum.outputs[1].subtitle, "your notebook (keeps the note yours)");
@@ -396,4 +402,52 @@ fn anchored_mixed_tx_round_trip_has_no_self_row() {
     assert_eq!(sum.total_in, Some(51_000));
     assert_eq!(sum.fee, Some(note.fee));
     assert!(sum.warn.is_none());
+}
+
+
+/// The security property the row exists to show: an ENCRYPTED note's
+/// plaintext is not in the transaction, so the confirm screen cannot
+/// display it — the row renders the ciphertext byte-for-byte instead
+/// (Sal, 2026-09-10: "if encrypted show the glyphs and not the plain text
+/// so they visually see that what we're sending is actually encrypted").
+///
+/// Deliberately asserts on ABSENCE of the plaintext, not merely on the
+/// presence of glyphs: a regression that decoded the body for display
+/// would still produce a non-empty title and pass a weaker check.
+#[test]
+fn an_encrypted_note_row_shows_ciphertext_never_the_plaintext() {
+    let spk_a = notebook_spk(NOTEBOOK_SEED);
+    let secret = "meet me at the docks at midnight";
+    // A PRIVATE self-note: FLAG_PRIVATE set, body sealed.
+    let id = notes_core::bundle::Identity::from_app_seed(&[7u8; 32]).unwrap();
+    let (payloads, _) =
+        notes_core::bundle::sealed_note_payloads(&id, secret, true, None, [0u8; 36], 100_000).unwrap();
+    let tx = make_tx(
+        vec![signed_txin(1, 0)],
+        vec![txout(0, op_return_script(&payloads[0])), txout(99_000, spk_a.clone())],
+    );
+    let mut ctx = base_ctx(vec![spk_a.clone()], vec![]);
+    ctx.prevouts.insert(
+        prevout_key(1, 0),
+        PrevoutInfo { value: 100_000, address: Some(addr_of(&spk_a)), source: "Notebook · Alice".into() },
+    );
+
+    let sum = summarize_signed_tx(&raw_hex(&tx), &ctx).unwrap();
+    let row = &sum.outputs[0];
+    assert_eq!(row.kind, "note");
+    assert!(row.subtitle.contains("encrypted"), "subtitle must say encrypted: {}", row.subtitle);
+
+    // THE assertion: no fragment of the plaintext survives into the UI.
+    assert!(!row.title.contains(secret), "plaintext leaked into the row: {}", row.title);
+    for word in secret.split(' ') {
+        assert!(!row.title.contains(word), "plaintext word {word:?} leaked: {}", row.title);
+    }
+    assert!(!row.detail.contains(&hex::encode(secret)), "plaintext leaked into the hex detail");
+
+    // One glyph per byte — the length stays honest (this is what
+    // mempool.space's delete-the-undecodable-bytes rendering loses).
+    let payload = &payloads[0];
+    assert_eq!(row.title.chars().count(), payload.len(), "one glyph per payload byte");
+    assert_eq!(row.detail, hex::encode(payload), "detail must be the exact payload bytes");
+    assert!(row.subtitle.contains(&format!("{} bytes", payload.len())));
 }

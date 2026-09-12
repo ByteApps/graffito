@@ -84,7 +84,10 @@ export struct SpendingCoinItem { address: string, value: string, status: string 
 export struct SpendCoin { outpoint: string, value: string, confirmed: bool, selected: bool, txid-short: string, explorer: string, tag: string }
 // One input/output row in the Sparrow-style PSBT confirmation. `kind` drives
 // the accent: note · self · recipient · change · input · other.
-export struct PsbtRow { title: string, subtitle: string, amount: string, kind: string }
+// `detail` = the row's full byte truth (the OP_RETURN payload as hex),
+// revealed by tapping the row. Empty on every other row, which is what
+// TxConfirmView keys expandability off.
+export struct PsbtRow { title: string, subtitle: string, amount: string, kind: string, detail: string }
 // A saved funding wallet in the manager list.
 // `coins`/`coin-title` + `expanded` (independent-expand rework, 2026-07-18):
 // each row carries its OWN Pay-from screen (20) coin panel data — external

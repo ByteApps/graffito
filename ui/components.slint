@@ -861,6 +861,9 @@ export component TxConfirmView inherits Flickable {
     in property <string> note;
     in property <[PsbtRow]> inputs;
     in property <[PsbtRow]> outputs;
+    // Which row's raw-byte detail is open (compared by content — two rows
+    // with identical bytes are genuinely the same payload).
+    property <string> open-detail;
     in property <string> fee-line;
     in property <string> lock-time-line;
     in property <string> warn;
@@ -932,6 +935,11 @@ export component TxConfirmView inherits Flickable {
         for o in root.outputs: Rectangle {
             border-radius: 10px;
             background: Pal.card;
+            // Only a row that HAS a detail is tappable; the touch area sits
+            // behind the content so it never eats a child's own gesture.
+            if o.detail != "": TouchArea {
+                clicked => { root.open-detail = root.open-detail == o.detail ? "" : o.detail; }
+            }
             border-width: 1px;
             border-color: o.kind == "self" ? Pal.good.with-alpha(0.4)
                 : (o.kind == "recipient" ? Pal.accent.with-alpha(0.4)
@@ -956,8 +964,25 @@ export component TxConfirmView inherits Flickable {
                                 : (o.kind == "other" ? Pal.bad : Pal.muted))));
                         }
                     }
+                    // One line, ELIDED, never wrapped: the payload as it
+                    // really is (a public note reads back as its own text,
+                    // an encrypted one can't) — see notes-core's
+                    // `payload_glyphs`.
                     if o.title != "": Mono { text: o.title; font-size: 11px * Metrics.type-scale; overflow: elide; wrap: no-wrap; }
                     if o.subtitle != "": Caption { text: o.subtitle; font-size: 10px * Metrics.type-scale; overflow: elide; }
+                    // Tap the row to reveal every byte as hex — the same
+                    // bytes an explorer shows once this is on chain.
+                    if o.detail != "" && root.open-detail == o.detail: Mono {
+                        text: o.detail;
+                        font-size: 10px * Metrics.type-scale;
+                        color: Pal.muted;
+                        wrap: char-wrap;
+                    }
+                    if o.detail != "" && root.open-detail != o.detail: Caption {
+                        text: "tap to show the raw bytes";
+                        font-size: 9px * Metrics.type-scale;
+                        color: Pal.faint;
+                    }
                 }
                 Mono {
                     // A 0-value OP_RETURN row has an empty amount — no

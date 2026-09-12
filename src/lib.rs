@@ -3472,13 +3472,20 @@ fn preview_mock(w: &AppWindow) {
         subtitle: "aaaaaaaa…aaaaaaaa : 0".into(),
         amount: "200,000".into(),
         kind: "input".into(),
+        detail: "".into(),
     }];
     w.global::<Confirm>().set_confirm_inputs(VecModel::from_slice(&ins));
     let outs = [
-        PsbtRow { title: "".into(), subtitle: "OP_RETURN · PNTE note".into(), amount: "0".into(), kind: "note".into() },
-        PsbtRow { title: "bcrt1pxs94vakt8gnqrwhuxdscwkx5e…".into(), subtitle: "directed recipient".into(), amount: "330".into(), kind: "recipient".into() },
-        PsbtRow { title: "bcrt1p8wpt9v4frpf3tkn0srd97pks…".into(), subtitle: "your notebook (keeps the note yours)".into(), amount: "330".into(), kind: "self".into() },
-        PsbtRow { title: "bcrt1p2caqg0ht8m7dykfrx2lnrcc…".into(), subtitle: "change back to the funding wallet".into(), amount: "198,980".into(), kind: "change".into() },
+        PsbtRow {
+            title: "PNTE100 note from android, yeah!!".into(),
+            subtitle: "OP_RETURN · PNTE note · public · 159 bytes".into(),
+            amount: "".into(),
+            kind: "note".into(),
+            detail: "504e5445313030206e6f74652066726f6d20616e64726f69642c20796561682121".into(),
+        },
+        PsbtRow { title: "bcrt1pxs94vakt8gnqrwhuxdscwkx5e…".into(), subtitle: "directed recipient".into(), amount: "330".into(), kind: "recipient".into(), detail: "".into() },
+        PsbtRow { title: "bcrt1p8wpt9v4frpf3tkn0srd97pks…".into(), subtitle: "your notebook (keeps the note yours)".into(), amount: "330".into(), kind: "self".into(), detail: "".into() },
+        PsbtRow { title: "bcrt1p2caqg0ht8m7dykfrx2lnrcc…".into(), subtitle: "change back to the funding wallet".into(), amount: "198,980".into(), kind: "change".into(), detail: "".into() },
     ];
     w.global::<Confirm>().set_confirm_outputs(VecModel::from_slice(&outs));
 
