@@ -70,11 +70,15 @@
          backing up as-is either: the seed blob is sealed under an
          AndroidKeyStore key that never leaves this device's TEE, so a
          restored copy is undecryptable anywhere else, and the note cache
-         rebuilds itself from the chain on the next scan. When the
-         passphrase-encrypted seed backup lands (Argon2id →
-         XChaCha20-Poly1305, the notes-core FLAG_PW primitives), this
-         becomes `android:dataExtractionRules` that INCLUDE only that one
-         encrypted blob — Sal, 2026-09-10. -->
+         rebuilds itself from the chain on the next scan.
+
+         This is the SETTLED design, not a placeholder: Sal's call
+         2026-09-11 — the key stays LOCAL, stored securely on the device,
+         with no cloud backup of any kind on Android. An encrypted
+         off-device backup (Argon2id → XChaCha20-Poly1305 over the BIP-39
+         entropy) was considered and DECLINED. The recovery path is the
+         recovery phrase the user writes down, same as it has always
+         been. -->
     <application
         android:name="com.byteapps.graffito.GraffitoApplication"
         android:label="Graffito"
