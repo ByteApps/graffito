@@ -58,7 +58,11 @@ fn measure_settings_tap_points() {
         .set_settings_hierarchical(std::env::var("MEASURE_HIER").as_deref() == Ok("1"));
     slint::platform::update_timers_and_animations();
 
-    for (idx, name) in [(n - 3, "Bitcoin Core"), (n - 2, "Electrum server"), (n - 1, "Custom…")] {
+    // Optional scroll offset, so cards BELOW the fold can be measured (the
+    // testing element tree only realises what is on screen).
+    let scroll: f32 = std::env::var("MEASURE_SCROLL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    app.global::<Settings>().set_settings_scroll_y(scroll);
+    for (idx, name) in [(n - 1, "Custom…")] {
         app.global::<Ui>().set_node_index(idx);
         slint::platform::update_timers_and_animations();
         eprintln!("\n--- node dropdown row browsed: {name} (index {idx}) ---");
@@ -66,6 +70,16 @@ fn measure_settings_tap_points() {
             let p = e.absolute_position();
             let sz = e.size();
             eprintln!("  Dropdown   tap y={:.0}  (top {:.0}, h {:.0})", p.y + sz.height / 2.0, p.y, sz.height);
+        }
+        for (i, e) in app.root_element().query_descendants().match_inherits("SettingsCard").find_all().into_iter().enumerate() {
+            let p = e.absolute_position();
+            let sz = e.size();
+            eprintln!("  SettingsCard[{i}] top={:.0} h={:.0}", p.y, sz.height);
+        }
+        for (i, e) in app.root_element().query_descendants().match_inherits("SelectPill").find_all().into_iter().enumerate().take(14) {
+            let p = e.absolute_position();
+            let sz = e.size();
+            eprintln!("  SelectPill[{i}] tap x={:.0} y={:.0} w={:.0}", p.x + sz.width / 2.0, p.y + sz.height / 2.0, sz.width);
         }
         for (i, e) in app.root_element().query_descendants().match_inherits("EditField").find_all().into_iter().enumerate() {
             let p = e.absolute_position();
