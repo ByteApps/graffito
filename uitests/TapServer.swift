@@ -55,6 +55,23 @@ final class TapServer: XCTestCase {
     private static let pollInterval: TimeInterval = 0.25
 
     func testTapServer() throws {
+        // WITHOUT THIS, ONE BAD TAP ENDS THE RUN. A tap resolves the app's
+        // coordinate space, so XCUITest snapshots the app first, and that
+        // fails transiently with "Failed to get matching snapshot: Error
+        // getting main window" when something is briefly over the app — an
+        // incoming NOTIFICATION BANNER does exactly it. XCTest's default is
+        // to stop the test at the first failure, so the runner exits and
+        // every later leg then times out against a server nobody is polling.
+        // That cost a cross-device run 15 minutes in on 2026-09-12.
+        //
+        // Note a wrapper around the tap CANNOT catch this: coordinate.tap()
+        // records an XCTest failure rather than throwing, so a `for attempt
+        // in 1...3` retry around it is dead code. Continuing past the
+        // failure is the only lever, and the command loop then reports the
+        // op as done and carries on — the leg's own `cb:` assertion is what
+        // catches a tap that truly did not land.
+        continueAfterFailure = true
+
         let env = ProcessInfo.processInfo.environment
 
         // xcodebuild forwards variables prefixed TEST_RUNNER_ from the host
@@ -204,6 +221,19 @@ final class TapServer: XCTestCase {
     // Coordinate-based only — see the file-level comment on why element
     // queries are unusable against this app.
 
+    // A tap resolves the app's coordinate space, which makes XCUITest take a
+    // snapshot of the app first — and that can fail transiently with
+    // "Failed to get matching snapshot: Error getting main window" when
+    // something is momentarily over the app. An incoming NOTIFICATION BANNER
+    // does exactly this, and on 2026-09-12 one killed a cross-device run 15
+    // minutes in: the whole XCTest fails, the runner exits, and every later
+    // leg then times out against a dead tap server.
+    //
+    // Retry rather than die. Bringing the app back to the front between
+    // attempts clears the common causes (a banner that has since gone, the
+    // app briefly not frontmost). Silencing notifications on the device is
+    // still worth doing for a long run; this just stops one banner from
+    // costing the run.
     private func tap(in app: XCUIApplication, x: Double, y: Double) {
         let coordinate = app
             .coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
