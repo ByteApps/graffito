@@ -85,9 +85,33 @@ final class TapServer: XCTestCase {
         let resultURL = baseURL.appendingPathComponent("result")
         let screenshotURL = baseURL.appendingPathComponent("screenshot")
 
+        // launch() vs activate(): this decides whether the app's `cb:` log
+        // lines are reachable AT ALL, so it is not a style choice.
+        //
+        // launch() always starts a FRESH process, and an app started by
+        // XCUITest has nowhere to send stdout — the harness gets a driveable
+        // UI and NO log, while every assertion in the cross-device suite is
+        // `dev_logha ios "cb: ..."`. The physical-device equivalent of the
+        // simulator's `simctl launch --console` is
+        // `devicectl device process launch --console`, which streams stdout
+        // for the life of the process — but only for the process IT started.
+        //
+        // So for a real run the harness starts the app under devicectl (that
+        // console stream is the log channel), then runs this test with
+        // TAPSERVER_ATTACH=1, and activate() simply brings that ALREADY
+        // RUNNING process to the front instead of replacing it. Both channels
+        // then point at one process: devicectl for output, this server for
+        // input. Without it the two race, and the log side silently loses.
+        let env2 = ProcessInfo.processInfo.environment
+        let attach = (env2["TEST_RUNNER_TAPSERVER_ATTACH"] ?? env2["TAPSERVER_ATTACH"] ?? "") == "1"
         let app = XCUIApplication()
-        app.launch()
-        print("TapServer: app launched, entering command loop")
+        if attach {
+            app.activate()
+            print("TapServer: attached to the running app (activate), entering command loop")
+        } else {
+            app.launch()
+            print("TapServer: app launched (fresh process, NO console stream), entering command loop")
+        }
 
         var running = true
         while running {
