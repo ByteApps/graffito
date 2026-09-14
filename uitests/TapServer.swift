@@ -54,6 +54,10 @@ final class TapServer: XCTestCase {
     /// How long to sleep between empty (204) polls of /next.
     private static let pollInterval: TimeInterval = 0.25
 
+    /// Named in refusal messages so a reader knows WHICH app had to be
+    /// frontmost for the input to be allowed.
+    private let XD_BUNDLE_DESC = "the app under test"
+
     func testTapServer() throws {
         // WITHOUT THIS, ONE BAD TAP ENDS THE RUN. A tap resolves the app's
         // coordinate space, so XCUITest snapshots the app first, and that
@@ -70,6 +74,15 @@ final class TapServer: XCTestCase {
         // failure is the only lever, and the command loop then reports the
         // op as done and carries on — the leg's own `cb:` assertion is what
         // catches a tap that truly did not land.
+        // UNBUFFER STDOUT. Swift block-buffers stdout when it is a pipe rather
+        // than a TTY, and xcodebuild captures it through a pipe — so the
+        // runner's own trace of what it is doing sits in a buffer instead of
+        // reaching the log. That cost hours: the log showed a healthy
+        // "attached ... entering command loop" (flushed early) and then ZERO
+        // "executing" lines, while the server's access log proved 18 commands
+        // had been handed out. The runner looked inert and was not.
+        setvbuf(stdout, nil, _IONBF, 0)
+
         continueAfterFailure = true
 
         let env = ProcessInfo.processInfo.environment
@@ -161,6 +174,39 @@ final class TapServer: XCTestCase {
                 let op = command["op"] as? String
             else {
                 print("TapServer: could not parse command JSON: \(String(data: data, encoding: .utf8) ?? "<binary>")")
+                continue
+            }
+
+            // REFUSE TO TOUCH ANYTHING UNLESS GRAFFITO IS FRONTMOST.
+            //
+            // A notification banner can switch apps mid-run, and a harness
+            // driving blind COORDINATES then types and taps into whatever
+            // came forward. On 2026-09-13 that put this automation into the
+            // user's BANKING app, and he stopped the run himself. A test
+            // harness must not be able to do that, and "keep notifications
+            // off" is a precaution, not a guarantee.
+            //
+            // So every input op is gated on the app under test actually being
+            // in the foreground. A refusal is reported as a normal command
+            // failure, which the harness surfaces and retries — cheap, and
+            // it fails safe rather than tapping somewhere unknown.
+            let inputOps: Set<String> = ["tap", "swipe", "type", "pasteboard"]
+            if inputOps.contains(op) && app.state != .runningForeground {
+                print("TapServer: REFUSING op=\(op) — \(XD_BUNDLE_DESC) is not frontmost (state=\(app.state.rawValue)); something else is on screen")
+                // Bring our app back, so the run can recover instead of
+                // needing a human. NOTE THE LIMIT HONESTLY: this cannot stop
+                // the FIRST tap, because when a banner is on screen the app
+                // under test is still frontmost and the tap lands on the
+                // banner. What it does stop is everything AFTER — the rest of
+                // a leg's taps and typed text going into whatever the banner
+                // opened. That is the difference between one stray tap and a
+                // whole compose sequence entered into someone's bank.
+                app.activate()
+                Thread.sleep(forTimeInterval: 1.5)
+                let recovered = app.state == .runningForeground
+                print("TapServer: re-activated \(XD_BUNDLE_DESC); frontmost now = \(recovered)")
+                postResult(to: resultURL, op: op, ok: false,
+                           error: "app under test was not frontmost (state \(app.state.rawValue)) — refused to send input somewhere unknown; re-activated=\(recovered)")
                 continue
             }
 
