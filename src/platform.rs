@@ -1013,3 +1013,121 @@ mod android_jni {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// iOS: a RECONNECTABLE `cb:` log channel (debug builds only)
+// ---------------------------------------------------------------------------
+//
+// The cross-device harness asserts on the app's `cb:` lines. On a physical
+// iPhone those were read from `devicectl device process launch --console`,
+// which works but is NOT survivable over wireless: the connection gets
+// invalidated mid-run ("The connection was invalidated",
+// com.apple.Mercury.error 1001), and because --console HOLDS the process it
+// takes the app down with it. There is no way to re-attach — a second
+// `process launch --console` against an already-running app produces no
+// output at all — so a dropped link costs the whole run and the state it has
+// built up.
+//
+// So the app also TEES its stdout to a file inside its own container. The
+// harness pulls that file with `devicectl device copy from`, which opens a
+// FRESH connection every time and therefore reconnects for free: a dropped
+// link costs one poll, not the run.
+//
+// TEE, never redirect — the console stream stays exactly as it was, so the
+// simulator path and anyone watching a terminal are unaffected.
+//
+// DEBUG BUILDS ONLY. These lines carry addresses, amounts and compose
+// parameters; a release build must not write them to a file that survives in
+// the app's container. The cfg gate below is what enforces that.
+#[cfg(all(target_os = "ios", debug_assertions))]
+pub fn install_ios_cb_log_file() {
+    ios_cb_log_file::install();
+}
+
+/// No-op everywhere else — release iOS, macOS and Android included.
+#[cfg(not(all(target_os = "ios", debug_assertions)))]
+pub fn install_ios_cb_log_file() {}
+
+#[cfg(all(target_os = "ios", debug_assertions))]
+mod ios_cb_log_file {
+    use std::ffi::c_int;
+    use std::io::Write;
+    use std::sync::Once;
+
+    const STDOUT_FILENO: c_int = 1;
+    const STDERR_FILENO: c_int = 2;
+    const READ_CHUNK: usize = 4096;
+
+    extern "C" {
+        fn pipe(fds: *mut c_int) -> c_int;
+        fn dup(oldfd: c_int) -> c_int;
+        fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
+        fn close(fd: c_int) -> c_int;
+        fn read(fd: c_int, buf: *mut std::ffi::c_void, count: usize) -> isize;
+        fn write(fd: c_int, buf: *const std::ffi::c_void, count: usize) -> isize;
+    }
+
+    static INIT: Once = Once::new();
+
+    pub fn install() {
+        INIT.call_once(|| unsafe { install_once() });
+    }
+
+    unsafe fn install_once() {
+        // Documents/, because that is what `devicectl device copy from
+        // --domain-type appDataContainer` can reach.
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let path = format!("{home}/Documents/cb.log");
+        let mut file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        let mut fds: [c_int; 2] = [-1, -1];
+        if pipe(fds.as_mut_ptr()) != 0 {
+            return;
+        }
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let orig_stdout = dup(STDOUT_FILENO);
+        dup2(write_fd, STDOUT_FILENO);
+        dup2(write_fd, STDERR_FILENO);
+        close(write_fd);
+
+        std::thread::spawn(move || {
+            let mut pending: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; READ_CHUNK];
+            loop {
+                let n = unsafe {
+                    read(read_fd, chunk.as_mut_ptr() as *mut std::ffi::c_void, chunk.len())
+                };
+                if n <= 0 {
+                    break;
+                }
+                let got = &chunk[..n as usize];
+                // Straight back out to the real stdout, unchanged, so the
+                // devicectl console stream still carries everything.
+                if orig_stdout >= 0 {
+                    unsafe {
+                        let _ = write(
+                            orig_stdout,
+                            got.as_ptr() as *const std::ffi::c_void,
+                            got.len(),
+                        );
+                    }
+                }
+                pending.extend_from_slice(got);
+                // Write out whole lines only, and FLUSH each time: the
+                // harness polls this file by copying it off the device, and a
+                // half-written line would read as a missing assertion.
+                while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=nl).collect();
+                    let _ = file.write_all(&line);
+                    let _ = file.flush();
+                }
+            }
+        });
+    }
+}

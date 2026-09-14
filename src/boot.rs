@@ -7,6 +7,12 @@
 use crate::*;
 
 pub(crate) fn boot() -> Rc<RefCell<State>> {
+    // Tee `cb:` output to a file in the app container so the cross-device
+    // harness has a RECONNECTABLE log channel on a physical iPhone (the
+    // devicectl --console stream dies with the wireless link and cannot be
+    // re-attached). Debug iOS builds only; a no-op everywhere else. Must run
+    // before the first `cb:` line below.
+    platform::install_ios_cb_log_file();
     let data_dir = std::env::var("APP_DATA_DIR").map(PathBuf::from).unwrap_or_else(|_| {
         PathBuf::from(std::env::var("HOME").expect("HOME"))
             .join("Library/Application Support/Graffito")
