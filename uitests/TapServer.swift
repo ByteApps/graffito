@@ -201,10 +201,22 @@ final class TapServer: XCTestCase {
                 // a leg's taps and typed text going into whatever the banner
                 // opened. That is the difference between one stray tap and a
                 // whole compose sequence entered into someone's bank.
-                app.activate()
-                Thread.sleep(forTimeInterval: 1.5)
-                let recovered = app.state == .runningForeground
-                print("TapServer: re-activated \(XD_BUNDLE_DESC); frontmost now = \(recovered)")
+                // ONLY re-activate an app that is actually RUNNING. activate()
+                // on a .notRunning app LAUNCHES it — and an app launched by
+                // XCUITest is not the process `devicectl ... --console` is
+                // attached to, so the `cb:` log channel the whole suite
+                // asserts on would silently go dead while everything looked
+                // fine. The harness owns launching (dev_launch, under
+                // devicectl); this guard must never take that over.
+                var recovered = false
+                if app.state == .runningBackground || app.state == .runningBackgroundSuspended {
+                    app.activate()
+                    Thread.sleep(forTimeInterval: 1.5)
+                    recovered = app.state == .runningForeground
+                    print("TapServer: re-activated \(XD_BUNDLE_DESC); frontmost now = \(recovered)")
+                } else {
+                    print("TapServer: \(XD_BUNDLE_DESC) is NOT RUNNING (state=\(app.state.rawValue)) — not launching it from here, because an XCUITest-launched process loses the devicectl console stream the suite reads. The harness must relaunch it.")
+                }
                 postResult(to: resultURL, op: op, ok: false,
                            error: "app under test was not frontmost (state \(app.state.rawValue)) — refused to send input somewhere unknown; re-activated=\(recovered)")
                 continue
