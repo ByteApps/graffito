@@ -9,6 +9,8 @@ mod boot;
 mod camera;
 mod editops;
 mod icloud;
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod inject;
 mod keychain;
 mod pending;
 mod platform;
@@ -2254,7 +2256,15 @@ pub fn run() {
     }
 
     let st = boot::boot();
+    // Debug-only, macOS-only UI injection channel (src/inject.rs): install
+    // a non-activating winit backend BEFORE the window exists, only when
+    // GRAFFITO_INJECT_PORT is set — every other launch is untouched.
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    inject::maybe_install_platform();
     let window = AppWindow::new().expect("window");
+    // Start the injection listener now that there is a window to drive.
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    inject::maybe_start_server(&window);
     // iCloud UI is Apple-only; Android's keystore is device-bound.
     window.global::<Ui>().set_apple_platform(cfg!(target_vendor = "apple"));
     window.global::<Ui>().set_desktop_platform(cfg!(target_os = "macos"));

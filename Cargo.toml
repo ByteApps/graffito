@@ -69,6 +69,13 @@ raw-window-handle = "0.6"
 nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 # Native file-open dialog (import-from-file door).
 rfd = "0.14"
+# Debug-only UI injection channel (src/inject.rs): both are already in the
+# graph transitively (slint's default `backend-winit` feature), this just
+# names them directly so inject.rs can build its own non-activating
+# backend. `winit` resolves through the same `[patch.crates-io]` fork as
+# everything else here.
+i-slint-backend-winit = "=1.17.1"
+winit = "0.30"
 
 # iOS: winit + Skia (Metal); femtovg/GL-ES and nokhwa/rfd are not available.
 [target.'cfg(target_os = "ios")'.dependencies]
