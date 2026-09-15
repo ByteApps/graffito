@@ -400,10 +400,38 @@ pub fn type_scale() -> f32 {
 /// surface the native paste menu — an in-app Paste button reads UIPasteboard.
 #[cfg(target_os = "ios")]
 pub fn clipboard_text() -> Option<String> {
+    #[cfg(debug_assertions)]
+    if let Some(s) = xd_paste_file_take() {
+        return Some(s);
+    }
     use objc2_ui_kit::UIPasteboard;
     let pb = unsafe { UIPasteboard::generalPasteboard() };
     let s = unsafe { pb.string() }?;
     Some(s.to_string())
+}
+
+/// Debug-only door for the cross-device UI suite on a PHYSICAL iPhone: if
+/// `Documents/xd-paste.txt` exists in the app container, an in-app Paste
+/// consumes it (read once, then deleted) instead of the system pasteboard.
+///
+/// Why: the suite's XCUITest tap server cannot set the pasteboard on a real
+/// device — `UIPasteboard.general.string = …` from the runner fails with
+/// `PBErrorDomain Code=10/11 "Pasteboard com.apple.UIKit.pboard.general is
+/// not available at this time"` (2026-09-14, iOS 26.6.2; it works on the
+/// simulator, which is how the gap stayed hidden). Typing the ~1.2-2.2 KB
+/// ML-KEM armor is no fallback either: the software keyboard's smart
+/// punctuation rewrites its `-----` runs. The harness drops the file with
+/// `devicectl device copy to` — the mirror of how it pulls `Documents/cb.log`
+/// — then taps the field's own Paste. Same-app data, so no "Allow Paste"
+/// alert. Compiled out of release like the cb.log tee.
+#[cfg(all(target_os = "ios", debug_assertions))]
+fn xd_paste_file_take() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = format!("{home}/Documents/xd-paste.txt");
+    let s = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    eprintln!("cb: xd-paste file len={}", s.len());
+    Some(s)
 }
 
 /// macOS pasteboard access goes through NSPasteboard, NOT the `pbcopy` /
