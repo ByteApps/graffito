@@ -389,6 +389,35 @@ pub(crate) fn note_subdust_fold_warn(w: &AppWindow, change: u64, fee: u64, vsize
     w.global::<Ui>().set_confirm_warn(if existing.is_empty() { msg.into() } else { format!("{existing}; {msg}").into() });
 }
 
+/// Debug-only per-refresh timing (Android input-watchdog investigation,
+/// 2026-09-15): `refresh_compose` does payfrom/fee/PQ estimation work that
+/// can run into tens of ms, and on Android that runs on `android_main` —
+/// the SAME thread that drains the NativeActivity input queue — so the
+/// cost of every edit-driven refresh matters for how many keystrokes a
+/// typing burst can lose. An RAII guard rather than hand-instrumenting
+/// every early `return` in `refresh_compose_inner` below: it logs on drop,
+/// so every exit path is covered for free. `#[cfg(debug_assertions)]`
+/// throughout — never in a release build.
+#[cfg(debug_assertions)]
+struct ComposeRefreshTimer {
+    start: std::time::Instant,
+    from: &'static str,
+}
+
+#[cfg(debug_assertions)]
+impl ComposeRefreshTimer {
+    fn new(from: &'static str) -> Self {
+        Self { start: std::time::Instant::now(), from }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for ComposeRefreshTimer {
+    fn drop(&mut self) {
+        println!("cb: compose-refresh ms={} from={}", self.start.elapsed().as_millis(), self.from);
+    }
+}
+
 impl State {
 /// The active external funding wallet's Activity pill value
 /// (`"wallet:<label>"`), or `None` if no funding wallet is active — used
@@ -2034,7 +2063,26 @@ pub(crate) fn balance_text_for(&self, kind: &str) -> String {
     st.store.as_ref().map(|s| format!("{} sats", commas(s.balance()))).unwrap_or_default()
 }
 
+/// Plain `refresh_compose` — every one of the ~28 non-edit call sites
+/// (pills, sheets, pick-contact, Rust callers touching state directly)
+/// keeps calling this unchanged and stays synchronous; tagged "other" in
+/// the debug timing trace. Edit-driven callers (the Note field, the
+/// passphrase field) go through [`refresh_compose_from`] instead, via the
+/// debounce timers wired in `run()`.
 pub(crate) fn refresh_compose(&mut self, w: &AppWindow) {
+    self.refresh_compose_from(w, "other");
+}
+
+/// Same as [`Self::refresh_compose`], tagged for the debug timing trace —
+/// `from` names what triggered this refresh (`"edit"`, `"passphrase"`,
+/// `"other"`, …).
+pub(crate) fn refresh_compose_from(&mut self, w: &AppWindow, from: &'static str) {
+    #[cfg(debug_assertions)]
+    let _t = ComposeRefreshTimer::new(from);
+    self.refresh_compose_inner(w);
+}
+
+fn refresh_compose_inner(&mut self, w: &AppWindow) {
     let st = self;
     // Keep the locktime panel's caption/warning fresh against the current
     // tip even if the store's scan advances while compose stays open (the
@@ -3067,11 +3115,16 @@ pub(crate) fn on_pq_generate_passphrase(&mut self, w: &AppWindow) {
         show_toast(w, if ok { "Copied" } else { "Copy failed" });
     }
 
-pub(crate) fn on_pq_passphrase_changed(&mut self, w: &AppWindow, text: SharedString) {
+pub(crate) fn on_pq_passphrase_changed(&mut self, _w: &AppWindow, text: SharedString) {
         let text = text.to_string();
         self.pq_passphrase_verified = self.pq_passphrase_generated.as_deref() == Some(text.as_str());
+        // `cb: pq-passphrase` is a log CONTRACT (grepped as the LAST len=
+        // line after typing a passphrase) — keep it per-edit even though
+        // the refresh_compose() it used to trigger synchronously is now
+        // debounced (Android input-watchdog fix, 2026-09-15: see `run()`'s
+        // `on_pq_passphrase_changed` wiring, which schedules the debounced
+        // refresh AFTER calling this method).
         println!("cb: pq-passphrase len={} verified={}", text.chars().count(), self.pq_passphrase_verified);
-        self.refresh_compose(w);
     }
 
 pub(crate) fn on_pq_mlkem_toggled(&mut self, w: &AppWindow, on: bool) {
@@ -3313,6 +3366,15 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
             w.global::<Ui>().set_status("still syncing — one moment".into());
             return;
         }
+        // Force a synchronous refresh before trusting `spend_enough`/
+        // `compose_oversize` below (Android input-watchdog fix, 2026-09-15):
+        // edit-driven refreshes are now debounced (~150ms, see `run()`'s
+        // `on_compose_changed`/`on_pq_passphrase_changed` wiring), so a Sign
+        // tap that lands inside that window would otherwise read a verdict
+        // computed against STALE text. Re-running here is idempotent and
+        // reads the CURRENT `Compose.compose-text` fresh, same as every
+        // other `refresh_compose` call.
+        self.refresh_compose_from(w, "send");
         let text = w.global::<Compose>().get_compose_text().to_string();
         let private = w.global::<Compose>().get_compose_private();
         let rate: f64 = w.global::<Compose>().get_rate_text().parse().unwrap_or(0.0);

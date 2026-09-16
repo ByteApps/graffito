@@ -309,7 +309,14 @@ pub(crate) fn on_cancel_remove(&mut self, w: &AppWindow) {
     }
 
 pub(crate) fn on_compose_changed(&mut self, w: &AppWindow) {
-        self.refresh_compose(w);
+        // Debug-only per-edit trace (Android input-watchdog investigation,
+        // 2026-09-15) — cheap (a char count), so it stays synchronous even
+        // though the actual `refresh_compose()` this used to call directly
+        // is now debounced (see `run()`'s `on_compose_changed` wiring,
+        // which calls this method for the synchronous bit, then restarts a
+        // single-shot timer for the coalesced refresh).
+        #[cfg(debug_assertions)]
+        println!("cb: compose-text len={}", w.global::<Compose>().get_compose_text().chars().count());
     }
 
 pub(crate) fn on_refresh_coins(&mut self, w: &AppWindow) {

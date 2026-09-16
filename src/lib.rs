@@ -2941,7 +2941,39 @@ pub fn run() {
 
     cb!(Modals, on_remove_contact, |w, s, addr: SharedString| { s.on_remove_contact(&w, addr) });
 
-    cb!(Ui, on_compose_changed, |w, s| { s.on_compose_changed(&w) });
+    // Debounced (Android input watchdog, `../CLAUDE.md` — and the ANR/
+    // dropped-character defect measured on a Pixel 2026-09-15):
+    // `refresh_compose()` prices fees/PQ/payfrom on every edit, which can
+    // run into tens of ms, and on Android that work runs on `android_main`
+    // — the SAME thread that drains the NativeActivity input queue — so a
+    // fast typing burst starves it long enough to drop characters (and
+    // once, trip the 5s ANR watchdog). Written out rather than via `cb!`
+    // (which would re-borrow `st` for the whole body and can't own a
+    // persistent `Timer`): the synchronous per-edit bit still runs
+    // immediately through `on_compose_changed` (its debug length trace),
+    // then a single-shot timer RESTARTED on every call coalesces a typing
+    // burst into ONE `refresh_compose_from(w, "edit")` ~150ms after the
+    // last keystroke. `Timer::start` is documented to restart if already
+    // running, so this is a true debounce, not a queue. Platform-neutral —
+    // the same path runs on desktop. Every other `refresh_compose` call
+    // site (pills, sheets, pick-contact, Rust callers) is untouched and
+    // stays synchronous.
+    {
+        let compose_debounce = slint::Timer::default();
+        let st = st.clone();
+        let weak = window.as_weak();
+        window.global::<Ui>().on_compose_changed(move || {
+            let w = weak.unwrap();
+            st.borrow_mut().on_compose_changed(&w);
+            let st = st.clone();
+            let weak = weak.clone();
+            compose_debounce.start(slint::TimerMode::SingleShot, std::time::Duration::from_millis(150), move || {
+                if let Some(w) = weak.upgrade() {
+                    st.borrow_mut().refresh_compose_from(&w, "edit");
+                }
+            });
+        });
+    }
 
     // Post-quantum "Security" section (compose screen 6). The Generate
     // button is the ONLY door to a verified (certified quantum-resistant)
@@ -2956,7 +2988,27 @@ pub fn run() {
     // anything else (including reverting back to a substring of it) reads
     // as unverified, matching `passphrase_verified`'s doc: "unedited
     // since".
-    cb!(Compose, on_pq_passphrase_changed, |w, s, text: SharedString| { s.on_pq_passphrase_changed(&w, text) });
+    // Debounced the same way as `on_compose_changed` above (Android input
+    // watchdog) — `on_pq_passphrase_changed` still runs synchronously for
+    // its own per-edit log contract (`cb: pq-passphrase len=… verified=…`
+    // stays a per-keystroke line), only the `refresh_compose()` it used to
+    // call directly is coalesced.
+    {
+        let pq_passphrase_debounce = slint::Timer::default();
+        let st = st.clone();
+        let weak = window.as_weak();
+        window.global::<Compose>().on_pq_passphrase_changed(move |text: SharedString| {
+            let w = weak.unwrap();
+            st.borrow_mut().on_pq_passphrase_changed(&w, text);
+            let st = st.clone();
+            let weak = weak.clone();
+            pq_passphrase_debounce.start(slint::TimerMode::SingleShot, std::time::Duration::from_millis(150), move || {
+                if let Some(w) = weak.upgrade() {
+                    st.borrow_mut().refresh_compose_from(&w, "passphrase");
+                }
+            });
+        });
+    }
 
     cb!(Compose, on_pq_mlkem_toggled, |w, s, _on: bool| { s.on_pq_mlkem_toggled(&w, _on) });
     cb!(Compose, on_pq_pw_cost_changed, |w, s, cost: SharedString| { s.on_pq_pw_cost_changed(&w, cost) });
