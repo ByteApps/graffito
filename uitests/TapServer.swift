@@ -241,8 +241,27 @@ final class TapServer: XCTestCase {
                 swipe(in: app, x: x, y: y, dx: dx, dy: dy, duration: duration)
 
             case "type":
+                // GUARD: `app.typeText` when nothing holds keyboard focus
+                // raises XCTest's "Failed to synthesize event: Neither
+                // element nor any descendant has keyboard focus" — and
+                // unlike an ordinary XCTest assertion, that is NOT covered
+                // by `continueAfterFailure = true` above: it ends the whole
+                // test session, xcodebuild exits, and the harness then
+                // spends ~2 minutes restarting the runner before it can
+                // even report the failure (runs 0641 and 1420 died exactly
+                // this way, 2026-09-15). Check a keyboard is actually up
+                // first (1.5s allows for the keyboard's own show animation
+                // right after a tap) and refuse to type otherwise — a
+                // normal command failure the harness can retry/report,
+                // instead of a runner death.
                 let text = command["text"] as? String ?? ""
-                app.typeText(text)
+                if !app.keyboards.firstMatch.waitForExistence(timeout: 1.5) {
+                    ok = false
+                    errorMessage = "no keyboard focus — nothing to type into"
+                    print("TapServer: error: \(errorMessage!)")
+                } else {
+                    app.typeText(text)
+                }
 
             case "pasteboard":
                 let text = command["text"] as? String ?? ""
