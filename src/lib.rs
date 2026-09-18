@@ -323,6 +323,20 @@ struct State {
     tx_lock_time_override: Option<app_core::notes_core::tx::LockTimePolicy>,
     ident: Option<AppIdentity>,
     store: Option<Store>,
+    /// Home's notes-list window (history-scaling): how many rows of the
+    /// active notebook's full sorted/filtered note list the user has
+    /// expanded to via `notes-load-more` — starts at `NOTES_WINDOW`,
+    /// grows by `NOTES_WINDOW_STEP` per load-more, reset to
+    /// `NOTES_WINDOW` on every `activate()` (a notebook/account/identity
+    /// switch) so a full repaint mid-scan never collapses an expanded
+    /// list back down on its own. See `update_home_notes`.
+    home_notes_shown: usize,
+    /// The `Rc<VecModel<NoteItem>>` bound to `Ui.notes`, kept across
+    /// repaints (never replaced) so `update_home_notes` can `extend()`
+    /// new rows onto it instead of resetting the whole model — that's
+    /// what keeps a `notes-load-more` from flashing/losing the
+    /// Flickable's scroll position.
+    home_notes_model: Rc<VecModel<NoteItem>>,
     fees: Option<FeeRates>,
     usd: Option<f64>,
     /// Session cache stamp for [`refresh_fees_price`] (network-efficiency,
@@ -1331,6 +1345,8 @@ impl State {
             tx_lock_time_override: None,
             ident: None,
             store: None,
+            home_notes_shown: NOTES_WINDOW,
+            home_notes_model: Rc::new(VecModel::default()),
             fees: None,
             usd: None,
             fees_fetched_at: None,
@@ -1507,6 +1523,12 @@ pub(crate) fn activate(&mut self, material_str: &str, persist: bool) -> Result<(
     st.spending_source = None;
     st.spending_coins.clear();
     st.spending_scanned = false;
+    // Home's notes-list window (history-scaling): activate() is the sole
+    // choke point for every notebook/account/network/identity switch —
+    // an expanded list from the PREVIOUSLY active notebook must never
+    // leak into a freshly opened one, so every activation starts
+    // collapsed again (see `update_home_notes`).
+    st.home_notes_shown = NOTES_WINDOW;
     // Taproot change-chain coins are per (identity, account, network) — but
     // UNLIKE the spending wallet above, they must survive a mere notebook
     // switch WITHIN the same context: they're account-level (shared by every
@@ -3371,6 +3393,8 @@ pub fn run() {
 
     cb!(Home, on_toggle_sender, |w, s, key: SharedString, excluded: bool| { s.on_toggle_sender(&w, key, excluded) });
 
+    cb!(Ui, on_notes_load_more, |w, s| { s.on_notes_load_more(&w) });
+
     let auto_refresh = slint::Timer::default();
     {
         let st = st.clone();
@@ -3664,6 +3688,20 @@ fn android_main(app: slint::android::AndroidApp) {
     slint::android::init(app).expect("slint android init");
     run();
 }
+
+/// U1 flow test addition (`plans/PLAN-graffito-history-scaling.md`): `pending`'s
+/// `QUEUE`/`SCAN_LANE` statics are process-global, so any test that spawns a
+/// REAL background scan worker (`refresh_async` et al.) and then drains
+/// jobs from `QUEUE` itself must serialize against every OTHER test that
+/// also posts/drains it directly (the pre-existing FIFO ordering test in
+/// `pending`'s own module, and the scan-gate-balance test alongside it) —
+/// `cargo test`'s default parallel test threads would otherwise let two
+/// such tests interleave posts into the SAME global `Vec`. Only tests that
+/// touch those statics need to acquire this; every other test in this
+/// binary (the vast majority, deliberately kept network-free — see e.g.
+/// `ui_flow_app_notebooks.rs`'s header) never contends for it.
+#[cfg(test)]
+pub(crate) static QUEUE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests;

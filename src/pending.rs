@@ -916,7 +916,7 @@ pub(crate) fn wallet_stores_refresh_async(&mut self, w: &AppWindow, purpose: Wal
             .into_iter()
             .map(|(index, address)| NotebookBundleResult {
                 index,
-                bundle: client.build_bundle(&address, None).map_err(|e| format!("{e}")),
+                bundle: client.build_bundle(&address).map_err(|e| format!("{e}")),
             })
             .collect();
         let current_statuses =
@@ -1915,6 +1915,40 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
         .collect();
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
     let prev_stats = st.store.as_ref().unwrap().addr_stats.clone();
+    // U1 streaming (`plans/PLAN-graffito-history-scaling.md`): what this
+    // scan already knows, so `ChainClient::scan_history` can stop paging
+    // early instead of always walking the full history like the old
+    // `build_bundle` call did. `known_confirmed` = every CONFIRMED
+    // txid-bearing record the store persists (notes, sweep/consolidate
+    // txs, and confirmed utxos — never a pending one); `must_see` = every
+    // note/tx record the store still holds PENDING (own or received),
+    // which blocks the early stop until each has turned up on some page
+    // (see `ScanCursor`'s own doc comment for why).
+    let cursor = {
+        let store = st.store.as_ref().unwrap();
+        let mut known_confirmed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut must_see: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for n in &store.notes {
+            match n.status {
+                NoteStatus::Confirmed => known_confirmed.extend(n.txids.iter().cloned()),
+                NoteStatus::Pending => must_see.extend(n.txids.iter().cloned()),
+                NoteStatus::Orphaned => {}
+            }
+        }
+        for t in &store.txs {
+            match t.status {
+                NoteStatus::Confirmed => known_confirmed.extend(t.txids.iter().cloned()),
+                NoteStatus::Pending => must_see.extend(t.txids.iter().cloned()),
+                NoteStatus::Orphaned => {}
+            }
+        }
+        for u in &store.utxos {
+            if u.height.is_some() {
+                known_confirmed.insert(u.txid.clone());
+            }
+        }
+        app_core::chain::ScanCursor { known_confirmed, must_see, tip_height: store.tip_height as u32 }
+    };
     let key = format!("nbscan/{address}");
     let creds = st.core_rpc_creds_for(&base, network);
     let core_watch = st.core_rpc_watch.clone();
@@ -1943,8 +1977,24 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
         // burst. A stats error (regtest server.py has no bare /address
         // endpoint) falls through to the full scan — the pre-check is an
         // optimization, never a gate.
+        //
+        // U1 review fix: that "always registers" claim is backend-
+        // dependent, not universal. Esplora/Electrum stats move on a
+        // confirm/drop transition, but the Core RPC backend's `/address/:a`
+        // shape is built from `listunspent`/`getreceivedbyaddress`, whose
+        // `tx_count` is only a PRESENCE flag — an outgoing pending tx that
+        // leaves no change at this address produces an IDENTICAL
+        // fingerprint before and after it confirms, which would hide the
+        // confirmation forever. So the short-circuit is gated on
+        // `nothing_pending` FIRST: it may only fire when the store holds no
+        // pending/unconfirmed record at all (the same population
+        // `cursor.must_see` and `dropped_checks` are built from) — whenever
+        // anything is pending, this always falls through to the now-cheap
+        // incremental `scan_history` walk (3 paths + one page, thanks to
+        // the cursor) regardless of the fingerprint.
         let new_stats = client.address_stats(&address).ok();
-        if prev_stats.is_some() && new_stats == prev_stats {
+        let nothing_pending = cursor.must_see.is_empty() && dropped_checks.is_empty();
+        if nothing_pending && prev_stats.is_some() && new_stats == prev_stats {
             // Network-efficiency (2026-07-23): fees used to refresh here
             // (one request) so compose estimates never went stale behind
             // the short-circuit — but fees/USD are only READ by the
@@ -1962,7 +2012,26 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
             post(&weak, move |w, st| st.apply_refresh_result(w, r));
             return;
         }
-        let bundle = client.build_bundle(&address, None).map_err(|e| format!("{e}"));
+        // U1 streaming: page through history via `scan_history` instead of
+        // `build_bundle`'s always-full walk, applying each PARTIAL page to
+        // the live store as it arrives (`apply_refresh_page`, posted like
+        // any other worker result) so a large/first-ever scan paints notes
+        // incrementally instead of only after the whole walk finishes. The
+        // cumulative FULL bundle this still returns is applied exactly as
+        // before via the unchanged `RefreshResult`/`apply_refresh_result`
+        // path below — one `cb: refresh notes=` line, one gate transition,
+        // per scan, no matter how many pages it took.
+        let address_for_pages = address.clone();
+        let weak_for_pages = weak.clone();
+        let mut page_num = 0u32;
+        let mut on_page = move |page: &app_core::notes_core::bundle::SyncBundle| {
+            page_num += 1;
+            let n = page_num;
+            let page_bundle = page.clone();
+            let addr = address_for_pages.clone();
+            post(&weak_for_pages, move |w, st| st.apply_refresh_page(w, addr, n, page_bundle));
+        };
+        let bundle = client.scan_history(&address, &cursor, &mut on_page).map_err(|e| format!("{e}"));
         let statuses = pending_txids
             .iter()
             .map(|t| (t.clone(), client.fetch_tx_status(t)))
@@ -2084,6 +2153,71 @@ pub(crate) fn apply_active_bundle(&mut self, w: &AppWindow, bundle: Result<app_c
         }
     }
     st.update_home(w);
+}
+
+/// U1 streaming (`plans/PLAN-graffito-history-scaling.md`): the UI-thread
+/// per-page half of the new `refresh_async` — applies ONE PARTIAL
+/// (`full: false`) bundle from `ChainClient::scan_history`'s `on_page`
+/// callback. Staleness guard on address, same idea as
+/// [`apply_refresh_result`]'s but a DISTINCT log line (`page-drop`, never
+/// `stale-drop`) — dropping a mid-scan page (the user switched notebooks)
+/// is routine and must never be confused with the final result's drop in
+/// a log grep. Applies through the SAME `apply_bundle`/`apply_bundle_watch`
+/// calls [`apply_active_bundle`] uses — `bundle.full` is `false` here, so
+/// `Store::apply_recovered`'s prune/reconcile path never runs (see its own
+/// doc comment: partial bundles only ever upsert/promote/merge-utxos) —
+/// but this deliberately skips everything [`apply_active_bundle`] does
+/// besides the apply itself: no `save_store`, no `drain_notebook`, no
+/// `update_scan_gate`, no `cb: refresh notes=` line. Those stay the FINAL
+/// post's job alone (`apply_refresh_result` -> `apply_active_bundle`), so a
+/// whole scan — however many pages it took — logs exactly ONE
+/// `cb: refresh notes=` line and ONE gate transition. Repaints only the
+/// notes list (`update_home_notes`), not the whole screen.
+pub(crate) fn apply_refresh_page(
+    &mut self,
+    w: &AppWindow,
+    address: String,
+    page_num: u32,
+    bundle: app_core::notes_core::bundle::SyncBundle,
+) {
+    let st = self;
+    if st.ident.as_ref().map(|i| i.address.as_str()) != Some(address.as_str()) {
+        println!("cb: refresh page-drop address={}", &address[..12.min(address.len())]);
+        return;
+    }
+    let keyed = st.ident.as_ref().unwrap().full().map(|i| i.clone_fields());
+    let output_x = st.ident.as_ref().unwrap().output_x();
+    let network = st.network;
+    let notebook_spks = st.notebook_spks_for();
+    let spending_window_spks = st.spending_window_spks_for();
+    let mlkem_secrets = mlkem_secrets_for(st.ident.as_ref().unwrap(), st.pq_imported.as_ref());
+    let n = bundle.notes_onchain.len();
+    let applied = match &keyed {
+        Some(identity) => st.store.as_mut().unwrap().apply_bundle(
+            &bundle,
+            identity,
+            network,
+            &notebook_spks,
+            &spending_window_spks,
+            &mlkem_secrets,
+        ),
+        None => st.store.as_mut().unwrap().apply_bundle_watch(
+            &bundle,
+            &output_x,
+            network,
+            &notebook_spks,
+            &spending_window_spks,
+        ),
+    };
+    if let Err(e) = applied {
+        // Never seen in practice (a partial bundle is the same shape a
+        // full one already applies successfully) — logged rather than
+        // silently swallowed so a real regression doesn't vanish.
+        println!("cb: refresh page-err={e}");
+        return;
+    }
+    println!("cb: refresh page={page_num} txs={n} address={}", &address[..12.min(address.len())]);
+    st.update_home_notes(w);
 }
 
 /// The UI-thread half of [`refresh_async`]: identical bookkeeping to the
@@ -2235,7 +2369,7 @@ pub(crate) fn refresh(&mut self, w: &AppWindow) {
     };
     let address = st.ident.as_ref().unwrap().address.clone();
     let dropped_checks = gather_dropped_checks(st.store.as_ref().unwrap());
-    match client.build_bundle(&address, None) {
+    match client.build_bundle(&address) {
         Ok(bundle) => {
             // st.fees/st.usd NOT stamped from a scan — see the matching
             // comment in `apply_active_bundle` (network-efficiency,
@@ -2623,6 +2757,10 @@ mod tests {
     /// `Ui::apply-pending` callback does.
     #[test]
     fn apply_pending_runs_jobs_in_fifo_arrival_order() {
+        // Serializes against every other test that posts/drains the
+        // process-global `QUEUE`/`SCAN_LANE` directly — see
+        // `QUEUE_TEST_LOCK`'s own doc comment.
+        let _queue_lock = QUEUE_TEST_LOCK.lock().expect("queue test lock");
         i_slint_backend_testing::init_no_event_loop();
         let app = AppWindow::new().expect("AppWindow");
         let weak = app.as_weak();
@@ -2658,5 +2796,75 @@ mod tests {
         assert_eq!(*order.lock().expect("order mutex"), vec![0, 1, 2]);
         // apply_pending must leave the queue empty behind it.
         assert!(QUEUE.lock().expect("pending queue mutex").is_empty());
+    }
+
+    const GATE_TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon \
+                                       abandon abandon abandon abandon about";
+
+    /// U1 streaming (`plans/PLAN-graffito-history-scaling.md`): admit/drain
+    /// must balance 1:1 per scan no matter how many pages it took —
+    /// `apply_refresh_page` (the per-page half) must NEVER touch the
+    /// scan-gate, only the FINAL `apply_refresh_result` may drain it.
+    /// Mirrors a real `refresh_async` worker's post sequence — N partial
+    /// posts, then one final post, each drained through `apply_pending`
+    /// exactly like the real `Ui.apply-pending` callback would — and
+    /// asserts `scan_gate.busy()` stays true across every partial and only
+    /// goes false after the final.
+    #[test]
+    fn refresh_page_and_final_balance_the_scan_gate() {
+        let _queue_lock = QUEUE_TEST_LOCK.lock().expect("queue test lock");
+        i_slint_backend_testing::init_no_event_loop();
+        let mut st =
+            State::test_stub(Network::Regtest, HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
+        let dir = std::env::temp_dir()
+            .join(format!("graffito-pending-gate-balance-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        st.data_dir = dir;
+        st.activate(GATE_TEST_MNEMONIC, false).expect("activate");
+        let address = st.ident.as_ref().expect("ident").address.clone();
+
+        let app = AppWindow::new().expect("AppWindow");
+        let weak = app.as_weak();
+
+        // The real admission site is `refresh_async`'s `scan_lane_submit`
+        // callback — reproduced directly here since this test drives
+        // `apply_refresh_page`/`apply_refresh_result` without going
+        // through the scan lane itself.
+        st.scan_gate.admit_notebook();
+        st.update_scan_gate(&app);
+        assert!(st.scan_gate.busy(), "an admitted scan must read busy");
+
+        for page_num in 1..=3u32 {
+            let page = app_core::notes_core::bundle::SyncBundle {
+                full: false,
+                network: Network::Regtest.as_str().to_string(),
+                ..Default::default()
+            };
+            let addr = address.clone();
+            post(&weak, move |w, st| st.apply_refresh_page(w, addr, page_num, page));
+            st.apply_pending(&app);
+            assert!(st.scan_gate.busy(), "gate must still be busy after partial {page_num}");
+        }
+
+        let addr = address.clone();
+        post(&weak, move |w, st| {
+            st.apply_refresh_result(
+                w,
+                RefreshResult {
+                    address: addr,
+                    bundle: Some(Ok(app_core::notes_core::bundle::SyncBundle {
+                        full: true,
+                        network: Network::Regtest.as_str().to_string(),
+                        ..Default::default()
+                    })),
+                    new_stats: None,
+                    statuses: Vec::new(),
+                    dropped_lookup: HashMap::new(),
+                    dropped_unspent: HashMap::new(),
+                },
+            );
+        });
+        st.apply_pending(&app);
+        assert!(!st.scan_gate.busy(), "the final post is the only thing that may drain the gate");
     }
 }

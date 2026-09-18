@@ -79,9 +79,21 @@ pub(super) struct EsploraAddrStats {
 
 
 /// Flat "did anything change since last scan" fingerprint for one address —
-/// esplora's `GET /address/:a` chain + mempool stats, flattened. A later
-/// wiring pass compares this against the last-persisted value ([`Store`]'s
-/// `addr_stats` field) to short-circuit a refresh when nothing moved.
+/// esplora's `GET /address/:a` chain + mempool stats, flattened. Compared
+/// by equality against the last-persisted value ([`Store`]'s `addr_stats`)
+/// to short-circuit a refresh when nothing moved, and read as `tx_count > 0`
+/// by `address_used`. Nothing displays these numbers.
+///
+/// Per-backend semantics (`plans/PLAN-graffito-history-scaling.md`, U2):
+/// Esplora is exact. Electrum: exact tx counts from `get_history`; `funded`
+/// is the current balance (`get_balance` confirmed / positive unconfirmed),
+/// `chain_spent` is 0 and `mempool_spent` a negative unconfirmed balance.
+/// Core RPC: `tx_count` is a 0/1 PRESENCE flag per bucket (no cheap RPC
+/// counts a watched address's spends), `funded` is lifetime received
+/// (`getreceivedbyaddress`), `chain_spent` is received minus unspent, and
+/// `mempool_spent` is 0. Because Core's shape cannot see a change-less
+/// outgoing tx confirm, the app's short-circuit only fires when the store
+/// has nothing pending (`refresh_async`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddrStats {
     pub chain_tx_count: u64,

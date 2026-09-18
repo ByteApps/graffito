@@ -120,6 +120,14 @@ mod ui_flow_app_spending_wallet;
 mod ui_flow_app_payfrom_state;
 mod ui_flow_app_dispatch;
 mod ui_flow_app_subdust_fold;
+/// History-scaling U-notes-window: Home's notes list windows to
+/// `NOTES_WINDOW` rows + `notes-load-more` growth instead of instantiating
+/// every note. Same real State/AppWindow flow as `ui_flow_app_notebooks`.
+mod ui_flow_home_window;
+/// History-scaling U1 (`plans/PLAN-graffito-history-scaling.md`): the full
+/// streaming-scan pipeline against a REAL loopback fake-Esplora server —
+/// see the file's own header for exactly what it proves.
+mod ui_flow_history_streaming;
 /// U11 (plans/PLAN-graffito-app-arch.md): in-process ports of the NETWORK-FREE
 /// legs of the coordinate Mac suite
 /// (ui-automation/tests/graffito-app-matrix.sh) — S1 hex import/copy/

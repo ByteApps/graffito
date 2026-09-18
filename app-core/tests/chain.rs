@@ -110,7 +110,7 @@ fn foreign_identity() -> app_core::notes_core::bundle::Identity {
 fn old_format_sim_identity_private_note_is_no_longer_decodable() {
     let fx = Fixture::for_address(SIM_ADDR, "sim-txs.json", "sim-utxo.json");
     let client = ChainClient::new(fx, Network::Testnet4);
-    let bundle = client.build_bundle(SIM_ADDR, None).unwrap();
+    let bundle = client.build_bundle(SIM_ADDR).unwrap();
 
     assert!(bundle.full);
     assert_eq!(bundle.network, "testnet4");
@@ -149,7 +149,7 @@ fn old_format_sim_identity_private_note_is_no_longer_decodable() {
 fn old_format_throwaway_public_note_is_no_longer_decodable() {
     let fx = Fixture::for_address(THROWAWAY_ADDR, "throwaway-txs.json", "throwaway-utxo.json");
     let client = ChainClient::new(fx, Network::Testnet4);
-    let bundle = client.build_bundle(THROWAWAY_ADDR, None).unwrap();
+    let bundle = client.build_bundle(THROWAWAY_ADDR).unwrap();
 
     // Funding/sweep txs carry no OP_RETURN — they must not appear; the
     // one PNTE-shaped candidate is the old-format relay-probe note.
@@ -161,27 +161,12 @@ fn old_format_throwaway_public_note_is_no_longer_decodable() {
     assert!(notes.is_empty(), "the old binary envelope version byte is rejected outright");
 }
 
-#[test]
-fn incremental_bundle_filters_by_height() {
-    let fx = Fixture::for_address(SIM_ADDR, "sim-txs.json", "sim-utxo.json");
-    let client = ChainClient::new(fx, Network::Testnet4);
-
-    let full = client.build_bundle(SIM_ADDR, None).unwrap();
-    let heights: Vec<u64> =
-        full.notes_onchain.iter().filter_map(|t| t.height).collect();
-    let max = *heights.iter().max().expect("confirmed notes exist");
-
-    // since = max ⇒ nothing new; since = max-1 ⇒ only the newest remain.
-    let none_new = client.build_bundle(SIM_ADDR, Some(max)).unwrap();
-    assert!(!none_new.full);
-    assert!(none_new.notes_onchain.iter().all(|t| t.height.is_none()));
-
-    let some = client.build_bundle(SIM_ADDR, Some(max - 1)).unwrap();
-    assert!(some
-        .notes_onchain
-        .iter()
-        .all(|t| t.height.is_none_or(|h| h > max - 1)));
-}
+// `incremental_bundle_filters_by_height` (the `since_height` post-fetch
+// filter) is RETIRED — plans/PLAN-graffito-history-scaling.md U1 dropped the
+// `build_bundle` parameter in favor of `ChainClient::scan_history`'s
+// pre-fetch `ScanCursor` stop rule. Its request-path-level equivalents live
+// in `app-core/tests/esplora_paths.rs`
+// (`full_scan_stops_at_known_confirmed_txid` and friends).
 
 #[test]
 fn pagination_follows_full_pages() {
@@ -255,7 +240,7 @@ fn default_bases() {
 fn old_format_watch_scan_finds_neither_recorded_note() {
     let fx = Fixture::for_address(SIM_ADDR, "sim-txs.json", "sim-utxo.json");
     let client = ChainClient::new(fx, Network::Testnet4);
-    let bundle = client.build_bundle(SIM_ADDR, None).unwrap();
+    let bundle = client.build_bundle(SIM_ADDR).unwrap();
 
     let notes = extract_notes_watch(&bundle, Network::Testnet4);
     assert!(notes.iter().find(|n| n.id == SIM_PRIVATE_TXID).is_none());
@@ -264,7 +249,7 @@ fn old_format_watch_scan_finds_neither_recorded_note() {
     // And the throwaway's public note is equally invisible now.
     let fx = Fixture::for_address(THROWAWAY_ADDR, "throwaway-txs.json", "throwaway-utxo.json");
     let client = ChainClient::new(fx, Network::Testnet4);
-    let bundle = client.build_bundle(THROWAWAY_ADDR, None).unwrap();
+    let bundle = client.build_bundle(THROWAWAY_ADDR).unwrap();
     let notes = extract_notes_watch(&bundle, Network::Testnet4);
     assert!(notes.iter().find(|n| n.id == THROWAWAY_PUBLIC_TXID).is_none());
     assert!(notes.is_empty());

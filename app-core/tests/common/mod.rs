@@ -51,6 +51,12 @@ pub mod mock_rpc;
 /// wallet grow" — see its own doc comment.
 pub mod count_proxy;
 
+/// U1 (`plans/PLAN-graffito-history-scaling.md`): a real-socket
+/// (`std::net::TcpListener`) counterpart of [`EsploraFake`] below, for
+/// proving `HttpTransport`/`AnyTransport` behave identically to the
+/// in-process fake over an actual HTTP round trip. See its own doc comment.
+pub mod esplora_server;
+
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet};
 use std::str::FromStr;
@@ -798,7 +804,30 @@ fn assert_utxos_match_tolerant(
 /// confirmation-state comparison below is a `>=`/tolerant check instead,
 /// see [`assert_utxos_match_tolerant`] and the inline comments at each
 /// remaining site.
+/// How much of esplora's `/address/:a` stats a backend reproduces
+/// (`plans/PLAN-graffito-history-scaling.md`, U2). The app reads
+/// [`AddrStats`] only as an equality fingerprint plus `tx_count > 0`
+/// (`address_used`), so a backend without a cheap per-address tx count
+/// may serve a fingerprint-grade shape instead of paying one fetch per
+/// wallet tx on every quiet tick — which is what U2 removed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatsContract {
+    /// Esplora semantics, exact: per-address tx counts, lifetime funded and
+    /// spent sums in both buckets.
+    Exact,
+    /// Core RPC: `tx_count` is a 0/1 PRESENCE flag per bucket (Core has no
+    /// per-address history filter that can see a spend of this address's
+    /// coin without the full wallet walk), lifetime funded is exact
+    /// (`getreceivedbyaddress`), and spent is `received - unspent` — a
+    /// change-detection quantity, not esplora's lifetime spent sum.
+    Fingerprint,
+}
+
 pub fn assert_chain_contract<T: Transport>(client: &ChainClient<T>, sc: &Scenario) {
+    assert_chain_contract_with(client, sc, StatsContract::Exact)
+}
+
+pub fn assert_chain_contract_with<T: Transport>(client: &ChainClient<T>, sc: &Scenario, stats_contract: StatsContract) {
     let live_tip = client.tip_height().unwrap();
     assert!(
         live_tip >= sc.tip_height,
@@ -837,25 +866,53 @@ pub fn assert_chain_contract<T: Transport>(client: &ChainClient<T>, sc: &Scenari
         // mempool -> chain during a long run, never the reverse).
         let (ctc, cf, cs, mtc, mf, ms) = sc.stats_for(&address);
         let stats = client.address_stats(&address).unwrap();
-        assert_eq!(
-            stats.chain_tx_count + stats.mempool_tx_count,
-            ctc + mtc,
-            "address_stats({address}) total tx_count"
-        );
+        // Lifetime funded is exact on every backend (Core: getreceivedbyaddress).
         assert_eq!(stats.chain_funded + stats.mempool_funded, cf + mf, "address_stats({address}) total funded");
-        assert_eq!(stats.chain_spent + stats.mempool_spent, cs + ms, "address_stats({address}) total spent");
-        assert!(
-            stats.mempool_tx_count <= mtc,
-            "address_stats({address}) mempool_tx_count must only shrink (mempool -> chain confirmation), \
-             never grow: expected <= {mtc}, got {}",
-            stats.mempool_tx_count
-        );
-        assert!(
-            stats.chain_tx_count >= ctc,
-            "address_stats({address}) chain_tx_count must never be fewer than what was already recorded \
-             confirmed: expected >= {ctc}, got {}",
-            stats.chain_tx_count
-        );
+        match stats_contract {
+            StatsContract::Exact => {
+                assert_eq!(
+                    stats.chain_tx_count + stats.mempool_tx_count,
+                    ctc + mtc,
+                    "address_stats({address}) total tx_count"
+                );
+                assert_eq!(stats.chain_spent + stats.mempool_spent, cs + ms, "address_stats({address}) total spent");
+                assert!(
+                    stats.mempool_tx_count <= mtc,
+                    "address_stats({address}) mempool_tx_count must only shrink (mempool -> chain confirmation), \
+                     never grow: expected <= {mtc}, got {}",
+                    stats.mempool_tx_count
+                );
+                assert!(
+                    stats.chain_tx_count >= ctc,
+                    "address_stats({address}) chain_tx_count must never be fewer than what was already recorded \
+                     confirmed: expected >= {ctc}, got {}",
+                    stats.chain_tx_count
+                );
+            }
+            StatsContract::Fingerprint => {
+                // Presence only: the one thing `address_used` needs. Never
+                // more than one per bucket, never zero for an address with
+                // history, and never fewer confirmed than were recorded.
+                assert!(stats.chain_tx_count <= 1 && stats.mempool_tx_count <= 1, "fingerprint tx_count is 0/1");
+                assert_eq!(
+                    (stats.chain_tx_count + stats.mempool_tx_count) > 0,
+                    (ctc + mtc) > 0,
+                    "address_stats({address}) presence"
+                );
+                assert!(
+                    ctc == 0 || stats.chain_tx_count == 1,
+                    "address_stats({address}) recorded confirmed history must still read present"
+                );
+                // spent = received - unspent by definition, so it must
+                // agree with the utxo set the same client just served.
+                let unspent: u64 = client.utxos(&address).unwrap().iter().map(|u| u.value).sum();
+                assert_eq!(
+                    stats.chain_funded + stats.mempool_funded - stats.chain_spent - stats.mempool_spent,
+                    unspent,
+                    "address_stats({address}) funded - spent must equal the served unspent sum"
+                );
+            }
+        }
 
         // address_used / address_probe.
         assert_eq!(client.address_used(&address).unwrap(), (ctc + mtc) > 0, "address_used({address})");
@@ -955,14 +1012,14 @@ pub fn assert_chain_contract<T: Transport>(client: &ChainClient<T>, sc: &Scenari
 
     // build_bundle: an address with at least one OP_RETURN-carrying tx.
     if let Some(address) = sc.all_addresses().into_iter().find(|a| sc.history_desc(a).iter().any(|t| t.vout.iter().any(|o| o.is_op_return))) {
-        let bundle = client.build_bundle(&address, None).unwrap();
+        let bundle = client.build_bundle(&address).unwrap();
         assert!(
             bundle.tip_height >= sc.tip_height,
             "build_bundle tip_height must be >= what the scenario recorded: live={}, scenario={}",
             bundle.tip_height,
             sc.tip_height
         );
-        assert!(bundle.full, "build_bundle(since_height=None).full");
+        assert!(bundle.full, "build_bundle().full");
         let expected_note_txids: HashSet<String> = sc
             .history_desc(&address)
             .iter()

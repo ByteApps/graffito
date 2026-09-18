@@ -330,17 +330,24 @@ impl ElectrumTransport {
         Some(t as u64)
     }
 
-    /// `address`'s full esplora-shaped history via `scripthash`, newest
-    /// first: mempool entries (electrs reports `height <= 0` for these — 0
-    /// = mempool with a confirmed parent, -1 = mempool with an
-    /// unconfirmed parent) in the server's own order, then confirmed
+    /// `address`'s LIGHTWEIGHT history order via `scripthash` — ONE
+    /// `blockchain.scripthash.get_history` call, no `transaction.get` at
+    /// all: newest first, mempool entries (electrs reports `height <= 0`
+    /// for these — 0 = mempool with a confirmed parent, -1 = mempool with
+    /// an unconfirmed parent) in the server's own order, then confirmed
     /// entries descending by height (most-recently-mined first) — mirrors
-    /// `CoreRpcTransport::wallet_txid_order`'s mempool-then-
+    /// `CoreRpcTransport::wallet_tx_order`'s mempool-then-
     /// descending-confirmations shape (equivalent to descending height at
-    /// a fixed tip). Backs `/address/:a`, `/address/:a/txs`, and
-    /// `/address/:a/txs/chain/:after`.
-    fn address_history_json(&self, scripthash: &str) -> Result<Vec<serde_json::Value>, Error> {
-        let tip = self.tip_height()?;
+    /// a fixed tip). Each entry carries `confirmed` (`height > 0`) so a
+    /// caller can run [`esplora_shape::paginate_order`] — the window
+    /// SELECTION step — before fetching any tx JSON at all
+    /// (`../../plans/PLAN-graffito-history-scaling.md`, "Where the O(N)
+    /// lives" item 1: the old code fetched + prevout-resolved the
+    /// address's ENTIRE history before slicing out the page the caller
+    /// asked for). Backs `/address/:a/txs` and `/address/:a/txs/chain/
+    /// :after`; `/address/:a` (stats) no longer walks this at all — see
+    /// [`Self::address_stats_route`].
+    fn address_order(&self, scripthash: &str) -> Result<Vec<(String, bool)>, Error> {
         let history = self.call("blockchain.scripthash.get_history", serde_json::json!([scripthash]))?;
         let mut entries: Vec<(String, i64)> = history
             .as_array()
@@ -363,18 +370,64 @@ impl ElectrumTransport {
                 (false, false) => b.1.cmp(&a.1),
             }
         });
-        let mut out = Vec::with_capacity(entries.len());
-        for (txid, _height) in entries {
-            out.push(self.esplora_tx_json(&txid, tip)?);
-        }
-        Ok(out)
+        Ok(entries.into_iter().map(|(txid, height)| (txid, height > 0)).collect())
     }
 
-    /// `GET /address/:a` — folds full history into chain/mempool buckets
-    /// via the shared [`esplora_shape::fold_address_stats`].
-    fn address_stats_route(&self, scripthash: &str, address: &str) -> Result<String, Error> {
-        let txs = self.address_history_json(scripthash)?;
-        Ok(esplora_shape::fold_address_stats(&txs, address).to_string())
+    /// `GET /address/:a` — U2 (`../../plans/PLAN-graffito-history-scaling.md`):
+    /// counts come straight from `get_history` (EXACT — electrs' scripthash
+    /// index already carries every tx that touches this address on EITHER
+    /// side, input or output, so bucketing its entries by `height` needs no
+    /// per-tx fetch at all), and the funded/spent SUMS come from
+    /// `blockchain.scripthash.get_balance` — zero `transaction.get` calls,
+    /// versus the old path's one full-history fetch (+ prevout resolution)
+    /// per call, including on the quiet 60s refresh tick this route backs.
+    ///
+    /// **Consumer-visible change, reported per the plan's instructions**:
+    /// `funded_txo_sum`/`spent_txo_sum` are no longer the old esplora-exact
+    /// definition (lifetime sum of confirmed-tx outputs TO this address /
+    /// lifetime sum of confirmed-tx inputs FROM this address, bucketed by
+    /// the SPENDING tx's own confirmed-ness — see the removed
+    /// `fold_address_stats` call this route used to make). They now report
+    /// `get_balance`'s CURRENT net balance split: `chain_funded` = the
+    /// confirmed balance, `mempool_funded`/`mempool_spent` = the
+    /// unconfirmed balance (Electrum's protocol allows this to go
+    /// negative — "spending confirmed funds via an unconfirmed tx" — which
+    /// is reported as `mempool_spent` instead of a negative `funded`).
+    /// `spent_txo_sum` under `chain_stats` is always `0` now (no cheap
+    /// Electrum call gives a lifetime confirmed-spent sum without exactly
+    /// the per-tx walk this unit removes).
+    ///
+    /// The only two consumers are `Store.addr_stats`'s equality-based
+    /// change fingerprint and `ChainClient::address_used`'s `tx_count > 0`
+    /// check (never a UI display — grepped repo-wide for this unit).
+    /// `tx_count` keeps its EXACT old definition (one increment per tx in
+    /// the address's history, same entries as before), so `address_used()`
+    /// is byte-for-byte unaffected. The sums stay TRUTHFUL for
+    /// fingerprinting: they change whenever the address's current balance
+    /// changes, and `tx_count` alone already changes on every other kind of
+    /// history event a same-value-swap could hide from a balance-only
+    /// comparison (a new tx always adds one more `get_history` entry, in
+    /// either bucket).
+    fn address_stats_route(&self, scripthash: &str) -> Result<String, Error> {
+        let history = self.call("blockchain.scripthash.get_history", serde_json::json!([scripthash]))?;
+        let (chain_n, mem_n) = history.as_array().cloned().unwrap_or_default().into_iter().fold(
+            (0u64, 0u64),
+            |(chain, mem), e| {
+                let height = e.get("height").and_then(|h| h.as_i64()).unwrap_or(0);
+                if height > 0 { (chain + 1, mem) } else { (chain, mem + 1) }
+            },
+        );
+        let balance = self.call("blockchain.scripthash.get_balance", serde_json::json!([scripthash]))?;
+        let confirmed = balance.get("confirmed").and_then(|v| v.as_i64()).unwrap_or(0);
+        let unconfirmed = balance.get("unconfirmed").and_then(|v| v.as_i64()).unwrap_or(0);
+        let chain_funded = confirmed.max(0) as u64;
+        let (mempool_funded, mempool_spent) =
+            if unconfirmed >= 0 { (unconfirmed as u64, 0u64) } else { (0u64, (-unconfirmed) as u64) };
+        Ok(serde_json::json!({
+            "chain_stats": {"tx_count": chain_n, "funded_txo_sum": chain_funded, "spent_txo_sum": 0},
+            "mempool_stats": {"tx_count": mem_n, "funded_txo_sum": mempool_funded, "spent_txo_sum": mempool_spent},
+        })
+        .to_string())
     }
 
     /// `GET /address/:a/utxo` → `blockchain.scripthash.listunspent` —
@@ -404,11 +457,22 @@ impl ElectrumTransport {
         Ok(serde_json::to_string(&items).unwrap())
     }
 
-    /// `GET /address/:a/txs[/chain/:after]` via the shared
-    /// [`esplora_shape::paginate_txs`].
+    /// `GET /address/:a/txs[/chain/:after]` — page-aware
+    /// (`../../plans/PLAN-graffito-history-scaling.md` item 1): computes the
+    /// page's txids from [`Self::address_order`]'s lightweight tuples via
+    /// [`esplora_shape::paginate_order`] FIRST, then calls
+    /// [`Self::esplora_tx_json`] (with its cache + prevout resolution) only
+    /// for the ≤ 25/50 txids that page actually needs — never the
+    /// address's whole history, which is what the old
+    /// fetch-everything-then-`paginate_txs` shape did.
     fn txs_route(&self, scripthash: &str, after: Option<&str>, chain_only: bool) -> Result<String, Error> {
-        let items = self.address_history_json(scripthash)?;
-        let items = esplora_shape::paginate_txs(items, after, chain_only);
+        let tip = self.tip_height()?;
+        let order = self.address_order(scripthash)?;
+        let page_txids = esplora_shape::paginate_order(order, after, chain_only);
+        let mut items = Vec::with_capacity(page_txids.len());
+        for txid in page_txids {
+            items.push(self.esplora_tx_json(&txid, tip)?);
+        }
         Ok(serde_json::to_string(&items).unwrap())
     }
 
@@ -536,7 +600,7 @@ impl Transport for ElectrumTransport {
                 };
             };
             return match sub {
-                None => self.address_stats_route(&scripthash, address),
+                None => self.address_stats_route(&scripthash),
                 Some("utxo") => self.utxo_route(&scripthash),
                 Some("txs") => self.txs_route(&scripthash, None, false),
                 Some(s) if s.starts_with("txs/chain/") => {
@@ -575,6 +639,8 @@ mod tests {
     use super::*;
     use super::super::client::ChainClient;
     use super::super::transport::{AnyTransport, TxLookupStatus};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     // ---- in-process mock Electrum server ----------------------------
 
@@ -587,8 +653,15 @@ mod tests {
     /// `responder`. Newline-delimited JSON-RPC 2.0, tolerant of multiple
     /// requests per connection (our own client never sends more than one,
     /// but nothing about the wire format requires that).
+    ///
+    /// `calls` (`../../plans/PLAN-graffito-history-scaling.md` item 3) is a
+    /// per-method call counter — the load-bearing assertion surface for
+    /// "page-aware costs O(page), not O(history)": a test asserts the exact
+    /// number of `transaction.get` (etc.) calls a route made, not merely
+    /// that it returned the right JSON.
     struct MockElectrumServer {
         addr: std::net::SocketAddr,
+        calls: std::sync::Arc<Mutex<HashMap<String, usize>>>,
     }
 
     impl MockElectrumServer {
@@ -599,6 +672,8 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock electrum server");
             let addr = listener.local_addr().expect("local_addr");
             let responder: Box<Responder> = Box::new(responder);
+            let calls: std::sync::Arc<Mutex<HashMap<String, usize>>> = std::sync::Arc::new(Mutex::new(HashMap::new()));
+            let calls_thread = calls.clone();
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { continue };
@@ -625,6 +700,7 @@ mod tests {
                         let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
                         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
                         let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                        *calls_thread.lock().expect("mock call-counter mutex poisoned").entry(method.clone()).or_insert(0) += 1;
                         let resp = match responder(&method, &params) {
                             Ok(result) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
                             Err((code, message)) => {
@@ -639,11 +715,17 @@ mod tests {
                     }
                 }
             });
-            MockElectrumServer { addr }
+            MockElectrumServer { addr, calls }
         }
 
         fn url(&self) -> String {
             format!("tcp://{}", self.addr)
+        }
+
+        /// Real call count for one JSON-RPC method so far — the item-3 call-
+        /// count assertion surface.
+        fn call_count(&self, method: &str) -> usize {
+            self.calls.lock().expect("mock call-counter mutex poisoned").get(method).copied().unwrap_or(0)
         }
     }
 
@@ -710,33 +792,17 @@ mod tests {
         ));
     }
 
-    // ---- address stats: funded/spent sums incl. prevout resolution ---
+    // ---- address stats: U2 — get_history counts + get_balance sums,
+    // ZERO transaction.get (`../../plans/PLAN-graffito-history-scaling.md`) --
 
     #[test]
-    fn address_stats_funded_spent_with_prevout_resolution() {
-        let addr = test_addr();
-        let srv = MockElectrumServer::start(move |method, params| match method {
-            "blockchain.headers.subscribe" => Ok(serde_json::json!({"height": 105, "hex": "00"})),
+    fn address_stats_uses_get_balance_not_transaction_get() {
+        let srv = MockElectrumServer::start(|method, _params| match method {
             "blockchain.scripthash.get_history" => Ok(serde_json::json!([
                 {"tx_hash": "tx1", "height": 100},
                 {"tx_hash": "tx2", "height": 0},
             ])),
-            "blockchain.transaction.get" => {
-                let arr = params.as_array().cloned().unwrap_or_default();
-                let txid = arr.first().and_then(|v| v.as_str()).unwrap_or("");
-                match txid {
-                    "tx1" => {
-                        let mut tx = verbose_tx(6, &addr, 0.0005, "witness_v0_keyhash");
-                        // No inlined prevout — forces resolution via a
-                        // parent fetch (like a mempool input's parent).
-                        tx["vin"] = serde_json::json!([{"txid": "parent1", "vout": 0}]);
-                        Ok(tx)
-                    }
-                    "parent1" => Ok(verbose_tx(50, &addr, 0.0003, "witness_v0_keyhash")),
-                    "tx2" => Ok(verbose_tx(0, &addr, 0.0002, "witness_v0_keyhash")),
-                    other => Err((2, format!("no such tx {other}"))),
-                }
-            }
+            "blockchain.scripthash.get_balance" => Ok(serde_json::json!({"confirmed": 50_000, "unconfirmed": 20_000})),
             other => Err((99, format!("unexpected method {other}"))),
         });
         let t = ElectrumTransport::new(&srv.url()).unwrap();
@@ -744,10 +810,71 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["chain_stats"]["tx_count"], 1);
         assert_eq!(v["chain_stats"]["funded_txo_sum"], 50_000);
-        assert_eq!(v["chain_stats"]["spent_txo_sum"], 30_000);
+        assert_eq!(v["chain_stats"]["spent_txo_sum"], 0);
         assert_eq!(v["mempool_stats"]["tx_count"], 1);
         assert_eq!(v["mempool_stats"]["funded_txo_sum"], 20_000);
         assert_eq!(v["mempool_stats"]["spent_txo_sum"], 0);
+        assert_eq!(srv.call_count("blockchain.transaction.get"), 0, "U2: stats must never fetch a tx");
+        assert_eq!(srv.call_count("blockchain.scripthash.get_balance"), 1);
+        assert_eq!(srv.call_count("blockchain.scripthash.get_history"), 1);
+    }
+
+    /// Electrum's `get_balance.unconfirmed` can go negative ("spending
+    /// confirmed funds via an unconfirmed tx") — must map to
+    /// `mempool_spent`, never panic on the `as u64` cast or silently clamp
+    /// to a wrong-but-passing zero on both sides.
+    #[test]
+    fn address_stats_negative_unconfirmed_balance_becomes_mempool_spent() {
+        let srv = MockElectrumServer::start(|method, _params| match method {
+            "blockchain.scripthash.get_history" => Ok(serde_json::json!([{"tx_hash": "tx1", "height": 0}])),
+            "blockchain.scripthash.get_balance" => Ok(serde_json::json!({"confirmed": 0, "unconfirmed": -1500})),
+            other => Err((99, format!("unexpected method {other}"))),
+        });
+        let t = ElectrumTransport::new(&srv.url()).unwrap();
+        let json = t.get_text(&format!("/address/{}", test_addr())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["mempool_stats"]["funded_txo_sum"], 0);
+        assert_eq!(v["mempool_stats"]["spent_txo_sum"], 1500);
+        assert_eq!(srv.call_count("blockchain.transaction.get"), 0);
+    }
+
+    /// Prevout resolution (a mempool-style input with no inlined
+    /// `prevout`) still works — it moved from the old stats fold into
+    /// `txs_route`'s per-tx materialization, and still costs exactly one
+    /// extra `transaction.get` for the parent, on top of the tx itself.
+    #[test]
+    fn txs_route_resolves_prevout_for_missing_inline_data() {
+        let addr = test_addr();
+        let addr_for_mock = addr.clone();
+        let srv = MockElectrumServer::start(move |method, params| match method {
+            "blockchain.headers.subscribe" => Ok(serde_json::json!({"height": 105, "hex": "00"})),
+            "blockchain.scripthash.get_history" => Ok(serde_json::json!([{"tx_hash": "tx1", "height": 100}])),
+            "blockchain.transaction.get" => {
+                let arr = params.as_array().cloned().unwrap_or_default();
+                let txid = arr.first().and_then(|v| v.as_str()).unwrap_or("");
+                match txid {
+                    "tx1" => {
+                        let mut tx = verbose_tx(6, &addr_for_mock, 0.0005, "witness_v0_keyhash");
+                        // No inlined prevout — forces resolution via a
+                        // parent fetch (like a mempool input's parent).
+                        tx["vin"] = serde_json::json!([{"txid": "parent1", "vout": 0}]);
+                        Ok(tx)
+                    }
+                    "parent1" => Ok(verbose_tx(50, &addr_for_mock, 0.0003, "witness_v0_keyhash")),
+                    other => Err((2, format!("no such tx {other}"))),
+                }
+            }
+            other => Err((99, format!("unexpected method {other}"))),
+        });
+        let t = ElectrumTransport::new(&srv.url()).unwrap();
+        let json = t.get_text(&format!("/address/{}/txs", test_addr())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let items = v.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["vin"][0]["prevout"]["scriptpubkey_address"], addr);
+        assert_eq!(items[0]["vin"][0]["prevout"]["value"], 30_000);
+        // tx1 itself, plus one parent fetch for the unresolved prevout.
+        assert_eq!(srv.call_count("blockchain.transaction.get"), 2);
     }
 
     // ---- utxo route: block_time from the header -----------------------
@@ -856,6 +983,179 @@ mod tests {
         assert_eq!(ids.len(), 25);
         assert_eq!(ids[0], "c29");
         assert!(!ids.contains(&"mem1"));
+    }
+
+    // ---- page-aware pagination: exact call counts + byte-identity
+    // (`../../plans/PLAN-graffito-history-scaling.md`, "Where the O(N) lives"
+    // items 1 + 3) --------------------------------------------------------
+
+    /// A FRESH mock (own port -> its own `TX_JSON_CACHE` key namespace, so
+    /// no cross-test cache carryover) with 60 confirmed txs + 2 mempool
+    /// txs: the plain `/address/:a/txs` page (cap 50, mempool-first) must
+    /// cost EXACTLY 50 `transaction.get` calls — the page's own txs, never
+    /// the address's full 62-tx history. This is the direct measurement
+    /// behind the "406 calls for N=162" defect this unit fixes.
+    #[test]
+    fn txs_route_plain_page_costs_exactly_the_page_not_the_history() {
+        let heights: Vec<i64> = (1..=60).collect();
+        let srv = MockElectrumServer::start(move |method, params| match method {
+            "blockchain.headers.subscribe" => Ok(serde_json::json!({"height": 1_000, "hex": "00"})),
+            "blockchain.scripthash.get_history" => {
+                let entries: Vec<serde_json::Value> = heights
+                    .iter()
+                    .map(|h| serde_json::json!({"tx_hash": format!("c{h}"), "height": h}))
+                    .chain([
+                        serde_json::json!({"tx_hash": "mem0", "height": 0}),
+                        serde_json::json!({"tx_hash": "mem1", "height": -1}),
+                    ])
+                    .collect();
+                Ok(serde_json::json!(entries))
+            }
+            "blockchain.transaction.get" => {
+                let arr = params.as_array().cloned().unwrap_or_default();
+                let txid = arr.first().and_then(|v| v.as_str()).unwrap_or("");
+                let confirmations = if let Some(h) = txid.strip_prefix('c').and_then(|s| s.parse::<u64>().ok()) {
+                    1_000 - h + 1
+                } else {
+                    0
+                };
+                Ok(verbose_tx(confirmations, &test_addr(), 0.0001, "witness_v0_keyhash"))
+            }
+            other => Err((99, format!("unexpected method {other}"))),
+        });
+        let t = ElectrumTransport::new(&srv.url()).unwrap();
+        let json = t.get_text(&format!("/address/{}/txs", test_addr())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // 62 in history (2 mempool + 60 confirmed), plain /txs caps at 50 —
+        // mempool-first, so 2 mempool + 48 confirmed.
+        assert_eq!(v.as_array().unwrap().len(), 50);
+        assert_eq!(srv.call_count("blockchain.transaction.get"), 50, "must materialize only the 50-item page");
+        assert_eq!(srv.call_count("blockchain.scripthash.get_history"), 1);
+    }
+
+    /// Same history, but a FRESH mock and a single `/txs/chain/:after`
+    /// call (as if this were the very first page a caller ever requested
+    /// past some earlier cursor) — must cost exactly 25 `transaction.get`,
+    /// never the other 34 confirmed txs beyond the cursor.
+    #[test]
+    fn txs_route_chain_page_costs_exactly_25_not_the_rest() {
+        let heights: Vec<i64> = (1..=60).collect();
+        let srv = MockElectrumServer::start(move |method, params| match method {
+            "blockchain.headers.subscribe" => Ok(serde_json::json!({"height": 1_000, "hex": "00"})),
+            "blockchain.scripthash.get_history" => {
+                let entries: Vec<serde_json::Value> =
+                    heights.iter().map(|h| serde_json::json!({"tx_hash": format!("c{h}"), "height": h})).collect();
+                Ok(serde_json::json!(entries))
+            }
+            "blockchain.transaction.get" => {
+                let arr = params.as_array().cloned().unwrap_or_default();
+                let txid = arr.first().and_then(|v| v.as_str()).unwrap_or("");
+                let confirmations = if let Some(h) = txid.strip_prefix('c').and_then(|s| s.parse::<u64>().ok()) {
+                    1_000 - h + 1
+                } else {
+                    0
+                };
+                Ok(verbose_tx(confirmations, &test_addr(), 0.0001, "witness_v0_keyhash"))
+            }
+            other => Err((99, format!("unexpected method {other}"))),
+        });
+        let t = ElectrumTransport::new(&srv.url()).unwrap();
+        // Cursor = c60 (the newest confirmed txid) — the next page is
+        // c59..c35 (25 items), never touching c34..c1.
+        let json = t.get_text(&format!("/address/{}/txs/chain/c60", test_addr())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let ids: Vec<&str> = v.as_array().unwrap().iter().map(|t| t["txid"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 25);
+        assert_eq!(ids[0], "c59");
+        assert_eq!(ids[24], "c35");
+        assert_eq!(srv.call_count("blockchain.transaction.get"), 25, "must materialize only the 25-item page");
+    }
+
+    /// The quiet-tick shape: `/address/:a` twice in a row costs exactly the
+    /// same 2 RPCs (`get_history` + `get_balance`) EACH time — no growth
+    /// with history size, and no `transaction.get` ever.
+    #[test]
+    fn address_stats_quiet_tick_costs_two_rpcs_per_call() {
+        let srv = MockElectrumServer::start(|method, _params| match method {
+            "blockchain.scripthash.get_history" => Ok(serde_json::json!([
+                {"tx_hash": "tx1", "height": 100},
+                {"tx_hash": "tx2", "height": 0},
+            ])),
+            "blockchain.scripthash.get_balance" => Ok(serde_json::json!({"confirmed": 50_000, "unconfirmed": 20_000})),
+            other => Err((99, format!("unexpected method {other}"))),
+        });
+        let t = ElectrumTransport::new(&srv.url()).unwrap();
+        let _ = t.get_text(&format!("/address/{}", test_addr())).unwrap();
+        assert_eq!(srv.call_count("blockchain.scripthash.get_history"), 1);
+        assert_eq!(srv.call_count("blockchain.scripthash.get_balance"), 1);
+        let _ = t.get_text(&format!("/address/{}", test_addr())).unwrap();
+        assert_eq!(srv.call_count("blockchain.scripthash.get_history"), 2);
+        assert_eq!(srv.call_count("blockchain.scripthash.get_balance"), 2);
+        assert_eq!(srv.call_count("blockchain.transaction.get"), 0);
+    }
+
+    /// Item 1's core invariant: the page-aware production route
+    /// ([`ElectrumTransport::txs_route`], reached via `get_text`) returns
+    /// content BYTE-IDENTICAL to the OLD shape — fetch the address's ENTIRE
+    /// lightweight order, materialize all of it, then run the same generic
+    /// [`esplora_shape::paginate_txs`] the pre-fix code called directly —
+    /// across a history with mempool entries, three txs sharing one block,
+    /// and more than 50 confirmed txs, for both the plain `/txs` page and
+    /// the `/txs/chain/:after` continuation.
+    #[test]
+    fn txs_route_page_aware_matches_old_full_fetch_shape() {
+        let heights: Vec<i64> = (4..=63).collect(); // 60 confirmed at distinct heights
+        let srv = MockElectrumServer::start(move |method, params| match method {
+            "blockchain.headers.subscribe" => Ok(serde_json::json!({"height": 1_000, "hex": "00"})),
+            "blockchain.scripthash.get_history" => {
+                let mut entries = vec![
+                    serde_json::json!({"tx_hash": "mem0", "height": 0}),
+                    serde_json::json!({"tx_hash": "mem1", "height": -1}),
+                    serde_json::json!({"tx_hash": "blk0", "height": 3}),
+                    serde_json::json!({"tx_hash": "blk1", "height": 3}),
+                    serde_json::json!({"tx_hash": "blk2", "height": 3}),
+                ];
+                entries.extend(heights.iter().map(|h| serde_json::json!({"tx_hash": format!("c{h}"), "height": h})));
+                Ok(serde_json::json!(entries))
+            }
+            "blockchain.transaction.get" => {
+                let arr = params.as_array().cloned().unwrap_or_default();
+                let txid = arr.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let confirmations: i64 = if txid.starts_with("blk") {
+                    1_000 - 3 + 1
+                } else if let Some(h) = txid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok()) {
+                    1_000 - h + 1
+                } else {
+                    0
+                };
+                Ok(verbose_tx(confirmations as u64, &test_addr(), 0.0001, "witness_v0_keyhash"))
+            }
+            other => Err((99, format!("unexpected method {other}"))),
+        });
+        let t = ElectrumTransport::new(&srv.url()).unwrap();
+
+        // NEW page-aware production path, via the real `get_text` routes.
+        let page1_json = t.get_text(&format!("/address/{}/txs", test_addr())).unwrap();
+        let page1: Vec<serde_json::Value> = serde_json::from_str(&page1_json).unwrap();
+        let last1 = page1.last().unwrap()["txid"].as_str().unwrap().to_string();
+        let page2_json = t.get_text(&format!("/address/{}/txs/chain/{last1}", test_addr())).unwrap();
+        let page2: Vec<serde_json::Value> = serde_json::from_str(&page2_json).unwrap();
+
+        // OLD full-fetch shape, reconstructed independently: materialize
+        // the WHOLE lightweight order (every txid, not just a page), then
+        // paginate the fully-materialized list — exactly what the pre-fix
+        // `address_history_json` + `paginate_txs` call used to do.
+        let scripthash = scripthash_for_address(&test_addr()).unwrap();
+        let order = t.address_order(&scripthash).unwrap();
+        let tip = t.tip_height().unwrap();
+        let full: Vec<serde_json::Value> =
+            order.iter().map(|(txid, _)| t.esplora_tx_json(txid, tip).unwrap()).collect();
+        let old_page1 = esplora_shape::paginate_txs(full.clone(), None, false);
+        let old_page2 = esplora_shape::paginate_txs(full, Some(&last1), true);
+
+        assert_eq!(page1, old_page1, "page 1 (plain /txs) diverged from the full-fetch shape");
+        assert_eq!(page2, old_page2, "page 2 (/txs/chain) diverged from the full-fetch shape");
+        assert!(!page1.is_empty() && !page2.is_empty(), "sanity: both pages must be non-trivial");
     }
 
     // ---- /tx/:id conversion (block_height, nulldata->op_return) -------

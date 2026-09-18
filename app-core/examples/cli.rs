@@ -258,7 +258,7 @@ fn main() {
                     app_core::spending::window_spks(&material, net, account, upto).unwrap_or_default();
             }
             let client = open_client_watched(&args[3], net, &key, account);
-            let bundle = client.build_bundle(&store.address, None).expect("build bundle");
+            let bundle = client.build_bundle(&store.address).expect("build bundle");
             // ML-KEM auto-unlock (single- and multi-recipient pq notes,
             // plans/PLAN-graffito-multi-pq.md): this identity's own notebook-leaf-
             // derived secret set at all three levels — the same union
@@ -798,7 +798,7 @@ fn main() {
             // bundle <address> <network> <base-url> <out.json|->
             let net = network(&args[3]);
             let client = open_client(&args[4], net);
-            let bundle = client.build_bundle(&args[2], None).expect("build bundle");
+            let bundle = client.build_bundle(&args[2]).expect("build bundle");
             let json = serde_json::to_string_pretty(&bundle).expect("serialize");
             if args[5] == "-" {
                 println!("{json}");

@@ -176,7 +176,7 @@ use app_core::keyexport::export_formats;
 use app_core::notes_core::Network;
 use app_core::spending;
 
-use common::{assert_chain_contract, Scenario, ScenarioIn, ScenarioOut, ScenarioTx, ScenarioWallet};
+use common::{assert_chain_contract_with, Scenario, StatsContract, ScenarioIn, ScenarioOut, ScenarioTx, ScenarioWallet};
 
 const TEST_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -1132,7 +1132,7 @@ fn core_rpc_conformance() {
     let transport = AnyTransport::new(&base, None).expect("construct Core RPC transport");
     let client = ChainClient::new(transport, fx.network);
 
-    assert_chain_contract(&client, scenario);
+    assert_chain_contract_with(&client, scenario, StatsContract::Fingerprint);
 
     // Explicit, standalone demonstration of the plan's §2.1 requirement
     // (also exercised implicitly inside `assert_chain_contract`'s own
@@ -1226,7 +1226,7 @@ fn core_rpc_conformance_ranged_descriptors() {
     }
 
     let client = ChainClient::new(transport, fx.network);
-    assert_chain_contract(&client, &fx.scenario);
+    assert_chain_contract_with(&client, &fx.scenario, StatsContract::Fingerprint);
 
     // Prove the MECHANISM, not just the result — a mutation that forces
     // `ranged_lookup_or_widen` to always return `Ok(false)` (disabling
@@ -1877,7 +1877,17 @@ fn core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5() {
 /// This is the MUTATION test the cache's safety rule demands: caching a
 /// transaction's `confirmed`/`status` shape is only safe once it can never
 /// change again. The three-call sequence below is deliberately shaped to
-/// catch BOTH wrong directions:
+/// catch BOTH wrong directions.
+///
+/// **Driven via `ChainClient::full_history` (`/txs` + `/txs/chain`), not
+/// `address_stats`** (`../../plans/PLAN-graffito-history-scaling.md` U2):
+/// `address_stats`'s `/address/:a` route no longer walks
+/// `listtransactions`/`getrawtransaction` at all — it now answers from
+/// `listunspent` + `getreceivedbyaddress`, which is the whole point of
+/// that unit — so it can no longer trigger `esplora_tx_json`/
+/// `TX_JSON_CACHE` the way this test needs. `full_history` still
+/// materializes every page's txs through `esplora_tx_json`, so it remains
+/// the right trigger for this cache's own behavior.
 ///
 /// 1. First call — the tx is UNCONFIRMED. Must be a real RPC call (nothing
 ///    to hit yet), and the result must NOT be cached (a mutation that
@@ -1925,9 +1935,9 @@ fn core_rpc_confirmed_tx_json_is_cached_but_a_pending_one_is_never_served_stale(
     let transport = AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport");
     let client = ChainClient::new(transport, Network::Regtest);
 
-    let stats1 = client.address_stats(addr).expect("address_stats (unconfirmed)");
-    assert_eq!(stats1.mempool_tx_count, 1, "the pending tx must be visible as mempool activity");
-    assert_eq!(stats1.chain_tx_count, 0);
+    let hist1 = client.full_history(addr).expect("full_history (unconfirmed)");
+    assert_eq!(hist1.len(), 1, "the pending tx must be visible");
+    assert!(!hist1[0].status.confirmed, "must read as still-mempool");
     assert_eq!(mock.call_count("getrawtransaction"), 1, "call 1 must be a genuine RPC round trip");
 
     // Call 2: the SAME txid has now confirmed — re-script both endpoints
@@ -1941,14 +1951,14 @@ fn core_rpc_confirmed_tx_json_is_cached_but_a_pending_one_is_never_served_stale(
         common::mock_rpc::MockResponse::Ok(serde_json::json!({"txid": txid, "confirmations": 6, "vin": [], "vout": vout})),
     );
 
-    let stats2 = client.address_stats(addr).expect("address_stats (freshly confirmed)");
-    assert_eq!(
-        stats2.chain_tx_count, 1,
+    let hist2 = client.full_history(addr).expect("full_history (freshly confirmed)");
+    assert_eq!(hist2.len(), 1);
+    assert!(
+        hist2[0].status.confirmed,
         "the fresh confirmation must be visible — a cache that served call 1's stale unconfirmed \
-         result here would leave this at 0, exactly the 'live tx reads as dropped/pending forever' \
+         result here would leave this false, exactly the 'live tx reads as dropped/pending forever' \
          failure this project treats as its worst"
     );
-    assert_eq!(stats2.mempool_tx_count, 0);
     assert_eq!(
         mock.call_count("getrawtransaction"),
         2,
@@ -1957,9 +1967,9 @@ fn core_rpc_confirmed_tx_json_is_cached_but_a_pending_one_is_never_served_stale(
 
     // Call 3: same confirmed txid, mock script unchanged — THIS is where
     // the cache must actually pay off.
-    let stats3 = client.address_stats(addr).expect("address_stats (repeat, confirmed)");
-    assert_eq!(stats3.chain_tx_count, 1);
-    assert_eq!(stats3.mempool_tx_count, 0);
+    let hist3 = client.full_history(addr).expect("full_history (repeat, confirmed)");
+    assert_eq!(hist3.len(), 1);
+    assert!(hist3[0].status.confirmed);
     assert_eq!(
         mock.call_count("getrawtransaction"),
         2,
@@ -1969,7 +1979,7 @@ fn core_rpc_confirmed_tx_json_is_cached_but_a_pending_one_is_never_served_stale(
 
     eprintln!(
         "core_rpc_confirmed_tx_json_is_cached_but_a_pending_one_is_never_served_stale: PASS \
-         (3 address_stats calls, 2 real getrawtransaction round trips)"
+         (3 full_history calls, 2 real getrawtransaction round trips)"
     );
 }
 
@@ -1978,15 +1988,22 @@ fn core_rpc_confirmed_tx_json_is_cached_but_a_pending_one_is_never_served_stale(
 /// not a documented aspiration — an unbounded cache would trade the fixed
 /// O(wallet-history) NETWORK cost this unit removes for an O(wallet-history)
 /// MEMORY cost instead, on a platform (a phone) that can least afford it.
-/// Drives ONE `address_stats` call against a synthetic wallet history of
-/// `cap + 50` distinct, already-confirmed txids — comfortably past the
-/// cap — and proves two things at once: the cache genuinely stops growing at
-/// the documented ceiling (a mutation that dropped the `cache.len() <
-/// TX_JSON_CACHE_MAX_ENTRIES` guard would let this regress unboundedly), and
-/// the cap bounds MEMORY only, never correctness — every one of the `cap +
-/// 50` txids must still be resolved via a real `getrawtransaction` call on
-/// this first pass (nothing is silently skipped just because the cache is
-/// full).
+/// Drives ONE `ChainClient::full_history` call (`../../plans/PLAN-graffito-
+/// history-scaling.md` U2 moved this off `address_stats`, which no longer
+/// walks `listtransactions`/`getrawtransaction` at all — see the cache
+/// test above) against a synthetic wallet history of `cap + 50` distinct,
+/// already-confirmed txids, none of which touch `addr` (empty `vout`) —
+/// comfortably past the cap — and proves two things at once: the cache
+/// genuinely stops growing at the documented ceiling (a mutation that
+/// dropped the `cache.len() < TX_JSON_CACHE_MAX_ENTRIES` guard would let
+/// this regress unboundedly), and the cap bounds MEMORY only, never
+/// correctness — every one of the `cap + 50` txids must still be resolved
+/// via a real `getrawtransaction` call on this first pass (nothing is
+/// silently skipped just because the cache is full). Because none of them
+/// touch `addr`, `txs_route`'s own page-cap never triggers (`items` stays
+/// empty, so the walk never stops early) and the whole history is
+/// consumed by the SINGLE plain `/txs` call `full_history` starts with —
+/// no pagination needed for this scenario.
 #[test]
 fn core_rpc_tx_json_cache_is_bounded() {
     let mock = common::mock_rpc::MockRpcServer::start();
@@ -2014,7 +2031,7 @@ fn core_rpc_tx_json_cache_is_bounded() {
     let client = ChainClient::new(transport, Network::Regtest);
 
     let before_len = app_core::chain::core_rpc_tx_json_cache_len();
-    client.address_stats(addr).expect("address_stats over a large synthetic wallet history");
+    client.full_history(addr).expect("full_history over a large synthetic wallet history");
     let after_len = app_core::chain::core_rpc_tx_json_cache_len();
 
     assert!(

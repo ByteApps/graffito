@@ -40,6 +40,16 @@ bip39 = "2"
 
 # Apple platforms (macOS + iOS) — Keychain + LAContext biometric reveal.
 [dev-dependencies]
+# U1 (plans/PLAN-graffito-history-scaling.md): the in-process flow test
+# `src/tests/ui_flow_history_streaming.rs` pulls in `app-core`'s
+# `tests/common/mod.rs` via `#[path = ...]` (same file, one truth, no
+# second copy of the scenario/fake-server machinery) — its `mod.rs`/
+# `count_proxy.rs` name these two crates directly, so they must also be
+# direct dev-dependencies of THIS crate now that the module compiles as
+# part of it. Versions match app-core/Cargo.toml exactly; test-only, never
+# reachable from the shipped app or cdylib.
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 # In-process, headless Slint UI testing (ElementHandle: find_by_accessible_label
 # / single_click) — drives the real AppWindow with NO window, focus, or
 # coordinates. See tests/ui_harness_spike.rs and the graffito-mac-ui memory.

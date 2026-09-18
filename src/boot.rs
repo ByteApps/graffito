@@ -155,6 +155,8 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
         core_rpc_migrate_pending,
         ident: None,
         store: None,
+        home_notes_shown: NOTES_WINDOW,
+        home_notes_model: Rc::new(VecModel::default()),
         fees: None,
         usd: None,
         fees_fetched_at: None,

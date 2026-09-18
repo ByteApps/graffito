@@ -68,6 +68,11 @@ export global Ui {
     in property <[string]> backup-word-list;
     in property <string> address;
     in property <[NoteItem]> notes;
+    // Notes-list window (history-scaling): reveal the next
+    // NOTES_WINDOW_STEP rows (Home.notes-total/notes-more track the
+    // count) — the home screen's footer row and its near-bottom
+    // auto-scroll trigger both call this.
+    callback notes-load-more();
     in-out property <string> note-view-id;
     // ---- locked-note unlock (post-quantum note view) ----
     // True while NoteRecord.locked is Some — text stays hidden until
@@ -570,6 +575,13 @@ export global Home {
     in-out property <bool> filter-expanded;
     in-out property <string> hidden-senders-label;    // "2 senders hidden", empty = none
     callback toggle-sender(string, bool);
+    // Notes-list window (history-scaling): rows after sender-filtering
+    // (`notes-total`) vs. how many of them are NOT currently in
+    // `Ui.notes` (`notes-more`, 0 = every filtered row is shown — the
+    // footer row only renders then it's > 0, so a short list stays
+    // byte-identical to before this feature).
+    in property <int> notes-total;
+    in property <int> notes-more;
 }
 
 export global Note {

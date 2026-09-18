@@ -41,6 +41,7 @@ pub(crate) use compose::*;
 pub(crate) use confirm::*;
 pub(crate) use contacts::*;
 pub(crate) use funding_wallets::*;
+pub(crate) use home::*;
 pub(crate) use info::*;
 pub(crate) use note::*;
 pub(crate) use onboarding::*;

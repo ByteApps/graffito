@@ -102,7 +102,9 @@ export component HomeScreen inherits VerticalLayout { padding-top: Ui.safe-top +
                 Caption {
                     text: Ui.notes.length == 0
                         ? (Ui.watch-only ? "No notes on this address yet." : "No notes yet — fund the address above, then compose.")
-                        : "Notes";
+                        : (Home.notes-total > Ui.notes.length
+                            ? "Notes · " + Home.notes-total
+                            : "Notes");
                     vertical-alignment: center;
                 }
                 if Home.hidden-senders-label != "": Badge { label: Home.hidden-senders-label; tint: Pal.warn; }
@@ -172,6 +174,24 @@ export component HomeScreen inherits VerticalLayout { padding-top: Ui.safe-top +
         // centres a short list). Matches the Settings-screen Flickable pattern.
         Flickable {
             viewport-height: notes-col.preferred-height;
+            // History-scaling: once the visible bottom edge nears the
+            // list's actual bottom AND more rows exist, pull in the next
+            // page — the only way the window grows (a footer row was
+            // tried and can never be seen: this trigger fires two rows
+            // before it would scroll into view). `last-requested-more` debounces so
+            // one scroll doesn't re-fire every pixel: it only fires again
+            // once `notes-more` has actually changed (the previous
+            // load-more landed, or the list itself changed).
+            property <int> last-requested-more: -1;
+            changed viewport-y => {
+                if (Home.notes-more > 0
+                    && Home.notes-more != last-requested-more
+                    && -self.viewport-y + self.height
+                        >= notes-col.preferred-height - 2 * (62px * Metrics.type-scale)) {
+                    last-requested-more = Home.notes-more;
+                    Ui.notes-load-more();
+                }
+            }
             notes-col := VerticalLayout {
                 alignment: start;
                 spacing: 6px;

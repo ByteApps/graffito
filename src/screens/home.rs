@@ -3,8 +3,17 @@
 
 use crate::*;
 
+/// Home's notes-list initial window (history-scaling U-notes-window):
+/// thousands of notes must not instantiate thousands of Slint rows.
+/// `update_home_notes` still builds the FULL sorted, sender-filtered
+/// list every call (cheap — no Slint elements involved) but only
+/// publishes this many rows on first paint of a (re)activated notebook.
+pub(crate) const NOTES_WINDOW: usize = 200;
+/// Rows revealed per `notes-load-more` tap or auto-scroll-near-bottom.
+pub(crate) const NOTES_WINDOW_STEP: usize = 100;
+
 impl State {
-pub(crate) fn go_home_or_list(&self, w: &AppWindow) {
+pub(crate) fn go_home_or_list(&mut self, w: &AppWindow) {
     let st = self;
     let listed = st
         .ident
@@ -20,11 +29,10 @@ pub(crate) fn go_home_or_list(&self, w: &AppWindow) {
     }
 }
 
-pub(crate) fn update_home(&self, w: &AppWindow) {
+pub(crate) fn update_home(&mut self, w: &AppWindow) {
     let st = self;
     let Some(ident) = &st.ident else { return };
     let Some(store) = &st.store else { return };
-    let watch = ident.is_watch();
     st.update_identity_flags(w);
     w.global::<Home>().set_notebook_title(st.notebook_display_name(ident.index).into());
     w.global::<Ui>().set_address(ident.address.as_str().into());
@@ -57,6 +65,39 @@ pub(crate) fn update_home(&self, w: &AppWindow) {
         }
         .into(),
     );
+    st.update_home_notes(w);
+    st.refresh_contacts(w);
+    st.update_settings_identity(w);
+    st.load_backend_settings(w);
+    st.update_wallet_coins(w);
+    st.update_spending_ui(w);
+}
+
+/// The notes-list half of `update_home`, carved out so it can also be
+/// re-run on its own (a `notes-load-more` tap/auto-scroll, and — the
+/// next unit — a streaming scan calling this after each page) without
+/// redoing the balance/senders/QR/cascade work above.
+///
+/// Builds the FULL sorted (unconfirmed-first), sender-filtered
+/// `Vec<NoteItem>` exactly as `update_home` always did — that part is
+/// cheap; it never instantiates a Slint element. What changed is that
+/// only a WINDOW of it (`home_notes_shown` rows, a PREFIX of the full
+/// list) is published to `Ui.notes`. `home_notes_shown` starts at
+/// `NOTES_WINDOW` and grows by `NOTES_WINDOW_STEP` per `on_notes_load_more`
+/// (reset to `NOTES_WINDOW` on notebook switch, in `activate()`).
+///
+/// `home_notes_model` is the SAME `Rc<VecModel<NoteItem>>` across calls:
+/// when the model's current rows are still an unchanged PREFIX of the
+/// new window (the ordinary load-more case, and a same-content repaint),
+/// only the NEW rows are `extend()`-ed in — no reset, so already-painted
+/// rows never flash or lose the Flickable's scroll position. Anything
+/// else (content genuinely changed, or the window shrank) falls back to
+/// a full `set_vec()` replace.
+pub(crate) fn update_home_notes(&mut self, w: &AppWindow) {
+    let st = self;
+    let Some(ident) = &st.ident else { return };
+    let Some(store) = &st.store else { return };
+    let watch = ident.is_watch();
     let address = ident.address.clone();
     let net = st.network;
     let mut items: Vec<NoteItem> = store
@@ -106,12 +147,26 @@ pub(crate) fn update_home(&self, w: &AppWindow) {
         })
         .collect();
     items.sort_by_key(|i| i.badge == "confirmed");
-    w.global::<Ui>().set_notes(VecModel::from_slice(&items));
-    st.refresh_contacts(w);
-    st.update_settings_identity(w);
-    st.load_backend_settings(w);
-    st.update_wallet_coins(w);
-    st.update_spending_ui(w);
+
+    let total = items.len();
+    let shown = st.home_notes_shown.min(total);
+    let window = &items[..shown];
+
+    let current_len = st.home_notes_model.row_count();
+    let is_unchanged_prefix = current_len > 0
+        && current_len <= window.len()
+        && (0..current_len)
+            .all(|i| st.home_notes_model.row_data(i).is_some_and(|r| r.id == window[i].id));
+    if is_unchanged_prefix {
+        if current_len < window.len() {
+            st.home_notes_model.extend(window[current_len..].iter().cloned());
+        }
+    } else {
+        st.home_notes_model.set_vec(window.to_vec());
+    }
+    w.global::<Ui>().set_notes(slint::ModelRc::from(st.home_notes_model.clone()));
+    w.global::<Home>().set_notes_total(total as i32);
+    w.global::<Home>().set_notes_more((total - shown) as i32);
 }
 }
 
@@ -205,4 +260,15 @@ pub(crate) fn on_toggle_sender(&mut self, w: &AppWindow, key: SharedString, excl
         self.save_store();
         self.update_home(w);
     }
+
+/// `Ui.notes-load-more()` — the footer row's tap, and the Flickable's
+/// auto-scroll-near-bottom trigger. Grows the shown-rows count by
+/// `NOTES_WINDOW_STEP` (clamped to the actual filtered total inside
+/// `update_home_notes`) and repaints just the notes list — no cb: line
+/// (not part of the UI suites' log contract; the row-count/pill change
+/// is the observable).
+pub(crate) fn on_notes_load_more(&mut self, w: &AppWindow) {
+    self.home_notes_shown = self.home_notes_shown.saturating_add(NOTES_WINDOW_STEP);
+    self.update_home_notes(w);
+}
 }

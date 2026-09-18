@@ -50,8 +50,11 @@ pub(super) fn tx_touches(tx: &serde_json::Value, address: &str) -> bool {
 }
 
 /// Whether an esplora-shaped tx (as built by [`verbose_tx_to_esplora_json`])
-/// is confirmed — the one field every ordering/filtering helper below needs
-/// to read back out of the JSON it was just given.
+/// is confirmed. Test-only since `../../plans/PLAN-graffito-history-scaling.md`
+/// item 1: no production caller materializes a full tx list and then
+/// filters it anymore ([`paginate_txs`], the only caller, is itself
+/// test-only now — see its own doc comment).
+#[cfg(test)]
 fn tx_confirmed(tx: &serde_json::Value) -> bool {
     tx.get("status").and_then(|s| s.get("confirmed")).and_then(|c| c.as_bool()).unwrap_or(false)
 }
@@ -157,56 +160,68 @@ pub(super) fn prevout_from_verbose_parent(parent: &serde_json::Value, vout: u64)
     (address, value)
 }
 
-/// `GET /address/:a`'s funded/spent fold — extracted verbatim from
-/// `CoreRpcTransport::address_stats_route`'s loop. `txs` is `address`'s full
-/// esplora-shaped history (already touch/history-filtered by the caller);
-/// this just buckets by confirmed/mempool and sums each side's own
-/// outputs-to-`address` (funded) and inputs-from-`address` (spent).
-pub(super) fn fold_address_stats(txs: &[serde_json::Value], address: &str) -> serde_json::Value {
-    let (mut chain_n, mut chain_f, mut chain_s) = (0u64, 0u64, 0u64);
-    let (mut mem_n, mut mem_f, mut mem_s) = (0u64, 0u64, 0u64);
-    for tx in txs {
-        let confirmed = tx_confirmed(tx);
-        let mut funded = 0u64;
-        let mut spent = 0u64;
-        for o in tx.get("vout").and_then(|v| v.as_array()).into_iter().flatten() {
-            if o.get("scriptpubkey_address").and_then(|a| a.as_str()) == Some(address) {
-                funded += o.get("value").and_then(|v| v.as_u64()).unwrap_or(0);
-            }
-        }
-        for i in tx.get("vin").and_then(|v| v.as_array()).into_iter().flatten() {
-            if i.get("prevout").and_then(|p| p.get("scriptpubkey_address")).and_then(|a| a.as_str()) == Some(address) {
-                spent += i.get("prevout").and_then(|p| p.get("value")).and_then(|v| v.as_u64()).unwrap_or(0);
-            }
-        }
-        if confirmed {
-            chain_n += 1;
-            chain_f += funded;
-            chain_s += spent;
-        } else {
-            mem_n += 1;
-            mem_f += funded;
-            mem_s += spent;
-        }
-    }
-    serde_json::json!({
-        "chain_stats": {"tx_count": chain_n, "funded_txo_sum": chain_f, "spent_txo_sum": chain_s},
-        "mempool_stats": {"tx_count": mem_n, "funded_txo_sum": mem_f, "spent_txo_sum": mem_s},
-    })
+// `fold_address_stats` (the old `GET /address/:a` funded/spent fold, which
+// needed `address`'s full esplora-shaped history materialized first) was
+// REMOVED here by `../../plans/PLAN-graffito-history-scaling.md` U2 — both
+// `CoreRpcTransport::address_stats_route` and `ElectrumTransport::
+// address_stats_route` now compute their stats from cheap, address-scoped
+// RPCs (`listunspent`/`getreceivedbyaddress` for Core,
+// `get_history`/`get_balance` for Electrum) instead, with ZERO full-history
+// fetch. See each transport's own doc comment for the consumer-visible
+// field-definition changes this required.
+
+/// `/address/:a/txs[/chain/:after]`'s pagination, STEP 2 of 2 (the
+/// materialisation shape) — see [`paginate_window`] for STEP 1 (the window
+/// SELECTION shape). `items` must already be newest-first (mempool first,
+/// then descending height/confirmations — each transport's own
+/// history-fetch produces that order); `chain_only` drops mempool entries
+/// and paginates 25-at-a-time by cursor, otherwise the plain `/txs` form
+/// caps at 50. This is a thin wrapper around [`paginate_window`] over
+/// already-materialized esplora JSON — kept for callers that already have
+/// the full list materialized (and for the existing tests below); a
+/// page-aware caller uses [`paginate_order`] instead, over lightweight
+/// `(txid, confirmed)` tuples, so it never materializes more than the page
+/// it was asked for (`../../plans/PLAN-graffito-history-scaling.md`, "Where
+/// the O(N) lives" item 1). Both go through the identical
+/// [`paginate_window`] core so the two selections can never drift apart —
+/// this is what makes page content/order provably byte-identical whether
+/// computed the OLD way (fetch everything, then slice) or the NEW way
+/// (slice the lightweight order, then fetch only that).
+///
+/// Test-only now (`../../plans/PLAN-graffito-history-scaling.md` item 1):
+/// no production translator calls this anymore — both
+/// `CoreRpcTransport::txs_route` and `ElectrumTransport::txs_route` now
+/// window BEFORE materializing (via [`paginate_order`]), never after. Kept
+/// (not deleted) as the independent "old shape" oracle the
+/// byte-identical-page tests reconstruct against.
+#[cfg(test)]
+pub(super) fn paginate_txs(items: Vec<serde_json::Value>, after: Option<&str>, chain_only: bool) -> Vec<serde_json::Value> {
+    paginate_window(items, after, chain_only, |t| t.get("txid").and_then(|v| v.as_str()).unwrap_or(""), tx_confirmed)
 }
 
-/// `/address/:a/txs[/chain/:after]`'s pagination — extracted verbatim from
-/// `CoreRpcTransport::txs_route`. `items` must already be newest-first
-/// (mempool first, then descending height/confirmations — each transport's
-/// own history-fetch produces that order); `chain_only` drops mempool
-/// entries and paginates 25-at-a-time by cursor, otherwise the plain
-/// `/txs` form caps at 50.
-pub(super) fn paginate_txs(mut items: Vec<serde_json::Value>, after: Option<&str>, chain_only: bool) -> Vec<serde_json::Value> {
+/// STEP 1 of 2: the window SELECTION shape, generic over anything that can
+/// report its own txid + confirmed-ness — an already-materialized esplora
+/// JSON value ([`paginate_txs`]) or a bare `(txid, confirmed)` tuple
+/// ([`paginate_order`]). Filters to confirmed-only when `chain_only`, slices
+/// from just after the `after` cursor (empty if the cursor isn't found —
+/// same "cursor fell off, in practice from a reorg mid-page" tolerance the
+/// old single-shot `paginate_txs` had), then caps at 25 (`chain_only`) or 50
+/// (plain). Extracting this generic core is what lets a page-aware
+/// translator apply the EXACT SAME selection to lightweight tuples that
+/// `paginate_txs` applies to full JSON, instead of two hand-kept-in-sync
+/// copies of the same three steps.
+pub(super) fn paginate_window<T>(
+    mut items: Vec<T>,
+    after: Option<&str>,
+    chain_only: bool,
+    txid: impl Fn(&T) -> &str,
+    confirmed: impl Fn(&T) -> bool,
+) -> Vec<T> {
     if chain_only {
-        items.retain(tx_confirmed);
+        items.retain(|t| confirmed(t));
     }
     if let Some(after_txid) = after {
-        let idx = items.iter().position(|t| t.get("txid").and_then(|v| v.as_str()) == Some(after_txid));
+        let idx = items.iter().position(|t| txid(t) == after_txid);
         items = match idx {
             Some(i) => items.split_off(i + 1),
             None => Vec::new(),
@@ -214,6 +229,19 @@ pub(super) fn paginate_txs(mut items: Vec<serde_json::Value>, after: Option<&str
     }
     items.truncate(if chain_only { 25 } else { 50 });
     items
+}
+
+/// STEP 1 alone, over lightweight `(txid, confirmed)` tuples in the same
+/// newest-first order [`paginate_txs`] expects — what a page-aware
+/// translator's `txs_route` calls BEFORE fetching any tx JSON, so it
+/// materializes (`esplora_tx_json` + its prevout resolution) only the
+/// txids the requested page actually needs, never the address's whole
+/// history. Returns just the ordered txids for that page; the caller
+/// fetches each one itself (so it can share its own `esplora_tx_json`/
+/// cache plumbing) and serializes the result — see
+/// `ElectrumTransport::txs_route` / `CoreRpcTransport::txs_route`.
+pub(super) fn paginate_order(order: Vec<(String, bool)>, after: Option<&str>, chain_only: bool) -> Vec<String> {
+    paginate_window(order, after, chain_only, |t| t.0.as_str(), |t| t.1).into_iter().map(|(txid, _)| txid).collect()
 }
 
 /// `/address/:a/utxo`'s `status` object — extracted from
@@ -442,5 +470,53 @@ mod tests {
         // Cursor not found -> empty.
         let out2 = paginate_txs(items, Some("zzz"), true);
         assert!(out2.is_empty());
+    }
+
+    /// Proves [`paginate_order`] (STEP 1 alone, over lightweight tuples)
+    /// selects the EXACT SAME txids, in the EXACT SAME order, that
+    /// [`paginate_txs`] (the old one-shot, fully-materialized shape)
+    /// selects — over a history with mempool entries, several txs sharing
+    /// one block (same `height`/confirmed-ness), and more than 50 confirmed
+    /// txs, across every `chain_only`/`after` combination a real caller
+    /// hits. This is the structural guarantee behind
+    /// `../../plans/PLAN-graffito-history-scaling.md`'s "page JSON must stay
+    /// byte-identical" invariant: a page-aware translator computes the page
+    /// window from tuples BEFORE fetching any tx JSON, but only because
+    /// this same core selects identically either way.
+    #[test]
+    fn paginate_order_matches_paginate_txs_across_mixed_history() {
+        let mut items = Vec::new();
+        let mut order = Vec::new();
+        // Two mempool entries (unconfirmed), server order preserved.
+        for i in 0..2 {
+            let txid = format!("mem{i}");
+            items.push(serde_json::json!({"txid": txid, "status": {"confirmed": false}}));
+            order.push((txid, false));
+        }
+        // Three txs sharing one block (all confirmed, no height to break
+        // ties by within this helper — relative order must survive as-is).
+        for i in 0..3 {
+            let txid = format!("blk{i}");
+            items.push(serde_json::json!({"txid": txid, "status": {"confirmed": true}}));
+            order.push((txid, true));
+        }
+        // 60 more confirmed txs — over both the chain_only cap (25) and the
+        // plain cap (50).
+        for i in 0..60 {
+            let txid = format!("c{i}");
+            items.push(serde_json::json!({"txid": txid, "status": {"confirmed": true}}));
+            order.push((txid, true));
+        }
+        for chain_only in [false, true] {
+            for after in [None, Some("blk1"), Some("c10"), Some("mem1"), Some("not-present")] {
+                let full = paginate_txs(items.clone(), after, chain_only);
+                let full_ids: Vec<&str> = full.iter().map(|t| t["txid"].as_str().unwrap()).collect();
+                let windowed = paginate_order(order.clone(), after, chain_only);
+                assert_eq!(
+                    full_ids, windowed,
+                    "chain_only={chain_only} after={after:?}: windowed selection diverged from the full-fetch one"
+                );
+            }
+        }
     }
 }

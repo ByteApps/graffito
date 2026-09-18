@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use notes_core::address::address_to_script_pubkey;
 use notes_core::bundle::{BundleUtxo, FeeRates, OnchainTx, SyncBundle};
 use notes_core::tx::op_return_payload;
@@ -7,6 +9,51 @@ use crate::Error;
 
 use super::esplora::{AddrStats, EsploraAddrStats, EsploraTx, EsploraUtxo};
 use super::transport::{Transport, TxLookupStatus};
+
+/// How many already-known CONFIRMED txids [`ChainClient::scan_history`] must
+/// see in a page before it's allowed to stop paging early. mempool.space
+/// (and the companion shim) serve confirmed history in pages of 25,
+/// newest-first, so landing on ≥6 txids the store already holds as
+/// confirmed means the walk has reached already-synced history — kept well
+/// above 1 so ordinary same-block reordering across backends can never look
+/// like "caught up" when it isn't.
+pub const HISTORY_REORG_MARGIN: usize = 6;
+
+/// mempool.space (and the companion shim) serve confirmed history in pages
+/// of this size, newest-first — [`ChainClient::scan_history`]'s "was this
+/// page full" checks compare against it rather than a bare `25` literal.
+pub const ESPLORA_PAGE_SIZE: usize = 25;
+
+/// U1 (`plans/PLAN-graffito-history-scaling.md`): what an incremental scan
+/// already knows, so [`ChainClient::scan_history`] can stop paging once it
+/// re-encounters that much of it. `known_confirmed` is the CONFIRMED txids
+/// the store already holds for the scanned address (mempool/unconfirmed
+/// txids never belong here — an incremental scan must always re-see a
+/// pending tx to learn it confirmed or dropped). `must_see` is every txid
+/// the store still holds PENDING/unconfirmed (own or received) — the early
+/// stop must never fire while any of them hasn't turned up on some fetched
+/// page (any status: still-mempool or freshly-confirmed both count), because
+/// that's exactly the information the store's dropped-pending detector
+/// needs a full walk to establish; a `must_see` txid that never appears on
+/// any page costs one walk all the way to the end (the natural "short page"
+/// stop still applies), which is the correct, deliberate cost of the
+/// "dropped from the mempool" case. `tip_height` is the store's own
+/// last-seen chain tip, 0 = unknown; it backs the reorg guard.
+pub struct ScanCursor {
+    pub known_confirmed: HashSet<String>,
+    pub must_see: HashSet<String>,
+    pub tip_height: u32,
+}
+
+impl ScanCursor {
+    /// The empty cursor: nothing is known-confirmed, nothing must be
+    /// re-seen, and no tip has been recorded, so [`ChainClient::scan_history`]
+    /// walks the full history — exactly the same request sequence and
+    /// content as today's [`ChainClient::build_bundle`].
+    pub fn empty() -> Self {
+        ScanCursor { known_confirmed: HashSet::new(), must_see: HashSet::new(), tip_height: 0 }
+    }
+}
 
 /// mempool.space bases per network. Regtest has no public instance —
 /// callers supply a custom base (companion/server.py shape) instead.
@@ -94,6 +141,39 @@ pub struct ChainClient<T: Transport> {
 /// [`ChainClient::fetch_tx_io`]'s return: spendable input coins, output
 /// (scriptPubKey, value) pairs, and whether the tx is confirmed.
 type TxIoResult = (Vec<crate::psbt_build::WatchCoin>, Vec<(Vec<u8>, u64)>, bool);
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// [`ChainClient::scan_history`]'s per-page `on_page` payload: a PARTIAL,
+/// `full: false` bundle carrying only `page_txs`' classified notes, but the
+/// COMPLETE utxo set (already one full call, so it's cheap and safe to
+/// repeat every page).
+fn page_bundle(
+    network: Network,
+    tip_height: u64,
+    utxos: &[BundleUtxo],
+    page_txs: &[EsploraTx],
+    address: &str,
+) -> SyncBundle {
+    let notes_onchain = page_txs.iter().filter_map(|t| classify_tx_net(t, address, network)).collect();
+    SyncBundle {
+        network: network.as_str().to_string(),
+        full: false,
+        since_height: None,
+        tip_height,
+        bundle_time: now_secs(),
+        fee_rates: FeeRates::default(),
+        btc_usd: None,
+        utxos: utxos.to_vec(),
+        notes_onchain,
+        ..SyncBundle::default()
+    }
+}
 
 impl<T: Transport> ChainClient<T> {
     pub fn new(transport: T, network: Network) -> Self {
@@ -420,47 +500,127 @@ impl<T: Transport> ChainClient<T> {
 
     /// Assemble the in-memory SyncBundle notes-core's extract_notes eats —
     /// identical shape to what the companion emits as QR/file bundles.
-    pub fn build_bundle(
+    /// Assemble the in-memory SyncBundle notes-core's extract_notes eats —
+    /// identical shape to what the companion emits as QR/file bundles. A
+    /// thin wrapper over [`Self::scan_history`] with an empty cursor: walks
+    /// the full history every time, exactly as before U1
+    /// (`plans/PLAN-graffito-history-scaling.md`) introduced incremental
+    /// scanning.
+    pub fn build_bundle(&self, address: &str) -> Result<SyncBundle, Error> {
+        self.scan_history(address, &ScanCursor::empty(), &mut |_| {})
+    }
+
+    /// U1 streaming primitive: page through `address`'s history like
+    /// [`Self::build_bundle`] used to unconditionally, but stop EARLY once
+    /// the walk has reconfirmed enough of what `cursor` already knows —
+    /// and call `on_page` with a partial, `full: false` bundle after every
+    /// fetched page (page content only; the complete UTXO set every time,
+    /// since that's already one full call) so a caller can apply new notes
+    /// incrementally instead of waiting for the whole walk to finish.
+    ///
+    /// Stop rule, checked after each page (initial `/txs` page included):
+    /// once a page's CONFIRMED tx count is a full [`ESPLORA_PAGE_SIZE`] AND
+    /// the cumulative count of txids from `cursor.known_confirmed` seen
+    /// CONFIRMED in some page reaches [`HISTORY_REORG_MARGIN`] AND every
+    /// `cursor.must_see` txid has turned up on some page (any status), no
+    /// further page is fetched. Mempool txs never count toward the
+    /// `known_confirmed` tally — a txid only counts when the CURRENT page
+    /// shows it confirmed, which is what makes a stale/wrong cursor entry
+    /// harmless — but DO count toward `must_see` (a still-pending txid is
+    /// exactly as "seen" sitting in the mempool as it is freshly confirmed).
+    /// A short (non-full) continuation page always ends the walk regardless
+    /// of `must_see` (it's the tail of history — nothing more to find, so a
+    /// `must_see` txid that never appeared genuinely isn't there); an empty
+    /// cursor never satisfies the confirmed-margin count
+    /// (`0 < HISTORY_REORG_MARGIN` always), so it always walks to the end —
+    /// byte-identical content to the pre-U1 `build_bundle`.
+    ///
+    /// Reorg safety: if the freshly-fetched tip is LOWER than
+    /// `cursor.tip_height` (and `cursor.tip_height > 0`), the chain moved
+    /// backward under us, so nothing in `known_confirmed` can be trusted —
+    /// `known_confirmed` is ignored entirely and the walk goes to the end,
+    /// same as an empty cursor.
+    pub fn scan_history(
         &self,
         address: &str,
-        since_height: Option<u64>,
+        cursor: &ScanCursor,
+        on_page: &mut dyn FnMut(&SyncBundle),
     ) -> Result<SyncBundle, Error> {
         let tip_height = self.tip_height()?;
-        // Network-efficiency (2026-07-23): fee_rates + btc_usd are only READ by
-        // the fee-showing screens (compose/sweep/consolidate/bump), which now
-        // fetch them lazily (`refresh_fees_price`, session-cached). A scan no
-        // longer fetches either — the notes-core SyncBundle fields are required,
-        // so they're filled with defaults the app's apply path ignores.
-        let fee_rates = FeeRates::default();
-        // Network-efficiency (2026-07-23): btc_usd was fetched on every scan
-        // but only ever READ by the fee-showing screens (compose/sweep/
-        // consolidate/bump) — those now fetch it lazily themselves
-        // (`refresh_fees_price`, session-cached). The field stays for serde
-        // compat; a scan never populates it.
-        let btc_usd = None;
         let utxos = self.utxos(address)?;
-        let history = self.full_history(address)?;
 
-        let notes_onchain = history
-            .iter()
-            .filter(|t| match since_height {
-                Some(h) => !t.status.confirmed || t.status.block_height.unwrap_or(u64::MAX) > h,
-                None => true,
-            })
-            .filter_map(|t| classify_tx_net(t, address, self.network))
-            .collect();
+        let reorged = cursor.tip_height > 0 && tip_height < cursor.tip_height as u64;
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut matched: HashSet<String> = HashSet::new();
+        let mut all_txs: Vec<EsploraTx> = Vec::new();
+
+        // Counts NEW confirmed txids in `page` that `cursor` already knows
+        // as confirmed — a no-op once `reorged` (the cursor is untrusted).
+        macro_rules! count_matches {
+            ($page:expr) => {
+                if !reorged {
+                    for t in $page.iter() {
+                        if t.status.confirmed && cursor.known_confirmed.contains(&t.txid) {
+                            matched.insert(t.txid.clone());
+                        }
+                    }
+                }
+            };
+        }
+
+        // Page 1: the initial `/txs` fetch (mempool + up to 25 confirmed).
+        let page1: Vec<EsploraTx> =
+            parse_json(&self.transport.get_text(&format!("/address/{address}/txs"))?)?;
+        let fresh1: Vec<EsploraTx> = page1.into_iter().filter(|t| seen.insert(t.txid.clone())).collect();
+        let confirmed_count1 = fresh1.iter().filter(|t| t.status.confirmed).count();
+        count_matches!(&fresh1);
+        let mut last = fresh1.iter().rfind(|t| t.status.confirmed).map(|t| t.txid.clone());
+        if !fresh1.is_empty() {
+            on_page(&page_bundle(self.network, tip_height, &utxos, &fresh1, address));
+        }
+        all_txs.extend(fresh1);
+
+        let page1_full = confirmed_count1 == ESPLORA_PAGE_SIZE;
+        let must_see_ok = cursor.must_see.iter().all(|t| seen.contains(t));
+        let mut continue_paging =
+            last.is_some() && !(page1_full && matched.len() >= HISTORY_REORG_MARGIN && must_see_ok);
+
+        while continue_paging {
+            let after = last.take().expect("continue_paging implies last.is_some()");
+            let page: Vec<EsploraTx> = parse_json(
+                &self.transport.get_text(&format!("/address/{address}/txs/chain/{after}"))?,
+            )?;
+            let fresh: Vec<EsploraTx> =
+                page.into_iter().filter(|t| seen.insert(t.txid.clone())).collect();
+            if fresh.is_empty() {
+                // Natural end: a backend that ignores the cursor and echoes
+                // an already-seen page also lands here (dedup empties it).
+                break;
+            }
+            let confirmed_count = fresh.iter().filter(|t| t.status.confirmed).count();
+            count_matches!(&fresh);
+            on_page(&page_bundle(self.network, tip_height, &utxos, &fresh, address));
+            last = fresh.iter().rfind(|t| t.status.confirmed).map(|t| t.txid.clone());
+            all_txs.extend(fresh);
+
+            let page_full = confirmed_count == ESPLORA_PAGE_SIZE;
+            let must_see_ok = cursor.must_see.iter().all(|t| seen.contains(t));
+            continue_paging =
+                last.is_some() && page_full && (matched.len() < HISTORY_REORG_MARGIN || !must_see_ok);
+        }
+
+        let notes_onchain =
+            all_txs.iter().filter_map(|t| classify_tx_net(t, address, self.network)).collect();
 
         Ok(SyncBundle {
             network: self.network.as_str().to_string(),
-            full: since_height.is_none(),
-            since_height,
+            full: true,
+            since_height: None,
             tip_height,
-            bundle_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            fee_rates,
-            btc_usd,
+            bundle_time: now_secs(),
+            fee_rates: FeeRates::default(),
+            btc_usd: None,
             utxos,
             notes_onchain,
             ..SyncBundle::default()

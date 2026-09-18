@@ -37,7 +37,8 @@ mod transport;
 pub use client::{
     classify_tx, classify_tx_net, default_base, default_explorer_base, discover_indexes,
     discover_spending, explorer_presets, explorer_tx_url, node_presets, scan_change_chain,
-    scan_change_chain_watch, ChainClient, ChangeCoin,
+    scan_change_chain_watch, ChainClient, ChangeCoin, ScanCursor, ESPLORA_PAGE_SIZE,
+    HISTORY_REORG_MARGIN,
 };
 pub use core_rpc::{
     core_rpc_import_descriptors_call_count, core_rpc_tx_json_cache_len,

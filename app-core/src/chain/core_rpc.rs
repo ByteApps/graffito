@@ -56,10 +56,15 @@ pub fn core_rpc_import_descriptors_call_count() -> u32 {
 /// (node identity, txid) — the fix for the measured O(wallet)
 /// `getrawtransaction` defect (`plans/PLAN-one-regtest-node.md`'s "The rescan
 /// trap" / "Two things now grow without bound"): `listtransactions "*"`
-/// ([`CoreRpcTransport::wallet_txid_order`]) has no per-address filter, so
-/// resolving history for ONE address means fetching EVERY wallet-wide
-/// txid via `getrawtransaction` — and, before this cache, doing so again
-/// from scratch on every single call. Measured with
+/// ([`CoreRpcTransport::wallet_tx_order`]) has no per-address filter, so
+/// resolving history for ONE address used to mean fetching EVERY
+/// wallet-wide txid via `getrawtransaction` — and, before this cache,
+/// doing so again from scratch on every single call.
+/// `../../plans/PLAN-graffito-history-scaling.md` item 1 later made
+/// `Self::txs_route` stop fetching past the requested page, but this cache
+/// still matters: a paginating caller walking a busy wallet page-by-page
+/// (or two backends sharing one node) still re-touches the SAME confirmed
+/// txids repeatedly. Measured with
 /// `tests/common/count_proxy.rs`: 5 identical `address_stats` calls issued
 /// 2090 `getrawtransaction` round trips (~418 each), with NO decrease
 /// across repetition.
@@ -1428,14 +1433,18 @@ impl CoreRpcTransport {
         v.as_u64().ok_or_else(|| Error::Json("getblockcount: not a number".into()))
     }
 
-    /// Every wallet-known txid (mempool + confirmed), deduped, ordered
+    /// Every wallet-known tx (mempool + confirmed), deduped, ordered
     /// newest-first: mempool (by descending `time`) first, then confirmed
     /// by ascending `confirmations` (= most-recently-confirmed first) —
     /// same ordering `server.py`'s `address_txids` uses. `listtransactions
     /// "*"` is wallet-WIDE (Core has no per-address filter — plan §2.2
-    /// flags the O(wallet) cost as a later-unit optimization); callers
-    /// filter down to one address via [`tx_touches`].
-    fn wallet_txid_order(&self) -> Result<Vec<String>, Error> {
+    /// flags the O(wallet) cost, and
+    /// `../../plans/PLAN-graffito-history-scaling.md` item 1 is the fix
+    /// this unit ships): each entry carries its own `confirmations` too, so
+    /// [`Self::txs_route`] can skip fetching a mempool entry outright when
+    /// only confirmed history was asked for, without needing a full tx
+    /// fetch just to learn that.
+    fn wallet_tx_order(&self) -> Result<Vec<(String, bool)>, Error> {
         let entries = self.rpc(
             Some(&Self::watch_wallet()),
             "listtransactions",
@@ -1456,35 +1465,72 @@ impl CoreRpcTransport {
         for e in list {
             if let Some(txid) = e.get("txid").and_then(|t| t.as_str()) {
                 if seen.insert(txid.to_string()) {
-                    out.push(txid.to_string());
+                    let confirmations = e.get("confirmations").and_then(|c| c.as_i64()).unwrap_or(0);
+                    out.push((txid.to_string(), confirmations > 0));
                 }
             }
         }
         Ok(out)
     }
 
-    /// `address`'s full esplora-shaped history (already touch-filtered),
-    /// newest-first. Backs `/address/:a`, `/address/:a/txs`, and
-    /// `/address/:a/txs/chain/:after`.
-    fn address_history_json(&self, address: &str) -> Result<Vec<serde_json::Value>, Error> {
-        let tip = self.tip_height_rpc()?;
-        let txids = self.wallet_txid_order()?;
-        let mut out = Vec::with_capacity(txids.len());
-        for txid in txids {
-            let tx = self.esplora_tx_json(&txid, tip)?;
-            if esplora_shape::tx_touches(&tx, address) {
-                out.push(tx);
-            }
-        }
-        Ok(out)
-    }
-
-    /// `GET /address/:a` — folds full history into chain/mempool buckets
-    /// via the shared [`esplora_shape::fold_address_stats`], exactly like
-    /// `server.py`'s `/address` handler (plan §1.3, :220).
+    /// `GET /address/:a` — U2 (`../../plans/PLAN-graffito-history-scaling.md`):
+    /// no `listtransactions` walk at all. `listunspent` gives the CURRENT
+    /// confirmed-unspent sum for this address; `getreceivedbyaddress`
+    /// (minconf 1 and minconf 0) gives the lifetime confirmed- and
+    /// any-confirmation-received sums — together these replace the old
+    /// fetch-the-whole-wallet-history-and-fold approach with three cheap,
+    /// address-scoped RPCs.
+    ///
+    /// **Consumer-visible change, reported per the plan's instructions.**
+    /// `chain_tx_count`/`mempool_tx_count` are no longer exact per-tx
+    /// counts — Core's RPC surface has no per-address filter that can see
+    /// a SPEND of this address's own coin without materializing every
+    /// wallet-wide tx (the very walk this unit removes), so they become
+    /// presence indicators (`1` if this address has EVER received
+    /// confirmed/unconfirmed funds, else `0`). The only reader that treats
+    /// them as a boolean, `ChainClient::address_used`'s `tx_count > 0`
+    /// check, is unaffected: an address that has ever been spent from must
+    /// have been funded first, so "has ever received anything" is an exact
+    /// substitute for "has ANY history" — and unlike a naive "current
+    /// unspent count", it can never flip from true back to false as coins
+    /// get spent. `funded_txo_sum`/`spent_txo_sum` are no longer the
+    /// lifetime esplora-exact definition (see the removed
+    /// `address_history_json` + `fold_address_stats` call this route used
+    /// to make): `chain_funded` is the lifetime confirmed-received sum
+    /// (monotonic — changes on any new confirmed funding), `chain_spent`
+    /// is that sum minus what's still unspent-and-confirmed right now
+    /// (changes on any spend, confirmed or pending), `mempool_funded` is
+    /// the unconfirmed portion of lifetime-received, and `mempool_spent`
+    /// stays `0` (no cheap RPC gives a mempool-side spent sum for Core).
+    /// The only two real consumers — `Store.addr_stats`'s equality
+    /// fingerprint and `address_used()` — remain truthful: the fingerprint
+    /// changes whenever new funds arrive OR existing confirmed funds get
+    /// spent, and `address_used()`'s boolean stays exact.
     fn address_stats_route(&self, address: &str) -> Result<String, Error> {
-        let txs = self.address_history_json(address)?;
-        Ok(esplora_shape::fold_address_stats(&txs, address).to_string())
+        let wallet = Self::watch_wallet();
+        let unspent = self.rpc(Some(&wallet), "listunspent", serde_json::json!([0, 9_999_999, [address]]))?;
+        let chain_unspent_btc: f64 = unspent
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|u| u.get("confirmations").and_then(|c| c.as_i64()).unwrap_or(0) > 0)
+            .filter_map(|u| u.get("amount").and_then(|a| a.as_f64()))
+            .sum();
+        let received_confirmed =
+            self.rpc(Some(&wallet), "getreceivedbyaddress", serde_json::json!([address, 1]))?.as_f64().unwrap_or(0.0);
+        let received_any =
+            self.rpc(Some(&wallet), "getreceivedbyaddress", serde_json::json!([address, 0]))?.as_f64().unwrap_or(0.0);
+        let chain_funded = esplora_shape::btc_to_sats(received_confirmed);
+        let mempool_funded = esplora_shape::btc_to_sats((received_any - received_confirmed).max(0.0));
+        let chain_spent = chain_funded.saturating_sub(esplora_shape::btc_to_sats(chain_unspent_btc));
+        let chain_tx_count = u64::from(chain_funded > 0);
+        let mempool_tx_count = u64::from(mempool_funded > 0);
+        Ok(serde_json::json!({
+            "chain_stats": {"tx_count": chain_tx_count, "funded_txo_sum": chain_funded, "spent_txo_sum": chain_spent},
+            "mempool_stats": {"tx_count": mempool_tx_count, "funded_txo_sum": mempool_funded, "spent_txo_sum": 0},
+        })
+        .to_string())
     }
 
     /// `GET /address/:a/utxo` → `listunspent 0 9999999 [address]` (plan
@@ -1521,20 +1567,54 @@ impl CoreRpcTransport {
         Ok(serde_json::to_string(&items).unwrap())
     }
 
-    /// `GET /address/:a/txs[/chain/:after]` — `listtransactions "*" …`
-    /// filtered to txs touching `address` (plan §1.3, `server.py`:188,
-    /// :283), paginated via the shared [`esplora_shape::paginate_txs`].
-    /// `chain_only` (the `/txs/chain/:after` form) drops mempool entries
-    /// and paginates 25-at-a-time by PATH-embedded cursor, exactly what
-    /// `ChainClient::full_history` sends and real esplora expects — see
-    /// the `EsploraFake` reference in `tests/common/mod.rs`; the regtest
-    /// `server.py` shim instead reads a query-string cursor it never
-    /// actually receives from this app (a pre-existing, out-of-scope shim
-    /// gap noted in `chain.rs`'s own doc comment), so it does not double
-    /// as a second worked example for this form.
+    /// `GET /address/:a/txs[/chain/:after]` — page-aware
+    /// (`../../plans/PLAN-graffito-history-scaling.md` item 1). Core has NO
+    /// per-address filter on `listtransactions`, so unlike Electrum's
+    /// `get_history` this can't compute the page's OWN txids from
+    /// lightweight data alone — but the CURSOR's position costs nothing
+    /// extra: `after` is always a txid from an earlier page of THIS SAME
+    /// address's own history, and filtering-by-touches never reorders
+    /// entries, so the cursor's position in the WALLET-WIDE lightweight
+    /// order ([`Self::wallet_tx_order`]) is found by a plain txid match —
+    /// zero fetches — and everything strictly after it, walked in that
+    /// same order, yields exactly the entries that would follow it in the
+    /// address-filtered list too. From there the walk applies the EXACT
+    /// SAME remaining selection [`esplora_shape::paginate_window`] applies
+    /// (confirmed-only filter, then cap at 25/50), just LAZILY: it fetches
+    /// (`esplora_tx_json`, with its cache + prevout resolution) and
+    /// `tx_touches`-checks each wallet-wide tx ONE AT A TIME, newest-first,
+    /// stopping the instant it has collected enough of this address's own
+    /// touching txs to fill the page — never fetching the rest of the
+    /// wallet's history once the page is full. `chain_only` skips a
+    /// mempool entry without even fetching it (the lightweight order
+    /// already knows it's unconfirmed). A cursor that's never found in the
+    /// wallet-wide order at all yields an empty page, same as the old
+    /// one-shot `paginate_txs`'s "index not found -> empty" rule.
     fn txs_route(&self, address: &str, after: Option<&str>, chain_only: bool) -> Result<String, Error> {
-        let items = self.address_history_json(address)?;
-        let items = esplora_shape::paginate_txs(items, after, chain_only);
+        let tip = self.tip_height_rpc()?;
+        let order = self.wallet_tx_order()?;
+        let cap = if chain_only { 25 } else { 50 };
+        let start = match after {
+            None => 0,
+            Some(after_txid) => match order.iter().position(|(txid, _)| txid == after_txid) {
+                Some(i) => i + 1,
+                None => order.len(), // cursor not found anywhere -> nothing after it
+            },
+        };
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        for (txid, confirmed) in order.into_iter().skip(start) {
+            if items.len() >= cap {
+                break;
+            }
+            if chain_only && !confirmed {
+                continue;
+            }
+            let tx = self.esplora_tx_json(&txid, tip)?;
+            if !esplora_shape::tx_touches(&tx, address) {
+                continue;
+            }
+            items.push(tx);
+        }
         Ok(serde_json::to_string(&items).unwrap())
     }
 
@@ -1744,10 +1824,274 @@ impl Transport for CoreRpcTransport {
     }
 }
 
+// `../../plans/PLAN-graffito-history-scaling.md` items 1 + 3: reuse
+// `tests/common/mock_rpc.rs` VERBATIM (a `#[path]` include, not a copy) so
+// the in-crate tests below share the exact same bitcoind-JSON-RPC-shaped
+// stub `core_rpc_conformance.rs`'s own mock-driven tests use — the
+// difference is only WHERE these tests live: in-crate gives white-box
+// access to `wallet_tx_order`/`esplora_tx_json`/`address_stats_route`/
+// `txs_route` directly, which the byte-identical-page proof test needs and
+// an external `tests/*.rs` file (crate-boundary, `pub`-only) can't reach.
+// Declared at the TOP LEVEL (not nested inside `mod tests`) because a
+// `#[path]` on a module nested inside an INLINE parent resolves relative to
+// a virtual `core_rpc/tests/` subdirectory that doesn't exist on disk —
+// this file's own real directory (`chain/`) is the only unambiguous base.
+#[cfg(test)]
+#[path = "../../tests/common/mock_rpc.rs"]
+mod mock_rpc_shared;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::transport::AnyTransport;
+    use super::mock_rpc_shared as mock_rpc;
+    use mock_rpc::{MockResponse, MockRpcServer};
+
+    /// A real, checksum-valid P2WPKH address (mirrors
+    /// `electrum::tests::test_addr` — via notes-core's own bech32 encoder,
+    /// not a hand-copied string).
+    fn test_addr() -> String {
+        notes_core::address::p2wpkh_address(notes_core::Network::Mainnet, &[0x11; 20])
+    }
+
+    /// Scripts the one-time "is this address already watched" ceremony
+    /// (`ensure_watch_wallet` + `ensure_address_watched`'s `getaddressinfo`
+    /// hit + `ensure_not_rescanning`'s `getwalletinfo` check) every
+    /// `/address/*` route runs through before reaching the route itself —
+    /// all three are cached PER TRANSPORT INSTANCE after their first
+    /// success, so scripting them once here is enough for a whole test,
+    /// however many `get_text` calls it makes on the SAME transport.
+    fn script_watch_ceremony(mock: &MockRpcServer) {
+        mock.set("createwallet", MockResponse::Ok(serde_json::json!("watchwallet")));
+        mock.set("getaddressinfo", MockResponse::Ok(serde_json::json!({"ismine": true})));
+        mock.set("getwalletinfo", MockResponse::Ok(serde_json::json!({"scanning": false})));
+        mock.set("getblockcount", MockResponse::Ok(serde_json::json!(1_000)));
+    }
+
+    fn core_transport(mock: &MockRpcServer) -> CoreRpcTransport {
+        match AnyTransport::new(&mock.base_url(), None).expect("construct Core RPC transport") {
+            AnyTransport::Core(c) => c,
+            AnyTransport::Esplora(_) | AnyTransport::Electrum(_) => panic!("expected a Core transport"),
+        }
+    }
+
+    // ---- U2: address stats — listunspent + getreceivedbyaddress, ZERO
+    // `listtransactions` (`../../plans/PLAN-graffito-history-scaling.md`) --
+
+    #[test]
+    fn address_stats_uses_listunspent_and_getreceivedbyaddress_not_listtransactions() {
+        let mock = MockRpcServer::start();
+        script_watch_ceremony(&mock);
+        mock.set(
+            "listunspent",
+            MockResponse::Ok(serde_json::json!([{"txid": "u1", "vout": 0, "amount": 0.0005, "confirmations": 6}])),
+        );
+        // MockRpcServer scripts ONE static response per METHOD NAME
+        // (not per params — see its own doc comment), so both the
+        // minconf=1 and minconf=0 `getreceivedbyaddress` calls this route
+        // makes get the SAME canned value here. That is a deliberately
+        // simple scenario (all funds confirmed, nothing pending) — it
+        // still proves the call-count claim this test exists for, and the
+        // resulting sums are exactly right for that scenario:
+        // mempool_funded = (received_any - received_confirmed).max(0) = 0.
+        mock.set("getreceivedbyaddress", MockResponse::Ok(serde_json::json!(0.0005)));
+        let core = core_transport(&mock);
+        let addr = test_addr();
+        let json = core.get_text(&format!("/address/{addr}")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["chain_stats"]["tx_count"], 1);
+        assert_eq!(v["chain_stats"]["funded_txo_sum"], 50_000);
+        assert_eq!(v["chain_stats"]["spent_txo_sum"], 0);
+        assert_eq!(v["mempool_stats"]["tx_count"], 0);
+        assert_eq!(v["mempool_stats"]["funded_txo_sum"], 0);
+        assert_eq!(v["mempool_stats"]["spent_txo_sum"], 0);
+        assert_eq!(mock.call_count("listtransactions"), 0, "U2: stats must never walk listtransactions");
+        assert_eq!(mock.call_count("getrawtransaction"), 0, "U2: stats must never fetch a tx");
+        assert_eq!(mock.call_count("listunspent"), 1);
+        assert_eq!(mock.call_count("getreceivedbyaddress"), 2);
+    }
+
+    /// The quiet-tick shape: the one-time watch ceremony (`createwallet`/
+    /// `getaddressinfo`/`getwalletinfo`) runs ONCE no matter how many times
+    /// `/address/:a` is called on the SAME transport, and each call after
+    /// that costs a CONSTANT 3 RPCs (`listunspent` + 2×
+    /// `getreceivedbyaddress`) — never growing with history size, and
+    /// never touching `listtransactions`.
+    #[test]
+    fn address_stats_quiet_tick_ceremony_runs_once_then_constant_per_call() {
+        let mock = MockRpcServer::start();
+        script_watch_ceremony(&mock);
+        mock.set("listunspent", MockResponse::Ok(serde_json::json!([])));
+        mock.set("getreceivedbyaddress", MockResponse::Ok(serde_json::json!(0.0)));
+        let core = core_transport(&mock);
+        let addr = test_addr();
+
+        let _ = core.get_text(&format!("/address/{addr}")).unwrap();
+        assert_eq!(mock.call_count("createwallet"), 1);
+        assert_eq!(mock.call_count("getaddressinfo"), 1);
+        assert_eq!(mock.call_count("getwalletinfo"), 1);
+        assert_eq!(mock.call_count("listunspent"), 1);
+        assert_eq!(mock.call_count("getreceivedbyaddress"), 2);
+
+        let _ = core.get_text(&format!("/address/{addr}")).unwrap();
+        // Ceremony is cached per-instance — stays at 1, not 2.
+        assert_eq!(mock.call_count("createwallet"), 1);
+        assert_eq!(mock.call_count("getaddressinfo"), 1);
+        assert_eq!(mock.call_count("getwalletinfo"), 1);
+        // Per-call cost repeats exactly — no growth.
+        assert_eq!(mock.call_count("listunspent"), 2);
+        assert_eq!(mock.call_count("getreceivedbyaddress"), 4);
+        assert_eq!(mock.call_count("listtransactions"), 0);
+        assert_eq!(mock.call_count("getrawtransaction"), 0);
+    }
+
+    /// Builds `n` confirmed `listtransactions` entries (txid `c<i>`,
+    /// `confirmations: i` so `c1` is the newest and `c<n>` the oldest —
+    /// ascending confirmations is `wallet_tx_order`'s newest-first sort
+    /// key) plus `mem` mempool entries (`confirmations: 0`, distinct
+    /// `time` so their relative order is deterministic).
+    fn listtransactions_entries(n: u64, mem: u64) -> serde_json::Value {
+        let mut entries: Vec<serde_json::Value> = (1..=n)
+            .map(|i| serde_json::json!({"txid": format!("c{i}"), "confirmations": i, "time": 2_000_000_000i64 - i as i64}))
+            .collect();
+        for m in 0..mem {
+            entries.push(serde_json::json!({"txid": format!("mem{m}"), "confirmations": 0, "time": (mem - m) as i64}));
+        }
+        serde_json::json!(entries)
+    }
+
+    /// A single static `getrawtransaction` body: one output paying `addr`,
+    /// always "confirmed" (irrelevant to `chain_only` filtering, which
+    /// this unit made run off the LIGHTWEIGHT `listtransactions`
+    /// `confirmations` field instead — see `wallet_tx_order`'s doc
+    /// comment) — good enough for every test below, none of which reads
+    /// per-tx content beyond "does it touch `addr`".
+    fn always_touching_tx(addr: &str) -> serde_json::Value {
+        serde_json::json!({
+            "confirmations": 500,
+            "blocktime": 1_700_000_000u64,
+            "vin": [],
+            "vout": [{"value": 0.0001, "scriptPubKey": {"address": addr, "type": "witness_v0_keyhash", "hex": "deadbeef"}}],
+        })
+    }
+
+    // ---- U1: page-aware `txs_route` — exact call counts + byte-identity
+    // (`../../plans/PLAN-graffito-history-scaling.md`) -------------------
+
+    /// 60 confirmed + 2 mempool = 62 in the wallet's ENTIRE history, all
+    /// touching one address (single-notebook scenario — matches real
+    /// per-notebook usage more than a busy multi-notebook wallet, but is
+    /// exactly what makes the call count below unambiguous). Plain `/txs`
+    /// caps at 50 (mempool-first: 2 mempool + 48 confirmed) — must cost
+    /// EXACTLY 50 `getrawtransaction` calls, never the other 12.
+    #[test]
+    fn txs_route_plain_page_costs_exactly_the_page_not_the_wallet_history() {
+        let mock = MockRpcServer::start();
+        script_watch_ceremony(&mock);
+        let addr = test_addr();
+        mock.set("listtransactions", MockResponse::Ok(listtransactions_entries(60, 2)));
+        mock.set("getrawtransaction", MockResponse::Ok(always_touching_tx(&addr)));
+        let core = core_transport(&mock);
+
+        let json = core.get_text(&format!("/address/{addr}/txs")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 50, "62 in history, plain /txs caps at 50");
+        assert_eq!(
+            mock.call_count("getrawtransaction"),
+            50,
+            "must materialize only the 50-item page, not the wallet's other 12 txs"
+        );
+        assert_eq!(mock.call_count("listtransactions"), 1);
+    }
+
+    /// Same 60-confirmed-tx history, no mempool noise. A `/txs/chain/c1`
+    /// continuation (as if `c1` were the last item of an earlier page)
+    /// must cost EXACTLY 25 `getrawtransaction` calls (`c2..c26`) — never
+    /// touching `c27..c60`, and never re-fetching the cursor `c1` itself
+    /// (its position is found on the lightweight order alone).
+    #[test]
+    fn txs_route_chain_page_costs_exactly_25_and_never_refetches_the_cursor() {
+        let mock = MockRpcServer::start();
+        script_watch_ceremony(&mock);
+        let addr = test_addr();
+        mock.set("listtransactions", MockResponse::Ok(listtransactions_entries(60, 0)));
+        mock.set("getrawtransaction", MockResponse::Ok(always_touching_tx(&addr)));
+        let core = core_transport(&mock);
+
+        let json = core.get_text(&format!("/address/{addr}/txs/chain/c1")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let ids: Vec<&str> = v.as_array().unwrap().iter().map(|t| t["txid"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 25);
+        assert_eq!(ids[0], "c2");
+        assert_eq!(ids[24], "c26");
+        assert_eq!(
+            mock.call_count("getrawtransaction"),
+            25,
+            "must materialize exactly the 25-item page — not the cursor, not c27..c60"
+        );
+    }
+
+    /// Item 1's core invariant, proven end-to-end through the real
+    /// `get_text` routes: the page-aware production path returns content
+    /// BYTE-IDENTICAL to the OLD shape (materialize the WHOLE wallet-wide
+    /// order, touch-filter it, then run the same generic
+    /// [`esplora_shape::paginate_txs`] the pre-fix code called directly),
+    /// across a history with mempool entries, several txs sharing one
+    /// confirmation count (Core's analogue of "same block" — bitcoind's
+    /// `listtransactions`/`getrawtransaction` report confirmations, not a
+    /// block height directly), and more than 50 confirmed txs — for both
+    /// the plain `/txs` page and the `/txs/chain/:after` continuation.
+    #[test]
+    fn txs_route_page_aware_matches_old_full_fetch_shape() {
+        let mock = MockRpcServer::start();
+        script_watch_ceremony(&mock);
+        let addr = test_addr();
+        let mut entries: Vec<serde_json::Value> = vec![
+            serde_json::json!({"txid": "mem0", "confirmations": 0, "time": 3}),
+            serde_json::json!({"txid": "mem1", "confirmations": 0, "time": 2}),
+            // Three txs sharing one confirmation count (a tie, exactly
+            // like three txs sharing one block on Electrum's side).
+            serde_json::json!({"txid": "tie0", "confirmations": 61, "time": 1_000}),
+            serde_json::json!({"txid": "tie1", "confirmations": 61, "time": 999}),
+            serde_json::json!({"txid": "tie2", "confirmations": 61, "time": 998}),
+        ];
+        for i in 1..=60u64 {
+            entries.push(serde_json::json!({"txid": format!("c{i}"), "confirmations": i, "time": 2_000_000_000i64 - i as i64}));
+        }
+        mock.set("listtransactions", MockResponse::Ok(serde_json::json!(entries)));
+        mock.set("getrawtransaction", MockResponse::Ok(always_touching_tx(&addr)));
+        let core = core_transport(&mock);
+
+        // NEW page-aware production path, via the real `get_text` routes.
+        let page1_json = core.get_text(&format!("/address/{addr}/txs")).unwrap();
+        let page1: Vec<serde_json::Value> = serde_json::from_str(&page1_json).unwrap();
+        let last1 = page1.last().unwrap()["txid"].as_str().unwrap().to_string();
+        let page2_json = core.get_text(&format!("/address/{addr}/txs/chain/{last1}")).unwrap();
+        let page2: Vec<serde_json::Value> = serde_json::from_str(&page2_json).unwrap();
+
+        // OLD full-fetch shape, reconstructed independently: materialize
+        // the WHOLE lightweight order (every txid, not just a page), then
+        // paginate the fully-materialized list — exactly what the pre-fix
+        // `address_history_json` (`wallet_txid_order` + per-txid
+        // `esplora_tx_json` + `tx_touches`) + `paginate_txs` call used to
+        // do. White-box (private-method) access is exactly why this test
+        // lives in-crate rather than in `tests/`.
+        let tip = core.tip_height_rpc().unwrap();
+        let order = core.wallet_tx_order().unwrap();
+        let mut full = Vec::with_capacity(order.len());
+        for (txid, _confirmed) in order {
+            let tx = core.esplora_tx_json(&txid, tip).unwrap();
+            if esplora_shape::tx_touches(&tx, &addr) {
+                full.push(tx);
+            }
+        }
+        let old_page1 = esplora_shape::paginate_txs(full.clone(), None, false);
+        let old_page2 = esplora_shape::paginate_txs(full, Some(&last1), true);
+
+        assert_eq!(page1, old_page1, "page 1 (plain /txs) diverged from the full-fetch shape");
+        assert_eq!(page2, old_page2, "page 2 (/txs/chain) diverged from the full-fetch shape");
+        assert!(!page1.is_empty() && !page2.is_empty(), "sanity: both pages must be non-trivial");
+    }
 
     #[test]
     fn core_rpc_transport_parses_scheme_host_port() {
