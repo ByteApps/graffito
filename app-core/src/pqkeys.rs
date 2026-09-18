@@ -1,5 +1,5 @@
 //! Per-notebook seed-derived ML-KEM receive keys (post-quantum note
-//! support, `../../plans/PLAN-graffito-pq-hybrid.md`) — one keypair per
+//! support, `../../reports/GRAFFITO-ENCRYPTION-LAYERS.md`) — one keypair per
 //! (notebook leaf secret, ML-KEM level), deterministic from the
 //! notebook's own leaf secret so recovery from the seed words reproduces
 //! exactly the same key every time (same principle as the notes/ECDH key,

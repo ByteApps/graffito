@@ -1,7 +1,7 @@
 //! Passphrase strength estimation, one-tap generation, and security-label
 //! copy for the optional post-quantum layers on directed private notes
 //! (an Argon2id passphrase layer and an ML-KEM hybrid layer, composable —
-//! see `../../plans/PLAN-graffito-pq-hybrid.md` at the workspace level for the
+//! see `../../reports/GRAFFITO-ENCRYPTION-LAYERS.md` at the workspace level for the
 //! encryption design; this module is the pure, UI-free logic the compose
 //! screen's live strength meter, generator button, and security label all
 //! read from). No key material, no crypto primitives — just numbers and
