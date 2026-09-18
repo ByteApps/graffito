@@ -111,6 +111,10 @@ fn handle_conn(stream: TcpStream, weak: Weak<AppWindow>) {
 /// Run `f` on the UI thread against the upgraded window and block the
 /// calling (listener) thread until it completes, returning the result.
 /// `Err` covers both "the event loop is gone" and "the window is gone".
+/// The wait is generous on purpose: a tap on Sign runs the whole compose
+/// path synchronously (Argon2id passphrase KDF + ML-KEM wrap + signing),
+/// which in a debug build takes several seconds; a 5 s budget timed out
+/// the cross-device suite's L5 on 2026-09-17 with the note fully composed.
 fn on_ui<R, F>(weak: &Weak<AppWindow>, f: F) -> Result<R, String>
 where
     F: FnOnce(&AppWindow) -> R + Send + 'static,
@@ -126,7 +130,7 @@ where
     {
         return Err("event loop gone".into());
     }
-    match rx.recv_timeout(Duration::from_secs(5)) {
+    match rx.recv_timeout(Duration::from_secs(60)) {
         Ok(Some(r)) => Ok(r),
         Ok(None) => Err("window gone".into()),
         Err(_) => Err("ui thread timeout".into()),
