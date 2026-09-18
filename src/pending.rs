@@ -1,5 +1,5 @@
 //! Async result-queue plumbing — moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md). U5 replaced the 17 former per-kind result
+//! plans/PLAN-graffito-app-arch.md). U5 replaced the 17 former per-kind result
 //! queues + 13 per-kind Slint callbacks + the hand-drains that applied
 //! them with ONE generic trampoline: every worker thread now
 //! boxes an `FnOnce(&AppWindow, &mut State)` closure over its own single
@@ -101,7 +101,7 @@ impl Drop for NetOpGuard {
 }
 
 /// The deferred network-operation queue's SCAN lane (design:
-/// `../PLAN-chain-notes-app.md` "Deferred: network operation queue" — the
+/// `../plans/PLAN-graffito-app.md` "Deferred: network operation queue" — the
 /// scan-freshness gate counters and `spending_refresh_async`'s
 /// coalescing early-return shipped as earlier slices; this is the general
 /// scheduling mechanism behind them). `app_core::netq::Lane` is the pure
@@ -234,7 +234,7 @@ pub(crate) struct RefreshResult {
 
 /// Build a `ChainClient` against `base`, picking the Esplora or Bitcoin
 /// Core RPC backend by URL scheme (`app_core::chain::AnyTransport`, the
-/// backend seam of `../PLAN-chain-notes-app-core-rpc.md`). `creds` is
+/// backend seam of `../plans/PLAN-graffito-app-core-rpc.md`). `creds` is
 /// resolved by the caller — via [`core_rpc_creds_for`] on the UI thread for
 /// a synchronous call, or snapshotted onto a worker thread before it spawns
 /// (same convention every other per-request State read already follows
@@ -256,7 +256,7 @@ pub(crate) fn open_client(
 }
 
 /// An Electrum server indexing ANOTHER chain must never serve a scan
-/// (PLAN-graffito-electrum.md, found live 2026-09-06): a testnet4
+/// (plans/PLAN-graffito-electrum.md, found live 2026-09-06): a testnet4
 /// address hashes to a scripthash the mainnet server simply has no history
 /// for, so the wallet reads as empty AND the mainnet tip gets stamped into
 /// every new transaction's locktime (non-final on testnet4 for years).
@@ -293,7 +293,7 @@ fn wrong_chain_err(network: Network) -> app_core::Error {
 }
 
 /// [`open_client`] plus Bitcoin Core ranged-watch configuration (U7 —
-/// `../PLAN-chain-notes-app-core-rpc.md` §2.2's "ranged descriptor import"
+/// `../plans/PLAN-graffito-app-core-rpc.md` §2.2's "ranged descriptor import"
 /// finally gets a caller; previously `CoreRpcTransport::watch_descriptors`
 /// had none anywhere in this crate, so the app always paid for one
 /// genesis-rescan `importdescriptors` PER ADDRESS instead of one per
@@ -393,7 +393,7 @@ pub(crate) struct WalletStoresRefreshResult {
     /// Every active notebook's bundle fetch, including the snapshot-time
     /// active one.
     pub(crate) results: Vec<NotebookBundleResult>,
-    /// Taproot change-chain gap walk (unit 3, `../PLAN-chain-notes-app-taproot-change.md`) —
+    /// Taproot change-chain gap walk (unit 3, `../plans/PLAN-graffito-app-taproot-change.md`) —
     /// `scan_change_chain` gap 1, account-level (folded into the SAME
     /// (fp8, network, account) staleness guard the notebook results use
     /// above, so no separate guard is needed on apply). `Err` on a
@@ -491,7 +491,7 @@ pub(crate) struct SweepSnapshot {
     pub(crate) notebooks_n: usize,
     /// Taproot CHANGE-chain coins (`m/86'/…/1/{index}`) that rode as
     /// inputs — pruned from `State.change_coins` on success (unit 6, see
-    /// `../PLAN-chain-notes-app-taproot-change.md`), same treatment as
+    /// `../plans/PLAN-graffito-app-taproot-change.md`), same treatment as
     /// `spending_spent` above: the next wallet-stores refresh re-scans
     /// chain 1 and would otherwise re-offer an already-spent coin.
     pub(crate) change_spent: Vec<(String, u32)>,
@@ -692,7 +692,7 @@ pub(crate) struct PickerProbeResult {
 }
 
 
-/// Finished Bitcoin Core preflight check (`PLAN-chain-notes-app-core-rpc.md`
+/// Finished Bitcoin Core preflight check (`plans/PLAN-graffito-app-core-rpc.md`
 /// §2.2/§2.3/U4, surfaced §3/U6). `network`+`base` are the snapshot the
 /// worker started against — `State::apply_node_health_result` drops a stale
 /// result (network switched, or the node URL changed) rather than paint it
@@ -1328,7 +1328,7 @@ pub(crate) fn apply_psbt_broadcast_result(&mut self, w: &AppWindow, r: PsbtBroad
                 // store as Pending exactly like a keyed compose (inputs
                 // locked, change spendable, raw hex kept for rebroadcast).
                 st.record_watch_note(&wn, txid, raw, vsize as u64);
-                // PLAN-pnte-redesign.md: the note id IS the txid.
+                // plans/PLAN-pnte-redesign.md: the note id IS the txid.
                 println!(
                     "cb: compose id={txid} txid={txid} fee={} vsize={vsize} to={} private={} gift={} watch={} broadcast=ok",
                     wn.fee,
@@ -1547,7 +1547,7 @@ pub(crate) fn apply_spending_compose_result(&mut self, w: &AppWindow, r: Spendin
             if let Some(store) = st.store.as_mut() {
                 store.record_signed(
                     app_core::store::NoteRecord {
-                        // PLAN-pnte-redesign.md: the note id IS the txid.
+                        // plans/PLAN-pnte-redesign.md: the note id IS the txid.
                         note_id: r.txid.clone(),
                         status: NoteStatus::Pending,
                         text: Some(r.text.clone()),
@@ -1655,7 +1655,7 @@ pub(crate) fn apply_mixed_compose_result(&mut self, w: &AppWindow, r: MixedCompo
                     });
                 store.record_signed(
                     app_core::store::NoteRecord {
-                        // PLAN-pnte-redesign.md: the note id IS the txid.
+                        // plans/PLAN-pnte-redesign.md: the note id IS the txid.
                         note_id: r.txid.clone(),
                         status: NoteStatus::Pending,
                         text: Some(r.text.clone()),

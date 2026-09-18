@@ -1,5 +1,5 @@
 //! A minimal, in-process, LOCAL-ONLY bitcoind-JSON-RPC-shaped HTTP stub —
-//! NOT bitcoind, NOT the shared node (`PLAN-one-regtest-node.md`). Built for
+//! NOT bitcoind, NOT the shared node (`plans/PLAN-one-regtest-node.md`). Built for
 //! U5's node-CONFIGURATION-dependent tests in `../core_rpc_conformance.rs`
 //! (pruned reporting, missing-txindex reporting, the NotFound/Unknown
 //! decision table, and the ranged-import birthday timestamp): what those

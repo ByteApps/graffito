@@ -1,5 +1,5 @@
 //! Screen.quiz — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 

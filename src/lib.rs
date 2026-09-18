@@ -61,7 +61,7 @@ use zeroize::{Zeroize, Zeroizing};
 slint::include_modules!();
 
 /// The `Screen` enum's kebab-case names — the ONE table (U2,
-/// PLAN-graffito-app-arch.md) driving `--render`'s CLI parser, its PNG
+/// plans/PLAN-graffito-app-arch.md) driving `--render`'s CLI parser, its PNG
 /// file names, and the `cb: sys-back` log line. Order matches the enum's
 /// declaration (types.slint), which is the app's historical screen-number
 /// order.
@@ -116,7 +116,7 @@ const SOURCE_URL: &str = "https://github.com/ByteApps/graffito";
 /// Minimum (and default) sats sent to a directed-note recipient.
 const DUST_SATS: u64 = app_core::notes_core::DUST_LIMIT;
 
-/// Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md): the
+/// Settings → "Compose defaults" (plans/PLAN-graffito-compose-simplify.md): the
 /// policy every fresh compose session starts from — set once in Settings,
 /// shown on Compose as small indicators, and never itself changed by a
 /// per-note sheet (a sheet only OVERRIDES the current note; see
@@ -366,7 +366,7 @@ struct State {
     /// deliberate opt-out from being re-enabled on the next recipient change
     /// or the next run (persisted in config.json as `pq_mlkem_off`).
     pq_mlkem_user_off: bool,
-    /// Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md):
+    /// Settings → "Compose defaults" (plans/PLAN-graffito-compose-simplify.md):
     /// the policy a fresh compose session starts from. `apply_compose_defaults`
     /// stamps every field below onto the live Compose globals; nothing here
     /// is itself mutated by a per-note sheet.
@@ -413,7 +413,7 @@ struct State {
     /// (`MlKemKeypair`'s own `Drop`); `None` before the first load/import
     /// this session, or after "Remove imported key".
     pq_imported: Option<app_core::notes_core::pq::MlKemKeypair>,
-    /// "My quantum key" replace guard (PLAN-graffito-quantum-key.md):
+    /// "My quantum key" replace guard (plans/PLAN-graffito-quantum-key.md):
     /// Generate/Import over an EXISTING `pq_imported` key routes through a
     /// confirm modal instead of acting immediately — this remembers WHICH
     /// action to actually run once the user confirms
@@ -432,7 +432,7 @@ struct State {
     consolidate_coins: bool,
     material: Option<Zeroizing<String>>, // session cache: avoids re-prompting Touch ID
     /// Bitcoin Core RPC ranged-watch descriptors (U7,
-    /// `../PLAN-chain-notes-app-core-rpc.md` §2.2's "ranged descriptor
+    /// `../plans/PLAN-graffito-app-core-rpc.md` §2.2's "ranged descriptor
     /// import" finally gets a caller) for the ACTIVE (identity, account,
     /// network) — computed ONCE by `activate()` from `material` via
     /// `app_core::chain::identity_watch_descriptors` and cloned into every
@@ -565,7 +565,7 @@ struct State {
     /// see `update_wallet_coins`). Empty for watch/WIF/hex identities
     /// (`scan_change_chain` is a no-op for non-hierarchical material).
     /// The wallet Sweep consumes these too (unit 4, see
-    /// `../PLAN-chain-notes-app-taproot-change.md`): `build_sweep_confirm`
+    /// `../plans/PLAN-graffito-app-taproot-change.md`): `build_sweep_confirm`
     /// derives each unique chain-1 index's owner via `realize_change` and
     /// folds its coins into the swept inputs, signed by that owner's own
     /// tweaked key — same own-coin discipline as notebook coins. Compose /
@@ -708,7 +708,7 @@ struct State {
     /// tx that broadcasts into missing-inputs (loud + fund-safe, but
     /// user-hostile; the window grows as public-host pacing slows scans).
     /// Full serialization is the deferred network-operation-queue item in
-    /// PLAN-chain-notes-app.md.
+    /// plans/PLAN-graffito-app.md.
     scan_gate: app_core::scan_gate::ScanGate,
     /// The universal confirm screen (26) session in progress, if any — see
     /// [`PendingBroadcast`]. `show_confirm` sets it, `on_confirm_broadcast`
@@ -845,7 +845,7 @@ enum PendingPayload {
         notebook_spent: Vec<app_core::store::OutPointRef>,
         spent_spending: Vec<(String, u32)>,
         /// Taproot CHANGE-chain coins ridden as inputs (unit 5, see
-        /// `../PLAN-chain-notes-app-taproot-change.md`) — same shape+timing
+        /// `../plans/PLAN-graffito-app-taproot-change.md`) — same shape+timing
         /// as `SweepSnapshot.change_spent`: pruned from `State.change_coins`
         /// on broadcast success only (`apply_mixed_compose_result`).
         change_spent: Vec<(String, u32)>,
@@ -989,7 +989,7 @@ struct WatchSpend {
     /// (ref_id, is_note) of the record being replaced when kind == "bump".
     bump_ref: Option<(String, bool)>,
     /// (txid, vout) of any taproot CHANGE-chain (chain 1) coins riding as
-    /// inputs (unit 6, see `../PLAN-chain-notes-app-taproot-change.md`) —
+    /// inputs (unit 6, see `../plans/PLAN-graffito-app-taproot-change.md`) —
     /// pruned from `State.change_coins` on broadcast success, same
     /// treatment `SweepSnapshot.change_spent` gives the keyed sweep.
     /// Non-empty makes the record non-bumpable (mirrors keyed CHANGE 2's
@@ -1286,7 +1286,7 @@ impl State {
             "pq_level": self.pq_level,
             "pq_pw_cost": self.pq_pw_cost.as_str(),
             // "pq_mlkem_off" (top-level) is GONE — superseded by
-            // "compose.pq_mlkem_off" below (PLAN-graffito-compose-simplify.md).
+            // "compose.pq_mlkem_off" below (plans/PLAN-graffito-compose-simplify.md).
             // `boot::compose_defaults_from_config` migrates a legacy value on
             // load; once resaved through this function it never comes back.
             "compose": self.compose_defaults.to_json(),
@@ -2159,7 +2159,7 @@ impl CloneFields for app_core::notes_core::bundle::Identity {
 
 
 
-/// Spending-self-notes fix window sizing (PLAN-chain-notes-app-spending-
+/// Spending-self-notes fix window sizing (PLAN-graffito-app-spending-
 /// self-notes.md, Unit A / RC1 — LOCKED decision 4): self-extending, no
 /// magic cap. `WINDOW_MIN` is the floor for a fresh/lightly-used spending
 /// wallet; `WINDOW_BUFFER` covers addresses handed out but not yet recorded
@@ -2310,7 +2310,7 @@ pub fn run() {
         window.global::<QuantumKeys>().set_pq_desc_1024(card(MlKemLevel::MlKem1024, MlKemAlg::MlKem1024).into());
     }
 
-    // EditOps global wiring — src/editops.rs (U4, PLAN-graffito-app-arch.md).
+    // EditOps global wiring — src/editops.rs (U4, plans/PLAN-graffito-app-arch.md).
     editops::wire(&window);
     // Capture-proof window while a secret is on screen (app.slint decides
     // which screens; this just applies it to the platform window).
@@ -2628,7 +2628,7 @@ pub fn run() {
 
     cb!(Ui, on_refresh, |w, s| { s.on_refresh(&w) });
 
-    // The ONE async trampoline (U5, PLAN-graffito-app-arch.md): every
+    // The ONE async trampoline (U5, plans/PLAN-graffito-app-arch.md): every
     // worker thread that finishes a background job — a scan, a broadcast,
     // a probe, the deferred auto-unlock, an iCloud-contacts merge — posts a
     // boxed closure onto the shared queue (`pending::post`) and invokes
@@ -2651,7 +2651,7 @@ pub fn run() {
 
     cb!(Compose, on_set_fee_tier, |w, s, tier: i32| { s.on_set_fee_tier(&w, tier) });
 
-    // ---- compose-simplify (PLAN-graffito-compose-simplify.md): status
+    // ---- compose-simplify (plans/PLAN-graffito-compose-simplify.md): status
     // strip pills, gear card, per-note override sheets. ----
     cb!(Compose, on_card_toggle, |w, s| { s.on_compose_card_toggle(&w) });
     cb!(Compose, on_card_row, |w, s, key: SharedString| { s.on_compose_card_row(&w, key) });
@@ -3013,7 +3013,7 @@ pub fn run() {
     cb!(Compose, on_pq_mlkem_toggled, |w, s, _on: bool| { s.on_pq_mlkem_toggled(&w, _on) });
     cb!(Compose, on_pq_pw_cost_changed, |w, s, cost: SharedString| { s.on_pq_pw_cost_changed(&w, cost) });
 
-    // Security panel opened (Sal 2026-08-22, PLAN-graffito-self-pw.md): the
+    // Security panel opened (Sal 2026-08-22, plans/PLAN-graffito-self-pw.md): the
     // sanctioned user-initiated door for lazily loading a SELF-note's
     // imported quantum key this session — the ML-KEM switch itself starts
     // disabled (`pq-mlkem-available` false) until `State.pq_imported` is
@@ -3196,7 +3196,7 @@ pub fn run() {
 
     cb!(Settings, on_set_chunk, |w, s, t: SharedString| { s.on_set_chunk(&w, t) });
 
-    // ---- Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md) ----
+    // ---- Settings → "Compose defaults" (plans/PLAN-graffito-compose-simplify.md) ----
     cb!(Settings, on_set_compose_default_visibility, |w, s, v: SharedString| { s.on_set_compose_default_visibility(&w, v) });
     cb!(Settings, on_set_compose_default_fee, |w, s, tier: SharedString, rate: SharedString| { s.on_set_compose_default_fee(&w, tier, rate) });
     cb!(Settings, on_set_compose_default_gift, |w, s, t: SharedString| { s.on_set_compose_default_gift(&w, t) });
@@ -3320,7 +3320,7 @@ pub fn run() {
     cb!(QuantumKeys, on_pq_import_file, |w, s| { s.on_pq_import_file(&w) });
 
     // Generate/Import both route through the REPLACE GUARD when a "My
-    // quantum key" is already present (PLAN-graffito-quantum-key.md — never
+    // quantum key" is already present (plans/PLAN-graffito-quantum-key.md — never
     // silently overwrite): the confirm modal opens instead of acting, and
     // `on_pq_replace_confirm` runs whichever action was pending. The
     // pending action's own input (gen level/extra, or import text) is left

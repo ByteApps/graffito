@@ -15,7 +15,7 @@
 //! what killed iOS builds 42 and 44.
 //!
 //! This is the APP-LEVEL gate, option (a) of
-//! `PLAN-chain-notes-app-android-biometric.md`. The Keystore key is NOT
+//! `plans/PLAN-graffito-app-android-biometric.md`. The Keystore key is NOT
 //! auth-bound (`setUserAuthenticationRequired`), because that permanently
 //! invalidates it when the user removes their screen lock — destroying the
 //! wrapped seed for anyone who never wrote the phrase down. So the honest
@@ -285,7 +285,7 @@ pub fn load_secret_protected(account: &str, _prompt: &str) -> Result<Option<Stri
     Ok(Some(s))
 }
 
-// --- User-presence gate (app-level, PLAN-chain-notes-app-android-biometric.md
+// --- User-presence gate (app-level, plans/PLAN-graffito-app-android-biometric.md
 // option (a)) ------------------------------------------------------------
 //
 // The dex is EMBEDDED rather than shipped as an asset: `InMemoryDexClassLoader`
@@ -510,7 +510,7 @@ pub fn spike_auth() -> Result<(), String> {
     Err("keychain spike is desktop-only".into())
 }
 
-// ---- Bitcoin Core RPC credentials (PLAN-chain-notes-app-core-rpc.md
+// ---- Bitcoin Core RPC credentials (plans/PLAN-graffito-app-core-rpc.md
 // §2.4/U6) — mirrors keychain/apple.rs's RPC-credentials section. ----
 //
 // These are network credentials, not key material, so they get NO

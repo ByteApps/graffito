@@ -3,7 +3,7 @@
 /// always judges the ACTUAL source, mutation included. Unlike the
 /// pre-U4 single-file version (`include_str!("../lib.rs")`), the shell now
 /// spans `boot.rs`/`editops.rs`/`pending.rs`/`util.rs`/`screens/*.rs` too
-/// (U4, PLAN-graffito-app-arch.md), so a call site this contract must catch
+/// (U4, plans/PLAN-graffito-app-arch.md), so a call site this contract must catch
 /// can live in ANY of them — walked at runtime (not `include_str!`, since
 /// the file list isn't known at compile time) via `CARGO_MANIFEST_DIR`.
 fn all_sources() -> Vec<(String, String)> {
@@ -263,7 +263,7 @@ fn named_watch_sites_use_watched_client_with_a_real_descriptor_list() {
             body.contains("open_client_watched("),
             "core-rpc wiring contract: fn {name} no longer calls open_client_watched — it \
              resolves one of the identity's OWN addresses (see the U7 commit / \
-             PLAN-chain-notes-app-core-rpc.md) and must build its ChainClient through the \
+             plans/PLAN-graffito-app-core-rpc.md) and must build its ChainClient through the \
              watched constructor with a real descriptor list, or every address it touches \
              pays for a per-address genesis rescan instead of one ranged import per \
              descriptor family.",

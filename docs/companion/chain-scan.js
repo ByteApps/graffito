@@ -1,9 +1,9 @@
 // Shared chain-scanning core for viewer.html and note.html: esplora fetch
 // + pagination, the JS port of the FROZEN PNTE envelope
-// (notes-core/src/envelope.rs, PLAN-pnte-redesign.md), and the note-card
+// (notes-core/src/envelope.rs, plans/PLAN-pnte-redesign.md), and the note-card
 // renderer.
 //
-// PLAN-pnte-redesign.md (2026-08-11): one note = one transaction. The note
+// plans/PLAN-pnte-redesign.md (2026-08-11): one note = one transaction. The note
 // id IS the txid — no separate note_id, no cross-tx chunk reassembly. All
 // OP_RETURN outputs of a tx, in vout order, concatenate into the note body;
 // the ASCII-armored header appears ONLY in the first OP_RETURN output.
@@ -40,7 +40,7 @@ const FLAG_CONT = 0x08;
 // flags bits 4-5: post-quantum sealing layers (notes-core/src/pq.rs) — an
 // Argon2id password layer (FLAG_PW) and/or an ML-KEM layer (FLAG_MLKEM),
 // on a PRIVATE note, directed or (since 2026-08-22, the self-pq
-// extension) not — and since 2026-09-06 (PLAN-graffito-multi-pq.md) ALSO
+// extension) not — and since 2026-09-06 (plans/PLAN-graffito-multi-pq.md) ALSO
 // on a FLAG_MULTI note (the prior MULTI-vs-pq exclusion is lifted). The
 // browser can never decrypt any private body, so a pq note (multi or not)
 // renders the same encrypted placeholder as any other private note —
@@ -140,7 +140,7 @@ function parseHeader(payload) {
   if (multi && (flags & FLAG_DIRECTED) === 0) return null;
   // pq bits require FLAG_PRIVATE (envelope.rs validate_pq — DIRECTED is
   // optional since the self-pq extension). Since 2026-09-06
-  // (PLAN-graffito-multi-pq.md) pq bits are ALSO valid together with
+  // (plans/PLAN-graffito-multi-pq.md) pq bits are ALSO valid together with
   // FLAG_MULTI — the prior exclusion here is LIFTED to match. The browser
   // still never decrypts any private body (multi or not), so this only
   // needs to keep the combination DECODABLE, not render it any
@@ -300,7 +300,7 @@ function noteFromTx(t, address, mine, notebookSet) {
 }
 
 // Port of notes-core extract_notes/extract_notes_multi (bundle.rs),
-// PLAN-pnte-redesign.md shape: one tx is at most one note (its id IS the
+// plans/PLAN-pnte-redesign.md shape: one tx is at most one note (its id IS the
 // txid), so there is no cross-tx bucketing to keep separate anymore.
 //
 // Acceptance: a tx that SPENDS FROM the notebook address, OR from any

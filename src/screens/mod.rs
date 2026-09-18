@@ -1,5 +1,5 @@
 //! One module per screen, mirroring `ui/screens/*.slint` (U4,
-//! PLAN-graffito-app-arch.md). `pub(crate) use X::*;` keeps a
+//! plans/PLAN-graffito-app-arch.md). `pub(crate) use X::*;` keeps a
 //! module's free helpers/statics/types visible crate-wide without
 //! per-caller imports; a module holding only `impl State` methods
 //! needs no re-export (inherent methods are visible everywhere).

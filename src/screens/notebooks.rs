@@ -1,5 +1,5 @@
 //! Screen.notebooks — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -175,7 +175,7 @@ pub(crate) fn on_settings_open(&mut self, w: &AppWindow) {
 
 /// Shared by the normal Settings entry (`on_settings_open`, the notebook
 /// list's gear) and Compose's "Edit compose defaults…" row
-/// (`on_compose_edit_defaults`, PLAN-graffito-compose-simplify.md), which
+/// (`on_compose_edit_defaults`, plans/PLAN-graffito-compose-simplify.md), which
 /// wants the SAME screen filtered down to just the "Compose defaults" card
 /// — `subset_compose` drives `Settings.settings-compose-only` (read by
 /// settings.slint to hide every other card) and picks the log line: plain

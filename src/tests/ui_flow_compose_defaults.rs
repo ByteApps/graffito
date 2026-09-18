@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // In-process UI-flow tests: compose-simplify
-// (PLAN-graffito-compose-simplify.md, 2026-09-07).
+// (plans/PLAN-graffito-compose-simplify.md, 2026-09-07).
 // ---------------------------------------------------------------------------
 //
 // Covers the plan's Verification §1 list: Settings "Compose defaults"

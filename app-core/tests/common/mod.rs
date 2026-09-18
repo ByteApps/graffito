@@ -1,4 +1,4 @@
-//! Backend-agnostic contract-testing helpers (PLAN-chain-notes-app-core-rpc.md
+//! Backend-agnostic contract-testing helpers (plans/PLAN-graffito-app-core-rpc.md
 //! unit U1). Lives in a `common/` SUBDIRECTORY (not `common.rs`) precisely so
 //! cargo does NOT treat it as its own test binary/crate — every other
 //! `tests/*.rs` file pulls this in with `mod common;`.
@@ -29,14 +29,14 @@
 //! carry empty witnesses/scriptSigs — deliberately UNSIGNED: `EsploraFake`
 //! never validates scripts (nothing here does), and real signing only
 //! matters once a scenario is actually replayed against a live `bitcoind`
-//! (a later unit) — see `PLAN-chain-notes-app-core-rpc.md` §3 step 3. Every
+//! (a later unit) — see `plans/PLAN-graffito-app-core-rpc.md` §3 step 3. Every
 //! generated address is realized through `notes_core::address` /
 //! `notes_core::taproot`, so it decodes, prefixes, and script-pubkey-encodes
 //! exactly like a genuine on-chain address.
 
 #![allow(dead_code)]
 
-/// U5 (`PLAN-one-regtest-node.md`) addition: a local-only bitcoind-JSON-RPC
+/// U5 (`plans/PLAN-one-regtest-node.md`) addition: a local-only bitcoind-JSON-RPC
 /// stub for driving `CoreRpcTransport`'s response-interpretation logic with
 /// synthetic bodies a shared, persistent, not-ours node cannot be coerced
 /// into producing on demand (pruned/no-txindex reporting, the NotFound
@@ -159,7 +159,7 @@ pub struct Scenario {
     /// Oldest → newest.
     pub txs: Vec<ScenarioTx>,
     pub wallet: Option<ScenarioWallet>,
-    /// U3 (`PLAN-chain-notes-app-core-rpc.md`, "Trap 1"): a genuinely
+    /// U3 (`plans/PLAN-graffito-app-core-rpc.md`, "Trap 1"): a genuinely
     /// SIGNED `(raw hex, expected txid)` pair for the broadcast contract
     /// check, when the backend under test actually validates scripts (a
     /// real `bitcoind`). `EsploraFake` never validates scripts, so every
@@ -741,7 +741,7 @@ pub fn build_unsigned_spend_hex(network: Network, from_txid: &str, from_vout: u3
 // ---------------------------------------------------------------------
 
 /// Compares two UTXO tuple-lists `(txid, vout, value, height)`, tolerating
-/// exactly ONE shared-node hazard (`PLAN-one-regtest-node.md`): a coin the
+/// exactly ONE shared-node hazard (`plans/PLAN-one-regtest-node.md`): a coin the
 /// scenario recorded UNCONFIRMED (`height: None`) may have since been
 /// mined by `regtest-automine.service` during a long test run against the
 /// Pi's persistent chain — that's fine, `got`'s height for it may be
@@ -779,7 +779,7 @@ fn assert_utxos_match_tolerant(
             None => assert!(
                 gh.is_none() || gh.unwrap() >= sc_tip,
                 "{label}: {et}:{ev} recorded unconfirmed — if it has since confirmed (shared node, \
-                 PLAN-one-regtest-node.md), the height must be >= the scenario's own tip ({sc_tip}), \
+                 plans/PLAN-one-regtest-node.md), the height must be >= the scenario's own tip ({sc_tip}), \
                  got {gh:?}"
             ),
         }
@@ -793,7 +793,7 @@ fn assert_utxos_match_tolerant(
 /// at a real `bitcoind` holding the same scenario.
 ///
 /// **Never asserts an exact tip height or an exact confirmed-vs-mempool
-/// split** (`PLAN-one-regtest-node.md`: the shared regtest node this may be
+/// split** (`plans/PLAN-one-regtest-node.md`: the shared regtest node this may be
 /// checked against grows underneath a long test run) — every height/
 /// confirmation-state comparison below is a `>=`/tolerant check instead,
 /// see [`assert_utxos_match_tolerant`] and the inline comments at each
@@ -981,7 +981,7 @@ pub fn assert_chain_contract<T: Transport>(client: &ChainClient<T>, sc: &Scenari
     // genuine decode computes. `EsploraFake` never validates scripts, so an
     // UNSIGNED spend (today's behavior, `build_unsigned_spend_hex`) is fine
     // there; a real backend (`bitcoind`) rejects an unsigned input, so
-    // `sc.broadcast_probe` (Trap 1, PLAN-chain-notes-app-core-rpc.md) lets
+    // `sc.broadcast_probe` (Trap 1, plans/PLAN-graffito-app-core-rpc.md) lets
     // such a caller supply a GENUINELY signed tx instead. Either way the
     // assertion itself — the backend must return the tx's own txid — is
     // identical.

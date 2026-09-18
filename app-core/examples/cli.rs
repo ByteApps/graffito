@@ -40,7 +40,7 @@ fn network(s: &str) -> Network {
 
 /// Build a chain client for `base` — Esplora or Bitcoin Core RPC, picked by
 /// the `bitcoind+http(s)://` URL scheme (`app_core::chain::AnyTransport`,
-/// the backend seam of `../../PLAN-chain-notes-app-core-rpc.md` §1.2). This
+/// the backend seam of `../../plans/PLAN-graffito-app-core-rpc.md` §1.2). This
 /// is what "gives the e2e suite a Core mode for free": every `<base-url>`
 /// positional argument the CLI already took now also accepts a
 /// `bitcoind+` base. Core RPC credentials come from `CORE_RPC_USER`/
@@ -57,7 +57,7 @@ fn open_client(base: &str, network: Network) -> ChainClient<AnyTransport> {
 
 /// [`open_client`] plus Bitcoin Core ranged-watch configuration — this
 /// CLI's mirror of `src/lib.rs`'s `open_client_watched` (U7,
-/// `../../PLAN-chain-notes-app-core-rpc.md` §2.2's "ranged descriptor
+/// `../../plans/PLAN-graffito-app-core-rpc.md` §2.2's "ranged descriptor
 /// import" finally gets a caller, both here and in the shipped app).
 /// `app_core::chain::identity_watch_descriptors` derives the SAME
 /// descriptors `export_formats`/`spending::funding_descriptor` already
@@ -137,7 +137,7 @@ fn main() {
             // armored text the app's "Copy public key" produces — so a
             // harness that knows every device's seed can hand each device
             // the others' quantum keys without moving a clipboard across
-            // devices (PLAN-graffito-cross-device-e2e.md).
+            // devices (plans/PLAN-graffito-cross-device-e2e.md).
             let net = network(&args[2]);
             let alg = match args.get(3).map(String::as_str) {
                 Some("512") => app_core::notes_core::pq::MlKemAlg::MlKem512,
@@ -260,7 +260,7 @@ fn main() {
             let client = open_client_watched(&args[3], net, &key, account);
             let bundle = client.build_bundle(&store.address, None).expect("build bundle");
             // ML-KEM auto-unlock (single- and multi-recipient pq notes,
-            // PLAN-graffito-multi-pq.md): this identity's own notebook-leaf-
+            // plans/PLAN-graffito-multi-pq.md): this identity's own notebook-leaf-
             // derived secret set at all three levels — the same union
             // `app-core/src/pqkeys.rs::derive_secrets`'s doc describes,
             // mirroring what `State::mlkem_secrets_for` hands the app's own
@@ -535,7 +535,7 @@ fn main() {
                 0)
             .expect("build note psbt");
             std::fs::write(&args[5], built.to_bytes()).expect("write psbt");
-            // PLAN-pnte-redesign.md: the note id IS the txid — no separate
+            // plans/PLAN-pnte-redesign.md: the note id IS the txid — no separate
             // id to generate or print.
             println!(
                 "cli: note-build id={} txid={} fee={} gift={} inputs={} -> {}",
@@ -581,7 +581,7 @@ fn main() {
                 0)
             .expect("build funded note psbt");
             std::fs::write(&args[7], built.to_bytes()).expect("write psbt");
-            // PLAN-pnte-redesign.md: the note id IS the txid — no separate
+            // plans/PLAN-pnte-redesign.md: the note id IS the txid — no separate
             // id to generate or print.
             println!(
                 "cli: note-funded-build id={} txid={} fee={} gift={} fund_in={} -> {}",
@@ -629,7 +629,7 @@ fn main() {
         }
         Some("note-unlock") => {
             // note-unlock <store.json> <txid> [password]
-            // Explicit unlock of a pq-locked note (PLAN-graffito-multi-pq.md):
+            // Explicit unlock of a pq-locked note (plans/PLAN-graffito-multi-pq.md):
             // `scan`'s auto-unlock only ever tries ML-KEM alone (never a
             // password, which is never stored — see `apply_bundle`'s doc);
             // this is the CLI's `Store::unlock_note` door for everything
@@ -662,7 +662,7 @@ fn main() {
             // recipient addresses route through the SAME multi-recipient
             // dispatch `compose_note` already has; pq flags follow
             // `ComposeRequest::pq_mlkem`'s per-recipient shape
-            // (PLAN-graffito-multi-pq.md, 2026-09-06).
+            // (plans/PLAN-graffito-multi-pq.md, 2026-09-06).
             let mut store = load(&args[2]);
             let net = network(&store.network.clone());
             let ident = identity(net);
@@ -1053,7 +1053,7 @@ fn main() {
                 ix.set_spending(account, section);
                 ix.save(&ix_path).expect("save notebooks index");
             }
-            // PLAN-pnte-redesign.md: the note id IS the txid.
+            // plans/PLAN-pnte-redesign.md: the note id IS the txid.
             println!(
                 "cli: compose id={} txid={} fee={} vsize={} to={} private={} broadcast=ok",
                 txid,
@@ -1078,7 +1078,7 @@ fn main() {
             // spending address, drive the compose screen — is much heavier
             // than the notebook-funded leg it already covers).
             //
-            // Post-quantum layers (PLAN-graffito-multi-pq.md, 2026-09-06):
+            // Post-quantum layers (plans/PLAN-graffito-multi-pq.md, 2026-09-06):
             // `--mlkem <armor1> <armor2> ...` supplies one recipient's
             // exported public armor (`pq-public`'s stdout) per recipient,
             // IN THE SAME ORDER as the recipient addresses — mixed levels
@@ -1216,7 +1216,7 @@ fn main() {
                 ix.set_spending(account, section);
                 ix.save(&ix_path).expect("save notebooks index");
             }
-            // PLAN-pnte-redesign.md: the note id IS the txid.
+            // plans/PLAN-pnte-redesign.md: the note id IS the txid.
             println!(
                 "cli: compose id={} txid={} fee={} vsize={} recipients={} sent_to_recipient={} private={} broadcast=ok",
                 txid,
@@ -1496,7 +1496,7 @@ fn main() {
         }
         Some("preflight") => {
             // preflight <base-url> <network> — surfaces
-            // `CoreRpcTransport::preflight` (PLAN-chain-notes-app-core-rpc.md
+            // `CoreRpcTransport::preflight` (plans/PLAN-graffito-app-core-rpc.md
             // §2.2/§2.3/U4) for a `bitcoind+http(s)://` base so scripts can
             // assert node health (txindex/pruned/IBD/tip) without going
             // through the UI. Esplora bases don't have this notion — usage

@@ -534,7 +534,7 @@ fn envelope_pq_flag_without_private_is_undecodable() {
     // None, matching the FLAG_MULTI-without-FLAG_DIRECTED guard.
     assert!(envelope::decode_note(&[b"PNTE110 hi".to_vec()]).is_none());
     // FLAG_PRIVATE without FLAG_DIRECTED is now the SELF-pq form
-    // (PLAN-graffito-self-pw.md) and DOES decode — flags 0x11 = PW|PRIVATE.
+    // (plans/PLAN-graffito-self-pw.md) and DOES decode — flags 0x11 = PW|PRIVATE.
     let d = envelope::decode_note(&[b"PNTE111 hi".to_vec()]).expect("self-pw decodes");
     assert_eq!(d.flags, FLAG_PRIVATE | FLAG_PW);
     // FLAG_MLKEM alone, same story as PW alone.
@@ -553,7 +553,7 @@ fn envelope_pq_flag_without_private_is_undecodable() {
 
 #[test]
 fn envelope_pq_flags_now_compatible_with_multi() {
-    // PLAN-graffito-multi-pq.md (2026-09-06): the prior MULTI-vs-pq
+    // plans/PLAN-graffito-multi-pq.md (2026-09-06): the prior MULTI-vs-pq
     // exclusion is LIFTED — a multi-recipient directed note may carry
     // either or both pq bits (pq.rs `seal_multi_pq` supplies the body
     // framing; this test only proves the HEADER accepts the combination).
@@ -949,7 +949,7 @@ fn pinned_derivation_vectors_per_level() {
 
 
 // ---------------------------------------------------------------------
-// Self-note pq layers (PLAN-graffito-self-pw.md, 2026-08-22)
+// Self-note pq layers (plans/PLAN-graffito-self-pw.md, 2026-08-22)
 // ---------------------------------------------------------------------
 
 /// Envelope validity for the self-pq extension: pq bits need FLAG_PRIVATE
@@ -970,7 +970,7 @@ fn self_pq_envelope_validity_matrix() {
     assert!(!ok(FLAG_MLKEM), "MLKEM without PRIVATE");
     assert!(!ok(FLAG_DIRECTED | FLAG_PW), "PW public directed");
     assert!(!ok(FLAG_MLKEM | FLAG_PW), "both without PRIVATE");
-    // MULTI+pq is now VALID (PLAN-graffito-multi-pq.md, 2026-09-06) — the
+    // MULTI+pq is now VALID (plans/PLAN-graffito-multi-pq.md, 2026-09-06) — the
     // exclusion lifted. `payload_lens_for`/`validate_multi` never checked
     // MULTI-requires-DIRECTED to begin with (that guard is decode-side,
     // `parse_header`'s `multi && flags & FLAG_DIRECTED == 0` check —
@@ -1194,7 +1194,7 @@ fn pq_cost_estimator_is_exact() {
 }
 
 // ---------------------------------------------------------------------
-// generate_mlkem_seed / generate_with_extra (PLAN-graffito-quantum-key.md)
+// generate_mlkem_seed / generate_with_extra (plans/PLAN-graffito-quantum-key.md)
 // ---------------------------------------------------------------------
 
 /// The mixing rule's contracts: fresh draws never collide (TRNG rides in
@@ -1307,7 +1307,7 @@ fn pw_cost_str_round_trips() {
 
 // ---------------------------------------------------------------------
 // 10. Multi-recipient pq layers, end-to-end through bundle::
-//     compose_directed_note_multi_pq_* + extraction (PLAN-graffito-multi-pq.md).
+//     compose_directed_note_multi_pq_* + extraction (plans/PLAN-graffito-multi-pq.md).
 // ---------------------------------------------------------------------
 
 #[test]

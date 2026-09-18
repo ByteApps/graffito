@@ -86,12 +86,12 @@ function log(el, msg, cls) {
   const q = new URLSearchParams(location.search);
   const network = q.get("network");
   const address = (q.get("address") || "").trim();
-  // The note id IS the txid (PLAN-pnte-redesign.md) — 64 lowercase hex chars.
+  // The note id IS the txid (plans/PLAN-pnte-redesign.md) — 64 lowercase hex chars.
   const noteId = (q.get("note") || "").trim().toLowerCase();
   // Optional &mine=<addr1,addr2,...> (comma-separated) extends OWN detection
   // to additional funding-source addresses via chain-scan.js's myAddresses
   // param — the notebook owner's link to disclose, default omits it (no
-  // disclosure; PLAN-graffito-funding-unification.md open question 1).
+  // disclosure; plans/PLAN-graffito-funding-unification.md open question 1).
   // The P2TR-looking entries double as `notebookAddresses` for chain-scan.js's
   // DISPLAY-OWNER dedup (2026-07-18) — see viewer.html's matching comment.
   const mineAddresses = (q.get("mine") || "").split(",").map((a) => a.trim()).filter(Boolean);
@@ -113,7 +113,7 @@ function log(el, msg, cls) {
   try {
     log(logEl, `Fetching tx ${noteId}…`);
     // The note id IS the txid — fetch it directly instead of scanning the
-    // whole address history (PLAN-pnte-redesign.md).
+    // whole address history (plans/PLAN-pnte-redesign.md).
     const note = await fetchNote(API[network].base, noteId, address, mineAddresses, notebookAddresses);
     if (!note) {
       return log(logEl, `Tx ${noteId} is not a Graffito entry at this address ` +

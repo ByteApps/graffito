@@ -1,5 +1,5 @@
 //! Screen.pay-from — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -10,7 +10,7 @@ pub(crate) fn on_toggle_coin(&mut self, w: &AppWindow, source: SharedString, out
         if let Some((txid, vout)) = op.rsplit_once(':') {
             if let Ok(vout) = vout.parse::<u32>() {
                 // Taproot CHANGE-chain coins (unit 5, see
-                // `../PLAN-chain-notes-app-taproot-change.md`) render folded
+                // `../plans/PLAN-graffito-app-taproot-change.md`) render folded
                 // into the "notebook" panel (`payfrom_panel_coins`), so the
                 // slint call site always passes source="notebook" for their
                 // rows too — resolve the TRUE source from the outpoint

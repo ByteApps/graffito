@@ -6,7 +6,7 @@
 //!
 //! Extended-key serialization (xprv/xpub) is provided for the reveal /
 //! key-export surfaces (`export.rs`) — the device UI still only shows the
-//! subset chosen in PLAN-graffito-seed-rotation.md (never a private
+//! subset chosen in plans/PLAN-graffito-seed-rotation.md (never a private
 //! xprv), but the serialization lives here so both apps render identical
 //! strings from one pure-Rust path.
 

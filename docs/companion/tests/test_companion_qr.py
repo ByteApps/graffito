@@ -12,7 +12,7 @@
 
 Prereqs: companion/server.py serving :8091, pointed at the ONE shared
 node — the Pi's persistent regtest or testnet4 chain, never a local
-throwaway one (PLAN-one-regtest-node.md):
+throwaway one (plans/PLAN-one-regtest-node.md):
 
     ../../../../ui-automation/node-env.sh <regtest|testnet4> python3 docs/companion/server.py 8091
 

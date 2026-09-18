@@ -8,7 +8,7 @@ Flow (the page does the work — this script only clicks and types):
 
 Prereqs: companion/server.py serving :8091, pointed at the ONE shared
 node — the Pi's persistent regtest chain, never a local throwaway one
-(PLAN-one-regtest-node.md):
+(plans/PLAN-one-regtest-node.md):
 
     ../../../../ui-automation/node-env.sh regtest python3 docs/companion/server.py 8091
 

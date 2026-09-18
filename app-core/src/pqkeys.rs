@@ -1,5 +1,5 @@
 //! Per-notebook seed-derived ML-KEM receive keys (post-quantum note
-//! support, `../../PLAN-graffito-pq-hybrid.md`) — one keypair per
+//! support, `../../plans/PLAN-graffito-pq-hybrid.md`) — one keypair per
 //! (notebook leaf secret, ML-KEM level), deterministic from the
 //! notebook's own leaf secret so recovery from the seed words reproduces
 //! exactly the same key every time (same principle as the notes/ECDH key,
@@ -185,7 +185,7 @@ pub fn import_to_native_private(
 }
 
 /// Generate a fresh, NON-seed-derived ML-KEM keypair for the app's "My
-/// quantum key" slot (`PLAN-graffito-quantum-key.md`) — the counterpart to
+/// quantum key" slot (`plans/PLAN-graffito-quantum-key.md`) — the counterpart to
 /// [`import_to_native_private`], writing the SAME native private armor
 /// format so the caller stores it in the identical keychain account
 /// (`pq-imported`) either way. `extra` is optional caller-supplied entropy

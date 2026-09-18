@@ -1,5 +1,5 @@
 // ui/modals.slint -- the AppWindow overlays extracted verbatim from
-// app.slint on 2026-09-03 (PLAN-graffito-app-arch.md U3b). Each stays
+// app.slint on 2026-09-03 (plans/PLAN-graffito-app-arch.md U3b). Each stays
 // gated the same way it always was; app.slint instantiates them, in the
 // same order, as the LAST children of the window (z-order matters).
 
@@ -10,7 +10,7 @@ import { Pal, Metrics } from "theme.slint";
 import { Switch } from "std-widgets.slint";
 
 // ScanningModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---------- shared camera-scan overlay (live preview) ----------
 export component ScanningModal inherits Rectangle {
@@ -92,7 +92,7 @@ export component ScanningModal inherits Rectangle {
     }
 
 // FundRenameModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---------- funding-wallet rename (modal overlay) ----------
 export component FundRenameModal inherits Rectangle {
@@ -140,7 +140,7 @@ export component FundRenameModal inherits Rectangle {
     }
 
 // RenameAddressModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---------- rename dialog (modal overlay) ----------
 export component RenameAddressModal inherits Rectangle {
@@ -252,7 +252,7 @@ export component RenameAddressModal inherits Rectangle {
     }
 
 // NbRenameModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---------- notebook rename dialog (modal overlay) ----------
 export component NbRenameModal inherits Rectangle {
@@ -300,7 +300,7 @@ export component NbRenameModal inherits Rectangle {
     }
 
 // ConfirmRemoveAddressModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---------- remove-contact confirmation (modal overlay) ----------
 export component ConfirmRemoveAddressModal inherits Rectangle {
@@ -351,7 +351,7 @@ export component ConfirmRemoveAddressModal inherits Rectangle {
     }
 
 // DiceClearConfirmModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---------- reset-identity confirmation (modal overlay) ----------
 // Clearing dice rolls is unrecoverable and can throw away several minutes
@@ -406,7 +406,7 @@ export component DiceClearConfirmModal inherits Rectangle {
     }
 
 // PqBackupConfirmModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---------- backup quantum private key confirmation (modal overlay) ----------
 export component PqBackupConfirmModal inherits Rectangle {
@@ -448,7 +448,7 @@ export component PqBackupConfirmModal inherits Rectangle {
     }
 
 // PqReplaceConfirmModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---- Replace guard: Generate/Import over an existing "My quantum
 // key" (screen 29) ----
@@ -490,7 +490,7 @@ export component PqReplaceConfirmModal inherits Rectangle {
     }
 
 // PqExportPrivateConfirmModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---- Export "My quantum key" private armor (screen 29): a warning
 // step, then the QR/copy reveal — never shown without the warning
@@ -579,7 +579,7 @@ export component PqExportPrivateConfirmModal inherits Rectangle {
     }
 
 // ResetConfirmModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 export component ResetConfirmModal inherits Rectangle {
         width: 100%;
         height: 100%;
@@ -631,7 +631,7 @@ export component ResetConfirmModal inherits Rectangle {
     }
 
 // OversizeModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---------- note-too-large dialog (modal overlay) ----------
 export component OversizeModal inherits Rectangle {
@@ -678,7 +678,7 @@ export component OversizeModal inherits Rectangle {
     }
 
 // BumpDialogModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---------- speed-up (RBF bump) dialog ----------
 export component BumpDialogModal inherits Rectangle {
@@ -730,7 +730,7 @@ export component BumpDialogModal inherits Rectangle {
     }
 
 // QrZoomModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---------- QR zoom overlay (tap any QR to enlarge it for scanning) ----------
 // Any small on-card QR (address, SeedQR, key export) opens this; a tap
@@ -768,7 +768,7 @@ export component QrZoomModal inherits Rectangle {
     }
 
 // ToastModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 export component ToastModal inherits Rectangle {
         width: 100%;
         height: 100%;
@@ -795,7 +795,7 @@ export component ToastModal inherits Rectangle {
     }
 
 // SplashModal -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // Splash cover — the topmost child, so it hides everything until Rust
 // flips `ready` (once the safe-area inset is known). Prevents the content

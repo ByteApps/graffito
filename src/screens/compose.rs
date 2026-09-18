@@ -1,5 +1,5 @@
 //! Screen.compose — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -33,7 +33,7 @@ pub(crate) fn note_est_at(
 /// Multi-recipient (2+ chips) analog of `note_est`: notes-core's
 /// `estimate_note_cost` only takes a single optional recipient spk length
 /// (and is hardwired to `multi_count: None`) — so this computes the body
-/// length matching `multi_body`'s framing (PLAN-pnte-redesign.md: the
+/// length matching `multi_body`'s framing (plans/PLAN-pnte-redesign.md: the
 /// recipient count lives in the envelope HEADER now, not a body-leading
 /// byte — `text` verbatim public, `count×WRAP_LEN || SEAL_OVERHEAD+text`
 /// private) and calls notes-core's own public `envelope::payload_lens_for`
@@ -84,7 +84,7 @@ pub(crate) fn compose_est(
 }
 
 /// Multi-recipient pq analog of [`multi_note_est`]: same framing
-/// arithmetic, but through `pq::multi_pq_overhead` (PLAN-graffito-multi-pq.md)
+/// arithmetic, but through `pq::multi_pq_overhead` (plans/PLAN-graffito-multi-pq.md)
 /// so the extra prefix bytes (shared PW block + per-recipient ML-KEM
 /// ciphertexts, mixed levels included) show up in the live cost preview
 /// exactly like the single-recipient pq estimator does.
@@ -543,7 +543,7 @@ pub(crate) fn resolve_payfrom_default(&mut self, w: &AppWindow) {
     st.apply_pay_from(w, default_source);
 }
 
-/// Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md): stamp
+/// Settings → "Compose defaults" (plans/PLAN-graffito-compose-simplify.md): stamp
 /// `st.compose_defaults` onto every per-note Compose/session field and
 /// clear the override set — the ONE place a fresh compose session (via
 /// `pick_contact_core`) and the gear card's "Reset this note to defaults"
@@ -828,13 +828,13 @@ pub(crate) fn refresh_compose_locktime_panel(&self, w: &AppWindow) {
 }
 
 /// Whether the compose screen's post-quantum "Security" section applies at
-/// all — private (any recipient count since PLAN-graffito-multi-pq.md,
+/// all — private (any recipient count since plans/PLAN-graffito-multi-pq.md,
 /// 2026-09-06; single-recipient-only before) + a KEYED identity
 /// (watch-only can't seal anything) +
 /// NOTEBOOK-funded (mixed/spending-funded compose calls a different
 /// builder that never carries pq layers — see `ComposeRequest::
 /// pq_password`'s doc). Covers BOTH a directed note (`st.to_address` set)
-/// and a self-note (`st.to_address` empty) since PLAN-graffito-self-pw.md —
+/// and a self-note (`st.to_address` empty) since plans/PLAN-graffito-self-pw.md —
 /// before that, self-notes were excluded entirely. Shared by the panel
 /// visibility condition (app.slint mirrors this exact logic) and every
 /// Rust caller that needs to know whether pq layers are even reachable
@@ -907,7 +907,7 @@ pub(crate) fn resolve_pq_mlkem_eks(
 /// resolved level for a self-note or ORDINARY (one-recipient) directed
 /// note, `Some` only when the ML-KEM layer is actually ON; `multi_algs` is
 /// non-empty ONLY for a 2+-recipient directed note with ML-KEM on, one alg
-/// per recipient in recipient order (PLAN-graffito-multi-pq.md — mixed
+/// per recipient in recipient order (plans/PLAN-graffito-multi-pq.md — mixed
 /// levels across recipients are allowed). `(0, None, vec![])` when the
 /// section doesn't apply or neither layer is on, so every non-pq compose
 /// stays byte-identical to before this feature. Called from
@@ -939,7 +939,7 @@ pub(crate) fn refresh_compose_pq(
 
     // ---- ML-KEM availability ----
     let (mlkem_available, mlkem_level, mlkem_caption, multi_algs) = if directed && is_multi {
-        // Multi-recipient (2026-09-06, PLAN-graffito-multi-pq.md):
+        // Multi-recipient (2026-09-06, plans/PLAN-graffito-multi-pq.md):
         // ALL-OR-NOTHING across every recipient — recomputed each refresh
         // (a handful of linear contact lookups, cheap enough to skip the
         // single-recipient cache's optimization).
@@ -983,7 +983,7 @@ pub(crate) fn refresh_compose_pq(
         };
         (available, level, caption, Vec::new())
     } else {
-        // Self-note (PLAN-graffito-self-pw.md): the ONLY eligible key is an
+        // Self-note (plans/PLAN-graffito-self-pw.md): the ONLY eligible key is an
         // imported/randomly-generated quantum key living outside the seed
         // tree (`State.pq_imported`) — NEVER the notebook's seed-derived
         // receive key, which shares the same leaf secret as the enc key it
@@ -996,7 +996,7 @@ pub(crate) fn refresh_compose_pq(
                 true,
                 Some(app_core::pqkeys::from_pq_alg(kp.alg())),
                 // "your quantum key", not "this imported key": the slot has
-                // held generated keys too since PLAN-graffito-quantum-key.md.
+                // held generated keys too since plans/PLAN-graffito-quantum-key.md.
                 "readable only where your quantum key is present — losing the key loses \
                  this note forever, even with your seed."
                     .to_string(),
@@ -1216,7 +1216,7 @@ pub(crate) fn mixed_compose_args(&self, w: &AppWindow) -> Result<MixedComposeArg
     }
 
     // Taproot CHANGE-chain coins (unit 5, see
-    // `../PLAN-chain-notes-app-taproot-change.md`): same account, chain 1
+    // `../plans/PLAN-graffito-app-taproot-change.md`): same account, chain 1
     // instead of the notebooks' chain 0 — `CoinSource::Change` carries the
     // chain-1 index (needed to derive the signing owner later); the
     // builder-side `change_spks` map is built here from the UNIQUE indexes
@@ -1294,7 +1294,7 @@ pub(crate) fn mixed_compose_args(&self, w: &AppWindow) -> Result<MixedComposeArg
 /// zero-coin panel, never a stale/wrong wallet's coins.
 ///
 /// Taproot CHANGE-chain coins (unit 5, see
-/// `../PLAN-chain-notes-app-taproot-change.md`): folded into the
+/// `../plans/PLAN-graffito-app-taproot-change.md`): folded into the
 /// `"notebook"` panel's row list — Sal's "one unified balance" rule, same
 /// philosophy as the Coins screen (`update_wallet_coins`'s `notebook:
 /// "change"` tag) — but their SELECTION membership is tracked under a
@@ -1501,7 +1501,7 @@ pub(crate) fn payfrom_state(&self, w: &AppWindow) -> PayfromState {
         .filter_map(|(t, v)| st.spending_coins.iter().find(|c| &c.txid == t && c.vout == *v).map(|c| c.value))
         .sum();
     // Taproot CHANGE-chain coins (unit 5, see
-    // `../PLAN-chain-notes-app-taproot-change.md`): tracked under their own
+    // `../plans/PLAN-graffito-app-taproot-change.md`): tracked under their own
     // "change" key in `mixed_selected` (see `payfrom_panel_coins`'s doc),
     // even though their rows render inside the "Notebook" panel.
     let chg_sel = st.mixed_coins_for("change");
@@ -1883,7 +1883,7 @@ pub(crate) fn sync_and_finalize_payfrom(&mut self, w: &AppWindow) {
 }
 
 /// Compose's status-strip pill labels + the gear card's row values
-/// (PLAN-graffito-compose-simplify.md, Format C) — Rust-computed, never
+/// (plans/PLAN-graffito-compose-simplify.md, Format C) — Rust-computed, never
 /// reimplemented in slint, same discipline as `pq-security-label`. Reuses
 /// the SAME text for a pill and its gear-card row (a deliberate scope
 /// simplification: the plan's mock shows slightly different wording per
@@ -2913,7 +2913,7 @@ pub(crate) fn fee_tier_index(name: &str) -> i32 {
 
 impl State {
 /// Set or clear the override marker for `key` for THIS compose session
-/// (PLAN-graffito-compose-simplify.md's Format-C "quiet marker" — an
+/// (plans/PLAN-graffito-compose-simplify.md's Format-C "quiet marker" — an
 /// accent tint on the pill/card-row value, and what gates the gear card's
 /// "Reset this note to defaults" row). `is_default` is the caller's OWN
 /// equality check against that setting's default (each compares
@@ -3128,7 +3128,7 @@ pub(crate) fn on_pq_passphrase_changed(&mut self, _w: &AppWindow, text: SharedSt
     }
 
 pub(crate) fn on_pq_mlkem_toggled(&mut self, w: &AppWindow, on: bool) {
-        // Session-only now (PLAN-graffito-compose-simplify.md): this used to
+        // Session-only now (plans/PLAN-graffito-compose-simplify.md): this used to
         // persist to config.json directly, which was the very "ML-KEM
         // switch persists across composes" bug the plan calls out — the
         // DEFAULT lives in `compose_defaults.pq_mlkem_off` (Settings →
@@ -3314,7 +3314,7 @@ pub(crate) fn on_fund_build(&mut self, w: &AppWindow) {
                         if n == 1 { "" } else { "self" },
                         gift_cost_suffix(nr, gift),
                     );
-                    // PLAN-pnte-redesign.md: the note id IS the txid.
+                    // plans/PLAN-pnte-redesign.md: the note id IS the txid.
                     println!(
                         "cb: watch-note-build id={} txid={} fee={} chunks={payload_outputs} funded=1{}",
                         built.txid,
@@ -3490,7 +3490,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
                         built.fee,
                         gift_cost_suffix(n, gift)
                     );
-                    // PLAN-pnte-redesign.md: the note id IS the txid.
+                    // plans/PLAN-pnte-redesign.md: the note id IS the txid.
                     println!(
                         "cb: watch-note-build id={} txid={} fee={} chunks={payload_outputs}{}",
                         built.txid,
@@ -3544,7 +3544,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
         } else {
             None
         };
-        // Per-recipient ML-KEM (2026-09-06, PLAN-graffito-multi-pq.md):
+        // Per-recipient ML-KEM (2026-09-06, plans/PLAN-graffito-multi-pq.md):
         // one `(alg, ek)` per directed recipient, in recipient order (to,
         // then extras) — or the single self-note imported key wrapped in a
         // length-1 Vec (see `ComposeRequest::pq_mlkem`'s doc).
@@ -3562,7 +3562,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
                         }
                     }
                 }
-                // Self-note (PLAN-graffito-self-pw.md): the imported quantum
+                // Self-note (plans/PLAN-graffito-self-pw.md): the imported quantum
                 // key ONLY — never the notebook's seed-derived receive key
                 // (see `pq_compose_eligible`'s doc). `ensure_pq_imported_
                 // loaded` already ran when the Security panel was opened
@@ -3602,7 +3602,7 @@ pub(crate) fn on_compose_send(&mut self, w: &AppWindow) {
         // its cost, ML-KEM level(s)) instead of reading the form. `mlkem=`
         // is `none`, `MlKem<level>` for exactly one recipient (unchanged
         // format), or a comma-separated per-recipient list in recipient
-        // order for 2+ (PLAN-graffito-multi-pq.md's log contract).
+        // order for 2+ (plans/PLAN-graffito-multi-pq.md's log contract).
         let mlkem_log = match req.pq_mlkem.as_ref() {
             None => "none".to_string(),
             Some(eks) if eks.len() == 1 => format!("{:?}", eks[0].0),
@@ -4021,7 +4021,7 @@ pub(crate) fn on_compose_send_mixed(&mut self, w: &AppWindow) {
         }
         let chunk = self.store.as_ref().map(|st| st.chunk_size).unwrap_or(DEFAULT_CHUNK);
 
-        // PLAN-pnte-redesign.md: a private body's AAD binds the tx's FIRST
+        // plans/PLAN-pnte-redesign.md: a private body's AAD binds the tx's FIRST
         // input's outpoint, not a synthetic id — `coins[0]` becomes that
         // input by construction (`assemble_mixed_note_psbt_multi_ext`
         // iterates `coins` in caller order with no reordering), so it's

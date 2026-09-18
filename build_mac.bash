@@ -2,7 +2,7 @@
 # Xcode post-compile step for the macOS target: build the Rust bin with the
 # standalone cargo (into target-macapp/, separate from the dev /target) and drop
 # it where Xcode code-signs the .app. Sibling of build_ios.bash (M8b / Mac App
-# Store). See PLAN-chain-notes-app.md.
+# Store). See plans/PLAN-graffito-app.md.
 #
 # Universal by $ARCHS: Xcode archives a Mac app for `arm64 x86_64`, so each
 # requested arch is built and lipo'd into one fat binary. A Debug/run build with

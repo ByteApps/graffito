@@ -12,7 +12,7 @@
 //!
 //! The app seed is NEVER an output here — every path runs through the
 //! one-way seed-entropy HKDF first (see `seeds.rs`). The device UI shows
-//! only the subset chosen in PLAN-graffito-seed-rotation.md (no private
+//! only the subset chosen in plans/PLAN-graffito-seed-rotation.md (no private
 //! xprv); the app shows all of it.
 
 use zeroize::Zeroizing;

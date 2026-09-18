@@ -1,5 +1,5 @@
 //! Recovery seeds — the composed pipeline from `GetAppSeed` to a BIP-86
-//! notebook leaf (PLAN-graffito-seed-rotation.md):
+//! notebook leaf (plans/PLAN-graffito-seed-rotation.md):
 //!
 //! ```text
 //! app_seed ── keys::derive_seed_entropy(·, seed_index) ─▶ entropy   ★ FROZEN, ours
@@ -72,7 +72,7 @@ pub fn seed_fingerprint_hex(app_seed: &[u8; 32], seed_index: u32) -> Result<Stri
 }
 
 // ---------------------------------------------------------------------
-// BIP-84 spending wallet branch (PLAN-graffito-funding-unification.md,
+// BIP-84 spending wallet branch (plans/PLAN-graffito-funding-unification.md,
 // "Derivation (the core spec)") — the SAME master material as the BIP-86
 // notebook leaf above, second standard branch:
 //

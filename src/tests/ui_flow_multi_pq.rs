@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // In-process UI-flow test: multi-recipient pq compose gating
-// (PLAN-graffito-multi-pq.md, 2026-09-06).
+// (plans/PLAN-graffito-multi-pq.md, 2026-09-06).
 // ---------------------------------------------------------------------------
 //
 // Mirrors `ui_flow_multi_confirm.rs`'s picker/funding setup (two taproot

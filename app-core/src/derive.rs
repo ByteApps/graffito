@@ -58,7 +58,7 @@ pub(crate) fn normal(i: u32) -> ChildNumber {
 /// m/86'/{coin}'/{account}'/{chain}/{index} from a master (depth-0) xprv.
 /// `chain` 0 = receive (the FROZEN notebook rule below), 1 = change. Added
 /// for the change-chain foundation
-/// (`../PLAN-chain-notes-app-taproot-change.md`) — chain-0 behavior is
+/// (`../plans/PLAN-graffito-app-taproot-change.md`) — chain-0 behavior is
 /// untouched by construction, since [`leaf_from_master`] just delegates
 /// here with `chain=0`.
 pub fn leaf_from_master_chain(

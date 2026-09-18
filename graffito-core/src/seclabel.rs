@@ -4,7 +4,7 @@
 //! so ([`security_label`], the section caption).
 //!
 //! Moved here from graffito's `app-core/src/passphrase.rs` (2026-09-01,
-//! PLAN-graffito-arch.md phase 2) after the policy had drifted across three
+//! plans/PLAN-graffito-arch.md phase 2) after the policy had drifted across three
 //! copies — app-core's function, a stale override in graffito's `src/lib.rs`
 //! (which shipped a "losing the imported key" warning to users who had
 //! GENERATED their key), and the device app's `pq_security_label`. The
@@ -26,7 +26,7 @@
 //!   and names the device ("readable only on this device — or another
 //!   holding your ML-KEM-768 personal quantum key").
 //!
-//! Unifying the two is a product decision (PLAN-graffito-arch.md phase
+//! Unifying the two is a product decision (plans/PLAN-graffito-arch.md phase
 //! 1b); until it is made, both live here, total and tested, and the
 //! workspace's `scripts/check-seclabel-parity.py` keeps the shared rows
 //! locked.
@@ -55,7 +55,7 @@
 //! slows each guess but cannot manufacture entropy the passphrase never
 //! had. An entropy claim that is only ASSUMED, never measured against what
 //! the user typed, is exactly how a "strong passphrase" quietly turns out
-//! not to be one (RANDOMNESS-AUDIT-2026-08-01.md) — hence the verified /
+//! not to be one (reports/RANDOMNESS-AUDIT-2026-08-01.md) — hence the verified /
 //! unverified distinction below.
 
 use notes_core::pq::MlKemAlg;
@@ -175,7 +175,7 @@ pub struct SecurityChoice {
     pub directed: bool,
     /// Estimated/exact entropy of the passphrase-layer passphrase, if the
     /// passphrase layer is enabled (`None` when it isn't). Offered on
-    /// directed notes and — since PLAN-graffito-self-pw.md (2026-08-22) —
+    /// directed notes and — since plans/PLAN-graffito-self-pw.md (2026-08-22) —
     /// self-notes too, though it never changes [`is_quantum_resistant`]'s
     /// answer for a self-note (already `true` regardless — see that fn's
     /// doc). A shell without a strength estimator fills this per
@@ -192,7 +192,7 @@ pub struct SecurityChoice {
     pub passphrase_verified: bool,
     /// The ML-KEM level, if the hybrid layer is enabled. `None` when it
     /// isn't in use. Offered on directed notes and — since
-    /// PLAN-graffito-self-pw.md — self-notes too (there, ONLY when sealed
+    /// plans/PLAN-graffito-self-pw.md — self-notes too (there, ONLY when sealed
     /// to a non-seed-derived personal quantum key — a compose-side
     /// obligation this struct can't see); same quantum-resistance caveat
     /// as `passphrase_bits` above.
@@ -293,11 +293,11 @@ pub fn describe(c: &SecurityChoice, flavor: SelfNoteCopy) -> (bool, String) {
 /// seed-derived key — no public-key material ever touches the chain), so
 /// [`is_quantum_resistant`] stays `true` whatever the layers say. The
 /// layers protect against a DIFFERENT threat (seed compromise, an exported
-/// xpub + quantum recovery of the leaf secret — PLAN-graffito-self-pw.md's
+/// xpub + quantum recovery of the leaf secret — plans/PLAN-graffito-self-pw.md's
 /// "Why"), so whenever one is actually on, the label surfaces the loss
 /// warning instead of the generic self-note sentence: forgetting the
 /// password, or losing the personal quantum key (`mlkem` on a self-note is
-/// always the non-seed personal key — PLAN-graffito-quantum-key.md), makes
+/// always the non-seed personal key — plans/PLAN-graffito-quantum-key.md), makes
 /// the note unrecoverable, seed or no seed.
 fn self_note_label(c: &SecurityChoice, flavor: SelfNoteCopy) -> String {
     const PLAIN: &str = "Private note: sealed with a key derived from your seed. Already quantum-resistant — no public-key material ever touches the chain.";

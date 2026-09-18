@@ -6,7 +6,7 @@
 //! note-encryption rule, an esplora chain client that assembles in-memory
 //! SyncBundles, the local store, and compose orchestration.
 //!
-//! Milestones and design: ../../PLAN-chain-notes-app.md (prime workspace).
+//! Milestones and design: ../../plans/PLAN-graffito-app.md (prime workspace).
 
 pub mod chain;
 pub mod compose;

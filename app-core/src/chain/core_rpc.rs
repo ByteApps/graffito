@@ -13,7 +13,7 @@ use crate::Error;
 use super::esplora_shape;
 use super::transport::Transport;
 
-/// U6 (`../../PLAN-chain-notes-app-core-rpc.md`, "unusable against a real
+/// U6 (`../../plans/PLAN-graffito-app-core-rpc.md`, "unusable against a real
 /// node" fix, 2026-07-30): process-global watch cache, shared across every
 /// `CoreRpcTransport` instance — belt-and-braces on TOP of
 /// [`CoreRpcTransport::ensure_address_watched`]'s node-truth
@@ -54,7 +54,7 @@ pub fn core_rpc_import_descriptors_call_count() -> u32 {
 
 /// Process-global cache of fully-resolved esplora-shaped tx JSON, keyed by
 /// (node identity, txid) — the fix for the measured O(wallet)
-/// `getrawtransaction` defect (`PLAN-one-regtest-node.md`'s "The rescan
+/// `getrawtransaction` defect (`plans/PLAN-one-regtest-node.md`'s "The rescan
 /// trap" / "Two things now grow without bound"): `listtransactions "*"`
 /// ([`CoreRpcTransport::wallet_txid_order`]) has no per-address filter, so
 /// resolving history for ONE address means fetching EVERY wallet-wide
@@ -64,7 +64,7 @@ pub fn core_rpc_import_descriptors_call_count() -> u32 {
 /// 2090 `getrawtransaction` round trips (~418 each), with NO decrease
 /// across repetition.
 ///
-/// **Moved into [`esplora_shape`] (`PLAN-graffito-electrum.md`)** so the
+/// **Moved into [`esplora_shape`] (`plans/PLAN-graffito-electrum.md`)** so the
 /// Electrum backend shares the exact same cache (and the exact same
 /// only-cache-a-CONFIRMED-result safety rule) rather than duplicating it —
 /// these two thin wrappers exist only to keep this module's existing
@@ -78,7 +78,7 @@ pub fn core_rpc_tx_json_cache_len() -> usize {
     esplora_shape::tx_json_cache_len()
 }
 
-/// Bitcoin Core JSON-RPC backend (`../../PLAN-chain-notes-app-core-rpc.md`
+/// Bitcoin Core JSON-RPC backend (`../../plans/PLAN-graffito-app-core-rpc.md`
 /// §1.3/U3, §2.2/§2.3/U4). A plain JSON-RPC 1.0 client over HTTP basic auth
 /// that receives an ESPLORA-shaped path (exactly what [`ChainClient`]
 /// already sends through [`Transport`]) and synthesizes an Esplora-shaped
@@ -104,7 +104,7 @@ pub fn core_rpc_tx_json_cache_len() -> usize {
 /// server.py`, which does the identical per-address translation against a
 /// real node and backs the whole regtest e2e + app↔Prime interop matrix.
 ///
-/// U5 (`../../PLAN-chain-notes-app-core-rpc.md` §2.1/§2.4) formalizes the
+/// U5 (`../../plans/PLAN-graffito-app-core-rpc.md` §2.1/§2.4) formalizes the
 /// error-mapping rule this unit's original -5→404 shortcut left informal,
 /// plus credential redaction: `creds` is private (was `pub`, a plaintext
 /// footgun — see [`CoreRpcTransport::new`]'s doc comment) and this type has
@@ -221,7 +221,7 @@ pub struct WatchDescriptor {
 }
 
 /// Initial `range_end` a freshly-configured [`WatchDescriptor`] family gets
-/// (U7, the wiring unit — `../../PLAN-chain-notes-app-core-rpc.md` §2.2's
+/// (U7, the wiring unit — `../../plans/PLAN-graffito-app-core-rpc.md` §2.2's
 /// "ranged descriptor import" finally gets a caller). 20 addresses per
 /// chain (0 through 19) mirrors the standard BIP-44-style gap limit this
 /// app already uses elsewhere for a FIRST look (`SPENDING_GAP_SHALLOW`-style
@@ -377,7 +377,7 @@ enum RpcOutcome {
 }
 
 // `btc_to_sats` and `tx_touches` moved to [`esplora_shape`]
-// (`PLAN-graffito-electrum.md`) so the Electrum backend shares them —
+// (`plans/PLAN-graffito-electrum.md`) so the Electrum backend shares them —
 // called below as `esplora_shape::btc_to_sats`/`esplora_shape::tx_touches`.
 
 impl CoreRpcTransport {
@@ -466,7 +466,7 @@ impl CoreRpcTransport {
     /// stripped by [`AnyTransport::new`] (e.g. `http://host:8332` or
     /// `http://user:pass@host:8332`).
     ///
-    /// U5 (`../../PLAN-chain-notes-app-core-rpc.md` §2.4, closing deferred
+    /// U5 (`../../plans/PLAN-graffito-app-core-rpc.md` §2.4, closing deferred
     /// audit finding M6) fixes two parsing defects a review of U2/U3 found,
     /// both of which used to produce a WRONG host/port silently instead of
     /// erroring:
@@ -1542,7 +1542,7 @@ impl CoreRpcTransport {
     /// (`fastestFee`/`halfHourFee`/`hourFee`/`economyFee`), clamped to the
     /// node's own live relay minimum (`minimumFee`, from
     /// `getmempoolinfo().mempoolminfee`) and forced non-increasing across
-    /// tiers (U7, `PLAN-chain-notes-app-core-rpc.md` §2.6).
+    /// tiers (U7, `plans/PLAN-graffito-app-core-rpc.md` §2.6).
     ///
     /// **Units, audited explicitly — this is the single most damaging bug
     /// this route could ship.** `estimatesmartfee`'s `feerate` is BTC per
@@ -1635,7 +1635,7 @@ impl CoreRpcTransport {
 
 // `SAT_VB_PER_BTC_PER_KVB`/`btc_per_kvb_to_sat_vb`, the four fallback
 // constants, `clamp_fee_tiers`, `BLOCK_VBYTES`, and `quiet_mempool_tiers`
-// all moved to [`esplora_shape`] (`PLAN-graffito-electrum.md`) so the
+// all moved to [`esplora_shape`] (`plans/PLAN-graffito-electrum.md`) so the
 // Electrum backend's fee route shares them byte-for-byte — called above
 // as `esplora_shape::*`. This module's own tests for them (below) now
 // call through that path too.

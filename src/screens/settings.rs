@@ -1,5 +1,5 @@
 //! Screen.settings — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -7,7 +7,7 @@ use crate::*;
 /// `fill` — the node picker gets an extra UI-managed row `fill` doesn't
 /// (the explorer picker has no "Bitcoin Core" concept, so it stays on the
 /// plain two-row-tail `fill`): `<presets…>, "Bitcoin Core", "Custom…"`.
-/// U12 (`PLAN-chain-notes-app-core-rpc.md` §2.5) moves the `bitcoind+`
+/// U12 (`plans/PLAN-graffito-app-core-rpc.md` §2.5) moves the `bitcoind+`
 /// storage prefix out of user-facing text — a stored Core base now selects
 /// the dedicated row and displays as bare `host:port` (`display_core_url`),
 /// never the raw prefixed string; anything else follows the original
@@ -23,7 +23,7 @@ pub(crate) fn fill_node(
     let electrum_row = presets.len() + 1;
     let custom_row = presets.len() + 2;
     opts.push("Bitcoin Core".into());
-    // "Electrum server" (2026-09-06, PLAN-graffito-electrum.md): a personal
+    // "Electrum server" (2026-09-06, plans/PLAN-graffito-electrum.md): a personal
     // electrs, the server Sparrow uses — no credentials, no watch wallet.
     // Shares the address field with the Core row (only one is visible).
     opts.push("Electrum server".into());
@@ -88,7 +88,7 @@ pub(crate) fn expected_genesis_hex(network: Network) -> &'static str {
 
 /// Normalize what a person types into the Settings "Electrum server"
 /// field into the stored `electrum+tcp://host:port` form
-/// (PLAN-graffito-electrum.md — the prefix is a STORAGE format like
+/// (plans/PLAN-graffito-electrum.md — the prefix is a STORAGE format like
 /// `bitcoind+`, never shown). Accepted: `host`, `host:port`,
 /// `tcp://host[:port]`, a pasted `electrum+tcp://…`; `ssl://` and
 /// `electrum+ssl://` are refused with a clear message until certificate
@@ -165,7 +165,7 @@ fn parse_host_port(authority: &str, empty_msg: &str) -> Result<(String, Option<u
 
 /// Normalize what a person types into the Settings "Bitcoin Core" node-
 /// address field into the stored `bitcoind+http(s)://host:port` form (U12,
-/// `PLAN-chain-notes-app-core-rpc.md` §2.5) — the ONLY thing that changes is
+/// `plans/PLAN-graffito-app-core-rpc.md` §2.5) — the ONLY thing that changes is
 /// how the field is spelled; `AnyTransport::new`/`node_backend_label` in
 /// app-core/src/chain.rs still read/produce exactly this prefix, untouched.
 /// Strips inline `user:pass@` userinfo first, same authority-vs-path guard
@@ -654,7 +654,7 @@ pub(crate) fn load_backend_settings(&self, w: &AppWindow) {
 /// [`load_backend_settings`] above on every repaint. That separation is
 /// what keeps RPC-credential Keychain reads off the hot path: this is the
 /// "Settings opened" lazy-load point the plan's §2.4 asks for
-/// (`PLAN-chain-notes-app-core-rpc.md`), not something that runs on boot or
+/// (`plans/PLAN-graffito-app-core-rpc.md`), not something that runs on boot or
 /// on every scan.
 pub(crate) fn update_node_backend_ui(&self, w: &AppWindow) {
     let st = self;
@@ -810,7 +810,7 @@ pub(crate) fn refresh_node_health(&mut self, w: &AppWindow) {
     });
 }
 
-/// Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md):
+/// Settings → "Compose defaults" (plans/PLAN-graffito-compose-simplify.md):
 /// repaint every row from `st.compose_defaults` — called from
 /// `update_settings_identity` (Settings open) and after every
 /// `on_set_compose_default_*` handler so a save is reflected immediately.
@@ -1325,7 +1325,7 @@ pub(crate) fn on_set_node_address(&mut self, w: &AppWindow, t: SharedString) {
         self.refresh_node_health(w);
     }
 
-/// The "Electrum server" row's field (PLAN-graffito-electrum.md): store
+/// The "Electrum server" row's field (plans/PLAN-graffito-electrum.md): store
 /// `electrum+tcp://host:port`, redisplay it canonically, then check the
 /// server (version, tip, and that it indexes THIS network's chain).
 pub(crate) fn on_set_node_electrum_address(&mut self, w: &AppWindow, t: SharedString) {

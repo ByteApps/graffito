@@ -1,5 +1,5 @@
 //! Small pure helpers shared across screens — moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -237,7 +237,7 @@ pub(crate) fn friendly_net_err(raw: &str) -> String {
     }
 }
 
-/// U5 (`../PLAN-chain-notes-app-core-rpc.md` §2.1/§2.4): Bitcoin Core's
+/// U5 (`../plans/PLAN-graffito-app-core-rpc.md` §2.1/§2.4): Bitcoin Core's
 /// rejection vocabulary — `testmempoolaccept` reject-reason tokens
 /// (`"txn-already-known"`, `"min relay fee not met, ..."`,
 /// `"bad-txns-inputs-missingorspent"`, `"non-final"`) and

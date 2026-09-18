@@ -85,7 +85,7 @@ pub struct Utxo {
 /// `u`'s outpoint exactly as it appears on the wire: txid in
 /// internal/little-endian order (already how [`Utxo::txid`] is stored) ||
 /// vout as `u32`-LE — the directed-private AAD's `outpoint` field
-/// (dm.rs, PLAN-pnte-redesign.md).
+/// (dm.rs, plans/PLAN-pnte-redesign.md).
 pub fn outpoint_bytes(u: &Utxo) -> [u8; 36] {
     let mut out = [0u8; 36];
     out[..32].copy_from_slice(&u.txid);
@@ -918,7 +918,7 @@ pub fn build_note_tx_multi_exact(
 
 // ---------------------------------------------------------------------
 // Mixed-source (taproot + P2WPKH) note transactions — the Prime device's
-// spending-wallet port (PLAN-graffito-funding-unification.md, "Prime
+// spending-wallet port (plans/PLAN-graffito-funding-unification.md, "Prime
 // device" + "New signing surface: P2WPKH in notes-core"). Unlike every
 // builder above (always P2TR key-path, one shared `tweaked_seckey`), a
 // spending-wallet coin is a P2WPKH input owned by ITS OWN fresh-address
@@ -960,7 +960,7 @@ pub struct MixedInput {
 /// conservative budgeting convention most wallets use (a real signature is
 /// often 1-2 bytes shorter, so the fee is a slight, harmless overpay).
 /// Together with the shared 41-byte base these reproduce
-/// PLAN-graffito-funding-unification.md's cost table exactly: P2TR input
+/// plans/PLAN-graffito-funding-unification.md's cost table exactly: P2TR input
 /// 57.5 vB, P2WPKH input 68 vB ((41*4 + 66)/4 = 57.5, (41*4 + 108)/4 = 68).
 fn mixed_input_witness_wu(kind: InputKind) -> usize {
     match kind {

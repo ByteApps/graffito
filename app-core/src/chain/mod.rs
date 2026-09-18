@@ -18,7 +18,7 @@
 //! retry-with-backoff (for the 429s that get through anyway). See the
 //! comment on `Transport for HttpTransport` below for the exact rules.
 //!
-//! U6 (`../../PLAN-graffito-app-arch.md`, "chain.rs split") broke this
+//! U6 (`../../plans/PLAN-graffito-app-arch.md`, "chain.rs split") broke this
 //! module up into files, purely a move — no behavior changed and every
 //! `app_core::chain::<Item>` path below still resolves:
 //! [`transport`] owns the `Transport` seam (`HttpTransport`/
@@ -44,7 +44,7 @@ pub use core_rpc::{
     core_rpc_tx_json_cache_max_entries, identity_watch_descriptors, CoreRpcTransport, NodeStatus,
     WatchDescriptor,
 };
-// PLAN-graffito-electrum.md: the Electrum protocol backend, plus the pure
+// plans/PLAN-graffito-electrum.md: the Electrum protocol backend, plus the pure
 // genesis-hash comparison the app supplies its own expected hash to.
 pub use electrum::{network_matches_genesis, ElectrumStatus, ElectrumTransport};
 pub use esplora::{AddrStats, EsploraOut, EsploraStatus, EsploraTx, EsploraUtxo, EsploraVin};

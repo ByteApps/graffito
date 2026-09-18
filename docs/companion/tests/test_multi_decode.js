@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Unit test for FLAG_MULTI (multi-recipient directed notes) decode in the
 // shipped companion/chain-scan.js — the JS port of notes-core's PNTE
-// envelope + bundle.rs scanner, PLAN-pnte-redesign.md shape.
+// envelope + bundle.rs scanner, plans/PLAN-pnte-redesign.md shape.
 //
 // Wire spec (notes-core/src/envelope.rs FLAG_MULTI, frozen on this
 // branch):
@@ -146,7 +146,7 @@ const HISTORIES = {
        "aa".repeat(72) + "aa".repeat(72) + "bb".repeat(24)), 104,
        { voutAddrs: [ADDR, CAROL] }),
   ],
-  // === G: multi + BOTH pq layers (PLAN-graffito-multi-pq.md, 2026-09-06) ===
+  // === G: multi + BOTH pq layers (plans/PLAN-graffito-multi-pq.md, 2026-09-06) ===
   // The prior MULTI-vs-pq exclusion is lifted — this header must now
   // DECODE (never foreign data), and since the browser holds no key at
   // all, it renders exactly like scenario E: sealed placeholder text,
@@ -229,7 +229,7 @@ vm.runInContext(`
          "privateTwo: recipients must resolve even though the body is sealed: " + JSON.stringify(ne.recipients));
   console.log("PASS E: private 2-recipient note (72B wraps + sealed body) — placeholder text, recipients resolve");
 
-  // --- G: multi + both pq layers, now decodable (PLAN-graffito-multi-pq.md) ---
+  // --- G: multi + both pq layers, now decodable (plans/PLAN-graffito-multi-pq.md) ---
   const g = await scanAddress("stub:multiPq", ${JSON.stringify(ADDR)});
   assert(g.notes.length === 1, "multiPq: expected 1 note (header must decode), got " + g.notes.length);
   const ng = g.notes[0];

@@ -1,11 +1,11 @@
 //! Private-note sealing: XChaCha20-Poly1305, one nonce per NOTE (the whole
 //! note is sealed once, then chunked — never per-chunk nonces; see
-//! PLAN-graffito.md). Blob layout: nonce(24) || ciphertext || tag(16).
+//! plans/PLAN-graffito.md). Blob layout: nonce(24) || ciphertext || tag(16).
 //!
 //! XChaCha20 is length-preserving, so sealed_len = plaintext_len + 40 —
 //! the compose screen's keystroke cost estimator depends on that constant.
 //!
-//! **Uniform AAD rule (PLAN-pnte-redesign.md, 2026-08-11 orchestrator
+//! **Uniform AAD rule (plans/PLAN-pnte-redesign.md, 2026-08-11 orchestrator
 //! review):** every sealed body — self-note or directed — binds the
 //! carrying tx's FIRST input's outpoint (36 bytes: txid in internal/
 //! little-endian order || vout as `u32`-LE, exactly as serialized on the

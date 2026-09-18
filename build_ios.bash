@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Xcode post-compile step: build the Rust bin with the standalone cargo (into
 # target-mobile/, separate from the Nix SDK's /target) and drop it where Xcode
-# code-signs the .app. See PLAN-chain-notes-app-phase4.md (M8b).
+# code-signs the .app. See plans/PLAN-graffito-app-phase4.md (M8b).
 #
 # Release builds also emit a **dSYM** for crash symbolication in App Store
 # Connect: the Rust bin IS the app's main executable, so we build it WITH debug

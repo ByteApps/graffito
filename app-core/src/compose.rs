@@ -1,6 +1,6 @@
 //! Compose orchestration: build via notes-core compose (the ONLY producer
 //! of on-chain bytes) → record pending in the store, keyed by the just-
-//! built tx's txid (PLAN-pnte-redesign.md: the note id IS the txid — there
+//! built tx's txid (plans/PLAN-pnte-redesign.md: the note id IS the txid — there
 //! is no synthetic id to generate up front any more). Broadcast is the
 //! caller's step (chain.rs), so a failed POST leaves a retryable Pending
 //! note with the tx hex still in hand.
@@ -110,7 +110,7 @@ pub struct ComposeRequest<'a> {
     /// rule: no public/multi-recipient pq notes). A self-note carrying a
     /// layer is stored LOCKED from the moment it's signed
     /// (`record_composed_note` never caches its plaintext) —
-    /// PLAN-graffito-self-pw.md: the password is a genuine second factor
+    /// plans/PLAN-graffito-self-pw.md: the password is a genuine second factor
     /// against seed compromise, so a cached copy would hollow it out.
     /// `None` = no passphrase layer (the ordinary v1 path, byte-identical
     /// to before this field existed).
@@ -120,7 +120,7 @@ pub struct ComposeRequest<'a> {
     /// choice; default [`notes_core::pq::PwCost::DEFAULT`].
     pub pq_pw_cost: notes_core::pq::PwCost,
     /// Post-quantum: an ML-KEM hybrid layer, PER RECIPIENT (2026-09-06,
-    /// PLAN-graffito-multi-pq.md — was a single `(alg, ek)` before multi-
+    /// plans/PLAN-graffito-multi-pq.md — was a single `(alg, ek)` before multi-
     /// recipient pq notes existed). `None` = no ML-KEM layer at all.
     /// `Some(v)` must carry EXACTLY one `(alg, ek_bytes)` per directed
     /// recipient (`req.recipient` + `req.extra_recipients`, in that same
@@ -144,7 +144,7 @@ pub struct ComposeRequest<'a> {
 
 #[derive(Debug, Clone)]
 pub struct ComposedNote {
-    /// PLAN-pnte-redesign.md: the note id IS the txid of the tx this
+    /// plans/PLAN-pnte-redesign.md: the note id IS the txid of the tx this
     /// compose just built — always equal to `tx.txid_hex`. No longer a
     /// synthetic 4-byte id chosen before signing (there is nothing left to
     /// generate — the id only exists once the tx does).
@@ -245,7 +245,7 @@ pub fn compose_note(
     // BEFORE the existing self/multi dispatch below rather than threading
     // pq state through it. Structural requirement mirrors notes-core's own
     // `SealLayers`/`MultiSealLayers`/envelope validity rule: a pq note is
-    // always private. Since 2026-09-06 (PLAN-graffito-multi-pq.md) a
+    // always private. Since 2026-09-06 (plans/PLAN-graffito-multi-pq.md) a
     // multi-recipient directed note may carry pq layers too — `pq_mlkem`,
     // when set, must supply exactly one `(alg, ek)` per recipient (1 for a
     // self-note or single-recipient directed note, `recipients.len()`
@@ -318,7 +318,7 @@ pub fn compose_note(
                 tx,
             });
         }
-        // Self-note pq compose (PLAN-graffito-self-pw.md): notebook-funded
+        // Self-note pq compose (plans/PLAN-graffito-self-pw.md): notebook-funded
         // only (auto-select or coin control, same two shapes as an ordinary
         // self-note) — mixed/spending-funded and watch-only compose never
         // reach this function with pq layers set (see `ComposeRequest::
@@ -421,7 +421,7 @@ pub fn record_composed_note(
         pending_spend: false,
     });
 
-    // Self-note pq layers (PLAN-graffito-self-pw.md): stored LOCKED from
+    // Self-note pq layers (plans/PLAN-graffito-self-pw.md): stored LOCKED from
     // the moment it's signed, even though WE composed it and hold the
     // plaintext right here — a cached copy would hollow out the password/
     // quantum-key second factor the whole feature exists for. Reconstruct
@@ -519,7 +519,7 @@ pub fn compose_and_record(
 /// Build + sign an RBF fee-bump replacement for a Pending note — PURE, no
 /// store mutation (the universal confirm screen's stage-A seam, same
 /// pattern as [`compose_note`] / [`record_composed_note`]): re-sign the
-/// SAME inputs at a higher rate. PLAN-pnte-redesign.md: the note id IS
+/// SAME inputs at a higher rate. plans/PLAN-pnte-redesign.md: the note id IS
 /// the txid, so a replacement (different fee, different outputs) has a
 /// DIFFERENT id from the note it replaces — [`record_bumped_note`] is
 /// what actually renames the stored record so the next scan re-matches
@@ -607,7 +607,7 @@ pub fn bump_fee_build(
         ),
     }?;
 
-    // PLAN-pnte-redesign.md: the replacement is a DIFFERENT tx (same
+    // plans/PLAN-pnte-redesign.md: the replacement is a DIFFERENT tx (same
     // inputs, different fee/outputs), so it has a DIFFERENT txid — the
     // note's new canonical id. `record_bumped_note` is what actually
     // renames the stored record; this just reports it, same as
@@ -1135,7 +1135,7 @@ mod multi_recipient_tests {
 
         // Rebuild directly through notes-core's single-recipient entry
         // point over the SAME inputs (there is no more note_id to line up —
-        // PLAN-pnte-redesign.md dropped it entirely) and compare txids
+        // plans/PLAN-pnte-redesign.md dropped it entirely) and compare txids
         // (non-witness bytes — schnorr aux-rand makes the witness itself
         // non-deterministic across two independent runs).
         let recipient = notes_core::address::Recipient::parse(NET, &bob_addr).unwrap();

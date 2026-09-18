@@ -174,7 +174,7 @@ fn watch_xpub_import_matches_full_identity() {
     ));
 }
 
-/// Recovery-seeds interop (PLAN-chain-notes-seed-rotation.md): a Prime
+/// Recovery-seeds interop (plans/PLAN-graffito-seed-rotation.md): a Prime
 /// device seed's 24 words, imported through OUR normal mnemonic path,
 /// must land on the byte-identical leaf, enc key, and address that the
 /// device derives via notes-core's seeds pipeline. This is the whole
@@ -232,7 +232,7 @@ fn prime_recovery_seed_words_import_identically() {
 
 // ---------------------------------------------------------------------
 // Change chain (m/86'/{coin}'/{account}'/1/{index}) — foundation for
-// PLAN-chain-notes-app-taproot-change.md. This unit ONLY adds derivation
+// plans/PLAN-graffito-app-taproot-change.md. This unit ONLY adds derivation
 // + address; the tests below are the correctness proof: chain-0 stays
 // byte-identical, and chain-1 matches an independent rust-bitcoin
 // derivation of the same BIP-86 change path.

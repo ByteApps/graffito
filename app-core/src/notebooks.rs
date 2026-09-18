@@ -15,7 +15,7 @@
 //! it survives rescans but is NOT chain-recoverable after an identity
 //! reset. Notes themselves recover per address; the index is rebuilt by
 //! receive-chain gap discovery plus whatever the user renames again.
-//! Design: ../../PLAN-chain-notes-notebooks.md (prime workspace).
+//! Design: ../../plans/PLAN-graffito-notebooks.md (prime workspace).
 
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +29,7 @@ use crate::Error;
 ///
 /// ACCOUNT-level (funding-unification M3.1, Sal's 2026-07-16 fix): the
 /// spending wallet is one BIP-84 branch (`m/84'/coin'/account'/…`) shared
-/// by every notebook of an account (PLAN-chain-notes-funding-unification.md,
+/// by every notebook of an account (plans/PLAN-graffito-funding-unification.md,
 /// "Derivation"), so this section lives HERE — in the per-identity
 /// notebooks index, keyed by account, next to the notebook metadata that's
 /// already scoped the same way — rather than per notebook store. Living

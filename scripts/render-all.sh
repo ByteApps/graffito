@@ -3,7 +3,7 @@
 # app's `--render` mode (software renderer, no window, `preview_mock`
 # state). Deterministic — two runs are byte-identical — so a before/after
 # `cmp` of the PNGs is the structural check for any UI refactor that
-# claims to be pixel-preserving (PLAN-graffito-app-arch.md).
+# claims to be pixel-preserving (plans/PLAN-graffito-app-arch.md).
 #
 #   scripts/render-all.sh <out-dir> [screens]   (default: all 28)
 #

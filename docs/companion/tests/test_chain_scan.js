@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Unit test for the shipped companion/chain-scan.js (the JS port of the
-// FROZEN PNTE envelope + extract_notes), PLAN-pnte-redesign.md shape: one
+// FROZEN PNTE envelope + extract_notes), plans/PLAN-pnte-redesign.md shape: one
 // note = one transaction, id = txid, multiple OP_RETURN outputs of the
 // SAME tx concatenate in vout order (header only on the first) — no more
 // cross-tx chunk reassembly, no more note_id.
@@ -39,7 +39,7 @@ const hexByte = (n) => n.toString(16).padStart(2, "0");
 const utf8Hex = (s) => Buffer.from(s, "utf8").toString("hex");
 
 // "PNTE" || '1' || flags(2 ASCII hex chars) || [count(2 ASCII hex chars)
-// iff multi] || ' ' (envelope.rs::build_header, PLAN-pnte-redesign.md).
+// iff multi] || ' ' (envelope.rs::build_header, plans/PLAN-pnte-redesign.md).
 // The WHOLE header is printable ASCII, so build it as a string and hex-
 // encode once — the flags/count fields are ASCII hex DIGITS, not raw
 // binary bytes (e.g. flags=6 is the two wire bytes '0','6', not 0x06).
@@ -94,7 +94,7 @@ function tx(txid, spks, height, opts = {}) {
 }
 
 const HISTORIES = {
-  // Intra-tx multi-output concatenation (PLAN-pnte-redesign.md's
+  // Intra-tx multi-output concatenation (plans/PLAN-pnte-redesign.md's
   // replacement for the old cross-tx chunking): ONE tx, two OP_RETURN
   // outputs — the header + "hello " on the first, raw "world" on the
   // second — must concatenate into one note, in vout order.

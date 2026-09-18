@@ -91,7 +91,7 @@ fn foreign_identity() -> app_core::notes_core::bundle::Identity {
     identity_from_leaf(&[0x33u8; 32]).unwrap()
 }
 
-/// PLAN-pnte-redesign.md (2026-08-11): these recorded LIVE testnet4
+/// plans/PLAN-pnte-redesign.md (2026-08-11): these recorded LIVE testnet4
 /// fixtures predate the wire redesign — the sim identity's standing
 /// private note (and the throwaway's public one, next test) were both
 /// composed under the OLD binary PNTE envelope (magic `PNTE` + a binary
@@ -99,7 +99,7 @@ fn foreign_identity() -> app_core::notes_core::bundle::Identity {
 /// printable ASCII `'1'` (0x31) and — envelope.rs's module doc, "FROZEN
 /// FORMAT... liberal decoding, never a panic" — rejects anything else as
 /// plain foreign data. There is deliberately no migration/dual-decode
-/// (PLAN-pnte-redesign.md, "nothing is in production"), so this old
+/// (plans/PLAN-pnte-redesign.md, "nothing is in production"), so this old
 /// real-chain note is now PERMANENTLY invisible to `extract_notes`: not
 /// merely undecryptable, it never becomes a `RecoveredNote` at all. Pinned
 /// here (superseding the old `sim_identity_private_note_surfaces_

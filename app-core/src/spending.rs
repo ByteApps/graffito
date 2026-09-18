@@ -1,5 +1,5 @@
 //! Spending wallet: BIP-84 branch of the SAME seed tree as the notebook's
-//! BIP-86 branch (PLAN-chain-notes-funding-unification.md, "Derivation (the
+//! BIP-86 branch (plans/PLAN-graffito-funding-unification.md, "Derivation (the
 //! core spec)"). `m/84'/{coin}'/{account}'/{chain}/{index}` — chain 0 =
 //! receive, 1 = change, P2WPKH (bc1q…), unlike the notebook's P2TR. Only HD
 //! identities can derive it: a BIP-39 mnemonic or a master-depth (0) xprv
@@ -141,7 +141,7 @@ pub fn derive_spending_key(
 /// Derive both spending chains' scriptPubKeys for indexes `0..upto` —
 /// chain 0 (receive) then chain 1 (change), in that order. Pure secp math,
 /// NO network calls. This is the classification-window widening lever
-/// (`PLAN-chain-notes-app-spending-self-notes.md`, Unit A / RC1): the
+/// (`plans/PLAN-graffito-app-spending-self-notes.md`, Unit A / RC1): the
 /// caller unions the result into the self-spk SET handed to
 /// `Store::apply_bundle`/`apply_bundle_watch`, so a note funded from a
 /// spending address within the window classifies OWN even when the

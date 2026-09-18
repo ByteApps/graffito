@@ -1,5 +1,5 @@
 //! Screen.contacts — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -277,7 +277,7 @@ pub(crate) fn pick_contact_core(&mut self, w: &AppWindow, addr: &str) {
         st.to_address = Some(a);
         w.global::<Ui>().set_directed(true);
     }
-    // Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md):
+    // Settings → "Compose defaults" (plans/PLAN-graffito-compose-simplify.md):
     // stamp the policy onto this fresh session — replaces the old
     // hardcoded fee-tier(1)/gift(dust)/coin-strategy(fewest) literals AND
     // the sticky `pq_mlkem_user_off` (the exact bug the plan calls out —
@@ -332,7 +332,7 @@ pub(crate) fn pick_contact_core(&mut self, w: &AppWindow, addr: &str) {
     w.global::<Ui>().set_screen(Screen::Compose);
     st.refresh_compose(w);
     // Logged once per fresh compose session, after every default has
-    // settled (PLAN-graffito-compose-simplify.md).
+    // settled (plans/PLAN-graffito-compose-simplify.md).
     println!("cb: compose-effective {}", st.compose_effective_log(w));
 }
 }

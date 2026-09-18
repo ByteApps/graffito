@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Targeted LIVE testnet4 pass for the Bitcoin Core RPC backend
-# (PLAN-chain-notes-app-core-rpc.md) — the validation regtest structurally
+# (plans/PLAN-graffito-app-core-rpc.md) — the validation regtest structurally
 # cannot provide: a real, synced, non-pruned node on a real network, over
 # an SSH tunnel to a remote Pi (this is NOT Esplora — see the tunnel's
 # port table; this script only ever speaks Core JSON-RPC, matching the

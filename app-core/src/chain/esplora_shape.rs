@@ -1,5 +1,5 @@
 //! Shared Esplora-shape synthesis, factored out of [`super::core_rpc`] so
-//! [`super::electrum`] (the Electrum backend, `../../PLAN-graffito-electrum.md`)
+//! [`super::electrum`] (the Electrum backend, `../../plans/PLAN-graffito-electrum.md`)
 //! can call the SAME code rather than duplicate it — both translators
 //! receive a Core-shaped verbose tx (bitcoind's `getrawtransaction
 //! verbosity=2`/electrs' `blockchain.transaction.get [txid, true]` answer

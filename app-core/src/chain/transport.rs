@@ -252,7 +252,7 @@ impl Transport for HttpTransport {
     }
 }
 
-/// The backend seam (`../../PLAN-chain-notes-app-core-rpc.md` §1.2):
+/// The backend seam (`../../plans/PLAN-graffito-app-core-rpc.md` §1.2):
 /// second-chain-backend selection rides the URL **scheme**, not a separate
 /// settings enum. `AnyTransport` implements [`Transport`] by delegating to
 /// whichever variant [`AnyTransport::new`] picked, so `ChainClient`, every
@@ -268,7 +268,7 @@ pub enum AnyTransport {
     /// `bitcoind+http(s)://host[:port]` — Bitcoin Core JSON-RPC.
     Core(CoreRpcTransport),
     /// `electrum+tcp://host:port` — Electrum protocol
-    /// (`PLAN-graffito-electrum.md`). `electrum+ssl://` is a recognized
+    /// (`plans/PLAN-graffito-electrum.md`). `electrum+ssl://` is a recognized
     /// prefix too, but [`AnyTransport::new`] refuses it outright (a
     /// follow-up unit) rather than ever constructing this variant for it.
     Electrum(ElectrumTransport),
@@ -461,7 +461,7 @@ mod tests {
         assert_eq!(node_backend_label("electrum+tcp://127.0.0.1:50001"), "Electrum");
     }
 
-    // ---- AnyTransport / ElectrumTransport (PLAN-graffito-electrum.md) --
+    // ---- AnyTransport / ElectrumTransport (plans/PLAN-graffito-electrum.md) --
 
     #[test]
     fn any_transport_picks_electrum_for_electrum_tcp_scheme() {

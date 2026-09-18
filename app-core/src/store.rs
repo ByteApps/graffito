@@ -32,7 +32,7 @@ pub const DEFAULT_CHUNK: usize = 100_000;
 /// the identity's own spending wallet was filed `received` with an
 /// "unknown" sender).
 ///
-/// 2 = the PNTE v1 wire redesign (`PLAN-pnte-redesign.md`, 2026-08-11):
+/// 2 = the PNTE v1 wire redesign (`plans/PLAN-pnte-redesign.md`, 2026-08-11):
 /// one note = one transaction, and the note id IS the txid — there is no
 /// more synthetic 4-byte `note_id`. Old-format `NoteRecord`s (hex8 ids)
 /// are structurally incompatible with the new scanner (which keys by
@@ -47,7 +47,7 @@ pub const CLASSIFY_VERSION: u32 = 5; // 3: graffito crypto epoch — old-salt no
 // recovers it on the next FULL rescan; the forced rescan is what brings the
 // lost note back on otherwise-quiet wallets (the addr_stats short-circuit
 // would skip them forever).
-// 5 (2026-08-22, PLAN-graffito-self-pw.md): a PW|PRIVATE (no DIRECTED)
+// 5 (2026-08-22, plans/PLAN-graffito-self-pw.md): a PW|PRIVATE (no DIRECTED)
 // envelope header — a self-note pq layer — was UNDECODABLE before this
 // feature (envelope.rs's old validity rule rejected FLAG_PW without
 // FLAG_DIRECTED), so a tx an older build scanned recorded no note at all,
@@ -75,7 +75,7 @@ pub enum NoteStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteRecord {
-    /// The note's canonical identity — PLAN-pnte-redesign.md: one note =
+    /// The note's canonical identity — plans/PLAN-pnte-redesign.md: one note =
     /// one tx, and the note id IS the txid (display-order hex). Always
     /// equal to `txids.last()`. A Pending note's id CHANGES when it is
     /// RBF-bumped (a new tx = a new txid = a new id; see
@@ -160,7 +160,7 @@ pub struct NoteRecord {
     /// pre-pq store file loads with `None`.
     #[serde(default)]
     pub locked: Option<notes_core::pq::LockedBody>,
-    /// Multi-recipient analog of `locked` (PLAN-graffito-multi-pq.md,
+    /// Multi-recipient analog of `locked` (plans/PLAN-graffito-multi-pq.md,
     /// 2026-09-06) — present instead of `locked` (never both) for a
     /// multi-recipient pq note. `#[serde(default)]` so every pre-multi-pq
     /// store file loads with `None`.
@@ -794,7 +794,7 @@ impl Store {
     /// function only ever deletes `received` rows, never touches or creates
     /// an own one, and only in response to independently-proven ownership.
     fn prune_stale_received_twins(&mut self, recovered: &[RecoveredNote], stats: &mut ApplyStats) {
-        // One note = one tx (PLAN-pnte-redesign.md): `RecoveredNote::id` IS
+        // One note = one tx (plans/PLAN-pnte-redesign.md): `RecoveredNote::id` IS
         // the txid, so "the same transaction recovered as own" is just
         // txid membership — no more (note_id, txids-list) cross-matching.
         let own: std::collections::HashSet<&str> =
@@ -939,7 +939,7 @@ impl Store {
 
     /// Returns true if the note was new.
     fn upsert_note(&mut self, note: &RecoveredNote) -> bool {
-        // PLAN-pnte-redesign.md: one note = one tx, and a txid can never
+        // plans/PLAN-pnte-redesign.md: one note = one tx, and a txid can never
         // collide across two genuinely different transactions — so a
         // scanned note matches an existing record by id (its CURRENT
         // canonical txid) or by appearing anywhere in that record's RBF
@@ -1424,7 +1424,7 @@ impl Store {
             .ok_or_else(|| Error::Store("no such note".into()))?;
         let received = rec.received;
 
-        // Multi-recipient pq note (PLAN-graffito-multi-pq.md, 2026-09-06):
+        // Multi-recipient pq note (plans/PLAN-graffito-multi-pq.md, 2026-09-06):
         // same dispatch shape as the single-recipient path below, through
         // `pq::unlock_received_multi`/`unlock_sent_multi` instead.
         let plaintext = if let Some(locked) = rec.locked_multi.clone() {
@@ -1492,7 +1492,7 @@ impl Store {
     }
 
     /// View-only unlock of a SELF-note's locked pq body
-    /// (PLAN-graffito-self-pw.md) — DISPLAYS the plaintext but, unlike
+    /// (plans/PLAN-graffito-self-pw.md) — DISPLAYS the plaintext but, unlike
     /// [`Self::unlock_note`], never writes it into `text` and never clears
     /// `locked`: every future open asks for the password/quantum key again.
     /// A cached copy would hollow out the whole feature (a self-note's pq

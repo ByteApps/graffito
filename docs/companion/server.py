@@ -72,7 +72,7 @@ PAGE_SIZE = 25  # esplora /txs/chain pagination size
 DEFAULT_PORT_BY_NETWORK = {"regtest": 18443, "testnet4": 48332}
 # The watch wallet name is configurable (CN_WATCH_WALLET) so a harness run
 # can point this server at its OWN per-run wallet instead of the shared
-# "graffito-watch" — see PLAN-one-regtest-node.md, "Two things now grow
+# "graffito-watch" — see plans/PLAN-one-regtest-node.md, "Two things now grow
 # without bound": that wallet is shared by every suite and every run
 # forever, so `listtransactions "*"` in address_txids() below is O(all
 # history ever recorded on the node), not O(this run). Measured 2026-08-03
@@ -99,7 +99,7 @@ DEFAULT_IMPORT_TIMESTAMP = int(os.environ.get("CN_IMPORT_TIMESTAMP", "0"))
 # A first-time `importdescriptors` at timestamp:0 is a rescan from GENESIS.
 # On the Pi's ~726-block regtest that's free — which is exactly why this
 # path shipped broken in build 52 (see regtest-hides-cost-bugs /
-# PLAN-one-regtest-node.md "Why he's right"). On testnet4 (~146k blocks and
+# plans/PLAN-one-regtest-node.md "Why he's right"). On testnet4 (~146k blocks and
 # growing) the same rescan is hundreds of seconds; the default 60s RPC
 # timeout would kill it mid-flight, so the import call alone gets a much
 # longer, bounded budget.
@@ -525,7 +525,7 @@ def handle_api(handler, method, path, query, body):
         if _node["network"] == "regtest":
             mine(1)  # regtest convenience: instant confirmation
         # testnet4: a successful broadcast IS the observable — there is no
-        # "mine a block" equivalent (see PLAN-one-regtest-node.md's
+        # "mine a block" equivalent (see plans/PLAN-one-regtest-node.md's
         # settle/confirm split). Leave it unconfirmed in the mempool.
         return txid
 

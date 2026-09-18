@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Cross-language byte-parity test for the PNTE v1 envelope decoder
-// (PLAN-pnte-redesign.md) shipped in companion/chain-scan.js.
+// (plans/PLAN-pnte-redesign.md) shipped in companion/chain-scan.js.
 //
 // Every vector below is copied VERBATIM (byte-for-byte, not
 // re-derived/re-implemented) from the Rust reference implementation's own
@@ -102,7 +102,7 @@ console.log("PASS all roundtrip.rs::envelope_rejects_bad_shapes negative vectors
   console.log("PASS FLAG_MULTI without FLAG_DIRECTED is undecodable (envelope.rs parse_header rule)");
 }
 
-// Self-pq extension (PLAN-graffito-self-pw.md, 2026-08-22): pq bits are
+// Self-pq extension (plans/PLAN-graffito-self-pw.md, 2026-08-22): pq bits are
 // valid with FLAG_PRIVATE alone — the viewer must DECODE these (rendering
 // the ordinary private placeholder), not drop them as foreign. Mirrors
 // envelope.rs validate_pq + tests/pq.rs's decode vectors.
@@ -117,7 +117,7 @@ console.log("PASS all roundtrip.rs::envelope_rejects_bad_shapes negative vectors
     const d = ctx.decodeNote_(`PNTE1${hex} hi`);
     assert(d !== null && d.flags === flags, `${why} (0x${hex}) must decode`);
   }
-  // PLAN-graffito-multi-pq.md (2026-09-06): the prior MULTI-vs-pq exclusion
+  // plans/PLAN-graffito-multi-pq.md (2026-09-06): the prior MULTI-vs-pq exclusion
   // is LIFTED — a multi-recipient note may now carry pq bits too. The
   // browser never decrypts a private body regardless, so this only proves
   // the header stays DECODABLE (not that it renders any differently).

@@ -1,7 +1,7 @@
 //! Passphrase strength estimation, one-tap generation, and security-label
 //! copy for the optional post-quantum layers on directed private notes
 //! (an Argon2id passphrase layer and an ML-KEM hybrid layer, composable —
-//! see `../../PLAN-graffito-pq-hybrid.md` at the workspace level for the
+//! see `../../plans/PLAN-graffito-pq-hybrid.md` at the workspace level for the
 //! encryption design; this module is the pure, UI-free logic the compose
 //! screen's live strength meter, generator button, and security label all
 //! read from). No key material, no crypto primitives — just numbers and
@@ -22,7 +22,7 @@
 //! entropy the passphrase never had.
 //!
 //! And per the ColdCard RNG disclosure this workspace's own
-//! `RANDOMNESS-AUDIT-2026-08-01.md` was prompted by: an entropy claim that
+//! `reports/RANDOMNESS-AUDIT-2026-08-01.md` was prompted by: an entropy claim that
 //! is only ever ASSUMED, never actually measured against what the user
 //! typed, is exactly how a "strong passphrase" quietly turns out not to
 //! be one. `estimate_bits`/`check` exist so the UI enforces the number
@@ -60,7 +60,7 @@ use crate::Error;
 
 // The security-copy POLICY — `REQUIRED_BITS`, `GENERATED_BITS`,
 // `MlKemLevel`, `SecurityChoice`, `is_quantum_resistant` — lives in the
-// shared crate since PLAN-graffito-arch.md phase 2 and is re-exported here
+// shared crate since plans/PLAN-graffito-arch.md phase 2 and is re-exported here
 // so no call site changed. (`security_label`/`describe` below are this
 // app's Flat-flavor wrappers over the shared functions.) Strength
 // ESTIMATION (`estimate_bits`/`check`/`check_generated`/`generate`) stays

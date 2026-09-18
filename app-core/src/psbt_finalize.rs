@@ -82,7 +82,7 @@ fn addr_of_spk(spk: &bitcoin::ScriptBuf, network: Network) -> Option<String> {
 }
 
 /// Decode the tx's OP_RETURN outputs into note text (public) or `None`
-/// (private / undecodable) — PLAN-pnte-redesign.md: one note = one tx, so
+/// (private / undecodable) — plans/PLAN-pnte-redesign.md: one note = one tx, so
 /// `envelope::decode_note` either decodes the WHOLE set of payloads or
 /// nothing at all (no more per-chunk decode + reassemble).
 fn note_role(payloads: &[Vec<u8>]) -> OutputRole {

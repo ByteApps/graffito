@@ -1,6 +1,6 @@
 // Screen.compose -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b); rebuilt 2026-09-07 per
-// PLAN-graffito-compose-simplify.md: the nine-controls-deep form (Private,
+// (plans/PLAN-graffito-app-arch.md U3b); rebuilt 2026-09-07 per
+// plans/PLAN-graffito-compose-simplify.md: the nine-controls-deep form (Private,
 // four fee chips + rate, Gift, Pay from, Change, Locktime, Security with
 // passphrase + cost + ML-KEM, "+ Add recipient", Sign) collapses into a
 // status strip of pills + a gear card, each opening a per-note override
@@ -130,7 +130,7 @@ export component ComposeScreen inherits Rectangle {
         if Ui.watch-only: Caption {
             text: "Watch-only: public notes only — sealing needs the encryption key, which stays on your other device.";
         }
-        // ---- status strip (PLAN-graffito-compose-simplify.md, Format C) ----
+        // ---- status strip (plans/PLAN-graffito-compose-simplify.md, Format C) ----
         // ALWAYS one pill per setting that applies; Gift and PQ only on
         // directed notes. A pill never changes state itself — tapping one
         // only opens its per-note sheet. Horizontally scrollable rather

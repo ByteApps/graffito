@@ -6,7 +6,7 @@
 //! lives in the app crate's `src/lib.rs`, driven entirely through
 //! [`Lane::admit`]/[`Lane::complete`].
 //!
-//! Design: `../../PLAN-chain-notes-app.md` "Deferred: network operation
+//! Design: `../../plans/PLAN-graffito-app.md` "Deferred: network operation
 //! queue" — two earlier slices (the scan-freshness gate counters and
 //! `spending_refresh_async`'s coalescing early-return) shipped ahead of
 //! this general mechanism; this module is the scheduling layer behind

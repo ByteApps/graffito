@@ -63,7 +63,7 @@ fn main() {
             let network = Network::from_str_opt(&args[2]).expect("network");
             println!("{}", identity.address(network));
         }
-        // Recovery seeds (PLAN-graffito-seed-rotation.md): mirror what
+        // Recovery seeds (plans/PLAN-graffito-seed-rotation.md): mirror what
         // the device derives so the e2e can cross-check the sim UI and
         // feed the words to the graffito desktop app import.
         Some("seed-words") => {

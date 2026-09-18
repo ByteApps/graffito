@@ -1,5 +1,5 @@
 //! Screen.sweep — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -311,7 +311,7 @@ pub(crate) fn build_sweep_confirm(&mut self, w: &AppWindow, dest: String, rate: 
         Vec::new()
     };
     // Taproot CHANGE-chain coins (unit 6, see
-    // `../PLAN-chain-notes-app-taproot-change.md`): same account, chain 1
+    // `../plans/PLAN-graffito-app-taproot-change.md`): same account, chain 1
     // instead of the notebooks' chain 0. Grouped by unique chain-1 index
     // (mirrors the `idents` loop above) so each owner's OWN tweaked key
     // signs exactly its own inputs — `realize_change` is the chain-1

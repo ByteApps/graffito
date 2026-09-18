@@ -1,5 +1,5 @@
 //! Screen.quantum-keys — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -104,7 +104,7 @@ pub(crate) fn update_pq_keys_screen(&self, w: &AppWindow) {
 }
 
 /// Generate a fresh "My quantum key" — deliberately NOT seed-derived
-/// (`app_core::pqkeys::generate_native_private`, PLAN-graffito-quantum-key.md)
+/// (`app_core::pqkeys::generate_native_private`, plans/PLAN-graffito-quantum-key.md)
 /// — from the level/extra-entropy fields on screen 29, store it into the
 /// SAME `pq-imported` Keychain slot the import flow writes, and update
 /// in-memory state. Called directly when no key exists yet, or from

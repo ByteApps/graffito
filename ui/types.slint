@@ -1,8 +1,8 @@
 // Shared data-model structs, rendered by AppWindow's list views and the
 // SDK bridge in src/lib.rs. Split out of app.slint (U1,
-// PLAN-graffito-app-arch.md) as a pure file move: no value changes.
+// plans/PLAN-graffito-app-arch.md) as a pure file move: no value changes.
 
-// The app's router (U2, PLAN-graffito-app-arch.md) — was a bare `int` with
+// The app's router (U2, plans/PLAN-graffito-app-arch.md) — was a bare `int` with
 // 56 Slint and 86 Rust integer comparisons/assignments; now one enum, in
 // the app's historical screen-number order (each comment is that screen's
 // old int, still referenced by the ui-automation suites' comments). 22/23

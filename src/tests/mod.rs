@@ -80,7 +80,7 @@ mod core_rpc_wiring_contract;
 mod core_rpc_settings_tests;
 mod ui_flow_quantum_key;
 
-/// U8 (PLAN-graffito-app-arch.md): in-process ports of the never-calibrated
+/// U8 (plans/PLAN-graffito-app-arch.md): in-process ports of the never-calibrated
 /// pq compose legs of the coordinate Mac suite
 /// (ui-automation/tests/graffito-app-selfpq.sh, SUPERSEDED — see its own
 /// header) — self-note + passphrase, self-note + ML-KEM, and locked-note
@@ -90,7 +90,7 @@ mod ui_flow_selfpq_passphrase;
 mod ui_flow_selfpq_kem;
 mod ui_flow_locked_note_unlock;
 
-/// U12 (PLAN-graffito-app-arch.md): in-process ports of the network-free legs
+/// U12 (plans/PLAN-graffito-app-arch.md): in-process ports of the network-free legs
 /// of the coordinate Mac suite
 /// (ui-automation/tests/graffito-app-multi-recipient.sh) — multi-select
 /// picker chips, the universal confirm screen's byte-true multi-recipient
@@ -100,12 +100,12 @@ mod ui_flow_multi_select;
 mod ui_flow_multi_confirm;
 mod ui_flow_multi_reply_all;
 
-/// PLAN-graffito-multi-pq.md (2026-09-06): multi-recipient directed notes
+/// plans/PLAN-graffito-multi-pq.md (2026-09-06): multi-recipient directed notes
 /// with pq layers — the all-or-nothing ML-KEM gate, the mixed-level
 /// caption, and the recipient-ordered `pq_mlkem`/log-line resolution the
 /// cross-device suite's `mlkem=MlKem768,MlKem1024` assertion depends on.
 mod ui_flow_multi_pq;
-/// U10 (PLAN-graffito-app-arch.md): in-process ports of the NETWORK-FREE
+/// U10 (plans/PLAN-graffito-app-arch.md): in-process ports of the NETWORK-FREE
 /// legs of the coordinate Mac suite (ui-automation/tests/graffito-app.sh) —
 /// notebooks create/name/open/archive, the universal-confirm cancel
 /// regression, the spending-wallet enable toggle + its M4 empty-wallet
@@ -120,7 +120,7 @@ mod ui_flow_app_spending_wallet;
 mod ui_flow_app_payfrom_state;
 mod ui_flow_app_dispatch;
 mod ui_flow_app_subdust_fold;
-/// U11 (PLAN-graffito-app-arch.md): in-process ports of the NETWORK-FREE
+/// U11 (plans/PLAN-graffito-app-arch.md): in-process ports of the NETWORK-FREE
 /// legs of the coordinate Mac suite
 /// (ui-automation/tests/graffito-app-matrix.sh) — S1 hex import/copy/
 /// reset, S2 WIF import, S3 mnemonic import + account switch + the
@@ -135,7 +135,7 @@ mod ui_flow_matrix_s3_mnemonic_accounts;
 mod ui_flow_matrix_s4_onboarding_contacts_settings;
 mod ui_flow_matrix_s6_dice;
 
-/// PLAN-graffito-compose-simplify.md (2026-09-07): Settings "Compose
+/// plans/PLAN-graffito-compose-simplify.md (2026-09-07): Settings "Compose
 /// defaults" config round-trip + the `pq_mlkem_off` migration, a per-note
 /// override applying then dying on the next compose (fee tier, the ML-KEM
 /// sticky-opt-out bug the plan calls out by name), the 330-sat gift dust

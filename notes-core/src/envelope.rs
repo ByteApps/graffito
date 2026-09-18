@@ -1,5 +1,5 @@
 //! The PNTE on-chain envelope (v1 redesign, 2026-08-11 —
-//! `PLAN-pnte-redesign.md`): **one note = one transaction**, the note id
+//! `plans/PLAN-pnte-redesign.md`): **one note = one transaction**, the note id
 //! IS the txid, and chunk order is simply OP_RETURN vout order within that
 //! one tx — no per-chunk binary header, no `note_id`/`seq`/`total`.
 //!
@@ -30,13 +30,13 @@
 //! Additive (2026): bits 4-5, `FLAG_PW`/`FLAG_MLKEM` (notes-core/src/pq.rs)
 //! — optional post-quantum sealing layers, hybrid on top of the existing
 //! base key (dm.rs ECDH for a directed note; the notebook enc key for a
-//! SELF-note — the 2026-08-22 self-pq extension, PLAN-graffito-self-pw.md),
+//! SELF-note — the 2026-08-22 self-pq extension, plans/PLAN-graffito-self-pw.md),
 //! never a replacement for it. Header ENCODING is unchanged (flags already
 //! occupy a full byte); only the body FRAMING is new (extra prefix blocks
 //! ahead of the sealed blob — see pq.rs). A header carrying either bit
 //! without FLAG_PRIVATE is undecodable.
 //!
-//! Additive (2026-09-06, PLAN-graffito-multi-pq.md): `FLAG_PW`/`FLAG_MLKEM`
+//! Additive (2026-09-06, plans/PLAN-graffito-multi-pq.md): `FLAG_PW`/`FLAG_MLKEM`
 //! are ALSO valid together with `FLAG_MULTI` — a multi-recipient directed
 //! note may carry either or both pq layers, per-recipient ML-KEM wraps and
 //! a single shared password block (see pq.rs's `seal_multi_pq`/
@@ -73,7 +73,7 @@ pub const FLAG_DIRECTED: u8 = 0x02;
 /// `output_addrs[0..count]`, precede change by construction).
 pub const FLAG_MULTI: u8 = 0x04;
 /// flags bit 3: RESERVED for continuation (chained notes spanning several
-/// transactions — see PLAN-pnte-redesign.md). Never emitted by anything in
+/// transactions — see plans/PLAN-pnte-redesign.md). Never emitted by anything in
 /// this crate today; decoding a header with this bit set always yields
 /// `None` (liberal/forward-compat: a decoder that doesn't understand
 /// chaining must never render a fragment as if it were a whole note).
@@ -81,10 +81,10 @@ pub const FLAG_CONT: u8 = 0x08;
 /// flags bit 4: post-quantum password layer (notes-core/src/pq.rs) — an
 /// Argon2id-stretched password, hybrid ON TOP of the note's base key
 /// (dm.rs ECDH when DIRECTED; the notebook enc key on a SELF-note —
-/// PLAN-graffito-self-pw.md), never a replacement for it. Requires
+/// plans/PLAN-graffito-self-pw.md), never a replacement for it. Requires
 /// `FLAG_PRIVATE` (DIRECTED optional since 2026-08-22) — a violating
 /// header is undecodable (`None`). May combine with `FLAG_MLKEM`, and
-/// (2026-09-06, PLAN-graffito-multi-pq.md) with `FLAG_MULTI` — on a
+/// (2026-09-06, plans/PLAN-graffito-multi-pq.md) with `FLAG_MULTI` — on a
 /// multi-recipient note the password is ONE shared block, mixed into
 /// every recipient's wrap key (pq.rs `seal_multi_pq`).
 pub const FLAG_PW: u8 = 0x10;
@@ -172,7 +172,7 @@ fn validate_multi(flags: u8, multi_count: Option<u8>) -> Result<(), Error> {
 
 /// `flags`'s pq bits (`FLAG_PW`/`FLAG_MLKEM`) validity — both require
 /// `FLAG_PRIVATE`, with OR without `FLAG_DIRECTED` (2026-08-22,
-/// PLAN-graffito-self-pw.md — the ADDITIVE extension the frozen format
+/// plans/PLAN-graffito-self-pw.md — the ADDITIVE extension the frozen format
 /// permits): the directed forms are the original pq layers; `PW|PRIVATE` /
 /// `MLKEM|PRIVATE` without DIRECTED are pq-layered SELF-notes (pq.rs
 /// `seal_self_pq`/`unlock_self` — including the seed-derived-ek warning
@@ -180,7 +180,7 @@ fn validate_multi(flags: u8, multi_count: Option<u8>) -> Result<(), Error> {
 /// Decoders older than this rule treat the self combinations as
 /// undecodable and skip them silently — graceful, by design.
 ///
-/// Since 2026-09-06 (PLAN-graffito-multi-pq.md) both bits are ALSO valid
+/// Since 2026-09-06 (plans/PLAN-graffito-multi-pq.md) both bits are ALSO valid
 /// together with `FLAG_MULTI` — a multi-recipient directed note may carry
 /// either or both pq layers (pq.rs `seal_multi_pq`/`unlock_received_multi`).
 /// This lifted the prior MULTI-vs-pq exclusion; a decoder older than this

@@ -1,10 +1,10 @@
 //! Guards the one rule that makes `graffito-core` safe to pin as a git
-//! dependency of the shelved Prime app (PLAN-graffito-arch.md, phase 2):
+//! dependency of the shelved Prime app (plans/PLAN-graffito-arch.md, phase 2):
 //! `[dependencies]` may contain ONLY `notes-core` and `serde` (optionally
 //! `serde_derive`, if `serde`'s own `derive` feature is ever split out into
 //! an explicit dep instead of a feature flag) — nothing else, ever, because
 //! anything else becomes a new crate in the on-device build graph and the
-//! workspace's RNG audit (RANDOMNESS-AUDIT-2026-08-01.md) assumes that
+//! workspace's RNG audit (reports/RANDOMNESS-AUDIT-2026-08-01.md) assumes that
 //! graph is closed. `[dev-dependencies]` (test-only, e.g. `serde_json`) is
 //! unrestricted — it never ships.
 //!
@@ -14,7 +14,7 @@
 //! scanner is enough for this file's shape and keeps the guard itself
 //! dependency-free.
 //!
-//! Mutation-tested: PLAN-graffito-arch.md's step 3 record has this test
+//! Mutation-tested: plans/PLAN-graffito-arch.md's step 3 record has this test
 //! failing when `serde_json` is temporarily added to `[dependencies]`, then
 //! passing again once reverted.
 
@@ -62,7 +62,7 @@ fn dependencies_are_exactly_notes_core_and_serde() {
         "graffito-core/Cargo.toml [dependencies] must contain ONLY notes-core \
          and serde (+ optional serde_derive) — found {deps:?}. Anything else \
          enters the Prime device build graph through this crate (see the \
-         module doc comment in this test file and PLAN-graffito-arch.md \
+         module doc comment in this test file and plans/PLAN-graffito-arch.md \
          phase 2's dependency-minimal rule)."
     );
 }

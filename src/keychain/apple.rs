@@ -817,7 +817,7 @@ pub fn spike_auth() -> Result<(), String> {
 
 // =======================================================================
 // Bitcoin Core RPC credentials
-// (`../../PLAN-chain-notes-app-core-rpc.md` §2.4/U6 — orchestrator-owned
+// (`../../plans/PLAN-graffito-app-core-rpc.md` §2.4/U6 — orchestrator-owned
 // security posture, not the implementer's call to change).
 // =======================================================================
 //

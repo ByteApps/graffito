@@ -1,7 +1,7 @@
 //! Boot sequence: data dir, config/migration load, contacts load/merge,
 //! and `State` construction — everything `run()` used to do before
 //! constructing the window. Moved verbatim from `run()` (U4,
-//! PLAN-graffito-app-arch.md); the only new code is the trailing `st`
+//! plans/PLAN-graffito-app-arch.md); the only new code is the trailing `st`
 //! return.
 
 use crate::*;
@@ -85,7 +85,7 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
         .and_then(|v| v.as_str())
         .and_then(app_core::notes_core::pq::PwCost::parse)
         .unwrap_or(app_core::notes_core::pq::PwCost::DEFAULT);
-    // Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md): the
+    // Settings → "Compose defaults" (plans/PLAN-graffito-compose-simplify.md): the
     // policy a fresh compose session starts from — see `compose_defaults_from_config`.
     let compose_defaults_migrated = config.get("compose").is_none();
     let compose_defaults: ComposeDefaults = compose_defaults_from_config(&config);
@@ -301,7 +301,7 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
     st
 }
 
-/// Settings → "Compose defaults" (PLAN-graffito-compose-simplify.md): parse
+/// Settings → "Compose defaults" (plans/PLAN-graffito-compose-simplify.md): parse
 /// the loaded `config.json` value into a [`ComposeDefaults`]. A config with
 /// a `"compose"` object (every build from 2026-09-07 on) parses it
 /// field-by-field via [`ComposeDefaults::from_json`]. A config predating

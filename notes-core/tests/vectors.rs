@@ -128,7 +128,7 @@ fn dm_derivation_vector() {
     );
 }
 
-/// FROZEN directed-note AAD layout (dm.rs, PLAN-pnte-redesign.md 2026-08-11
+/// FROZEN directed-note AAD layout (dm.rs, plans/PLAN-pnte-redesign.md 2026-08-11
 /// rebinding): `dm_aad` = sender_x(32) || recipient_x(32) || outpoint(36),
 /// 100 bytes — pinned so a byte-layout regression is caught even though
 /// `seal_aad` uses a random nonce internally (see
@@ -194,7 +194,7 @@ fn directed_aad_seal_open_vector() {
 /// regression is caught even though `seal_multi`/`seal_aad` use a random
 /// nonce internally (see `multi_seal_open_vector` below for a full
 /// round-trip pin). Rebound from the old `sender_x(32) || note_id(4)`,
-/// 36 bytes, by PLAN-pnte-redesign.md (2026-08-11) alongside the singular
+/// 36 bytes, by plans/PLAN-pnte-redesign.md (2026-08-11) alongside the singular
 /// `dm_aad` above — restored here per orchestrator review: a layout vector
 /// deleted at exactly the moment the layout changes proves nothing.
 #[test]

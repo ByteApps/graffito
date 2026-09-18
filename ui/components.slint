@@ -1,7 +1,7 @@
 // The design-system component library: typography (H1/Body/Caption/Mono),
 // buttons, Header/Badge, QR widgets, and the compose/confirm panels
 // (CoinListPanel, TxConfirmView). Split out of app.slint (U1,
-// PLAN-graffito-app-arch.md) as a pure file move: no value changes.
+// plans/PLAN-graffito-app-arch.md) as a pure file move: no value changes.
 // Also fixes the Slint 1.17.1 deprecation warnings in SyncButton and
 // QrSpinner (3 properties each): rotation-angle/rotation-origin-x/
 // rotation-origin-y → transform-rotation/transform-origin (a Point
@@ -529,7 +529,7 @@ export component Dropdown inherits Rectangle {
     }
 }
 
-// Compose status-strip pill (PLAN-graffito-compose-simplify.md, Format C):
+// Compose status-strip pill (plans/PLAN-graffito-compose-simplify.md, Format C):
 // a small rounded chip that shows what's currently in effect for a compose
 // setting. NEVER changes state itself — `clicked` only opens the setting's
 // per-note sheet, so a mis-tap can't flip privacy or the paying wallet.
@@ -616,7 +616,7 @@ export component MenuValueRow inherits Rectangle {
 }
 
 // A labeled checkbox row — the compose per-note sheets' "Make this my
-// default" control (PLAN-graffito-compose-simplify.md, 2026-09-07 round 3)
+// default" control (plans/PLAN-graffito-compose-simplify.md, 2026-09-07 round 3)
 // and the rename dialog's "Save to iCloud" reuse this exact visual (a
 // bordered square + SVG check mark, never a glyph, per the icon rule).
 // Accessible label is the row's own text, per Sal's ask.

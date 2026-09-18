@@ -1,4 +1,4 @@
-//! Recovery-seeds vectors (PLAN-graffito-seed-rotation.md):
+//! Recovery-seeds vectors (plans/PLAN-graffito-seed-rotation.md):
 //! - our ported BIP-39 against the independent `bip39` crate + the spec's
 //!   best-known vector,
 //! - our ported BIP-32 against rust-bitcoin's `Xpriv` over the full

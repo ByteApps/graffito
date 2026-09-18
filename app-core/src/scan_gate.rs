@@ -3,7 +3,7 @@
 //! `update_scan_gate`, `src/lib.rs`). No threads, no UI types — just the
 //! admit/drain bookkeeping, host-testable with `cargo test -p app-core`.
 //!
-//! Design: `../../PLAN-chain-notes-app.md` "Network layer" — the gate keeps
+//! Design: `../../plans/PLAN-graffito-app.md` "Network layer" — the gate keeps
 //! a money-flow Sign button disabled while ANY scan that feeds its coin
 //! cache is in flight (notebook refresh, spending-wallet scan, or a
 //! wallet-wide stores refresh). Counters, not bools, for the two scan

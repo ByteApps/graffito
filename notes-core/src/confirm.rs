@@ -24,7 +24,7 @@ use crate::{Error, Network};
 /// candidate output; whether it's actually a PNTE payload is decided by
 /// the FIRST OP_RETURN output's header (`envelope::parse_header`) — later
 /// OP_RETURN outputs of the SAME tx carry no header of their own
-/// (PLAN-pnte-redesign.md: one note = one tx, header only on the first
+/// (plans/PLAN-pnte-redesign.md: one note = one tx, header only on the first
 /// output), so once the tx's first OP_RETURN validates, every later one is
 /// labeled as part of the same note too.
 fn op_return_payloads_in_order(outputs: &[crate::tx::TxOut]) -> Vec<&[u8]> {

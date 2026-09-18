@@ -1,7 +1,7 @@
 //! Sync-bundle JSON (companion → device), note extraction (the scanner
 //! side), and the high-level compose path (device → signed tx hex).
 //!
-//! PLAN-pnte-redesign.md (2026-08-11): **one note = one transaction.** The
+//! plans/PLAN-pnte-redesign.md (2026-08-11): **one note = one transaction.** The
 //! scanner groups strictly per-tx (no more note_id×origin chunk buckets —
 //! txids are unique by construction), and a note's id IS its txid.
 
@@ -52,7 +52,7 @@ impl Identity {
     }
 
     /// Identity from a BIP-86 leaf secret — the bip86 notebook scheme
-    /// (PLAN-graffito-seed-rotation.md) and the graffito desktop app's
+    /// (plans/PLAN-graffito-seed-rotation.md) and the graffito desktop app's
     /// shipped derivation: BIP-341 tweak for the keys, the FROZEN
     /// `graffito/enc/v1` rule for the enc key. Byte-identical to what the
     /// graffito desktop app derives after a plain BIP-39 import — once it
@@ -135,7 +135,7 @@ pub struct OnchainTx {
     /// merely PAYING the address surface as RECEIVED notes instead.
     pub spends_from_self: bool,
     /// OP_RETURN payloads (hex), in output order — every OP_RETURN output
-    /// of the tx. The FIRST decodes the PNTE header (PLAN-pnte-redesign.md:
+    /// of the tx. The FIRST decodes the PNTE header (plans/PLAN-pnte-redesign.md:
     /// one note = one tx); the rest are raw body continuation bytes.
     pub payloads: Vec<String>,
     /// True when any output pays the notes address (directed-note delivery).
@@ -158,7 +158,7 @@ pub struct OnchainTx {
     pub recipient: Option<String>,
     /// Raw scriptPubKeys (hex) of every input's prevout — enables the
     /// self-spk-SET ownership rule (`extract_notes_multi`/`_watch_multi`,
-    /// PLAN-graffito-funding-unification.md). Empty (the serde default)
+    /// plans/PLAN-graffito-funding-unification.md). Empty (the serde default)
     /// falls back to `spends_from_self` for bundles that don't populate it
     /// — old callers and old bundles are unaffected.
     #[serde(default)]
@@ -174,7 +174,7 @@ pub struct OnchainTx {
     pub output_addrs: Vec<String>,
     /// The tx's FIRST input's prevout, as `"<txid>:<vout>"` (display-order
     /// txid, `format_outpoint`'s convention — same as `confirm.rs`'s
-    /// outpoint keys). PLAN-pnte-redesign.md: a directed-private note's AAD
+    /// outpoint keys). plans/PLAN-pnte-redesign.md: a directed-private note's AAD
     /// now binds this outpoint instead of the (now nonexistent) note_id, so
     /// decoding one requires it. `#[serde(default)]`: absent on bundles from
     /// a companion that hasn't been updated to report it yet, in which case
@@ -301,7 +301,7 @@ fn parse_outpoint(s: &str) -> Option<[u8; 36]> {
 }
 
 /// A note recovered from chain data. `id` IS the carrying transaction's
-/// txid (display-order hex) — PLAN-pnte-redesign.md: one note = one tx, so
+/// txid (display-order hex) — plans/PLAN-pnte-redesign.md: one note = one tx, so
 /// there is no separate note_id anymore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredNote {
@@ -346,7 +346,7 @@ pub struct RecoveredNote {
     /// [`extract_notes_pq`] for a convenience wrapper that also attempts
     /// auto-unlock.
     pub locked: Option<crate::pq::LockedBody>,
-    /// Multi-recipient analog of `locked` (PLAN-graffito-multi-pq.md,
+    /// Multi-recipient analog of `locked` (plans/PLAN-graffito-multi-pq.md,
     /// 2026-09-06) — present instead of `locked` (never both) when
     /// `decoded.multi_count` was `Some` on a pq-flagged note. See
     /// [`crate::pq::MultiLockedBody`].
@@ -504,7 +504,7 @@ pub fn extract_notes_pq(
             }
         } else if let Some(locked) = note.locked_multi.clone() {
             // Multi-recipient analog: same "try every derived level" loop,
-            // via `pq::unlock_received_multi` (PLAN-graffito-multi-pq.md).
+            // via `pq::unlock_received_multi` (plans/PLAN-graffito-multi-pq.md).
             for secret in mlkem_secrets {
                 if let Ok(pt) = pq::unlock_received_multi(
                     &locked,
@@ -661,7 +661,7 @@ fn extract_notes_inner(
 
         // Post-quantum layer(s) (envelope::FLAG_PW/FLAG_MLKEM — pq.rs).
         // Header validity (envelope.rs) guarantees these bits only appear
-        // on FLAG_PRIVATE notes; since 2026-09-06 (PLAN-graffito-multi-pq.md)
+        // on FLAG_PRIVATE notes; since 2026-09-06 (plans/PLAN-graffito-multi-pq.md)
         // they may ALSO combine with FLAG_MULTI, so `decoded.multi_count`
         // can be `Some` here now. Extraction never attempts v1-style
         // decryption on a pq note: it packages everything needed to unlock
@@ -716,7 +716,7 @@ fn extract_notes_inner(
             let locked = keys.and_then(|identity| {
                 let outpoint = outpoint?;
                 if !directed {
-                    // SELF-note pq layers (PLAN-graffito-self-pw.md): the
+                    // SELF-note pq layers (plans/PLAN-graffito-self-pw.md): the
                     // sealing key mixes the AUTHOR's enc_key, so only the
                     // author's own wallet can ever unlock. A RECEIVED
                     // foreign self-pq note therefore gets NO LockedBody —
@@ -1257,7 +1257,7 @@ pub fn compose_directed_note_with_change_amount(
 /// `compose_note_with_change` sibling — there's no two-phase dance:
 /// `inputs[0]` IS the tx's first input, so the outpoint (crypt.rs's
 /// uniform AAD rule) is known immediately.
-/// Self-note pq compose (PLAN-graffito-self-pw.md): like the private
+/// Self-note pq compose (plans/PLAN-graffito-self-pw.md): like the private
 /// branch of [`compose_note_with_change`], but the body is sealed by
 /// [`crate::pq::seal_self_pq`] under one or both extra layers (password
 /// and/or ML-KEM — see that function's doc, including the
@@ -1467,7 +1467,7 @@ fn dedupe_recipients(recipients: &[(Recipient, u64)]) -> Result<Vec<&(Recipient,
 /// Build the FLAG_MULTI body: the UTF-8 text verbatim (public) or
 /// `count × wrap(72B) || sealed_body` (private, via `dm::seal_multi`) — the
 /// recipient count lives in the envelope HEADER now, not a body-leading
-/// byte (PLAN-pnte-redesign.md). Shared by both compose entry points below.
+/// byte (plans/PLAN-pnte-redesign.md). Shared by both compose entry points below.
 /// `outpoint` is ignored (ignored by `dm::seal_multi` too, transitively —
 /// only present in the AAD) when `private` is false.
 fn multi_body(
@@ -1752,7 +1752,7 @@ pub fn compose_directed_note_pq_exact_amount(
 }
 
 // ---------------------------------------------------------------------
-// Post-quantum MULTI-recipient directed compose (PLAN-graffito-multi-pq.md,
+// Post-quantum MULTI-recipient directed compose (plans/PLAN-graffito-multi-pq.md,
 // 2026-09-06) — the pq analog of `compose_directed_note_multi_*` above,
 // hybrid over the same per-recipient dm.rs wraps (pq.rs `seal_multi_pq`).
 // Additive: none of the compose functions above are touched. PRIVATE-only

@@ -1,4 +1,4 @@
-//! U1 (`PLAN-chain-notes-app-core-rpc.md` §3 step 1): the backend-agnostic
+//! U1 (`plans/PLAN-graffito-app-core-rpc.md` §3 step 1): the backend-agnostic
 //! contract battery, run against TODAY's Esplora `ChainClient` through
 //! `EsploraFake`. Locks in current `ChainClient`/free-scan-function
 //! behavior so the upcoming `Transport` refactor (U2) and the Core RPC

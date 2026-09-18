@@ -734,7 +734,7 @@ fn credentials_typed_into_node_address_field_never_reach_the_stored_url() {
     }
 }
 
-// ---- Electrum server row (PLAN-graffito-electrum.md, 2026-09-06) ----
+// ---- Electrum server row (plans/PLAN-graffito-electrum.md, 2026-09-06) ----
 
 #[test]
 fn fill_node_electrum_base_selects_the_electrum_row_and_shows_host_port() {

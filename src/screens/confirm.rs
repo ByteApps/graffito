@@ -1,5 +1,5 @@
 //! Screen.confirm — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -86,7 +86,7 @@ pub(crate) fn record_watch_note(&mut self, wn: &WatchNote, txid: &str, raw: &str
     });
     store.record_signed(
         app_core::store::NoteRecord {
-            // PLAN-pnte-redesign.md: the note id IS the txid.
+            // plans/PLAN-pnte-redesign.md: the note id IS the txid.
             note_id: txid.to_string(),
             status: NoteStatus::Pending,
             text: Some(wn.text.clone()),
@@ -1010,7 +1010,7 @@ pub(crate) fn on_confirm_broadcast(&mut self, w: &AppWindow) {
                 // swap — then save, exactly like the Compose arm. A failed
                 // POST leaves a retryable record with the replacement hex
                 // in hand (`apply_act_bump_result` behavior, unchanged).
-                // PLAN-pnte-redesign.md: a note bump RENAMES the record's
+                // plans/PLAN-pnte-redesign.md: a note bump RENAMES the record's
                 // id to the replacement's txid (the note id IS the txid),
                 // so the busy-row marker below must follow the rename — a
                 // sweep/consolidate bump keeps using `ref_id` (its identity

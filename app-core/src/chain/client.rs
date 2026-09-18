@@ -534,7 +534,7 @@ pub fn discover_indexes<T: Transport>(
 /// via [`scan_change_chain`]. Mirrors [`crate::funding::FundingUtxo`]'s
 /// shape (txid/vout/value/address/index/confirmed) plus the leaf's own
 /// script pubkey, so folding these into the wallet's coin set later (a
-/// later unit — see `../PLAN-chain-notes-app-taproot-change.md`) is a
+/// later unit — see `../plans/PLAN-graffito-app-taproot-change.md`) is a
 /// straight field copy, not a translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeCoin {
@@ -775,7 +775,7 @@ fn classify_tx_inner(tx: &EsploraTx, address: &str, network: Option<Network>) ->
         .any(|i| i.prevout.as_ref().and_then(|p| p.scriptpubkey_address.as_deref()) == Some(address));
     let pays_self = tx.vout.iter().any(|o| o.scriptpubkey_address.as_deref() == Some(address));
 
-    // PLAN-pnte-redesign.md: the tx's FIRST input's prevout — display-order
+    // plans/PLAN-pnte-redesign.md: the tx's FIRST input's prevout — display-order
     // `"<txid>:<vout>"`, matching notes-core's `bundle::format_outpoint`
     // convention. This is the outpoint every private body's AAD binds
     // (self-note or directed), so decrypting one requires it. Esplora and

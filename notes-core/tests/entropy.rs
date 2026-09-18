@@ -13,7 +13,7 @@
 //! (`battery-check/tests/validate.rs`, 11/11 passing against
 //! `/dev/urandom`), swapping in notes-core's own TRNG-backed generator.
 //!
-//! PLAN-pnte-redesign.md (2026-08-11) removed `keys::generate_note_id`/
+//! plans/PLAN-pnte-redesign.md (2026-08-11) removed `keys::generate_note_id`/
 //! `pick_unique_note_id` entirely — the note id IS the txid now (unique by
 //! construction, no on-chain field, no TRNG draw), one fewer TRNG consumer
 //! than before. The distribution-battery/collision-guard coverage that

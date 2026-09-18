@@ -46,7 +46,7 @@ On Android, a **Google Play closed beta** is on its way — the same app, packag
 
 - [DEVELOPMENT.md](DEVELOPMENT.md) — building (desktop + mobile), testing, architecture pointers
 - [THIRD-PARTY.md](THIRD-PARTY.md) — libraries this app is built on
-- `PLAN-chain-notes-app.md` (workspace repo) — design document and milestones
+- `plans/PLAN-graffito-app.md` (workspace repo) — design document and milestones
 
 ## Support
 

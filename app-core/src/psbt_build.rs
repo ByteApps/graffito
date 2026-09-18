@@ -247,7 +247,7 @@ pub fn build_watch_bump_psbt(
 /// Keyless PUBLIC multi-recipient note body: the exact `FLAG_DIRECTED |
 /// FLAG_MULTI` framing `notes_core::bundle::sealed_note_payloads_multi`
 /// produces for a PUBLIC (non-private) note — the UTF-8 text verbatim, no
-/// leading count byte (PLAN-pnte-redesign.md moved the recipient count
+/// leading count byte (plans/PLAN-pnte-redesign.md moved the recipient count
 /// into the envelope HEADER, `encode_outputs`'s `multi_count` param), since
 /// a public body needs no key at all (see notes-core's `multi_body`, the
 /// `!private` branch). Watch identities have no key material to hand
@@ -522,7 +522,7 @@ pub fn build_funded_sweep_psbt(
 
 /// The tx's FIRST input's outpoint, in notes-core's wire order (txid
 /// internal/LE || vout LE) — every private body's AAD binds this
-/// (crypt.rs's uniform AAD rule, PLAN-pnte-redesign.md). `coins[0]`
+/// (crypt.rs's uniform AAD rule, plans/PLAN-pnte-redesign.md). `coins[0]`
 /// becomes the tx's first input by construction in every builder that
 /// calls this (`assemble_funded_note_psbt`'s input ordering), so it's
 /// known before the tx itself is built.
@@ -703,7 +703,7 @@ pub fn build_funding_psbt_amount(
     recipient_amount: u64,
     lock_time: u32,
 ) -> Result<BuiltPsbt, Error> {
-    // PLAN-pnte-redesign.md: a private body's AAD binds the tx's FIRST
+    // plans/PLAN-pnte-redesign.md: a private body's AAD binds the tx's FIRST
     // input's outpoint — `plan.coins[0]` becomes that input by construction
     // (`assemble_funded_note_psbt`'s input ordering), so it's known before
     // the tx is built.
@@ -767,7 +767,7 @@ pub fn build_funding_psbt_multi(
 }
 
 /// [`build_funding_psbt_multi`] with optional post-quantum layers
-/// (PLAN-graffito-multi-pq.md, 2026-09-06) — `mlkem_eks`, when `Some`, must
+/// (plans/PLAN-graffito-multi-pq.md, 2026-09-06) — `mlkem_eks`, when `Some`, must
 /// carry exactly one `(alg, ek)` per recipient (mixed levels allowed);
 /// `password`, when `Some`, seals ONE shared Argon2id block mixed into
 /// every recipient's wrap. Requires 2+ recipients (a single-recipient pq
@@ -1748,7 +1748,7 @@ mod tests {
     /// `sealed_note_payloads_multi` produces for a public (non-private)
     /// note with the same text/recipient-count/outpoint — the public
     /// multi body never touches key material (the UTF-8 text verbatim, no
-    /// count byte — PLAN-pnte-redesign.md moved the count into the
+    /// count byte — plans/PLAN-pnte-redesign.md moved the count into the
     /// envelope header — see notes-core's `multi_body`), so the two must
     /// be byte-identical regardless of which (or whose) recipients/
     /// outpoint are named.
@@ -1941,7 +1941,7 @@ mod tests {
         }
     }
 
-    /// `build_funding_psbt_multi_pq` (PLAN-graffito-multi-pq.md, 2026-09-06):
+    /// `build_funding_psbt_multi_pq` (plans/PLAN-graffito-multi-pq.md, 2026-09-06):
     /// the spending-wallet/external-funding multi-recipient note builder,
     /// with a shared password AND per-recipient mixed-level ML-KEM — the
     /// exact shape `note-spend-funded-multi`'s new pq flags reach. Proves
@@ -2037,7 +2037,7 @@ mod tests {
     }
 
     /// CHANGE-CHAIN sweep signing (taproot-change unit 6, see
-    /// `../PLAN-chain-notes-app-taproot-change.md`): a coin sitting at the
+    /// `../plans/PLAN-graffito-app-taproot-change.md`): a coin sitting at the
     /// account's chain-1 (`m/86'/…/1/{index}`) leaf — the same leaf
     /// `sweep`'s change-idents loop derives via `realize_change` — signs
     /// with `sign_own_taproot_inputs` exactly like a chain-0 notebook coin

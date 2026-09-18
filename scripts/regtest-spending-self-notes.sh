@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # regtest-spending-self-notes.sh — e2e for the spending-funded-self-notes fix
-# (../../PLAN-chain-notes-app-spending-self-notes.md).
+# (../../plans/PLAN-graffito-app-spending-self-notes.md).
 #
 # Reproduces the REPORTED scenario end to end against a real bitcoind:
 # a note composed by this identity but paid for entirely from its SPENDING
@@ -23,7 +23,7 @@
 #      "unknown"-sender record.
 #
 # Talks to the ONE shared node — the Pi's persistent regtest chain, never a
-# local throwaway bitcoind (PLAN-one-regtest-node.md). Run it through the
+# local throwaway bitcoind (plans/PLAN-one-regtest-node.md). Run it through the
 # workspace wrapper so CN_NETWORK/CN_NODE_HOST/CN_NODE_PORT/CORE_RPC_USER/
 # CORE_RPC_PASS reach it:
 #   ui-automation/node-env.sh regtest graffito/scripts/regtest-spending-self-notes.sh
@@ -51,7 +51,7 @@ APP="$REPO/target/debug/examples/cli"
 NET="${CN_NETWORK:-regtest}"
 if [[ "$NET" != "regtest" ]]; then
     echo "SKIP regtest-spending-self-notes (regtest-only: every leg needs POST"
-    echo "  .../faucet and .../mine, both 409 on $NET — see PLAN-one-regtest-node.md"
+    echo "  .../faucet and .../mine, both 409 on $NET — see plans/PLAN-one-regtest-node.md"
     echo "  'two verbs, not one')"
     echo "0 PASS · 1 SKIP"
     exit 0

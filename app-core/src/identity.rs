@@ -480,7 +480,7 @@ pub fn realize(
 /// Change-chain (`m/86'/{coin}'/{account}'/1/{index}`) counterpart to
 /// [`realize`] — same account, `chain=1` instead of the notebook's frozen
 /// `chain=0`. Foundation for the taproot change-chain feature
-/// (`../PLAN-chain-notes-app-taproot-change.md`): derivation + address
+/// (`../plans/PLAN-graffito-app-taproot-change.md`): derivation + address
 /// only here, scanning/spending land in a later change. Reuses
 /// [`identity_from_leaf`] (⇒ `notes_core::bundle::Identity::from_leaf_secret`)
 /// for the BIP-341 tweak + P2TR address — the exact same code path

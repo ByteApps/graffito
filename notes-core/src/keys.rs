@@ -2,7 +2,7 @@
 //!
 //! CONSENSUS-CRITICAL FOR RE-DERIVATION: the HKDF salt/info strings below
 //! are baked into every note ever written — the wipe-recovery story
-//! (PLAN-graffito.md) depends on re-deriving the identical identity key
+//! (plans/PLAN-graffito.md) depends on re-deriving the identical identity key
 //! and encryption key from `GetAppSeed` after a seed restore. NEVER change
 //! them (same rule as prime-paper-wallet's backup-key derivation).
 //!
@@ -27,7 +27,7 @@ use crate::Error;
 
 const KEY_SALT: &[u8] = b"prime-graffito/key/v1";
 const ENC_SALT: &[u8] = b"prime-graffito/enc/v1";
-/// Recovery-seed entropy salt (PLAN-graffito-seed-rotation.md). FROZEN
+/// Recovery-seed entropy salt (plans/PLAN-graffito-seed-rotation.md). FROZEN
 /// (post-epoch).
 const SEED_SALT: &[u8] = b"prime-graffito/seed/v1";
 /// The graffito (desktop app) shared enc rule, relocated here so both apps

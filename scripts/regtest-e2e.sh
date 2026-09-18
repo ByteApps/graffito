@@ -7,7 +7,7 @@
 #   prime role = notes-core's notes_cli (identity from NOTES_APP_SEED)
 #   chain role = the shared PERSISTENT node described below
 #
-# PLAN-one-regtest-node.md (prime workspace root): there is only ONE
+# plans/PLAN-one-regtest-node.md (prime workspace root): there is only ONE
 # regtest node — the Raspberry Pi's persistent, shared one — and this
 # script never spawns bitcoind itself, in any mode. Two independent
 # choices, orthogonal to each other:
@@ -37,7 +37,7 @@
 #            2026-08-02. On testnet4, `faucet`'s lazy WIF read (see below)
 #            is never reached in dry-run mode at all.
 #
-# Contract (PLAN-one-regtest-node.md "The shared contract" — this is a
+# Contract (plans/PLAN-one-regtest-node.md "The shared contract" — this is a
 # PUBLIC repo, so these are read from the ENVIRONMENT ONLY, never a flag,
 # never printed, never sourced from ../private/):
 #   CN_NETWORK     regtest | testnet4           (default: regtest)
@@ -74,7 +74,7 @@
 # `faucet`/`broadcast_raw`/`broadcast_raw_check` keep their names and
 # original semantics; their bodies differ per network+backend below.
 #
-# Funding (PLAN-one-regtest-node.md "Funding, per network"):
+# Funding (plans/PLAN-one-regtest-node.md "Funding, per network"):
 #   regtest    the Pi's `testwallet` (~14,096 BTC spendable, Core-RPC
 #              backend only — spend FROM it, never create/load/rename/
 #              reset it, it is not ours). Esplora-backend regtest funding
@@ -108,7 +108,7 @@
 #   on the FIRST actual funding call — never at setup time, never
 #   speculatively, and never at all in --dry-run mode.
 #
-# Pending-state legs (PLAN-one-regtest-node.md "Skips must be loud"): any
+# Pending-state legs (plans/PLAN-one-regtest-node.md "Skips must be loud"): any
 # leg whose correctness genuinely depends on ON-DEMAND block production
 # (not just chain visibility) is regtest-only. This script has exactly one
 # such leg (the self-notes "status=confirmed" assertion below); it's
@@ -119,7 +119,7 @@
 # `pass` — a leg that skipped part of its assertion must not ALSO claim a
 # full PASS credit; it's represented exactly once, as the SKIP.
 #
-# The rescan trap (PLAN-one-regtest-node.md "A rescan BLOCKS the whole
+# The rescan trap (plans/PLAN-one-regtest-node.md "A rescan BLOCKS the whole
 # wallet"): `importdescriptors` at `timestamp: 0` is a genesis rescan and
 # BLOCKS every other RPC on that wallet (error -4) until it finishes —
 # free on a short chain, fatal on testnet4, and dangerous on ANY shared
@@ -162,7 +162,7 @@ DRY_RUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --core-rpc) BACKEND="core-rpc"; shift ;;
-        --electrum) BACKEND="electrum"; shift ;;   # a personal electrs (PLAN-graffito-electrum.md); port from CN_ELECTRUM_PORT
+        --electrum) BACKEND="electrum"; shift ;;   # a personal electrs (plans/PLAN-graffito-electrum.md); port from CN_ELECTRUM_PORT
         --network) NETWORK="${2:?--network requires regtest|testnet4}"; shift 2 ;;
         --network=*) NETWORK="${1#--network=}"; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -936,7 +936,7 @@ E2E_PRIME_FUNDED+=("$P_ADDR")   # give it back on exit (e2e_fund_return)
 pass "prime address $P_ADDR"
 
 echo "== recovery-seeds interop: a Prime bip86 seed's 24 words import identically =="
-# The whole point of PLAN-chain-notes-seed-rotation.md, proven across the
+# The whole point of plans/PLAN-graffito-seed-rotation.md, proven across the
 # two ACTUAL host binaries: the device derives a rotatable BIP-39 phrase
 # from its app seed (notes_cli seed-words) and a bip86 notebook address
 # (seed-address); feeding those SAME words to the app's normal mnemonic
@@ -992,7 +992,7 @@ PRIV_TXID="$(echo "$PRIV_OUT" | grep -oE 'txid=[0-9a-f]+' | head -1 | cut -d= -f
 # The ONE genuinely regtest-only leg in this script: the assertion below
 # hardcodes "status=confirmed", which needs an actual block — on testnet4
 # that means a real ~10-minute wait for on-demand mining that doesn't
-# exist there (PLAN-one-regtest-node.md's "pending→confirmed" skip
+# exist there (plans/PLAN-one-regtest-node.md's "pending→confirmed" skip
 # category). Everything ELSE in this script only ever needed the tx
 # visible to a scan (settle), never actually confirmed.
 if require_regtest "self-notes: confirmed-status assertion (needs on-demand mining)"; then
@@ -1126,7 +1126,7 @@ pass "interop matrix + external funding (P2TR + P2WPKH) complete (work dir: $WOR
 
 # ---------------------------------------------------------------------------
 # Funding-unification M4: the INTERNAL spending wallet (BIP-84 of the same
-# seed, signed fully in-app — see ../PLAN-chain-notes-funding-unification.md).
+# seed, signed fully in-app — see ../plans/PLAN-graffito-funding-unification.md).
 # A dedicated identity (own mnemonic, own store) so its notebook stays
 # dust-only and the balance/utxo assertions below aren't polluted by the
 # self/directed notes composed against $STORE above.
@@ -1290,7 +1290,7 @@ done
 pass "multi leg: all three recipients independently scan + read the multi-recipient public note"
 
 # ---------------------------------------------------------------------------
-# PLAN-graffito-multi-pq.md (2026-09-06): ML-KEM + password layers on a
+# plans/PLAN-graffito-multi-pq.md (2026-09-06): ML-KEM + password layers on a
 # MULTI-recipient note — the exclusion the plain multi leg above never
 # needed to test is now lifted. Three recipients at mixed ML-KEM levels
 # (512/768/1024), each ek exported via `pq-public` under the recipient's
@@ -1329,7 +1329,7 @@ pre_watch_fresh "$MPQ_R1_ADDR" "$MPQ_R2_ADDR" "$MPQ_R3_ADDR"
 
 # Each recipient's seed-derived ML-KEM receive key, at their OWN chosen
 # level — exactly `cli pq-public` under its own key, same convention the
-# single-recipient pq legs use (mixed levels, per PLAN-graffito-multi-pq.md).
+# single-recipient pq legs use (mixed levels, per plans/PLAN-graffito-multi-pq.md).
 MPQ_R1_EK="$(APP_KEY="$MPQ_R1" "$APP" pq-public "$NETWORK" 512 2>"$WORK/mpq-r1-pq.err")"
 MPQ_R2_EK="$(APP_KEY="$MPQ_R2" "$APP" pq-public "$NETWORK" 768 2>"$WORK/mpq-r2-pq.err")"
 MPQ_R3_EK="$(APP_KEY="$MPQ_R3" "$APP" pq-public "$NETWORK" 1024 2>"$WORK/mpq-r3-pq.err")"
@@ -1349,7 +1349,7 @@ MPQ_TXID="$(echo "$MPQ_OUT" | grep -oE 'txid=[0-9a-f]+' | head -1 | cut -d= -f2)
 pass "multi+pq leg: 3-recipient private note (ML-KEM 512/768/1024 + shared password) composed + signed + broadcast entirely in-app, notebook-funded"
 
 # note-spend-funded-multi ALSO accepts the same --mlkem/--password flags
-# (PLAN-graffito-multi-pq.md's explicit ask) — proven separately here for
+# (plans/PLAN-graffito-multi-pq.md's explicit ask) — proven separately here for
 # the build+sign+broadcast path alone: a spending-wallet-funded tx's first
 # input is P2WPKH, so the received-side sender_x candidate never resolves
 # (the pre-existing single-candidate limitation above) and this leg

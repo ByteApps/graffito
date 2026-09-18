@@ -3,7 +3,7 @@
 # app-core) must render identically, starting with the compose screen's
 # security copy (`seclabel`). Sibling of notes-core (the FROZEN protocol
 # pieces); consumed by app-core as a git dependency pinned to the SAME rev
-# as notes-core (PLAN-graffito-arch.md, phase 2).
+# as notes-core (plans/PLAN-graffito-arch.md, phase 2).
 #
 # Dependency-minimal BY RULE: notes-core + serde only. No zxcvbn (strength
 # estimation stays in app-core), no getrandom, no rust-bitcoin — nothing

@@ -1,5 +1,5 @@
 //! Screen.home — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -121,7 +121,7 @@ pub(crate) fn on_open_note(&mut self, w: &AppWindow, id: SharedString) {
         if let Some(n) = store.notes.iter().find(|n| n.note_id.as_str() == id.as_str()) {
             println!("cb: open-note id={} status={:?} decrypted={}", n.note_id, n.status, n.text.is_some());
             let watch = self.ident.as_ref().map(|i| i.is_watch()).unwrap_or(false);
-            // PLAN-pnte-redesign.md: the note id IS the txid now (64 hex
+            // plans/PLAN-pnte-redesign.md: the note id IS the txid now (64 hex
             // chars, not the old synthetic hex8) — the inline "id:" quick-
             // view line shows just the first 8 chars, same footprint as
             // before; the full id is still available verbatim via the

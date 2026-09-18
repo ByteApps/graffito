@@ -322,7 +322,7 @@ $("buildBtn").addEventListener("click", async () => {
         // fabricate its script, matching notes-core's additive
         // input_prevout_spks field, which falls back to spends_from_self
         // when empty). Enables the device's self-spk-SET ownership rule
-        // (PLAN-graffito-funding-unification.md).
+        // (plans/PLAN-graffito-funding-unification.md).
         const inputPrevoutSpks = t.vin
           .map((i) => i.prevout && i.prevout.scriptpubkey)
           .filter(Boolean);
@@ -340,7 +340,7 @@ $("buildBtn").addEventListener("click", async () => {
         // The tx's FIRST input's prevout, as "<txid>:<vout>" (display-order
         // txid — notes-core's bundle::format_outpoint convention). A
         // directed-private note's AAD binds this outpoint instead of the
-        // (now nonexistent) note_id (PLAN-pnte-redesign.md); a coinbase
+        // (now nonexistent) note_id (plans/PLAN-pnte-redesign.md); a coinbase
         // input (no `txid`) leaves it null, same as any other tx this
         // field can't be derived for — the device degrades that note to a
         // sealed placeholder, never a crash.

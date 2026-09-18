@@ -46,7 +46,7 @@ fn funded_store(identity: &Identity) -> Store {
     store
 }
 
-/// PLAN-pnte-redesign.md: the tx's FIRST input's outpoint, display-order
+/// plans/PLAN-pnte-redesign.md: the tx's FIRST input's outpoint, display-order
 /// `"<txid>:<vout>"` — every private body's AAD binds this, so a bundle
 /// fixture must carry it for `extract_notes*` to decrypt anything. Shared
 /// by every `OnchainTx` fixture builder below; independent of which
@@ -399,7 +399,7 @@ fn custom_change_address_not_tracked_as_own_coin() {
     assert_eq!(store2.utxos.iter().filter(|u| !u.pending_spend).count(), 1);
 }
 
-/// PLAN-pnte-redesign.md: the note id IS the txid, so an RBF bump — a
+/// plans/PLAN-pnte-redesign.md: the note id IS the txid, so an RBF bump — a
 /// DIFFERENT tx (same inputs, higher fee) — gets a DIFFERENT id, and the
 /// stored record is renamed/rekeyed to it (superseding the old
 /// `bump_fee_same_note_id_same_inputs_higher_fee`'s "identity survives
@@ -844,7 +844,7 @@ fn display_owner_dedup_archived_notebook_input_never_anchors() {
 }
 
 // ---------------------------------------------------------------------
-// spending-self-notes fix (PLAN-chain-notes-app-spending-self-notes.md),
+// spending-self-notes fix (plans/PLAN-graffito-app-spending-self-notes.md),
 // Units A + B: a note composed by the app but funded purely from the
 // spending wallet (BIP-84, P2WPKH inputs, dust change back to the
 // notebook) has no notebook input and no taproot input — the old
@@ -1187,7 +1187,7 @@ fn alice_own_view(tx: &NoteTx, bob_addr: &str, height: u64) -> SyncBundle {
 /// loudly, never silently dropped. Covers: a public note and a multi-
 /// recipient pick — one representative failure each is enough (the guard
 /// is a single `if` in `compose_note`, not per-shape logic). A self-note
-/// pq layer is NOT in this list since PLAN-graffito-self-pw.md (2026-08-22)
+/// pq layer is NOT in this list since plans/PLAN-graffito-self-pw.md (2026-08-22)
 /// — see `pq_self_note_with_password_is_stored_locked_and_never_cached`
 /// and the ML-KEM case in `pq_self_note_with_mlkem_layer_composes`.
 #[test]
@@ -1245,7 +1245,7 @@ fn pq_layers_require_a_private_note() {
     assert!(matches!(err, Error::Store(_)));
 
     // A private note but the wrong `pq_mlkem` key COUNT (2 recipients, only
-    // 1 key supplied) — PLAN-graffito-multi-pq.md's per-recipient shape
+    // 1 key supplied) — plans/PLAN-graffito-multi-pq.md's per-recipient shape
     // must be enforced, not silently truncated/padded.
     let carol_addr = carol().address(NET);
     let kp = bob_pq_keypair();
@@ -1272,7 +1272,7 @@ fn pq_layers_require_a_private_note() {
     assert!(matches!(err, Error::Store(_)));
 }
 
-/// Multi-recipient pq compose (PLAN-graffito-multi-pq.md, 2026-09-06): a
+/// Multi-recipient pq compose (plans/PLAN-graffito-multi-pq.md, 2026-09-06): a
 /// private note to 2+ recipients with EITHER a password layer, an
 /// ML-KEM layer (one key per recipient, mixed levels allowed), or both is
 /// now ACCEPTED — the exclusion the previous test's old name asserted was
@@ -1341,7 +1341,7 @@ fn pq_multi_recipient_note_composes_with_password_and_mixed_mlkem_levels() {
     assert_eq!(composed.recipients.len(), 2);
 }
 
-/// Self-note pq compose routing (PLAN-graffito-self-pw.md): a private
+/// Self-note pq compose routing (plans/PLAN-graffito-self-pw.md): a private
 /// SELF-note (no recipient) with an ML-KEM layer alone is accepted and
 /// carries JUST `FLAG_MLKEM` — a self-note pq layer is no longer refused
 /// the way it was before this feature (see the previous test's doc
@@ -1649,7 +1649,7 @@ fn pq_note_refuses_fee_bump() {
 }
 
 // ---------------------------------------------------------------------------
-// Self-note pq layers (PLAN-graffito-self-pw.md, 2026-08-22): password and/or
+// Self-note pq layers (plans/PLAN-graffito-self-pw.md, 2026-08-22): password and/or
 // ML-KEM on a private SELF-note. Unlike a directed pq note (which the
 // composer caches plaintext for immediately — see the tests above), a
 // self-pq note is stored LOCKED from the moment it's signed and only ever
@@ -1720,7 +1720,7 @@ fn pq_self_note_with_password_is_stored_locked_and_never_cached() {
     assert!(!rec.received);
 }
 
-/// View-only unlock (PLAN-graffito-self-pw.md): `Store::unlock_note_view`
+/// View-only unlock (plans/PLAN-graffito-self-pw.md): `Store::unlock_note_view`
 /// returns the plaintext for display, but — unlike `Store::unlock_note` —
 /// never persists it: the record's `text` stays `None`, `locked` survives
 /// untouched, and a round-trip through `Store::save`/`Store::load` (a real
@@ -1795,7 +1795,7 @@ fn pq_self_note_unlock_is_view_only_and_never_persists() {
     assert_eq!(text_again, plaintext);
 }
 
-/// `CLASSIFY_VERSION` bump pin (PLAN-graffito-self-pw.md): a `PW|PRIVATE`
+/// `CLASSIFY_VERSION` bump pin (plans/PLAN-graffito-self-pw.md): a `PW|PRIVATE`
 /// (no `FLAG_DIRECTED`) header was UNDECODABLE before this feature — an
 /// older build's scan recorded no note at all for such a tx, own or
 /// otherwise. Bumping this constant is what forces one full rescan per
@@ -1876,7 +1876,7 @@ fn pending_note_change_spent_elsewhere_is_not_resurrected() {
 }
 
 // ---------------------------------------------------------------------
-// Multi-recipient pq layers (PLAN-graffito-multi-pq.md, 2026-09-06) — full
+// Multi-recipient pq layers (plans/PLAN-graffito-multi-pq.md, 2026-09-06) — full
 // app-core round trip: ComposeRequest -> compose_and_record -> apply_bundle
 // -> Store::unlock_note, mirroring the single-recipient pq tests above.
 // ---------------------------------------------------------------------

@@ -1,5 +1,5 @@
 //! Screen.coins — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -162,7 +162,7 @@ pub(crate) fn open_notebook_consolidate(&mut self, w: &AppWindow) {
 /// notebook, plus the cross-wallet summary — data as of each notebook's
 /// last scan (the ↻ on the coins screen rescans them all). Taproot
 /// change-chain coins (`st.change_coins`, unit 3 — see
-/// `../PLAN-chain-notes-app-taproot-change.md`) are folded into the SAME
+/// `../plans/PLAN-graffito-app-taproot-change.md`) are folded into the SAME
 /// list, each tagged "change" instead of a notebook name (Sal's decision:
 /// one unified balance, not a separate segment) — they count toward the
 /// total coin count and spendable sats but NOT toward the "M notebooks"

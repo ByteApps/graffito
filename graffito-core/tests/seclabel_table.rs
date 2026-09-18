@@ -5,7 +5,7 @@
 //!
 //! Provenance:
 //! - `Flat` rows: graffito's `app-core/tests/security_label_contract.rs`
-//!   (2026-09-01, phase 1 of PLAN-graffito-arch.md), byte-for-byte. That
+//!   (2026-09-01, phase 1 of plans/PLAN-graffito-arch.md), byte-for-byte. That
 //!   file keeps exercising app-core's re-exported surface; this one pins
 //!   the shared crate itself.
 //! - `Detailed` rows: prime-graffito `src/main.rs` `pq_security_label` as
@@ -110,7 +110,7 @@ fn flat_self_note_password_layer() {
 #[test]
 fn flat_self_note_quantum_key_layer() {
     // "your quantum key", never "the imported key": the slot has held
-    // generated keys since PLAN-graffito-quantum-key.md.
+    // generated keys since plans/PLAN-graffito-quantum-key.md.
     for level in LEVELS {
         assert_row(
             choice(true, false, None, false, Some(level)),

@@ -67,7 +67,7 @@ fn findability_real_buttons_by_label_headless() {
 }
 
 // Superseded 2026-09-07 by `findability_compose_status_strip_and_sheets`
-// below (PLAN-graffito-compose-simplify.md): the "Security" collapsible
+// below (plans/PLAN-graffito-compose-simplify.md): the "Security" collapsible
 // this test drove no longer exists — it split into the status-strip pills,
 // the gear card, and the passphrase/quantum per-note sheets. Renamed
 // (not just edited) so a `findability_compose_security_panel` grep
@@ -86,7 +86,7 @@ fn findability_compose_status_strip_and_sheets() {
     // zero-geometry/clipped elements from the a11y tree.
     app.window().set_size(slint::LogicalSize::new(430.0, 2400.0));
     // A private, directed, notebook-funded compose — every status pill
-    // applies (PLAN-graffito-compose-simplify.md: "Gift and PQ only on
+    // applies (plans/PLAN-graffito-compose-simplify.md: "Gift and PQ only on
     // directed notes"). No `State`/Rust handlers are wired in this raw
     // AppWindow spike, so the Rust-computed pill labels sit at their
     // literal `globals.slint` defaults ("Private", "1 sat/vB", "Gift 330",

@@ -17,7 +17,7 @@
 //! - public/directed rows: `security_label` as shipped (pre-existing,
 //!   unchanged, already covered by `passphrase.rs` unit tests).
 //! - self-note layered rows: the `src/lib.rs` override as shipped in the
-//!   PLAN-graffito-quantum-key.md builds, byte-for-byte, with ONE
+//!   plans/PLAN-graffito-quantum-key.md builds, byte-for-byte, with ONE
 //!   deliberate correction: the quantum-key rows said "the imported key",
 //!   stale since `pqkeys::generate_native_private` ("My quantum key"
 //!   generation) shipped in the same plan — a user who GENERATED their key
@@ -119,7 +119,7 @@ fn self_note_password_layer() {
 fn self_note_quantum_key_layer() {
     // DELIBERATE COPY CHANGE (2026-09-01): shipped shell said "losing the
     // imported key"; the key can be generated on-device since
-    // PLAN-graffito-quantum-key.md, so the copy now says "your quantum key".
+    // plans/PLAN-graffito-quantum-key.md, so the copy now says "your quantum key".
     for level in [MlKemLevel::MlKem512, MlKemLevel::MlKem768, MlKemLevel::MlKem1024] {
         assert_row(
             choice(true, false, None, false, Some(level)),

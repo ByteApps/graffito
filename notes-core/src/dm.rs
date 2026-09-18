@@ -23,7 +23,7 @@
 //! AAD binds direction and note identity: `sender_x || recipient_x ||
 //! outpoint` — a sealed body replayed from a different sender address, to a
 //! different recipient, or under another outpoint fails authentication.
-//! PLAN-pnte-redesign.md (2026-08-11) rebinds this from the old `note_id(4)`
+//! plans/PLAN-pnte-redesign.md (2026-08-11) rebinds this from the old `note_id(4)`
 //! (a field that no longer exists on-chain — the note id IS the txid, which
 //! can't be known before signing) to `outpoint(36)` = the tx's FIRST
 //! input's prevout, serialized exactly as it appears on the wire (txid in

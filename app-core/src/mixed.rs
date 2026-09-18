@@ -46,7 +46,7 @@ pub enum CoinSource {
     /// An external (watch-only) funding wallet, identified by its saved id.
     Wallet(String),
     /// The identity's own taproot CHANGE-chain coin (`m/86'/…/1/{index}`,
-    /// taproot-change unit 5 — see `../PLAN-chain-notes-app-taproot-change.md`).
+    /// taproot-change unit 5 — see `../plans/PLAN-graffito-app-taproot-change.md`).
     /// Same account as `Notebook`, just chain 1 instead of chain 0 — an
     /// OWN coin, not a distinct wallet (Sal's "one unified balance" rule).
     /// `MixedCoin.index` is its chain-1 index (needed by the caller to
@@ -526,7 +526,7 @@ pub fn assemble_mixed_note_psbt_multi(
 
 /// [`assemble_mixed_note_psbt_multi`] extended with taproot CHANGE-chain
 /// coins (`CoinSource::Change`, taproot-change unit 5 — see
-/// `../PLAN-chain-notes-app-taproot-change.md`): `change_spks` maps a
+/// `../plans/PLAN-graffito-app-taproot-change.md`): `change_spks` maps a
 /// chain-1 index to that leaf's own P2TR scriptPubKey (the caller derives
 /// these via `identity::realize_change` — this builder has no key
 /// material, only spks). `assemble_mixed_note_psbt_multi`/
@@ -982,7 +982,7 @@ mod tests {
     /// notes-core's own `compose_note_exact` actually pays. Uses Sal's
     /// concrete example (330-sat coin, 1 sat/vB, a note whose single
     /// OP_RETURN chunk sizes to a 99-vB no-change tx — was 103 vB before
-    /// PLAN-pnte-redesign.md shrank the envelope header by 4 bytes, no
+    /// plans/PLAN-pnte-redesign.md shrank the envelope header by 4 bytes, no
     /// more binary `note_id`) so the numbers in the UI copy are provably
     /// real, not illustrative.
     #[test]
@@ -1019,7 +1019,7 @@ mod tests {
         let (nominal, folded) =
             predict_notebook_fold(330, 0, vsize_wc, 34, rate).expect("fold predicted");
         assert_eq!(nominal, fee_nc_direct, "Δ-shortcut must match direct no-change vsize math");
-        assert_eq!(nominal, 99, "matches Sal's concrete example exactly (PLAN-pnte-redesign.md: was 103 before the 4-byte-shorter envelope header)");
+        assert_eq!(nominal, 99, "matches Sal's concrete example exactly (plans/PLAN-pnte-redesign.md: was 103 before the 4-byte-shorter envelope header)");
         assert_eq!(folded, 231);
         assert_eq!(nominal + folded, built.fee, "predicted split must equal the real built tx's fee");
     }
@@ -1593,7 +1593,7 @@ mod tests {
     }
 
     // ---- taproot-change unit 5: CoinSource::Change compose paths ----
-    // See `../PLAN-chain-notes-app-taproot-change.md`. `realize_change`
+    // See `../plans/PLAN-graffito-app-taproot-change.md`. `realize_change`
     // derives the chain-1 (`m/86'/…/1/{index}`) owner exactly as
     // `build_sweep_confirm`'s change-idents loop already does for the
     // SWEEP path (unit 4, MONEY-VERIFIED on regtest) — these three tests

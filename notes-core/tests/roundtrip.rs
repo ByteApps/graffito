@@ -388,7 +388,7 @@ fn dm_shared_key_is_symmetric() {
     let c = Identity::from_app_seed(&[8u8; 32]).unwrap();
     assert_ne!(dm::ecdh_shared_x(&c.tweaked_seckey, &b.output_x).unwrap(), ab);
 
-    // AAD binds the outpoint at the dm layer (PLAN-pnte-redesign.md).
+    // AAD binds the outpoint at the dm layer (plans/PLAN-pnte-redesign.md).
     let outpoint = [0xAAu8; 36];
     let wrong_outpoint = [0xBBu8; 36];
     let blob =
@@ -651,7 +651,7 @@ fn received_acceptance_is_additive() {
 }
 
 /// Two unrelated txs — one own, one received — scanned in the same bundle
-/// must stay two separate notes. PLAN-pnte-redesign.md retires the old
+/// must stay two separate notes. plans/PLAN-pnte-redesign.md retires the old
 /// note_id×origin bucketing this used to stress (a note's id IS its txid,
 /// unique by construction, so no two distinct notes could ever collide
 /// into one bucket anymore); kept as basic own/received separation
@@ -1131,7 +1131,7 @@ fn sweep_multi_source_cross_check() {
 }
 
 // ---------------------------------------------------------------------
-// Self-spk-SET ownership rule (PLAN-graffito-funding-unification.md M0):
+// Self-spk-SET ownership rule (plans/PLAN-graffito-funding-unification.md M0):
 // `extract_notes_multi`/`_watch_multi` generalize OWN from "spends from the
 // notebook address" to "spends from any of MY scriptPubKeys", via the new
 // `OnchainTx::input_prevout_spks` field. `extract_notes`/`extract_notes_watch`
@@ -1236,7 +1236,7 @@ fn self_spk_set_leaves_non_matching_spk_scan_unchanged() {
 /// (c) Own vs received stay separate notes under the self-spk-SET rule
 /// too: an spk-matched OWN tx and an unrelated pays-self RECEIVED tx in
 /// the same bundle must not merge (each tx is independently its own note
-/// by construction — PLAN-pnte-redesign.md — but this is still useful
+/// by construction — plans/PLAN-pnte-redesign.md — but this is still useful
 /// coverage of the self-spk-set path specifically).
 #[test]
 fn self_spk_set_own_received_notes_stay_separate() {

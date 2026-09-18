@@ -18,11 +18,11 @@
 //!   no asymmetric secret.
 //!
 //! Both layers are valid on a PRIVATE SINGLE-recipient DIRECTED note and —
-//! since 2026-08-22 (PLAN-graffito-self-pw.md, the additive extension) — on
+//! since 2026-08-22 (plans/PLAN-graffito-self-pw.md, the additive extension) — on
 //! a PRIVATE SELF-note too (see the "Self-note pq layers" section below for
 //! that variant's own domain, threat model, and the seed-derived-ek
 //! warning); the layers can be combined. Since 2026-09-06
-//! (PLAN-graffito-multi-pq.md) both layers are ALSO valid on a PRIVATE
+//! (plans/PLAN-graffito-multi-pq.md) both layers are ALSO valid on a PRIVATE
 //! MULTI-recipient DIRECTED note — see the "Multi-recipient pq layers"
 //! section near the bottom of this file for that variant's own wire
 //! framing and key derivation (a NEW domain, distinct from both the
@@ -31,7 +31,7 @@
 //!
 //! ## Wire format
 //!
-//! The note BODY (after the ASCII header, PLAN-pnte-redesign.md) gains
+//! The note BODY (after the ASCII header, plans/PLAN-pnte-redesign.md) gains
 //! prefix blocks ahead of today's sealed blob, in this exact order:
 //!
 //! ```text
@@ -63,7 +63,7 @@
 //!
 //! This crate runs on a device where ALL entropy must route through
 //! `getrandom` 0.2 (the workspace's vendored TRNG `[patch]` override —
-//! `RANDOMNESS-AUDIT-2026-08-01.md`). This module MUST NOT use `rand`,
+//! `reports/RANDOMNESS-AUDIT-2026-08-01.md`). This module MUST NOT use `rand`,
 //! `rand_core::OsRng`, or any API that could reach getrandom 0.3/0.4. Every
 //! random byte here is drawn by calling `getrandom::getrandom` directly and
 //! handed to a DETERMINISTIC ml-kem API (`generate_deterministic`,
@@ -191,7 +191,7 @@ impl Drop for MlKemKeypair {
     }
 }
 
-/// Generation-seed mixing domain (PLAN-graffito-quantum-key.md). NOT
+/// Generation-seed mixing domain (plans/PLAN-graffito-quantum-key.md). NOT
 /// FROZEN in the re-derivation sense — nothing ever re-derives this seed
 /// (it is stored/exported whole) — but shared verbatim by both apps so
 /// one audited implementation covers them.
@@ -751,7 +751,7 @@ fn derive_pq_key(
 }
 
 // ---------------------------------------------------------------------
-// Self-note pq layers (PLAN-graffito-self-pw.md, 2026-08-22) — FROZEN
+// Self-note pq layers (plans/PLAN-graffito-self-pw.md, 2026-08-22) — FROZEN
 // once shipped, same rule as every domain above.
 // ---------------------------------------------------------------------
 //
@@ -1068,7 +1068,7 @@ pub struct LockedBody {
 }
 
 impl LockedBody {
-    /// A SELF-note locked body (PLAN-graffito-self-pw.md): there is no
+    /// A SELF-note locked body (plans/PLAN-graffito-self-pw.md): there is no
     /// sender/recipient pair, so both x slots hold the all-zero sentinel
     /// (not a valid secp256k1 x-coordinate for any key either app
     /// derives; `is_self` discriminates). Store-compatible with the
@@ -1207,7 +1207,7 @@ pub fn unlock_sent(
 }
 
 // ---------------------------------------------------------------------
-// Multi-recipient pq layers (PLAN-graffito-multi-pq.md, 2026-09-06) — a
+// Multi-recipient pq layers (plans/PLAN-graffito-multi-pq.md, 2026-09-06) — a
 // NEW domain, distinct from both `derive_pq_key` (single-recipient
 // directed) and `derive_self_pq_key` (self-note) above. FROZEN once
 // shipped, same rule as every domain in this file.
@@ -1651,7 +1651,7 @@ mod tests {
     }
 
     /// FROZEN-domain pin for the self-pq sealing key
-    /// (PLAN-graffito-self-pw.md): fixed inputs -> pinned output for every
+    /// (plans/PLAN-graffito-self-pw.md): fixed inputs -> pinned output for every
     /// layer combination, plus domain separation from the directed
     /// dm-pq/v1 derivation. A mismatch means shipped self-pq notes stop
     /// unlocking — SHIP-BLOCKING, never "fix the hex".
@@ -1730,7 +1730,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // Multi-recipient pq layers (PLAN-graffito-multi-pq.md)
+    // Multi-recipient pq layers (plans/PLAN-graffito-multi-pq.md)
     // -------------------------------------------------------------
 
     fn ident(seed_byte: u8) -> crate::bundle::Identity {
@@ -2056,7 +2056,7 @@ mod tests {
     /// notes-core derive_multi_wrap_key_domain_separates_on_pq_flags`, saw
     /// it fail, then reverted).
     /// FROZEN-domain pin for the multi-recipient wrap-key derivation
-    /// (PLAN-graffito-multi-pq.md): fixed inputs -> pinned output for
+    /// (plans/PLAN-graffito-multi-pq.md): fixed inputs -> pinned output for
     /// every layer combination, mirroring `self_pq_kdf_vectors_are_pinned`
     /// above. `derive_multi_wrap_key` (like `derive_pq_key`/
     /// `derive_self_pq_key`) never draws randomness itself — the only

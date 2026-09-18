@@ -1,5 +1,5 @@
 // Screen.note -- extracted verbatim from app.slint on 2026-09-03
-// (PLAN-graffito-app-arch.md U3b).
+// (plans/PLAN-graffito-app-arch.md U3b).
 //
 // ---------- 5 · note view ----------
 
@@ -87,7 +87,7 @@ export component NoteScreen inherits VerticalLayout { padding-top: Ui.safe-top +
                     }
                     Caption { text: Ui.note-unlock-caption; }
                 }
-                // SELF-note ML-KEM-only (PLAN-graffito-self-pw.md): unlike
+                // SELF-note ML-KEM-only (plans/PLAN-graffito-self-pw.md): unlike
                 // the unrecoverable directed cases this block otherwise
                 // renders, the author can still retry against an
                 // already-imported quantum key with no password to type.

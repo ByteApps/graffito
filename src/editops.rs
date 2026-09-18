@@ -2,7 +2,7 @@
 //! clipboard for the EditField/EditArea widgets (offsets come from
 //! TextInput's cursor API and are always char boundaries; clamp
 //! defensively anyway). Moved verbatim out of `run()` (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 

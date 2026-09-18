@@ -1,5 +1,5 @@
 //! Screen.note — handlers moved out of `lib.rs` verbatim (U4,
-//! PLAN-graffito-app-arch.md).
+//! plans/PLAN-graffito-app-arch.md).
 
 use crate::*;
 
@@ -8,7 +8,7 @@ use crate::*;
 ///
 /// - Not locked (`n.locked` is `None`, whether it's a plaintext note or an
 ///   already-unlocked one): everything hidden.
-/// - A SELF-note (`locked.is_self()`, PLAN-graffito-self-pw.md): checked
+/// - A SELF-note (`locked.is_self()`, plans/PLAN-graffito-self-pw.md): checked
 ///   FIRST — unlike a directed note, the author always holds the enc key
 ///   `unlock_self` needs, so there is no `SenderCannotReopen` case here at
 ///   all. `FLAG_PW` shows the password field (+ Unlock button, unchanged
@@ -30,7 +30,7 @@ use crate::*;
 pub(crate) fn refresh_note_unlock_ui(w: &AppWindow, n: &app_core::store::NoteRecord) {
     use app_core::notes_core::envelope::{FLAG_MLKEM, FLAG_PW};
 
-    // Multi-recipient pq notes (PLAN-graffito-multi-pq.md) populate
+    // Multi-recipient pq notes (plans/PLAN-graffito-multi-pq.md) populate
     // `locked_multi` instead of `locked` (never both) — this block treats
     // them identically to a single-recipient directed pq note in every way
     // that matters here: never self (FLAG_MULTI always implies
@@ -89,7 +89,7 @@ pub(crate) fn refresh_note_unlock_ui(w: &AppWindow, n: &app_core::store::NoteRec
 
 /// Build screen 5's detail text block for note `n` — shared by
 /// `on_open_note` (the normal, store-backed render, `text_override: None`)
-/// and `on_unlock_note`'s SELF-note view-only path (PLAN-graffito-self-pw.md),
+/// and `on_unlock_note`'s SELF-note view-only path (plans/PLAN-graffito-self-pw.md),
 /// which passes the just-decrypted plaintext as `text_override` WITHOUT
 /// writing it into `n.text`/the store: a self-pq note's second factor stays
 /// load-bearing on every future open, so nothing about this render may
@@ -150,7 +150,7 @@ impl State {
 pub(crate) fn on_unlock_note(&mut self, w: &AppWindow) {
         // User-initiated tap — the LAUNCH-PATH rule's other sanctioned door
         // (besides opening the Quantum keys screen, and — since
-        // PLAN-graffito-self-pw.md — the Security panel's own header tap)
+        // plans/PLAN-graffito-self-pw.md — the Security panel's own header tap)
         // for loading an imported ML-KEM secret from the Keychain this
         // session. Runs before the borrows below so it never conflicts
         // with them.
@@ -165,7 +165,7 @@ pub(crate) fn on_unlock_note(&mut self, w: &AppWindow) {
         w.global::<Note>().set_note_unlock_busy(true);
 
         // A SELF-note's locked body goes through the VIEW-ONLY path
-        // (PLAN-graffito-self-pw.md): `unlock_note`/`unlock_sent` refuse it
+        // (plans/PLAN-graffito-self-pw.md): `unlock_note`/`unlock_sent` refuse it
         // outright (`is_self()` discriminates in notes-core), so this check
         // must happen before picking which store fn to call at all.
         let is_self = self

@@ -1,4 +1,4 @@
-//! U1 (`PLAN-chain-notes-app-core-rpc.md` §3 step 1): the Esplora-ONLY half
+//! U1 (`plans/PLAN-graffito-app-core-rpc.md` §3 step 1): the Esplora-ONLY half
 //! of the contract work — exact request-path strings, in order, for every
 //! `ChainClient` method. This is `HttpTransport`'s contract, not
 //! `ChainClient`'s, so unlike `tests/chain_contract.rs`'s

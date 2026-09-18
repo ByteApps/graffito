@@ -79,7 +79,7 @@ export global Ui {
     // `note-unlock-caption` explains why nothing can be typed to fix it
     // (KEM-only and this device lacks the key, or an own DIRECTED note
     // sealed with ML-KEM — the sender can never reopen that layer). A
-    // SELF-note (PLAN-graffito-self-pw.md) is different: its author always
+    // SELF-note (plans/PLAN-graffito-self-pw.md) is different: its author always
     // holds the enc key, so an Unlock tap can still succeed against an
     // already-imported quantum key even with no password to type —
     // `note-unlock-show-button` (true only for that case) adds the button
@@ -121,7 +121,7 @@ export global Ui {
     in property <string> confirm-warn;         // amber warning banner text, "" = none
     in property <[FundingWalletRow]> funding-wallets;   // saved wallet manager
     in-out property <string> fund-rename-id;            // non-empty = rename modal open
-    // ---- internal spending wallet (funding-unification M3, PLAN-chain-notes-funding-unification.md) ----
+    // ---- internal spending wallet (funding-unification M3, plans/PLAN-graffito-funding-unification.md) ----
     // Same BIP-84 branch of the SAME seed as the notebook's BIP-86 leaf,
     // signed fully in-app — no PSBT round trip. HD identities only.
     in property <bool> spending-capable;      // material can derive m/84' (mnemonic / master xprv)
@@ -171,7 +171,7 @@ export global Ui {
     // Bitcoin node picker: option labels, in order
     // `<network Esplora presets…>, "Bitcoin Core", "Custom…"` (U12 — the
     // storage-only `bitcoind+http(s)://host:port` prefix, see
-    // `PLAN-chain-notes-app-core-rpc.md` §2.5, never appears in this UI;
+    // `plans/PLAN-graffito-app-core-rpc.md` §2.5, never appears in this UI;
     // `node-address-text` below is a bare `host:port`). Row order means the
     // last two indices are always the UI-managed rows regardless of how
     // many presets a network has (zero on regtest, so there it's exactly
@@ -266,7 +266,7 @@ export global Ui {
     callback reveal-hide();            // back/Done from 18 or 19: wipes every revealed value
     callback copy-value(string);       // copy a revealed format to the clipboard
     callback go-home();
-    // The ONE async trampoline (U5, PLAN-graffito-app-arch.md): every
+    // The ONE async trampoline (U5, plans/PLAN-graffito-app-arch.md): every
     // worker thread that finishes a background job (a scan, a broadcast, a
     // probe, an iCloud-contacts merge, …) posts a boxed `FnOnce(&AppWindow,
     // &mut State)` onto one shared FIFO queue (`pending::post`) and invokes
@@ -497,7 +497,7 @@ export global Settings {
     // URL, normalized+stored as `bitcoind+http(s)://host:port` in Rust —
     // the prefix never appears here.
     callback set-node-address(string);
-    // "Electrum server" row: host[:port] → electrum+tcp://host:port (PLAN-graffito-electrum.md).
+    // "Electrum server" row: host[:port] → electrum+tcp://host:port (plans/PLAN-graffito-electrum.md).
     callback set-node-electrum-address(string);
     // Save Bitcoin Core RPC creds (user, pass) to the Keychain for the
     // active network's configured node — never written to config.json.
@@ -511,7 +511,7 @@ export global Settings {
     callback reveal-public();          // Settings entry: derive from cached material, no auth, -> screen 18
     callback reveal-private();         // Settings entry: FRESH biometric, only navigates (-> screen 19) on success
 
-    // ---- "Compose defaults" section (PLAN-graffito-compose-simplify.md) ----
+    // ---- "Compose defaults" section (plans/PLAN-graffito-compose-simplify.md) ----
     // The policy every fresh compose session starts from; the Compose
     // screen's pills/gear card only override a given note, never these.
     in-out property <string> compose-default-visibility: "private";   // "private" | "public"
@@ -635,7 +635,7 @@ export global Compose {
     in property <string> compose-locktime-warn;
     // ---- post-quantum layers (compose screen 6, "Security" collapsible —
     // visible for a private, single-recipient-or-self, notebook-funded,
-    // non-watch note — PLAN-graffito-self-pw.md extended this to self-notes
+    // non-watch note — plans/PLAN-graffito-self-pw.md extended this to self-notes
     // too, 2026-08-22). LAST collapsible on the screen (Sal's e2e-drift
     // rule: put new panels as late as possible so only the Sign/cost area
     // below needs recalibration).
@@ -700,7 +700,7 @@ export global Compose {
     // sweep/consolidate (screen 16) panels, same (mode, custom-height) shape.
     callback set-compose-locktime(string, string);
 
-    // ---- compose-simplify (PLAN-graffito-compose-simplify.md): the status
+    // ---- compose-simplify (plans/PLAN-graffito-compose-simplify.md): the status
     // strip of pills + the gear card + the per-note override sheets that
     // replace the old always-visible collapsibles. ----
     // Non-empty = which per-note sheet is open: "visibility" | "fee" |
@@ -1005,7 +1005,7 @@ export global QuantumKeys {
     callback pq-save-public();
     // "My quantum key" — a separate, NON-seed-derived ML-KEM keypair held
     // in the keychain (`pq-imported` account) — generate OR import,
-    // shared lifecycle (PLAN-graffito-quantum-key.md). `pq-import-fp` is
+    // shared lifecycle (plans/PLAN-graffito-quantum-key.md). `pq-import-fp` is
     // the CURRENT key's display line ("ML-KEM-768 · fp"), empty when none
     // is present; `pq-import-source` names where it came from ("Generated
     // on this device" or an import source, only set right after a

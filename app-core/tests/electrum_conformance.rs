@@ -1,4 +1,4 @@
-//! Electrum backend against a REAL electrs (PLAN-graffito-electrum.md §
+//! Electrum backend against a REAL electrs (plans/PLAN-graffito-electrum.md §
 //! Verification 2) — read-only, so it may run against the Pi's MAINNET
 //! instance through the SSH tunnel. The server is taken from the
 //! environment ONLY (`CN_ELECTRUM_HOST`, default 127.0.0.1 — the tunnel;

@@ -1,4 +1,4 @@
-//! Electrum protocol chain backend (`../../PLAN-graffito-electrum.md`) — a
+//! Electrum protocol chain backend (`../../plans/PLAN-graffito-electrum.md`) — a
 //! plain-TCP, newline-delimited JSON-RPC 2.0 client for a personal
 //! `electrs`/ElectrumX server (romanz electrs, the same server Sparrow and
 //! btc-rpc-explorer already use). Selected by the `electrum+tcp://host:port`

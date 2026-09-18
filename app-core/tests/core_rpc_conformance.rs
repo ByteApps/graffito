@@ -1,7 +1,7 @@
-//! U3 conformance suite (`PLAN-chain-notes-app-core-rpc.md` §3 step 3):
+//! U3 conformance suite (`plans/PLAN-graffito-app-core-rpc.md` §3 step 3):
 //! replays the SAME backend-agnostic contract battery `chain_contract.rs`
 //! runs against `EsploraFake` (U1), this time against the workspace's ONE
-//! shared regtest node (`PLAN-one-regtest-node.md`) through
+//! shared regtest node (`plans/PLAN-one-regtest-node.md`) through
 //! `ChainClient<AnyTransport>`'s Core RPC backend (U3).
 //!
 //! **This suite no longer spawns its own `bitcoind`.** It connects to the
@@ -128,7 +128,7 @@
 //! joins the `Scenario`, keeping the faucet address (and `testwallet`
 //! behind it) out of `all_addresses()` entirely — not merely inconvenient
 //! to desync, but structurally unreachable. This is the SAME choice as
-//! option (a) over option (b) in `PLAN-one-regtest-node.md`'s design
+//! option (a) over option (b) in `plans/PLAN-one-regtest-node.md`'s design
 //! writeup: scoping the contract assertion down to "addresses this file
 //! itself funded" (option b) would have removed the concern too, but at
 //! the cost of the "complete real history" property `assert_chain_contract`
@@ -200,7 +200,7 @@ fn data_output(payload: &[u8]) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------
-// The shared-node contract (PLAN-one-regtest-node.md, "the shared
+// The shared-node contract (plans/PLAN-one-regtest-node.md, "the shared
 // contract"). No suite invents its own — this is it.
 // ---------------------------------------------------------------------
 
@@ -225,7 +225,7 @@ fn node_env() -> NodeEnv {
     if network != "regtest" && network != "testnet4" {
         panic!(
             "CN_NETWORK={network:?} is not one of \"regtest\"/\"testnet4\" — see the shared contract \
-             table in PLAN-one-regtest-node.md."
+             table in plans/PLAN-one-regtest-node.md."
         );
     }
     let host = std::env::var("CN_NODE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -237,7 +237,7 @@ fn node_env() -> NodeEnv {
     let user = std::env::var("CORE_RPC_USER").unwrap_or_else(|_| {
         panic!(
             "CORE_RPC_USER is not set. This suite talks to the ONE shared {network} node — it never \
-             spawns its own bitcoind (PLAN-one-regtest-node.md). Fix: export CN_NETWORK, CN_NODE_HOST, \
+             spawns its own bitcoind (plans/PLAN-one-regtest-node.md). Fix: export CN_NETWORK, CN_NODE_HOST, \
              CN_NODE_PORT, CORE_RPC_USER, CORE_RPC_PASS yourself (or run through the workspace wrapper \
              `ui-automation/node-env.sh {network} cargo test -p app-core ...` once it exists), and make \
              sure the SSH tunnel is up: `ssh -f -N -o ExitOnForwardFailure=yes -L {default_port}:\
@@ -263,7 +263,7 @@ fn node_env() -> NodeEnv {
         panic!(
             "CN_WATCH_WALLET is not set. This suite drives the PRODUCTION Core transport, so without \
              a per-run wallet name it creates and bloats the shared `graffito-watch` wallet on the \
-             {network} node (PLAN-one-regtest-node.md, \"Two things now grow\"). Fix: export a unique \
+             {network} node (plans/PLAN-one-regtest-node.md, \"Two things now grow\"). Fix: export a unique \
              name first, e.g. `export CN_WATCH_WALLET=\"cn-conf-$$-$(date +%s)\"`, alongside the \
              CN_NETWORK/CN_NODE_* and CORE_RPC_* variables."
         );
@@ -293,7 +293,7 @@ fn network_of(env: &NodeEnv) -> Network {
 /// Fails loudly (never silently skips) when the configured network isn't
 /// regtest. Every fixture-building test in this file mines blocks to set up
 /// its scenario, and there is no testnet4 equivalent — you cannot mine
-/// there (`PLAN-one-regtest-node.md`'s hard constraint).
+/// there (`plans/PLAN-one-regtest-node.md`'s hard constraint).
 fn require_regtest(test_name: &str, env: &NodeEnv) {
     assert_eq!(
         env.network, "regtest",
@@ -385,7 +385,7 @@ impl Node {
                              Fix: bring up the SSH tunnel — `ssh -f -N -o ExitOnForwardFailure=yes \
                              -L {port}:127.0.0.1:{port} satoshi@raspberrypi.local` — and confirm \
                              CN_NODE_HOST/CN_NODE_PORT/CORE_RPC_USER/CORE_RPC_PASS are correct for the \
-                             {} node (PLAN-one-regtest-node.md's shared contract). This suite never \
+                             {} node (plans/PLAN-one-regtest-node.md's shared contract). This suite never \
                              spawns its own bitcoind, so there is no local fallback.",
                             self.env.network, self.env.host, self.env.port, self.env.network,
                             port = self.env.port,
@@ -461,7 +461,7 @@ fn connect_node() -> Node {
 /// Waits (bounded) for the shared node's `graffito-watch` wallet to
 /// finish any IN-PROGRESS rescan before this test starts touching it.
 /// Purely test-harness courtesy for a genuinely observed hazard on the
-/// shared, multi-consumer node (`PLAN-one-regtest-node.md`): bitcoind
+/// shared, multi-consumer node (`plans/PLAN-one-regtest-node.md`): bitcoind
 /// refuses ANY concurrent operation on a wallet mid-rescan (RPC code -4,
 /// "Wallet is currently rescanning. Abort existing rescan or wait.")  — and
 /// on a node other agents/suites/the real app may be touching at the same
@@ -539,7 +539,7 @@ fn unique_wallet_name(role: &str) -> String {
 }
 
 // ---------------------------------------------------------------------
-// Faucet funding (`PLAN-one-regtest-node.md`'s "value must circulate, not
+// Faucet funding (`plans/PLAN-one-regtest-node.md`'s "value must circulate, not
 // be mined" fix). See the module doc's "Fixture funding" section for the
 // full design writeup — this is the mechanism.
 // ---------------------------------------------------------------------
@@ -722,7 +722,7 @@ impl Drop for Faucet {
 /// coinbases at account-0/index-0 while this run's own `Scenario` only
 /// recorded the one IT mined. Randomizing the account index (the
 /// `regtest-e2e.sh --pi-regtest` technique — see
-/// `PLAN-one-regtest-node.md`'s "Assertions become deltas" section) makes
+/// `plans/PLAN-one-regtest-node.md`'s "Assertions become deltas" section) makes
 /// every HD-derived address in this run unique across all of history, past
 /// and future, without touching how `TEST_MNEMONIC` itself is used.
 static ACCOUNT_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -1152,7 +1152,7 @@ fn core_rpc_conformance() {
             let status = core.preflight().expect("preflight");
             assert!(!status.pruned, "the shared node is never pruned");
             assert!(status.txindex, "the shared node runs with txindex=1");
-            // NEVER an exact tip-height equality (PLAN-one-regtest-node.md)
+            // NEVER an exact tip-height equality (plans/PLAN-one-regtest-node.md)
             // — `tip` was captured back when the fixture finished building,
             // and everything `assert_chain_contract` just did in between
             // gave the shared node's automine plenty of wall-clock time to
@@ -1178,7 +1178,7 @@ fn core_rpc_conformance() {
     eprintln!("core_rpc_conformance: PASS ({} scenario txs, tip={tip})", scenario.txs.len());
 }
 
-/// U4 test 1 (`../../PLAN-chain-notes-app-core-rpc.md` §3 step, "Ranged
+/// U4 test 1 (`../../plans/PLAN-graffito-app-core-rpc.md` §3 step, "Ranged
 /// import works"): the SAME 43-tx scenario `core_rpc_conformance` builds,
 /// this time with the notebook's `tr(...)` chain and the spending wallet's
 /// `wpkh(...)` chain configured as RANGED descriptor families
@@ -1408,7 +1408,7 @@ fn core_rpc_range_widening_finds_address_beyond_initial_range() {
 }
 
 /// U7 test ("wiring reachability" —
-/// `../../PLAN-chain-notes-app-core-rpc.md` §2.2's "ranged descriptor
+/// `../../plans/PLAN-graffito-app-core-rpc.md` §2.2's "ranged descriptor
 /// import" finally gets a production caller). Every ranged-descriptor test
 /// ABOVE this one calls `CoreRpcTransport::watch_descriptors` DIRECTLY —
 /// which is exactly why the bug this unit fixes shipped in the first
@@ -1612,7 +1612,7 @@ fn core_rpc_cli_scan_wires_ranged_watch_descriptors() {
 }
 
 /// U4 test 3 ("Pruned node"), RESTRUCTURED for the "one regtest node"
-/// migration (`PLAN-one-regtest-node.md`): the shared node is permanently
+/// migration (`plans/PLAN-one-regtest-node.md`): the shared node is permanently
 /// unpruned and not ours to restart with `-prune=550`, but what this test
 /// actually verifies is `preflight()`'s INTERPRETATION of a
 /// `getblockchaininfo` response — nothing about that needs a real pruned
@@ -1863,7 +1863,7 @@ fn core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5() {
     eprintln!("core_rpc_notfound_requires_txindex_not_just_rpc_code_minus5: PASS (synthetic table, 7 cases)");
 }
 
-/// Later unit (`PLAN-one-regtest-node.md`'s "Two things now grow without
+/// Later unit (`plans/PLAN-one-regtest-node.md`'s "Two things now grow without
 /// bound" / the workspace CLAUDE.md's "Core has no per-address filter —
 /// plan §2.2 flags the O(wallet) cost as a later-unit optimization"): a
 /// `getrawtransaction`-result cache in `esplora_tx_json`
@@ -2233,7 +2233,7 @@ fn watch_wallet_descriptor_timestamps(node: &Node) -> HashMap<String, u64> {
         .collect()
 }
 
-/// U6 (`../../PLAN-chain-notes-app-core-rpc.md`, "unusable against a real
+/// U6 (`../../plans/PLAN-graffito-app-core-rpc.md`, "unusable against a real
 /// node" fix, 2026-07-30) — THE regression this unit exists to prevent.
 ///
 /// The bug: `CoreRpcTransport::ensure_address_watched`'s `watched` cache
@@ -2257,7 +2257,7 @@ fn watch_wallet_descriptor_timestamps(node: &Node) -> HashMap<String, u64> {
 /// process-global, test-visibility-only counter), which is entirely
 /// independent of chain length and would have caught this bug on regtest
 /// from day one. Now that regtest itself is a real, ever-growing shared
-/// chain (`PLAN-one-regtest-node.md`), that independence matters even
+/// chain (`plans/PLAN-one-regtest-node.md`), that independence matters even
 /// more: a call-count assertion is exactly as meaningful at height 726 as
 /// at height 72,600.
 ///
@@ -2426,7 +2426,7 @@ fn core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero() {
     eprintln!("core_rpc_ranged_import_never_silently_defaults_timestamp_to_zero: PASS (birthday={birthday})");
 }
 
-/// The whole faucet/guard redesign above (`PLAN-one-regtest-node.md`'s
+/// The whole faucet/guard redesign above (`plans/PLAN-one-regtest-node.md`'s
 /// "value must circulate, not be mined" fix) rests on ONE claim: a
 /// throwaway wallet's funds return to `testwallet` even when the test body
 /// PANICS, not just on a clean return. An untested cleanup path is not a
