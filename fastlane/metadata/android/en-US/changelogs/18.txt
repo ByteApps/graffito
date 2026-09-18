@@ -1,0 +1,9 @@
+• Syncing a notebook now fetches only what is new instead of walking its
+  whole history every time, on every backend (mempool-style explorers,
+  your own Bitcoin Core node, and Electrum servers).
+• Notes appear as they arrive: the first page renders right away and the
+  rest streams in behind it. Long histories no longer stall the screen.
+• The notes list scales to thousands of notes — it renders a window and
+  grows as you scroll; the header shows the total.
+• Quiet background checks on Core and Electrum are now a couple of small
+  requests instead of re-downloading every transaction.
