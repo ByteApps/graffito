@@ -306,11 +306,34 @@ def _parent_output(parent_txid, vout):
     return (out.get("scriptPubKey") or {}).get("address"), out.get("value", 0)
 
 
+# Process-local cache of the esplora shape for DEEPLY confirmed txs, keyed by
+# txid. The address handler below builds `esplora_tx` for EVERY wallet txid
+# on EVERY page before it filters by address and slices — one
+# `getrawtransaction` per tx per page, over the tunnel — so a viewer paging
+# a 162-tx address measured 12 s per page, 84 s in all, against the
+# cross-device suite's 60 s wait (2026-09-18). A tx six blocks deep never
+# changes shape or height (a six-deep testnet4 reorg would invalidate the
+# height, accepted for a dev server), so it is built once per process.
+# Mempool and shallow txs stay uncached: their status is what changes.
+_ESPLORA_CACHE_MIN_CONF = 6
+_esplora_cache = {}
+
+
 def esplora_tx(txid, tip):
     """Map `getrawtransaction txid 2` onto the esplora tx shape the page
     consumes (only the fields it reads)."""
+    cached = _esplora_cache.get(txid)
+    if cached is not None:
+        return cached
     raw = cli_json("getrawtransaction", txid, "2")
     conf = raw.get("confirmations", 0) or 0
+    shaped = _shape_tx(txid, raw, conf, tip)
+    if conf >= _ESPLORA_CACHE_MIN_CONF:
+        _esplora_cache[txid] = shaped
+    return shaped
+
+
+def _shape_tx(txid, raw, conf, tip):
     status = {"confirmed": conf > 0}
     if conf > 0:
         status["block_height"] = tip - conf + 1
