@@ -1,0 +1,4 @@
+• Compose no longer drops keystrokes on Android: typing a note or an
+  address used to re-run the fee and size estimate on every character,
+  which could stall input and, on a long note, freeze the screen. Those
+  refreshes are now debounced; Sign still updates immediately.
