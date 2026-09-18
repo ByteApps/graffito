@@ -1,8 +1,8 @@
-• Syncing a notebook fetches only what is new instead of walking its
+• Syncing fetches only what is new instead of walking a notebook's
   whole history, on every backend (explorer, Bitcoin Core, Electrum).
 • Notes appear as they arrive: the first page renders right away and
-  the rest streams in behind it. Long histories no longer stall.
+  the rest streams in behind it.
 • The notes list scales to thousands of notes: it renders a window and
   grows as you scroll; the header shows the total.
-• Quiet background checks on Core and Electrum are now a couple of
-  small requests instead of re-downloading every transaction.
+• Quiet background checks on Core and Electrum are a couple of small
+  requests instead of re-downloading every transaction.
