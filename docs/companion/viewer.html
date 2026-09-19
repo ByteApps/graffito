@@ -84,6 +84,138 @@
 "use strict";
 
 let serverMode = false;
+
+/* ------------------------------------------------------- IndexedDB memo
+ * (plans/PLAN-graffito-history-scaling.md, U6). Keyed network:address:txid,
+ * CONFIRMED notes only — a mempool tx is never persisted, and a private
+ * note's sealed body never was rendered in the first place (`note.text` is
+ * already null for it), so nothing beyond what the page already shows
+ * lands on disk. The database VERSION is VIEWER_CACHE_VERSION
+ * (chain-scan.js): bumping that constant fires onupgradeneeded, which
+ * drops and recreates both stores — an old memo across a decode-rule
+ * change is discarded outright, never half-trusted. Every call here is
+ * wrapped by the caller so a failure (private browsing, quota, a browser
+ * with no IndexedDB at all) falls back to today's full walk — this layer
+ * is a pure accelerator, never a requirement.
+ */
+const IDB_NAME = "graffito-viewer";
+const IDB_STORE_NOTES = "notes";
+const IDB_STORE_META = "meta";
+
+function openViewerDb() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) { reject(new Error("indexedDB unavailable")); return; }
+    const req = indexedDB.open(IDB_NAME, VIEWER_CACHE_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (db.objectStoreNames.contains(IDB_STORE_NOTES)) db.deleteObjectStore(IDB_STORE_NOTES);
+      if (db.objectStoreNames.contains(IDB_STORE_META)) db.deleteObjectStore(IDB_STORE_META);
+      const notes = db.createObjectStore(IDB_STORE_NOTES, { keyPath: "key" });
+      notes.createIndex("naddr", "naddr", { unique: false });
+      db.createObjectStore(IDB_STORE_META, { keyPath: "naddr" });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error("indexedDB open failed"));
+  });
+}
+function idbGetAllByIndex(db, storeName, indexName, key) {
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(storeName, "readonly").objectStore(storeName).index(indexName).getAll(key);
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbGet(db, storeName, key) {
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(storeName, "readonly").objectStore(storeName).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbPutAll(db, storeName, records) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    const store = tx.objectStore(storeName);
+    for (const r of records) store.put(r);
+  });
+}
+function idbPut(db, storeName, record) { return idbPutAll(db, storeName, [record]); }
+function idbClearNaddr(db, storeName, naddr) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    const req = tx.objectStore(storeName).index("naddr").openCursor(naddr);
+    req.onsuccess = () => { const cur = req.result; if (cur) { cur.delete(); cur.continue(); } };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// Cursor-aware scan for the common case (no &mine=): renders whatever is
+// already cached for `naddr` immediately (caller's job), then walks only
+// the NEW activity via chain-scan.js's fullHistoryUntil and merges it in.
+// `cachedRecords`/`prevMeta` are passed in (not re-read) since the caller
+// already fetched them to paint the cached notes first. Only CONFIRMED,
+// successfully-decoded notes are written back — a mempool note or a
+// foreign/non-PNTE confirmed tx is never persisted (the cursor is built
+// from decoded notes only, per U6; a confirmed tx's classification can
+// never change once mined, the same assumption server.py's esplora_tx
+// cache relies on, so an already-cached note is never re-fetched or
+// re-decoded). Returns the same shape scanAddress does, plus `cached:
+// true` so the caller can label the (necessarily partial, this-load-only)
+// txsScanned/foreign/nonPnte figures honestly.
+async function scanAddressCached(base, address, db, naddr, prevMeta, cachedRecords, onPage, myAddresses) {
+  const mine = new Set([address, ...(myAddresses || [])]);
+  const knownConfirmed = new Set(cachedRecords.map((r) => r.txid));
+
+  let tip = null;
+  try { tip = parseInt(await esploraText(base, "/blocks/tip/height"), 10); } catch { tip = null; }
+  const forceFull = !prevMeta || prevMeta.tip == null || tip == null || tip < prevMeta.tip;
+
+  const txs = await fullHistoryUntil(base, address, forceFull ? [] : knownConfirmed, onPage);
+
+  // Classify every FETCHED tx. On an incremental walk, page 1 always
+  // comes back in full — skip a confirmed txid already in the cache
+  // rather than reclassify it (it can't have changed); everything else
+  // (mempool, and any newly-fetched confirmed page) is fresh.
+  const freshNotes = [];
+  let noteTxs = 0, receivedTxs = 0, foreign = 0, nonPnte = 0, txsScanned = 0;
+  for (const t of txs) {
+    const confirmed = t.status.confirmed;
+    if (!forceFull && confirmed && knownConfirmed.has(t.txid)) continue;
+    const r = noteFromTx(t, address, mine, null);
+    txsScanned++;
+    if (!r.accepted) { foreign++; continue; }
+    if (r.accepted === "own") noteTxs++; else receivedTxs++;
+    if (!r.note) { nonPnte++; continue; }
+    freshNotes.push(r.note);
+  }
+
+  const freshConfirmedRecords = freshNotes
+    .filter((n) => n.height != null)
+    .map((n) => ({ key: `${naddr}:${n.noteId}`, naddr, txid: n.noteId, height: n.height, note: n }));
+
+  if (forceFull) await idbClearNaddr(db, IDB_STORE_NOTES, naddr);
+  if (freshConfirmedRecords.length) await idbPutAll(db, IDB_STORE_NOTES, freshConfirmedRecords);
+  await idbPut(db, IDB_STORE_META, { naddr, tip, updatedAt: Date.now() });
+
+  const survivingCached = forceFull ? [] : cachedRecords;
+  const byTxid = new Map(survivingCached.map((r) => [r.txid, r.note]));
+  for (const n of freshNotes) byTxid.set(n.noteId, n); // confirmed or mempool, never persisted for mempool
+  const notes = [...byTxid.values()];
+  const sortKey = (n) => (n.height == null ? Number.MAX_SAFE_INTEGER : n.height);
+  notes.sort((a, b) => sortKey(b) - sortKey(a));
+
+  return {
+    notes,
+    noteTxs: notes.filter((n) => !n.received).length,
+    receivedTxs: notes.filter((n) => n.received).length,
+    txsScanned, foreign, nonPnte,
+    cached: true,
+  };
+}
+
 // Optional &mine=<addr1,addr2,...> (comma-separated) extends OWN detection
 // to additional funding-source addresses via chain-scan.js's myAddresses
 // param — the notebook owner's link to disclose, default omits it (no
@@ -150,21 +282,80 @@ async function loadNotes() {
   const logEl = $("viewLog");
   logEl.textContent = "";
   $("notes").textContent = "";
+  // Test/automation contract: set ONLY when THIS load is complete. A cached
+  // render lands in #notes before the chain reconcile, so waiting on the
+  // cards alone is not waiting on the scan.
+  window.__cnViewer = undefined;
   if (!address) return log(logEl, "Enter the notes address first.", "err");
   $("loadBtn").disabled = true;
   $("notesHeader").textContent = "Loading…";
+  const network = net();
+  const base = API[network].base;
+  const notebookAddresses = mineAddresses.filter((a) => P2TR_RE.test(a));
+  // The IndexedDB memo is scoped to the default view (no &mine=): that
+  // param changes classification per-load (funding-unification OWN
+  // detection, DISPLAY-OWNER dedup), and caching a classification that
+  // depends on a per-load parameter risks serving a stale-wrong verdict
+  // on a later load with a different &mine=. The plain, common case (a
+  // device's home-screen QR/link, no &mine=) is what U6 targets; the
+  // advanced disclosure link stays a full fresh scan every time.
+  const useCache = mineAddresses.length === 0;
   try {
-    log(logEl, `Scanning ${address} on ${net()}…`);
-    const notebookAddresses = mineAddresses.filter((a) => P2TR_RE.test(a));
-    const scan = await scanAddress(API[net()].base, address,
-      (n) => log(logEl, `  …paged ${n} more confirmed txs`), mineAddresses, notebookAddresses);
+    let db = null;
+    if (useCache) {
+      try { db = await openViewerDb(); } catch { db = null; }
+    }
+
+    let scan = null;
+    if (db) {
+      const naddr = `${network}:${address}`;
+      let cachedRecords = [], meta = null;
+      try {
+        [cachedRecords, meta] = await Promise.all([
+          idbGetAllByIndex(db, IDB_STORE_NOTES, "naddr", naddr),
+          idbGet(db, IDB_STORE_META, naddr),
+        ]);
+      } catch { cachedRecords = []; meta = null; }
+
+      if (cachedRecords.length) {
+        const cachedNotes = cachedRecords.map((r) => r.note)
+          .sort((a, b) => (b.height ?? Number.MAX_SAFE_INTEGER) - (a.height ?? Number.MAX_SAFE_INTEGER));
+        render(cachedNotes, address);
+        const when = meta && meta.updatedAt ? new Date(meta.updatedAt).toLocaleString() : "an earlier load";
+        $("notesHeader").textContent = `${cachedNotes.length} note(s) · cached · updated ${when}`;
+        log(logEl, `Showing ${cachedNotes.length} note(s) from cache (updated ${when}) — checking for new activity…`);
+      } else {
+        log(logEl, `Scanning ${address} on ${network}…`);
+      }
+
+      try {
+        scan = await scanAddressCached(base, address, db, naddr, meta, cachedRecords,
+          (n) => log(logEl, `  …paged ${n} more confirmed txs`), mineAddresses);
+      } catch (e) {
+        log(logEl, `cache read/write failed (${e.message}) — falling back to a full scan`, "err");
+        scan = null;
+      }
+    } else {
+      log(logEl, `Scanning ${address} on ${network}…`);
+    }
+
+    if (!scan) {
+      scan = await scanAddress(base, address,
+        (n) => log(logEl, `  …paged ${n} more confirmed txs`), mineAddresses, notebookAddresses);
+    }
 
     render(scan.notes, address);
     const bits = [`${scan.notes.length} note(s)`, `${scan.noteTxs} note tx(s)`];
     if (scan.receivedTxs) bits.push(`${scan.receivedTxs} received tx(s)`);
-    bits.push(`${scan.txsScanned} txs scanned`);
-    if (scan.foreign) bits.push(`${scan.foreign} unrelated OP_RETURN tx(s) ignored`);
-    if (scan.nonPnte) bits.push(`${scan.nonPnte} non-PNTE payload(s) ignored`);
+    // scan.cached (scanAddressCached) means txsScanned/foreign/nonPnte
+    // cover only THIS load's freshly-fetched activity, not the full
+    // history — a cached-known confirmed tx is never re-fetched, so
+    // there is nothing to re-count for it. Labeled accordingly so the
+    // line stays honest rather than reusing the "scanned" wording for a
+    // number that no longer means "the whole history".
+    bits.push(scan.cached ? `${scan.txsScanned} new tx(s) checked` : `${scan.txsScanned} txs scanned`);
+    if (scan.foreign) bits.push(`${scan.foreign} unrelated OP_RETURN tx(s) ignored${scan.cached ? " (new)" : ""}`);
+    if (scan.nonPnte) bits.push(`${scan.nonPnte} non-PNTE payload(s) ignored${scan.cached ? " (new)" : ""}`);
     $("notesHeader").textContent = bits.join(" · ");
     log(logEl, "Done.", "ok");
     window.__cnViewer = { notes: scan.notes };

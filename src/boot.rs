@@ -215,6 +215,8 @@ pub(crate) fn boot() -> Rc<RefCell<State>> {
         spending_scanned: false,
         change_coins: Vec::new(),
         change_coins_ctx: None,
+        last_scan_paths: None,
+        scan_partial_new: 0,
         pending_spending_sweep_index: None,
         mixed_selected: Vec::new(),
         payfrom_expanded_source: String::new(),

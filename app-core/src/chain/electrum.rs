@@ -37,7 +37,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bitcoin::Address;
@@ -106,6 +106,9 @@ pub struct ElectrumTransport {
     host: String,
     port: u16,
     next_id: AtomicU64,
+    /// U7 request counter — see
+    /// [`super::transport::Transport::request_count`].
+    request_count: AtomicU32,
 }
 
 impl std::fmt::Debug for ElectrumTransport {
@@ -132,7 +135,12 @@ impl ElectrumTransport {
         }
         let port: u16 =
             port.parse().map_err(|_| Error::Http(format!("electrum+tcp URL: invalid port {port:?}")))?;
-        Ok(ElectrumTransport { host: host.to_string(), port, next_id: AtomicU64::new(1) })
+        Ok(ElectrumTransport {
+            host: host.to_string(),
+            port,
+            next_id: AtomicU64::new(1),
+            request_count: AtomicU32::new(0),
+        })
     }
 
     /// Identifies this node for the shared [`esplora_shape`] tx-JSON cache
@@ -567,6 +575,8 @@ impl Transport for ElectrumTransport {
     fn get_text(&self, path: &str) -> Result<String, Error> {
         #[cfg(debug_assertions)]
         eprintln!("cb: http GET {path}");
+        // Not debug-gated (U7) — see `HttpTransport::get_text`'s note.
+        self.request_count.fetch_add(1, Ordering::Relaxed);
         if path == "/blocks/tip/height" {
             return Ok(self.tip_height()?.to_string());
         }
@@ -627,10 +637,16 @@ impl Transport for ElectrumTransport {
     fn post_text(&self, path: &str, body: String) -> Result<String, Error> {
         #[cfg(debug_assertions)]
         eprintln!("cb: http POST {path}");
+        // Not debug-gated (U7) — see `HttpTransport::get_text`'s note.
+        self.request_count.fetch_add(1, Ordering::Relaxed);
         if path != "/tx" {
             return Err(Error::Http(format!("404: no POST route for {path}")));
         }
         self.broadcast(body.trim())
+    }
+
+    fn request_count(&self) -> u32 {
+        self.request_count.load(Ordering::Relaxed)
     }
 }
 

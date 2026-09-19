@@ -13,7 +13,7 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use app_core::chain::{AnyTransport, ChainClient};
+use app_core::chain::{AnyTransport, ChainClient, Transport};
 use app_core::notes_core::Network;
 
 use common::esplora_server::EsploraFakeServer;
@@ -77,4 +77,34 @@ fn http_transport_matches_in_process_fake_for_60_tx_scenario() {
     got_notes.sort();
     expected_notes.sort();
     assert_eq!(got_notes, expected_notes, "the real-socket transport must yield the same notes_onchain set");
+}
+
+/// U7 (`plans/PLAN-graffito-history-scaling.md`): `AnyTransport::Esplora`'s
+/// `request_count()` must track every `get_text`/`post_text` call it makes,
+/// success or failure, so `refresh_async` can snapshot it into
+/// `cb: refresh paths=<n> pages=<p>` without relying on the fake server's
+/// own (test-only) request log. A real loopback server stands in for "a
+/// stub" here — no new dependency, same server this file already proves
+/// matches the in-process fake byte-for-byte.
+#[test]
+fn any_transport_request_count_tracks_every_call() {
+    let (sc, addr) = build_60_tx_scenario();
+    let server = EsploraFakeServer::start(Arc::new(Mutex::new(sc)));
+    let transport = AnyTransport::new(&server.base_url(), None).expect("plain http(s) base must parse as Esplora");
+    assert_eq!(transport.request_count(), 0, "a fresh transport starts at zero");
+
+    transport.get_text("/blocks/tip/height").expect("tip route");
+    transport.get_text(&format!("/address/{addr}")).expect("stats route");
+    transport.get_text(&format!("/address/{addr}/utxo")).expect("utxo route");
+    assert_eq!(transport.request_count(), 3, "three successful get_text calls");
+
+    // A call that comes back an error still counts — the counter measures
+    // requests MADE, not requests that succeeded (a hostile/offline node
+    // making every call fail must not read as "zero network cost").
+    let _ = transport.get_text("/no/such/route");
+    assert_eq!(transport.request_count(), 4, "a failing call still counts as one request");
+
+    // Matches the server's own independent request log, proving the two
+    // counters agree rather than one merely mirroring the other's math.
+    assert_eq!(server.drain_requests().len(), 4, "sanity: the server saw exactly the same 4 requests");
 }

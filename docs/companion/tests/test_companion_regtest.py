@@ -184,6 +184,7 @@ def main():
         assert "viewer.html" in viewer.url and address in viewer.url \
             and "network=regtest" in viewer.url, viewer.url
         wait_log("#notes", VIEWER_NOTE_TEXT, viewer)  # params auto-load the notes
+        viewer.wait_for_function("window.__cnViewer !== undefined")  # cached cards land before the scan completes
         shown = viewer.locator("#notes").text_content()
         assert "Encrypted (private)" in shown, shown       # note1 stays sealed
         assert NOTE_TEXT not in shown                      # plaintext never leaks
@@ -202,6 +203,7 @@ def main():
         viewer.fill("#address", address)
         viewer.click("#loadBtn")
         wait_log("#notes", VIEWER_NOTE_TEXT, viewer)
+        viewer.wait_for_function("window.__cnViewer !== undefined")  # cached cards land before the scan completes
         print("PASS viewer standalone load")
 
         # ---- note.html permalinks: public via click, private via direct URL.
@@ -316,6 +318,7 @@ def main():
         viewer = browser.new_page()
         viewer.goto(BASE + f"/viewer.html?address={b_address}&network=regtest")
         wait_log("#notes", DIRECTED_PUB_TEXT, viewer)
+        viewer.wait_for_function("window.__cnViewer !== undefined")  # cached cards land before the scan completes
         shown = viewer.locator("#notes").text_content()
         assert "Encrypted (directed)" in shown, shown
         assert DIRECTED_PRIV_TEXT not in shown, "directed-private plaintext leaked!"
@@ -343,11 +346,13 @@ def main():
         viewer_mine.wait_for_function(
             "document.querySelector('#notesHeader').textContent.includes('note')"
         )
+        viewer_mine.wait_for_function("window.__cnViewer !== undefined")
         notes_mine = viewer_mine.evaluate("window.__cnViewer.notes")
         assert not any(n["text"] == DIRECTED_PUB_TEXT for n in notes_mine), \
             f"A-anchored own note must be deduped off B's &mine= page: {notes_mine}"
         viewer_mine.goto(BASE + f"/viewer.html?address={address}&network=regtest")
         wait_log("#notes", DIRECTED_PUB_TEXT, viewer_mine)
+        viewer_mine.wait_for_function("window.__cnViewer !== undefined")  # cached cards land before the scan completes
         pub_at_a = next(n for n in viewer_mine.evaluate("window.__cnViewer.notes")
                         if n["text"] == DIRECTED_PUB_TEXT)
         assert not pub_at_a["received"] and pub_at_a["to"] == b_address, pub_at_a
@@ -355,6 +360,7 @@ def main():
 
         viewer_mine.goto(BASE + f"/viewer.html?address={b_address}&network=regtest")
         wait_log("#notes", DIRECTED_PUB_TEXT, viewer_mine)
+        viewer_mine.wait_for_function("window.__cnViewer !== undefined")  # cached cards land before the scan completes
         notes_default = viewer_mine.evaluate("window.__cnViewer.notes")
         pub_default = next(n for n in notes_default if n["text"] == DIRECTED_PUB_TEXT)
         assert pub_default["received"] and pub_default["from"] == address, \
@@ -362,6 +368,99 @@ def main():
         print("PASS viewer WITHOUT &mine= keeps today's received-from-funder rendering")
         viewer_mine.close()
         browser.close()
+
+        # ---- U6: viewer.html's IndexedDB memo (plans/PLAN-graffito-
+        # history-scaling.md). A SECOND load of the same address in the
+        # SAME browser storage must cost far fewer /regtest/api requests
+        # than the first — the cursor-aware fullHistoryUntil (chain-
+        # scan.js) should stop paging almost immediately once its memo
+        # already covers the tail. Needs > 25 notes (one esplora page) so
+        # the first load actually pages at all. A fresh browser context
+        # (no IndexedDB carried over — equivalent to clearing it) must
+        # pay the full price again: the memo is an accelerator, not a
+        # correctness dependency.
+        cache_env = {**os.environ, "NOTES_APP_SEED": secrets.token_hex(32)}
+        cache_address = cli("address", "regtest", env=cache_env)
+        browser = p.chromium.launch()
+        cache_page = browser.new_page()
+        cache_page.goto(BASE)
+        cache_page.wait_for_function("document.querySelector('#modePill').textContent.includes('regtest')")
+        cache_page.fill("#address", cache_address)
+        cache_page.click("#faucetBtn")
+        wait_log("#syncLog", "Faucet sent", cache_page)
+
+        N_CACHE_NOTES = 27  # > one esplora page (25) so the first load must page
+        cache_bundle = build_and_download(cache_page, tmp)
+        for i in range(N_CACHE_NOTES):
+            note_i = json.loads(cli("compose", str(cache_bundle), "public", "2", "100000",
+                                     f"cache-scaling note {i}", env=cache_env))
+            cache_page.fill("#hexPaste", note_i["raw_hex"])
+            cache_page.click("#broadcastBtn")
+            wait_log("#bcastLog", "accepted", cache_page)
+            cache_bundle = build_and_download(cache_page, tmp)  # fresh change for the next note
+        print(f"PASS built {N_CACHE_NOTES} public notes on a fresh identity for the cache-scaling leg")
+        cache_page.close()
+
+        def load_and_count_api_requests(page, url):
+            """Navigate `page` to `url`, wait for the viewer to finish, and
+            return how many /regtest/api requests that ONE load made — the
+            same idea as the cross-device checker's rerouted-request log,
+            scoped to this file since that log lives outside this repo."""
+            counts = {"n": 0}
+
+            def on_request(req):
+                if "/regtest/api/" in req.url:
+                    counts["n"] += 1
+
+            page.on("request", on_request)
+            try:
+                page.goto(url)
+                wait_log("#notesHeader", "note(", page)
+                page.wait_for_timeout(200)  # let any trailing request land before we unhook
+            finally:
+                page.remove_listener("request", on_request)
+            return counts["n"]
+
+        cache_url = BASE + f"/viewer.html?address={cache_address}&network=regtest"
+
+        # First + second load share ONE page (== one browser context ==
+        # one IndexedDB origin store), so the second sees whatever the
+        # first wrote.
+        cache_viewer = browser.new_page()
+        first_n = load_and_count_api_requests(cache_viewer, cache_url)
+        assert first_n >= 3, (
+            f"first load of {N_CACHE_NOTES} notes should page through /txs/chain "
+            f"(tip + >=2 requests), got {first_n}"
+        )
+        print(f"PASS first load of {N_CACHE_NOTES}+ notes costs {first_n} requests (pages the full history)")
+
+        second_n = load_and_count_api_requests(cache_viewer, cache_url)
+        assert second_n <= 2, f"second load (same browser storage) should cost <=2 requests, got {second_n}"
+        print(f"PASS second load of the same address in the same browser storage costs only {second_n} requests")
+        cache_viewer.close()
+
+        # Negative control: browser.new_page() opens a fresh, isolated
+        # browser context (per Playwright's own contract) — no IndexedDB
+        # carried over, equivalent to a private window or a cleared
+        # store. The next load must pay the same price as the first.
+        fresh_viewer = browser.new_page()
+        third_n = load_and_count_api_requests(fresh_viewer, cache_url)
+        assert third_n == first_n, (
+            f"a fresh IndexedDB (new browser context) must cost the same as the very first load: "
+            f"{third_n} vs {first_n}"
+        )
+        print(f"PASS a fresh browser context (no memo) pays the full {third_n}-request cost again")
+        fresh_viewer.close()
+        browser.close()
+
+        # Mutation check performed by hand against chain-scan.js's stop
+        # rule (docs/companion/tests/test_history_scaling.js has the
+        # scripted version at the pure-pager level; described here, not
+        # left in code, since this file's leg needs a real node): with
+        # fullHistoryUntil's while-loop condition forced to always `true`
+        # (deleting the stop rule), the SECOND load above no longer stops
+        # early — second_n rises to match first_n instead of staying <=2.
+        # Reverted immediately after confirming it.
     print("COMPANION REGTEST E2E PASSED")
 
 

@@ -425,6 +425,33 @@ pub struct Store {
     /// stamped.
     #[serde(skip)]
     pub spending: SpendingSection,
+    /// U5 (plans/PLAN-graffito-history-scaling.md, "don't re-decrypt known
+    /// notes"): txids this store has confirmed are NOT one of our notes —
+    /// extraction was attempted and no [`RecoveredNote`] came back — so a
+    /// later scan can skip the decrypt seam for them entirely instead of
+    /// re-running `extract_notes_pq`/`extract_notes_watch_multi_deduped`
+    /// over the same non-note tx forever. `#[serde(default)]` so every
+    /// pre-U5 store file loads with an empty set: nothing is skipped on
+    /// false pretenses, the set just repopulates from the next scan.
+    /// Pruned to the current bundle's visible history on every FULL apply
+    /// (`Self::apply_recovered`), so it tracks the store's own tx history
+    /// size rather than growing without bound.
+    #[serde(default)]
+    pub seen_not_mine: std::collections::HashSet<String>,
+    /// U5 classification escape hatch. Set by [`Self::migrate_classification`]
+    /// when it finds `classify_version` stale at load — the corrected
+    /// extraction logic (whatever changed to earn the bump) must reach
+    /// EVERY existing note at least once, so the decode-skip optimization
+    /// above is disabled (every txid is re-attempted, regardless of a
+    /// cached `text` or a `seen_not_mine` entry) until the next `full`
+    /// apply completes. Deliberately NOT persisted (`#[serde(skip)]`): it
+    /// only has to survive from `load()` to the first full apply within
+    /// THIS run — `classify_version` itself is already the durable stamp,
+    /// bumped in memory at load and written to disk by that apply's save.
+    /// Skipping it on save also means a completed forced rescan can never
+    /// resurrect itself on a later load.
+    #[serde(skip)]
+    pub(crate) force_full_redecode: bool,
 }
 
 fn default_chunk() -> usize {
@@ -490,6 +517,9 @@ impl Store {
             excluded_senders: Vec::new(),
             seen_received: Vec::new(),
             spending: SpendingSection::default(),
+            seen_not_mine: std::collections::HashSet::new(),
+            // A brand-new store has no prior scan to force-redo.
+            force_full_redecode: false,
         }
     }
 
@@ -520,6 +550,11 @@ impl Store {
     /// disk), not just the active one.
     fn migrate_classification(&mut self) {
         if self.classify_version < CLASSIFY_VERSION {
+            // U5 escape hatch: the corrected classification must reach
+            // every existing note once, so decode-skipping is disabled
+            // until the next full apply completes (see
+            // `force_full_redecode`'s doc comment).
+            self.force_full_redecode = true;
             // PNTE v1 wire redesign (classify_version 2): old-format notes
             // (synthetic hex8 ids) are structurally incompatible with the
             // new txid-keyed scanner — no migration/dual-decode, they
@@ -659,10 +694,16 @@ impl Store {
                 self_spks.push(spk.clone());
             }
         }
-        self.apply_recovered(
-            bundle,
-            extract_notes_pq(bundle, identity, network, &self_spks, notebook_spks, mlkem_secrets),
-        )
+        let (decode_bundle, skipped) = self.bundle_for_decode(bundle);
+        let recovered =
+            extract_notes_pq(&decode_bundle, identity, network, &self_spks, notebook_spks, mlkem_secrets);
+        self.record_decode_outcome(&decode_bundle, &recovered, bundle);
+        let decoded = decode_bundle.notes_onchain.len();
+        let mut stats = self.apply_recovered(bundle, recovered)?;
+        stats.notes_seen += self.count_skipped_known_notes(bundle, &decode_bundle);
+        stats.decoded = decoded;
+        stats.skipped = skipped;
+        Ok(stats)
     }
 
     /// Watch-only [`Self::apply_bundle`]: same merge, but notes extract
@@ -690,10 +731,99 @@ impl Store {
                 self_spks.push(spk.clone());
             }
         }
-        self.apply_recovered(
-            bundle,
-            extract_notes_watch_multi_deduped(bundle, network, &self_spks, notebook_spks, &own_spk),
-        )
+        let (decode_bundle, skipped) = self.bundle_for_decode(bundle);
+        let recovered = extract_notes_watch_multi_deduped(
+            &decode_bundle,
+            network,
+            &self_spks,
+            notebook_spks,
+            &own_spk,
+        );
+        self.record_decode_outcome(&decode_bundle, &recovered, bundle);
+        let decoded = decode_bundle.notes_onchain.len();
+        let mut stats = self.apply_recovered(bundle, recovered)?;
+        stats.notes_seen += self.count_skipped_known_notes(bundle, &decode_bundle);
+        stats.decoded = decoded;
+        stats.skipped = skipped;
+        Ok(stats)
+    }
+
+    /// U5: split `bundle.notes_onchain` into "attempt" (returned bundle) and
+    /// "skip" (the count) — a txid is skipped only when this store already
+    /// holds it as a decoded note (`NoteRecord.text.is_some()`) or as a
+    /// previously-confirmed non-note (`seen_not_mine`), and only outside a
+    /// forced full-reclassify window (`force_full_redecode`). Everything
+    /// else about the bundle (utxos, tip, network, …) is untouched — only
+    /// `notes_onchain` is narrowed, so callers must still pass the ORIGINAL
+    /// bundle to [`Self::apply_recovered`] for status promotion, utxo
+    /// merge, and prune/reconcile.
+    fn bundle_for_decode(&self, bundle: &SyncBundle) -> (SyncBundle, usize) {
+        if self.force_full_redecode {
+            return (bundle.clone(), 0);
+        }
+        let total = bundle.notes_onchain.len();
+        let mut filtered = bundle.clone();
+        filtered.notes_onchain =
+            bundle.notes_onchain.iter().filter(|tx| self.needs_decode(&tx.txid)).cloned().collect();
+        let skipped = total - filtered.notes_onchain.len();
+        (filtered, skipped)
+    }
+
+    /// Whether `txid` needs a decode attempt this apply. A txid already
+    /// held as a NoteRecord is re-attempted only while its `text` is still
+    /// `None` (a locked pq note — the password/ML-KEM secret that unlocks
+    /// it may have just arrived); a txid never seen as a note is
+    /// re-attempted unless it's already confirmed `seen_not_mine`.
+    /// U5 log-contract guard: `ApplyStats.notes_seen` means "notes in this
+    /// bundle", decoded now or already held. A txid the partition skipped
+    /// because the store already holds its decoded note still counts —
+    /// otherwise the terminal `cb: refresh notes=` line reads `notes=0` for
+    /// a note the same scan's partial page decoded seconds earlier (the
+    /// Mac suite's "post-broadcast refresh" leg caught exactly that).
+    fn count_skipped_known_notes(&self, bundle: &SyncBundle, decode_bundle: &SyncBundle) -> usize {
+        let attempted: std::collections::HashSet<&str> =
+            decode_bundle.notes_onchain.iter().map(|t| t.txid.as_str()).collect();
+        bundle
+            .notes_onchain
+            .iter()
+            .filter(|t| !attempted.contains(t.txid.as_str()))
+            .filter(|t| self.notes.iter().any(|n| n.note_id == t.txid || n.txids.iter().any(|x| x == &t.txid)))
+            .count()
+    }
+
+    fn needs_decode(&self, txid: &str) -> bool {
+        match self.notes.iter().find(|n| n.note_id == txid || n.txids.iter().any(|t| t == txid)) {
+            Some(n) => n.text.is_none(),
+            None => !self.seen_not_mine.contains(txid),
+        }
+    }
+
+    /// After an (unskipped) decode attempt, remember every txid that came
+    /// back with no [`RecoveredNote`] at all — a structurally non-note tx
+    /// (no valid PNTE header, or a spoof) will never decode differently on
+    /// a later scan under the SAME classification generation, so there is
+    /// nothing to re-attempt. `full_bundle` is the ORIGINAL, un-narrowed
+    /// bundle passed to this apply — used only to prune `seen_not_mine`
+    /// back down to the current visible history on a full scan, so the set
+    /// tracks the store's own tx-history size rather than growing forever
+    /// (a partial/page bundle is too narrow a view to prune against, so it
+    /// leaves the set alone).
+    fn record_decode_outcome(
+        &mut self,
+        attempted: &SyncBundle,
+        recovered: &[RecoveredNote],
+        full_bundle: &SyncBundle,
+    ) {
+        for tx in &attempted.notes_onchain {
+            if !recovered.iter().any(|n| n.id == tx.txid) {
+                self.seen_not_mine.insert(tx.txid.clone());
+            }
+        }
+        if full_bundle.full {
+            let known: std::collections::HashSet<&str> =
+                full_bundle.notes_onchain.iter().map(|t| t.txid.as_str()).collect();
+            self.seen_not_mine.retain(|t| known.contains(t.as_str()));
+        }
     }
 
     fn check_identity(&self, output_x: &[u8; 32]) -> Result<(), Error> {
@@ -725,6 +855,11 @@ impl Store {
         // partial view and must never delete anything it didn't fully see).
         if bundle.full {
             self.prune_stale_received_twins(&recovered, &mut stats);
+            // U5 escape hatch: a full apply is exactly one complete pass
+            // over every note this store can see, so whatever forced this
+            // rescan (a `classify_version` bump at load) has now reached
+            // every existing note — decode-skipping may resume next time.
+            self.force_full_redecode = false;
         }
 
         // Confirm pending notes whose txid surfaced with a height even if
@@ -1555,6 +1690,17 @@ pub struct ApplyStats {
     /// removed in favor of an independently-proven own one, never the
     /// reverse.
     pub reclassified: usize,
+    /// U5: how many `notes_onchain` txids this apply actually handed to
+    /// the decrypt seam (`extract_notes_pq`/`extract_notes_watch_multi_
+    /// deduped`) — i.e. the bundle size minus [`Self::skipped`]. Counts
+    /// attempts, not successful decodes: a foreign/undecodable tx still
+    /// costs one.
+    pub decoded: usize,
+    /// U5: how many `notes_onchain` txids this apply skipped decoding for
+    /// — already held as a decoded [`NoteRecord`] (`text.is_some()`) or
+    /// already confirmed [`Store::seen_not_mine`]. Always 0 while
+    /// [`Store::force_full_redecode`] is forcing a complete rescan.
+    pub skipped: usize,
 }
 
 #[cfg(test)]

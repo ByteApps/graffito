@@ -177,6 +177,8 @@ pub struct CoreRpcTransport {
     /// `getwalletinfo` per transport instance (and `src/lib.rs` builds a
     /// fresh one per operation), never one per address route.
     scan_idle_seen: AtomicBool,
+    /// U7 request counter — see [`super::transport::Transport::request_count`].
+    request_count: AtomicU32,
 }
 
 impl std::fmt::Debug for CoreRpcTransport {
@@ -560,6 +562,7 @@ impl CoreRpcTransport {
             next_id: Mutex::new(0),
             status_cache: Mutex::new(None),
             probe_calls: AtomicU32::new(0),
+            request_count: AtomicU32::new(0),
         })
     }
 
@@ -1726,6 +1729,8 @@ impl Transport for CoreRpcTransport {
         // same discipline as `HttpTransport::get_text`.
         #[cfg(debug_assertions)]
         eprintln!("cb: http GET {path}");
+        // Not debug-gated (U7) — see `HttpTransport::get_text`'s note.
+        self.request_count.fetch_add(1, Ordering::Relaxed);
 
         if path == "/blocks/tip/height" {
             return Ok(self.tip_height_rpc()?.to_string());
@@ -1797,6 +1802,8 @@ impl Transport for CoreRpcTransport {
     fn post_text(&self, path: &str, body: String) -> Result<String, Error> {
         #[cfg(debug_assertions)]
         eprintln!("cb: http POST {path}");
+        // Not debug-gated (U7) — see `HttpTransport::get_text`'s note.
+        self.request_count.fetch_add(1, Ordering::Relaxed);
         if path != "/tx" {
             return Err(Error::Http(format!("404: no POST route for {path}")));
         }
@@ -1821,6 +1828,10 @@ impl Transport for CoreRpcTransport {
         }
         let txid = self.rpc(None, "sendrawtransaction", serde_json::json!([raw_hex]))?;
         txid.as_str().map(str::to_string).ok_or_else(|| Error::Json("sendrawtransaction: did not return a txid".into()))
+    }
+
+    fn request_count(&self) -> u32 {
+        self.request_count.load(Ordering::Relaxed)
     }
 }
 

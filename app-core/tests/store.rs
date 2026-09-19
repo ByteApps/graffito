@@ -1809,6 +1809,275 @@ fn classify_version_bumped_for_self_pw_notes() {
     assert_eq!(app_core::store::CLASSIFY_VERSION, 5);
 }
 
+// ---------------------------------------------------------------------------
+// U5 (plans/PLAN-graffito-history-scaling.md, "don't re-decrypt known
+// notes"): `apply_bundle`/`apply_bundle_watch` skip the decrypt seam
+// (`extract_notes_pq`/`extract_notes_watch_multi_deduped`) for a txid the
+// store already holds as a decoded note, and count the discount via
+// `ApplyStats::{decoded,skipped}`.
+// ---------------------------------------------------------------------------
+
+/// Re-applying the SAME full bundle a second time must not re-run the
+/// decrypt seam for a note it already decoded — the core U5 saving. A
+/// wipe-recovered (fresh) store's FIRST apply still has to actually
+/// decrypt everything; only the SECOND, no-op re-apply gets to skip.
+#[test]
+fn apply_bundle_skips_decode_for_already_decoded_notes() {
+    let a = alice();
+    let mut composer = funded_store(&a);
+    let sent = compose_and_record(
+        &mut composer,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "already decoded",
+            private: true,
+            recipient: None,
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: None,
+            pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
+            pq_mlkem: None,
+        },
+    )
+    .unwrap();
+
+    let alice_bundle = alice_own_view(&sent.tx, &a.address(NET), 105);
+
+    let mut fresh = Store::new(&a.output_x, NET);
+    let first = fresh.apply_bundle(&alice_bundle, &a, NET, &[], &[], &[]).unwrap();
+    assert_eq!(first.decoded, 1, "nothing cached yet — the one tx must be attempted");
+    assert_eq!(first.skipped, 0);
+    assert_eq!(fresh.notes.len(), 1);
+    assert_eq!(fresh.notes[0].text.as_deref(), Some("already decoded"));
+
+    let second = fresh.apply_bundle(&alice_bundle, &a, NET, &[], &[], &[]).unwrap();
+    assert_eq!(second.decoded, 0, "already decoded — must not re-run the decrypt seam");
+    assert_eq!(second.skipped, 1);
+    assert_eq!(first.notes_seen, 1, "notes_seen counts the bundle's notes on the first apply");
+    assert_eq!(second.notes_seen, 1, "a skipped-but-known note still counts as seen (cb: refresh notes= contract)");
+    // Byte-identical store contents — the skip must be a pure discount,
+    // never a behavior change on top of the existing idempotent re-apply.
+    assert_eq!(fresh.notes.len(), 1);
+    assert_eq!(fresh.notes[0].text.as_deref(), Some("already decoded"));
+    assert_eq!(fresh.notes[0].status, NoteStatus::Confirmed);
+    assert_eq!(fresh.notes[0].height, Some(105));
+}
+
+/// The streaming-scan regression U5 exists to fix (plan doc, "Shipped
+/// 2026-09-18"): a first import applies each page TWICE — a `full: false`
+/// partial, then the cumulative `full: true` bundle — which used to
+/// decrypt every note on the page twice. The cumulative apply must report
+/// `decoded == 0` for txids the partial page already decoded.
+#[test]
+fn cumulative_full_apply_skips_notes_already_seen_on_a_partial_page() {
+    let a = alice();
+    let mut composer = funded_store(&a);
+    let sent = compose_and_record(
+        &mut composer,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "streamed page",
+            private: true,
+            recipient: None,
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: None,
+            pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
+            pq_mlkem: None,
+        },
+    )
+    .unwrap();
+
+    let mut partial = alice_own_view(&sent.tx, &a.address(NET), 105);
+    partial.full = false;
+
+    let mut fresh = Store::new(&a.output_x, NET);
+    let page = fresh.apply_bundle(&partial, &a, NET, &[], &[], &[]).unwrap();
+    assert_eq!(page.decoded, 1, "a fresh partial page must still decrypt what it carries");
+    assert_eq!(page.skipped, 0);
+    assert_eq!(fresh.notes[0].text.as_deref(), Some("streamed page"));
+
+    let mut cumulative = partial.clone();
+    cumulative.full = true;
+    let full = fresh.apply_bundle(&cumulative, &a, NET, &[], &[], &[]).unwrap();
+    assert_eq!(
+        full.decoded, 0,
+        "the cumulative full apply must not re-decrypt what the partial page already cached"
+    );
+    assert_eq!(full.skipped, 1);
+}
+
+/// A locked pq note (no secret yet, `text: None`) must be RE-ATTEMPTED on
+/// every scan, never skipped — it's exactly the case a later secret
+/// (password typed in, or an ML-KEM secret newly supplied) needs to reach.
+/// Only once it actually decodes does the ordinary skip apply to it.
+#[test]
+fn locked_pq_note_is_re_attempted_until_the_secret_arrives() {
+    let a = alice();
+    let b = bob();
+    let bob_addr = b.address(NET);
+    let alice_addr = a.address(NET);
+    let bob_kp = bob_pq_keypair();
+
+    let mut composer = funded_store(&a);
+    let sent = compose_and_record(
+        &mut composer,
+        &a,
+        NET,
+        &ComposeRequest {
+            text: "kem only, for bob",
+            private: true,
+            recipient: Some(&bob_addr),
+            extra_recipients: &[],
+            change_to: None,
+            coins: None,
+            fee_rate: 1.0,
+            gift_amount: None,
+            lock_time: None,
+            now: 1,
+            pq_password: None,
+            pq_pw_cost: notes_core::pq::PwCost::DEFAULT,
+            pq_mlkem: Some(vec![(MlKemAlg::MlKem768, bob_kp.ek().to_vec())]),
+        },
+    )
+    .unwrap();
+    assert_eq!(sent.pq_flags, FLAG_MLKEM);
+
+    let bob_bundle = bob_receives(&sent.tx, &alice_addr, 200);
+    let mut bob_store = Store::new(&b.output_x, NET);
+
+    let first = bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &[], &[]).unwrap();
+    assert_eq!(first.decoded, 1, "never seen before — must attempt");
+    assert_eq!(first.skipped, 0);
+    assert!(bob_store.notes[0].text.is_none());
+    assert!(bob_store.notes[0].locked.is_some());
+
+    // No secret yet on a re-scan: still locked, so it must be
+    // RE-ATTEMPTED — never skipped.
+    let second = bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &[], &[]).unwrap();
+    assert_eq!(second.decoded, 1, "still locked — must re-attempt, never skip");
+    assert_eq!(second.skipped, 0);
+    assert!(bob_store.notes[0].text.is_none());
+
+    // The secret arrives: the same re-attempt path decodes it.
+    let secrets = pqkeys::derive_secrets(&BOB_LEAF);
+    let third = bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &[], &secrets).unwrap();
+    assert_eq!(third.decoded, 1);
+    assert_eq!(third.skipped, 0);
+    assert_eq!(bob_store.notes[0].text.as_deref(), Some("kem only, for bob"));
+    assert!(bob_store.notes[0].locked.is_none());
+
+    // Now that it's decoded, a further re-scan finally gets to skip it.
+    let fourth = bob_store.apply_bundle(&bob_bundle, &b, NET, &[], &[], &secrets).unwrap();
+    assert_eq!(fourth.decoded, 0, "now decoded — the ordinary skip applies");
+    assert_eq!(fourth.skipped, 1);
+}
+
+/// The classification escape hatch: a store LOADED with a stale
+/// `classify_version` must decode-attempt EVERY note at least once more —
+/// including one that already carries a cached `text` — because bumping
+/// `CLASSIFY_VERSION` means the decode/classification logic itself
+/// changed, and the whole point of the bump is that the fix must reach
+/// every existing note, not just new ones. `Store::load` is the only
+/// public door that can stage this (mirrors
+/// `classification_migration_forces_one_rescan_on_old_store` in
+/// `src/store.rs`'s own test module, from the outside). Once that one
+/// full apply lands, ordinary skipping must resume.
+#[test]
+fn classify_version_bump_forces_one_full_redecode_then_resumes_skipping() {
+    let a = alice();
+    let cached_txid = "11".repeat(32);
+    let new_txid = "22".repeat(32);
+
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let path = dir.join("classify-escape-hatch-store.json");
+    let json = format!(
+        r#"{{
+            "version": 1,
+            "network": "regtest",
+            "identity_fingerprint": "{fp}",
+            "address": "{addr}",
+            "notes": [
+                {{
+                    "note_id": "{cached}",
+                    "status": "confirmed",
+                    "text": "already cached before the bump",
+                    "private": false,
+                    "directed": false,
+                    "received": false,
+                    "txids": ["{cached}"],
+                    "height": 100,
+                    "blocktime": 1700000100
+                }}
+            ],
+            "utxos": [],
+            "contacts": [],
+            "txs": [],
+            "classify_version": 4
+        }}"#,
+        fp = hex::encode(a.output_x),
+        addr = a.address(NET),
+        cached = cached_txid,
+    );
+    std::fs::write(&path, json).unwrap();
+
+    let mut store = Store::load(&path).unwrap();
+    assert_eq!(
+        store.classify_version,
+        app_core::store::CLASSIFY_VERSION,
+        "stamped current in memory at load, same as the existing migration test"
+    );
+
+    // Neither tx carries a real PNTE payload — extraction will find no
+    // note for either, own or received. Only whether each was ATTEMPTED
+    // (vs skipped) is under test here.
+    let neither_ours = |txid: &str, height: u64| OnchainTx {
+        txid: txid.to_string(),
+        height: Some(height),
+        blocktime: Some(1_700_000_000 + height),
+        spends_from_self: false,
+        payloads: vec![],
+        pays_self: false,
+        sender: None,
+        author_candidates: vec![],
+        recipient: None,
+        input_prevout_spks: vec![],
+        output_addrs: vec![],
+        first_input_outpoint: None,
+    };
+    let full_bundle = bundle(
+        vec![neither_ours(&cached_txid, 100), neither_ours(&new_txid, 101)],
+        vec![],
+        101,
+    );
+
+    let first = store.apply_bundle(&full_bundle, &a, NET, &[], &[], &[]).unwrap();
+    assert_eq!(first.decoded, 2, "the version bump must force BOTH txids to be re-attempted");
+    assert_eq!(first.skipped, 0);
+    // The cached note's text must never be clobbered by a failed
+    // re-derivation attempt.
+    assert_eq!(
+        store.notes.iter().find(|n| n.note_id == cached_txid).unwrap().text.as_deref(),
+        Some("already cached before the bump")
+    );
+
+    let second = store.apply_bundle(&full_bundle, &a, NET, &[], &[], &[]).unwrap();
+    assert_eq!(second.decoded, 0, "the forced rescan is one-shot — skipping must resume");
+    assert_eq!(second.skipped, 2);
+}
+
 /// A store whose tip was stamped by a scan against the WRONG chain must take
 /// the next scan's tip verbatim, even when it is LOWER. Found live
 /// 2026-09-06: a testnet4 identity pointed at a mainnet electrs took tip

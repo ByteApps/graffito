@@ -52,6 +52,15 @@ const FLAG_MLKEM = 0x20;
 // FLAG_CONT until it ships) makes the header undecodable.
 const KNOWN_FLAGS = FLAG_PRIVATE | FLAG_DIRECTED | FLAG_MULTI | FLAG_PW | FLAG_MLKEM;
 
+// Bump whenever a change to the decode logic above (KNOWN_FLAGS,
+// parseHeader, decodeNote, noteFromTx) would make a previously-decoded
+// note's rendered shape wrong. viewer.html keys its IndexedDB memo's
+// version on this constant (plans/PLAN-graffito-history-scaling.md, U6),
+// so bumping it discards every old memo instead of half-trusting it — the
+// same role CLASSIFY_VERSION plays for the device apps' stores, ported
+// here since chain-scan.js had no version field of its own.
+const VIEWER_CACHE_VERSION = 1;
+
 const P2TR_RE = /^(bc|tb|bcrt)1p/;
 
 const shortAddr = (a) => (a && a.length > 17 ? `${a.slice(0, 8)}…${a.slice(-6)}` : a || "unknown");
@@ -94,6 +103,49 @@ async function fullHistory(base, address, onPage) {
     if (!page.length) break;
     txs.push(...page);
     if (onPage) onPage(page.length);
+    last = page.length >= 25 ? page[page.length - 1].txid : null;
+  }
+  const seen = new Set();
+  return txs.filter((t) => !seen.has(t.txid) && seen.add(t.txid));
+}
+
+// Reorg-safety margin for fullHistoryUntil below — mirrors app-core's
+// ChainClient::scan_history / HISTORY_REORG_MARGIN
+// (plans/PLAN-graffito-history-scaling.md, U1/U6): don't stop at the very
+// first re-seen known txid, walk past this many of them first, so a
+// shallow reorg of the boundary region between "new" and "already cached"
+// is never mistaken for the whole tail being unchanged.
+const HISTORY_REORG_MARGIN = 6;
+
+// Cursor-aware sibling of fullHistory, for a caller (viewer.html) that
+// already has a set of CONFIRMED txids it trusts from a previous scan.
+// `known` is that set (a Set or a plain array of txids) — empty/omitted
+// walks the FULL history, byte-for-byte like fullHistory (a cold cache, or
+// the caller decided a full re-walk is required, e.g. the chain tip moved
+// down since the memo was written: that check lives in the caller, since
+// this function has no notion of "last time"). Otherwise /txs/chain
+// paging stops once HISTORY_REORG_MARGIN known txids have been re-seen
+// across the fetched pages — never fewer, so the margin still gets walked
+// even when `known` holds barely enough entries. Unconfirmed → confirmed
+// transitions are still observed because /txs (page 1) always comes back
+// in full, exactly as in fullHistory. Returns the same shape as
+// fullHistory: a de-duplicated array of esplora tx objects — but when
+// `known` covers the tail, it is only the NEWLY fetched pages (mempool +
+// whatever of the confirmed chain wasn't already known), not the whole
+// history; the caller is expected to already hold the rest.
+async function fullHistoryUntil(base, address, known, onPage) {
+  const knownSet = known instanceof Set ? known : new Set(known || []);
+  const txs = await esploraJson(base, `/address/${address}/txs`);
+  const confirmed = txs.filter((t) => t.status.confirmed);
+  let last = confirmed.length ? confirmed[confirmed.length - 1].txid : null;
+  const fullWalk = knownSet.size === 0;
+  let knownSeen = fullWalk ? 0 : confirmed.filter((t) => knownSet.has(t.txid)).length;
+  while (last && (fullWalk || knownSeen < HISTORY_REORG_MARGIN)) {
+    const page = await esploraJson(base, `/address/${address}/txs/chain?after_txid=${last}`);
+    if (!page.length) break;
+    txs.push(...page);
+    if (onPage) onPage(page.length);
+    if (!fullWalk) knownSeen += page.filter((t) => knownSet.has(t.txid)).length;
     last = page.length >= 25 ? page[page.length - 1].txid : null;
   }
   const seen = new Set();

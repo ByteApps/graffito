@@ -31,7 +31,7 @@ use app_core::bitcoin;
 use app_core::chain::{
     default_base, explorer_presets, explorer_tx_url, node_backend_label, node_presets,
     scan_change_chain, scan_change_chain_watch, AddrStats, AnyTransport, ChainClient, ChangeCoin,
-    NodeStatus, TxLookupStatus,
+    NodeStatus, Transport, TxLookupStatus,
 };
 use app_core::compose::ComposeRequest;
 use app_core::funding::{FundingSource, FundingUtxo, FundingWallet};
@@ -602,6 +602,20 @@ struct State {
     /// caught it). `activate()` clears `change_coins` only when this context
     /// changes; the wallet-stores apply stamps it whenever it repopulates.
     change_coins_ctx: Option<(String, Network, u32)>,
+    /// U7 (`plans/PLAN-graffito-history-scaling.md`): `(paths, pages)` from
+    /// the most recently applied [`pending::RefreshResult`] — the same
+    /// numbers `apply_refresh_result` logs as `cb: refresh paths=<n>
+    /// pages=<p> address=<12>`, kept here purely so a test can assert on it
+    /// without scraping stdout. Overwritten by every `apply_refresh_result`
+    /// call (single-notebook `refresh_async` only — the wallet-wide
+    /// multi-notebook scan has no single client to count and doesn't touch
+    /// this field).
+    last_scan_paths: Option<(u32, u32)>,
+    /// New notes applied by this scan's PARTIAL pages so far, folded into
+    /// the terminal `cb: refresh notes=… new=…` line (suites assert
+    /// `new=[1-9]` after a compose; the final full apply skips what a
+    /// partial page already decoded, so it alone would print `new=0`).
+    scan_partial_new: usize,
     /// Settings → "Sweep notebook funds here": the spending-wallet receive
     /// index the sweep destination was set to, so the broadcast handler
     /// can mark it used on success (fresh-address discipline). None for
@@ -1404,6 +1418,8 @@ impl State {
             spending_scanned: false,
             change_coins: Vec::new(),
             change_coins_ctx: None,
+            last_scan_paths: None,
+            scan_partial_new: 0,
             pending_spending_sweep_index: None,
             mixed_selected: Vec::new(),
             payfrom_expanded_source: String::new(),

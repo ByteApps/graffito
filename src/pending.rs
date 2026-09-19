@@ -229,6 +229,20 @@ pub(crate) struct RefreshResult {
     /// Populated only for entries whose lookup came back `NotFound` —
     /// keyed by the record's first spent input (txid, vout).
     pub(crate) dropped_unspent: HashMap<(String, u32), bool>,
+    /// U7 (`plans/PLAN-graffito-history-scaling.md`): the ONE `client`'s
+    /// [`app_core::chain::Transport::request_count`] snapshotted at the end
+    /// of the worker job — every request this scan made (stats precheck,
+    /// tip, utxo, `scan_history` pages, and the pending-status/dropped
+    /// lookups, since they all share this same transport instance per the
+    /// "don't collapse `open_client`/`open_client_watched`" invariant).
+    /// `1` on the stats-precheck short-circuit (`cb: refresh unchanged`) —
+    /// the ONE `/address/:a` fingerprint request still counts — and `0`
+    /// only on the `open_client_watched` failure path (no client was ever
+    /// built, so no requests were made at all).
+    pub(crate) paths: u32,
+    /// How many `scan_history` pages this scan walked (`page_num` from
+    /// `refresh_async`'s `on_page` closure) — `0` on both paths above.
+    pub(crate) pages: u32,
 }
 
 
@@ -1965,6 +1979,8 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
                     statuses: Vec::new(),
                     dropped_lookup: HashMap::new(),
                     dropped_unspent: HashMap::new(),
+                    paths: 0,
+                    pages: 0,
                 };
                 post(&weak, move |w, st| st.apply_refresh_result(w, r));
                 return;
@@ -2008,6 +2024,12 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
                 statuses: Vec::new(),
                 dropped_lookup: HashMap::new(),
                 dropped_unspent: HashMap::new(),
+                // Same `client` the `address_stats` call above just used —
+                // snapshotting its real counter rather than hand-writing
+                // `1` keeps this honest if the precheck ever grows a
+                // second request.
+                paths: client.transport.request_count(),
+                pages: 0,
             };
             post(&weak, move |w, st| st.apply_refresh_result(w, r));
             return;
@@ -2024,7 +2046,15 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
         let address_for_pages = address.clone();
         let weak_for_pages = weak.clone();
         let mut page_num = 0u32;
-        let mut on_page = move |page: &app_core::notes_core::bundle::SyncBundle| {
+        // U7: NOT `move` (unlike before) — `page_num` is captured by unique
+        // `&mut` instead of moved-in-as-a-copy, so the count keeps
+        // accumulating across calls and is still readable from `page_num`
+        // once `on_page`'s last use (the `scan_history` call below) ends its
+        // borrow. `address_for_pages`/`weak_for_pages` only need `.clone()`/
+        // `&`, which a non-`move` closure can borrow just as well; the INNER
+        // closure handed to `post` is the one that truly needs `move` (it
+        // must be `'static` to queue onto the UI thread), and stays as-is.
+        let mut on_page = |page: &app_core::notes_core::bundle::SyncBundle| {
             page_num += 1;
             let n = page_num;
             let page_bundle = page.clone();
@@ -2032,11 +2062,18 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
             post(&weak_for_pages, move |w, st| st.apply_refresh_page(w, addr, n, page_bundle));
         };
         let bundle = client.scan_history(&address, &cursor, &mut on_page).map_err(|e| format!("{e}"));
+        let pages = page_num;
         let statuses = pending_txids
             .iter()
             .map(|t| (t.clone(), client.fetch_tx_status(t)))
             .collect();
         let (dropped_lookup, dropped_unspent) = fetch_dropped_checks(&client, &address, &dropped_checks);
+        // Snapshotted LAST, after `scan_history`'s pages AND the
+        // pending-status/dropped lookups just above — every one of those
+        // calls shares this same `client` (one transport per scan; see the
+        // "don't collapse open_client/open_client_watched" invariant), so
+        // this is the true total for the whole scan, not just the walk.
+        let paths = client.transport.request_count();
         let r = RefreshResult {
             address,
             bundle: Some(bundle),
@@ -2044,6 +2081,8 @@ pub(crate) fn refresh_async(&mut self, w: &AppWindow) {
             statuses,
             dropped_lookup,
             dropped_unspent,
+            paths,
+            pages,
         };
         post(&weak, move |w, st| st.apply_refresh_result(w, r));
     };
@@ -2133,10 +2172,11 @@ pub(crate) fn apply_active_bundle(&mut self, w: &AppWindow, bundle: Result<app_c
                         // common case with `reclassified=0`).
                         println!("cb: refresh reclassified n={}", stats.reclassified);
                     }
+                    let new_total = stats.notes_new + std::mem::take(&mut st.scan_partial_new);
                     println!(
                         "cb: refresh notes={} new={} orphaned={} balance={} tip={}",
                         stats.notes_seen,
-                        stats.notes_new,
+                        new_total,
                         stats.orphaned,
                         st.store.as_ref().unwrap().balance(),
                         st.store.as_ref().unwrap().tip_height
@@ -2209,13 +2249,18 @@ pub(crate) fn apply_refresh_page(
             &spending_window_spks,
         ),
     };
-    if let Err(e) = applied {
-        // Never seen in practice (a partial bundle is the same shape a
-        // full one already applies successfully) — logged rather than
-        // silently swallowed so a real regression doesn't vanish.
-        println!("cb: refresh page-err={e}");
-        return;
-    }
+    let page_stats = match applied {
+        Ok(s) => s,
+        Err(e) => {
+            // Never seen in practice (a partial bundle is the same shape a
+            // full one already applies successfully) — logged rather than
+            // silently swallowed so a real regression doesn't vanish.
+            println!("cb: refresh page-err={e}");
+            return;
+        }
+    };
+    // Folded into the terminal `cb: refresh … new=` line by apply_refresh_result.
+    st.scan_partial_new += page_stats.notes_new;
     println!("cb: refresh page={page_num} txs={n} address={}", &address[..12.min(address.len())]);
     st.update_home_notes(w);
 }
@@ -2241,11 +2286,35 @@ pub(crate) fn apply_refresh_result(&mut self, w: &AppWindow, r: RefreshResult) {
         // longer fetched here at all (network-efficiency, 2026-07-23)
         // — the fee-showing screens fetch them lazily on open.
         println!("cb: refresh unchanged");
+        // U7: still a measured number (the one `/address/:a` precheck
+        // request), not a hand-typed constant — see `RefreshResult::paths`.
+        println!(
+            "cb: refresh paths={} pages={} address={}",
+            r.paths,
+            r.pages,
+            &r.address[..12.min(r.address.len())]
+        );
+        st.last_scan_paths = Some((r.paths, r.pages));
         w.global::<Ui>().set_status("up to date".into());
         st.update_home(w);
         return;
     };
     st.apply_active_bundle(w, bundle, &r.statuses, &r.dropped_lookup, &r.dropped_unspent, r.new_stats);
+    // U7 (`plans/PLAN-graffito-history-scaling.md`): right after the
+    // `cb: refresh notes=…` line `apply_active_bundle` just printed (never
+    // touch that line's wording/count) — a regression back to O(N) request
+    // paths per scan must show up as a NUMBER here, never as a timeout
+    // (`regtest-hides-cost-bugs`). Printed unconditionally (even if the
+    // apply itself failed and logged `cb: refresh err=…`/`apply failed`
+    // instead) since the request count is about the NETWORK cost of this
+    // scan, independent of whether the store apply succeeded.
+    println!(
+        "cb: refresh paths={} pages={} address={}",
+        r.paths,
+        r.pages,
+        &r.address[..12.min(r.address.len())]
+    );
+    st.last_scan_paths = Some((r.paths, r.pages));
     if w.global::<Ui>().get_screen() == Screen::PayFrom {
         st.update_funding_screen_ui(w);
         st.log_funding_refresh();
@@ -2861,6 +2930,8 @@ mod tests {
                     statuses: Vec::new(),
                     dropped_lookup: HashMap::new(),
                     dropped_unspent: HashMap::new(),
+                    paths: 4,
+                    pages: 3,
                 },
             );
         });

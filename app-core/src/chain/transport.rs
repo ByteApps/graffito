@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -9,6 +10,19 @@ use super::electrum::ElectrumTransport;
 pub trait Transport {
     fn get_text(&self, path: &str) -> Result<String, Error>;
     fn post_text(&self, path: &str, body: String) -> Result<String, Error>;
+
+    /// Count of `get_text`/`post_text` calls made through this transport
+    /// instance so far (U7, `plans/PLAN-graffito-history-scaling.md`) — the
+    /// cheap, always-on counterpart to the `#[cfg(debug_assertions)]`
+    /// `cb: http …` trace: a caller (namely `apply_refresh_result`) snapshots
+    /// it once per scan and prints it as a NUMBER, so a regression to O(N)
+    /// requests shows up in suite output as a number, never as a timeout
+    /// (`regtest-hides-cost-bugs`). Default `0` for any future `Transport`
+    /// impl that doesn't wire a counter — never a hard build error, since
+    /// this is instrumentation, not a correctness contract.
+    fn request_count(&self) -> u32 {
+        0
+    }
 }
 
 /// Task #14 (dropped-pending detection): the outcome of a `/tx/:txid`
@@ -35,6 +49,8 @@ pub struct HttpTransport {
     /// and pacing it would only slow the e2e suites and shift their
     /// timing calibrations.
     paced: bool,
+    /// U7 request counter — see [`Transport::request_count`].
+    request_count: AtomicU32,
 }
 
 /// True for bases whose host is loopback — the pacer/politeness exemption.
@@ -69,6 +85,7 @@ impl HttpTransport {
                 .build()
                 .expect("client config is static"),
             paced,
+            request_count: AtomicU32::new(0),
         }
     }
 }
@@ -199,6 +216,11 @@ impl Transport for HttpTransport {
         // are unaffected.)
         #[cfg(debug_assertions)]
         eprintln!("cb: http GET {path}");
+        // Not debug-gated (U7) — one atomic add per logical call, counted
+        // once regardless of 429 retries below (a retry is the SAME logical
+        // request, not a second one, for the purposes of the per-scan count
+        // a caller snapshots via `request_count()`).
+        self.request_count.fetch_add(1, Ordering::Relaxed);
         let mut attempt = 0u32;
         loop {
             if self.paced {
@@ -225,6 +247,8 @@ impl Transport for HttpTransport {
         // stderr, not stdout — see the `get_text` note above.
         #[cfg(debug_assertions)]
         eprintln!("cb: http POST {path}");
+        // Not debug-gated (U7) — see the `get_text` note above.
+        self.request_count.fetch_add(1, Ordering::Relaxed);
         let mut attempt = 0u32;
         loop {
             if self.paced {
@@ -249,6 +273,10 @@ impl Transport for HttpTransport {
             }
             return Err(Error::Http(trim_error_body(status.as_u16(), &text)));
         }
+    }
+
+    fn request_count(&self) -> u32 {
+        self.request_count.load(Ordering::Relaxed)
     }
 }
 
@@ -323,6 +351,13 @@ impl Transport for AnyTransport {
             AnyTransport::Esplora(t) => t.post_text(path, body),
             AnyTransport::Core(t) => t.post_text(path, body),
             AnyTransport::Electrum(t) => t.post_text(path, body),
+        }
+    }
+    fn request_count(&self) -> u32 {
+        match self {
+            AnyTransport::Esplora(t) => t.request_count(),
+            AnyTransport::Core(t) => t.request_count(),
+            AnyTransport::Electrum(t) => t.request_count(),
         }
     }
 }

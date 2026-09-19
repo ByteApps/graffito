@@ -109,6 +109,24 @@ fn drain_until(app: &AppWindow, st: &mut State, mut done: impl FnMut(&AppWindow,
 /// `idle_polls` streak sees nothing to run, not until a specific total is
 /// reached (used for the short-circuit/incremental steps, whose paths are
 /// asserted from the recorder rather than a UI count).
+/// Waits (bounded) until `SCAN_LANE` has nothing running or queued. The
+/// worker thread calls `lane.complete(id)` AFTER it has posted its result,
+/// so a test that returns as soon as the result is applied can leave the
+/// lane "running" for a few more microseconds — and the next test's
+/// `refresh_async` for the SAME notebook address then coalesces into that
+/// ghost job and makes zero requests (seen once as `left: []` on the
+/// quiet-rescan assertion in a full-suite run). Every test that submits a
+/// lane job waits for idle at its start and after it settles.
+fn wait_lane_idle() {
+    for _ in 0..20_000u32 {
+        if crate::pending::SCAN_LANE.lock().expect("scan lane").0.is_idle() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("SCAN_LANE never went idle");
+}
+
 fn drain_settle(app: &AppWindow, st: &mut State) {
     let mut idle = 0u32;
     for _ in 0..20_000u32 {
@@ -117,6 +135,7 @@ fn drain_settle(app: &AppWindow, st: &mut State) {
         } else {
             idle += 1;
             if idle > 50 {
+                wait_lane_idle();
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -149,6 +168,7 @@ fn add_tx(scenario: &Arc<Mutex<Scenario>>, pay_to: &str, height: Option<u64>, ta
 #[test]
 fn thousand_tx_history_streams_then_scales_incrementally() {
     let _queue_lock = QUEUE_TEST_LOCK.lock().expect("queue test lock");
+    wait_lane_idle();
     i_slint_backend_testing::init_no_event_loop();
 
     // The identity's receive address is a pure function of the mnemonic —
@@ -251,12 +271,33 @@ fn thousand_tx_history_streams_then_scales_incrementally() {
         rest_paths.iter().all(|p| p.contains("/txs/chain/") || p == &format!("/address/{address}/txs")),
         "every request after the first 4 is a history page: {rest_paths:?}"
     );
+    // U7 (`plans/PLAN-graffito-history-scaling.md`): the SAME total, this
+    // time read from the app's own `client.transport.request_count()`
+    // snapshot rather than the fake server's request log — an independent
+    // measurement of the same fact, exactly what `apply_refresh_result`
+    // now logs as `cb: refresh paths=<n> pages=<p>`. `pages` = 40: one
+    // `on_page` call for the initial `/txs` fetch + 39 for the 39 FULL
+    // `/txs/chain/` pages that returned data (the 40th chain request comes
+    // back empty and `scan_history` breaks BEFORE calling `on_page` for
+    // it — see its own doc comment) — one less than the 44 total paths
+    // because the stats/tip/utxo precheck trio makes no `on_page` call.
+    assert_eq!(
+        st.last_scan_paths,
+        Some((44, 40)),
+        "app-level path/page counter must match the server's own request log"
+    );
 
     // ---- (c) nothing changed — the fingerprint short-circuits -----------
     st.refresh_async(&app);
     drain_settle(&app, &mut st);
     assert_eq!(server.drain_requests(), vec![format!("/address/{address}")], "unchanged: only the stats precheck");
     assert!(!st.scan_gate.busy());
+    // U7: a quiet re-scan must show up as the NUMBER 1, never as "took no
+    // time". This path is governed by `refresh_async`'s OWN fingerprint
+    // precheck (`nothing_pending && new_stats == prev_stats`), not
+    // `ScanCursor` — see (d)/(e) below for the assertion that catches a
+    // regression in the CURSOR early-stop instead.
+    assert_eq!(st.last_scan_paths, Some((1, 0)), "quiet re-scan: one stats precheck, zero pages");
 
     // ---- (d) one CONFIRMED tx — cheap incremental catch-up --------------
     // The scenario's tip started at 10_000 (well above N=1000 confirmation
@@ -274,6 +315,9 @@ fn thousand_tx_history_streams_then_scales_incrementally() {
         "known_confirmed lets page 1 alone satisfy the early stop"
     );
     assert_eq!(app.global::<Home>().get_notes_total(), N as i32 + 1);
+    // U7: 4 requests, 1 page (the initial `/txs` fetch's own `on_page`
+    // call — the early stop never reaches a `/txs/chain/` request at all).
+    assert_eq!(st.last_scan_paths, Some((4, 1)), "one confirmed tx: cheap incremental catch-up");
 
     // ---- (e) a MEMPOOL tx, then confirming it — must_see stays cheap ----
     let pending_txid = add_tx(&scenario, &address, None, "mempool");
@@ -284,6 +328,7 @@ fn thousand_tx_history_streams_then_scales_incrementally() {
         vec![format!("/address/{address}"), "/blocks/tip/height".to_string(), format!("/address/{address}/utxo"), format!("/address/{address}/txs")],
         "a mempool tx never blocks the confirmed-only early stop"
     );
+    assert_eq!(st.last_scan_paths, Some((4, 1)), "one mempool tx: same cheap shape as (d)");
     {
         let store = st.store.as_ref().unwrap();
         let n = store.notes.iter().find(|n| n.txids.contains(&pending_txid)).expect("mempool note recorded");
@@ -303,6 +348,7 @@ fn thousand_tx_history_streams_then_scales_incrementally() {
         vec![format!("/address/{address}"), "/blocks/tip/height".to_string(), format!("/address/{address}/utxo"), format!("/address/{address}/txs")],
         "must_see re-saw the pending txid on page 1 — still no chain pages needed"
     );
+    assert_eq!(st.last_scan_paths, Some((4, 1)), "confirming the pending tx: still the same cheap shape");
     let store = st.store.as_ref().unwrap();
     let n = store.notes.iter().find(|n| n.txids.contains(&pending_txid)).expect("note still present");
     assert_eq!(n.status, NoteStatus::Confirmed, "the badge must flip to confirmed");
@@ -321,6 +367,7 @@ fn thousand_tx_history_streams_then_scales_incrementally() {
 #[test]
 fn pending_record_blocks_the_fingerprint_short_circuit() {
     let _queue_lock = QUEUE_TEST_LOCK.lock().expect("queue test lock");
+    wait_lane_idle();
     i_slint_backend_testing::init_no_event_loop();
 
     let material = app_core::identity::parse_key_material(MNEMONIC, Network::Regtest).expect("parse material");
