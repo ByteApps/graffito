@@ -1,0 +1,7 @@
+• Faster re-syncs: notes already decrypted on this device are not
+  decrypted again on every scan, so large notebooks refresh in a fraction
+  of the time.
+• The web viewer remembers the notes it has already decoded and fetches
+  only new activity on the next visit.
+• Each sync now reports how many requests it made, so slow backends are
+  visible instead of silent.
