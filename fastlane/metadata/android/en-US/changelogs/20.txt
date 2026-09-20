@@ -1,0 +1,5 @@
+• Hardware and Bluetooth keyboards now type every character correctly:
+  shifted symbols such as ":" "@" and "?" no longer arrive unshifted.
+• The on-screen keyboard closes when you leave a screen or tap anywhere
+  outside a text field, and comes back when you tap a field.
+• Content moves above the keyboard on devices where it previously did not.
