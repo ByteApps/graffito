@@ -1,0 +1,1 @@
+cargo:rustc-check-cfg=cfg(slint_nightly_test)

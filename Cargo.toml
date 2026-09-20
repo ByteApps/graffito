@@ -197,6 +197,16 @@ slint-build = "=1.17.1"
 [patch.crates-io]
 winit = { git = "https://github.com/ByteApps/winit", rev = "cea753eacbc334b1b61056efb6690075b5235cf1" }
 
+# Vendored fork of Slint's Android backend (2026-09-19,
+# vendor/i-slint-backend-android-activity/NOTES.md): fixes lost Shift/meta
+# state on hardware/Bluetooth-keyboard key events, a soft keyboard that
+# stays up after its focused TextInput is destroyed (a screen switch), and
+# adds tap-outside-a-text-field-dismisses-the-keyboard. Android-only crate
+# (`#![cfg]`-gated inside it) — inert on every other target, including this
+# very [patch.crates-io] entry (Cargo only consults it when something in
+# the graph actually depends on the crate, which only Android builds do).
+i-slint-backend-android-activity = { path = "vendor/i-slint-backend-android-activity" }
+
 # Slint's text shaper (harfrust, via parley) has an integer add that overflows
 # on very large single text runs. Release wraps it (overflow-checks off by
 # default), but debug builds panic-abort — crashing the app on a huge paste

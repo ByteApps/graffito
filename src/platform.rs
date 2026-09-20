@@ -760,6 +760,18 @@ mod android_jni {
     /// the deprecated getSystemWindowInsetTop/Bottom() (same numbers, minus
     /// the cutout). Err when the decor view has no insets yet (not attached
     /// on the very first ticks) — the caller re-polls.
+    ///
+    /// graffito patch (2026-09-19): on the emulator, `getRootWindowInsets()`
+    /// returns null even though the window IS attached (observed: every
+    /// call logs `cb: window-insets Err("Null pointer in
+    /// getRootWindowInsets")`, so content never shifts above the keyboard
+    /// there) — fall back to `WindowManager.getCurrentWindowMetrics()
+    /// .getWindowInsets()` on API ≥ 30, the same fallback Slint's own Java
+    /// helper takes for `get_safe_area()`/`get_view_rect()` at that SDK
+    /// level (`vendor/i-slint-backend-android-activity/java/
+    /// SlintAndroidJavaHelper.java`). Below API 30 there is no
+    /// `WindowMetrics` to fall back to, so a null root-insets result there
+    /// still errors as before.
     pub fn window_insets() -> Result<(i32, i32), String> {
         // NOT the ndk_context context object (an Application-ish context is
         // what the other shims get — which is why open_url needs
@@ -771,13 +783,24 @@ mod android_jni {
             let activity = unsafe { JObject::from_raw(activity_ptr as jni::sys::jobject) };
             let window = env.call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])?.l()?;
             let decor = env.call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?.l()?;
-            let insets = env
+            let sdk = env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i()?;
+            let mut insets = env
                 .call_method(&decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", &[])?
                 .l()?;
+            if insets.is_null() && sdk >= 30 {
+                let wm = env
+                    .call_method(&activity, "getWindowManager", "()Landroid/view/WindowManager;", &[])?
+                    .l()?;
+                let metrics = env
+                    .call_method(&wm, "getCurrentWindowMetrics", "()Landroid/view/WindowMetrics;", &[])?
+                    .l()?;
+                insets = env
+                    .call_method(&metrics, "getWindowInsets", "()Landroid/view/WindowInsets;", &[])?
+                    .l()?;
+            }
             if insets.is_null() {
                 return Err(jni::errors::Error::NullPtr("getRootWindowInsets"));
             }
-            let sdk = env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i()?;
             if sdk >= 30 {
                 let ty = |env: &mut JNIEnv, name: &str| -> jni::errors::Result<i32> {
                     env.call_static_method("android/view/WindowInsets$Type", name, "()I", &[])?.i()
