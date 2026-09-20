@@ -243,6 +243,36 @@ export component EditField inherits Rectangle {
         overflow: elide;
     }
 
+    // A tap inside the field's PADDING — inside the rounded box, outside
+    // clip-rect's inner TextInput — used to reach nothing at all: no
+    // TouchArea covered that strip, so it never focused `ti` (measured
+    // 2026-09-19 on Android: no IME request whatsoever, on any platform).
+    // This one fills the WHOLE box and is declared FIRST, so a tap that
+    // lands on the text itself, the clear button, or inside
+    // ContextMenuArea (all declared later) still goes to THEM —
+    // "later sibling wins input" (see the QR-zoom-overlay note elsewhere
+    // in this app) — only a genuine padding tap ever reaches this handler,
+    // and double/triple-tap-select / the right-click menu are untouched.
+    TouchArea {
+        clicked => {
+            root.internal-sel = true;
+            if (!ti.has-focus) { ti.focus(); }
+            // Land the caret at whichever end is nearer the tap — a tap
+            // left of the text run means "start", right of it "end".
+            if (self.pressed-x < clip-rect.x) {
+                ti.set-selection-offsets(0, 0);
+            } else {
+                ti.set-selection-offsets(EditOps.byte-len(ti.text), EditOps.byte-len(ti.text));
+            }
+            root.internal-sel = false;
+            root.bubble = false;
+            root.last-tap-off = ti.cursor-position-byte-offset;
+            root.last-tap-text = ti.text;
+            root.tap-count = 1;
+            dbl.running = false;
+        }
+    }
+
     ContextMenuArea {
         enabled: !EditOps.touch;
         Menu {
@@ -486,6 +516,34 @@ export component EditArea inherits Rectangle {
         font-size: 13px * Metrics.type-scale;
         color: Pal.muted;
         overflow: elide;
+    }
+
+    // Same padding-tap fix as EditField, against `fli`'s bounds (the
+    // Flickable's 10px/8px inset) instead of clip-rect — see the comment
+    // there. Multi-line, so above/below the text run matters more than
+    // left/right: a tap above `fli` lands at the start, below it at the
+    // end, and a tap in the narrow left/right margin falls back to
+    // whichever side it's on.
+    TouchArea {
+        clicked => {
+            root.internal-sel = true;
+            if (!ti.has-focus) { ti.focus(); }
+            if (self.pressed-y < fli.y) {
+                ti.set-selection-offsets(0, 0);
+            } else if (self.pressed-y > fli.y + fli.height) {
+                ti.set-selection-offsets(EditOps.byte-len(ti.text), EditOps.byte-len(ti.text));
+            } else if (self.pressed-x < fli.x) {
+                ti.set-selection-offsets(0, 0);
+            } else {
+                ti.set-selection-offsets(EditOps.byte-len(ti.text), EditOps.byte-len(ti.text));
+            }
+            root.internal-sel = false;
+            root.bubble = false;
+            root.last-tap-off = ti.cursor-position-byte-offset;
+            root.last-tap-text = ti.text;
+            root.tap-count = 1;
+            dbl.running = false;
+        }
     }
 
     ContextMenuArea {

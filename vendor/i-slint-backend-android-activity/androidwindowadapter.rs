@@ -29,6 +29,7 @@ use i_slint_core::window::{InputMethodRequest, WindowInner};
 use i_slint_renderer_skia::{SkiaRenderer, SkiaSharedContext};
 use std::cell::Cell;
 use std::collections::HashMap;
+use i_slint_core::item_tree::ItemRc;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -66,7 +67,7 @@ pub struct AndroidWindowAdapter {
     // tap (small movement) from a drag, which must never dismiss focus.
     // `LogicalPoint` (not the api `LogicalPosition`) to match what
     // `touch_pos()` in `process_inputs` already produces.
-    tap_down_positions: RefCell<HashMap<i32, i_slint_core::lengths::LogicalPoint>>,
+    tap_down_positions: RefCell<HashMap<i32, (i_slint_core::lengths::LogicalPoint, Option<ItemRc>)>>,
 }
 
 impl WindowAdapter for AndroidWindowAdapter {
@@ -488,7 +489,14 @@ impl AndroidWindowAdapter {
                                 // graffito patch (2026-09-19): (c) remember
                                 // this pointer's down position so Up can
                                 // tell a genuine tap from a drag.
-                                self.tap_down_positions.borrow_mut().insert(p.pointer_id(), pos);
+                                {
+                                    // graffito patch (2026-09-19): remember which item had focus
+                                    // when the finger went down, so a tap that MOVES focus (onto a
+                                    // field, or onto a field's padding whose TouchArea focuses it)
+                                    // is never mistaken for a tap outside the field.
+                                    let focus_before = WindowInner::from_pub(&self.window).focus_item.borrow().upgrade();
+                                    self.tap_down_positions.borrow_mut().insert(p.pointer_id(), (pos, focus_before));
+                                }
                                 WindowInner::from_pub(&self.window).process_touch_input(
                                     p.pointer_id(),
                                     pos,
@@ -521,10 +529,16 @@ impl AndroidWindowAdapter {
                                 // which is exactly the desired "tap on a
                                 // text field keeps working" behavior.
                                 const TAP_SLOP: f32 = 8.0;
-                                if let Some(down) = self.tap_down_positions.borrow_mut().remove(&pid) {
+                                if let Some((down, focus_before)) = self.tap_down_positions.borrow_mut().remove(&pid) {
                                     let dx = pos.x as f32 - down.x as f32;
                                     let dy = pos.y as f32 - down.y as f32;
-                                    if dx * dx + dy * dy <= TAP_SLOP * TAP_SLOP {
+                                    let focus_now = WindowInner::from_pub(&self.window).focus_item.borrow().upgrade();
+                                    let focus_unchanged = match (&focus_before, &focus_now) {
+                                        (Some(a), Some(b)) => a == b,
+                                        (None, None) => true,
+                                        _ => false,
+                                    };
+                                    if focus_unchanged && dx * dx + dy * dy <= TAP_SLOP * TAP_SLOP {
                                         self.dismiss_keyboard_if_tap_outside_focus(pos);
                                     }
                                 }
